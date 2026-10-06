@@ -15,7 +15,8 @@ use eframe::egui::{self, Color32, Pos2, Rect, RichText, Stroke, TextureHandle, V
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    sync::mpsc,
+    path::{Path, PathBuf},
+    sync::{mpsc, Arc},
     time::Duration,
 };
 
@@ -93,8 +94,34 @@ struct Preview {
     w: u32,
     h: u32,
     bytes: Vec<u8>,
+    selection: Option<[i32; 4]>,
+    selection_polygon: Option<Vec<[f32; 2]>>,
     target: String,
     mask: bool,
+}
+struct CanvasSelection {
+    document: String,
+    revision: u64,
+    bounds: Option<[i32; 4]>,
+    polygon: Option<Vec<[f32; 2]>>,
+}
+struct ConnectOutcome {
+    summary: String,
+    registrations: usize,
+    retry: bool,
+}
+type ConnectAction = Arc<dyn Fn(&Path, &Path) -> Result<ConnectOutcome, String> + Send + Sync>;
+struct RenameEdit {
+    document: String,
+    layer: String,
+    original: String,
+    text: String,
+    revision: u64,
+    focus: bool,
+}
+struct MergeReply {
+    document: String,
+    result: Result<Value, String>,
 }
 struct LayerDrag {
     gesture: String,
@@ -144,6 +171,7 @@ pub struct PeerBrush {
     logo: TextureHandle,
     texture: Option<TextureHandle>,
     canvas_pixels: Option<(u32, u32, Vec<u8>)>,
+    canvas_selection: Option<CanvasSelection>,
     animation: animation::Animation,
     preview_rx: mpsc::Receiver<Preview>,
     preview_tx: mpsc::Sender<Preview>,
@@ -171,8 +199,26 @@ pub struct PeerBrush {
     new_height: u32,
     show_connection: bool,
     connection_codex: bool,
-    rename: String,
-    show_rename: bool,
+    connect_action: ConnectAction,
+    connect_rx: mpsc::Receiver<Result<ConnectOutcome, String>>,
+    connect_tx: mpsc::Sender<Result<ConnectOutcome, String>>,
+    connecting: bool,
+    connect_ready: bool,
+    connect_retry: bool,
+    connect_feedback: String,
+    connect_button_rect: Option<Rect>,
+    connection_settings_rect: Option<Rect>,
+    merge_rx: mpsc::Receiver<MergeReply>,
+    merge_tx: mpsc::Sender<MergeReply>,
+    rename_edit: Option<RenameEdit>,
+    name_click: Option<(String, Pos2, f64)>,
+    layer_clipboard: bool,
+    opacity_rect: Option<Rect>,
+    blend_rect: Option<Rect>,
+    color_tab_rect: Option<Rect>,
+    mask_tab_rect: Option<Rect>,
+    effect_area_rect: Option<Rect>,
+    new_folder_rect: Option<Rect>,
     collapsed: HashSet<String>,
     mask_step: Option<String>,
     activity_text: String,
@@ -281,6 +327,8 @@ impl PeerBrush {
             .unwrap_or_default();
         let (preview_tx, preview_rx) = mpsc::channel();
         let (job_tx, job_rx) = mpsc::channel();
+        let (connect_tx, connect_rx) = mpsc::channel();
+        let (merge_tx, merge_rx) = mpsc::channel();
         Self {
             shared,
             connection,
@@ -313,6 +361,7 @@ impl PeerBrush {
             logo,
             texture: None,
             canvas_pixels: None,
+            canvas_selection: None,
             animation: animation::Animation::default(),
             preview_rx,
             preview_tx,
@@ -340,8 +389,32 @@ impl PeerBrush {
             new_height: 768,
             show_connection: false,
             connection_codex: true,
-            rename: String::new(),
-            show_rename: false,
+            connect_action: Arc::new(|executable, state_dir| {
+                crate::discovery::connect(executable, state_dir).map(|report| ConnectOutcome {
+                    summary: report.summary(),
+                    registrations: report.registered_count,
+                    retry: report.needs_retry(),
+                })
+            }),
+            connect_rx,
+            connect_tx,
+            connecting: false,
+            connect_ready: false,
+            connect_retry: false,
+            connect_feedback: String::new(),
+            connect_button_rect: None,
+            connection_settings_rect: None,
+            merge_rx,
+            merge_tx,
+            rename_edit: None,
+            name_click: None,
+            layer_clipboard: false,
+            opacity_rect: None,
+            blend_rect: None,
+            color_tab_rect: None,
+            mask_tab_rect: None,
+            effect_area_rect: None,
+            new_folder_rect: None,
             collapsed: HashSet::new(),
             mask_step: None,
             activity_text: String::new(),
@@ -376,6 +449,117 @@ impl PeerBrush {
             Err(e) => self.message = e,
         }
     }
+    fn selected_layer_ids(&self, doc: &Document) -> Vec<String> {
+        doc.layers
+            .iter()
+            .filter(|l| self.selection_layers.contains(&l.id))
+            .map(|l| l.id.clone())
+            .collect()
+    }
+    fn copy_request(
+        &self,
+        doc: &Document,
+        cut: bool,
+        merged: bool,
+    ) -> Option<crate::clipboard::Request> {
+        if self.layer_clipboard && (cut || !merged) {
+            let ids = self.selected_layer_ids(doc);
+            Some(if cut {
+                crate::clipboard::Request::CutLayers {
+                    shared: self.shared.clone(),
+                    doc: doc.clone(),
+                    ids,
+                }
+            } else {
+                crate::clipboard::Request::CopyLayers {
+                    doc: doc.clone(),
+                    ids,
+                }
+            })
+        } else if cut {
+            None
+        } else {
+            Some(crate::clipboard::Request::Copy {
+                doc: doc.clone(),
+                target: self.selected.clone(),
+                mask: self.mask,
+                merged,
+            })
+        }
+    }
+    fn create_folder(&mut self, doc: &Document) {
+        let ids = self.selected_layer_ids(doc);
+        self.edit(
+            vec![json!({"op":"group.create_selected","layers":ids,"name":"Folder"})],
+            "Group selected layers",
+        );
+        self.layer_clipboard = true;
+        self.collapsed.remove(&self.selected);
+    }
+    fn selection_points(&self, doc: &Document, rect: Rect, scale: f32) -> Vec<Pos2> {
+        let preview = self
+            .canvas_selection
+            .as_ref()
+            .filter(|p| p.document == doc.id && p.revision == doc.revision);
+        let (bounds, polygon) = preview
+            .map_or((doc.selection, doc.selection_polygon.as_ref()), |p| {
+                (p.bounds, p.polygon.as_ref())
+            });
+        let Some(bounds) = bounds else {
+            return vec![];
+        };
+        let corners;
+        let points = if let Some(polygon) = polygon {
+            polygon.as_slice()
+        } else {
+            corners = [
+                [bounds[0] as f32, bounds[1] as f32],
+                [bounds[2] as f32, bounds[1] as f32],
+                [bounds[2] as f32, bounds[3] as f32],
+                [bounds[0] as f32, bounds[3] as f32],
+            ];
+            &corners
+        };
+        points
+            .iter()
+            .map(|p| rect.min + Vec2::new(p[0] * scale, p[1] * scale))
+            .collect()
+    }
+    fn duplicate_layers(&mut self, doc: &Document) {
+        let ids = self.selected_layer_ids(doc);
+        let result = {
+            let mut e = self.shared.lock().unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.duplicate","layers":ids})],
+                Some(doc.revision),
+                None,
+                "Duplicate layers",
+            )
+            .map(|result| {
+                let created = result["created"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<HashSet<_>>();
+                crate::tree::roots(&e.doc, &created)
+            })
+        };
+        match result {
+            Ok(ids) => {
+                if let Some(id) = ids.first() {
+                    self.select_content(id);
+                }
+                self.selection_layers = ids.into_iter().collect();
+                self.layer_clipboard = true;
+                self.message = "Duplicated layers".into();
+                self.last_preview = None;
+            }
+            Err(e) => self.message = e,
+        }
+    }
     fn layer_cmd(&mut self, op: &str, extra: Value, label: &str) {
         if !self.selection_layers.contains(&self.selected) {
             self.selection_layers = [self.selected.clone()].into_iter().collect();
@@ -391,6 +575,7 @@ impl PeerBrush {
             "mask.remove",
             "mask.toggle",
             "fill",
+            "paint.fill",
         ]
         .contains(&op)
         {
@@ -464,6 +649,91 @@ impl PeerBrush {
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
+    }
+    fn connect_ai(&mut self, ctx: &egui::Context) {
+        if self.connecting {
+            return;
+        }
+        let executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                self.receive_connection(Err(format!("Could not locate PeerBrush: {error}")));
+                return;
+            }
+        };
+        let state_dir: PathBuf = self.connection.state_dir.clone();
+        let action = self.connect_action.clone();
+        let tx = self.connect_tx.clone();
+        let ctx = ctx.clone();
+        self.connecting = true;
+        self.connect_feedback = "Preparing MCP discovery and installed AI clients…".into();
+        self.message = self.connect_feedback.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("peerbrush-ai-connect".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    action(&executable, &state_dir)
+                }))
+                .unwrap_or_else(|_| Err("MCP setup could not complete. Try again.".into()));
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            })
+        {
+            self.receive_connection(Err(format!("Could not start MCP setup: {error}")));
+        }
+    }
+    fn receive_connection(&mut self, result: Result<ConnectOutcome, String>) {
+        self.connecting = false;
+        match result {
+            Ok(report) => {
+                self.connect_ready = report.registrations > 0;
+                self.connect_retry = report.retry;
+                self.connect_feedback = report.summary;
+            }
+            Err(error) => {
+                self.connect_ready = false;
+                self.connect_retry = true;
+                self.connect_feedback = error;
+            }
+        }
+        self.message = self
+            .connect_feedback
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Client presence belongs to the live MCP handshake, never to a setup result.
+    }
+    fn merge_layers(&mut self, ctx: &egui::Context, doc: &Document) {
+        if self.busy {
+            return;
+        }
+        let mut ids = doc
+            .layers
+            .iter()
+            .filter(|l| self.selection_layers.contains(&l.id))
+            .map(|l| l.id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            ids.push(self.selected.clone());
+        }
+        let document = doc.id.clone();
+        let revision = doc.revision;
+        let shared = self.shared.clone();
+        let tx = self.merge_tx.clone();
+        let ctx = ctx.clone();
+        self.busy = true;
+        self.message = "Merging layers…".into();
+        if let Err(error) = std::thread::Builder::new()
+            .name("peerbrush-merge".into())
+            .spawn(move || {
+                let result = crate::merge::edit(&shared, "human", &ids, Some(revision), None, None);
+                let _ = tx.send(MergeReply { document, result });
+                ctx.request_repaint();
+            })
+        {
+            self.busy = false;
+            self.message = format!("Could not start merging layers: {error}");
+        }
     }
     fn open(&mut self) {
         let dirty = {
@@ -666,6 +936,12 @@ impl PeerBrush {
                 && p.mask == (self.mask && self.isolate)
             {
                 if !p.bytes.is_empty() {
+                    self.canvas_selection = Some(CanvasSelection {
+                        document: p.doc_id.clone(),
+                        revision: p.revision,
+                        bounds: p.selection,
+                        polygon: p.selection_polygon.clone(),
+                    });
                     if !self
                         .animation
                         .fade_preview(self.canvas_pixels.as_ref(), &p, time)
@@ -728,11 +1004,11 @@ impl PeerBrush {
                     if !commands.is_empty() {
                         doc = crate::engine::Engine::preview_edits(doc, &commands)?;
                     }
-                    doc.preview(None, edge, layer.as_deref(), mask)
+                    let (w, h, bytes, _) = doc.preview(None, edge, layer.as_deref(), mask)?;
+                    Ok::<_, String>((w, h, bytes, doc.selection, doc.selection_polygon.clone()))
                 })();
-                let (w, h, bytes) = output
-                    .map(|(w, h, b, _)| (w, h, b))
-                    .unwrap_or((0, 0, vec![]));
+                let (w, h, bytes, selection, selection_polygon) =
+                    output.unwrap_or((0, 0, vec![], None, None));
                 let _ = tx.send(Preview {
                     live,
                     doc_id: id,
@@ -742,6 +1018,8 @@ impl PeerBrush {
                     w,
                     h,
                     bytes,
+                    selection,
+                    selection_polygon,
                 });
                 ctx.request_repaint();
             });
@@ -799,6 +1077,27 @@ impl PeerBrush {
         self.thumbs.get(&key).map(|(_, texture)| texture.clone())
     }
     fn layer_menu(&mut self, ui: &mut egui::Ui, doc: &Document, l: &crate::engine::Layer) {
+        if ui
+            .add_enabled(
+                !self.busy && !doc.read_only,
+                egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os = "macos") {
+                    "⌘ E"
+                } else {
+                    "Ctrl+E"
+                }),
+            )
+            .on_hover_text(
+                "Merge selected layers · A single layer merges down · A folder merges its contents",
+            )
+            .clicked()
+        {
+            if !self.selection_layers.contains(&l.id) {
+                self.select_content(&l.id);
+            }
+            self.merge_layers(ui.ctx(), doc);
+            ui.close_menu();
+        }
+        ui.separator();
         for (title, op, extra) in [
             ("Rename", "rename", json!({})),
             ("Duplicate", "layer.duplicate", json!({})),
@@ -820,8 +1119,7 @@ impl PeerBrush {
             {
                 self.selected = l.id.clone();
                 if op == "rename" {
-                    self.rename = l.name.clone();
-                    self.show_rename = true;
+                    self.begin_rename(doc, &l.id);
                 } else {
                     self.layer_cmd(op, extra, title);
                 }
@@ -867,77 +1165,134 @@ impl PeerBrush {
             ui.close_menu();
         }
     }
+    fn layer_footer(&mut self, ui: &mut egui::Ui, l: &crate::engine::Layer) {
+        let mut blend = l.blend.clone();
+        self.blend_hover = None;
+        let combo = egui::ComboBox::from_id_salt("blend")
+            .selected_text(format!("{}{}", blend[..1].to_uppercase(), &blend[1..]))
+            .width(ui.available_width() - 10.0)
+            .show_ui(ui, |ui| {
+                for name in [
+                    "normal", "multiply", "screen", "overlay", "darken", "lighten",
+                ] {
+                    let response = ui.selectable_value(&mut blend, name.into(), name);
+                    if response.hovered() {
+                        self.blend_hover = Some((l.id.clone(), name.into()));
+                    }
+                    if response.clicked() {
+                        self.blend_hover = None;
+                        self.layer_cmd("layer.update", json!({"blend":blend}), "Layer blend");
+                    }
+                }
+            });
+        self.blend_rect = Some(combo.response.rect);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Opacity").size(12.0).color(MUTED));
+            let mut percent = l.opacity * 100.0;
+            let width = (ui.available_width() - 3.0).max(60.0);
+            let response = controls::range(
+                ui,
+                ("opacity", &l.id),
+                &mut percent,
+                0.0..=100.0,
+                width,
+                "%",
+                0,
+                false,
+            );
+            self.opacity_rect = Some(response.rect);
+            if response.changed() {
+                self.layer_parameter(json!({"opacity":percent/100.0}), "Layer opacity", &response);
+            }
+        });
+    }
+    fn channel_tabs(&mut self, ui: &mut egui::Ui, has_mask: bool) {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        let accent = ui.visuals().selection.stroke.color;
+        let color = ui.add(
+            egui::Label::new(RichText::new("Color").color(if self.mask { MUTED } else { accent }))
+                .sense(egui::Sense::click()),
+        );
+        self.color_tab_rect = Some(color.rect);
+        if color.clicked() {
+            self.mask = false;
+            self.last_preview = None;
+        }
+        if !self.mask {
+            ui.painter().line_segment(
+                [color.rect.left_bottom(), color.rect.right_bottom()],
+                Stroke::new(1.0_f32, accent),
+            );
+        }
+        ui.label(RichText::new("/").color(MUTED));
+        let mask = ui.add_enabled(
+            has_mask,
+            egui::Label::new(RichText::new("Mask").color(if self.mask { accent } else { MUTED }))
+                .sense(egui::Sense::click()),
+        );
+        self.mask_tab_rect = Some(mask.rect);
+        if mask.clicked() {
+            self.mask = true;
+            self.last_preview = None;
+        }
+        if self.mask {
+            ui.painter().line_segment(
+                [mask.rect.left_bottom(), mask.rect.right_bottom()],
+                Stroke::new(1.0_f32, accent),
+            );
+        }
+        mask.on_hover_text(if has_mask {
+            "Mask effects"
+        } else {
+            "Add a mask to edit its effects"
+        });
+    }
     fn layers(&mut self, ui: &mut egui::Ui, doc: &Document) {
         ui.add_space(10.0);
         ui.horizontal(|ui|{ui.label(RichText::new("Layers").size(15.0).strong());ui.label(RichText::new(doc.layers.len().to_string()).size(11.0).color(MUTED));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
-                if icons::button(ui, Icon::Folder, "New group").clicked(){self.edit(vec![json!({"op":"layer.add","kind":"group","name":"Group"})],"New group");}
-                if icons::button(ui, Icon::FillLayer, "New color fill layer").clicked(){self.edit(vec![json!({"op":"layer.add","kind":"fill","name":"Color fill","color":self.color})],"New fill layer");}
+                let folder = icons::button(ui, Icon::Folder, "New folder · contains selected layers");
+                self.new_folder_rect = Some(folder.rect);
+                if folder.clicked() { self.create_folder(doc); }
                 if icons::button(ui, Icon::AddLayer, "New paint layer").clicked(){self.edit(vec![json!({"op":"layer.add","kind":"paint","name":format!("Paint {}",doc.layers.len()+1)})],"New paint layer");}
             });
         });
         ui.add_space(12.0);
         let selected = doc.layers.iter().find(|l| l.id == self.selected).cloned();
-        if let Some(l) = &selected {
-            let mut blend = l.blend.clone();
-            self.blend_hover = None;
-            egui::ComboBox::from_id_salt("blend")
-                .selected_text(format!("{}{}", blend[..1].to_uppercase(), &blend[1..]))
-                .width(ui.available_width() - 10.0)
-                .show_ui(ui, |ui| {
-                    for name in [
-                        "normal", "multiply", "screen", "overlay", "darken", "lighten",
-                    ] {
-                        let response = ui.selectable_value(&mut blend, name.into(), name);
-                        if response.hovered() {
-                            self.blend_hover = Some((l.id.clone(), name.into()));
-                        }
-                        if response.clicked() {
-                            self.blend_hover = None;
-                            self.layer_cmd("layer.update", json!({"blend":blend}), "Layer blend");
-                        }
-                    }
-                });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Opacity").size(12.0).color(MUTED));
-                let mut percent = l.opacity * 100.0;
-                let width = (ui.available_width() - 3.0).max(60.0);
-                let response = controls::range(
-                    ui,
-                    ("opacity", &l.id),
-                    &mut percent,
-                    0.0..=100.0,
-                    width,
-                    "%",
-                    0,
-                    false,
-                );
-                if response.changed() {
-                    self.layer_parameter(
-                        json!({"opacity":percent/100.0}),
-                        "Layer opacity",
-                        &response,
-                    );
-                }
-            });
-        }
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
         self.layer_list(ui, doc);
         ui.add_space(10.0);
         self.effect_add_rect = None;
+        self.opacity_rect = None;
+        self.blend_rect = None;
+        self.color_tab_rect = None;
+        self.mask_tab_rect = None;
+        self.effect_area_rect = None;
         if let Some(l) = selected {
+            let remaining = ui.available_rect_before_wrap();
+            let stack_rect = Rect::from_min_max(
+                remaining.min,
+                egui::pos2(
+                    remaining.right(),
+                    (remaining.bottom() - 78.0).max(remaining.top() + 54.0),
+                ),
+            );
+            self.effect_area_rect = Some(stack_rect);
+            let mut stack_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("selected effects")
+                    .max_rect(stack_rect),
+            );
+            stack_ui.set_clip_rect(stack_rect);
             egui::Frame::new()
                 .fill(Color32::TRANSPARENT)
                 .inner_margin(4)
-                .show(ui, |ui| {
+                .show(&mut stack_ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.mask, false, "Color");
-                        if l.mask.is_some() {
-                            ui.selectable_value(&mut self.mask, true, "Mask");
-                        }
+                        self.channel_tabs(ui, l.mask.is_some());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .selectable_label(self.isolate, "Solo")
@@ -967,7 +1322,7 @@ impl PeerBrush {
                         });}
                     } else if let Some(m) = &l.mask {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("MASK STACK").size(10.0).color(MUTED));
+                            ui.label(RichText::new("MASK STACK").size(10.0).color(MUTED)).on_hover_text("Bottom runs first · Top runs last");
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -999,7 +1354,7 @@ impl PeerBrush {
                             .id_salt("mask effects")
                             .max_height((ui.available_height() - 8.0).max(24.0))
                             .show(ui, |ui| {
-                                for (index, step) in m.steps.iter().enumerate() {
+                                for (index, step) in m.steps.iter().enumerate().rev() {
                                     let preview=self.thumbnail_for(doc,&l.id,true,Some(index));
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x=5.0;
@@ -1057,7 +1412,7 @@ impl PeerBrush {
                                                     );
                                                     self.mask_step = None;
                                                 }
-                                                if index > 0
+                                                if index + 1 < m.steps.len()
                                                     && icons::small_button(
                                                         ui,
                                                         Icon::Up,
@@ -1068,9 +1423,12 @@ impl PeerBrush {
                                                 {
                                                     self.layer_cmd(
                                                         "mask.step.reorder",
-                                                        json!({"step":step.id,"index":index-1}),
+                                                        json!({"step":step.id,"index":index+1}),
                                                         "Reorder mask step",
                                                     );
+                                                }
+                                                if index > 0 && icons::small_button(ui, Icon::Down, "Move mask effect down").clicked() {
+                                                    self.layer_cmd("mask.step.reorder", json!({"step":step.id,"index":index-1}), "Reorder mask step");
                                                 }
                                             },
                                         );
@@ -1103,6 +1461,10 @@ impl PeerBrush {
                         });
                     }
                 });
+            ui.advance_cursor_after_rect(stack_rect);
+            ui.add_space(5.0);
+            ui.separator();
+            self.layer_footer(ui, &l);
         }
     }
     fn gizmo(
@@ -1154,11 +1516,7 @@ impl PeerBrush {
             self.gizmo_bounds = Some((key, doc.revision, b));
         }
         let b = self.gizmo_bounds.as_ref().unwrap().2;
-        let b = if targets.len() == 1 {
-            doc.selection.unwrap_or(b)
-        } else {
-            b
-        };
+        let b = doc.selection.unwrap_or(b);
         let pivot = [(b[0] + b[2]) as f32 / 2.0, (b[1] + b[3]) as f32 / 2.0];
         let screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
         let center = screen(pivot);
@@ -1262,8 +1620,8 @@ impl PeerBrush {
         if self.gizmo_handle != 0 {
             for target in &targets {
                 self.transient.push(if self.tool==Tool::Move {
-                    json!({"op":"move","layer":target.id,"dx":dx.round(),"dy":dy.round(),"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":targets.len()==1})
-                } else {json!({"op":"transform","layer":target.id,"angle":angle,"scale_x":sx,"scale_y":sy,"pivot":pivot,"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":targets.len()==1})});
+                    json!({"op":"move","layer":target.id,"dx":dx.round(),"dy":dy.round(),"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":doc.selection.is_some()})
+                } else {json!({"op":"transform","layer":target.id,"angle":angle,"scale_x":sx,"scale_y":sy,"pivot":pivot,"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":doc.selection.is_some()})});
             }
         }
         let painter = ui.painter().with_clip_rect(available);
@@ -1368,6 +1726,11 @@ impl PeerBrush {
         }
         let available = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(available, egui::Sense::click_and_drag());
+        if response.hovered()
+            && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
+        {
+            self.layer_clipboard = false;
+        }
         let fit = ((available.width() - 60.0) / doc.width as f32)
             .min((available.height() - 60.0) / doc.height as f32)
             .max(0.01);
@@ -1457,13 +1820,7 @@ impl PeerBrush {
             self.drag_start = None;
             return;
         }
-        if let Some(selection) = doc.selection {
-            let r = Rect::from_min_max(
-                to_screen([selection[0] as f32, selection[1] as f32]),
-                to_screen([selection[2] as f32, selection[3] as f32]),
-            );
-            selection::outline(ui, &painter, r);
-        }
+        selection::polygon(ui, &painter, &self.selection_points(doc, rect, scale));
         self.ai_canvas(ui, &painter, doc, rect, scale);
         for lease in &self.shared.lock().unwrap().leases {
             for scope in &lease.scopes {
@@ -1661,7 +2018,7 @@ impl PeerBrush {
                             self.paint_command(vec![p],c,"Brush dot");
                         }
                         Tool::Fill => {
-                            self.layer_cmd("fill", json!({"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}), "Fill layer")
+                            self.layer_cmd("paint.fill", json!({"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}), "Fill layer")
                         }
                         Tool::SmartMask => {
                             self.layer_cmd("mask.from_color",json!({"point":[p[0] as i32,p[1] as i32],"tolerance":self.mask_tolerance/100.0,"contiguous":self.mask_contiguous,"mode":self.smart_mask_mode}),"Smart mask");
@@ -1717,9 +2074,46 @@ impl PeerBrush {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(path)));
             }
         }
+        while let Ok(result) = self.connect_rx.try_recv() {
+            self.receive_connection(result);
+        }
+        while let Ok(reply) = self.merge_rx.try_recv() {
+            self.busy = false;
+            match reply.result {
+                Ok(result) => {
+                    let created = result["created"]
+                        .as_array()
+                        .and_then(|ids| ids.first())
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let Some(id) = created {
+                        let still_present = {
+                            let e = self.shared.lock().unwrap();
+                            e.doc.id == reply.document && e.doc.layers.iter().any(|l| l.id == id)
+                        };
+                        if still_present {
+                            self.select_content(&id);
+                        }
+                    }
+                    self.message = "Merged layers".into();
+                    self.last_preview = None;
+                }
+                Err(error) => {
+                    self.message = error;
+                }
+            }
+        }
+        if self.connecting {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         while let Ok(reply) = self.clipboard.replies.try_recv() {
-            if let Some(id) = reply.selected {
+            if !reply.selected_layers.is_empty() {
+                self.select_content(&reply.selected_layers[0]);
+                self.selection_layers = reply.selected_layers.into_iter().collect();
+                self.layer_clipboard = true;
+            } else if let Some(id) = reply.selected {
                 self.select_content(&id);
+                self.layer_clipboard = false;
             }
             self.message = reply.result.unwrap_or_else(|e| e);
             self.last_preview = None;
@@ -1746,6 +2140,11 @@ impl PeerBrush {
             e.expire();
             (e.doc.clone(), e.ai_change.clone())
         };
+        if self.rename_edit.as_ref().is_some_and(|edit| {
+            edit.document != doc.id || !doc.layers.iter().any(|l| l.id == edit.layer)
+        }) {
+            self.rename_edit = None;
+        }
         let time = ctx.input(|i| i.time);
         if self.animation.observe(&doc, ai_change, time) {
             // Reveal the destination so an AI hierarchy move remains visible.
@@ -1845,30 +2244,38 @@ impl PeerBrush {
                 Color32::WHITE,
             );
         }
-        let typing = ctx
-            .memory(|m| m.focused())
-            .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
+        let typing = self.rename_edit.is_some()
+            || ctx
+                .memory(|m| m.focused())
+                .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
         if !typing {
-            let (copy, paste, merged) = ctx.input(|i| {
+            let (copy, cut, paste, merged) = ctx.input(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy))
                         || (i.modifiers.command && i.key_pressed(egui::Key::C)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Cut))
+                        || (i.modifiers.command && i.key_pressed(egui::Key::X)),
                     i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
                         || (i.modifiers.command && i.key_pressed(egui::Key::V)),
                     i.modifiers.shift,
                 )
             });
-            if copy {
-                self.message = self
-                    .clipboard
-                    .request(crate::clipboard::Request::Copy {
-                        doc: doc.clone(),
-                        target: self.selected.clone(),
-                        mask: self.mask,
-                        merged,
-                    })
-                    .map(|_| "Copying selection…".into())
-                    .unwrap_or_else(|e| e);
+            if copy || cut {
+                if let Some(request) = self.copy_request(&doc, cut, merged) {
+                    self.message = self
+                        .clipboard
+                        .request(request)
+                        .map(|_| {
+                            if cut {
+                                "Cutting layers…".into()
+                            } else if self.layer_clipboard && !merged {
+                                "Copying layers…".into()
+                            } else {
+                                "Copying selection…".into()
+                            }
+                        })
+                        .unwrap_or_else(|e| e);
+                }
             }
             if paste {
                 self.message = self
@@ -1882,9 +2289,9 @@ impl PeerBrush {
                     .unwrap_or_else(|e| e);
             }
             ctx.input(|i| {
-                if i.modifiers.alt && !i.modifiers.command && i.key_pressed(egui::Key::B) {
+                if i.modifiers.alt && !i.modifiers.command && (i.key_pressed(egui::Key::B) || i.key_pressed(egui::Key::Backspace)) {
                     let color=if self.mask {[self.mask_value,self.mask_value,self.mask_value,255]}else{self.color};
-                    self.layer_cmd("fill",json!({"color":color,"mask":self.mask,"step":self.mask_step}),"Fill foreground");
+                    self.layer_cmd("paint.fill",json!({"color":color,"mask":self.mask,"step":self.mask_step}),"Fill foreground");
                 }
                 if i.modifiers.command && i.key_pressed(egui::Key::Z) {
                     let r = if i.modifiers.shift {
@@ -1902,6 +2309,12 @@ impl PeerBrush {
                 }
                 if i.modifiers.command && i.key_pressed(egui::Key::O) {
                     self.open();
+                }
+                if i.modifiers.command && i.key_pressed(egui::Key::E) {
+                    self.merge_layers(ctx, &doc);
+                }
+                if i.modifiers.command && i.key_pressed(egui::Key::D) && self.layer_clipboard {
+                    self.duplicate_layers(&doc);
                 }
                 for (key, tool) in [
                     (egui::Key::B, Tool::Brush),
@@ -1997,14 +2410,28 @@ impl PeerBrush {
                     .on_hover_text("You and your AI. Same canvas.");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        if ui
-                            .add(
-                                egui::Button::new("Connect AI").fill(Color32::from_rgb(74, 48, 71)),
-                            )
-                            .clicked()
-                        {
-                            self.show_connection = true;
+                        let settings = icons::small_button(ui, Icon::Adjust, "AI connection settings");
+                        self.connection_settings_rect = Some(settings.rect);
+                        if settings.clicked() { self.show_connection = true; }
+                        let title = if self.connecting {
+                            "Connecting…"
+                        } else if self.connect_retry {
+                            "Retry AI"
+                        } else if self.connect_ready {
+                            "MCP ready"
+                        } else {
+                            "Connect AI"
+                        };
+                        let button = ui.add_enabled(!self.connecting, egui::Button::new(title).min_size(Vec2::new(110.0, 28.0)).fill(Color32::from_rgb(74, 48, 71)));
+                        self.connect_button_rect = Some(button.rect);
+                        if button.clicked() { self.connect_ai(ui.ctx()); }
+                        if self.connecting {
+                            let spinner = Rect::from_center_size(button.rect.left_center() + Vec2::new(11.0, 0.0), Vec2::splat(10.0));
+                            egui::Spinner::new().size(10.0).color(ACCENT).paint_at(ui, spinner);
                         }
+                        button.on_hover_text(if self.connect_feedback.is_empty() {
+                            "Advertise PeerBrush and set up installed AI clients. An agent turns the MCP indicator green when it connects."
+                        } else { &self.connect_feedback });
                         let color = if connected {
                             Color32::from_rgb(166, 215, 157)
                         } else {
@@ -2018,7 +2445,7 @@ impl PeerBrush {
                             })
                             .size(11.0)
                             .color(color),
-                        ).on_hover_text("MCP starts automatically. Connect an AI client to turn this indicator green.");
+                        ).on_hover_text("The server is listening. Connect AI sets up discovery and installed clients; this indicator turns green after an actual agent handshake.");
                         let (_, r) = ui.allocate_space(Vec2::new(6.0, 6.0));
                         ui.painter().circle_filled(r.center(), 2.5, color);
                     });
@@ -2406,9 +2833,10 @@ impl PeerBrush {
         }
         if self.show_connection {
             let mut open = true;
-            egui::Window::new("Connect AI").open(&mut open).default_width(550.0).show(ctx, |ui| {
+            egui::Window::new("AI connection settings").open(&mut open).default_width(550.0).show(ctx, |ui| {
                 ui.label(RichText::new("MCP is ready").color(Color32::from_rgb(166, 215, 157)).strong());
-                ui.label("The server starts with PeerBrush. The top indicator turns green when an agent connects.");
+                ui.label("Connect AI handles discovery and installed clients. Manual configuration is available here for other clients.");
+                if !self.connect_feedback.is_empty() { ui.label(&self.connect_feedback); }
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.connection_codex, true, "Codex");
                     ui.selectable_value(&mut self.connection_codex, false, "Other clients");
@@ -2437,22 +2865,6 @@ impl PeerBrush {
                 }
             });
             self.show_connection = open;
-        }
-        if self.show_rename {
-            let mut open = true;
-            egui::Window::new("Rename layer")
-                .open(&mut open)
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    ui.text_edit_singleline(&mut self.rename);
-                    if ui.button("Rename").clicked() {
-                        self.layer_cmd("layer.update", json!({"name":self.rename}), "Rename layer");
-                        self.show_rename = false;
-                    }
-                });
-            if !open {
-                self.show_rename = false;
-            }
         }
         if self.pending || self.busy || !self.points.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -3039,6 +3451,10 @@ mod tests {
             cmd,
         );
         assert_eq!(app.selection_layers.len(), 2);
+        assert!(
+            app.rename_edit.is_none(),
+            "Rapid Ctrl-click on another row must not start rename"
+        );
         app.shared.lock().unwrap().undo.clear();
         app.layer_cmd("layer.update", json!({"opacity":0.7}), "Opacity");
         assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
@@ -3594,6 +4010,8 @@ mod tests {
                 live,
                 doc_id: doc.id.clone(),
                 revision: doc.revision,
+                selection: doc.selection,
+                selection_polygon: doc.selection_polygon.clone(),
                 target: variant,
                 mask: false,
                 w: 1,
@@ -3603,5 +4021,664 @@ mod tests {
             .unwrap();
         app.request_preview(&ctx, &doc);
         assert!(app.texture.is_some());
+    }
+    #[test]
+    fn connect_ai_click_starts_async_setup_without_a_modal_or_fake_client_presence() {
+        let (mut app, ctx) = fixture();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        app.connect_action = Arc::new(move |exe, state| {
+            started_tx
+                .send((exe.to_path_buf(), state.to_path_buf()))
+                .unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            Ok(ConnectOutcome {
+                summary: "Ready in Codex. Reload its MCP tools.".into(),
+                registrations: 1,
+                retry: false,
+            })
+        });
+        frame(&mut app, &ctx, vec![], Default::default());
+        let button = app.connect_button_rect.unwrap().center();
+        click(&mut app, &ctx, button);
+        let (executable, state) = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(executable, std::env::current_exe().unwrap());
+        assert_eq!(state, app.connection.state_dir);
+        assert!(app.connecting);
+        assert!(!app.show_connection);
+        assert!(!app.busy);
+        // The worker is intentionally blocked: manual canvas shortcuts still run.
+        key(&mut app, &ctx, egui::Key::Q);
+        assert!(app.tool == Tool::None);
+        app.connect_ai(&ctx);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "Repeated clicks must not start duplicate setup jobs"
+        );
+        assert!(app.shared.lock().unwrap().mcp_clients.is_empty());
+        release_tx.send(()).unwrap();
+        let result = app.connect_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.connect_tx.send(result).unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(!app.connecting);
+        assert!(app.connect_ready);
+        assert!(!app.connect_retry);
+        assert!(!app.show_connection);
+        assert_eq!(app.message, "Ready in Codex. Reload its MCP tools.");
+        assert!(app.shared.lock().unwrap().mcp_clients.is_empty());
+    }
+    #[test]
+    fn secondary_connection_settings_opens_manual_configuration_without_starting_setup() {
+        let (mut app, ctx) = fixture();
+        app.connect_action = Arc::new(|_, _| panic!("Settings must not register any client"));
+        frame(&mut app, &ctx, vec![], Default::default());
+        let settings = app.connection_settings_rect.unwrap().center();
+        click(&mut app, &ctx, settings);
+        assert!(app.show_connection);
+        assert!(!app.connecting);
+        assert!(app.connect_feedback.is_empty());
+    }
+    #[test]
+    fn failed_or_partial_setup_exposes_retry_and_never_claims_an_agent_connected() {
+        let (mut app, ctx) = fixture();
+        app.connect_tx
+            .send(Err(
+                "Claude configuration is locked. Close it and retry.".into()
+            ))
+            .unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.connect_retry);
+        assert!(!app.connect_ready);
+        assert!(app.message.contains("configuration is locked"));
+        app.connect_tx
+            .send(Ok(ConnectOutcome {
+                summary: "Codex ready; another client requires approval.".into(),
+                registrations: 1,
+                retry: true,
+            }))
+            .unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.connect_ready && app.connect_retry);
+        assert!(app.shared.lock().unwrap().mcp_clients.is_empty());
+        assert!(!app.show_connection);
+    }
+    #[test]
+    fn command_e_merges_selected_layers_selects_result_and_keeps_one_undo_entry() {
+        let (mut app, ctx) = fixture();
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new(32, 32).unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.add","kind":"paint","name":"Top"})],
+                None,
+                None,
+                "Add",
+            )
+            .unwrap();
+            e.doc.layers[0].pixels.set(4, 4, [233, 84, 32, 255]);
+            e.doc.layers[1].pixels.set(8, 8, [24, 120, 222, 255]);
+            e.undo.clear();
+        }
+        let ids = app
+            .shared
+            .lock()
+            .unwrap()
+            .doc
+            .layers
+            .iter()
+            .map(|l| l.id.clone())
+            .collect::<Vec<_>>();
+        app.selected = ids[0].clone();
+        app.selection_layers = ids.iter().cloned().collect();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let command = egui::Modifiers {
+            command: true,
+            ctrl: cfg!(not(target_os = "macos")),
+            mac_cmd: cfg!(target_os = "macos"),
+            ..Default::default()
+        };
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: command,
+            }],
+            command,
+        );
+        let reply = app.merge_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(reply.result.is_ok());
+        app.merge_tx.send(reply).unwrap();
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: command,
+            }],
+            command,
+        );
+        assert!(!app.busy);
+        assert_eq!(app.selection_layers.len(), 1);
+        let mut e = app.shared.lock().unwrap();
+        assert_eq!(e.doc.layers.len(), 1);
+        assert_eq!(app.selected, e.doc.layers[0].id);
+        assert!(!ids.contains(&app.selected));
+        assert_eq!(e.undo.len(), 1);
+        e.undo("human").unwrap();
+        assert_eq!(
+            e.doc
+                .layers
+                .iter()
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+    #[test]
+    fn mask_stack_displays_last_operation_on_top_without_changing_execution_order() {
+        let (mut app, ctx) = fixture();
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new(32, 32).unwrap();
+            e.doc.layers[0].kind = "fill".into();
+            let layer = e.doc.layers[0].id.clone();
+            e.edit(
+                "human",
+                &[
+                    json!({"op":"mask.add","layer":layer,"value":128}),
+                    json!({"op":"mask.step.add","layer":layer,"kind":"invert"}),
+                    json!({"op":"mask.step.add","layer":layer,"kind":"levels","value":2.0}),
+                ],
+                None,
+                None,
+                "Mask stack",
+            )
+            .unwrap();
+            app.selected = layer.clone();
+            app.selection_layers = [layer].into_iter().collect();
+        }
+        app.mask = true;
+        let source = app.shared.lock().unwrap().doc.clone();
+        let expected = source.preview(None, 32, None, false).unwrap().2;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 1200.0))),
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+        let mut labels = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if ["Fill", "Paint", "Invert", "Levels"]
+                        .contains(&text.galley.job.text.as_str()) =>
+                {
+                    Some((text.pos.y, text.galley.job.text.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        labels.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(
+            labels.into_iter().map(|(_, name)| name).collect::<Vec<_>>(),
+            ["Levels", "Invert", "Paint", "Fill"]
+        );
+        let e = app.shared.lock().unwrap();
+        assert_eq!(
+            e.doc.layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .steps
+                .iter()
+                .map(|s| s.id.clone())
+                .collect::<Vec<_>>(),
+            source.layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .steps
+                .iter()
+                .map(|s| s.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(e.doc.preview(None, 32, None, false).unwrap().2, expected);
+        // Invert then gamma 2 gives 63; reversing execution would give 191.
+        assert_eq!(expected[3], 63);
+        assert_eq!(e.undo.len(), 1);
+    }
+    fn small_fixture() -> (PeerBrush, egui::Context) {
+        let (mut app, ctx) = fixture();
+        let doc = Document::new(32, 32).unwrap();
+        let id = doc.layers[0].id.clone();
+        app.shared.lock().unwrap().doc = doc;
+        app.select_content(&id);
+        (app, ctx)
+    }
+    fn modified_key(
+        app: &mut PeerBrush,
+        ctx: &egui::Context,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        for pressed in [true, false] {
+            frame(
+                app,
+                ctx,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                }],
+                modifiers,
+            );
+        }
+    }
+    #[test]
+    fn layer_clipboard_intent_tracks_rows_and_canvas_without_touching_os_clipboard() {
+        let (mut app, ctx) = small_fixture();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let id = app.selected.clone();
+        let row = app.layer_rects[&id];
+        click(&mut app, &ctx, row.right_center() - Vec2::new(30.0, 0.0));
+        let doc = app.shared.lock().unwrap().doc.clone();
+        assert!(app.layer_clipboard);
+        assert!(
+            matches!(app.copy_request(&doc, false, false), Some(crate::clipboard::Request::CopyLayers { ids, .. }) if ids == vec![id.clone()])
+        );
+        assert!(
+            matches!(app.copy_request(&doc, true, false), Some(crate::clipboard::Request::CutLayers { doc: copied, ids, .. }) if copied.id == doc.id && copied.revision == doc.revision && ids == vec![id.clone()])
+        );
+        assert!(matches!(
+            app.copy_request(&doc, false, true),
+            Some(crate::clipboard::Request::Copy { merged: true, .. })
+        ));
+        app.tool = Tool::None;
+        let canvas = app.view_rect.unwrap().center();
+        click(&mut app, &ctx, canvas);
+        assert!(!app.layer_clipboard);
+        assert!(matches!(
+            app.copy_request(&doc, false, false),
+            Some(crate::clipboard::Request::Copy { merged: false, .. })
+        ));
+        assert!(app.copy_request(&doc, true, false).is_none());
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+    }
+    #[test]
+    fn command_d_duplicates_all_selected_roots_in_one_undo_and_selects_copies() {
+        let (mut app, ctx) = small_fixture();
+        let original = {
+            let mut e = app.shared.lock().unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.add","kind":"paint","name":"Second"})],
+                None,
+                None,
+                "Setup",
+            )
+            .unwrap();
+            e.undo.clear();
+            e.doc
+                .layers
+                .iter()
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>()
+        };
+        app.selected = original[0].clone();
+        app.selection_layers = original.iter().cloned().collect();
+        app.layer_clipboard = true;
+        modified_key(
+            &mut app,
+            &ctx,
+            egui::Key::D,
+            egui::Modifiers {
+                command: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        let mut e = app.shared.lock().unwrap();
+        assert_eq!(e.doc.layers.len(), 4);
+        assert_eq!(app.selection_layers.len(), 2);
+        assert!(app.selection_layers.iter().all(|id| !original.contains(id)));
+        assert!(app.selection_layers.contains(&app.selected));
+        assert_eq!(e.undo.len(), 1);
+        e.undo("human").unwrap();
+        assert_eq!(
+            e.doc
+                .layers
+                .iter()
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>(),
+            original
+        );
+    }
+    #[test]
+    fn inline_rename_double_click_uses_text_focus_and_commits_one_edit() {
+        let (mut app, ctx) = small_fixture();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![], Default::default());
+        }
+        let layer = app.selected.clone();
+        let row = app.layer_rects[&layer];
+        let name = row.right_center() - Vec2::new(30.0, 0.0);
+        click(&mut app, &ctx, name);
+        click(&mut app, &ctx, name);
+        assert!(
+            app.rename_edit.is_some(),
+            "Double-click must open the inline editor"
+        );
+        frame(&mut app, &ctx, vec![], Default::default());
+        let edit = app.rename_edit.as_ref().unwrap();
+        let text_id = egui::Id::new(("layer rename", &edit.document, &edit.layer));
+        assert_eq!(ctx.memory(|m| m.focused()), Some(text_id));
+        assert!(egui::TextEdit::load_state(&ctx, text_id).is_some());
+        let tool = app.tool;
+        let colors = (app.color, app.background);
+        for key in [egui::Key::W, egui::Key::E, egui::Key::R, egui::Key::X] {
+            self::key(&mut app, &ctx, key);
+        }
+        assert!(app.tool == tool);
+        assert_eq!((app.color, app.background), colors);
+        for key in [egui::Key::D, egui::Key::C, egui::Key::X, egui::Key::V] {
+            modified_key(
+                &mut app,
+                &ctx,
+                key,
+                egui::Modifiers {
+                    command: true,
+                    ctrl: true,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        app.rename_edit.as_mut().unwrap().text = "Renamed artwork".into();
+        key(&mut app, &ctx, egui::Key::Enter);
+        assert!(app.rename_edit.is_none());
+        let e = app.shared.lock().unwrap();
+        assert_eq!(e.doc.layers[0].name, "Renamed artwork");
+        assert_eq!(e.undo.len(), 1);
+    }
+    #[test]
+    fn inline_folder_rename_escape_cancels_and_focus_loss_commits_once() {
+        let (mut app, ctx) = small_fixture();
+        let folder = {
+            let mut e = app.shared.lock().unwrap();
+            let result = e
+                .edit(
+                    "human",
+                    &[json!({"op":"group.create_selected","layers":[],"name":"Folder"})],
+                    None,
+                    None,
+                    "Setup",
+                )
+                .unwrap();
+            e.undo.clear();
+            result["created"][0].as_str().unwrap().to_string()
+        };
+        let doc = app.shared.lock().unwrap().doc.clone();
+        app.begin_rename(&doc, &folder);
+        frame(&mut app, &ctx, vec![], Default::default());
+        app.rename_edit.as_mut().unwrap().text = "Discard me".into();
+        key(&mut app, &ctx, egui::Key::Escape);
+        assert!(app.rename_edit.is_none());
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        app.begin_rename(&doc, &folder);
+        frame(&mut app, &ctx, vec![], Default::default());
+        app.rename_edit.as_mut().unwrap().text = "Assets".into();
+        let canvas = app.view_rect.unwrap().center();
+        app.tool = Tool::None;
+        click(&mut app, &ctx, canvas);
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.rename_edit.is_none());
+        let e = app.shared.lock().unwrap();
+        assert_eq!(
+            e.doc.layers.iter().find(|l| l.id == folder).unwrap().name,
+            "Assets"
+        );
+        assert_eq!(e.undo.len(), 1);
+    }
+    #[test]
+    fn footer_stays_below_effects_with_connected_color_mask_tabs() {
+        let (mut app, ctx) = small_fixture();
+        let id = app.selected.clone();
+        let mut commands = vec![json!({"op":"mask.add","layer":id})];
+        for _ in 0..12 {
+            commands.push(json!({"op":"effect.add","layer":id,"kind":"levels"}));
+            commands.push(json!({"op":"mask.step.add","layer":id,"kind":"levels"}));
+        }
+        app.shared
+            .lock()
+            .unwrap()
+            .edit("human", &commands, None, None, "Stack")
+            .unwrap();
+        for mask in [false, true] {
+            app.mask = mask;
+            for _ in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1100.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                );
+            }
+            let color = app.color_tab_rect.unwrap();
+            let mask = app.mask_tab_rect.unwrap();
+            assert!((color.center().y - mask.center().y).abs() < 1.0);
+            assert!((0.0..=20.0).contains(&(mask.left() - color.right())));
+            let effect = app.effect_area_rect.unwrap();
+            let blend = app.blend_rect.unwrap();
+            let opacity = app.opacity_rect.unwrap();
+            assert!(blend.top() >= effect.bottom());
+            assert!(opacity.top() >= blend.bottom());
+            assert!(
+                opacity.bottom() < 580.0,
+                "Footer must remain visible: {opacity:?}"
+            );
+            assert!(effect.contains_rect(app.effect_add_rect.unwrap()));
+        }
+    }
+    #[test]
+    fn alt_backspace_floods_only_selection_with_foreground_and_one_undo() {
+        let (mut app, ctx) = small_fixture();
+        app.color = [240, 34, 72, 255];
+        app.shared.lock().unwrap().doc.selection = Some([4, 5, 10, 11]);
+        modified_key(
+            &mut app,
+            &ctx,
+            egui::Key::Backspace,
+            egui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        );
+        let mut e = app.shared.lock().unwrap();
+        assert_eq!(e.doc.layers[0].pixels.get(4, 5), app.color);
+        assert_eq!(e.doc.layers[0].pixels.get(9, 10), app.color);
+        assert_eq!(e.doc.layers[0].pixels.get(3, 5), [0; 4]);
+        assert_eq!(e.doc.layers[0].pixels.get(10, 10), [0; 4]);
+        assert_eq!(e.doc.layers[0].kind, "paint");
+        assert_eq!(e.undo.len(), 1);
+        e.undo("human").unwrap();
+        assert_eq!(e.doc.layers[0].pixels.get(4, 5), [0; 4]);
+    }
+    #[test]
+    fn new_folder_button_contains_selected_layers_and_selects_folder() {
+        let (mut app, ctx) = small_fixture();
+        let ids = {
+            let mut e = app.shared.lock().unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.add","kind":"paint","name":"Second"})],
+                None,
+                None,
+                "Setup",
+            )
+            .unwrap();
+            e.undo.clear();
+            e.doc
+                .layers
+                .iter()
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>()
+        };
+        app.selection_layers = ids.iter().cloned().collect();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let folder = app.new_folder_rect.unwrap().center();
+        click(&mut app, &ctx, folder);
+        let e = app.shared.lock().unwrap();
+        assert_eq!(e.doc.layers.len(), 3);
+        assert_eq!(
+            e.doc
+                .layers
+                .iter()
+                .find(|l| l.id == app.selected)
+                .unwrap()
+                .kind,
+            "group"
+        );
+        assert_eq!(
+            app.selection_layers,
+            [app.selected.clone()].into_iter().collect()
+        );
+        assert!(ids.iter().all(|id| e
+            .doc
+            .layers
+            .iter()
+            .find(|l| l.id == *id)
+            .unwrap()
+            .parent
+            .as_deref()
+            == Some(&app.selected)));
+        assert_eq!(e.undo.len(), 1);
+    }
+    #[test]
+    fn selection_ants_follow_the_rendered_transform_polygon_and_reject_stale_geometry() {
+        let (mut app, _) = small_fixture();
+        let mut doc = app.shared.lock().unwrap().doc.clone();
+        doc.selection = Some([4, 4, 12, 12]);
+        doc.selection_polygon = Some(vec![[8.0, 4.0], [12.0, 8.0], [8.0, 12.0], [4.0, 8.0]]);
+        let rect = Rect::from_min_size(egui::pos2(20.0, 30.0), Vec2::splat(64.0));
+        let preview_polygon = vec![[12.0, 5.0], [16.0, 9.0], [12.0, 13.0], [8.0, 9.0]];
+        app.canvas_selection = Some(CanvasSelection {
+            document: doc.id.clone(),
+            revision: doc.revision,
+            bounds: Some([8, 5, 16, 13]),
+            polygon: Some(preview_polygon.clone()),
+        });
+        let points = app.selection_points(&doc, rect, 2.0);
+        assert_eq!(
+            points,
+            preview_polygon
+                .iter()
+                .map(|p| rect.min + Vec2::new(p[0] * 2.0, p[1] * 2.0))
+                .collect::<Vec<_>>()
+        );
+        doc.revision += 1;
+        let points = app.selection_points(&doc, rect, 2.0);
+        assert_eq!(
+            points,
+            doc.selection_polygon
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|p| rect.min + Vec2::new(p[0] * 2.0, p[1] * 2.0))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            points[0].y != points[1].y,
+            "Rotated edges cannot become the axis-aligned bounding rectangle"
+        );
+    }
+    #[test]
+    fn multiple_layer_gizmo_rotates_selected_pixels_around_selection_center() {
+        let (mut app, ctx) = small_fixture();
+        let ids = {
+            let mut e = app.shared.lock().unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.add","kind":"paint"})],
+                None,
+                None,
+                "Setup",
+            )
+            .unwrap();
+            e.doc.selection = Some([4, 5, 12, 13]);
+            e.undo.clear();
+            e.doc
+                .layers
+                .iter()
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>()
+        };
+        app.selection_layers = ids.iter().cloned().collect();
+        app.tool = Tool::Rotate;
+        frame(&mut app, &ctx, vec![], Default::default());
+        let rect = app.view_rect.unwrap();
+        let scale = rect.width() / 32.0;
+        let center = rect.min + Vec2::new(8.0 * scale, 9.0 * scale);
+        let start = center + Vec2::new(58.0, 0.0);
+        let end = center + Vec2::new(0.0, 58.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                button(
+                    start,
+                    egui::PointerButton::Primary,
+                    true,
+                    Default::default(),
+                ),
+            ],
+            Default::default(),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(end)],
+            Default::default(),
+        );
+        let transforms = app
+            .transient
+            .iter()
+            .filter(|c| c["op"] == "transform")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            transforms.len(),
+            2,
+            "The selection-centered rotation ring must be interactive"
+        );
+        for command in transforms {
+            assert_eq!(command["pivot"], json!([8.0, 9.0]));
+            assert_eq!(command["selection_only"], true);
+            assert!((command["angle"].as_f64().unwrap() - 90.0).abs() < 0.01);
+        }
+        assert!(
+            app.shared.lock().unwrap().undo.is_empty(),
+            "Live rotation preview must not commit history"
+        );
     }
 }

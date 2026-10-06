@@ -304,3 +304,92 @@ fn early_tip_regions_match_original_coverage_across_supported_extremes() {
         }
     }
 }
+
+#[test]
+fn rotated_selection_clips_paint_and_erase_without_changing_inside_stroke_bytes() {
+    let mut initial = Raster::new(128, 128);
+    for y in 0..128 {
+        for x in 0..128 {
+            initial.set(x, y, [x as u8, y as u8, 91, 173]);
+        }
+    }
+    let clip = [20, 20, 109, 105];
+    let polygon = [
+        [64.25, 21.825],
+        [104.55, 62.125],
+        [64.25, 102.425],
+        [23.95, 62.125],
+    ];
+    let rectangle = [[20., 20.], [109., 20.], [109., 105.], [20., 105.]];
+    let settings = Settings {
+        radius: 32.,
+        hardness: 0.4,
+        opacity: 0.75,
+        flow: 0.41,
+        angle: 35.,
+        roundness: 0.55,
+        ..Default::default()
+    };
+    let points = [[1., 32.], [127., 96.]];
+    for erase in [false, true] {
+        let mut unrestricted = initial.clone();
+        brush::paint(
+            &mut unrestricted,
+            &points,
+            settings,
+            [200, 50, 17, 213],
+            erase,
+            Some(clip),
+        )
+        .unwrap();
+        let mut rectangular = initial.clone();
+        brush::paint_with_selection(
+            &mut rectangular,
+            &points,
+            settings,
+            [200, 50, 17, 213],
+            erase,
+            Some(clip),
+            Some(&rectangle),
+        )
+        .unwrap();
+        assert_eq!(
+            rectangular.tiles, unrestricted.tiles,
+            "rectangular selection changed stroke appearance"
+        );
+        let mut rotated = initial.clone();
+        brush::paint_with_selection(
+            &mut rotated,
+            &points,
+            settings,
+            [200, 50, 17, 213],
+            erase,
+            Some(clip),
+            Some(&polygon),
+        )
+        .unwrap();
+        let mut changed = 0;
+        for y in 0..128 {
+            for x in 0..128 {
+                // Independent convex-diamond oracle; no tested membership helper used here.
+                let inside =
+                    ((x as f32 + 0.5) - 64.25).abs() + ((y as f32 + 0.5) - 62.125).abs() < 40.3;
+                let expected = if inside {
+                    unrestricted.get(x, y)
+                } else {
+                    initial.get(x, y)
+                };
+                assert_eq!(
+                    rotated.get(x, y),
+                    expected,
+                    "erase {erase}, pixel ({x},{y})"
+                );
+                changed += usize::from(expected != initial.get(x, y));
+            }
+        }
+        assert!(
+            changed > 0,
+            "test stroke did not touch the rotated selection"
+        );
+    }
+}

@@ -24,6 +24,14 @@ fn run() -> Result<(), String> {
     }
     match args.first().map(String::as_str) {
         Some("mcp") => return server::stdio(&state_dir),
+        Some("discover") => {
+            let manifest = peerbrush::discovery::discover()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?
+            );
+            return Ok(());
+        }
         Some("cli") => {
             let method = args.get(1).map(String::as_str).unwrap_or("observe");
             let params = if let Some(file) = args.get(2).filter(|s| s.starts_with('@')) {
@@ -60,7 +68,7 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("--help") => {
-            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [--headless]\npeerbrush mcp [--state-dir PATH]\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]");
+            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [--headless]\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]");
             return Ok(());
         }
         _ => {}

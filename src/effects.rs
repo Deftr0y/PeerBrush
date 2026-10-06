@@ -210,6 +210,10 @@ pub fn invalidate(doc: &mut Document, commands: &[Value]) {
             "layer.reorder",
             "layer.parent",
             "layer.delete",
+            "layer.merge",
+            "layer.duplicate",
+            "layer.paste",
+            "group.create_selected",
             "image.place",
         ]
         .contains(&c["op"].as_str().unwrap_or(""))

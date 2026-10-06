@@ -4,13 +4,14 @@ import argparse, os, pathlib, shutil, sys, tomllib, zipfile
 parser=argparse.ArgumentParser()
 parser.add_argument('--output',type=pathlib.Path)
 parser.add_argument('--registry',type=pathlib.Path)
+parser.add_argument('--binary',type=pathlib.Path,help='Native release binary to package; defaults to target/release')
 args=parser.parse_args()
 root=pathlib.Path(__file__).resolve().parents[1]
 output=(args.output or root/'dist').resolve();output.mkdir(parents=True,exist_ok=True)
 platform={'win32':'Windows','darwin':'macOS'}.get(sys.platform,'Linux')
 bundle=output/f'PeerBrush-{platform}';bundle.mkdir(exist_ok=True)
 exe='peerbrush.exe' if sys.platform=='win32' else 'peerbrush'
-shutil.copy2(root/'target'/'release'/exe,bundle/exe)
+shutil.copy2(args.binary or root/'target'/'release'/exe,bundle/exe)
 for name in ['LICENSE','README.md','FOLLOWUPS.MD']:shutil.copy2(root/name,bundle/name)
 shutil.copytree(root/'docs',bundle/'docs',dirs_exist_ok=True)
 shutil.copytree(root/'assets',bundle/'assets',dirs_exist_ok=True)

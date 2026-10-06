@@ -1,6 +1,6 @@
 [package]
 name = "peerbrush"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "You and your AI. Same canvas."
@@ -11,6 +11,7 @@ eframe = { version = "0.31", default-features = false, features = ["default_font
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 base64 = "0.22"

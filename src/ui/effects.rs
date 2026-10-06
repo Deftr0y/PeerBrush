@@ -127,26 +127,19 @@ pub(super) fn settings(
                 if let Some(index) = index {
                     let x = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
                     let y = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
-                    let low = if index == 0 {
+                    let selected_x = if index == 0 {
                         0.0
-                    } else {
-                        points[index - 1][0].as_f64().unwrap() as f32 + 0.01
-                    };
-                    let high = if index + 1 == points.len() {
+                    } else if index + 1 == points.len() {
                         1.0
                     } else {
-                        points[index + 1][0].as_f64().unwrap() as f32 - 0.01
+                        bounded_curve_x(
+                            x as f64,
+                            points[index - 1][0].as_f64().unwrap(),
+                            points[index + 1][0].as_f64().unwrap(),
+                            points[index][0].as_f64().unwrap(),
+                        )
                     };
-                    settings["points"][index] = json!([
-                        if index == 0 {
-                            0.0
-                        } else if index + 1 == points.len() {
-                            1.0
-                        } else {
-                            x.clamp(low, high)
-                        },
-                        y
-                    ]);
+                    settings["points"][index] = json!([selected_x, y]);
                     changed = Some(response.clone());
                 }
             }
@@ -158,6 +151,17 @@ pub(super) fn settings(
         response.on_hover_text("Drag a curve point to reshape the tones");
     }
     changed
+}
+// Imported curves can have arbitrarily close, strictly ordered points.
+fn bounded_curve_x(x: f64, previous: f64, next: f64, original: f64) -> f64 {
+    let margin = 0.01_f64.min((next - previous) * 0.25);
+    let low = previous + margin;
+    let high = next - margin;
+    if low > previous && high < next && low <= high {
+        x.clamp(low, high)
+    } else {
+        original
+    }
 }
 impl PeerBrush {
     pub(super) fn color_stack(&mut self, ui: &mut egui::Ui, l: &Layer) {
@@ -179,7 +183,7 @@ impl PeerBrush {
                 (ui.available_height() - if l.mask.is_none() { 38.0 } else { 8.0 }).max(24.0),
             )
             .show(ui, |ui| {
-                for (index, effect) in l.effects.iter().enumerate() {
+                for (index, effect) in l.effects.iter().enumerate().rev() {
                     ui.push_id(&effect.id, |ui| {
                         ui.horizontal(|ui| {
                             let mut enabled = effect.enabled;
@@ -204,12 +208,22 @@ impl PeerBrush {
                                         );
                                     }
                                     if index > 0
-                                        && icons::small_button(ui, Icon::Up, "Move effect up")
+                                        && icons::small_button(ui, Icon::Down, "Move effect down")
                                             .clicked()
                                     {
                                         self.layer_cmd(
                                             "effect.reorder",
                                             json!({"effect":effect.id,"index":index-1}),
+                                            "Reorder effects",
+                                        );
+                                    }
+                                    if index + 1 < l.effects.len()
+                                        && icons::small_button(ui, Icon::Up, "Move effect up")
+                                            .clicked()
+                                    {
+                                        self.layer_cmd(
+                                            "effect.reorder",
+                                            json!({"effect":effect.id,"index":index+1}),
                                             "Reorder effects",
                                         );
                                     }
@@ -245,6 +259,65 @@ pub(super) fn effect_name(kind: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn top_color_effect_is_last_without_reinterpreting_saved_sources() {
+        let ctx = egui::Context::default();
+        let mut e = crate::engine::Engine::new();
+        e.doc = Document::new(4, 4).unwrap();
+        e.doc.layers[0].kind = "fill".into();
+        e.doc.layers[0].color = [64, 64, 64, 255];
+        let id = e.doc.layers[0].id.clone();
+        e.edit(
+            "human",
+            &[
+                json!({"op":"effect.add","layer":id,"kind":"invert"}),
+                json!({"op":"effect.add","layer":id,"kind":"adjust","settings":{"brightness":0.2}}),
+            ],
+            None,
+            None,
+            "Effects",
+        )
+        .unwrap();
+        let source = serde_json::to_value(&e.doc.layers[0].effects).unwrap();
+        let layer = e.doc.layers[0].clone();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(e));
+        let connection = crate::server::Connection {
+            port: 0,
+            token: String::new(),
+            state_dir: std::path::PathBuf::new(),
+            instance_lock: None,
+        };
+        let mut app = PeerBrush::init(&ctx, shared.clone(), connection);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 600.))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, &layer));
+            },
+        );
+        let y = |label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == label => Some(t.pos.y),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(y("Color adjustment") < y("Invert"));
+        let e = shared.lock().unwrap();
+        assert_eq!(
+            serde_json::to_value(&e.doc.layers[0].effects).unwrap(),
+            source
+        );
+        assert_eq!(
+            &e.doc.preview(None, 4, None, false).unwrap().2[..4],
+            &[242, 242, 242, 255]
+        );
+    }
     #[test]
     fn dragging_a_curve_point_keeps_its_identity_near_another_point() {
         let ctx = egui::Context::default();
@@ -291,5 +364,17 @@ mod tests {
         drop(draw);
         assert_eq!(values["points"][2], json!([1.0, 1.0]));
         assert!(values["points"][1][0].as_f64().unwrap() > 0.9);
+    }
+    #[test]
+    fn tight_imported_curve_points_remain_strictly_ordered_when_dragged() {
+        for (previous, next, original) in [
+            (0.499, 0.501, 0.5),
+            (0.5, 0.5000000000000002, 0.5000000000000001),
+        ] {
+            for x in [0.0, 0.5, 1.0] {
+                let adjusted = bounded_curve_x(x, previous, next, original);
+                assert!(adjusted > previous && adjusted < next);
+            }
+        }
     }
 }

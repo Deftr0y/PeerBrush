@@ -13,7 +13,7 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/AI_interface-MCP-5aaaff.svg)](docs/mcp.md)
 
-[Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development](docs/development.md) · [Roadmap](FOLLOWUPS.MD)
+[Download Windows](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.2/PeerBrush-Windows.zip) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development](docs/development.md) · [Roadmap](FOLLOWUPS.MD)
 
 </div>
 
@@ -43,15 +43,15 @@ You stay in control while AI works directly alongside you inside the same editin
 ### Built for the way you work
 
 - **Visual, compact controls.** White tool glyphs, Ubuntu Sans, uncluttered range values and live canvas feedback.
-- **A useful hierarchy.** Distinct folders, multi-layer editing, drag into or out of folders, animated reorder previews, and visibility sweep gestures.
-- **Editable effects.** Each layer or folder has independent color and mask stacks. Return to an effect and change its settings after later edits.
+- **A useful hierarchy.** Distinct folders, multi-layer editing, drag into or out of folders, animated reorder previews, and visibility sweep gestures, inline renaming, grouping and merging.
+- **Editable effects.** Each layer or folder has independent color and mask stacks. The top effect runs last. Return to an effect and change its settings after later edits; blend and opacity sit beneath the stack.
 - **Familiar navigation.** Maya-style W/E/R gizmos, Q to hide, F to frame, middle drag to pan, wheel or Alt + right drag to zoom.
 - **A practical brush.** Hardness, flow, opacity, spacing, angle, roundness and smoothing; live size changes, Alt eyedropper, two colors and X to swap.
-- **Real clipboard support.** Copy a selection or composite and paste an editable layer; accept images copied in other applications.
+- **Real clipboard support.** Copy, cut, paste or duplicate whole layers and folders, including masks and effects; copy selected pixels or the composite; accept images copied in other applications.
 
 ## Run PeerBrush
 
-The Windows portable build runs directly from `peerbrush.exe`. **No Rust installation is needed to use it.** Open/import/drop an image, work in layers, save PSD, and export PNG.
+[Download the Windows x64 portable build](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.2/PeerBrush-Windows.zip), extract it, and run `PeerBrush-Windows/peerbrush.exe`. **No Rust installation is needed to use it.** Open/import/drop an image, work in layers, save PSD, and export PNG.
 
 To develop from source:
 
@@ -68,13 +68,9 @@ Windows, macOS and Linux builds are configured in CI. This checkpoint has been t
 
 ## Connect an AI agent
 
-MCP starts automatically with the editor. The top bar reports whether a client is attached. The adapter can register while the editor is closed, then reconnect when you open it.
+Click **Connect AI** to register PeerBrush with detected Codex, Claude Desktop, Cursor and Gemini CLI installations. Existing client settings are preserved and backed up. A local discovery manifest gives other agents the executable, workspace and authenticated HTTP endpoint. Restart or reload a configured client to load the tools; the top bar turns green when it actually connects.
 
-For Codex, register the executable you run:
-
-```powershell
-codex mcp add peerbrush -- "C:\path\to\PeerBrush\peerbrush.exe" mcp
-```
+The adapter can initialize while the editor is closed, then reconnect when you open it. Advanced settings and manual setup are available beside Connect AI. See [connection details](docs/mcp.md).
 
 Agents can observe a layer, mask, or cropped canvas region; edit through shared commands; place generated or edited pixels; and undo, inspect, refine, or redo an attempt. Model choice stays outside PeerBrush, so different compatible models and agents can plug into the same workflow.
 
@@ -118,11 +114,11 @@ The long-term goal is an MCP-native creative application where compatible AI age
 - Local and remote model support through connected agents
 - Extensible tool and plugin architecture
 
-The next slices include incremental/GPU rendering, broader selections and subject masking, liquify, text/vector source layers, stronger PSD fidelity, and selective task undo. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status.
+The next slices include incremental/GPU rendering, broader selection tools and subject masking, liquify, text/vector source layers, stronger PSD fidelity, and selective task undo. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status.
 
 ## Status
 
-🚧 **Early development — [v0.1.1 checkpoint](docs/checkpoint-0.1.1.md)**
+🚧 **Early development — [v0.1.2 checkpoint](docs/checkpoint-0.1.2.md)**
 
 PeerBrush is currently experimental and under active development. Features, APIs, and project structure are expected to change.
 

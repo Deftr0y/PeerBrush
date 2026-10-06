@@ -7,7 +7,8 @@
     "max_layers": 100,
     "raster_budget_mib": 512,
     "color_effect_budget_mib": 256,
-    "mask_effect_budget_mib": 128
+    "mask_effect_budget_mib": 128,
+    "selection_vertices": 64
   },
   "formats": {
     "work": "PSD v1, 8-bit RGB",
@@ -27,16 +28,6 @@
     },
     {
       "op": "layer.add",
-      "kind": "fill",
-      "color": [
-        233,
-        84,
-        32,
-        255
-      ]
-    },
-    {
-      "op": "layer.add",
       "kind": "group",
       "name": "Assets"
     },
@@ -53,8 +44,19 @@
       "layer": "ID"
     },
     {
+      "op": "layer.merge",
+      "layers": [
+        "UPPER_LAYER_ID",
+        "LOWER_LAYER_ID"
+      ],
+      "name": "Merged artwork"
+    },
+    {
       "op": "layer.duplicate",
-      "layer": "ID"
+      "layers": [
+        "LAYER_A",
+        "LAYER_B"
+      ]
     },
     {
       "op": "layer.reorder",
@@ -97,7 +99,7 @@
       "mask": false
     },
     {
-      "op": "fill",
+      "op": "paint.fill",
       "layer": "ID",
       "color": [
         30,
@@ -367,6 +369,46 @@
       "layer": "ID",
       "new_layer": false,
       "mode": "replace"
+    },
+    {
+      "op": "paint.fill",
+      "layer": "ID",
+      "color": [
+        233,
+        84,
+        32,
+        255
+      ],
+      "mask": false
+    },
+    {
+      "op": "group.create_selected",
+      "layers": [
+        "LAYER_A",
+        "LAYER_B"
+      ],
+      "name": "Details"
+    },
+    {
+      "op": "selection",
+      "polygon": [
+        [
+          20,
+          40
+        ],
+        [
+          40,
+          20
+        ],
+        [
+          60,
+          40
+        ],
+        [
+          40,
+          60
+        ]
+      ]
     }
   ],
   "not_yet": [
@@ -378,10 +420,20 @@
     "liquify",
     "subject/object segmentation",
     "heal/clone",
-    "nonrectangular selections",
+    "freehand/lasso selection tools",
     "tiled GPU compositor",
     "disk eviction",
     "selective task undo"
   ],
-  "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local PNG/JPEG path or base64 PNG. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable."
+  "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local PNG/JPEG path or base64 PNG. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",
+  "merge_layers": {
+    "command": "layer.merge",
+    "single_paint": "Merge down to the next sibling",
+    "single_folder": "Bake visible folder contents",
+    "multiple": "Merge contiguous selected siblings using normal blend, in their current order",
+    "undo": "One reversible batch; masks/effects are baked into raster pixels",
+    "blend": "Multiple selected roots must be contiguous normal-blend siblings. Flattening a single folder preserves its external blend. Unsupported backdrop-dependent merges are rejected."
+  },
+  "foreground_fill": "paint.fill blends foreground RGBA into the current selection, or the visible canvas when unselected. Expands a raster layer to cover that area while preserving surrounding pixels, masks and effects. mask:true fills the requested/latest paint mask step in grayscale. Layer and folder locks, reservations and undo apply. A folder color target creates one ordinary child paint layer. Legacy fill source layers remain readable for PSD compatibility.",
+  "selection_geometry": "selection.rect stays the axis-aligned bounding rectangle. After W/E/R selection transforms, document.selection_polygon retains the exact transformed shape. Brush, fill, shapes, gradients and copied image pixels clip to pixel centers inside this polygon. selection commands with rect reset the polygon; polygon points can also be supplied explicitly. Repeated layer transforms in one gesture use the same original selection."
 }

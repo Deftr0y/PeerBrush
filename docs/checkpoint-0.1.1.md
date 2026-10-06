@@ -30,4 +30,4 @@ Five full 1536-edge preview updates improved roughly 5–6%; CPU compositing sti
 
 ## Remaining scope
 
-Liquify, model-based subject/object segmentation, full group transforms, selective task undo, text/vector layers, broader PSD fidelity and full color management remain on the roadmap. Native macOS/Linux behavior awaits CI and platform testing. The next logo revision is awaiting the actual MayaMCP M reference; rejected candidates have not replaced the previously selected app mark.
+Liquify, model-based subject/object segmentation, full group transforms, selective task undo, text/vector layers, broader PSD fidelity and full color management remain on the roadmap. Native macOS/Linux behavior awaits CI and platform testing. The user has provisionally accepted an interlocking P based on MayaMCP's interlocking M mark; further logo refinement remains on the roadmap.

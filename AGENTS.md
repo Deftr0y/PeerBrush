@@ -11,3 +11,5 @@
 - Keep model choice outside the application; return actual image content and explicit document coordinates to clients.
 - Run engine/codec/protocol tests and visually verify the native workspace after behavior changes.
 - Do not commit generated QA artifacts, credentials, connection tokens, development tools, recovery files, or build outputs. Requested bundled app artwork, fonts and curated documentation screenshots are source assets and must accompany the application.
+
+- Layer controls use a connected Color/Mask selector, with blend and opacity beneath the effects. Top effects run last. Rename inline, without a dialog. Create regular layers and folders; new folders collect selected roots.

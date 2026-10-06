@@ -123,6 +123,19 @@ pub fn paint(
     erase: bool,
     clip: Option<[i32; 4]>,
 ) -> Result<(), String> {
+    paint_with_selection(raster, points, settings, color, erase, clip, None)
+}
+
+/// Polygon vertices are layer-local; only selected pixel centers receive coverage.
+pub fn paint_with_selection(
+    raster: &mut Raster,
+    points: &[[f32; 2]],
+    settings: Settings,
+    color: Pixel,
+    erase: bool,
+    clip: Option<[i32; 4]>,
+    polygon: Option<&[[f32; 2]]>,
+) -> Result<(), String> {
     if points.is_empty()
         || points.len() > 10000
         || points
@@ -220,6 +233,11 @@ pub fn paint(
                 for y in y0..y1 {
                     let row = ((y - tile_y) as u32 * TILE) as usize;
                     for x in x0..x1 {
+                        if polygon.is_some_and(|selection| {
+                            !crate::selection::contains(selection, x as f32 + 0.5, y as f32 + 0.5)
+                        }) {
+                            continue;
+                        }
                         let alpha = tip.coverage(x as f32 + 0.5 - p[0], y as f32 + 0.5 - p[1])
                             * settings.flow;
                         if alpha <= 0.0 {

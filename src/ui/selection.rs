@@ -1,14 +1,29 @@
 use super::*;
 pub(super) fn outline(ui: &egui::Ui, painter: &egui::Painter, rect: Rect) {
+    polygon(
+        ui,
+        painter,
+        &[
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ],
+    );
+}
+pub(super) fn polygon(ui: &egui::Ui, painter: &egui::Painter, points: &[Pos2]) {
+    if points.len() < 3 {
+        return;
+    }
     let phase = ui.input(|i| (i.time * 12.0 % 8.0) as f32);
     let clip = painter.clip_rect();
     let mut distance = 0.0;
-    for (a, b) in [
-        (rect.left_top(), rect.right_top()),
-        (rect.right_top(), rect.right_bottom()),
-        (rect.right_bottom(), rect.left_bottom()),
-        (rect.left_bottom(), rect.left_top()),
-    ] {
+    for (a, b) in points
+        .iter()
+        .copied()
+        .zip(points.iter().copied().cycle().skip(1))
+        .take(points.len())
+    {
         let length = a.distance(b);
         if length < 0.1 {
             continue;

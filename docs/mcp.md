@@ -1,8 +1,10 @@
 # MCP and CLI
 
-MCP starts automatically with PeerBrush. Click **Connect AI** for client configuration. Green means an attached MCP client; red means the editor is waiting for one. There is no separate MCP on/off switch. The stdio adapter attaches to the same live document. It can initialize and list tools while the editor is closed, and reconnects when it opens. Editing calls require the app to be running.
+MCP starts automatically with PeerBrush. Click **Connect AI** to register the running executable and its exact workspace with detected Codex, Claude Desktop, Cursor and Gemini CLI clients. Settings are updated atomically with backups; unrelated server entries, comments and preferences are preserved. No model or remote service is started. Reload or restart the configured client and approve PeerBrush when prompted. Green means an attached MCP client; red means the editor is waiting for one. There is no separate MCP on/off switch. The stdio adapter attaches to the same live document. It can initialize and list tools while the editor is closed, and reconnects when it opens. Editing calls require the app to be running.
 
-For Codex, register the executable you run:
+The neighboring settings button provides manual setup and recovery. Clients that require extra approval are reported there. A successful registration means the client has configuration; it does not mean the client is connected yet.
+
+For manual Codex setup, register the executable you run:
 
 ```powershell
 codex mcp add peerbrush -- "C:\path\to\PeerBrush\peerbrush.exe" mcp
@@ -46,7 +48,15 @@ CLI examples (PowerShell):
 
 Use `--state-dir PATH` consistently for an isolated instance. CLI image results include absolute file paths plus a crop-coordinate manifest; base64 image data is not printed.
 
-Local HTTP clients can POST to `/mcp` or `/rpc` using the bearer token in the runtime `connection.json`. The service binds only to 127.0.0.1. Do not publish the token. Internet-facing clients, arbitrary scripts, and built-in model calls are not part of v0.1.
+## Local discovery and HTTP
+
+Connect AI writes a token-free manifest at `~/.peerbrush/mcp.json`. Run `peerbrush discover` to print it for a local agent. It includes the executable, stdio arguments, exact connection-file location, and an HTTP endpoint template. This is an explicit discovery file; MCP does not make all agents scan or connect automatically.
+
+Direct clients read `url` and `token` from that workspace's `connection.json` and POST to `${url}/mcp` using `Authorization: Bearer <token>`. The service binds only to 127.0.0.1 and validates host and origin. Keep the token local. `/rpc` remains the application/CLI bridge; it is not the public MCP transport.
+
+Streamable HTTP supports **2026-07-28**, **2025-11-25**, and **2025-06-18**. Modern requests carry protocol/client metadata and `Mcp-Method` / `Mcp-Name` headers; legacy clients initialize and use a session ID. Notifications return an empty HTTP 202 response. Legacy sessions can be deleted. Unsupported versions and mismatched headers return protocol errors. See the official [modern transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) and [legacy transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) specifications.
+
+Local Claude Desktop, Cursor and Gemini setup follows their [Claude guide](https://modelcontextprotocol.io/docs/develop/connect-local-servers), [Cursor documentation](https://cursor.com/docs/mcp), and [Gemini CLI documentation](https://geminicli.com/docs/tools/mcp-server/). Unsupported clients can use the manifest or manual stdio configuration. Remote/cloud agents require a separately configured bridge; this release does not publish a public server or call models itself.
 
 
 ## Artistic iteration and visible activity
@@ -79,8 +89,28 @@ CLI uses the same operation: `peerbrush.exe cli place_image '@placement.json'`. 
 
 Blue marks show affected layers, relevant tools, and rectangular AI work areas. Agent edits animate as presentation feedback without delaying the committed shared state. Observe returns committed pixels and revision, so agents never have to wait for an interface animation to finish.
 
-The Windows development helper `scripts/dev.ps1 run` uses the checkout's `.runtime` workspace rather than the packaged executable's default workspace. The **Connect AI** copied configuration already includes that instance's absolute `--state-dir`. If registering it manually, pass the same directory:
+The Windows development helper `scripts/dev.ps1 run` uses the checkout's `.runtime` workspace rather than the packaged executable's default workspace. Automatic Connect AI registration and the settings panel's copied configuration include that instance's absolute `--state-dir`. If registering it manually, pass the same directory:
 
 ```powershell
 codex mcp add peerbrush -- "C:\path\to\PeerBrush\target\release\peerbrush.exe" mcp --state-dir "C:\path\to\PeerBrush\.runtime"
 ```
+
+## Hierarchy and fill commands
+
+`peerbrush_edit` shares the same engine operations as the interface:
+
+```json
+{"commands":[{"op":"layer.duplicate","layers":["LAYER_OR_FOLDER_ID"]}],"actor":"my-agent","expected_revision":7}
+```
+
+```json
+{"commands":[{"op":"group.create_selected","layers":["LAYER_A","LAYER_B"],"name":"Details"}],"actor":"my-agent","expected_revision":7}
+```
+
+```json
+{"commands":[{"op":"layer.merge","layers":["UPPER_ID","LOWER_ID"],"name":"Merged detail"}],"actor":"my-agent","expected_revision":7}
+```
+
+Merge bakes the selected sources, masks and effects into a regular raster layer. A selected folder flattens its children; one selected raster merges with the sibling below it. Multiple roots must be adjacent siblings with normal external blend, so unrelated layers and backdrop-dependent blends are not silently changed. Use a folder to retain internal blend interactions before flattening. Rendering happens outside the shared engine lock for a single merge request; commit requires the document to remain unchanged. Undo restores the editable sources.
+
+Regular layers and folders are the creation choices. `paint.fill` floods a regular layer, or clips to the current selection. A rotated selection is returned as `selection_polygon` along with its bounding `selection` rectangle. Use observation to get the current exact shape and revision before editing it.

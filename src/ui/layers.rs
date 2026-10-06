@@ -23,6 +23,99 @@ fn rows(
     }
 }
 impl PeerBrush {
+    pub(super) fn begin_rename(&mut self, _doc: &Document, id: &str) {
+        if self.rename_edit.is_some() {
+            self.finish_rename();
+        }
+        let (document, revision, name) = {
+            let e = self.shared.lock().unwrap();
+            let Some(layer) = e.doc.layers.iter().find(|l| l.id == id) else {
+                return;
+            };
+            (e.doc.id.clone(), e.doc.revision, layer.name.clone())
+        };
+        self.select_content(id);
+        self.layer_clipboard = true;
+        self.layer_drag = None;
+        self.rename_edit = Some(RenameEdit {
+            document,
+            layer: id.into(),
+            original: name.clone(),
+            text: name,
+            revision,
+            focus: true,
+        });
+    }
+    pub(super) fn finish_rename(&mut self) {
+        let Some(edit) = self.rename_edit.take() else {
+            return;
+        };
+        if edit.text == edit.original {
+            return;
+        }
+        if edit.text.trim().is_empty() {
+            self.message = "Layer names need text".into();
+            return;
+        }
+        let result = {
+            let mut e = self.shared.lock().unwrap();
+            if e.doc.id != edit.document {
+                Err("The document changed while renaming".into())
+            } else {
+                e.edit(
+                    "human",
+                    &[json!({"op":"layer.update","layer":edit.layer,"name":edit.text})],
+                    Some(edit.revision),
+                    None,
+                    "Rename layer",
+                )
+            }
+        };
+        self.message = result.map(|_| "Renamed layer".into()).unwrap_or_else(|e| e);
+        self.last_preview = None;
+    }
+    fn inline_rename(&mut self, ui: &mut egui::Ui, width: f32) {
+        let mut commit = false;
+        let mut cancel = false;
+        if let Some(edit) = &mut self.rename_edit {
+            let id = egui::Id::new(("layer rename", &edit.document, &edit.layer));
+            let response = ui.add_sized(
+                [width, 30.0],
+                egui::TextEdit::singleline(&mut edit.text)
+                    .id(id)
+                    .frame(false)
+                    .font(egui::FontId::proportional(12.0))
+                    .char_limit(256),
+            );
+            let initial = edit.focus;
+            if initial {
+                edit.focus = false;
+                response.request_focus();
+                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(edit.text.chars().count()),
+                        )));
+                    state.store(ui.ctx(), id);
+                }
+            }
+            cancel = (response.has_focus() || response.lost_focus())
+                && ui.input(|i| i.key_pressed(egui::Key::Escape));
+            commit = !initial
+                && (response.lost_focus()
+                    || response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if cancel || commit {
+                response.surrender_focus();
+            }
+        }
+        if cancel {
+            self.rename_edit = None;
+        } else if commit {
+            self.finish_rename();
+        }
+    }
     pub(super) fn select_content(&mut self, id: &str) {
         self.selected = id.into();
         self.selection_layers = [id.to_string()].into_iter().collect();
@@ -32,6 +125,7 @@ impl PeerBrush {
         self.last_preview = None;
     }
     fn select_row(&mut self, ui: &egui::Ui, doc: &Document, id: &str) {
+        self.layer_clipboard = true;
         let mods = ui.input(|i| i.modifiers);
         if mods.shift {
             let mut visible = vec![];
@@ -186,37 +280,59 @@ impl PeerBrush {
             let mask_width = if l.mask.is_some() { 35.0 } else { 0.0 };
             let name_width =
                 (ui.available_width() - mask_width - if l.locked { 21.0 } else { 0.0 }).max(25.0);
-            let name = ui.add_sized(
-                [name_width, 30.0],
-                egui::Label::new(
-                    RichText::new(&l.name)
-                        .size(12.0)
-                        .font(egui::FontId::new(
-                            12.0,
-                            if l.kind == "group" {
-                                egui::FontFamily::Name("semibold".into())
+            if self
+                .rename_edit
+                .as_ref()
+                .is_some_and(|edit| edit.layer == l.id)
+            {
+                self.inline_rename(ui, name_width);
+            } else {
+                let name = ui.add_sized(
+                    [name_width, 30.0],
+                    egui::Label::new(
+                        RichText::new(&l.name)
+                            .size(12.0)
+                            .font(egui::FontId::new(
+                                12.0,
+                                if l.kind == "group" {
+                                    egui::FontFamily::Name("semibold".into())
+                                } else {
+                                    egui::FontFamily::Proportional
+                                },
+                            ))
+                            .color(if self.ai_layer(&l.id, ui.input(|i| i.time)) {
+                                AI_BLUE
+                            } else if l.visible {
+                                Color32::WHITE
                             } else {
-                                egui::FontFamily::Proportional
-                            },
-                        ))
-                        .color(if self.ai_layer(&l.id, ui.input(|i| i.time)) {
-                            AI_BLUE
-                        } else if l.visible {
-                            Color32::WHITE
-                        } else {
-                            MUTED
-                        }),
-                )
-                .truncate()
-                .sense(egui::Sense::click()),
-            );
-            if name.clicked() {
-                self.select_row(ui, doc, &l.id);
-            }
-            if name.double_clicked() {
-                self.selected = l.id.clone();
-                self.rename = l.name.clone();
-                self.show_rename = true;
+                                MUTED
+                            }),
+                    )
+                    .truncate()
+                    .sense(egui::Sense::click()),
+                );
+                if name.clicked() {
+                    self.select_row(ui, doc, &l.id);
+                    let (time, modifiers) = ui.input(|i| (i.time, i.modifiers));
+                    let pointer = name.interact_pointer_pos().unwrap_or(name.rect.center());
+                    let options = ui.ctx().options(|o| o.input_options.clone());
+                    // egui counts rapid clicks globally, including clicks on different rows.
+                    // Rename requires two unmodified clicks on this same name at the same spot.
+                    let same_name = self.name_click.as_ref().is_some_and(|(id, point, at)| {
+                        id == &l.id
+                            && time - at < options.max_double_click_delay
+                            && point.distance(pointer) <= options.max_click_dist
+                    });
+                    if name.double_clicked()
+                        && same_name
+                        && !modifiers.command
+                        && !modifiers.shift
+                        && !modifiers.alt
+                    {
+                        self.begin_rename(doc, &l.id);
+                    }
+                    self.name_click = Some((l.id.clone(), pointer, time));
+                }
             }
             if l.mask.is_some() {
                 if self
@@ -229,6 +345,7 @@ impl PeerBrush {
                     .clicked()
                 {
                     self.select_content(&l.id);
+                    self.layer_clipboard = false;
                     self.mask_step = None;
                     if ui.input(|i| i.modifiers.shift) {
                         self.layer_cmd("mask.toggle", json!({}), "Toggle mask");
@@ -277,7 +394,7 @@ impl PeerBrush {
         }
         self.layer_rects.clear();
         self.eye_rects.clear();
-        let reserve = (ui.available_height() * 0.42).clamp(180.0, 330.0);
+        let reserve = (ui.available_height() * 0.58).clamp(280.0, 480.0);
         let height = (ui.available_height() - reserve).max(46.0);
         egui::ScrollArea::vertical().max_height(height).auto_shrink([false,false]).show(ui,|ui| {
             let mut original=vec![];rows(doc,None,0,&self.collapsed,&mut original);
@@ -320,7 +437,7 @@ impl PeerBrush {
                 self.layer_rects.insert(l.id.clone(),rect);
                 let held=self.layer_drag.as_ref().is_some_and(|d|d.ids.contains(&l.id));
                 let response=ui.interact(rect,ui.id().with((&l.id,"row")),egui::Sense::click_and_drag());
-                if response.drag_started() && self.eye_sweep.is_none() {
+                if response.drag_started() && self.eye_sweep.is_none() && !self.rename_edit.as_ref().is_some_and(|edit| edit.layer == l.id) {
                     if !self.selection_layers.contains(&l.id) {self.select_content(&l.id);}
                     let start=ui.input(|i|i.pointer.press_origin()).unwrap_or(rect.center());
                     self.layer_drag=Some(LayerDrag {gesture:crate::engine::id(),id:l.id.clone(),revision:doc.revision,offset:start.y-rect.top(),target:index,ids:crate::tree::roots(doc,&self.selection_layers),commands:vec![]});

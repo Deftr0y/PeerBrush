@@ -135,6 +135,8 @@ pub struct Document {
     pub revision: u64,
     pub layers: Vec<Layer>,
     pub selection: Option<[i32; 4]>,
+    #[serde(default)]
+    pub selection_polygon: Option<Vec<[f32; 2]>>,
     pub read_only: bool,
     pub warnings: Vec<String>,
 }
@@ -149,6 +151,7 @@ impl Document {
             revision: 0,
             layers: vec![Layer::new("Paint 1", "paint", w, h)],
             selection: None,
+            selection_polygon: None,
             read_only: false,
             warnings: vec![],
         })
@@ -438,7 +441,7 @@ impl Engine {
     }
     pub fn state(&mut self) -> Value {
         self.expire();
-        json!({"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         if let (Some(x), Some(y)) = (&a.target, &b.target) {
@@ -517,6 +520,34 @@ impl Engine {
     pub fn scopes(&self, c: &Value) -> Vec<Scope> {
         let op = text(c, "op", "");
         let target = c.get("layer").and_then(Value::as_str).map(String::from);
+        if op == "paint.fill" {
+            let layer = target
+                .as_deref()
+                .and_then(|id| self.doc.layers.iter().find(|l| l.id == id));
+            if layer.is_some_and(|l| l.kind == "group") && c["mask"] != true {
+                return vec![Scope {
+                    target: None,
+                    rect: None,
+                }];
+            }
+            let mut area = c
+                .get("rect")
+                .and_then(rect)
+                .or(self.doc.selection)
+                .unwrap_or([0, 0, self.doc.width as i32, self.doc.height as i32]);
+            if let Some(selection) = self.doc.selection {
+                area = [
+                    area[0].max(selection[0]),
+                    area[1].max(selection[1]),
+                    area[2].min(selection[2]),
+                    area[3].min(selection[3]),
+                ];
+            }
+            return vec![Scope {
+                target,
+                rect: Some(area),
+            }];
+        }
         if op == "image.place" && c["new_layer"] == false {
             return vec![Scope {
                 target,
@@ -530,6 +561,10 @@ impl Engine {
             "layer.add",
             "layer.reorder",
             "layer.delete",
+            "layer.merge",
+            "layer.duplicate",
+            "layer.paste",
+            "group.create_selected",
             "layer.parent",
             "image.import",
             "image.paste",
@@ -589,6 +624,58 @@ impl Engine {
         label: &str,
         gesture: Option<&str>,
     ) -> Result<Value, String> {
+        self.edit_transaction(actor, commands, expected, task, label, gesture, None, None)
+    }
+    pub(crate) fn edit_prepared_merge(
+        &mut self,
+        actor: &str,
+        command: Value,
+        expected: Option<u64>,
+        task: Option<&str>,
+        prepared: crate::merge::Prepared,
+    ) -> Result<Value, String> {
+        self.edit_transaction(
+            actor,
+            &[command],
+            expected,
+            task,
+            "Merge layers",
+            None,
+            Some(prepared),
+            None,
+        )
+    }
+    /// Typed copy-on-write paste avoids serializing raster data through JSON.
+    pub fn paste_layers(
+        &mut self,
+        actor: &str,
+        snapshot: &crate::layer_clipboard::Layers,
+        target: &str,
+        expected: Option<u64>,
+        task: Option<&str>,
+    ) -> Result<Value, String> {
+        self.edit_transaction(
+            actor,
+            &[json!({"op":"layer.paste","layer":target})],
+            expected,
+            task,
+            "Paste layers",
+            None,
+            None,
+            Some(snapshot.clone()),
+        )
+    }
+    fn edit_transaction(
+        &mut self,
+        actor: &str,
+        commands: &[Value],
+        expected: Option<u64>,
+        task: Option<&str>,
+        label: &str,
+        gesture: Option<&str>,
+        mut prepared: Option<crate::merge::Prepared>,
+        mut clipboard: Option<crate::layer_clipboard::Layers>,
+    ) -> Result<Value, String> {
         if self.doc.read_only {
             return Err("This PSD is read-only. Create a compatible copy first.".into());
         }
@@ -630,8 +717,65 @@ impl Engine {
                 return Err("Task reservation expired or was released".into());
             }
         }
+        let mut pasted_roots = None;
+        let mut selection_gesture: Option<(
+            Value,
+            Option<[i32; 4]>,
+            Option<Vec<[f32; 2]>>,
+            Vec<String>,
+        )> = None;
         for c in commands {
-            if let Err(err) = self.apply(c) {
+            if matches!(c["op"].as_str(), Some("move" | "transform"))
+                && c["selection_only"] != false
+            {
+                let mut signature = c.clone();
+                if let Some(object) = signature.as_object_mut() {
+                    object.remove("layer");
+                }
+                let target = c["layer"].as_str().unwrap_or("").to_owned();
+                if let Some((previous, bounds, polygon, targets)) = &mut selection_gesture {
+                    if *previous == signature && !targets.contains(&target) {
+                        self.doc.selection = *bounds;
+                        self.doc.selection_polygon = polygon.clone();
+                        targets.push(target);
+                    } else {
+                        selection_gesture = Some((
+                            signature,
+                            self.doc.selection,
+                            self.doc.selection_polygon.clone(),
+                            vec![target],
+                        ));
+                    }
+                } else {
+                    selection_gesture = Some((
+                        signature,
+                        self.doc.selection,
+                        self.doc.selection_polygon.clone(),
+                        vec![target],
+                    ));
+                }
+            } else {
+                selection_gesture = None;
+            }
+            let applied = if c["op"] == "layer.paste" {
+                if let Some(snapshot) = clipboard.take() {
+                    crate::layer_clipboard::paste(&mut self.doc, &snapshot, text(c, "layer", ""))
+                        .map(|roots| {
+                            pasted_roots = Some(roots);
+                        })
+                } else {
+                    Err("Use the typed layer clipboard to paste layers".into())
+                }
+            } else if c["op"] == "layer.merge" {
+                if let Some(prepared) = prepared.take() {
+                    prepared.apply(&mut self.doc)
+                } else {
+                    self.apply(c)
+                }
+            } else {
+                self.apply(c)
+            };
+            if let Err(err) = applied {
                 self.doc = before;
                 return Err(err);
             }
@@ -672,6 +816,17 @@ impl Engine {
             .filter(|l| !before.layers.iter().any(|old| old.id == l.id))
             .map(|l| l.id.clone())
             .collect();
+        let created_roots = pasted_roots.unwrap_or_else(|| {
+            self.doc
+                .layers
+                .iter()
+                .filter(|l| {
+                    created.contains(&l.id)
+                        && !l.parent.as_ref().is_some_and(|p| created.contains(p))
+                })
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>()
+        });
         let visual_scopes: Vec<Scope> = commands
             .iter()
             .filter_map(|command| {
@@ -702,7 +857,7 @@ impl Engine {
             "transform" => "scale",
             "image.place" | "image.import" | "image.paste" | "image.patch" => "place",
             "layer.update" if command.get("opacity").is_some() => "opacity",
-            "fill" => "fill",
+            "fill" | "paint.fill" => "fill",
             op if op.starts_with("effect.") => "effects",
             op if op.starts_with("mask.") => "mask",
             op if op.starts_with("layer.") => "layers",
@@ -748,7 +903,7 @@ impl Engine {
         }
         self.status = label.into();
         Ok(
-            json!({"revision":revision,"applied":commands.len(),"created":created,"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name})).collect::<Vec<_>>()}),
+            json!({"revision":revision,"applied":commands.len(),"created":created,"created_roots":created_roots,"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name})).collect::<Vec<_>>()}),
         )
     }
     fn apply(&mut self, c: &Value) -> Result<(), String> {
@@ -758,6 +913,23 @@ impl Engine {
             .is_some_and(|r| !r.is_null() && rect(r).is_none())
         {
             return Err("Invalid rectangle coordinates".into());
+        }
+        if op == "layer.duplicate" {
+            let ids = crate::grouping::requested(c)?;
+            crate::layer_clipboard::duplicate(&mut self.doc, &ids)?;
+            return Ok(());
+        }
+        if op == "group.create_selected" {
+            let ids = crate::grouping::requested(c)?;
+            crate::grouping::create(&mut self.doc, &ids, text(c, "name", "Folder"))?;
+            return Ok(());
+        }
+        if op == "layer.merge" {
+            // Earlier commands in the same batch may have changed effect sources.
+            crate::effects::invalidate(&mut self.doc, &[json!({"op":"layer.merge"})]);
+            let ids = crate::merge::requested(c)?;
+            let prepared = crate::merge::prepare(&self.doc, &ids, c["name"].as_str())?;
+            return prepared.apply(&mut self.doc);
         }
         if op == "image.paste" {
             return crate::clipboard::paste(&mut self.doc, c);
@@ -806,7 +978,19 @@ impl Engine {
             return Ok(());
         }
         if op == "selection" {
-            self.doc.selection = c.get("rect").and_then(rect);
+            if let Some(polygon) = c.get("polygon").filter(|p| !p.is_null()) {
+                let points: Vec<[f32; 2]> = serde_json::from_value(polygon.clone())
+                    .map_err(|_| "Selection polygon must contain [x,y] points")?;
+                let bounds = crate::selection::bounds(&points)?;
+                if c.get("rect").and_then(rect).is_some_and(|r| r != bounds) {
+                    return Err("Selection rectangle must match its polygon bounds".into());
+                }
+                self.doc.selection = Some(bounds);
+                self.doc.selection_polygon = Some(points);
+            } else {
+                self.doc.selection = c.get("rect").and_then(rect);
+                self.doc.selection_polygon = None;
+            }
             return Ok(());
         }
         if op == "layer.add" {
@@ -881,16 +1065,6 @@ impl Engine {
                 }
             }
             self.doc.layers.retain(|l| !ids.contains(&l.id));
-            return Ok(());
-        }
-        if op == "layer.duplicate" {
-            if self.doc.layers[i].kind == "group" {
-                return Err("Duplicate individual layers in this version".into());
-            }
-            let mut l = self.doc.layers[i].clone();
-            l.id = id();
-            l.name.push_str(" copy");
-            self.doc.layers.insert(i, l);
             return Ok(());
         }
         if op == "layer.reorder" {
@@ -1188,6 +1362,10 @@ impl Engine {
             };
             return Ok(());
         }
+        if op == "paint.fill" {
+            return crate::fill::apply(&mut self.doc, c);
+        }
+        let selection_polygon = crate::selection::polygon(&self.doc).map(Vec::from);
         let selection = self.doc.selection;
         if op == "fill"
             && self.doc.layers[i].kind == "group"
@@ -1202,6 +1380,11 @@ impl Engine {
             let col = color(c);
             for y in area[1].max(0)..area[3].min(self.doc.height as i32) {
                 for x in area[0].max(0)..area[2].min(self.doc.width as i32) {
+                    if selection_polygon.as_ref().is_some_and(|points| {
+                        !crate::selection::contains(points, x as f32 + 0.5, y as f32 + 0.5)
+                    }) {
+                        continue;
+                    }
                     child.pixels.set(x, y, col);
                 }
             }
@@ -1211,7 +1394,12 @@ impl Engine {
         let layer = &mut self.doc.layers[i];
         if ["move", "transform"].contains(&op) && c["selection_only"].as_bool() != Some(false) {
             if let Some(area) = selection {
-                self.doc.selection = Some(crate::transform::selection(layer, area, c)?);
+                let polygon =
+                    selection_polygon.unwrap_or_else(|| crate::selection::rectangle(area));
+                let (bounds, polygon) =
+                    crate::transform::selection_with_polygon(layer, &polygon, c)?;
+                self.doc.selection = Some(bounds);
+                self.doc.selection_polygon = Some(polygon);
                 return Ok(());
             }
         }
@@ -1414,13 +1602,20 @@ impl Engine {
                 })
                 .collect::<Result<Vec<_>, &str>>()?;
             let raster = edit_raster(layer, c)?;
-            crate::brush::paint(
+            let polygon = selection_polygon.as_ref().map(|points| {
+                points
+                    .iter()
+                    .map(|p| [p[0] - x as f32, p[1] - y as f32])
+                    .collect::<Vec<_>>()
+            });
+            crate::brush::paint_with_selection(
                 raster,
                 &points,
                 settings,
                 brush,
                 c["erase"].as_bool().unwrap_or(false),
                 clip,
+                polygon.as_deref(),
             )?;
             return Ok(());
         }
@@ -1453,6 +1648,11 @@ impl Engine {
             }
             for yy in clip[1].max(ly)..clip[3].min(ly + lh) {
                 for xx in clip[0].max(lx)..clip[2].min(lx + lw) {
+                    if selection_polygon.as_ref().is_some_and(|points| {
+                        !crate::selection::contains(points, xx as f32 + 0.5, yy as f32 + 0.5)
+                    }) {
+                        continue;
+                    }
                     let tx = xx - lx;
                     let ty = yy - ly;
                     let mut col = col;

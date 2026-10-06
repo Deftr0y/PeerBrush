@@ -27,7 +27,7 @@ This is the living backlog for ideas raised during development. Add new requests
 | PB-019 | Smart masking tools | Color/contiguous tools verified; subject segmentation planned | Color-range and contiguous-region masking first, with add/subtract and refinement; subject/object segmentation later needs a model backend. |
 | PB-020 | Actual live feedback everywhere | Implemented and verified; standing rule | Render strokes, W/E/R transforms, blend hover, effects and dragged layer order through the shared engine. Finish gestures as one undoable edit. |
 | PB-021 | Interactive tool size shortcuts | Implemented and verified | [ / ] (including shifted braces) change brush/eraser size; S + horizontal drag changes size with a live tip outline and readout, without painting. |
-| PB-022 | Better color picker with editable HEX | Implemented and verified | Large saturation/value field, hue rail, original/current swatches, compact RGB/alpha controls and live HEX editing, including fill layers. |
+| PB-022 | Better color picker with editable HEX | Implemented and verified | Large saturation/value field, hue rail, original/current swatches, compact RGB/alpha controls and live HEX editing, for artwork and mask colors. |
 
 | PB-023 | Reliable W/E/R/Q after clicking controls | Implemented and verified | Tool shortcuts survive ordinary button, layer and slider focus; text fields keep typing; physical keys support non-Latin layouts. |
 | PB-024 | Copy selection and paste into a new layer | Implemented and verified | Ctrl/Cmd+C copies the selected layer area; Ctrl/Cmd+Shift+C copies the composite. Pasting stays in the current folder; a root layer and paste get a new folder. Preserve selection coordinates; one undo restores the previous document. |
@@ -51,12 +51,22 @@ This is the living backlog for ideas raised during development. Add new requests
 | PB-039 | Agent image placement | Implemented and verified | One-call placement from absolute PNG/JPEG path or base64 PNG, explicit pixel rectangle, new/current layer, editable masks/effects retained, undo and cropped PNG feedback. |
 | PB-040 | Blue AI activity markers | Implemented and verified | Blue identifies recent AI edits and reservations on affected layers, tools, controls and canvas areas; human interaction keeps Ember orange. |
 | PB-041 | Animated AI edits | Initial animation coverage verified; extend with tools | Ease numeric controls and actual canvas opacity/move feedback, lerp hierarchy rows including folder indentation, transition discrete rendered results. Shared state commits immediately; human edits interrupt presentation animation. Extend animation coverage as tools grow. |
-| PB-042 | Refine P logo toward MayaMCP | Reference confirmed; refining interlocking P for review | Crisp geometric orange/ivory/plum P, genuine transparency, clear at toolbar and app-icon sizes. |
+| PB-042 | Refine P logo toward MayaMCP | Interlocking P accepted provisionally; further refinement planned | Crisp geometric orange/ivory/plum P, genuine transparency, clear at toolbar and app-icon sizes. |
+
+| PB-043 | One-click local MCP registration and discovery | Implemented and verified | Register detected Codex/Claude/Cursor/Gemini clients, preserve settings, publish token-free manifest; green only for a real connection. |
+| PB-044 | Merge layers and folders | Implemented and verified | One undoable bake, preserve masks/effects/current appearance; guard gaps, locks, stale commits and backdrop-dependent blends. |
+| PB-045 | Top effect runs last | Implemented and verified | Reverse display and reorder directions for both stacks without reinterpreting existing saved sources. |
+| PB-046 | Whole-layer duplicate/copy/cut/paste | Implemented and verified | Ctrl/Cmd+D/C/X/V for selected trees, editable masks/effects, efficient COW snapshots, OS-image fallback and safe cuts. |
+| PB-047 | Inline layer renaming | Implemented and verified | Double-click edits in the row, Enter/blur commits, Escape cancels; no popup or confirmation. |
+| PB-048 | Connected Color/Mask and bottom layer controls | Implemented and verified | Compact connected selector; blend and opacity below effects; Add effect remains reachable. |
+| PB-049 | Regular layers and folders; Alt+Backspace flood | Implemented and verified | Remove fill-layer creation from the UI, preserve existing files, fill active layer/selection with foreground through the shared engine. |
+| PB-050 | Selection follows its transformed content | Implemented and verified | Rotated/scaled/moved outline and exact selection clipping for paint, fill and copy; undo restores geometry and pixels. |
+| PB-051 | New folder contains selected layers | Implemented and verified | Gather selected roots and all descendants in order, atomic lock/reservation checks and one undo. |
 
 ## Next development slices
 
 - Full stroke-aware incremental previews and progressive large-document rendering.
-- Editable text and shape source layers, non-destructive transforms, group/selection transforms, crop/resize, clone/heal, and nonrectangular selections.
+- Editable text and shape source layers, non-destructive transforms, group transforms, crop/resize, clone/heal, and more selection tools.
 - Selective task undo that preserves interleaved human changes.
 - Tiled GPU compositing, cache budgets, disk eviction, and progressive large-file decoding.
 - ICC color management, clipping, pass-through group fidelity, and broader PSD compatibility.

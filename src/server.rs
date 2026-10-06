@@ -260,13 +260,25 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                 .get("commands")
                 .and_then(Value::as_array)
                 .ok_or("commands must be an array")?;
-            let result = shared.lock().unwrap().edit(
-                actor,
-                commands,
-                p.get("expected_revision").and_then(Value::as_u64),
-                p.get("task").and_then(Value::as_str),
-                p.get("label").and_then(Value::as_str).unwrap_or("AI edit"),
-            )?;
+            let result = if commands.len() == 1 && commands[0]["op"] == "layer.merge" {
+                let ids = crate::merge::requested(&commands[0])?;
+                crate::merge::edit(
+                    shared,
+                    actor,
+                    &ids,
+                    p.get("expected_revision").and_then(Value::as_u64),
+                    p.get("task").and_then(Value::as_str),
+                    commands[0].get("name").and_then(Value::as_str),
+                )?
+            } else {
+                shared.lock().unwrap().edit(
+                    actor,
+                    commands,
+                    p.get("expected_revision").and_then(Value::as_u64),
+                    p.get("task").and_then(Value::as_str),
+                    p.get("label").and_then(Value::as_str).unwrap_or("AI edit"),
+                )?
+            };
             let feedback = p
                 .get("feedback")
                 .and_then(Value::as_str)
@@ -417,8 +429,17 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
     }
 }
 
-fn initialization() -> Value {
-    json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")},"instructions":"Observe before edits. Use explicit IDs, expected_revision, optional selective task reservations, and PNG feedback. Never silently reacquire after user takeover. Work like an artist: inspect actual images after edits, undo weak attempts, refine and retry; use redo to compare. Publish concise human-language activity through task descriptions. Do not assume the first edit is final."})
+fn initialization(params: &Value) -> Value {
+    let requested = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("2025-03-26");
+    let version = if LEGACY_MCP_VERSIONS.contains(&requested) {
+        requested
+    } else {
+        MCP_HTTP_VERSIONS[1]
+    };
+    json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")},"instructions":"Observe before edits. Use explicit IDs, expected_revision, optional selective task reservations, and PNG feedback. Never silently reacquire after user takeover. Work like an artist: inspect actual images after edits, undo weak attempts, refine and retry; use redo to compare. Publish concise human-language activity through task descriptions. Do not assume the first edit is final."})
 }
 
 pub fn mcp(shared: &Shared, request: &Value) -> Value {
@@ -439,7 +460,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("")
     {
-        "initialize" => Ok(initialization()),
+        "initialize" => Ok(initialization(&p)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools":tools()})),
         "tools/call" => {
@@ -514,6 +535,644 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
         }
     }
 }
+/// Both per-request metadata and initialization-based Streamable HTTP clients.
+pub const MCP_HTTP_VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "2025-06-18"];
+// Stdio keeps the installed adapter's older initialization compatibility.
+const LEGACY_MCP_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
+const HTTP_BODY_LIMIT: usize = 4 * 1024 * 1024;
+const HTTP_SESSION_LIMIT: usize = 128;
+const HTTP_SESSION_TTL: u64 = 300;
+
+struct HttpSession {
+    version: String,
+    expires: u64,
+}
+
+fn header<'a>(request: &'a tiny_http::Request, name: &'static str) -> Result<Option<&'a str>, ()> {
+    let mut values = request.headers().iter().filter(|h| h.field.equiv(name));
+    let value = values.next().map(|h| h.value.as_str());
+    if values.next().is_some() {
+        Err(())
+    } else {
+        Ok(value)
+    }
+}
+
+fn rpc_error(request: Option<&Value>, code: i32, message: &str) -> Value {
+    let mut error = json!({"jsonrpc":"2.0","error":{"code":code,"message":message}});
+    if let Some(id) = request.and_then(|q| q.get("id")) {
+        if id.is_string() || id.is_number() {
+            error["id"] = id.clone();
+        }
+    }
+    error
+}
+
+fn respond_http(
+    request: tiny_http::Request,
+    status: u16,
+    body: Option<Value>,
+    session: Option<&str>,
+) {
+    let mut response =
+        tiny_http::Response::from_string(body.as_ref().map(Value::to_string).unwrap_or_default())
+            .with_status_code(status)
+            .with_header(tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap());
+    if body.is_some() {
+        response
+            .add_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap());
+    }
+    if status == 405 {
+        response.add_header(tiny_http::Header::from_bytes("Allow", "POST, DELETE").unwrap());
+    }
+    if let Some(id) = session {
+        response.add_header(tiny_http::Header::from_bytes("MCP-Session-Id", id).unwrap());
+    }
+    let _ = request.respond(response);
+}
+
+fn fail_http(
+    request: tiny_http::Request,
+    status: u16,
+    q: Option<&Value>,
+    code: i32,
+    message: &str,
+) {
+    respond_http(request, status, Some(rpc_error(q, code, message)), None);
+}
+
+fn unsupported_version(request: tiny_http::Request, q: &Value, requested: &str) {
+    let mut error = rpc_error(Some(q), -32022, "Unsupported MCP protocol version");
+    error["error"]["data"] = json!({"requested":requested,"supported":MCP_HTTP_VERSIONS});
+    respond_http(request, 400, Some(error), None);
+}
+
+fn touch_http_presence(shared: &Shared, client: &str) {
+    let mut engine = shared.lock().unwrap();
+    engine.expire();
+    engine.mcp_clients.insert(client.into(), engine::now() + 90);
+}
+
+fn decode_name_header(value: &str) -> Option<String> {
+    if let Some(encoded) = value
+        .strip_prefix("=?base64?")
+        .and_then(|v| v.strip_suffix("?="))
+    {
+        String::from_utf8(STANDARD.decode(encoded).ok()?).ok()
+    } else if value
+        .bytes()
+        .all(|c| c == b'\t' || (0x20..=0x7e).contains(&c))
+    {
+        Some(value.into())
+    } else {
+        None
+    }
+}
+
+fn handle_modern_http(
+    request: tiny_http::Request,
+    shared: &Shared,
+    mut q: Value,
+    version: Option<&str>,
+) {
+    // Notifications have no core request metadata schema and never execute editing tools.
+    if q.get("id").is_none() {
+        if version != Some(MCP_HTTP_VERSIONS[0]) {
+            unsupported_version(request, &q, version.unwrap_or(""));
+        } else {
+            respond_http(request, 202, None, None);
+        }
+        return;
+    }
+    let meta = &q["params"]["_meta"];
+    let body_version = meta["io.modelcontextprotocol/protocolVersion"].as_str();
+    let method = q["method"].as_str().unwrap_or("").to_owned();
+    let method_header = header(&request, "Mcp-Method");
+    if version.is_none() || body_version != version || method_header != Ok(Some(method.as_str())) {
+        fail_http(
+            request,
+            400,
+            Some(&q),
+            -32020,
+            "MCP version or method header is missing or does not match the request body",
+        );
+        return;
+    }
+    if ["tools/call", "resources/read", "prompts/get"].contains(&method.as_str()) {
+        let field = if method == "resources/read" {
+            "uri"
+        } else {
+            "name"
+        };
+        let name = q["params"][field].as_str();
+        let name_header = header(&request, "Mcp-Name")
+            .ok()
+            .flatten()
+            .and_then(decode_name_header);
+        if name.is_none() || name_header.as_deref() != name {
+            fail_http(
+                request,
+                400,
+                Some(&q),
+                -32020,
+                "Mcp-Name header is missing, malformed or does not match the request body",
+            );
+            return;
+        }
+    }
+    if version != Some(MCP_HTTP_VERSIONS[0]) {
+        unsupported_version(request, &q, version.unwrap_or(""));
+        return;
+    }
+    if !meta["io.modelcontextprotocol/clientCapabilities"].is_object()
+        || meta
+            .get("io.modelcontextprotocol/clientInfo")
+            .is_some_and(|info| !info["name"].is_string() || !info["version"].is_string())
+    {
+        fail_http(
+            request,
+            400,
+            Some(&q),
+            -32602,
+            "Request metadata requires clientCapabilities and valid optional clientInfo",
+        );
+        return;
+    }
+    if !["server/discover", "ping", "tools/list", "tools/call"].contains(&method.as_str()) {
+        fail_http(request, 404, Some(&q), -32601, "Method not found");
+        return;
+    }
+    // Identity is presentation only. One bounded presence entry covers stateless clients.
+    q["_client"] = json!("http-stateless");
+    touch_http_presence(shared, "http-stateless");
+    let mut result = if method == "server/discover" {
+        json!({"jsonrpc":"2.0","id":q["id"],"result":{
+            "supportedVersions":MCP_HTTP_VERSIONS,"capabilities":{"tools":{}},
+            "instructions":initialization(&json!({}))["instructions"],"ttlMs":300000,"cacheScope":"private"
+        }})
+    } else {
+        mcp(shared, &q)
+    };
+    if result.get("result").is_some() {
+        result["result"]["resultType"] = json!("complete");
+        result["result"]["_meta"]["io.modelcontextprotocol/serverInfo"] =
+            json!({"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")});
+        if method == "tools/list" {
+            result["result"]["ttlMs"] = json!(300000);
+            result["result"]["cacheScope"] = json!("private");
+        }
+    }
+    touch_http_presence(shared, "http-stateless");
+    respond_http(request, 200, Some(result), None);
+}
+
+fn handle_http(
+    mut request: tiny_http::Request,
+    shared: &Shared,
+    auth: &str,
+    port: u16,
+    sessions: &mut std::collections::BTreeMap<String, HttpSession>,
+) {
+    let localhost = format!("localhost:{port}");
+    let loopback = format!("127.0.0.1:{port}");
+    let origin_ok = match header(&request, "Origin") {
+        Ok(None) => true,
+        Ok(Some(origin)) => {
+            origin == format!("http://{localhost}") || origin == format!("http://{loopback}")
+        }
+        Err(()) => false,
+    };
+    if !origin_ok
+        || !matches!(header(&request, "Host"), Ok(Some(host)) if host == localhost || host == loopback)
+    {
+        fail_http(
+            request,
+            403,
+            None,
+            -32600,
+            "Browser origin or host is not permitted",
+        );
+        return;
+    }
+    if header(&request, "Authorization") != Ok(Some(auth)) {
+        fail_http(
+            request,
+            401,
+            None,
+            -32600,
+            "PeerBrush bearer token required",
+        );
+        return;
+    }
+    let is_mcp = request.url() == "/mcp";
+    if !is_mcp && request.url() != "/rpc" {
+        fail_http(request, 404, None, -32601, "Not found");
+        return;
+    }
+    let now = engine::now();
+    sessions.retain(|id, session| {
+        if session.expires <= now {
+            shared
+                .lock()
+                .unwrap()
+                .mcp_clients
+                .remove(&format!("http-{id}"));
+            false
+        } else {
+            true
+        }
+    });
+    if is_mcp && request.method() == &tiny_http::Method::Delete {
+        let session_id = match header(&request, "MCP-Session-Id") {
+            Ok(value) => value.map(String::from),
+            Err(()) => {
+                fail_http(
+                    request,
+                    400,
+                    None,
+                    -32600,
+                    "Duplicate MCP-Session-Id header",
+                );
+                return;
+            }
+        };
+        let version = match header(&request, "MCP-Protocol-Version") {
+            Ok(value) => value,
+            Err(()) => {
+                fail_http(
+                    request,
+                    400,
+                    None,
+                    -32020,
+                    "Duplicate MCP-Protocol-Version header",
+                );
+                return;
+            }
+        };
+        if version == Some(MCP_HTTP_VERSIONS[0]) {
+            fail_http(
+                request,
+                405,
+                None,
+                -32600,
+                "Stateless MCP does not use DELETE sessions",
+            );
+        } else if let Some(id) = session_id {
+            if let Some(session) = sessions.get(&id) {
+                if version.is_some_and(|v| v != session.version) {
+                    fail_http(
+                        request,
+                        400,
+                        None,
+                        -32602,
+                        "MCP protocol version does not match the session",
+                    );
+                    return;
+                }
+                sessions.remove(&id);
+                shared
+                    .lock()
+                    .unwrap()
+                    .mcp_clients
+                    .remove(&format!("http-{id}"));
+                respond_http(request, 204, None, None);
+            } else {
+                fail_http(
+                    request,
+                    404,
+                    None,
+                    -32600,
+                    "MCP session expired or unknown; initialize again",
+                );
+            }
+        } else {
+            fail_http(request, 400, None, -32600, "MCP-Session-Id required");
+        }
+        return;
+    }
+    if request.method() != &tiny_http::Method::Post {
+        fail_http(
+            request,
+            405,
+            None,
+            -32600,
+            "Use POST for MCP messages; standalone SSE is not supported",
+        );
+        return;
+    }
+    if is_mcp {
+        let accepts = header(&request, "Accept").ok().flatten().unwrap_or("");
+        let accepts_type = |kind| {
+            accepts.split(',').any(|part| {
+                part.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case(kind)
+            })
+        };
+        if !accepts_type("application/json") || !accepts_type("text/event-stream") {
+            fail_http(
+                request,
+                406,
+                None,
+                -32600,
+                "Accept must include application/json and text/event-stream",
+            );
+            return;
+        }
+        let content_type = header(&request, "Content-Type")
+            .ok()
+            .flatten()
+            .unwrap_or("");
+        if !content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+        {
+            fail_http(
+                request,
+                415,
+                None,
+                -32600,
+                "Content-Type must be application/json",
+            );
+            return;
+        }
+    }
+    if request.body_length().unwrap_or(0) > HTTP_BODY_LIMIT {
+        fail_http(
+            request,
+            413,
+            None,
+            -32600,
+            "Request exceeds the 4 MiB limit",
+        );
+        return;
+    }
+    let mut body = Vec::new();
+    if request
+        .as_reader()
+        .take((HTTP_BODY_LIMIT + 1) as u64)
+        .read_to_end(&mut body)
+        .is_err()
+    {
+        fail_http(request, 400, None, -32700, "Could not read request body");
+        return;
+    }
+    if body.len() > HTTP_BODY_LIMIT {
+        fail_http(
+            request,
+            413,
+            None,
+            -32600,
+            "Request exceeds the 4 MiB limit",
+        );
+        return;
+    }
+    let mut q: Value = match serde_json::from_slice(&body) {
+        Ok(q) => q,
+        Err(_) if !is_mcp => {
+            respond_http(
+                request,
+                200,
+                Some(json!({"ok":false,"error":"Invalid JSON"})),
+                None,
+            );
+            return;
+        }
+        Err(_) => {
+            fail_http(request, 400, None, -32700, "Parse error");
+            return;
+        }
+    };
+    if !is_mcp {
+        // The private authenticated bridge lets stdio keep its offline handshake and reconnect.
+        let result = if q["method"] == "mcp" {
+            if q["params"]["request"].is_object() {
+                if q["params"]["request"].get("id").is_none() {
+                    Ok(Value::Null)
+                } else {
+                    Ok(mcp(shared, &q["params"]["request"]))
+                }
+            } else {
+                Err("MCP bridge requires a request object".into())
+            }
+        } else {
+            dispatch(
+                shared,
+                q.get("method").and_then(Value::as_str).unwrap_or(""),
+                q.get("params").unwrap_or(&json!({})),
+            )
+        };
+        respond_http(
+            request,
+            200,
+            Some(match result {
+                Ok(value) => json!({"ok":true,"result":value}),
+                Err(error) => json!({"ok":false,"error":error}),
+            }),
+            None,
+        );
+        return;
+    }
+    let id_ok = q
+        .get("id")
+        .is_none_or(|id| id.is_string() || id.is_number());
+    let response = q.get("method").is_none()
+        && q.get("id").is_some()
+        && (q.get("result").is_some() != q.get("error").is_some());
+    if !q.is_object()
+        || q["jsonrpc"] != "2.0"
+        || !id_ok
+        || (!response && !q["method"].is_string())
+        || q.get("params").is_some_and(|p| !p.is_object())
+        || (q.get("id").is_some()
+            && q["method"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("notifications/")))
+    {
+        fail_http(
+            request,
+            400,
+            Some(&q),
+            -32600,
+            "Invalid JSON-RPC request; batches are not supported",
+        );
+        return;
+    }
+    if q["method"] == "tools/call"
+        && q.get("id").is_some()
+        && (!q["params"]["name"].is_string()
+            || q["params"]
+                .get("arguments")
+                .is_some_and(|arguments| !arguments.is_object()))
+    {
+        fail_http(
+            request,
+            400,
+            Some(&q),
+            -32602,
+            "Tool calls require a name and object arguments",
+        );
+        return;
+    }
+    let version = match header(&request, "MCP-Protocol-Version") {
+        Ok(value) => value.map(String::from),
+        Err(()) => {
+            fail_http(
+                request,
+                400,
+                Some(&q),
+                -32020,
+                "Duplicate MCP-Protocol-Version header",
+            );
+            return;
+        }
+    };
+    if version.as_deref() == Some("2025-03-26") {
+        unsupported_version(request, &q, "2025-03-26");
+        return;
+    }
+    let body_version = q["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str();
+    let modern = version
+        .as_deref()
+        .is_some_and(|v| !MCP_HTTP_VERSIONS[1..].contains(&v))
+        || body_version.is_some_and(|v| !MCP_HTTP_VERSIONS[1..].contains(&v));
+    if modern {
+        if response {
+            fail_http(
+                request,
+                400,
+                Some(&q),
+                -32600,
+                "Stateless HTTP clients cannot send JSON-RPC responses",
+            );
+        } else {
+            handle_modern_http(request, shared, q, version.as_deref());
+        }
+        return;
+    }
+    let session_id = match header(&request, "MCP-Session-Id") {
+        Ok(value) => value.map(String::from),
+        Err(()) => {
+            fail_http(
+                request,
+                400,
+                Some(&q),
+                -32600,
+                "Duplicate MCP-Session-Id header",
+            );
+            return;
+        }
+    };
+    if q["method"] == "initialize" && q.get("id").is_some() {
+        if session_id.is_some() {
+            fail_http(
+                request,
+                400,
+                Some(&q),
+                -32600,
+                "Initialize a new connection without MCP-Session-Id",
+            );
+            return;
+        }
+        if q["params"]
+            .get("protocolVersion")
+            .is_some_and(|v| !v.is_string())
+        {
+            fail_http(
+                request,
+                400,
+                Some(&q),
+                -32602,
+                "protocolVersion must be a string",
+            );
+            return;
+        }
+        if sessions.len() >= HTTP_SESSION_LIMIT {
+            fail_http(
+                request,
+                429,
+                Some(&q),
+                -32000,
+                "Too many MCP sessions; close unused connections and retry",
+            );
+            return;
+        }
+        let requested = q["params"]["protocolVersion"]
+            .as_str()
+            .unwrap_or("2025-06-18");
+        let version = if MCP_HTTP_VERSIONS[1..].contains(&requested) {
+            requested
+        } else {
+            MCP_HTTP_VERSIONS[1]
+        };
+        let version = version.to_owned();
+        q["params"]["protocolVersion"] = json!(version);
+        let id = engine::id();
+        q["_client"] = json!(format!("http-{id}"));
+        let result = mcp(shared, &q);
+        sessions.insert(
+            id.clone(),
+            HttpSession {
+                version: result["result"]["protocolVersion"].as_str().unwrap().into(),
+                expires: now + HTTP_SESSION_TTL,
+            },
+        );
+        touch_http_presence(shared, &format!("http-{id}"));
+        respond_http(request, 200, Some(result), Some(&id));
+        return;
+    }
+    let Some(id) = session_id else {
+        fail_http(
+            request,
+            400,
+            Some(&q),
+            -32600,
+            "MCP-Session-Id required; initialize the connection first",
+        );
+        return;
+    };
+    if id.is_empty() || !id.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        fail_http(request, 400, Some(&q), -32600, "Invalid MCP-Session-Id");
+        return;
+    }
+    let Some(session) = sessions.get_mut(&id) else {
+        fail_http(
+            request,
+            404,
+            Some(&q),
+            -32600,
+            "MCP session expired or unknown; initialize again",
+        );
+        return;
+    };
+    if version.as_deref().is_some_and(|v| v != session.version) {
+        fail_http(
+            request,
+            400,
+            Some(&q),
+            -32602,
+            "MCP protocol version does not match the session",
+        );
+        return;
+    }
+    session.expires = now + HTTP_SESSION_TTL;
+    let client = format!("http-{id}");
+    touch_http_presence(shared, &client);
+    if response || q.get("id").is_none() {
+        respond_http(request, 202, None, None);
+    } else {
+        q["_client"] = json!(client);
+        let result = mcp(shared, &q);
+        touch_http_presence(shared, &client);
+        respond_http(request, 200, Some(result), None);
+    }
+}
+
 pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
     fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
     let instance_lock = fs::OpenOptions::new()
@@ -557,68 +1216,9 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         }
     });
     thread::spawn(move || {
-        for mut request in http.incoming_requests() {
-            let authenticated = request
-                .headers()
-                .iter()
-                .any(|h| h.field.equiv("Authorization") && h.value.as_str() == auth);
-            if !authenticated {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("Unauthorized").with_status_code(401),
-                );
-                continue;
-            }
-            if request.method() != &tiny_http::Method::Post {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("POST required").with_status_code(405),
-                );
-                continue;
-            }
-            if request.body_length().unwrap_or(0) > 4 * 1024 * 1024 {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("Request too large").with_status_code(413),
-                );
-                continue;
-            }
-            let is_mcp = request.url() == "/mcp";
-            if !is_mcp && request.url() != "/rpc" {
-                let _ = request
-                    .respond(tiny_http::Response::from_string("Not found").with_status_code(404));
-                continue;
-            }
-            let mut body = String::new();
-            let _ = request
-                .as_reader()
-                .take(4 * 1024 * 1024 + 1)
-                .read_to_string(&mut body);
-            let result = match serde_json::from_str::<Value>(&body) {
-                Ok(q) => {
-                    if is_mcp {
-                        mcp(&shared, &q)
-                    } else {
-                        match dispatch(
-                            &shared,
-                            q.get("method").and_then(Value::as_str).unwrap_or(""),
-                            q.get("params").unwrap_or(&json!({})),
-                        ) {
-                            Ok(v) => json!({"ok":true,"result":v}),
-                            Err(e) => json!({"ok":false,"error":e}),
-                        }
-                    }
-                }
-                Err(e) => json!({"ok":false,"error":e.to_string()}),
-            };
-            let code = if result.is_null() { 202 } else { 200 };
-            let response = tiny_http::Response::from_string(if result.is_null() {
-                String::new()
-            } else {
-                result.to_string()
-            })
-            .with_status_code(code)
-            .with_header(
-                tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
-            );
-            let _ = request.respond(response);
+        let mut sessions = std::collections::BTreeMap::new();
+        for request in http.incoming_requests() {
+            handle_http(request, &shared, &auth, port, &mut sessions);
         }
     });
     Ok(Connection {
@@ -669,10 +1269,17 @@ fn client_with_timeout(
     let token = conn["token"]
         .as_str()
         .ok_or("Invalid PeerBrush connection token. Reopen the application.")?;
-    ureq::post(&format!("{url}/{endpoint}"))
+    let bridge = endpoint == "mcp";
+    let endpoint = if bridge { "rpc" } else { endpoint };
+    let payload = if bridge {
+        json!({"method":"mcp","params":{"request":payload}})
+    } else {
+        payload.clone()
+    };
+    let response: Value = ureq::post(&format!("{url}/{endpoint}"))
         .set("Authorization", &format!("Bearer {token}"))
         .timeout(timeout)
-        .send_json(payload.clone())
+        .send_json(payload)
         .map_err(|error| match error {
             ureq::Error::Transport(ref transport)
                 if transport.kind() == ureq::ErrorKind::ConnectionFailed =>
@@ -693,12 +1300,24 @@ fn client_with_timeout(
             _ => error.to_string(),
         })?
         .into_json()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if bridge {
+        if response["ok"] == true {
+            Ok(response["result"].clone())
+        } else {
+            Err(response["error"]
+                .as_str()
+                .unwrap_or("PeerBrush MCP bridge failed")
+                .into())
+        }
+    } else {
+        Ok(response)
+    }
 }
 
 fn stdio_static_response(request: &Value) -> Option<Value> {
     let result = match request.get("method").and_then(Value::as_str)? {
-        "initialize" => initialization(),
+        "initialize" => initialization(request.get("params").unwrap_or(&json!({}))),
         "ping" => json!({}),
         "tools/list" => json!({"tools":tools()}),
         _ => return None,
