@@ -51,7 +51,7 @@ This is the living backlog for ideas raised during development. Add new requests
 | PB-039 | Agent image placement | Implemented and verified | One-call placement from absolute PNG/JPEG path or base64 PNG, explicit pixel rectangle, new/current layer, editable masks/effects retained, undo and cropped PNG feedback. |
 | PB-040 | Blue AI activity markers | Implemented and verified | Blue identifies recent AI edits and reservations on affected layers, tools, controls and canvas areas; human interaction keeps Ember orange. |
 | PB-041 | Animated AI edits | Initial animation coverage verified; extend with tools | Ease numeric controls and actual canvas opacity/move feedback, lerp hierarchy rows including folder indentation, transition discrete rendered results. Shared state commits immediately; human edits interrupt presentation animation. Extend animation coverage as tools grow. |
-| PB-042 | Refine P logo toward MayaMCP | Awaiting actual MayaMCP M reference | Crisp geometric orange/ivory/plum P, genuine transparency, clear at toolbar and app-icon sizes. |
+| PB-042 | Refine P logo toward MayaMCP | Reference confirmed; refining interlocking P for review | Crisp geometric orange/ivory/plum P, genuine transparency, clear at toolbar and app-icon sizes. |
 
 ## Next development slices
 
