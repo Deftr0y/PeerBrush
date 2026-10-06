@@ -1,0 +1,387 @@
+{
+  "version": "build",
+  "coordinates": "Document pixels. rect=[left,top,right,bottom], right/bottom exclusive.",
+  "limits": {
+    "max_edge": 8192,
+    "max_pixels": 33554432,
+    "max_layers": 100,
+    "raster_budget_mib": 512,
+    "color_effect_budget_mib": 256,
+    "mask_effect_budget_mib": 128
+  },
+  "formats": {
+    "work": "PSD v1, 8-bit RGB",
+    "import": [
+      "PNG",
+      "JPEG"
+    ],
+    "export": [
+      "PNG"
+    ]
+  },
+  "commands": [
+    {
+      "op": "layer.add",
+      "kind": "paint",
+      "name": "AI paint"
+    },
+    {
+      "op": "layer.add",
+      "kind": "fill",
+      "color": [
+        233,
+        84,
+        32,
+        255
+      ]
+    },
+    {
+      "op": "layer.add",
+      "kind": "group",
+      "name": "Assets"
+    },
+    {
+      "op": "layer.update",
+      "layer": "ID",
+      "opacity": 0.7,
+      "blend": "multiply",
+      "visible": true,
+      "locked": false
+    },
+    {
+      "op": "layer.delete",
+      "layer": "ID"
+    },
+    {
+      "op": "layer.duplicate",
+      "layer": "ID"
+    },
+    {
+      "op": "layer.reorder",
+      "layer": "ID",
+      "index": 0
+    },
+    {
+      "op": "layer.parent",
+      "layer": "ID",
+      "parent": "GROUP_ID"
+    },
+    {
+      "op": "paint",
+      "layer": "ID",
+      "points": [
+        [
+          50,
+          50
+        ],
+        [
+          100,
+          100
+        ]
+      ],
+      "radius": 12,
+      "color": [
+        233,
+        84,
+        32,
+        255
+      ],
+      "hardness": 0.8,
+      "opacity": 1.0,
+      "flow": 0.6,
+      "spacing": 0.15,
+      "roundness": 1.0,
+      "angle": 0.0,
+      "smoothing": 0.0,
+      "erase": false,
+      "mask": false
+    },
+    {
+      "op": "fill",
+      "layer": "ID",
+      "color": [
+        30,
+        30,
+        30,
+        255
+      ],
+      "rect": [
+        0,
+        0,
+        100,
+        100
+      ]
+    },
+    {
+      "op": "shape",
+      "layer": "ID",
+      "kind": "ellipse",
+      "rect": [
+        30,
+        30,
+        200,
+        120
+      ],
+      "color": [
+        233,
+        84,
+        32,
+        255
+      ]
+    },
+    {
+      "op": "image.import",
+      "path": "C:/art/reference.png"
+    },
+    {
+      "op": "transform",
+      "layer": "ID",
+      "angle": 25,
+      "scale_x": 1.2,
+      "scale_y": 1.2,
+      "pivot": [
+        100,
+        100
+      ]
+    },
+    {
+      "op": "gradient",
+      "layer": "ID",
+      "rect": [
+        0,
+        0,
+        200,
+        100
+      ],
+      "color": [
+        233,
+        84,
+        32,
+        255
+      ]
+    },
+    {
+      "op": "move",
+      "layer": "ID",
+      "dx": 10,
+      "dy": 0
+    },
+    {
+      "op": "mask.add",
+      "layer": "ID",
+      "value": 255
+    },
+    {
+      "op": "mask.step.add",
+      "layer": "ID",
+      "kind": "invert"
+    },
+    {
+      "op": "mask.step.add",
+      "layer": "ID",
+      "kind": "levels",
+      "value": 1.5
+    },
+    {
+      "op": "mask.step.add",
+      "layer": "ID",
+      "kind": "blur",
+      "value": 8
+    },
+    {
+      "op": "mask.step.update",
+      "layer": "ID",
+      "step": "STEP_ID",
+      "enabled": true,
+      "value": 128
+    },
+    {
+      "op": "mask.step.reorder",
+      "layer": "ID",
+      "step": "STEP_ID",
+      "index": 0
+    },
+    {
+      "op": "mask.step.delete",
+      "layer": "ID",
+      "step": "STEP_ID"
+    },
+    {
+      "op": "mask.toggle",
+      "layer": "ID",
+      "enabled": false
+    },
+    {
+      "op": "effect.add",
+      "layer": "ID",
+      "kind": "levels",
+      "settings": {
+        "black": 0.0,
+        "white": 1.0,
+        "gamma": 1.2
+      }
+    },
+    {
+      "op": "effect.add",
+      "layer": "ID_OR_GROUP_ID",
+      "kind": "blur",
+      "settings": {
+        "radius": 8
+      }
+    },
+    {
+      "op": "effect.add",
+      "layer": "ID",
+      "kind": "curves",
+      "settings": {
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            0.5,
+            0.7
+          ],
+          [
+            1,
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "op": "effect.update",
+      "layer": "ID",
+      "effect": "EFFECT_ID",
+      "settings": {
+        "radius": 12
+      },
+      "enabled": true
+    },
+    {
+      "op": "effect.reorder",
+      "layer": "ID",
+      "effect": "EFFECT_ID",
+      "index": 0
+    },
+    {
+      "op": "effect.delete",
+      "layer": "ID",
+      "effect": "EFFECT_ID"
+    },
+    {
+      "op": "mask.step.add",
+      "layer": "ID",
+      "kind": "gaussian",
+      "settings": {
+        "radius": 8
+      }
+    },
+    {
+      "op": "mask.step.add",
+      "layer": "ID",
+      "kind": "curves",
+      "settings": {
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            0.5,
+            0.7
+          ],
+          [
+            1,
+            1
+          ]
+        ]
+      }
+    },
+    {
+      "op": "mask.from_color",
+      "layer": "ID",
+      "point": [
+        20,
+        20
+      ],
+      "tolerance": 0.12,
+      "contiguous": true,
+      "mode": "replace"
+    },
+    {
+      "op": "selection",
+      "rect": [
+        10,
+        10,
+        200,
+        200
+      ]
+    },
+    {
+      "op": "adjust",
+      "layer": "ID",
+      "brightness": 0.1,
+      "contrast": 1.1,
+      "saturation": 0.8
+    },
+    {
+      "op": "image.patch",
+      "layer": "ID",
+      "path": "absolute-path.png",
+      "x": 0,
+      "y": 0
+    },
+    {
+      "op": "image.paste",
+      "layer": "destination-layer-or-group-id",
+      "png": "base64 PNG bytes",
+      "origin": [
+        0,
+        0
+      ]
+    },
+    {
+      "op": "image.place",
+      "path": "C:/art/generated.png",
+      "rect": [
+        100,
+        80,
+        500,
+        380
+      ],
+      "layer": "CONTEXT_LAYER_OR_FOLDER_ID",
+      "new_layer": true,
+      "name": "Generated detail"
+    },
+    {
+      "op": "image.place",
+      "png": "BASE64_PNG",
+      "rect": [
+        100,
+        80,
+        500,
+        380
+      ],
+      "layer": "ID",
+      "new_layer": false,
+      "mode": "replace"
+    }
+  ],
+  "not_yet": [
+    "remote clients",
+    "Photoshop text/vector editing",
+    "smart objects",
+    "clipping",
+    "color management",
+    "liquify",
+    "subject/object segmentation",
+    "heal/clone",
+    "nonrectangular selections",
+    "tiled GPU compositor",
+    "disk eviction",
+    "selective task undo"
+  ],
+  "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local PNG/JPEG path or base64 PNG. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable."
+}
