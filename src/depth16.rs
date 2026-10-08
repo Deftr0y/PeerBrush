@@ -168,6 +168,21 @@ pub(crate) fn prepare_with_masks(
                 continue;
             }
         }
+        if let Some(bytes) = crate::disk_cache::read(&key, width, height, 16) {
+            let words = bytes
+                .chunks_exact(2)
+                .map(|v| u16::from_ne_bytes([v[0], v[1]]))
+                .collect();
+            let image = Arc::new(Image16 {
+                width,
+                height,
+                words,
+            });
+            let mut cache = cache.lock().map_err(|_| "16-bit color cache unavailable")?;
+            insert_color(&mut cache, key, image.clone());
+            out[index] = Some(image);
+            continue;
+        }
         let mut image = match layer.kind.as_str() {
             "fill" => {
                 let mut image = Image16::new(width, height)?;
@@ -202,26 +217,43 @@ pub(crate) fn prepare_with_masks(
             color::apply(&mut image, &effect.kind, &effect.settings)?;
         }
         let image = Arc::new(image);
-        let bytes = image.words.len() * 2;
         let mut cache = cache.lock().map_err(|_| "16-bit color cache unavailable")?;
         if let Some(existing) = cache.items.get(&key) {
             out[index] = Some(existing.clone());
             continue;
         }
-        while cache.bytes + bytes > COLOR_BUDGET as usize {
-            let Some(old) = cache.order.pop_front() else {
-                break;
-            };
-            if let Some(image) = cache.items.remove(&old) {
-                cache.bytes -= image.words.len() * 2;
-            }
-        }
-        cache.bytes += bytes;
-        cache.order.push_back(key.clone());
-        cache.items.insert(key, image.clone());
+        insert_color(&mut cache, key, image.clone());
         out[index] = Some(image);
     }
     Ok(out)
+}
+fn insert_color(cache: &mut ColorCache, key: String, image: Arc<Image16>) {
+    let bytes = image.words.len() * 2;
+    if bytes > COLOR_BUDGET as usize {
+        return;
+    }
+    if let Some(previous) = cache.items.remove(&key) {
+        cache.bytes -= previous.words.len() * 2;
+    }
+    cache.order.retain(|k| k != &key);
+    while cache.bytes + bytes > COLOR_BUDGET as usize {
+        let Some(old) = cache.order.pop_front() else {
+            break;
+        };
+        if let Some(image) = cache.items.remove(&old) {
+            cache.bytes -= image.words.len() * 2;
+            crate::disk_cache::spill(
+                &old,
+                image.width,
+                image.height,
+                16,
+                bytemuck::cast_slice(&image.words),
+            );
+        }
+    }
+    cache.bytes += bytes;
+    cache.order.push_back(key.clone());
+    cache.items.insert(key, image.clone());
 }
 pub fn render_crop(doc: &Document, rect: [i32; 4]) -> Result<Image16, String> {
     let width = u32::try_from(i64::from(rect[2]) - i64::from(rect[0]))

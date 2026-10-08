@@ -126,6 +126,7 @@ impl Tool {
     }
 }
 struct Preview {
+    coarse: bool,
     error: Option<String>,
     live: String,
     revision: u64,
@@ -259,9 +260,12 @@ pub struct PeerBrush {
     drag_start: Option<[f32; 2]>,
     view_rect: Option<Rect>,
     message: String,
+    last_status: String,
     job_rx: mpsc::Receiver<Result<String, String>>,
     job_tx: mpsc::Sender<Result<String, String>>,
     busy: bool,
+    load_control: Option<crate::loading::Control>,
+    load_preview: Option<TextureHandle>,
     show_new: bool,
     new_width: u32,
     new_bit_depth: u16,
@@ -503,9 +507,12 @@ impl PeerBrush {
             drag_start: None,
             view_rect: None,
             message: "Ready".into(),
+            last_status: "Ready".into(),
             job_rx,
             job_tx,
             busy: false,
+            load_control: None,
+            load_preview: None,
             show_new: false,
             new_width: 1024,
             new_bit_depth: 8,
@@ -859,6 +866,9 @@ impl PeerBrush {
         }
     }
     fn open(&mut self) {
+        if self.busy {
+            return;
+        }
         let dirty = {
             let e = self.shared.lock().unwrap();
             e.doc.revision != e.saved_revision
@@ -867,16 +877,42 @@ impl PeerBrush {
             self.message = "Save your work before opening another document".into();
             return;
         }
+        self.open_job(None, false);
+    }
+    fn open_job(&mut self, path: Option<PathBuf>, recover: bool) {
+        if self.busy {
+            return;
+        }
         let s = self.shared.clone();
+        let control = crate::loading::Control::default();
+        {
+            let e = s.lock().unwrap();
+            control.bind(e.doc.id.clone(), e.doc.revision);
+        }
+        self.load_control = Some(control.clone());
+        self.load_preview = None;
         self.job(move || {
-            let Some(path) = rfd::FileDialog::new()
-                .add_filter("Photoshop document", &["psd"])
-                .pick_file()
-            else {
+            let path = path.or_else(|| {
+                rfd::FileDialog::new()
+                    .add_filter("Photoshop document", &["psd"])
+                    .pick_file()
+            });
+            let Some(path) = path else {
                 return Ok("Ready".into());
             };
-            server::open(&s, &path)?;
-            Ok("PSD opened".into())
+            server::open_progress(&s, &path, &control)?;
+            if recover {
+                let mut e = s.lock().unwrap();
+                e.path = None;
+                e.file_version = None;
+                e.saved_revision = u64::MAX;
+            }
+            Ok(if recover {
+                "Recovered autosave — save to your chosen PSD"
+            } else {
+                "PSD opened"
+            }
+            .into())
         });
     }
     fn save(&mut self, save_as: bool) {
@@ -962,10 +998,7 @@ impl PeerBrush {
                 self.message = "Save your work before dropping another PSD".into();
                 return;
             }
-            self.job(move || {
-                server::open(&shared, &paths[0])?;
-                Ok("PSD opened".into())
-            });
+            self.open_job(Some(paths[0].clone()), false);
         } else if !paths.is_empty() {
             self.job(move || {
                 let commands: Vec<Value> = paths
@@ -1161,7 +1194,9 @@ impl PeerBrush {
             }
         }
         while let Ok(p) = self.preview_rx.try_recv() {
-            self.pending = false;
+            if !p.coarse {
+                self.pending = false;
+            }
             if p.doc_id == doc.id
                 && p.revision == doc.revision
                 && (p.target == variant || (!live.is_empty() && p.live == live))
@@ -1277,6 +1312,34 @@ impl PeerBrush {
                             .map_err(|_| "Preview worker cache unavailable")?
                             .edit(doc, &commands, &live)?;
                     }
+                    // A coarse shared-engine frame reaches the canvas before detailed sampling.
+                    // Derived only: no source changes, history, or 16-bit conversion.
+                    if dirty.is_none()
+                        && refinement.is_none()
+                        && edge > 512
+                        && doc.width.max(doc.height) > 1024
+                    {
+                        if let Ok((w, h, bytes, _)) = doc.preview(None, 256, layer.as_deref(), mask)
+                        {
+                            let _ = tx.send(Preview {
+                                coarse: true,
+                                error: None,
+                                live: live.clone(),
+                                doc_id: id.clone(),
+                                revision,
+                                target: variant.clone(),
+                                mask,
+                                w,
+                                h,
+                                bytes,
+                                dirty: None,
+                                selection: doc.selection,
+                                selection_polygon: doc.selection_polygon.clone(),
+                                selection_coverage: doc.selection_coverage.clone(),
+                            });
+                            ctx.request_repaint();
+                        }
+                    }
                     let mut rendered = cache
                         .lock()
                         .map_err(|_| "Preview worker cache unavailable")?
@@ -1314,6 +1377,7 @@ impl PeerBrush {
                 let (w, h, bytes, dirty, selection, selection_polygon, selection_coverage) =
                     output.unwrap_or((0, 0, vec![], None, None, None, None));
                 let _ = tx.send(Preview {
+                    coarse: false,
                     error,
                     live,
                     doc_id: id,
@@ -2639,8 +2703,15 @@ impl PeerBrush {
             self.message = reply.result.unwrap_or_else(|e| e);
             self.last_preview = None;
         }
+        let status = self.shared.lock().unwrap().status.clone();
+        if status != self.last_status {
+            self.message = status.clone();
+            self.last_status = status;
+        }
         while let Ok(result) = self.job_rx.try_recv() {
             self.busy = false;
+            self.load_control = None;
+            self.load_preview = None;
             if result
                 .as_ref()
                 .is_ok_and(|msg| msg.starts_with("Imported ") || msg.starts_with("Added "))
@@ -3493,16 +3564,55 @@ impl PeerBrush {
                 if ui.button("Copy configuration").clicked() { ui.ctx().copy_text(config); }
                 ui.label(RichText::new(format!("Local endpoint · 127.0.0.1:{}", self.connection.port)).size(11.0).color(MUTED));
                 if self.connection.state_dir.join("recovery.psd").exists() && ui.button("Recover last autosave").clicked() {
-                    let s = self.shared.clone();
                     let path = self.connection.state_dir.join("recovery.psd");
-                    self.job(move || {
-                        server::open(&s, &path)?;
-                        { let mut e = s.lock().unwrap(); e.path = None; e.file_version = None; e.saved_revision = u64::MAX; }
-                        Ok("Recovered autosave — save to your chosen PSD".into())
-                    });
+                    self.open_job(Some(path),true);
                 }
             });
             self.show_connection = open;
+        }
+        let loading = self
+            .load_control
+            .clone()
+            .or_else(|| self.shared.lock().unwrap().loading.clone());
+        if let Some(control) = loading {
+            if let Some((w, h, bytes)) = control.take_preview() {
+                self.load_preview = Some(ctx.load_texture(
+                    "loading saved image",
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &bytes),
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            let status = control.status();
+            egui::Window::new("Opening PSD")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(350.)
+                .show(ctx, |ui| {
+                    ui.label(if status.stage.is_empty() {
+                        "Choose a PSD file"
+                    } else {
+                        &status.stage
+                    });
+                    if status.total > 0 {
+                        ui.add(
+                            egui::ProgressBar::new(status.completed as f32 / status.total as f32)
+                                .show_percentage(),
+                        );
+                    }
+                    if ui.button("Cancel opening").clicked() {
+                        control.cancel();
+                    }
+                    if let Some(texture) = &self.load_preview {
+                        ui.add(egui::Image::new(texture).max_size(egui::vec2(350., 260.)));
+                        ui.label(
+                            RichText::new("Saved image · loading editable sources")
+                                .size(11.)
+                                .color(MUTED),
+                        );
+                    }
+                });
+        } else {
+            self.load_preview = None;
         }
         if self.pending || self.busy || !self.points.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -4645,6 +4755,7 @@ mod tests {
         app.points.push([30.0, 10.0]);
         app.preview_tx
             .send(Preview {
+                coarse: false,
                 error: None,
                 live,
                 doc_id: doc.id.clone(),
@@ -5935,6 +6046,7 @@ mod tests {
             app.pending = true;
             app.preview_tx
                 .send(Preview {
+                    coarse: false,
                     error: None,
                     live: String::new(),
                     doc_id: source.id.clone(),

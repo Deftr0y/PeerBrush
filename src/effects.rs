@@ -290,12 +290,20 @@ impl Cache {
         Some(out)
     }
     fn insert(&mut self, key: String, image: Arc<Image>) {
+        if image.bytes.len() > BUDGET {
+            return;
+        }
+        if let Some(previous) = self.items.remove(&key) {
+            self.bytes -= previous.bytes.len();
+        }
+        self.order.retain(|k| k != &key);
         while self.bytes + image.bytes.len() > BUDGET {
             let Some(k) = self.order.pop_front() else {
                 break;
             };
             if let Some(v) = self.items.remove(&k) {
                 self.bytes -= v.bytes.len();
+                crate::disk_cache::spill(&k, v.width, v.height, 8, &v.bytes);
             }
         }
         self.bytes += image.bytes.len();
@@ -436,6 +444,16 @@ pub fn prepare(
         let key = format!("{}:{w}:{h}", l.effect_key);
         let cache = CACHE.get_or_init(|| Mutex::new(Cache::default()));
         if let Some(image) = cache.lock().unwrap().get(&key) {
+            out[i] = Some(image);
+            continue;
+        }
+        if let Some(bytes) = crate::disk_cache::read(&key, w, h, 8) {
+            let image = Arc::new(Image {
+                width: w,
+                height: h,
+                bytes,
+            });
+            cache.lock().unwrap().insert(key, image.clone());
             out[i] = Some(image);
             continue;
         }

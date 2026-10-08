@@ -7,6 +7,56 @@ use std::{
     time::Duration,
 };
 
+#[test]
+fn modern_async_open_exposes_progress_cancel_and_exact_native_sources() {
+    let canvas = Canvas::new();
+    let control = peerbrush::loading::Control::default();
+    canvas.shared.lock().unwrap().loading = Some(control.clone());
+    let call = modern_request(
+        json!("cancel-load"),
+        "tools/call",
+        json!({"name":"peerbrush_document","arguments":{"action":"cancel_open"}}),
+    );
+    let reply: Value = response(canvas.modern(&call).send_json(call.clone()))
+        .into_json()
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    assert!(control.check().is_err());
+    canvas.shared.lock().unwrap().loading = None;
+    let mut doc = peerbrush::engine::Document::new_depth(32, 16, 16).unwrap();
+    doc.layers[0]
+        .pixels
+        .set16(3, 7, [60001, 12347, 34569, 65535]);
+    let path = canvas.dir.join("async-native.psd");
+    std::fs::write(&path, peerbrush::psd::encode(&doc).unwrap()).unwrap();
+    let call = modern_request(
+        json!("open-load"),
+        "tools/call",
+        json!({"name":"peerbrush_document","arguments":{"action":"open_async","path":path}}),
+    );
+    let reply: Value = response(canvas.modern(&call).send_json(call.clone()))
+        .into_json()
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    for _ in 0..100 {
+        let e = canvas.shared.lock().unwrap();
+        if e.loading.is_none() {
+            break;
+        }
+        drop(e);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut e = canvas.shared.lock().unwrap();
+    assert!(e.loading.is_none());
+    assert_eq!(e.doc.id, doc.id);
+    assert_eq!(
+        e.doc.layers[0].pixels.get16(3, 7),
+        [60001, 12347, 34569, 65535]
+    );
+    assert!(e.undo.is_empty());
+    assert_eq!(e.state()["file_status"], "PSD opened");
+}
+
 struct Canvas {
     shared: server::Shared,
     connection: server::Connection,

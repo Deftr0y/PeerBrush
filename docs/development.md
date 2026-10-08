@@ -77,7 +77,7 @@ Release measurements on the Windows NVIDIA RTX 3070 Ti Laptop system, with nine 
 | 2048² / native 16-bit, levels + blur | 12864 ms | 621 ms |
 | 4096² / native 16-bit, levels + blur | 65044 ms | 565 ms |
 
-Run `cargo run --release --example preview_performance` or add `-- --effects16` for native effects. Finer dirty-tile tracking and progressive large-document handling remain queued.
+Run `cargo run --release --example preview_performance` or add `-- --effects16` for native effects. Finer dirty-tile tracking remains queued. Progressive loading is described below.
 
 ## Tiled GPU previews (PB-076)
 
@@ -113,3 +113,11 @@ PB-066 verification passed 120 targeted library, engine, folder/geometry, clipbo
 Whole-raster transforms accumulate double-precision placement and regenerate current projections from COW originals. Painted mask steps have independent originals; edits reset only the affected raster, including direct tile writers. Budgets count supplementary sources, private format 9 preserves them, and task compensation restores originals only for an exact pixel inverse. See [retained transforms](retained-transforms.md).
 
 PB-067 passed 172 targeted library/UI, engine, painting, raster, folder/geometry, selection, preview, clipboard, task inverse, HTTP/stdio and PSD/source checks. Native rotation and scale gestures rendered artwork/masks and committed once; each undo restored PNG16 byte-for-byte. Twelve successive rotation/inverse and shrink/enlarge operations restored the original PNG16 exactly. Independent standard PSD16 composite checks retained alpha exactly and RGB within one word; reopening retained sources followed by inverse rotation/scaling restored the same original. Published v0.1.4 protected all three newer saved examples and refused edits. Two opt-in device tests were excluded from this count.
+
+## Large documents (PB-068)
+
+`psd::decode_reader` reads bounded sections and streams composite/color-layer rows into native tiles with cancellation. A saved-image projection precedes complete source restoration; validated private sources avoid duplicate standard-layer decoding. `loading::Control` stays outside the document/history, and replacement checks source revision, file version and reservations. Native preview workers deliver coarse/detailed shared-engine frames with ordinary stale-image rejection.
+
+Evicted color-effect images use a separate disposable disk LRU under the workspace instance lock. Native words remain native; size/depth/dimensions/source-key/checksum validation precedes reuse. Missing/corrupt entries recompute. Existing RAM/GPU budgets and document limits remain explicit; mask buffers and private JSON are bounded in-memory paths. See [loading/caching behavior and limits](large-documents.md).
+
+PB-068 passed 145 distinct targeted library, engine, folder, native-depth, preview, HTTP/stdio, loading/cache and PSD/source checks; two opt-in device tests were excluded. The native workspace displayed loading stages, a fixed Cancel control and saved-image feedback. A 3072² native16 project with four retained raster originals reopened and exported PNG16 byte-for-byte against its saved baseline. Independently decoded standard PSD16 channels retained native RGB and exact opaque/transparent alpha. Cancellation through the shared native loader control preserved the previous document ID, revision and saved state. UI clicks on this local fixture arrived after loading completed, so a successful button-click cancellation is not claimed.

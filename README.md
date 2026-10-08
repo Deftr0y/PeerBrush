@@ -42,6 +42,7 @@ You stay in control while AI works directly alongside you inside the same editin
 
 ### Built for the way you work
 
+- **Progressive document loading.** Cancellable native16 PSD decoding, saved-image feedback and bounded disposable effect caches. See [large-document behavior](docs/large-documents.md).
 - **Visual, compact controls.** White tool glyphs, Ubuntu Sans, uncluttered range values and live canvas feedback.
 - **A useful hierarchy.** Distinct folders, multi-layer editing, drag into or out of folders, animated reorder previews, visibility sweep gestures, inline renaming, grouping and merging.
 - **Editable effects.** Each layer or folder has independent color and mask stacks. The top effect runs last. Return to an effect and change its settings after later edits; blend and opacity sit beneath the stack.

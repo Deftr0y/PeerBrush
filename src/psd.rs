@@ -706,12 +706,339 @@ struct Record {
     mask_enabled: bool,
     section: u32,
 }
+fn decoded_storage(records: &[Record], w: u32, h: u32, depth: u16) -> Result<(), String> {
+    let tile = crate::raster::TILE as i64;
+    let unit = (tile * tile * 4 * if depth == 16 { 2 } else { 1 }) as u64;
+    let mut bytes = 0u64;
+    for rec in records {
+        let lw = (rec.bounds[3] - rec.bounds[1]) as i64;
+        let lh = (rec.bounds[2] - rec.bounds[0]) as i64;
+        if rec.channels.iter().any(|(c, _)| (-1..=2).contains(c)) {
+            bytes += (((lw + tile - 1) / tile) * ((lh + tile - 1) / tile)) as u64 * unit;
+        }
+        if rec.channels.iter().any(|(c, _)| *c == -2) {
+            if let Some(b) = rec.mask_bounds {
+                if b[3] < b[1] || b[2] < b[0] {
+                    return Err("Invalid mask bounds".into());
+                }
+                let (pw, ph) = if rec.layer.kind == "group" {
+                    (w as i64, h as i64)
+                } else {
+                    (lw, lh)
+                };
+                let left = (b[1] as i64 - rec.bounds[1] as i64).clamp(0, pw);
+                let right = (b[3] as i64 - rec.bounds[1] as i64).clamp(0, pw);
+                let top = (b[0] as i64 - rec.bounds[0] as i64).clamp(0, ph);
+                let bottom = (b[2] as i64 - rec.bounds[0] as i64).clamp(0, ph);
+                if right > left && bottom > top {
+                    bytes += (((right + tile - 1) / tile - left / tile)
+                        * ((bottom + tile - 1) / tile - top / tile))
+                        as u64
+                        * unit;
+                }
+            }
+        }
+        if bytes > 512 * 1024 * 1024 {
+            return Err("PSD decoded tiles exceed the 512 MiB raster-source budget".into());
+        }
+    }
+    Ok(())
+}
+
+struct HashedReader<'a, R> {
+    reader: &'a mut R,
+    hash: u64,
+}
+impl<R: Read> Read for HashedReader<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.reader.read(out)?;
+        for b in &out[..n] {
+            self.hash = (self.hash ^ *b as u64).wrapping_mul(0x100000001b3);
+        }
+        Ok(n)
+    }
+}
+fn stream_composite<R: Read>(
+    input: &mut R,
+    w: u32,
+    h: u32,
+    depth: u16,
+    count: usize,
+    transparency: bool,
+    control: &crate::loading::Control,
+) -> Result<Raster, String> {
+    let mut kind = [0; 2];
+    input.read_exact(&mut kind).map_err(|e| e.to_string())?;
+    let kind = u16::from_be_bytes(kind);
+    if kind > 3 {
+        return Err("Unsupported PSD composite compression".into());
+    }
+    let lengths = if kind == 1 {
+        let mut lengths = Vec::with_capacity(h as usize * count);
+        for _ in 0..h as usize * count {
+            let mut n = [0; 2];
+            input.read_exact(&mut n).map_err(|e| e.to_string())?;
+            lengths.push(u16::from_be_bytes(n) as usize);
+        }
+        lengths
+    } else {
+        vec![]
+    };
+    let mut raster = Raster::new_depth(w, h, depth);
+    if kind >= 2 {
+        let mut zip = ZlibDecoder::new(input);
+        composite_rows(
+            &mut zip,
+            &mut raster,
+            count,
+            kind,
+            &lengths,
+            transparency,
+            0,
+            true,
+            "Decoding saved image",
+            control,
+        )?;
+        let mut extra = [0; 1];
+        if zip.read(&mut extra).map_err(|e| e.to_string())? != 0 {
+            return Err("Wrong PSD composite size".into());
+        }
+    } else {
+        composite_rows(
+            input,
+            &mut raster,
+            count,
+            kind,
+            &lengths,
+            transparency,
+            0,
+            true,
+            "Decoding saved image",
+            control,
+        )?;
+    }
+    control.progress("Resolving saved composite transparency", 0, 1)?;
+    // PSD compatibility colors are composited over white. Restore straight RGB in tiles.
+    let max = if depth == 16 { 65535i64 } else { 255 };
+    let restore = |pixel: &mut [u16]| {
+        let a = pixel[3] as i64;
+        for v in &mut pixel[..3] {
+            *v = if a == 0 {
+                0
+            } else {
+                (((*v as i64 + a - max) * max + a / 2) / a).clamp(0, max) as u16
+            };
+        }
+    };
+    for tile in raster.samples16.values_mut() {
+        control.check()?;
+        for pixel in std::sync::Arc::make_mut(tile).chunks_exact_mut(4) {
+            restore(pixel);
+        }
+    }
+    for tile in raster.tiles.values_mut() {
+        control.check()?;
+        for pixel in std::sync::Arc::make_mut(tile).chunks_exact_mut(4) {
+            let mut p = pixel.try_into().map(|p: [u8; 4]| p.map(u16::from)).unwrap();
+            restore(&mut p);
+            pixel.copy_from_slice(&p.map(|v| v as u8));
+        }
+    }
+    Ok(raster)
+}
+fn composite_rows<R: Read>(
+    input: &mut R,
+    raster: &mut Raster,
+    count: usize,
+    kind: u16,
+    lengths: &[usize],
+    transparency: bool,
+    channel: usize,
+    initialize: bool,
+    stage: &str,
+    control: &crate::loading::Control,
+) -> Result<(), String> {
+    use crate::raster::TILE;
+    use std::sync::Arc;
+    let (w, h, depth) = (raster.width, raster.height, raster.depth);
+    let row_bytes = w as usize * if depth == 16 { 2 } else { 1 };
+    let mut row = vec![0; row_bytes];
+    let mut packed = vec![];
+    for c in 0..count {
+        for y in 0..h {
+            if y % 16 == 0 {
+                control.progress(stage, c * h as usize + y as usize, count * h as usize)?;
+            }
+            if kind == 1 {
+                packed.resize(lengths[c * h as usize + y as usize], 0);
+                input.read_exact(&mut packed).map_err(|e| e.to_string())?;
+                let (mut i, mut o) = (0, 0);
+                while i < packed.len() {
+                    let packet = packed[i] as i8;
+                    i += 1;
+                    match packet {
+                        0..=127 => {
+                            let n = packet as usize + 1;
+                            if i + n > packed.len() || o + n > row.len() {
+                                return Err("Invalid PSD RLE literal".into());
+                            }
+                            row[o..o + n].copy_from_slice(&packed[i..i + n]);
+                            i += n;
+                            o += n;
+                        }
+                        -127..=-1 => {
+                            let n = (-packet as i16 + 1) as usize;
+                            let value = *packed.get(i).ok_or("Invalid PSD RLE repeat")?;
+                            i += 1;
+                            if o + n > row.len() {
+                                return Err("PSD RLE row overflow".into());
+                            }
+                            row[o..o + n].fill(value);
+                            o += n;
+                        }
+                        _ => {}
+                    }
+                }
+                if o != row.len() {
+                    return Err("Invalid PSD RLE row width".into());
+                }
+            } else {
+                input.read_exact(&mut row).map_err(|e| e.to_string())?;
+            }
+            if kind == 3 {
+                if depth == 16 {
+                    let mut previous = 0u16;
+                    for word in row.chunks_exact_mut(2) {
+                        previous = previous.wrapping_add(u16::from_be_bytes([word[0], word[1]]));
+                        word.copy_from_slice(&previous.to_be_bytes());
+                    }
+                } else {
+                    for x in 1..row.len() {
+                        row[x] = row[x].wrapping_add(row[x - 1]);
+                    }
+                }
+            }
+            if c + channel == 3 && !transparency {
+                continue;
+            }
+            for tx in 0..w.div_ceil(TILE) {
+                let start = tx * TILE;
+                let end = (start + TILE).min(w);
+                let index = ((y % TILE) * TILE * 4) as usize;
+                if depth == 16 {
+                    let tile = raster
+                        .samples16
+                        .entry((tx, y / TILE))
+                        .or_insert_with(|| Arc::new(vec![0; (TILE * TILE * 4) as usize]));
+                    let values = Arc::make_mut(tile);
+                    for x in start..end {
+                        let i = index + ((x - start) * 4) as usize;
+                        if initialize && c == 0 {
+                            values[i + 3] = 65535;
+                        }
+                        values[i + c + channel] =
+                            u16::from_be_bytes([row[x as usize * 2], row[x as usize * 2 + 1]]);
+                    }
+                } else {
+                    let tile = raster
+                        .tiles
+                        .entry((tx, y / TILE))
+                        .or_insert_with(|| Arc::new(vec![0; (TILE * TILE * 4) as usize]));
+                    let values = Arc::make_mut(tile);
+                    for x in start..end {
+                        let i = index + ((x - start) * 4) as usize;
+                        if initialize && c == 0 {
+                            values[i + 3] = 255;
+                        }
+                        values[i + c + channel] = row[x as usize];
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn decode(data: &[u8]) -> Result<Document, String> {
-    if data.len() > 256 * 1024 * 1024 {
+    decode_reader(
+        &mut std::io::Cursor::new(data),
+        &crate::loading::Control::default(),
+    )
+}
+fn stream_layer_channel(
+    bytes: &[u8],
+    raster: &mut Raster,
+    channel: usize,
+    initialize: bool,
+    control: &crate::loading::Control,
+) -> Result<(), String> {
+    if raster.width == 0 || raster.height == 0 {
+        return Ok(());
+    }
+    let mut cursor = std::io::Cursor::new(bytes);
+    let mut kind = [0; 2];
+    cursor.read_exact(&mut kind).map_err(|e| e.to_string())?;
+    let kind = u16::from_be_bytes(kind);
+    if kind > 3 {
+        return Err("Unsupported PSD channel compression".into());
+    }
+    let mut lengths = vec![];
+    if kind == 1 {
+        for _ in 0..raster.height {
+            let mut n = [0; 2];
+            cursor.read_exact(&mut n).map_err(|e| e.to_string())?;
+            lengths.push(u16::from_be_bytes(n) as usize);
+        }
+    }
+    if kind >= 2 {
+        let mut zip = ZlibDecoder::new(cursor);
+        composite_rows(
+            &mut zip,
+            raster,
+            1,
+            kind,
+            &lengths,
+            true,
+            channel,
+            initialize,
+            "Decoding native layer pixels",
+            control,
+        )?;
+        let mut extra = [0; 1];
+        if zip.read(&mut extra).map_err(|e| e.to_string())? != 0 {
+            return Err("Wrong PSD channel size".into());
+        }
+    } else {
+        composite_rows(
+            &mut cursor,
+            raster,
+            1,
+            kind,
+            &lengths,
+            true,
+            channel,
+            initialize,
+            "Decoding native layer pixels",
+            control,
+        )?;
+    }
+    Ok(())
+}
+/// Stream the composite into native tiles; never buffer the complete encoded file.
+pub fn decode_reader<R: Read + std::io::Seek>(
+    reader: &mut R,
+    control: &crate::loading::Control,
+) -> Result<Document, String> {
+    use std::io::SeekFrom;
+    let length = reader.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    if length > 256 * 1024 * 1024 {
         return Err("Initial PSD file limit is 256 MiB".into());
     }
-    let mut r = Cursor::new(data);
+    reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    control.progress("Reading PSD header", 0, 1)?;
+    let mut header = [0; 26];
+    reader.read_exact(&mut header).map_err(|e| e.to_string())?;
+    let mut r = Cursor::new(&header);
     if r.bytes(4)? != b"8BPS" || r.u16()? != 1 {
         return Err("Only PSD v1 is supported; PSB is not supported yet".into());
     }
@@ -725,8 +1052,80 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
     if ![8, 16].contains(&depth) || mode != 3 || !(3..=4).contains(&channel_count) {
         return Err("PeerBrush opens 8-bit and 16-bit RGB PSDs (3 or 4 channels); unsupported Photoshop source features remain protected".into());
     }
-    r.block()?;
-    let resources = r.block()?;
+    read_section(reader, length, control, "Reading color data")?;
+    let resources = read_section(reader, length, control, "Reading PSD resources")?;
+    let layer_section = read_section(reader, length, control, "Reading layer sources")?;
+    let transparency = merged_transparency(&layer_section, depth)?;
+    let mut input = HashedReader {
+        reader,
+        hash: 0xcbf29ce484222325,
+    };
+    let merged = stream_composite(
+        &mut input,
+        w,
+        h,
+        depth,
+        channel_count,
+        transparency,
+        control,
+    )?;
+    let mut remaining = [0; 65536];
+    loop {
+        control.check()?;
+        if input.read(&mut remaining).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+    }
+    control.preview(&merged)?;
+    decode_parts(
+        &resources,
+        &layer_section,
+        w,
+        h,
+        depth,
+        merged,
+        input.hash,
+        control,
+    )
+}
+fn read_section<R: Read + std::io::Seek>(
+    reader: &mut R,
+    length: u64,
+    control: &crate::loading::Control,
+    stage: &str,
+) -> Result<Vec<u8>, String> {
+    let mut n = [0; 4];
+    reader.read_exact(&mut n).map_err(|e| e.to_string())?;
+    let n = u32::from_be_bytes(n) as usize;
+    let position = reader.stream_position().map_err(|e| e.to_string())?;
+    if n as u64 > length.saturating_sub(position) {
+        return Err("Truncated PSD section".into());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(n)
+        .map_err(|_| "PSD section allocation failed")?;
+    for offset in (0..n).step_by(1024 * 1024) {
+        control.progress(stage, offset, n)?;
+        let end = (offset + 1024 * 1024).min(n);
+        bytes.resize(end, 0);
+        reader
+            .read_exact(&mut bytes[offset..end])
+            .map_err(|e| e.to_string())?;
+    }
+    control.progress(stage, n, n)?;
+    Ok(bytes)
+}
+fn decode_parts(
+    resources: &[u8],
+    layer_section: &[u8],
+    w: u32,
+    h: u32,
+    depth: u16,
+    merged: Raster,
+    composite_hash: u64,
+    control: &crate::loading::Control,
+) -> Result<Document, String> {
     let mut rr = Cursor::new(resources);
     let mut embedded = None;
     let mut warnings = vec![];
@@ -743,7 +1142,7 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
         }
         let payload = rr.block()?;
         if key == 4000 && payload.starts_with(b"PBR1") {
-            embedded = Some(payload[4..].to_vec());
+            embedded = Some(&payload[4..]);
         }
         // VersionInfo marks a missing compatibility composite explicitly.
         if key == 1057 && payload.len() >= 5 && payload[..4] == [0, 0, 0, 1] {
@@ -756,25 +1155,69 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
             rr.bytes(1)?;
         }
     }
-    let layer_section = r.block()?;
-    let composite_data = &data[r.pos..];
     let high = depth == 16;
     if high && !has_merged_composite {
         return Err("This 16-bit PSD has no saved compatibility image. Re-save a copy in Photoshop with Maximize PSD Compatibility enabled to preview it in PeerBrush".into());
     }
+    if let Some(bytes) = embedded {
+        control.progress("Restoring editable sources", 0, 1)?;
+        let mut json = vec![];
+        let limit = if high {
+            512 * 1024 * 1024
+        } else {
+            128 * 1024 * 1024
+        };
+        let mut zip = ZlibDecoder::new(&bytes[..]).take(limit + 1);
+        let mut chunk = vec![0; 1024 * 1024];
+        let result = (|| -> Result<(), String> {
+            loop {
+                control.check()?;
+                let n = zip.read(&mut chunk).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                json.extend_from_slice(&chunk[..n]);
+            }
+            Ok(())
+        })();
+        control.check()?;
+        if result.is_ok()
+            && json.len()
+                <= if high {
+                    512 * 1024 * 1024
+                } else {
+                    128 * 1024 * 1024
+                }
+        {
+            if let Ok(e) = serde_json::from_slice::<Embedded>(&json) {
+                if (1..=9).contains(&e.format)
+                    && e.document.bit_depth == depth
+                    && (!high || e.format >= 5)
+                    && e.standard_hash == hash(layer_section) ^ composite_hash
+                    && validate(&e.document).is_ok()
+                {
+                    control.progress("Ready", 1, 1)?;
+                    return Ok(e.document);
+                }
+            }
+        }
+        warnings.push(
+            "PeerBrush definitions were changed or removed externally; using saved PSD pixels"
+                .into(),
+        );
+    }
     let mut records = vec![];
-    let mut merged_transparency = merged_transparency(layer_section, depth)?;
     if !layer_section.is_empty() {
         let info = layer_info(layer_section, depth)?;
         if info.len() >= 2 {
             let mut lr = Cursor::new(info);
             let signed_count = lr.i16()?;
-            merged_transparency |= signed_count < 0;
             let count = signed_count.unsigned_abs() as usize;
             if count > 200 {
                 return Err("Too many PSD layers for this version".into());
             }
-            for _ in 0..count {
+            for record_index in 0..count {
+                control.progress("Reading layer definitions", record_index, count)?;
                 let bounds = [lr.i32()?, lr.i32()?, lr.i32()?, lr.i32()?];
                 if bounds.iter().any(|v| v.unsigned_abs() > 100000) {
                     return Err("PSD layer coordinates exceed initial limits".into());
@@ -799,7 +1242,11 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
                 }
                 let mut channels = vec![];
                 for _ in 0..nc {
-                    channels.push((lr.i16()?, lr.u32()? as usize));
+                    let channel = lr.i16()?;
+                    channels.push((channel, lr.u32()? as usize));
+                    if !(-2..=2).contains(&channel) {
+                        warnings.push(format!("Unsupported Photoshop layer channel: {channel}"));
+                    }
                 }
                 if lr.bytes(4)? != b"8BIM" {
                     return Err("Invalid blend signature".into());
@@ -949,147 +1396,91 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
                     section,
                 });
             }
-            let mut total = 0usize;
-            for rec in &mut records {
-                let lw = rec.layer.pixels.width;
-                let lh = rec.layer.pixels.height;
-                let n = lw as usize * lh as usize;
-                total = total
-                    .checked_add(n * if high { 8 } else { 4 })
-                    .ok_or("PSD allocation overflow")?;
-                if total > 512 * 1024 * 1024 {
-                    return Err("PSD layers exceed initial memory budget".into());
-                }
-                let mut rgba = if high { vec![] } else { vec![0; n * 4] };
-                let mut rgba16 = if high { vec![0; n * 4] } else { vec![] };
-                for p in rgba.chunks_exact_mut(4) {
-                    p[3] = 255;
-                }
-                for p in rgba16.chunks_exact_mut(4) {
-                    p[3] = 65535;
-                }
-                for &(ch, size) in &rec.channels {
-                    let bytes = lr.bytes(size)?;
-                    if ch == -2 {
-                        if let Some(b) = rec.mask_bounds {
-                            let mw = b[3].checked_sub(b[1]).ok_or("Invalid mask")?;
-                            let mh = b[2].checked_sub(b[0]).ok_or("Invalid mask")?;
-                            if mw < 0 || mh < 0 {
-                                return Err("Invalid mask bounds".into());
-                            }
-                            let values = if high {
-                                decode_channel_16(bytes, mw as u32, mh as u32)?
-                            } else {
-                                decode_channel(bytes, mw as u32, mh as u32)?
-                                    .into_iter()
-                                    .map(|v| v as u16 * 257)
-                                    .collect()
-                            };
-                            let (pw, ph) = if rec.layer.kind == "group" {
-                                (w, h)
-                            } else {
-                                (lw, lh)
-                            };
-                            let mut pixels = Raster::new_depth(pw, ph, depth);
-                            for yy in 0..mh {
-                                for xx in 0..mw {
-                                    let v = values[(yy * mw + xx) as usize];
-                                    pixels.set16(
-                                        xx + b[1] - rec.bounds[1],
-                                        yy + b[0] - rec.bounds[0],
-                                        [v, v, v, 65535],
-                                    );
+            if warnings.is_empty() {
+                decoded_storage(&records, w, h, depth)?;
+                let record_count = records.len();
+                for (record_index, rec) in records.iter_mut().enumerate() {
+                    control.progress("Decoding native layer pixels", record_index, record_count)?;
+                    let lw = rec.layer.pixels.width;
+                    let lh = rec.layer.pixels.height;
+                    let mut pixels = Raster::new_depth(lw, lh, depth);
+                    let mut initialized = false;
+                    for &(ch, size) in &rec.channels {
+                        control.check()?;
+                        let bytes = lr.bytes(size)?;
+                        if ch == -2 {
+                            if let Some(b) = rec.mask_bounds {
+                                let mw = b[3].checked_sub(b[1]).ok_or("Invalid mask")?;
+                                let mh = b[2].checked_sub(b[0]).ok_or("Invalid mask")?;
+                                if mw < 0 || mh < 0 {
+                                    return Err("Invalid mask bounds".into());
                                 }
+                                let values = if high {
+                                    decode_channel_16(bytes, mw as u32, mh as u32)?
+                                } else {
+                                    decode_channel(bytes, mw as u32, mh as u32)?
+                                        .into_iter()
+                                        .map(|v| v as u16 * 257)
+                                        .collect()
+                                };
+                                let (pw, ph) = if rec.layer.kind == "group" {
+                                    (w, h)
+                                } else {
+                                    (lw, lh)
+                                };
+                                let mut pixels = Raster::new_depth(pw, ph, depth);
+                                for yy in 0..mh {
+                                    if yy % 16 == 0 {
+                                        control.check()?;
+                                    }
+                                    for xx in 0..mw {
+                                        let v = values[(yy * mw + xx) as usize];
+                                        pixels.set16(
+                                            xx + b[1] - rec.bounds[1],
+                                            yy + b[0] - rec.bounds[0],
+                                            [v, v, v, 65535],
+                                        );
+                                    }
+                                }
+                                rec.layer.mask = Some(Mask {
+                                    cache_key: crate::engine::id(),
+                                    enabled: rec.mask_enabled,
+                                    steps: vec![
+                                        MaskStep {
+                                            id: id(),
+                                            kind: "fill".into(),
+                                            enabled: true,
+                                            value: rec.mask_default as f32,
+                                            pixels: Raster::new_depth(pw, ph, depth),
+                                            settings: serde_json::Value::Null,
+                                        },
+                                        MaskStep {
+                                            id: id(),
+                                            kind: "paint".into(),
+                                            enabled: true,
+                                            value: 0.0,
+                                            pixels,
+                                            settings: serde_json::Value::Null,
+                                        },
+                                    ],
+                                });
                             }
-                            rec.layer.mask = Some(Mask {
-                                cache_key: crate::engine::id(),
-                                enabled: rec.mask_enabled,
-                                steps: vec![
-                                    MaskStep {
-                                        id: id(),
-                                        kind: "fill".into(),
-                                        enabled: true,
-                                        value: rec.mask_default as f32,
-                                        pixels: Raster::new_depth(pw, ph, depth),
-                                        settings: serde_json::Value::Null,
-                                    },
-                                    MaskStep {
-                                        id: id(),
-                                        kind: "paint".into(),
-                                        enabled: true,
-                                        value: 0.0,
-                                        pixels,
-                                        settings: serde_json::Value::Null,
-                                    },
-                                ],
-                            });
-                        }
-                    } else if (-1..=2).contains(&ch) {
-                        let c = if ch == -1 { 3 } else { ch as usize };
-                        if high {
-                            let values = decode_channel_16(bytes, lw, lh)?;
-                            for (p, value) in rgba16.chunks_exact_mut(4).zip(values) {
-                                p[c] = value;
-                            }
+                        } else if (-1..=2).contains(&ch) {
+                            let c = if ch == -1 { 3 } else { ch as usize };
+                            stream_layer_channel(bytes, &mut pixels, c, !initialized, control)?;
+                            initialized = true;
                         } else {
-                            let values = decode_channel(bytes, lw, lh)?;
-                            for (p, value) in rgba.chunks_exact_mut(4).zip(values) {
-                                p[c] = value;
-                            }
+                            warnings.push(format!("Unsupported Photoshop layer channel: {ch}"));
                         }
-                    } else {
-                        warnings.push(format!("Unsupported Photoshop layer channel: {ch}"));
+                    }
+                    if lw > 0 && lh > 0 {
+                        rec.layer.pixels = pixels;
+                    } else if rec.layer.kind == "group" {
+                        rec.layer.pixels = Raster::new_depth(w, h, depth);
                     }
                 }
-                if lw > 0 && lh > 0 {
-                    rec.layer.pixels = if high {
-                        Raster::from_rgba16(lw, lh, &rgba16)?
-                    } else {
-                        Raster::from_rgba(lw, lh, &rgba)?
-                    };
-                } else if rec.layer.kind == "group" {
-                    rec.layer.pixels = Raster::new_depth(w, h, depth);
-                }
             }
         }
-    }
-    let merged = if high {
-        decode_composite_16(composite_data, w, h, channel_count, merged_transparency)?
-    } else {
-        decode_composite(composite_data, w, h, channel_count, merged_transparency)?
-    };
-    if let Some(bytes) = embedded {
-        let mut json = vec![];
-        let result = ZlibDecoder::new(&bytes[..])
-            .take(if high {
-                512 * 1024 * 1024 + 1
-            } else {
-                128 * 1024 * 1024 + 1
-            })
-            .read_to_end(&mut json);
-        if result.is_ok()
-            && json.len()
-                <= if high {
-                    512 * 1024 * 1024
-                } else {
-                    128 * 1024 * 1024
-                }
-        {
-            if let Ok(e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=9).contains(&e.format)
-                    && e.document.bit_depth == depth
-                    && (!high || e.format >= 5)
-                    && e.standard_hash == hash(layer_section) ^ hash(composite_data)
-                    && validate(&e.document).is_ok()
-                {
-                    return Ok(e.document);
-                }
-            }
-        }
-        warnings.push(
-            "PeerBrush definitions were changed or removed externally; using saved PSD pixels"
-                .into(),
-        );
     }
     warnings.sort();
     warnings.dedup();
@@ -1118,6 +1509,7 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
         warnings.push("16-bit Photoshop source features are read-only and protected. The saved composite retains 16-bit samples; an explicit editable copy flattens its layers without reducing precision".into());
     }
     doc.warnings = warnings;
+    control.progress("Ready", 1, 1)?;
     Ok(doc)
 }
 ///16-bit Photoshop layer records live in Lr16 instead of the primary8-bit block.
@@ -1282,114 +1674,6 @@ fn decode_planes_16(data: &[u8], w: u32, h: u32, count: usize) -> Result<Vec<u16
 fn decode_channel_16(data: &[u8], w: u32, h: u32) -> Result<Vec<u16>, String> {
     decode_planes_16(data, w, h, 1)
 }
-fn decode_composite_16(
-    data: &[u8],
-    w: u32,
-    h: u32,
-    count: usize,
-    transparency: bool,
-) -> Result<Raster, String> {
-    let planes = decode_planes_16(data, w, h, count)?;
-    let pixels = w as usize * h as usize;
-    let sample = |channel: usize, i: usize| planes[channel * pixels + i] as i64;
-    let mut words = vec![0; pixels * 4];
-    for i in 0..pixels {
-        let alpha = if transparency && count >= 4 {
-            sample(3, i)
-        } else {
-            65535
-        };
-        for c in 0..3 {
-            words[i * 4 + c] = if alpha == 0 {
-                0
-            } else {
-                (((sample(c, i) + alpha - 65535) * 65535 + alpha / 2) / alpha).clamp(0, 65535)
-                    as u16
-            };
-        }
-        words[i * 4 + 3] = alpha as u16;
-    }
-    drop(planes);
-    Raster::from_rgba16(w, h, &words)
-}
-
-fn decode_composite(
-    data: &[u8],
-    w: u32,
-    h: u32,
-    count: usize,
-    transparency: bool,
-) -> Result<Raster, String> {
-    let mut r = Cursor::new(data);
-    let kind = r.u16()?;
-    let n = w as usize * h as usize;
-    let mut channels = vec![];
-    if kind == 0 {
-        for _ in 0..count {
-            channels.push(r.bytes(n)?.to_vec());
-        }
-    } else if kind == 1 {
-        let mut sizes = vec![];
-        for _ in 0..count {
-            let mut s = vec![];
-            for _ in 0..h {
-                s.push(r.u16()?);
-            }
-            sizes.push(s);
-        }
-        for s in sizes {
-            let mut b = vec![];
-            u16b(&mut b, 1);
-            for v in &s {
-                u16b(&mut b, *v);
-            }
-            let total: usize = s.iter().map(|v| *v as usize).sum();
-            b.extend_from_slice(r.bytes(total)?);
-            channels.push(decode_channel(&b, w, h)?);
-        }
-    } else if kind == 2 || kind == 3 {
-        let mut decoded = vec![];
-        ZlibDecoder::new(&data[2..])
-            .take((n * count + 1) as u64)
-            .read_to_end(&mut decoded)
-            .map_err(|e| e.to_string())?;
-        if decoded.len() != n * count {
-            return Err("Wrong composite size".into());
-        }
-        for c in 0..count {
-            let mut v = decoded[c * n..(c + 1) * n].to_vec();
-            if kind == 3 {
-                for row in v.chunks_exact_mut(w as usize) {
-                    for i in 1..row.len() {
-                        row[i] = row[i].wrapping_add(row[i - 1]);
-                    }
-                }
-            }
-            channels.push(v);
-        }
-    } else {
-        return Err("Unsupported composite compression".into());
-    }
-    let mut rgba = vec![0; n * 4];
-    for i in 0..n {
-        let alpha = if transparency && count >= 4 {
-            channels[3][i]
-        } else {
-            255
-        };
-        for c in 0..3 {
-            rgba[i * 4 + c] = if alpha == 0 {
-                0
-            } else {
-                (((channels[c][i] as i32 + alpha as i32 - 255) * 255 + alpha as i32 / 2)
-                    / alpha as i32)
-                    .clamp(0, 255) as u8
-            };
-        }
-        rgba[i * 4 + 3] = alpha;
-    }
-    Raster::from_rgba(w, h, &rgba)
-}
 pub fn validate(doc: &Document) -> Result<(), String> {
     crate::compositor::validate_clipping(doc)?;
     for coverage in [&doc.selection_coverage, &doc.selection_previous]
@@ -1523,4 +1807,48 @@ pub fn validate(doc: &Document) -> Result<(), String> {
         crate::effects::validate_budget(doc)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    fn record() -> Record {
+        Record {
+            layer: Layer::new("Thin source", "paint", 8192, 1),
+            channels: vec![(0, 2)],
+            bounds: [0, 0, 1, 8192],
+            mask_bounds: None,
+            mask_default: 255,
+            mask_enabled: true,
+            section: 0,
+        }
+    }
+    #[test]
+    fn tile_budget_counts_padding_masks_and_skips_empty_records_before_decoding() {
+        let mut records = (0..32).map(|_| record()).collect::<Vec<_>>();
+        decoded_storage(&records, 8192, 1, 16).unwrap();
+        for rec in &mut records {
+            rec.bounds[2] = 256;
+        }
+        // A complete tile row costs exactly as much as a one-pixel-high row.
+        decoded_storage(&records, 8192, 256, 16).unwrap();
+        for rec in &mut records {
+            rec.bounds[2] = 1;
+        }
+        records.push(record());
+        assert!(decoded_storage(&records, 8192, 1, 16)
+            .unwrap_err()
+            .contains("budget"));
+        records.pop();
+        records[0].mask_bounds = Some([0, 0, 1, 1]);
+        records[0].channels.push((-2, 2));
+        assert!(decoded_storage(&records, 8192, 1, 16).is_err());
+        for rec in &mut records {
+            rec.channels.clear();
+        }
+        decoded_storage(&records, 8192, 1, 16).unwrap();
+        assert!(records
+            .iter()
+            .all(|r| r.layer.pixels.tiles.is_empty() && r.layer.pixels.samples16.is_empty()));
+    }
 }

@@ -847,7 +847,10 @@
     "preview": "Native Image menu shows actual shared-engine pixels and dimensions. Apply one undo; Cancel/Escape or a newer source edit discards preview."
   },
   "retained_transforms": {
-    "commands": ["transform", "move"],
+    "commands": [
+      "transform",
+      "move"
+    ],
     "behavior": "Whole-layer rotation/scaling accumulate affine placement and regenerate current raster/mask projections from retained native originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the pivot.",
     "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty] mapping original local coordinates to the current frame, or null. No tile samples in observations.",
     "pixel_edits": "Painting, clone/heal, fill, direct adjustments, image replacement and selected-pixel edits establish a new baseline for only the changed raster. Other mask/color originals and effects remain editable. Image resize and explicit channel-depth conversion establish raster baselines; crop/canvas retain sources.",
@@ -869,5 +872,21 @@
     "guards": "Complete-layer transforms preserve definitions; selected-pixel/mask transforms require explicit rasterization. Color painting/placement refuses source layers. Mask painting and effects remain editable. Shared stale/revision/lock/reservation guards are atomic.",
     "psd": "Private source format 8 supplements current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
     "limits": "4 MP original source frame, 4096 characters / 96 lines, size 1–1024, line_height 0.5–4, 128 path points, stroke_width 0–256, 32 million outline/path work budget."
+  },
+  "large_documents": {
+    "document_actions": [
+      "open",
+      "open_async",
+      "cancel_open"
+    ],
+    "progress": "observe state.loading stage/completed/total and state.file_status; no partial editable document is exposed",
+    "decoder": "Row-to-native-tile raw/RLE/ZIP/predicted composites and color channels, cancellable section reads, bounded saved-image preview, direct validated PeerBrush source restoration",
+    "rendering": "Coarse shared-engine frame before detailed native preview; revision/view guards; native sources remain 8/16-bit",
+    "disk_cache": {
+      "bytes": 536870912,
+      "entry_bytes": 268435456,
+      "kind": "Disposable evicted 8/16-bit color effects, isolated per instance, checksum/dimension/depth/source-key guarded; failures recompute from sources"
+    },
+    "limits": "PSD v1, encoded 256 MiB, 8192 per edge, 32 MP, raster sources including originals 512 MiB; bounded mask/private-JSON memory paths; no PSB or out-of-core editable sources"
   }
 }
