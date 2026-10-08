@@ -846,6 +846,15 @@
     "guards": "Whole-document reservation scope; locked moved/resampled layers reject. Optional document_id/source_revision; all failures atomic.",
     "preview": "Native Image menu shows actual shared-engine pixels and dimensions. Apply one undo; Cancel/Escape or a newer source edit discards preview."
   },
+  "retained_transforms": {
+    "commands": ["transform", "move"],
+    "behavior": "Whole-layer rotation/scaling accumulate affine placement and regenerate current raster/mask projections from retained native originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the pivot.",
+    "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty] mapping original local coordinates to the current frame, or null. No tile samples in observations.",
+    "pixel_edits": "Painting, clone/heal, fill, direct adjustments, image replacement and selected-pixel edits establish a new baseline for only the changed raster. Other mask/color originals and effects remain editable. Image resize and explicit channel-depth conversion establish raster baselines; crop/canvas retain sources.",
+    "psd": "Supplementary format 9 retains originals alongside current standard raster/mask channels and merged composite. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
+    "limits": "Current plus original tiles count against 512 MiB document memory. 8192 per edge, 32 MP, 128 million output samples per layer command; singular/nonfinite/out-of-range/nested sources refused atomically.",
+    "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists."
+  },
   "editable_sources": {
     "commands": [
       "source.add",

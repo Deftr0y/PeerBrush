@@ -1,6 +1,6 @@
 use crate::{
     engine::{Document, Layer},
-    raster::{blend, check_size, Pixel, Raster},
+    raster::{blend, check_size, Raster},
 };
 use serde_json::Value;
 pub(crate) fn copy_shift(source: &Raster, w: u32, h: u32, dx: i32, dy: i32) -> Raster {
@@ -533,149 +533,20 @@ fn sample_words16(words: &[u16], w: u32, h: u32, x: f32, y: f32) -> [u16; 4] {
 
 /// The shared whole-layer affine operation, including native mask sources.
 pub(crate) fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
-    let before = layer.source.is_some().then(|| layer.clone());
-    layer_inner(layer, c)?;
-    if let Some(before) = before {
-        crate::source::transformed(&before, layer, c)?;
-    }
-    Ok(())
+    crate::retained::layer(layer, c)
 }
-fn layer_inner(layer: &mut Layer, c: &Value) -> Result<(), String> {
-    let n = |key: &str, default: f64| c[key].as_f64().unwrap_or(default);
-    if c["op"] == "move" {
-        let nx = layer.x as f64 + n("dx", 0.0);
-        let ny = layer.y as f64 + n("dy", 0.0);
-        if !nx.is_finite() || !ny.is_finite() || nx.abs() > 100000.0 || ny.abs() > 100000.0 {
-            return Err("Move is outside the initial coordinate limits".into());
-        }
-        layer.x = nx.round() as i32;
-        layer.y = ny.round() as i32;
-        if layer.kind == "adjustment" && layer.mask.is_none() {
-            layer.x = 0;
-            layer.y = 0;
-        }
-        return Ok(());
+pub(crate) fn move_layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    let nx = layer.x as f64 + c["dx"].as_f64().unwrap_or(0.);
+    let ny = layer.y as f64 + c["dy"].as_f64().unwrap_or(0.);
+    if !nx.is_finite() || !ny.is_finite() || nx.abs() > 100000. || ny.abs() > 100000. {
+        return Err("Move is outside the initial coordinate limits".into());
     }
-    let angle = n("angle", 0.0) as f32;
-    let sx = n("scale_x", 1.0) as f32;
-    let sy = n("scale_y", 1.0) as f32;
-    if !angle.is_finite() || !(0.05..=20.0).contains(&sx) || !(0.05..=20.0).contains(&sy) {
-        return Err("Transform scale must be 0.05–20 and rotation must be finite".into());
+    layer.x = nx.round() as i32;
+    layer.y = ny.round() as i32;
+    if layer.kind == "adjustment" && layer.mask.is_none() {
+        layer.x = 0;
+        layer.y = 0;
     }
-    let pivot = c.get("pivot").and_then(Value::as_array);
-    let px = pivot
-        .and_then(|v| v.first())
-        .and_then(Value::as_f64)
-        .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.0) as f32;
-    let py = pivot
-        .and_then(|v| v.get(1))
-        .and_then(Value::as_f64)
-        .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.0) as f32;
-    if !px.is_finite() || !py.is_finite() || px.abs() > 100000.0 || py.abs() > 100000.0 {
-        return Err("Invalid transform pivot".into());
-    }
-    if ["group", "adjustment"].contains(&layer.kind.as_str()) && layer.mask.is_none() {
-        return Ok(());
-    }
-    if angle.rem_euclid(360.0) == 0.0 && sx == 1.0 && sy == 1.0 {
-        return Ok(());
-    }
-    let (mut sin, mut cos) = angle.to_radians().sin_cos();
-    if sin.abs() < 0.000001 {
-        sin = 0.0;
-    }
-    if cos.abs() < 0.000001 {
-        cos = 0.0;
-    }
-    let forward = |x: f32, y: f32| {
-        let (x, y) = ((x - px) * sx, (y - py) * sy);
-        [px + x * cos - y * sin, py + x * sin + y * cos]
-    };
-    let (x, y, w, h) = (layer.x, layer.y, layer.pixels.width, layer.pixels.height);
-    let b = if layer.kind == "paint"
-        && layer.source.is_none()
-        && layer
-            .mask
-            .as_ref()
-            .is_none_or(|m| m.steps.iter().all(|s| s.pixels.bytes() == 0))
-    {
-        layer
-            .pixels
-            .source_bounds()
-            .unwrap_or([0, 0, w as i32, h as i32])
-    } else {
-        [0, 0, w as i32, h as i32]
-    };
-    let corners = [
-        forward((x + b[0]) as f32, (y + b[1]) as f32),
-        forward((x + b[2]) as f32, (y + b[1]) as f32),
-        forward((x + b[2]) as f32, (y + b[3]) as f32),
-        forward((x + b[0]) as f32, (y + b[3]) as f32),
-    ];
-    let left = corners
-        .iter()
-        .map(|p| p[0])
-        .fold(f32::INFINITY, f32::min)
-        .floor() as i32;
-    let top = corners
-        .iter()
-        .map(|p| p[1])
-        .fold(f32::INFINITY, f32::min)
-        .floor() as i32;
-    let right = corners
-        .iter()
-        .map(|p| p[0])
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil() as i32;
-    let bottom = corners
-        .iter()
-        .map(|p| p[1])
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil() as i32;
-    let (nw, nh) = ((right - left) as u32, (bottom - top) as u32);
-    if left.unsigned_abs() > 100000 || top.unsigned_abs() > 100000 {
-        return Err("Transform is outside the coordinate limits".into());
-    }
-    check_size(nw, nh)?;
-    let resample = |source: &Raster, fill: Option<Pixel>| {
-        resample(source, nw, nh, fill, |xx, yy| {
-            let (dx, dy) = (
-                left as f32 + xx as f32 + 0.5 - px,
-                top as f32 + yy as f32 + 0.5 - py,
-            );
-            [
-                (dx * cos + dy * sin) / sx + px - x as f32 - 0.5,
-                (-dx * sin + dy * cos) / sy + py - y as f32 - 0.5,
-            ]
-        })
-    };
-    layer.pixels = if ["group", "adjustment"].contains(&layer.kind.as_str()) {
-        Raster::new_depth(nw, nh, layer.pixels.depth)
-    } else {
-        resample(
-            &layer.pixels,
-            if layer.kind == "fill" {
-                Some(layer.color)
-            } else {
-                None
-            },
-        )
-    };
-    if let Some(mask) = &mut layer.mask {
-        mask.cache_key = crate::engine::id();
-        for step in &mut mask.steps {
-            step.pixels = if step.kind == "paint" {
-                resample(&step.pixels, None)
-            } else {
-                Raster::new_depth(nw, nh, layer.pixels.depth)
-            };
-        }
-    }
-    if !["group", "adjustment"].contains(&layer.kind.as_str()) {
-        layer.kind = "paint".into();
-    }
-    layer.x = left;
-    layer.y = top;
     Ok(())
 }
 

@@ -598,3 +598,63 @@ fn modern_edits_native_vector_sources_and_returns_actual_png_and_properties() {
     assert_eq!(e.undo.len(), 1);
     assert_eq!(e.ai_change.as_ref().unwrap().tool, "layers");
 }
+
+#[test]
+fn modern_transform_cycles_preserve_native_originals_and_return_current_pixels() {
+    let canvas = Canvas::new();
+    let (id, before) = {
+        let mut e = canvas.shared.lock().unwrap();
+        e.doc = peerbrush::engine::Document::new_depth(32, 32, 16).unwrap();
+        for y in 4..28 {
+            for x in 4..28 {
+                e.doc.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [12345 + x as u16 * 347, 23457 + y as u16 * 283, 34569, 65535],
+                );
+            }
+        }
+        (e.doc.layers[0].id.clone(), e.doc.export_png().unwrap())
+    };
+    let commands = [
+        json!({"op":"transform","layer":id,"angle":31,"pivot":[16,16],"selection_only":false}),
+        json!({"op":"transform","layer":id,"angle":-31,"pivot":[16,16],"selection_only":false}),
+        json!({"op":"transform","layer":id,"scale_x":0.1,"scale_y":0.1,"pivot":[16,16],"selection_only":false}),
+        json!({"op":"transform","layer":id,"scale_x":10,"scale_y":10,"pivot":[16,16],"selection_only":false}),
+    ];
+    let q = modern_request(
+        json!("retained"),
+        "tools/call",
+        json!({"name":"peerbrush_edit","arguments":{"actor":"transform-agent","expected_revision":0,"commands":commands,"max_edge":32}}),
+    );
+    let r: Value = response(canvas.modern(&q).send_json(q.clone()))
+        .into_json()
+        .unwrap();
+    assert_eq!(r["result"]["isError"], false);
+    let feedback = r["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["type"] == "image")
+        .unwrap();
+    let png = STANDARD.decode(feedback["data"].as_str().unwrap()).unwrap();
+    let image = image::load_from_memory(&png).unwrap().to_rgba8();
+    assert_eq!(
+        image.get_pixel(12, 12).0,
+        [
+            peerbrush::raster::project16(12345 + 12 * 347),
+            peerbrush::raster::project16(23457 + 12 * 283),
+            peerbrush::raster::project16(34569),
+            255
+        ]
+    );
+    let mut e = canvas.shared.lock().unwrap();
+    assert!(e.doc.export_png().unwrap() == before);
+    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.state()["layers"][0]["transform_source"]["bit_depth"], 16);
+    assert_eq!(e.state()["layers"][0]["transform_source"]["width"], 32);
+    assert_eq!(e.ai_change.as_ref().unwrap().tool, "scale");
+    e.undo("transform-agent").unwrap();
+    assert!(e.doc.export_png().unwrap() == before);
+    assert!(e.doc.layers[0].pixels.retained.is_none());
+}

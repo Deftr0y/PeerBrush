@@ -24,6 +24,8 @@ pub fn check_size(w: u32, h: u32) -> Result<(), String> {
 /// Copy-on-write sparse tiles: empty layers and history do not duplicate full canvases.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Raster {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained: Option<Box<crate::retained::Original>>,
     pub width: u32,
     pub height: u32,
     #[serde(default = "default_depth")]
@@ -125,6 +127,7 @@ mod samples16_serde {
 impl Raster {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
+            retained: None,
             width,
             height,
             depth: 8,
@@ -158,9 +161,16 @@ impl Raster {
             out.tiles
                 .insert(key, Arc::new(tile.iter().copied().map(project16).collect()));
         }
+        out.retained = self.retained.take();
+        if let Some(s) = &mut out.retained {
+            s.pixels.convert_depth(8);
+        }
         *self = out;
     }
     pub fn promote16(&mut self) {
+        if let Some(s) = &mut self.retained {
+            s.pixels.promote16();
+        }
         if self.is16() {
             return;
         }
@@ -198,6 +208,10 @@ impl Raster {
         if color == [0; 4] && !self.samples16.contains_key(&(x / TILE, y / TILE)) {
             return;
         }
+        if self.retained.is_some() && self.get16(x as i32, y as i32) == color {
+            return;
+        }
+        self.retained = None;
         let tile = self
             .samples16
             .entry((x / TILE, y / TILE))
@@ -317,6 +331,9 @@ impl Raster {
         (b[0] != i32::MAX).then_some(b)
     }
     pub fn validate_layout(&self) -> Result<(), String> {
+        if let Some(original) = &self.retained {
+            original.validate(self.depth)?;
+        }
         if !matches!(self.depth, 8 | 16)
             || (self.is16() && !self.tiles.is_empty())
             || (!self.is16() && !self.samples16.is_empty())
@@ -370,6 +387,10 @@ impl Raster {
         if color == [0; 4] && !self.tiles.contains_key(&(x / TILE, y / TILE)) {
             return;
         }
+        if self.retained.is_some() && self.get(x as i32, y as i32) == color {
+            return;
+        }
+        self.retained = None;
         let tile = self
             .tiles
             .entry((x / TILE, y / TILE))
@@ -460,6 +481,15 @@ impl Raster {
     pub fn bytes(&self) -> usize {
         self.tiles.len() * (TILE * TILE * 4) as usize
             + self.samples16.len() * (TILE * TILE * 8) as usize
+    }
+    /// Budget both the current projection and its supplementary original source.
+    pub fn stored_bytes(&self) -> usize {
+        self.bytes()
+            + self
+                .retained
+                .as_ref()
+                .map(|s| s.pixels.bytes())
+                .unwrap_or(0)
     }
     /// Interpolate premultiplied color to keep transparent edges clean.
     pub fn sample(&self, x: f32, y: f32) -> Pixel {

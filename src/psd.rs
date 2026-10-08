@@ -523,7 +523,9 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc.layers.iter().any(|l| l.source.is_some()) {
+        format: if crate::retained::has_originals(doc) {
+            9
+        } else if doc.layers.iter().any(|l| l.source.is_some()) {
             8
         } else if doc.layers.iter().any(|l| {
             ["group", "adjustment"].contains(&l.kind.as_str())
@@ -1074,7 +1076,7 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
                 }
         {
             if let Ok(e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=8).contains(&e.format)
+                if (1..=9).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ hash(composite_data)
@@ -1446,6 +1448,12 @@ pub fn validate(doc: &Document) -> Result<(), String> {
             return Err("Invalid opacity".into());
         }
         total += l.pixels.bytes();
+        total += l
+            .pixels
+            .retained
+            .as_ref()
+            .map(|s| s.pixels.bytes())
+            .unwrap_or(0);
         let mut p = l.parent.as_deref();
         let mut depth = 0;
         while let Some(parent) = p {
@@ -1476,6 +1484,12 @@ pub fn validate(doc: &Document) -> Result<(), String> {
                     return Err("Mask precision does not match the document".into());
                 }
                 total += s.pixels.bytes();
+                total += s
+                    .pixels
+                    .retained
+                    .as_ref()
+                    .map(|s| s.pixels.bytes())
+                    .unwrap_or(0);
                 let valid = match s.kind.as_str() {
                     "blur" => (0.0..=64.0).contains(&s.value),
                     "levels" => (0.1..=5.0).contains(&s.value),

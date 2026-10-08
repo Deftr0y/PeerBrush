@@ -1,0 +1,13 @@
+# Transforms that retain original pixels
+
+Whole-layer rotation and scaling retain the original native raster and an accumulated affine placement. Every preview and finished gesture samples that original, so shrinking then enlarging or rotating repeatedly does not repeatedly filter the previous result. Exact inverse placement restores native words, including hidden RGB, without an 8-bit editing copy. Move changes document placement without resampling. Hidden folder descendants use the same operation and pivot.
+
+Each painted mask step retains its own original and placement. Effects, mask operations, hierarchy and blend settings remain editable. Changing only a mask preserves the color original; painting color preserves unaffected mask originals. Pixel editing establishes a new baseline from the current appearance for the changed raster. This includes painting, clone/heal, fills, direct pixel adjustments, image replacement, and selected-pixel transformations. Undo restores the preceding pixels and originals together. Image size explicitly resamples the document and establishes new raster baselines, as does an explicit channel-depth conversion; crop and canvas size retain the existing samples and placement.
+
+UI, MCP and CLI use the same `transform` and `move` commands, reservations, locks and revision guards. With an active selection, use `selection_only:false` to transform the whole layer. Selected-pixel operations continue to edit that region as raster artwork. Live previews contain actual shared-engine pixels, and finishing a gesture produces one undo step.
+
+Observation exposes `transform_source` for each retained color raster and painted mask step: original width, height, bit depth, source bytes and the affine matrix `[a,b,c,d,tx,ty]` mapping original local coordinates to the current local frame. Sample data stays in the document, not in observation responses.
+
+PSD saves contain current standard layer raster/mask channels and a current merged composite. Supplementary PeerBrush source format 9 preserves originals for later edits and inverse transforms after reopening. Photoshop receives the current raster appearance; this does not create Photoshop Smart Objects. Earlier PeerBrush readers protect these newer documents as read-only.
+
+Original tiles use copy-on-write snapshots and are counted alongside current raster projections in the 512 MiB document budget. Transform dimensions retain the 8192-edge/32-megapixel limits, with a 128-million-sample work bound per layer command. Invalid, reserved, locked or over-budget requests roll back atomically. Nested originals are refused; derived preview caches remain outside history and saved source definitions.

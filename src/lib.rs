@@ -22,6 +22,7 @@ pub mod preview;
 pub mod psd;
 pub mod raster;
 pub(crate) mod render;
+pub mod retained;
 pub mod retouch;
 pub mod segmentation;
 pub mod selection;

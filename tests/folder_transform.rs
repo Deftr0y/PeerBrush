@@ -113,7 +113,7 @@ fn folder_rotation_keeps_native_pixels_hidden_children_masks_sources_and_one_und
         .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&source).unwrap()["format"],
-            7
+            9
         );
         let restored = psd::decode(&saved).unwrap();
         assert!(!restored.read_only);

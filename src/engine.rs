@@ -477,7 +477,7 @@ impl Engine {
     }
     pub fn state(&mut self) -> Value {
         self.expire();
-        json!({"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -987,10 +987,15 @@ impl Engine {
             .layers
             .iter()
             .map(|l| {
-                l.pixels.bytes()
+                l.pixels.stored_bytes()
                     + l.mask
                         .as_ref()
-                        .map(|m| m.steps.iter().map(|s| s.pixels.bytes()).sum::<usize>())
+                        .map(|m| {
+                            m.steps
+                                .iter()
+                                .map(|s| s.pixels.stored_bytes())
+                                .sum::<usize>()
+                        })
                         .unwrap_or(0)
             })
             .sum();
@@ -1128,6 +1133,18 @@ impl Engine {
         )
     }
     fn apply(&mut self, c: &Value) -> Result<(), String> {
+        let before = crate::retained::has_originals(&self.doc).then(|| self.doc.clone());
+        self.apply_retained(c)?;
+        if let Some(before) = before {
+            let whole_transform = matches!(c["op"].as_str(), Some("move" | "transform"))
+                && (before.selection.is_none() || c["selection_only"] == false);
+            if !whole_transform {
+                crate::retained::reconcile(&before, &mut self.doc);
+            }
+        }
+        Ok(())
+    }
+    fn apply_retained(&mut self, c: &Value) -> Result<(), String> {
         if c.get("source_revision")
             .is_some_and(|r| r.as_u64() != Some(self.doc.revision))
             || c.get("document_id")
@@ -1194,10 +1211,12 @@ impl Engine {
             }
             if depth != self.doc.bit_depth as u64 {
                 for layer in &mut self.doc.layers {
+                    layer.pixels.retained = None;
                     layer.pixels.convert_depth(depth as u16);
                     if let Some(mask) = &mut layer.mask {
                         mask.cache_key = id();
                         for step in &mut mask.steps {
+                            step.pixels.retained = None;
                             step.pixels.convert_depth(depth as u16);
                         }
                     }

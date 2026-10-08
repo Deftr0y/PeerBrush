@@ -229,6 +229,12 @@ impl Inverse {
                 .copied()
                 .collect()
         };
+        // Partial pixel compensation must not revive an original over later human pixels.
+        let retained = if current == after {
+            before.retained.clone()
+        } else {
+            None
+        };
         let mut changed = None;
         let mut conflicts = None;
         for (tx, ty) in keys {
@@ -262,6 +268,7 @@ impl Inverse {
         if let Some(rect) = changed {
             self.scope(Some(target), Some(rect));
         }
+        current.retained = retained;
         if let Some(rect) = conflicts {
             self.conflict(
                 Some(target),
