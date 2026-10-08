@@ -409,6 +409,7 @@ impl Inverse {
             y,
             color,
             effects,
+            source,
             psd_metadata
         );
         self.raster(
@@ -620,7 +621,7 @@ fn mask_equal(a: &Option<Mask>, b: &Option<Mask>) -> bool {
     }
 }
 fn layer_meta(l: &Layer) -> Value {
-    json!({"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"x":l.x,"y":l.y,"color":l.color,"effects":l.effects,"psd_metadata":l.psd_metadata})
+    json!({"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"x":l.x,"y":l.y,"color":l.color,"effects":l.effects,"source":l.source,"psd_metadata":l.psd_metadata})
 }
 fn layer_equal(a: &Layer, b: &Layer) -> bool {
     layer_meta(a) == layer_meta(b) && a.pixels == b.pixels && mask_equal(&a.mask, &b.mask)

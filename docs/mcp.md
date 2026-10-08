@@ -144,3 +144,5 @@ Native 16-bit projects retain channel precision in the shared engine and PSD/PNG
 `clone` and `heal` use explicit document-pixel source anchors, optional source layers or merged artwork, shared brush settings and native 16-bit sampling. Include `source_revision` and `document_id` to require the exact sampled state. See [retouch commands](retouch.md).
 
 Whole-document `crop`, `canvas.resize` and `image.resize` commands share native previews and history. They use document pixels, whole-document reservations, original channel depth and optional exact source guards. See [geometry commands](geometry.md).
+
+Editable text/vector layers share `source.add`, `source.update` and `source.rasterize`. Observation exposes the complete `source` definition on each layer; retain its frame/matrix when updating content. Sources use native RGBA16 colors and explicit document origins, preserve masks/effects, and return ordinary rendered PNG feedback with coordinates. Unsupported fonts/scripts and pixel edits into editable color sources are refused. See [source schemas and limits](editable-sources.md).

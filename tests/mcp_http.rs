@@ -563,3 +563,38 @@ fn legacy_session_memory_is_bounded() {
     canvas.initialize("2025-11-25", json!(130));
     assert_eq!(canvas.shared.lock().unwrap().mcp_clients.len(), 128);
 }
+
+#[test]
+fn modern_edits_native_vector_sources_and_returns_actual_png_and_properties() {
+    let canvas = Canvas::new();
+    {
+        let mut e = canvas.shared.lock().unwrap();
+        e.doc = peerbrush::engine::Document::new_depth(32, 32, 16).unwrap();
+    }
+    let source = json!({"width":16,"height":16,"content":{"kind":"shape","shape":"rectangle","bounds":[2,2,14,14],"points":[],"closed":true,"fill":[12345,23457,34569,65535],"stroke":[0,0,0,0],"stroke_width":0}});
+    let q = modern_request(
+        json!("source"),
+        "tools/call",
+        json!({"name":"peerbrush_edit","arguments":{"actor":"vector-agent","expected_revision":0,"commands":[{"op":"source.add","source":source,"x":4,"y":6}],"max_edge":32}}),
+    );
+    let r: Value = response(canvas.modern(&q).send_json(q.clone()))
+        .into_json()
+        .unwrap();
+    assert_eq!(r["result"]["isError"], false);
+    let content = r["result"]["content"].as_array().unwrap();
+    let feedback = content.iter().find(|v| v["type"] == "image").unwrap();
+    let png = STANDARD.decode(feedback["data"].as_str().unwrap()).unwrap();
+    let image = image::load_from_memory(&png).unwrap().to_rgba8();
+    assert_eq!(image.get_pixel(8, 10).0, [48, 91, 135, 255]);
+    let mut e = canvas.shared.lock().unwrap();
+    let observed: peerbrush::source::Source =
+        serde_json::from_value(e.state()["layers"][0]["source"].clone()).unwrap();
+    let requested: peerbrush::source::Source = serde_json::from_value(source).unwrap();
+    assert_eq!(observed, requested);
+    assert_eq!(
+        e.doc.layers[0].pixels.get16(4, 4),
+        [12345, 23457, 34569, 65535]
+    );
+    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.ai_change.as_ref().unwrap().tool, "layers");
+}

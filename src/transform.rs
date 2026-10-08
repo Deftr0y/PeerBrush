@@ -533,6 +533,14 @@ fn sample_words16(words: &[u16], w: u32, h: u32, x: f32, y: f32) -> [u16; 4] {
 
 /// The shared whole-layer affine operation, including native mask sources.
 pub(crate) fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    let before = layer.source.is_some().then(|| layer.clone());
+    layer_inner(layer, c)?;
+    if let Some(before) = before {
+        crate::source::transformed(&before, layer, c)?;
+    }
+    Ok(())
+}
+fn layer_inner(layer: &mut Layer, c: &Value) -> Result<(), String> {
     let n = |key: &str, default: f64| c[key].as_f64().unwrap_or(default);
     if c["op"] == "move" {
         let nx = layer.x as f64 + n("dx", 0.0);
@@ -585,6 +593,7 @@ pub(crate) fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     };
     let (x, y, w, h) = (layer.x, layer.y, layer.pixels.width, layer.pixels.height);
     let b = if layer.kind == "paint"
+        && layer.source.is_none()
         && layer
             .mask
             .as_ref()

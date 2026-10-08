@@ -523,7 +523,9 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc.layers.iter().any(|l| {
+        format: if doc.layers.iter().any(|l| l.source.is_some()) {
+            8
+        } else if doc.layers.iter().any(|l| {
             ["group", "adjustment"].contains(&l.kind.as_str())
                 && (l.x != 0
                     || l.y != 0
@@ -1072,7 +1074,7 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
                 }
         {
             if let Ok(e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=7).contains(&e.format)
+                if (1..=8).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ hash(composite_data)
@@ -1405,6 +1407,12 @@ pub fn validate(doc: &Document) -> Result<(), String> {
     let mut total = 0usize;
     for l in &doc.layers {
         validate_metadata(&l.psd_metadata)?;
+        if let Some(source) = &l.source {
+            if l.kind != "paint" {
+                return Err("Editable text/vector sources require paint raster projections".into());
+            }
+            source.validate()?;
+        }
         if !ids.insert(l.id.clone()) {
             return Err("Duplicate layer ID".into());
         }

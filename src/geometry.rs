@@ -313,6 +313,10 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
         if p.image {
             let (w, h) = scaled_size(&layer.pixels, p.scale)?;
             layer.pixels = resized(&layer.pixels, w, h);
+            if let Some(source) = &mut layer.source {
+                source.prepend([p.scale[0], 0., 0., p.scale[1], 0., 0.]);
+                layer.pixels = source.render(w, h, layer.pixels.depth)?;
+            }
             if let Some(mask) = &mut layer.mask {
                 mask.cache_key = id();
                 for (step_index, step) in mask.steps.iter_mut().enumerate() {

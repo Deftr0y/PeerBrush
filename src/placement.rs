@@ -53,7 +53,7 @@ fn decode(command: &Value, depth: u16) -> Result<Raster, String> {
     }
 }
 
-fn unlocked(doc: &Document, target: &str) -> Result<(), String> {
+pub(crate) fn unlocked(doc: &Document, target: &str) -> Result<(), String> {
     let mut current = Some(target);
     for _ in 0..=16 {
         let Some(id) = current else { return Ok(()) };
@@ -111,6 +111,11 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
         }
         let index =
             context_index.ok_or("Choose the current layer with layer and new_layer:false")?;
+        if doc.layers[index].source.is_some() {
+            return Err(
+                "Rasterize the editable text/vector layer before placing pixels into it".into(),
+            );
+        }
         if doc.layers[index].kind == "group" {
             return Err("Place into a paint layer or create a new child layer".into());
         }

@@ -55,6 +55,8 @@ pub struct Layer {
     pub effects: Vec<crate::effects::Effect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub psd_metadata: Vec<crate::psd::LayerMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::source::Source>,
     #[serde(skip, default = "id")]
     pub effect_key: String,
 }
@@ -77,6 +79,7 @@ impl Layer {
             mask: None,
             effects: vec![],
             psd_metadata: vec![],
+            source: None,
             effect_key: id(),
         }
     }
@@ -474,7 +477,7 @@ impl Engine {
     }
     pub fn state(&mut self) -> Value {
         self.expire();
-        json!({"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -594,7 +597,7 @@ impl Engine {
                     }]
                 });
         }
-        if ["layer.add", "image.import"].contains(&op) {
+        if ["layer.add", "image.import", "source.add"].contains(&op) {
             return c["parent"]
                 .as_str()
                 .map(|p| {
@@ -1068,6 +1071,7 @@ impl Engine {
             "canvas.resize" | "image.resize" | "resize" => "scale",
             "liquify.stroke" => "liquify",
             "adjustment.add" => "effects",
+            op if op.starts_with("source.") => "layers",
             "move" => "move",
             "transform" if num(command, "angle", 0.0) != 0.0 => "rotate",
             "transform" => "scale",
@@ -1166,6 +1170,9 @@ impl Engine {
         self.doc.ensure_depth();
         let op = text(c, "op", "");
         let target = text(c, "layer", "");
+        if op == "source.add" {
+            return crate::source::add(&mut self.doc, c);
+        }
         if ["crop", "canvas.resize", "image.resize", "resize"].contains(&op) {
             return crate::geometry::apply(&mut self.doc, c);
         }
@@ -1370,6 +1377,40 @@ impl Engine {
         }
         if self.doc.layers[i].locked && op != "layer.update" {
             return Err("Layer is locked".into());
+        }
+        if op == "source.update" {
+            return crate::source::update(&mut self.doc.layers[i], c);
+        }
+        if op == "source.rasterize" {
+            if self.doc.layers[i].source.take().is_none() {
+                return Err("This layer has no editable source".into());
+            }
+            return Ok(());
+        }
+        if self.doc.layers[i].source.is_some() {
+            let mask = c["mask"] == true;
+            if !mask
+                && matches!(
+                    op,
+                    "paint"
+                        | "smudge"
+                        | "clone"
+                        | "heal"
+                        | "fill"
+                        | "paint.fill"
+                        | "shape"
+                        | "gradient"
+                        | "adjust"
+                        | "image.patch"
+                )
+            {
+                return Err("Edit this layer's text/vector properties, paint its mask, or explicitly rasterize it first".into());
+            }
+            if matches!(op, "move" | "transform")
+                && (mask || (self.doc.selection.is_some() && c["selection_only"] != false))
+            {
+                return Err("Transform the complete editable text/vector layer with selection_only:false, or rasterize it for a pixel/mask transform".into());
+            }
         }
         if op == "layer.delete" {
             let mut ids = vec![target.to_string()];

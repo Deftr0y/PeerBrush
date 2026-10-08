@@ -28,6 +28,7 @@ impl Editor {
 }
 impl PeerBrush {
     pub(super) fn open_geometry(&mut self, doc: &Document, mode: &'static str) {
+        self.cancel_source();
         self.cancel_refinement();
         self.points.clear();
         self.drag_start = None;

@@ -10,6 +10,7 @@ mod liquify;
 mod refinement;
 mod retouch;
 mod selection;
+mod source;
 use crate::{controls, thumbnails};
 use crate::{
     engine::Document,
@@ -201,6 +202,7 @@ pub struct PeerBrush {
     selection_gesture_mode: Option<String>,
     project_settings: Option<(u32, u32, u16)>,
     geometry: Option<geometry::Editor>,
+    source_editor: Option<source::Editor>,
     task_undo_review: Option<Value>,
     refinement: Option<refinement::Editor>,
     retouch_source: Option<retouch::Anchor>,
@@ -444,6 +446,7 @@ impl PeerBrush {
             selection_gesture_mode: None,
             project_settings: None,
             geometry: None,
+            source_editor: None,
             task_undo_review: None,
             refinement: None,
             retouch_source: None,
@@ -1107,6 +1110,13 @@ impl PeerBrush {
     fn request_preview(&mut self, ctx: &egui::Context, _doc: &Document) {
         let current = self.shared.lock().unwrap().doc.clone();
         if self
+            .source_editor
+            .as_ref()
+            .is_some_and(|e| e.document != current.id || e.revision != current.revision)
+        {
+            self.cancel_source();
+        }
+        if self
             .geometry
             .as_ref()
             .is_some_and(|g| g.document != current.id || g.revision != current.revision)
@@ -1156,8 +1166,12 @@ impl PeerBrush {
                 && p.revision == doc.revision
                 && (p.target == variant || (!live.is_empty() && p.live == live))
                 && p.mask == (self.mask && self.isolate)
+                && (self.source_editor.is_none() || p.live == live)
             {
                 if let Some(editor) = &mut self.geometry {
+                    editor.error = p.error.clone();
+                }
+                if let Some(editor) = &mut self.source_editor {
                     editor.error = p.error.clone();
                 }
                 if !p.bytes.is_empty() {
@@ -1422,6 +1436,11 @@ impl PeerBrush {
             self.selected = l.id.clone();
             self.layer_cmd("mask.remove", json!({}), "Remove mask");
             self.mask = false;
+            ui.close_menu();
+        }
+        if l.source.is_some() && ui.button("Edit text/vector properties…").clicked() {
+            self.select_content(&l.id);
+            self.open_source(doc, "edit");
             ui.close_menu();
         }
         ui.separator();
@@ -2049,6 +2068,9 @@ impl PeerBrush {
         if let Some(editor) = &self.geometry {
             self.transient.push(editor.command());
         }
+        if let Some(editor) = &self.source_editor {
+            self.transient.push(editor.command());
+        }
         if let Some(editor) = &self.refinement {
             self.transient.push(editor.command());
         }
@@ -2138,7 +2160,7 @@ impl PeerBrush {
             Stroke::new(1.0_f32, Color32::from_rgb(90, 84, 93)),
             egui::StrokeKind::Outside,
         );
-        if self.geometry.is_some() {
+        if self.geometry.is_some() || self.source_editor.is_some() {
             return;
         }
         let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
@@ -3034,6 +3056,13 @@ impl PeerBrush {
                             if ui.add_enabled(!doc.read_only && !self.busy,egui::Button::new(label)).clicked() {self.open_geometry(&doc,mode);ui.close_menu();}
                         }
                     });
+                    ui.menu_button("Layer",|ui| {
+                        for (label,kind) in [("New text…","text"),("New vector shape…","shape"),("Edit text/vector…","edit")] {
+                            let enabled=!doc.read_only&&!self.busy && (kind!="edit"||doc.layers.iter().any(|l|l.id==self.selected&&l.source.is_some()));
+                            if ui.add_enabled(enabled,egui::Button::new(label)).clicked(){self.open_source(&doc,kind);ui.close_menu();}
+                        }
+                        if ui.add_enabled(!doc.read_only&&doc.layers.iter().any(|l|l.id==self.selected&&l.source.is_some()),egui::Button::new("Rasterize text/vector")).on_hover_text("Keep the current pixels and remove editable properties · Undo restores the source").clicked(){self.layer_cmd("source.rasterize",json!({}),"Rasterize text/vector");ui.close_menu();}
+                    });
                     ui.menu_button("Select",|ui| {
                         let learned = crate::segmentation::configured() && !doc.read_only && !self.busy;
                         if ui.add_enabled(learned, egui::Button::new("Select subject")).on_hover_text("Uses the externally configured local selection provider").clicked(){self.segment_subject(&doc,false);ui.close_menu();}
@@ -3390,6 +3419,7 @@ impl PeerBrush {
         self.task_history_review(ctx, &doc);
         self.refinement_window(ctx, &doc);
         self.geometry_window(ctx, &doc);
+        self.source_window(ctx, &doc);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")
@@ -4972,6 +5002,73 @@ mod tests {
             app.mask = true;
             assert!(!app.begin_retouch(&doc, [26., 16.]));
             assert!(app.retouch_source.is_none());
+        }
+    }
+    #[test]
+    fn editable_source_previews_render_pixels_without_painting_and_cancel_on_shared_changes() {
+        for kind in ["text", "shape"] {
+            let (mut app, ctx) = small_fixture();
+            frame(&mut app, &ctx, vec![], Default::default());
+            let doc = app.shared.lock().unwrap().doc.clone();
+            app.open_source(&doc, kind);
+            let editor = app.source_editor.as_mut().unwrap();
+            editor.x = 0;
+            editor.y = 0;
+            if let crate::source::Content::Text { text, size, .. } = &mut editor.source.content {
+                *text = "Hi".into();
+                *size = 16.;
+            }
+            let command = editor.command();
+            let expected = Engine::preview_edits(doc.clone(), &[command.clone()]).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            loop {
+                frame(&mut app, &ctx, vec![], Default::default());
+                if !app.pending
+                    && app
+                        .canvas_pixels
+                        .as_ref()
+                        .is_some_and(|(_, _, p)| p.chunks_exact(4).any(|v| v[3] > 0))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Editable source preview did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let (w, h, pixels) = app.canvas_pixels.as_ref().unwrap();
+            assert_eq!(
+                pixels,
+                &expected.preview(None, (*w).max(*h), None, false).unwrap().2
+            );
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            let center = app.view_rect.unwrap().center();
+            click(&mut app, &ctx, center);
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            app.cancel_source();
+            assert!(app.source_editor.is_none());
+            app.shared
+                .lock()
+                .unwrap()
+                .edit("human", &[command], Some(doc.revision), None, "Source")
+                .unwrap();
+            let current = app.shared.lock().unwrap().doc.clone();
+            app.select_content(&current.layers[0].id);
+            app.open_source(&current, "edit");
+            app.shared
+                .lock()
+                .unwrap()
+                .edit(
+                    "other",
+                    &[json!({"op":"layer.update","layer":app.selected,"visible":false})],
+                    None,
+                    None,
+                    "Shared edit",
+                )
+                .unwrap();
+            app.request_preview(&ctx, &current);
+            assert!(app.source_editor.is_none());
         }
     }
     #[test]
