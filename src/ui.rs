@@ -3,6 +3,7 @@ mod animation;
 mod brush;
 mod color;
 mod effects;
+mod geometry;
 mod history;
 mod layers;
 mod liquify;
@@ -124,6 +125,7 @@ impl Tool {
     }
 }
 struct Preview {
+    error: Option<String>,
     live: String,
     revision: u64,
     doc_id: String,
@@ -198,6 +200,7 @@ pub struct PeerBrush {
     selection_path: Vec<[f32; 2]>,
     selection_gesture_mode: Option<String>,
     project_settings: Option<(u32, u32, u16)>,
+    geometry: Option<geometry::Editor>,
     task_undo_review: Option<Value>,
     refinement: Option<refinement::Editor>,
     retouch_source: Option<retouch::Anchor>,
@@ -440,6 +443,7 @@ impl PeerBrush {
             selection_path: vec![],
             selection_gesture_mode: None,
             project_settings: None,
+            geometry: None,
             task_undo_review: None,
             refinement: None,
             retouch_source: None,
@@ -1103,6 +1107,13 @@ impl PeerBrush {
     fn request_preview(&mut self, ctx: &egui::Context, _doc: &Document) {
         let current = self.shared.lock().unwrap().doc.clone();
         if self
+            .geometry
+            .as_ref()
+            .is_some_and(|g| g.document != current.id || g.revision != current.revision)
+        {
+            self.cancel_geometry();
+        }
+        if self
             .refinement
             .as_ref()
             .is_some_and(|r| r.document != current.id || r.revision != current.revision)
@@ -1146,6 +1157,9 @@ impl PeerBrush {
                 && (p.target == variant || (!live.is_empty() && p.live == live))
                 && p.mask == (self.mask && self.isolate)
             {
+                if let Some(editor) = &mut self.geometry {
+                    editor.error = p.error.clone();
+                }
                 if !p.bytes.is_empty() {
                     self.canvas_selection = Some(CanvasSelection {
                         document: p.doc_id.clone(),
@@ -1282,9 +1296,11 @@ impl PeerBrush {
                         doc.selection_coverage.clone(),
                     ))
                 })();
+                let error = output.as_ref().err().cloned();
                 let (w, h, bytes, dirty, selection, selection_polygon, selection_coverage) =
                     output.unwrap_or((0, 0, vec![], None, None, None, None));
                 let _ = tx.send(Preview {
+                    error,
                     live,
                     doc_id: id,
                     revision,
@@ -2030,6 +2046,9 @@ impl PeerBrush {
             self.message = "Image changed during retouch · stroke cancelled".into();
         }
         self.transient.clear();
+        if let Some(editor) = &self.geometry {
+            self.transient.push(editor.command());
+        }
         if let Some(editor) = &self.refinement {
             self.transient.push(editor.command());
         }
@@ -2051,8 +2070,13 @@ impl PeerBrush {
         {
             self.layer_clipboard = false;
         }
-        let fit = ((available.width() - 60.0) / doc.width as f32)
-            .min((available.height() - 60.0) / doc.height as f32)
+        let [canvas_width, canvas_height] = self
+            .geometry
+            .as_ref()
+            .map(|g| g.size())
+            .unwrap_or([doc.width, doc.height]);
+        let fit = ((available.width() - 60.0) / canvas_width as f32)
+            .min((available.height() - 60.0) / canvas_height as f32)
             .max(0.01);
         if self.frame_pending {
             let target = doc.selection.filter(|r| r[2] > r[0] && r[3] > r[1]);
@@ -2077,7 +2101,7 @@ impl PeerBrush {
             self.frame_pending = false;
         }
         let scale = fit * self.zoom;
-        let size = Vec2::new(doc.width as f32 * scale, doc.height as f32 * scale);
+        let size = Vec2::new(canvas_width as f32 * scale, canvas_height as f32 * scale);
         let rect = Rect::from_center_size(available.center() + self.pan, size);
         self.view_rect = Some(rect);
         let painter = ui.painter().with_clip_rect(available);
@@ -2114,6 +2138,9 @@ impl PeerBrush {
             Stroke::new(1.0_f32, Color32::from_rgb(90, 84, 93)),
             egui::StrokeKind::Outside,
         );
+        if self.geometry.is_some() {
+            return;
+        }
         let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
         let to_doc = |p: Pos2| [(p.x - rect.min.x) / scale, (p.y - rect.min.y) / scale];
         let size_mode = [
@@ -3002,6 +3029,11 @@ impl PeerBrush {
                             ui.close_menu();
                         }
                     });
+                    ui.menu_button("Image",|ui| {
+                        for (label,mode) in [("Crop…","crop"),("Canvas size…","canvas.resize"),("Image size…","image.resize")] {
+                            if ui.add_enabled(!doc.read_only && !self.busy,egui::Button::new(label)).clicked() {self.open_geometry(&doc,mode);ui.close_menu();}
+                        }
+                    });
                     ui.menu_button("Select",|ui| {
                         let learned = crate::segmentation::configured() && !doc.read_only && !self.busy;
                         if ui.add_enabled(learned, egui::Button::new("Select subject")).on_hover_text("Uses the externally configured local selection provider").clicked(){self.segment_subject(&doc,false);ui.close_menu();}
@@ -3088,7 +3120,10 @@ impl PeerBrush {
                             RichText::new(format!(
                                 "{}%",
                                 self.view_rect
-                                    .map(|r| (r.width() / doc.width as f32 * 100.0).round() as u32)
+                                    .map(|r| {
+                                        let width = self.geometry.as_ref().map(|g| g.size()[0]).unwrap_or(doc.width);
+                                        (r.width() / width as f32 * 100.0).round() as u32
+                                    })
                                     .unwrap_or(100)
                             ))
                             .size(11.0)
@@ -3354,6 +3389,7 @@ impl PeerBrush {
         self.color_window(ctx);
         self.task_history_review(ctx, &doc);
         self.refinement_window(ctx, &doc);
+        self.geometry_window(ctx, &doc);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")
@@ -4579,6 +4615,7 @@ mod tests {
         app.points.push([30.0, 10.0]);
         app.preview_tx
             .send(Preview {
+                error: None,
                 live,
                 doc_id: doc.id.clone(),
                 revision: doc.revision,
@@ -4935,6 +4972,91 @@ mod tests {
             app.mask = true;
             assert!(!app.begin_retouch(&doc, [26., 16.]));
             assert!(app.retouch_source.is_none());
+        }
+    }
+    #[test]
+    fn document_geometry_previews_pixels_dimensions_and_cancels_when_source_changes() {
+        for mode in ["crop", "canvas.resize", "image.resize"] {
+            let (mut app, ctx) = small_fixture();
+            {
+                let mut e = app.shared.lock().unwrap();
+                for y in 0..32 {
+                    for x in 0..32 {
+                        e.doc.layers[0]
+                            .pixels
+                            .set(x, y, [x as u8 * 7, y as u8 * 7, 53, 255]);
+                    }
+                }
+            }
+            frame(&mut app, &ctx, vec![], Default::default());
+            let original = app.shared.lock().unwrap().doc.clone();
+            app.open_geometry(&original, mode);
+            let editor = app.geometry.as_mut().unwrap();
+            editor.rect = [8, 4, 24, 28];
+            editor.width = 48;
+            editor.height = 24;
+            editor.proportional = false;
+            let command = editor.command();
+            let expected = Engine::preview_edits(original.clone(), &[command.clone()]).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            loop {
+                frame(&mut app, &ctx, vec![], Default::default());
+                if !app.pending
+                    && app.canvas_pixels.as_ref().is_some_and(|(w, h, _)| {
+                        (*w as f32 / *h as f32 - expected.width as f32 / expected.height as f32)
+                            .abs()
+                            < 0.005
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Geometry preview did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let (w, h, pixels) = app.canvas_pixels.as_ref().unwrap();
+            let rendered = expected.preview(None, (*w).max(*h), None, false).unwrap();
+            assert_eq!(pixels, &rendered.2);
+            let view = app.view_rect.unwrap();
+            assert!(
+                (view.width() / view.height() - expected.width as f32 / expected.height as f32)
+                    .abs()
+                    < 0.0001
+            );
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            assert_eq!(
+                app.shared.lock().unwrap().doc.export_png().unwrap(),
+                original.export_png().unwrap()
+            );
+            let center = view.center();
+            click(&mut app, &ctx, center);
+            assert!(
+                app.shared.lock().unwrap().undo.is_empty(),
+                "Geometry preview must not paint"
+            );
+            app.cancel_geometry();
+            assert!(app.geometry.is_none());
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            app.open_geometry(&original, mode);
+            app.shared
+                .lock()
+                .unwrap()
+                .edit(
+                    "other",
+                    &[json!({"op":"paint.fill","layer":app.selected,"color":[17,61,91,255]})],
+                    None,
+                    None,
+                    "Newer work",
+                )
+                .unwrap();
+            app.request_preview(&ctx, &original);
+            assert!(
+                app.geometry.is_none(),
+                "A source change must discard the stale geometry editor"
+            );
+            assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
         }
     }
     fn small_fixture() -> (PeerBrush, egui::Context) {
@@ -5716,6 +5838,7 @@ mod tests {
             app.pending = true;
             app.preview_tx
                 .send(Preview {
+                    error: None,
                     live: String::new(),
                     doc_id: source.id.clone(),
                     revision: source.revision,

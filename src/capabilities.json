@@ -616,6 +616,26 @@
       "radius": 12,
       "heal_radius": 16,
       "sample_merged": true
+    },
+    {
+      "op": "crop",
+      "rect": [
+        100,
+        80,
+        900,
+        680
+      ]
+    },
+    {
+      "op": "canvas.resize",
+      "width": 1600,
+      "height": 1200,
+      "anchor": "center"
+    },
+    {
+      "op": "image.resize",
+      "width": 800,
+      "height": 600
     }
   ],
   "not_yet": [
@@ -751,5 +771,29 @@
     "precision": "Native16 source samples, premultiplied fractional interpolation and grayscale values remain native16. Heal preserves destination alpha and transparent hidden pixels.",
     "limits": "Merged sampling 16 MP; heal_radius integer 1\u201364 (default brush radius clamped 1\u201332). Brush work budgets apply.",
     "algorithm": "Clone copies sampled color/alpha through brush coverage. Heal transfers texture with local average color adaptation; not full Photoshop healing."
+  },
+  "document_geometry": {
+    "commands": [
+      "crop",
+      "canvas.resize",
+      "image.resize"
+    ],
+    "anchors": [
+      "top_left",
+      "top",
+      "top_right",
+      "left",
+      "center",
+      "right",
+      "bottom_left",
+      "bottom",
+      "bottom_right"
+    ],
+    "crop": "Explicit exclusive rect in document pixels; shifts layer origins and retains all off-canvas pixels. Negative coordinates may expand canvas.",
+    "canvas": "Changes canvas dimensions and anchored origins without resampling. Default center.",
+    "image": "Resamples all layer and paint-mask sources at original depth, scales editable spatial controls, clears current/previous selections. Integer frame rounding; premultiplied bilinear with clamped edges.",
+    "limits": "8192 per edge, 32 MP, 128 million output samples across nonempty sources/masks. Spatial effects need proportional dimensions (integer rounding allowed); radius and source budgets apply.",
+    "guards": "Whole-document reservation scope; locked moved/resampled layers reject. Optional document_id/source_revision; all failures atomic.",
+    "preview": "Native Image menu shows actual shared-engine pixels and dimensions. Apply one undo; Cancel/Escape or a newer source edit discards preview."
   }
 }

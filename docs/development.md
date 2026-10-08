@@ -32,7 +32,7 @@ Sparse raster tiles are copy-on-write, so snapshots share unchanged content. Ato
 
 Initial limits: 8192 pixels per edge, 32 megapixels, 100 editable layers, 512 MiB allocated raster tiles, 256 MiB PSD input, and 128 MiB decoded application metadata. These limits are deliberately explicit while streaming and stronger cache budgets are developed.
 
-Roadmap: GPU tile compositor and incremental preview updates; text/vector source layers; crop/resize and non-destructive transforms; additional selection tools and subject segmentation; liquify distortion maps; selective task undo; isolated/pass-through group fidelity; remote connection and plugin support.
+Roadmap: GPU tile compositor and incremental preview updates; text/vector source layers; non-destructive transforms; additional selection tools and subject segmentation; liquify distortion maps; selective task undo; isolated/pass-through group fidelity; remote connection and plugin support.
 
 Dependency and embedded-font licenses must accompany packaged builds. The application is GPL v3; dependencies retain their original licenses. CI builds and tests on Windows, macOS, and Linux. Cross-platform support is not considered validated until those jobs run successfully.
 
@@ -103,3 +103,5 @@ Folder scopes protect the whole subtree, including descendant region reservation
 Verification covers native8/16 rotations, default/shared pivots, hidden children and RGB, folder effects/masks, adjustment masks, smart-mask coordinates, standard PSD rendering after ignoring private resources, exact native word restoration, atomic locks/reservations/failures, protocol image coordinates and one-step UI gestures. The native workspace rotated actual PNG16 pixels and its painted folder mask/effect, saved/reopened the editable hierarchy with identical PNG16 bytes, and one undo restored the original byte-for-byte. Broader engine, native precision, codec, protocol, selection and actual-device tests passed.
 
 Clone/heal use frozen COW sources and shared brush pressure/texture/flow coverage. Native16 premultiplied sampling avoids narrowing; healing uses tile-local integral sums with complete halos and preserves destination alpha. UI source coordinates and alignment generate the same commands as MCP/CLI; source_revision guards cancel interrupted gestures. See [retouch](retouch.md).
+
+Document geometry uses shared atomic commands. Crop/anchored canvas changes preserve COW source rasters and map world-coordinate group effects; image resize resamples native sources and captured liquify confidence masks, scales spatial controls and refuses unsupported anisotropic effects. The UI previews actual dimensions/pixels, reports worker errors and cancels stale source revisions. See [geometry](geometry.md).

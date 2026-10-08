@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod effects;
 pub mod engine;
 pub mod fill;
+pub mod geometry;
 pub mod gpu;
 pub mod grouping;
 pub mod history;

@@ -694,6 +694,8 @@ impl Engine {
             "new",
             "crop",
             "resize",
+            "canvas.resize",
+            "image.resize",
             "document.settings",
             "layer.add",
             "layer.reorder",
@@ -1062,6 +1064,8 @@ impl Engine {
             "smudge" => "smudge",
             "clone" => "clone",
             "heal" => "heal",
+            "crop" => "selection",
+            "canvas.resize" | "image.resize" | "resize" => "scale",
             "liquify.stroke" => "liquify",
             "adjustment.add" => "effects",
             "move" => "move",
@@ -1162,6 +1166,9 @@ impl Engine {
         self.doc.ensure_depth();
         let op = text(c, "op", "");
         let target = text(c, "layer", "");
+        if ["crop", "canvas.resize", "image.resize", "resize"].contains(&op) {
+            return crate::geometry::apply(&mut self.doc, c);
+        }
         if c.get("rect")
             .is_some_and(|r| !r.is_null() && rect(r).is_none())
         {

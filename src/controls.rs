@@ -158,10 +158,20 @@ pub fn range_with_color(
     .inner
 }
 
-pub fn numeric(ui: &mut egui::Ui, value: &mut u32, limits: RangeInclusive<u32>) -> egui::Response {
+pub fn numeric<N: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    value: &mut N,
+    limits: RangeInclusive<N>,
+) -> egui::Response {
     ui.scope(|ui| {
-        for widget in [&mut ui.style_mut().visuals.widgets.inactive] {
+        let visuals = ui.visuals_mut();
+        for widget in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+        ] {
             widget.bg_fill = Color32::TRANSPARENT;
+            widget.weak_bg_fill = Color32::TRANSPARENT;
             widget.bg_stroke = Stroke::NONE;
         }
         ui.add(egui::DragValue::new(value).range(limits))
