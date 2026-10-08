@@ -6,12 +6,29 @@ pub(super) fn settings(
     settings: &mut Value,
 ) -> Option<egui::Response> {
     let mut changed = None;
+    if kind == "levels" {
+        changed = levels_slider(ui, settings);
+    }
     let params: Vec<(&str, &str, f32, f32, &str)> = match kind {
         "blur" | "gaussian" => vec![("radius", "Radius", 0.0, 64.0, " px")],
         "levels" => vec![
             ("black", "Black", 0.0, 0.99, ""),
             ("white", "White", 0.01, 1.0, ""),
             ("gamma", "Gamma", 0.1, 5.0, ""),
+        ],
+        "hsl" => vec![
+            ("hue", "Hue", -180.0, 180.0, "°"),
+            ("saturation", "Saturation", -1.0, 1.0, "%"),
+            ("lightness", "Lightness", -1.0, 1.0, "%"),
+        ],
+        "bloom" => vec![
+            ("threshold", "Threshold", 0.0, 1.0, "%"),
+            ("spread", "Spread", 0.0, 64.0, " px"),
+            ("strength", "Strength", 0.0, 3.0, "%"),
+        ],
+        "liquify" => vec![
+            ("radius", "Default radius", 0.5, 512.0, " px"),
+            ("strength", "Amount", 0.0, 1.0, "%"),
         ],
         "adjust" => vec![
             ("brightness", "Brightness", -1.0, 1.0, ""),
@@ -25,34 +42,157 @@ pub(super) fn settings(
         .show(ui, |ui| {
             for (key, label, min, max, suffix) in params {
                 controls::label(ui, label);
-                let mut value = effects::number(
-                    settings,
-                    key,
-                    if key == "radius" {
-                        8.0
-                    } else if ["white", "gamma", "contrast", "saturation"].contains(&key) {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                );
+                let defaults = effects::defaults(kind);
+                let default = defaults[key]
+                    .as_f64()
+                    .map(|x| x as f32)
+                    .unwrap_or(if kind == "gaussian" { 8.0 } else { 0.0 });
+                let scale = if suffix == "%" { 100.0 } else { 1.0 };
+                let mut value = effects::number(settings, key, default) * scale;
                 let response = controls::range(
                     ui,
                     key,
                     &mut value,
-                    min..=max,
+                    min * scale..=max * scale,
                     160.0,
                     suffix,
-                    if key == "radius" { 0 } else { 2 },
+                    if scale == 100.0 || ["radius", "spread", "hue"].contains(&key) {
+                        0
+                    } else {
+                        2
+                    },
                     false,
                 );
                 if response.changed() {
-                    settings[key] = json!(value);
+                    settings[key] = json!(value / scale);
                     changed = Some(response);
                 }
                 ui.end_row();
             }
         });
+    if kind == "color_balance" {
+        let band_id = ui.id().with("color balance band");
+        let mut selected = ui
+            .ctx()
+            .data(|d| d.get_temp::<usize>(band_id))
+            .unwrap_or(1)
+            .min(2);
+        ui.horizontal(|ui| {
+            for (i, label) in ["Shadows", "Midtones", "Highlights"]
+                .into_iter()
+                .enumerate()
+            {
+                ui.selectable_value(&mut selected, i, label);
+            }
+        });
+        ui.ctx().data_mut(|d| d.insert_temp(band_id, selected));
+        let band = ["shadows", "midtones", "highlights"][selected];
+        let mut values: [f32; 3] =
+            std::array::from_fn(|i| settings[band][i].as_f64().unwrap_or(0.0) as f32);
+        egui::Grid::new((ui.id(), "balance axes"))
+            .spacing(Vec2::new(8.0, 6.0))
+            .show(ui, |ui| {
+                for (i, label) in ["Cyan ↔ Red", "Magenta ↔ Green", "Yellow ↔ Blue"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    controls::label(ui, label);
+                    let mut value = values[i] * 100.0;
+                    let response = controls::range(
+                        ui,
+                        (band, i),
+                        &mut value,
+                        -100.0..=100.0,
+                        160.0,
+                        "",
+                        0,
+                        false,
+                    );
+                    if response.changed() {
+                        values[i] = value / 100.0;
+                        settings[band] = json!(values);
+                        changed = Some(response);
+                    }
+                    ui.end_row();
+                }
+            });
+        let mut preserve = settings["preserve_luminosity"].as_bool().unwrap_or(true);
+        let response = ui.checkbox(&mut preserve, "Preserve luminosity");
+        if response.changed() {
+            settings["preserve_luminosity"] = json!(preserve);
+            changed = Some(response);
+        }
+    }
+    if kind == "liquify" {
+        let mut strokes = settings["strokes"].as_array().cloned().unwrap_or_default();
+        let mut removed = None;
+        let mut edited = false;
+        for (index, stroke) in strokes.iter_mut().enumerate() {
+            ui.push_id(("liquify stroke", index), |ui| {
+                let mode = stroke["mode"].as_str().unwrap_or("push");
+                let label = match mode {
+                    "expand" => "Expand",
+                    "pinch" => "Pinch",
+                    "restore" => "Restore",
+                    _ => "Push",
+                };
+                ui.horizontal(|ui| {
+                    egui::CollapsingHeader::new(format!("{} · {}", index + 1, label))
+                        .id_salt("stroke")
+                        .show(ui, |ui| {
+                            egui::Grid::new("stroke params")
+                                .spacing(Vec2::new(8.0, 6.0))
+                                .show(ui, |ui| {
+                                    for (key, label, min, max, suffix, default) in [
+                                        (
+                                            "radius",
+                                            "Radius",
+                                            0.5,
+                                            512.0,
+                                            " px",
+                                            effects::number(settings, "radius", 40.0),
+                                        ),
+                                        ("strength", "Strength", 0.0, 1.0, "%", 1.0),
+                                    ] {
+                                        controls::label(ui, label);
+                                        let scale = if key == "strength" { 100.0 } else { 1.0 };
+                                        let mut value =
+                                            effects::number(stroke, key, default) * scale;
+                                        let response = controls::range(
+                                            ui,
+                                            key,
+                                            &mut value,
+                                            min * scale..=max * scale,
+                                            160.0,
+                                            suffix,
+                                            0,
+                                            false,
+                                        );
+                                        if response.changed() {
+                                            stroke[key] = json!(value / scale);
+                                            edited = true;
+                                            changed = Some(response);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    let response = icons::small_button(ui, Icon::Trash, "Remove liquify stroke");
+                    if response.clicked() {
+                        removed = Some(index);
+                        changed = Some(response);
+                        edited = true;
+                    }
+                });
+            });
+        }
+        if let Some(index) = removed {
+            strokes.remove(index);
+        }
+        if edited {
+            settings["strokes"] = json!(strokes);
+        }
+    }
     if kind == "curves" {
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(240.0, 110.0), egui::Sense::click_and_drag());
@@ -80,9 +220,11 @@ pub(super) fn settings(
             )
         };
         let points = settings["points"].as_array().cloned().unwrap_or_default();
-        let line = points
-            .iter()
-            .map(|p| to_screen(p[0].as_f64().unwrap() as f32, p[1].as_f64().unwrap() as f32))
+        let line = (0..=256)
+            .map(|i| {
+                let x = i as f32 / 256.0;
+                to_screen(x, effects::curve_value(settings, x))
+            })
             .collect();
         ui.painter().add(egui::Shape::line(
             line,
@@ -95,7 +237,42 @@ pub(super) fn settings(
                 Color32::WHITE,
             );
         }
-        if response.dragged() || response.clicked() {
+        if response.double_clicked() {
+            if let Some(p) = response.interact_pointer_pos() {
+                let x = ((p.x - rect.left()) / rect.width()).clamp(0.001, 0.999);
+                let y = ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0);
+                if points.len() < 16
+                    && points
+                        .iter()
+                        .all(|p| (p[0].as_f64().unwrap() - x as f64).abs() > 0.001)
+                {
+                    let mut updated = points.clone();
+                    updated.push(json!([x, y]));
+                    updated
+                        .sort_by(|a, b| a[0].as_f64().unwrap().total_cmp(&b[0].as_f64().unwrap()));
+                    settings["interpolation"] = json!("smooth");
+                    settings["points"] = json!(updated);
+                    changed = Some(response.clone());
+                }
+            }
+        } else if response.secondary_clicked() {
+            if let Some(p) = response.interact_pointer_pos() {
+                if let Some(index) = points.iter().enumerate().find_map(|(i, v)| {
+                    (i > 0
+                        && i + 1 < points.len()
+                        && to_screen(v[0].as_f64().unwrap() as f32, v[1].as_f64().unwrap() as f32)
+                            .distance(p)
+                            < 10.0)
+                        .then_some(i)
+                }) {
+                    let mut updated = points.clone();
+                    updated.remove(index);
+                    settings["interpolation"] = json!("smooth");
+                    settings["points"] = json!(updated);
+                    changed = Some(response.clone());
+                }
+            }
+        } else if response.dragged() || response.clicked() || response.drag_started() {
             if let Some(pointer) = response.interact_pointer_pos() {
                 let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(pointer);
                 let nearest = points
@@ -112,6 +289,11 @@ pub(super) fn settings(
                                 .distance(origin),
                             )
                     })
+                    .filter(|(_, p)| {
+                        to_screen(p[0].as_f64().unwrap() as f32, p[1].as_f64().unwrap() as f32)
+                            .distance(origin)
+                            < 10.0
+                    })
                     .map(|(i, _)| i);
                 let drag_id = response.id.with("curve point");
                 if response.drag_started() {
@@ -120,7 +302,7 @@ pub(super) fn settings(
                     }
                 }
                 let index = if response.dragged() {
-                    ui.ctx().data(|d| d.get_temp::<usize>(drag_id)).or(nearest)
+                    ui.ctx().data(|d| d.get_temp::<usize>(drag_id))
                 } else {
                     nearest
                 };
@@ -139,6 +321,7 @@ pub(super) fn settings(
                             points[index][0].as_f64().unwrap(),
                         )
                     };
+                    settings["interpolation"] = json!("smooth");
                     settings["points"][index] = json!([selected_x, y]);
                     changed = Some(response.clone());
                 }
@@ -148,7 +331,9 @@ pub(super) fn settings(
             ui.ctx()
                 .data_mut(|d| d.remove::<usize>(response.id.with("curve point")));
         }
-        response.on_hover_text("Drag a curve point to reshape the tones");
+        response.on_hover_text(
+            "Double-click to add a point · Drag to shape · Right-click a point to remove",
+        );
     }
     changed
 }
@@ -171,6 +356,9 @@ impl PeerBrush {
                 for kind in effects::KINDS {
                     if ui.button(effect_name(kind)).clicked() {
                         self.layer_cmd("effect.add", json!({"kind":kind}), "Add color effect");
+                        if *kind == "liquify" {
+                            self.activate_liquify(None);
+                        }
                         ui.close_menu();
                     }
                 }
@@ -230,6 +418,20 @@ impl PeerBrush {
                                 },
                             );
                         });
+                        if effect.kind == "liquify" {
+                            if ui
+                                .button("Edit on canvas")
+                                .on_hover_text("Paint an editable distortion")
+                                .clicked()
+                            {
+                                self.activate_liquify(Some(effect.id.clone()));
+                            }
+                            ui.label(
+                                RichText::new("Paint on canvas · Each stroke stays editable below")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                        }
                         let mut values = effect.settings.clone();
                         if let Some(response) = settings(ui, &effect.kind, &mut values) {
                             self.layer_parameter(
@@ -248,6 +450,10 @@ pub(super) fn effect_name(kind: &str) -> &str {
     match kind {
         "blur" | "gaussian" => "Gaussian blur",
         "adjust" => "Color adjustment",
+        "color_balance" => "Color balance",
+        "hsl" => "Hue / saturation",
+        "bloom" => "Bloom",
+        "liquify" => "Liquify",
         "grayscale" => "Grayscale",
         "levels" => "Levels",
         "curves" => "Curves",
@@ -377,4 +583,83 @@ mod tests {
             }
         }
     }
+}
+
+fn levels_slider(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Response> {
+    let (rect, mut response) =
+        ui.allocate_exact_size(Vec2::new(240.0, 38.0), egui::Sense::click_and_drag());
+    let bar = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 18.0));
+    for i in 0..128 {
+        let x = bar.left() + bar.width() * i as f32 / 128.0;
+        ui.painter().rect_filled(
+            Rect::from_min_max(
+                egui::pos2(x, bar.top()),
+                egui::pos2(x + bar.width() / 128.0 + 0.5, bar.bottom()),
+            ),
+            0,
+            Color32::from_gray((i * 255 / 127) as u8),
+        );
+    }
+    let mut black = effects::number(settings, "black", 0.0);
+    let mut white = effects::number(settings, "white", 1.0);
+    let mut gamma = effects::number(settings, "gamma", 1.0);
+    let positions = [black, black + (white - black) * 0.5_f32.powf(gamma), white];
+    let id = response.id.with("levels handle");
+    if response.drag_started() || response.clicked() {
+        if let Some(p) = ui
+            .input(|i| i.pointer.press_origin())
+            .or(response.interact_pointer_pos())
+        {
+            let nearest = (0..3)
+                .min_by(|a, b| {
+                    (bar.left() + positions[*a] * bar.width() - p.x)
+                        .abs()
+                        .total_cmp(&(bar.left() + positions[*b] * bar.width() - p.x).abs())
+                })
+                .unwrap();
+            ui.ctx().data_mut(|d| d.insert_temp(id, nearest));
+        }
+    }
+    if response.dragged() || response.clicked() {
+        if let (Some(p), Some(index)) = (
+            response.interact_pointer_pos(),
+            ui.ctx().data(|d| d.get_temp::<usize>(id)),
+        ) {
+            let x = ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
+            match index {
+                0 => black = x.min(white - 0.01).clamp(0.0, 0.99),
+                2 => white = x.max(black + 0.01).clamp(0.01, 1.0),
+                _ => {
+                    gamma = (((x - black) / (white - black)).clamp(0.001, 0.999).ln()
+                        / 0.5_f32.ln())
+                    .clamp(0.1, 5.0)
+                }
+            }
+            settings["black"] = json!(black);
+            settings["white"] = json!(white);
+            settings["gamma"] = json!(gamma);
+            response.mark_changed();
+        }
+    }
+    for (i, v) in [black, black + (white - black) * 0.5_f32.powf(gamma), white]
+        .into_iter()
+        .enumerate()
+    {
+        let x = bar.left() + v * bar.width();
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(x, bar.bottom() + 2.0),
+                egui::pos2(x - 5.0, bar.bottom() + 11.0),
+                egui::pos2(x + 5.0, bar.bottom() + 11.0),
+            ],
+            [Color32::BLACK, Color32::GRAY, Color32::WHITE][i],
+            Stroke::new(1.0_f32, MUTED),
+        ));
+    }
+    if response.drag_stopped() {
+        ui.ctx().data_mut(|d| d.remove::<usize>(id));
+    }
+    let changed = response.changed();
+    let response = response.on_hover_text("Drag the black, midtone and white input handles");
+    changed.then_some(response)
 }

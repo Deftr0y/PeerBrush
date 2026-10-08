@@ -50,6 +50,11 @@ fn file_version(path: &Path) -> Result<(u64, u128), String> {
     ))
 }
 pub fn open(shared: &Shared, path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        return Err(
+            "Choose a .psd file inside this folder, or drop one PSD onto the canvas".into(),
+        );
+    }
     let before = {
         let e = shared.lock().unwrap();
         (e.doc.id.clone(), e.doc.revision)
@@ -74,6 +79,52 @@ pub fn open(shared: &Shared, path: &Path) -> Result<(), String> {
     }
     e.replace(doc, Some(path.into()))?;
     e.file_version = Some(version);
+    Ok(())
+}
+/// Explicitly flatten unsupported Photoshop structure without reducing channel precision or replacing its file.
+pub fn compatible_copy(shared: &Shared, actor: &str, expected: Option<u64>) -> Result<(), String> {
+    let source = {
+        let mut e = shared.lock().unwrap();
+        e.expire();
+        e.check(
+            actor,
+            &[Scope {
+                target: None,
+                rect: None,
+            }],
+        )?;
+        if !e.doc.read_only {
+            return Err("This document is already editable".into());
+        }
+        if expected.is_some_and(|rev| rev != e.doc.revision) {
+            return Err("Document changed; observe again before converting".into());
+        }
+        e.doc.clone()
+    };
+    let mut doc = engine::Document::new_depth(source.width, source.height, source.bit_depth)?;
+    if source.bit_depth == 16 {
+        let image = crate::depth16::render(&source)?;
+        doc.layers[0].pixels =
+            raster::Raster::from_rgba16(image.width, image.height, &image.words)?;
+    } else {
+        let (w, h, pixels, _) =
+            source.preview(None, source.width.max(source.height), None, false)?;
+        doc.layers[0].pixels = raster::Raster::from_rgba(w, h, &pixels)?;
+    }
+    doc.name = format!(
+        "{} - {}-bit copy.psd",
+        source.name.trim_end_matches(".psd"),
+        source.bit_depth
+    );
+    doc.layers[0].name = format!("Flattened {}-bit artwork", source.bit_depth);
+    doc.revision = 1;
+    let mut e = shared.lock().unwrap();
+    if e.doc.id != source.id || e.doc.revision != source.revision {
+        return Err("Document changed while preparing the copy".into());
+    }
+    e.replace(doc, None)?;
+    e.saved_revision = 0;
+    e.file_version = None;
     Ok(())
 }
 pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
@@ -142,7 +193,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_observe","description":"Inspect live document structure and actual PNG image content. Coordinates are document pixels, origin top left. Request layer/mask/rect views, max_edge and since_revision to reduce image traffic.","inputSchema":{"type":"object","properties":{"layer":{"type":"string"},"mask":{"type":"boolean"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"since_revision":{"type":"integer"},"image":{"type":"boolean"}},"additionalProperties":false}},
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
-        {"name":"peerbrush_document","description":"New/open/save PSD or export PNG. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","save","export"]},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"discard":{"type":"boolean"}},"required":["action"]}},
+        {"name":"peerbrush_document","description":"New/open/save PSD or export PNG. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","save","export","compatible_copy"]},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Work like an artist: inspect each result, undo unsatisfactory attempts, revise and try again, or redo to compare. AI undo/redo requires expected_revision and only reverses its own latest batch; preserve interleaved human work. Returns visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply an absolute local PNG/JPEG path or base64 PNG, and exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_capabilities","description":"Get concise supported operations and runnable JSON examples before editing.","inputSchema":{"type":"object","properties":{}}}
@@ -150,13 +201,22 @@ pub fn tools() -> Value {
 }
 pub fn capabilities() -> Value {
     static DATA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    DATA.get_or_init(|| {
-        let mut value: Value =
-            serde_json::from_str(include_str!("capabilities.json")).expect("bundled capabilities");
-        value["version"] = json!(env!("CARGO_PKG_VERSION"));
-        value
-    })
-    .clone()
+    let mut result = DATA
+        .get_or_init(|| {
+            let mut value: Value = serde_json::from_str(include_str!("capabilities.json"))
+                .expect("bundled capabilities");
+            value["version"] = json!(env!("CARGO_PKG_VERSION"));
+            value
+        })
+        .clone();
+    result["rendering"] = json!({
+        "canvas": "wgpu",
+        "effects": crate::gpu::status(),
+        "brush": "incremental tiled CPU coverage",
+        "compositing": "compiled CPU layer tree with regional gesture updates",
+        "liquify": "CPU displacement grid"
+    });
+    result
 }
 
 fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
@@ -407,13 +467,23 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             }
             match action {
                 "new" => {
-                    let doc = engine::Document::new(
+                    let depth = p.get("bit_depth").map_or(Ok(8), |v| {
+                        v.as_u64()
+                            .filter(|d| [8, 16].contains(d))
+                            .map(|d| d as u16)
+                            .ok_or("Color depth must be 8 or 16 bits")
+                    })?;
+                    let doc = engine::Document::new_depth(
                         p.get("width").and_then(Value::as_u64).unwrap_or(1024) as u32,
                         p.get("height").and_then(Value::as_u64).unwrap_or(768) as u32,
+                        depth,
                     )?;
                     shared.lock().unwrap().replace(doc, None)?;
                 }
                 "open" => open(shared, path.as_deref().ok_or("Missing path")?)?,
+                "compatible_copy" => {
+                    compatible_copy(shared, actor, p["expected_revision"].as_u64())?
+                }
                 "save" => {
                     let path = path
                         .or_else(|| shared.lock().unwrap().path.clone())

@@ -13,6 +13,10 @@ fn fill_tiles(
     origin: [i32; 2],
     polygon: Option<&[[f32; 2]]>,
 ) {
+    if raster.depth == 16 {
+        fill_tiles16(raster, area, color.map(|v| v as u16 * 257), origin, polygon);
+        return;
+    }
     if color[3] == 0 {
         return;
     }
@@ -81,6 +85,81 @@ fn fill_tiles(
     }
 }
 
+fn fill_tiles16(
+    raster: &mut Raster,
+    area: [i32; 4],
+    color: [u16; 4],
+    origin: [i32; 2],
+    polygon: Option<&[[f32; 2]]>,
+) {
+    if color[3] == 0 {
+        return;
+    }
+    let area = [
+        area[0].max(0),
+        area[1].max(0),
+        area[2].min(raster.width as i32),
+        area[3].min(raster.height as i32),
+    ];
+    if area[0] >= area[2] || area[1] >= area[3] {
+        return;
+    }
+    let mut constant = vec![0; (TILE * TILE * 4) as usize];
+    for pixel in constant.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&color);
+    }
+    let constant = Arc::new(constant);
+    for ty in area[1] as u32 / TILE..=(area[3] - 1) as u32 / TILE {
+        for tx in area[0] as u32 / TILE..=(area[2] - 1) as u32 / TILE {
+            let tile_x = (tx * TILE) as i32;
+            let tile_y = (ty * TILE) as i32;
+            let (x0, x1, y0, y1) = (
+                area[0].max(tile_x),
+                area[2].min(tile_x + TILE as i32),
+                area[1].max(tile_y),
+                area[3].min(tile_y + TILE as i32),
+            );
+            let full = x0 == tile_x
+                && y0 == tile_y
+                && x1 == tile_x + TILE as i32
+                && y1 == tile_y + TILE as i32;
+            if polygon.is_none()
+                && full
+                && (color[3] == 65535 || !raster.samples16.contains_key(&(tx, ty)))
+            {
+                raster.samples16.insert((tx, ty), constant.clone());
+                continue;
+            }
+            let tile = match raster.samples16.entry((tx, ty)) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(Arc::new(vec![0; (TILE * TILE * 4) as usize])),
+            };
+            let pixels = Arc::make_mut(tile);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if polygon.is_some_and(|p| {
+                        !crate::selection::contains(
+                            p,
+                            (x + origin[0]) as f32 + 0.5,
+                            (y + origin[1]) as f32 + 0.5,
+                        )
+                    }) {
+                        continue;
+                    }
+                    let at = (((y - tile_y) as u32 * TILE + (x - tile_x) as u32) * 4) as usize;
+                    let old = pixels[at..at + 4].try_into().unwrap();
+                    let result = if color[3] == 65535 {
+                        color
+                    } else {
+                        crate::raster::blend16(old, color, 1.0, "normal")
+                    };
+                    pixels[at..at + 4].copy_from_slice(&result);
+                }
+            }
+        }
+    }
+}
+
 pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
     let target = command["layer"].as_str().ok_or("Choose a layer to fill")?;
     let index = doc
@@ -130,6 +209,7 @@ pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
         }
         let mut child = Layer::new("Foreground fill", "paint", doc.width, doc.height);
         child.parent = Some(target.into());
+        child.pixels = Raster::new_depth(doc.width, doc.height, doc.bit_depth);
         fill_tiles(&mut child.pixels, area, color, [0, 0], polygon.as_deref());
         doc.layers.insert(index + 1, child);
         return Ok(());

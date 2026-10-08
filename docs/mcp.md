@@ -114,3 +114,25 @@ codex mcp add peerbrush -- "C:\path\to\PeerBrush\target\release\peerbrush.exe" m
 Merge bakes the selected sources, masks and effects into a regular raster layer. A selected folder flattens its children; one selected raster merges with the sibling below it. Multiple roots must be adjacent siblings with normal external blend, so unrelated layers and backdrop-dependent blends are not silently changed. Use a folder to retain internal blend interactions before flattening. Rendering happens outside the shared engine lock for a single merge request; commit requires the document to remain unchanged. Undo restores the editable sources.
 
 Regular layers and folders are the creation choices. `paint.fill` floods a regular layer, or clips to the current selection. A rotated selection is returned as `selection_polygon` along with its bounding `selection` rectangle. Use observation to get the current exact shape and revision before editing it.
+
+
+## Painting and color tools
+
+`peerbrush_capabilities` returns brush tip/settings, all blend modes and runnable commands. Use `paint` with `tip:dry|chalk|grain|bristle`, density/grain, pressure toggles and taper distances. Pressure points accept `[x,y,p]` with `p` in0–1; plain points remain compatible. `smudge` adds wetness/load/pickup and uses the same selection, layer and mask coordinates.
+
+`adjustment.add` accepts `layers`, `kind` and editable `settings`. A paint target gets a clipped adjustment; a folder target gets a scoped child; multiple roots become a shared folder. An existing pixel selection becomes its mask. `layer.clip` sets `base` to the next unclipped sibling below; `base:null` releases clipping. Preserve whole clipping units when copying or reorganizing.
+
+Color effects add `color_balance`, `hsl`, `bloom` and `liquify`. Balance uses shadows/midtones/highlights RGB complementary-axis arrays in −1–1, with preserve_luminosity. HSL uses hue degrees −180–180 and saturation/lightness −1–1. Bloom uses threshold 0–1, spread 0–64 document pixels and strength 0–3.
+
+`liquify.stroke` accepts document-space points, mode push/expand/pinch/restore, radius and strength. It appends to the latest enabled liquify effect, or creates one; optional `effect` chooses an existing effect ID. Stored strokes use layer-local coordinates and retain their selection clipping. Inspect the result, undo a poor stroke, revise and retry. `effect.update` edits the retained source settings after later work.
+
+Supported 8-bit and 16-bit RGB PSD raster layers and masks remain editable at their native depth. Unsupported Photoshop structures open protected from their saved composite. Document action `compatible_copy` explicitly creates a flattened editable project at the original bit depth with no source filename, so saving requires a new path. This copy preserves channel precision; unsupported Photoshop source structure remains in the original file.
+
+Native 16-bit projects retain channel precision in the shared engine and PSD/PNG files. Create them with `peerbrush_document` action `new`, `bit_depth:16`. Observation images are compact 8-bit PNG projections. `peerbrush_capabilities.rendering` reports the actual adapter, supported automatic GPU effects and successful dispatch count; a CPU-only/headless process does not claim an attached GPU.
+
+
+### Selection and project settings
+
+`selection` accepts `kind` (`rectangle`, `ellipse`, `lasso`, `polygon`, `magnetic`, `wand`, `quick`, `object`, `row`, `column`), `mode` (`replace`, `add`, `subtract`, `intersect`), `rect` or `polygon`, `feather` (0–64 px), and color sampling options `layer`, `sample_merged`, `tolerance` (0–255), `contiguous`, `point`, `points` and `radius`. Polygon/magnetic geometry is supplied as document-coordinate points. Row/column clients supply their explicit one-pixel rectangle. Clear with `selection.clear`; restore with `selection.reselect`; invert with `selection.invert`; expand/contract with `selection.modify`, `mode` and `radius`. Empty selection bounds mean zero selected pixels, not deselection.
+
+`document.settings` accepts `width`, `height` and `bit_depth` (8 or 16), preserves layer content/positions, and commits one history item. It requires document-wide access. A 16-to-8 conversion is intentional quantization. `liquify.stroke` accepts an optional `effect` ID and captures selection coverage. Visibility-only `layer.update` commands (`op`, `layer`, `visible` only) remain usable during pixel reservations and do not conflict with pending pixel revisions. Other layer fields retain ordinary checks.

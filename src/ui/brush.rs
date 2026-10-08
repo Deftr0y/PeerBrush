@@ -1,5 +1,25 @@
 use super::*;
 impl PeerBrush {
+    pub(super) fn pointer_pressure(ui: &egui::Ui) -> Option<f32> {
+        ui.input(|input| {
+            input.events.iter().rev().find_map(|event| {
+                if let egui::Event::Touch {
+                    force: Some(force),
+                    phase,
+                    ..
+                } = event
+                {
+                    if matches!(phase, egui::TouchPhase::Start | egui::TouchPhase::Move)
+                        && force.is_finite()
+                        && (0.0..=1.0).contains(force)
+                    {
+                        return Some(*force);
+                    }
+                }
+                None
+            })
+        })
+    }
     pub(super) fn tip_outline(&self, painter: &egui::Painter, center: Pos2, scale: f32) {
         let (sin, cos) = self.brush.angle.to_radians().sin_cos();
         let points: Vec<Pos2> = (0..=48)
@@ -109,29 +129,30 @@ impl PeerBrush {
     }
     pub(super) fn stroke_command(&self, points: Vec<[f32; 2]>, color: Pixel) -> Value {
         let b = self.brush;
-        json!({"op":"paint","layer":self.selected,"points":points,"radius":self.radius,"color":color,
+        let pressures = (self.stroke_has_pressure && self.stroke_pressures.len() == points.len())
+            .then_some(&self.stroke_pressures);
+        let mut command = json!({"op":if self.tool==Tool::Smudge {"smudge"}else{"paint"},"layer":self.selected,"points":points,"radius":self.radius,"color":color,
             "mask":self.mask,"step":self.mask_step,"erase":self.tool==Tool::Eraser,
             "hardness":b.hardness,"opacity":b.opacity,"flow":b.flow,"spacing":b.spacing,
-            "roundness":b.roundness,"angle":b.angle,"smoothing":b.smoothing})
+            "roundness":b.roundness,"angle":b.angle,"smoothing":b.smoothing,
+            "tip":b.tip.name(),"density":b.density,"grain":b.grain,"seed":b.seed,
+            "pressure_size":b.pressure_size,"pressure_opacity":b.pressure_opacity,
+            "taper_start":b.taper_start,"taper_end":b.taper_end,"taper_size":b.taper_size,"taper_opacity":b.taper_opacity,
+            "wetness":b.wetness,"load":b.load,"pickup":b.pickup});
+        if let Some(pressures) = pressures {
+            command["pressures"] = json!(pressures);
+        }
+        command
     }
     pub(super) fn brush_settings(&mut self, ctx: &egui::Context) {
         let mut open = true;
-        egui::Window::new("Brush")
+        egui::Window::new(if self.tool==Tool::Smudge {"Smudge"}else{"Brush"})
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .default_pos(egui::pos2(85.0, 125.0))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    for name in ["Hard round", "Soft round", "Calligraphy"] {
-                        if ui.selectable_label(false, name).clicked() {
-                            self.brush.hardness = if name == "Soft round" { 0.0 } else { 1.0 };
-                            self.brush.roundness = if name == "Calligraphy" { 0.2 } else { 1.0 };
-                            self.brush.angle = if name == "Calligraphy" { -35.0 } else { 0.0 };
-                            self.brush.spacing = 0.15;
-                        }
-                    }
-                });
+                self.tip_presets(ui);
                 let key = format!("{:?}", self.brush);
                 if self.brush_preview.as_ref().map(|p| p.0.as_str()) != Some(key.as_str()) {
                     let mut r = crate::raster::Raster::new(260, 54);
@@ -189,7 +210,7 @@ impl PeerBrush {
                             ),
                             (
                                 "opacity",
-                                "Opacity",
+                                if self.tool==Tool::Smudge {"Strength"}else{"Opacity"},
                                 &mut self.brush.opacity,
                                 0.0,
                                 100.0,
@@ -248,8 +269,112 @@ impl PeerBrush {
                             false,
                         );
                         ui.end_row();
+                        if self.brush.tip!=crate::brush::TipKind::Round {
+                            let mut density=self.brush.density*100.0;
+                            controls::label(ui,"Density");controls::range(ui,"tip density",&mut density,5.0..=100.0,200.0,"%",0,false);ui.end_row();self.brush.density=density/100.0;
+                            controls::label(ui,"Grain");controls::range(ui,"tip grain",&mut self.brush.grain,0.5..=32.0,200.0," px",1,false);ui.end_row();
+                        }
+                        for (id,label,value) in [("taper start","Start",&mut self.brush.taper_start),("taper end","End",&mut self.brush.taper_end)] {
+                            controls::label(ui,label);controls::range(ui,id,value,0.0..=512.0,200.0," px",0,false).on_hover_text("Taper length along the stroke");ui.end_row();
+                        }
+                        if self.tool==Tool::Smudge {
+                            for (id,label,value) in [("wetness","Wet",&mut self.brush.wetness),("paint load","Load",&mut self.brush.load),("paint pickup","Pickup",&mut self.brush.pickup)] {
+                                let mut percent=*value*100.0;controls::label(ui,label);controls::range(ui,id,&mut percent,0.0..=100.0,200.0,"%",0,false);ui.end_row();*value=percent/100.0;
+                            }
+                        }
                     });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Pressure").small().color(MUTED));
+                    ui.checkbox(&mut self.brush.pressure_size,"Size").on_hover_text("Uses genuine device force when supplied, or explicit agent pressure. Mouse strokes use taper.");
+                    ui.checkbox(&mut self.brush.pressure_opacity,"Opacity");
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Taper").small().color(MUTED));
+                    ui.checkbox(&mut self.brush.taper_size,"Size");ui.checkbox(&mut self.brush.taper_opacity,"Opacity");
+                });
             });
         self.show_brush = open;
+    }
+    fn tip_presets(&mut self, ui: &mut egui::Ui) {
+        use crate::brush::{Settings, TipKind};
+        ui.horizontal_wrapped(|ui| {
+            for (name, tip, hardness, roundness, density, grain) in [
+                ("Hard", TipKind::Round, 1.0, 1.0, 1.0, 2.0),
+                ("Soft", TipKind::Round, 0.0, 1.0, 1.0, 2.0),
+                ("Ink", TipKind::Round, 1.0, 0.2, 1.0, 2.0),
+                ("Dry", TipKind::Dry, 0.85, 0.65, 0.65, 2.5),
+                ("Chalk", TipKind::Chalk, 0.8, 1.0, 0.75, 3.0),
+                ("Grain", TipKind::Grain, 0.9, 1.0, 0.65, 1.0),
+                ("Bristle", TipKind::Bristle, 1.0, 0.7, 0.75, 3.0),
+            ] {
+                let id = egui::Id::new(("brush preset thumbnail", name));
+                let texture = ui
+                    .ctx()
+                    .data_mut(|data| data.get_temp::<TextureHandle>(id))
+                    .unwrap_or_else(|| {
+                        let mut raster = crate::raster::Raster::new(44, 30);
+                        let settings = Settings {
+                            radius: 10.0,
+                            tip,
+                            hardness,
+                            roundness,
+                            density,
+                            grain,
+                            angle: if name == "Ink" { -35.0 } else { 0.0 },
+                            ..Default::default()
+                        };
+                        let _ = crate::brush::paint(
+                            &mut raster,
+                            &[[12., 15.], [32., 15.]],
+                            settings,
+                            [245, 242, 240, 255],
+                            false,
+                            None,
+                        );
+                        let texture = ui.ctx().load_texture(
+                            name,
+                            egui::ColorImage::from_rgba_unmultiplied([44, 30], &raster.rgba()),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(id, texture.clone()));
+                        texture
+                    });
+                let (rect, response) =
+                    ui.allocate_exact_size(Vec2::new(44.0, 48.0), egui::Sense::click());
+                let selected = self.brush.tip == tip
+                    && self.brush.hardness == hardness
+                    && self.brush.roundness == roundness;
+                let image = Rect::from_min_size(rect.min, Vec2::new(44.0, 30.0));
+                ui.painter().image(
+                    texture.id(),
+                    image,
+                    Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                ui.painter().text(
+                    rect.center_bottom() - Vec2::new(0., 8.),
+                    egui::Align2::CENTER_CENTER,
+                    name,
+                    egui::FontId::proportional(10.0),
+                    if selected { ACCENT } else { MUTED },
+                );
+                if selected {
+                    ui.painter().line_segment(
+                        [rect.left_bottom(), rect.right_bottom()],
+                        Stroke::new(1.5_f32, ACCENT),
+                    );
+                }
+                if response.on_hover_text(format!("{name} brush")).clicked() {
+                    self.brush.tip = tip;
+                    self.brush.hardness = hardness;
+                    self.brush.roundness = roundness;
+                    self.brush.density = density;
+                    self.brush.grain = grain;
+                    self.brush.angle = if name == "Ink" { -35.0 } else { 0.0 };
+                    self.brush.spacing = 0.15;
+                }
+            }
+        });
     }
 }

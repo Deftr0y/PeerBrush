@@ -194,6 +194,7 @@ fn tiled_brush_matches_original_pixels_and_preserves_history_source() {
             roundness: [0.05, 0.42, 1.0][case % 3],
             angle: [-179.5, -48.0, 0.0, 35.2, 90.0][case % 5],
             smoothing: [0.0, 0.37, 1.0][(case / 3) % 3],
+            ..Default::default()
         };
         let clip = (case % 3 == 0).then_some([245, 12, 510, 389]);
         let color = [233, 82, 19, [0, 71, 193, 255][(case / 2) % 4]];

@@ -12,4 +12,6 @@
 - Run engine/codec/protocol tests and visually verify the native workspace after behavior changes.
 - Do not commit generated QA artifacts, credentials, connection tokens, development tools, recovery files, or build outputs. Requested bundled app artwork, fonts and curated documentation screenshots are source assets and must accompany the application.
 
-- Layer controls use a connected Color/Mask selector, with blend and opacity beneath the effects. Top effects run last. Rename inline, without a dialog. Create regular layers and folders; new folders collect selected roots.
+- Layer controls use a connected Color/Mask selector, with blend and opacity beneath the effects. Top effects run last. Rename inline, without a dialog. Create regular layers, folders and explicitly requested adjustment layers; new folders collect selected roots.
+
+- Preserve native 16-bit channels through edits, internal clipboard, effects, transforms and PSD/PNG saves. Screen/agent previews may project to 8 bit. Never silently make an 8-bit editable copy of a 16-bit original. Unsupported Photoshop structures can be explicitly flattened at their original precision.

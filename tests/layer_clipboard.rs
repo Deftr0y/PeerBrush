@@ -414,3 +414,70 @@ fn pasted_content_invalidates_cached_destination_folder_effects() {
         &[195, 165, 135, 255]
     );
 }
+
+#[test]
+fn native_layer_copy_duplicate_and_cross_depth_paste_preserve_every_word() {
+    let mut source = Document::new_depth(8, 8, 16).unwrap();
+    let original = source.layers[0].id.clone();
+    let sample = [12345, 23456, 34567, 45678];
+    source.layers[0].pixels.set16(2, 3, sample);
+    let snapshot = layer_clipboard::copy(&source, &[original.clone()]).unwrap();
+    let restored: layer_clipboard::Layers =
+        serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+    assert_eq!(restored.layers[0].pixels.get16(2, 3), sample);
+    let copied = layer_clipboard::duplicate(&mut source, &[original]).unwrap();
+    assert_eq!(
+        source
+            .layers
+            .iter()
+            .find(|l| l.id == copied[0])
+            .unwrap()
+            .pixels
+            .get16(2, 3),
+        sample
+    );
+    let mut target = Document::new(8, 8).unwrap();
+    let destination = target.layers[0].id.clone();
+    let pasted = layer_clipboard::paste(&mut target, &restored, &destination).unwrap();
+    assert_eq!(target.bit_depth, 16);
+    assert!(target.layers.iter().all(|l| l.pixels.depth == 16));
+    assert_eq!(
+        target
+            .layers
+            .iter()
+            .find(|l| l.id == pasted[0])
+            .unwrap()
+            .pixels
+            .get16(2, 3),
+        sample
+    );
+    let bytes = peerbrush::psd::encode(&target).unwrap();
+    let reopened = peerbrush::psd::decode(&bytes).unwrap();
+    assert_eq!(reopened.bit_depth, 16);
+    assert_eq!(
+        reopened
+            .layers
+            .iter()
+            .find(|l| l.id == pasted[0])
+            .unwrap()
+            .pixels
+            .get16(2, 3),
+        sample
+    );
+    // Mixed native sources in a typed snapshot are malformed; no implicit rounding.
+    let mut malformed = restored;
+    malformed.layers[0].pixels = Raster::new(8, 8);
+    malformed.layers[0].mask = Some(Mask {
+        enabled: true,
+        cache_key: engine::id(),
+        steps: vec![MaskStep {
+            id: engine::id(),
+            kind: "paint".into(),
+            enabled: true,
+            value: 255.,
+            settings: json!({}),
+            pixels: Raster::new_depth(8, 8, 16),
+        }],
+    });
+    assert!(layer_clipboard::validate(&malformed).is_err());
+}

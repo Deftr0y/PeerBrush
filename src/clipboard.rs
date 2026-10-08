@@ -13,10 +13,15 @@ pub struct Image {
     pub width: u32,
     pub height: u32,
     pub bytes: Vec<u8>,
+    /// Native words retained inside PeerBrush; OS clipboard transport uses display bytes.
+    pub samples16: Option<Vec<u16>>,
     pub origin: Option<[i32; 2]>,
 }
 impl Image {
     pub fn copy(doc: &Document, target: &str, mask: bool, merged: bool) -> Result<Self, String> {
+        if doc.bit_depth == 16 {
+            return Self::copy16(doc, target, mask, merged);
+        }
         let area = doc
             .selection
             .unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
@@ -57,15 +62,13 @@ impl Image {
             }
         }
         // Resolve validity once; copied pixels are already cropped to the selection bounds.
-        if let Some(polygon) = crate::selection::polygon(doc) {
+        if let Some(coverage) = crate::selection::current(doc) {
             for y in 0..height {
                 for x in 0..width {
-                    if !crate::selection::contains(
-                        polygon,
-                        (area[0] + x as i32) as f32 + 0.5,
-                        (area[1] + y as i32) as f32 + 0.5,
-                    ) {
-                        let at = ((y * width + x) * 4) as usize;
+                    let at = ((y * width + x) * 4) as usize;
+                    let factor = coverage.value(area[0] + x as i32, area[1] + y as i32);
+                    bytes[at + 3] = (bytes[at + 3] as f64 * factor as f64).round() as u8;
+                    if bytes[at + 3] == 0 {
                         bytes[at..at + 4].fill(0);
                     }
                 }
@@ -75,13 +78,85 @@ impl Image {
             width,
             height,
             bytes,
+            samples16: None,
+            origin: Some([area[0], area[1]]),
+        })
+    }
+    fn copy16(doc: &Document, target: &str, mask: bool, merged: bool) -> Result<Self, String> {
+        let area = doc
+            .selection
+            .unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
+        if area[2] <= area[0]
+            || area[3] <= area[1]
+            || area[2] <= 0
+            || area[3] <= 0
+            || area[0] >= doc.width as i32
+            || area[1] >= doc.height as i32
+        {
+            return Err("Select an area inside the canvas to copy".into());
+        }
+        let (width, height, mut words, area) =
+            crate::depth16::preview16(doc, Some(area), 8192, (!merged).then_some(target), mask)?;
+        if !merged && !mask {
+            let index = doc
+                .layers
+                .iter()
+                .position(|layer| layer.id == target)
+                .ok_or("Layer no longer exists")?;
+            let layer = &doc.layers[index];
+            let prepared = if layer.mask.as_ref().is_some_and(|mask| mask.enabled) {
+                crate::depth16::mask_image(doc, index)?
+            } else {
+                None
+            };
+            for y in 0..height {
+                for x in 0..width {
+                    let factor = prepared.as_ref().map_or(1., |image| {
+                        image.get(area[0] + x as i32 - layer.x, area[1] + y as i32 - layer.y)[0]
+                            as f64
+                            / 65535.
+                    });
+                    let alpha = &mut words[((y * width + x) * 4 + 3) as usize];
+                    *alpha = (*alpha as f64 * factor * layer.opacity as f64)
+                        .round()
+                        .clamp(0., 65535.) as u16;
+                }
+            }
+        }
+        if let Some(coverage) = crate::selection::current(doc) {
+            for y in 0..height {
+                for x in 0..width {
+                    let at = ((y * width + x) * 4) as usize;
+                    let factor = coverage.value(area[0] + x as i32, area[1] + y as i32);
+                    words[at + 3] = (words[at + 3] as f64 * factor as f64).round() as u16;
+                    if words[at + 3] == 0 {
+                        words[at..at + 4].fill(0);
+                    }
+                }
+            }
+        }
+        let bytes = words
+            .iter()
+            .copied()
+            .map(crate::raster::project16)
+            .collect();
+        Ok(Self {
+            width,
+            height,
+            bytes,
+            samples16: Some(words),
             origin: Some([area[0], area[1]]),
         })
     }
     pub fn command(&self, context: &str) -> Result<Value, String> {
         check_size(self.width, self.height)?;
+        let encoded = if let Some(words) = &self.samples16 {
+            crate::raster::png16(self.width, self.height, words)?
+        } else {
+            png(self.width, self.height, &self.bytes)?
+        };
         Ok(
-            json!({"op":"image.paste","layer":context,"png":STANDARD.encode(png(self.width, self.height, &self.bytes)?),"origin":self.origin}),
+            json!({"op":"image.paste","layer":context,"png":STANDARD.encode(encoded),"origin":self.origin}),
         )
     }
 }
@@ -136,12 +211,18 @@ pub fn paste(doc: &mut Document, command: &Value) -> Result<(), String> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader.decode().map_err(|e| e.to_string())?.to_rgba8();
+    let image = reader.decode().map_err(|e| e.to_string())?;
     check_size(image.width(), image.height())?;
     let mut pasted = Layer::new("Pasted image", "paint", image.width(), image.height());
-    pasted.pixels = Raster::from_rgba(image.width(), image.height(), image.as_raw())?;
+    pasted.pixels = if doc.bit_depth == 16 {
+        let image = image.to_rgba16();
+        Raster::from_rgba16(image.width(), image.height(), image.as_raw())?
+    } else {
+        let image = image.to_rgba8();
+        Raster::from_rgba(image.width(), image.height(), image.as_raw())?
+    };
     let origin = if command["origin"].is_null() {
         [
             (doc.width as i32 - image.width() as i32) / 2,
@@ -169,6 +250,7 @@ pub fn paste(doc: &mut Document, command: &Value) -> Result<(), String> {
             doc.width,
             doc.height,
         );
+        folder.pixels = Raster::new_depth(doc.width, doc.height, doc.bit_depth);
         // Retain the source interaction with the backdrop when introducing a group.
         folder.blend = selected.blend.clone();
         folder.parent = selected.parent.clone();
@@ -187,6 +269,8 @@ pub fn paste(doc: &mut Document, command: &Value) -> Result<(), String> {
         doc.layers.insert(at, pasted);
     }
     doc.selection = None;
+    doc.selection_coverage = None;
+    doc.selection_polygon = None;
     doc.selection_polygon = None;
     Ok(())
 }
@@ -286,6 +370,7 @@ impl Provider for arboard::Clipboard {
             width,
             height,
             bytes: pixels.bytes.into_owned(),
+            samples16: None,
             origin: None,
         })
     }
@@ -386,15 +471,13 @@ impl Session {
                     return Ok("Pasted editable layers".into());
                 }
                 let mut image = clipboard.read_image()?;
-                image.origin = self
-                    .image
-                    .as_ref()
-                    .filter(|old| {
-                        old.width == image.width
-                            && old.height == image.height
-                            && old.bytes == image.bytes
-                    })
-                    .and_then(|old| old.origin);
+                let retained = self.image.as_ref().filter(|old| {
+                    old.width == image.width
+                        && old.height == image.height
+                        && old.bytes == image.bytes
+                });
+                image.origin = retained.and_then(|old| old.origin);
+                image.samples16 = retained.and_then(|old| old.samples16.clone());
                 let command = image.command(&target)?;
                 let mut engine = shared.lock().unwrap();
                 let result =
@@ -570,6 +653,7 @@ mod tests {
             width: 1,
             height: 1,
             bytes: vec![12, 34, 56, 255],
+            samples16: None,
             origin: None,
         });
         let revision = shared.lock().unwrap().doc.revision;
@@ -629,5 +713,51 @@ mod tests {
         assert!(e.doc.layers.is_empty());
         e.undo("human").unwrap();
         assert_eq!(e.doc.layers.len(), 1);
+    }
+
+    #[test]
+    fn native_pixel_copy_retains_words_across_the_os_display_transport() {
+        let (shared, mut doc, id) = fixture();
+        doc.bit_depth = 16;
+        doc.layers[0].pixels.promote16();
+        doc.layers[0]
+            .pixels
+            .set16(2, 3, [10001, 30003, 50007, 65535]);
+        doc.selection = Some([2, 3, 3, 4]);
+        shared.lock().unwrap().doc = doc.clone();
+        let mut session = Session::default();
+        let mut fake = Fake::default();
+        session
+            .process(
+                &mut fake,
+                Request::Copy {
+                    doc,
+                    target: id.clone(),
+                    mask: false,
+                    merged: false,
+                },
+            )
+            .result
+            .unwrap();
+        // Native OS image formats expose display bytes to arboard, so only internal retention
+        // can preserve these original words during a PeerBrush-to-PeerBrush paste.
+        fake.image.as_mut().unwrap().samples16 = None;
+        let reply = session.process(
+            &mut fake,
+            Request::Paste {
+                shared: shared.clone(),
+                target: id,
+                revision: 0,
+            },
+        );
+        reply.result.unwrap();
+        let engine = shared.lock().unwrap();
+        let pasted = engine
+            .doc
+            .layers
+            .iter()
+            .find(|l| Some(&l.id) == reply.selected.as_ref())
+            .unwrap();
+        assert_eq!(pasted.pixels.get16(0, 0), [10001, 30003, 50007, 65535]);
     }
 }

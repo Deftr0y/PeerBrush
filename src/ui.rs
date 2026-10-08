@@ -4,6 +4,7 @@ mod brush;
 mod color;
 mod effects;
 mod layers;
+mod liquify;
 mod selection;
 use crate::{controls, thumbnails};
 use crate::{
@@ -23,6 +24,26 @@ use std::{
 const ACCENT: Color32 = Color32::from_rgb(233, 84, 32);
 const AI_BLUE: Color32 = Color32::from_rgb(90, 170, 255);
 const MUTED: Color32 = Color32::from_rgb(188, 183, 189);
+fn key_modifiers(input: &egui::InputState, key: egui::Key) -> egui::Modifiers {
+    input
+        .events
+        .iter()
+        .find_map(|event| match event {
+            egui::Event::Key {
+                key: k,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } if *k == key || *physical_key == Some(key) => Some(*modifiers),
+            _ => None,
+        })
+        .unwrap_or(input.modifiers)
+}
+fn command_key(input: &egui::InputState, key: egui::Key) -> bool {
+    let mods = key_modifiers(input, key);
+    (mods.command || mods.ctrl) && input.key_pressed(key)
+}
 fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, _color: Color32) {
     use crate::icons::{self, Icon};
     let icon = match tool {
@@ -31,6 +52,8 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, _color: Color32) 
         Tool::Rotate => Icon::Rotate,
         Tool::Scale => Icon::Scale,
         Tool::Brush => Icon::Brush,
+        Tool::Smudge => Icon::Smudge,
+        Tool::Liquify => Icon::Liquify,
         Tool::Eraser => Icon::Eraser,
         Tool::Fill => Icon::Fill,
         Tool::Gradient => Icon::Gradient,
@@ -57,6 +80,8 @@ enum Tool {
     Rotate,
     Scale,
     Brush,
+    Smudge,
+    Liquify,
     Eraser,
     Fill,
     Rectangle,
@@ -74,7 +99,9 @@ impl Tool {
             Self::Move => "Move · W",
             Self::Rotate => "Rotate · E",
             Self::Scale => "Scale · R",
-            Self::Brush => "Brush",
+            Self::Brush => "Brush · B",
+            Self::Smudge => "Wet blend · U",
+            Self::Liquify => "Liquify · L",
             Self::Eraser => "Eraser",
             Self::Fill => "Fill",
             Self::Rectangle => "Rectangle",
@@ -94,8 +121,10 @@ struct Preview {
     w: u32,
     h: u32,
     bytes: Vec<u8>,
+    dirty: Option<[u32; 4]>,
     selection: Option<[i32; 4]>,
     selection_polygon: Option<Vec<[f32; 2]>>,
+    selection_coverage: Option<crate::selection::Coverage>,
     target: String,
     mask: bool,
 }
@@ -104,6 +133,7 @@ struct CanvasSelection {
     revision: u64,
     bounds: Option<[i32; 4]>,
     polygon: Option<Vec<[f32; 2]>>,
+    coverage: Option<crate::selection::Coverage>,
 }
 struct ConnectOutcome {
     summary: String,
@@ -149,12 +179,27 @@ pub struct PeerBrush {
     mask: bool,
     isolate: bool,
     tool: Tool,
+    selection_kind: String,
+    selection_mode: String,
+    selection_feather: f32,
+    selection_tolerance: f32,
+    selection_contiguous: bool,
+    selection_merged: bool,
+    selection_width: f32,
+    selection_path: Vec<[f32; 2]>,
+    selection_gesture_mode: Option<String>,
+    project_settings: Option<(u32, u32, u16)>,
     color: Pixel,
     mask_value: u8,
     radius: f32,
     size_drag: Option<(Pos2, f32)>,
     live_gesture: Option<String>,
     brush: crate::brush::Settings,
+    liquify: liquify::Settings,
+    liquify_effect: Option<String>,
+    stroke_pressures: Vec<f32>,
+    stroke_has_pressure: bool,
+    current_pressure: Option<f32>,
     background: Pixel,
     mask_background: u8,
     show_brush: bool,
@@ -169,6 +214,7 @@ pub struct PeerBrush {
     pan: Vec2,
     frame_pending: bool,
     logo: TextureHandle,
+    wordmark: TextureHandle,
     texture: Option<TextureHandle>,
     canvas_pixels: Option<(u32, u32, Vec<u8>)>,
     canvas_selection: Option<CanvasSelection>,
@@ -176,6 +222,7 @@ pub struct PeerBrush {
     preview_rx: mpsc::Receiver<Preview>,
     preview_tx: mpsc::Sender<Preview>,
     pending: bool,
+    preview_cache: Arc<std::sync::Mutex<crate::preview::Cache>>,
     last_preview: Option<(String, u64, String, bool)>,
     thumbs: HashMap<String, (u64, TextureHandle)>,
     thumb_worker: thumbnails::Worker,
@@ -196,6 +243,7 @@ pub struct PeerBrush {
     busy: bool,
     show_new: bool,
     new_width: u32,
+    new_bit_depth: u16,
     new_height: u32,
     show_connection: bool,
     connection_codex: bool,
@@ -229,6 +277,9 @@ pub struct PeerBrush {
 }
 impl PeerBrush {
     pub fn new(cc: &eframe::CreationContext<'_>, shared: Shared, connection: Connection) -> Self {
+        if let Some(state) = &cc.wgpu_render_state {
+            let _ = crate::gpu::install(state);
+        }
         Self::init(&cc.egui_ctx, shared, connection)
     }
     fn init(ctx: &egui::Context, shared: Shared, connection: Connection) -> Self {
@@ -273,6 +324,30 @@ impl PeerBrush {
             egui::ColorImage::from_rgba_unmultiplied(
                 [image.width() as usize, image.height() as usize],
                 image.as_raw(),
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+        let img = image::load_from_memory(include_bytes!("../assets/peerbrush-wordmark.png"))
+            .unwrap()
+            .to_rgba8();
+        let mut b = [img.width(), img.height(), 0, 0];
+        for (x, y, p) in img.enumerate_pixels() {
+            if p[3] > 180 {
+                b = [b[0].min(x), b[1].min(y), b[2].max(x + 1), b[3].max(y + 1)];
+            }
+        }
+        let img = image::imageops::crop_imm(&img, b[0], b[1], b[2] - b[0], b[3] - b[1]).to_image();
+        let img = image::imageops::resize(
+            &img,
+            1024,
+            (img.height() as f32 * 1024.0 / img.width() as f32).round() as u32,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let wordmark = ctx.load_texture(
+            "PeerBrush wordmark",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [img.width() as usize, img.height() as usize],
+                img.as_raw(),
             ),
             egui::TextureOptions::LINEAR,
         );
@@ -339,12 +414,27 @@ impl PeerBrush {
             mask: false,
             isolate: false,
             tool: Tool::Brush,
+            selection_kind: "rectangle".into(),
+            selection_mode: "replace".into(),
+            selection_feather: 0.,
+            selection_tolerance: 24.,
+            selection_contiguous: true,
+            selection_merged: true,
+            selection_width: 12.,
+            selection_path: vec![],
+            selection_gesture_mode: None,
+            project_settings: None,
             color: [233, 84, 32, 255],
             mask_value: 0,
             radius: 18.0,
             size_drag: None,
             live_gesture: None,
             brush: crate::brush::Settings::default(),
+            liquify: liquify::Settings::default(),
+            liquify_effect: None,
+            stroke_pressures: vec![],
+            stroke_has_pressure: false,
+            current_pressure: None,
             background: [245, 242, 240, 255],
             mask_background: 255,
             show_brush: false,
@@ -359,6 +449,7 @@ impl PeerBrush {
             pan: Vec2::ZERO,
             frame_pending: false,
             logo,
+            wordmark,
             texture: None,
             canvas_pixels: None,
             canvas_selection: None,
@@ -366,6 +457,7 @@ impl PeerBrush {
             preview_rx,
             preview_tx,
             pending: false,
+            preview_cache: Arc::new(std::sync::Mutex::new(crate::preview::Cache::default())),
             last_preview: None,
             thumbs: HashMap::new(),
             thumb_worker: thumbnails::Worker::new(ctx.clone()),
@@ -386,6 +478,7 @@ impl PeerBrush {
             busy: false,
             show_new: false,
             new_width: 1024,
+            new_bit_depth: 8,
             new_height: 768,
             show_connection: false,
             connection_codex: true,
@@ -857,13 +950,29 @@ impl PeerBrush {
             });
         }
     }
+    fn liquify_command(&self, points: &[[f32; 2]]) -> Value {
+        let mut command = liquify::command(&self.selected, points, self.radius, &self.liquify);
+        command["mask"] = json!(self.mask);
+        if let Some(effect) = &self.liquify_effect {
+            command["effect"] = json!(effect);
+        }
+        command
+    }
+    fn activate_liquify(&mut self, effect: Option<String>) {
+        self.tool = Tool::Liquify;
+        self.mask = false;
+        self.liquify_effect = effect;
+        self.message =
+            "Liquify: paint on the canvas · Choose Push, Expand, Pinch or Restore above".into();
+    }
     fn preview_variant(&self) -> String {
         let target = if self.isolate {
             self.selected.as_str()
         } else {
             ""
         };
-        let stroke = if [Tool::Brush, Tool::Eraser].contains(&self.tool) && !self.points.is_empty()
+        let stroke = if [Tool::Brush, Tool::Eraser, Tool::Smudge].contains(&self.tool)
+            && !self.points.is_empty()
         {
             let color = if self.mask {
                 [
@@ -878,6 +987,11 @@ impl PeerBrush {
             Some(self.stroke_command(self.points.clone(), color))
         } else {
             None
+        };
+        let stroke = if self.tool == Tool::Liquify && !self.points.is_empty() {
+            Some(self.liquify_command(&self.points))
+        } else {
+            stroke
         };
         format!(
             "{target};{:?};{};{}",
@@ -909,7 +1023,46 @@ impl PeerBrush {
         }
         self.canvas_pixels = Some((w, h, bytes));
     }
-    fn request_preview(&mut self, ctx: &egui::Context, doc: &Document) {
+    fn set_canvas_dirty(
+        &mut self,
+        ctx: &egui::Context,
+        w: u32,
+        h: u32,
+        bytes: Vec<u8>,
+        dirty: Option<[u32; 4]>,
+    ) {
+        if let Some([left, top, right, bottom]) = dirty.filter(|b| b[0] < b[2] && b[1] < b[3]) {
+            if self
+                .canvas_pixels
+                .as_ref()
+                .is_some_and(|(cw, ch, _)| (*cw, *ch) == (w, h))
+            {
+                if let Some(texture) = &mut self.texture {
+                    let mut cropped =
+                        Vec::with_capacity(((right - left) * (bottom - top) * 4) as usize);
+                    for y in top..bottom {
+                        cropped.extend_from_slice(
+                            &bytes[((y * w + left) * 4) as usize..((y * w + right) * 4) as usize],
+                        );
+                    }
+                    texture.set_partial(
+                        [left as usize, top as usize],
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [(right - left) as usize, (bottom - top) as usize],
+                            &cropped,
+                        ),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.canvas_pixels = Some((w, h, bytes));
+                    return;
+                }
+            }
+        }
+        self.set_canvas(ctx, w, h, bytes);
+    }
+    fn request_preview(&mut self, ctx: &egui::Context, _doc: &Document) {
+        let current = self.shared.lock().unwrap().doc.clone();
+        let doc = &current;
         let time = ctx.input(|i| i.time);
         let edge = self
             .view_rect
@@ -932,6 +1085,7 @@ impl PeerBrush {
         while let Ok(p) = self.preview_rx.try_recv() {
             self.pending = false;
             if p.doc_id == doc.id
+                && p.revision == doc.revision
                 && (p.target == variant || (!live.is_empty() && p.live == live))
                 && p.mask == (self.mask && self.isolate)
             {
@@ -941,12 +1095,13 @@ impl PeerBrush {
                         revision: p.revision,
                         bounds: p.selection,
                         polygon: p.selection_polygon.clone(),
+                        coverage: p.selection_coverage.clone(),
                     });
                     if !self
                         .animation
                         .fade_preview(self.canvas_pixels.as_ref(), &p, time)
                     {
-                        self.set_canvas(ctx, p.w, p.h, p.bytes);
+                        self.set_canvas_dirty(ctx, p.w, p.h, p.bytes, p.dirty);
                     }
                 }
                 if p.revision != doc.revision {
@@ -976,7 +1131,9 @@ impl PeerBrush {
             if let Some((layer, blend)) = &self.blend_hover {
                 commands.push(json!({"op":"layer.update","layer":layer,"blend":blend}));
             }
-            if [Tool::Brush, Tool::Eraser].contains(&self.tool) && !self.points.is_empty() {
+            if [Tool::Brush, Tool::Eraser, Tool::Smudge].contains(&self.tool)
+                && !self.points.is_empty()
+            {
                 let color = if self.mask {
                     [
                         self.mask_value,
@@ -989,6 +1146,23 @@ impl PeerBrush {
                 };
                 commands.push(self.stroke_command(self.points.clone(), color));
             }
+            if self.tool == Tool::Liquify && !self.points.is_empty() {
+                commands.push(self.liquify_command(&self.points));
+            }
+            let dirty = if !live.is_empty()
+                && commands.len() == 1
+                && matches!(commands[0]["op"].as_str(), Some("paint" | "smudge"))
+            {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .scopes(&commands[0])
+                    .first()
+                    .and_then(|scope| scope.rect)
+            } else {
+                None
+            };
+            let cache = self.preview_cache.clone();
             let tx = self.preview_tx.clone();
             let ctx = ctx.clone();
             let layer = if self.isolate {
@@ -1002,13 +1176,27 @@ impl PeerBrush {
                 let revision = doc.revision;
                 let output = (|| {
                     if !commands.is_empty() {
-                        doc = crate::engine::Engine::preview_edits(doc, &commands)?;
+                        doc = cache
+                            .lock()
+                            .map_err(|_| "Preview worker cache unavailable")?
+                            .edit(doc, &commands, &live)?;
                     }
-                    let (w, h, bytes, _) = doc.preview(None, edge, layer.as_deref(), mask)?;
-                    Ok::<_, String>((w, h, bytes, doc.selection, doc.selection_polygon.clone()))
+                    let rendered = cache
+                        .lock()
+                        .map_err(|_| "Preview worker cache unavailable")?
+                        .render(&doc, &live, dirty, edge, layer.as_deref(), mask)?;
+                    Ok::<_, String>((
+                        rendered.width,
+                        rendered.height,
+                        rendered.bytes,
+                        rendered.dirty,
+                        doc.selection,
+                        doc.selection_polygon.clone(),
+                        doc.selection_coverage.clone(),
+                    ))
                 })();
-                let (w, h, bytes, selection, selection_polygon) =
-                    output.unwrap_or((0, 0, vec![], None, None));
+                let (w, h, bytes, dirty, selection, selection_polygon, selection_coverage) =
+                    output.unwrap_or((0, 0, vec![], None, None, None, None));
                 let _ = tx.send(Preview {
                     live,
                     doc_id: id,
@@ -1018,8 +1206,10 @@ impl PeerBrush {
                     w,
                     h,
                     bytes,
+                    dirty,
                     selection,
                     selection_polygon,
+                    selection_coverage,
                 });
                 ctx.request_repaint();
             });
@@ -1106,8 +1296,7 @@ impl PeerBrush {
                 "layer.update",
                 json!({"locked":!l.locked}),
             ),
-            ("White mask", "mask.add", json!({"value":255})),
-            ("Black mask", "mask.add", json!({"value":0})),
+            ("Add mask", "mask.add", json!({"value":255})),
         ] {
             if ui
                 .add_enabled(
@@ -1155,6 +1344,29 @@ impl PeerBrush {
                 }
             }
         });
+        let doc = self.shared.lock().unwrap().doc.clone();
+        if ui
+            .button(if l.clip_to.is_some() {
+                "Release clipping"
+            } else {
+                "Clip to layer below"
+            })
+            .clicked()
+        {
+            let base = if l.clip_to.is_some() {
+                None
+            } else {
+                doc.layers
+                    .iter()
+                    .skip_while(|b| b.id != l.id)
+                    .skip(1)
+                    .find(|b| b.parent == l.parent)
+                    .map(|b| b.clip_to.clone().unwrap_or_else(|| b.id.clone()))
+            };
+            self.selected = l.id.clone();
+            self.layer_cmd("layer.clip", json!({"base":base}), "Layer clipping");
+            ui.close_menu();
+        }
         ui.separator();
         if ui
             .button(RichText::new("Delete layer").color(Color32::from_rgb(255, 154, 144)))
@@ -1169,13 +1381,17 @@ impl PeerBrush {
         let mut blend = l.blend.clone();
         self.blend_hover = None;
         let combo = egui::ComboBox::from_id_salt("blend")
-            .selected_text(format!("{}{}", blend[..1].to_uppercase(), &blend[1..]))
+            .selected_text(
+                crate::raster::BLENDS
+                    .iter()
+                    .find(|(mode, _)| *mode == blend)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("Normal"),
+            )
             .width(ui.available_width() - 10.0)
             .show_ui(ui, |ui| {
-                for name in [
-                    "normal", "multiply", "screen", "overlay", "darken", "lighten",
-                ] {
-                    let response = ui.selectable_value(&mut blend, name.into(), name);
+                for &(name, label) in crate::raster::BLENDS {
+                    let response = ui.selectable_value(&mut blend, name.into(), label);
                     if response.hovered() {
                         self.blend_hover = Some((l.id.clone(), name.into()));
                     }
@@ -1207,46 +1423,47 @@ impl PeerBrush {
         });
     }
     fn channel_tabs(&mut self, ui: &mut egui::Ui, has_mask: bool) {
-        ui.spacing_mut().item_spacing.x = 3.0;
-        let accent = ui.visuals().selection.stroke.color;
+        ui.spacing_mut().item_spacing.x = 0.0;
         let color = ui.add(
-            egui::Label::new(RichText::new("Color").color(if self.mask { MUTED } else { accent }))
-                .sense(egui::Sense::click()),
+            egui::Button::new("Color")
+                .selected(!self.mask)
+                .corner_radius(egui::CornerRadius {
+                    nw: 6,
+                    sw: 6,
+                    ne: 0,
+                    se: 0,
+                })
+                .min_size(Vec2::new(64.0, 28.0)),
         );
         self.color_tab_rect = Some(color.rect);
         if color.clicked() {
             self.mask = false;
             self.last_preview = None;
         }
-        if !self.mask {
-            ui.painter().line_segment(
-                [color.rect.left_bottom(), color.rect.right_bottom()],
-                Stroke::new(1.0_f32, accent),
-            );
-        }
-        ui.label(RichText::new("/").color(MUTED));
         let mask = ui.add_enabled(
             has_mask,
-            egui::Label::new(RichText::new("Mask").color(if self.mask { accent } else { MUTED }))
-                .sense(egui::Sense::click()),
+            egui::Button::new("Mask")
+                .selected(self.mask)
+                .corner_radius(egui::CornerRadius {
+                    nw: 0,
+                    sw: 0,
+                    ne: 6,
+                    se: 6,
+                })
+                .min_size(Vec2::new(64.0, 28.0)),
         );
         self.mask_tab_rect = Some(mask.rect);
         if mask.clicked() {
             self.mask = true;
             self.last_preview = None;
         }
-        if self.mask {
-            ui.painter().line_segment(
-                [mask.rect.left_bottom(), mask.rect.right_bottom()],
-                Stroke::new(1.0_f32, accent),
-            );
-        }
         mask.on_hover_text(if has_mask {
-            "Mask effects"
+            "Edit mask"
         } else {
-            "Add a mask to edit its effects"
+            "Add a mask first"
         });
     }
+
     fn layers(&mut self, ui: &mut egui::Ui, doc: &Document) {
         ui.add_space(10.0);
         ui.horizontal(|ui|{ui.label(RichText::new("Layers").size(15.0).strong());ui.label(RichText::new(doc.layers.len().to_string()).size(11.0).color(MUTED));
@@ -1254,6 +1471,16 @@ impl PeerBrush {
                 let folder = icons::button(ui, Icon::Folder, "New folder · contains selected layers");
                 self.new_folder_rect = Some(folder.rect);
                 if folder.clicked() { self.create_folder(doc); }
+                ui.menu_button("◐",|ui| {
+                    for (kind,label) in [("color_balance","Color balance"),("hsl","Hue / saturation"),("levels","Levels"),("curves","Curves")] {
+                        if ui.button(label).clicked() {
+                            let ids:Vec<_>=doc.layers.iter().filter(|l|self.selection_layers.contains(&l.id)).map(|l|l.id.clone()).collect();
+                            self.edit(vec![json!({"op":"adjustment.add","layers":ids,"kind":kind,"name":label})],"New adjustment");
+                            let id=self.shared.lock().unwrap().doc.layers.iter().find(|l|l.kind=="adjustment" && l.name==label).map(|l|l.id.clone());if let Some(id)=id{self.select_content(&id);}
+                            ui.close_menu();
+                        }
+                    }
+                }).response.on_hover_text("Add clipped adjustment · multiple layers become a shared color group");
                 if icons::button(ui, Icon::AddLayer, "New paint layer").clicked(){self.edit(vec![json!({"op":"layer.add","kind":"paint","name":format!("Paint {}",doc.layers.len()+1)})],"New paint layer");}
             });
         });
@@ -1316,7 +1543,7 @@ impl PeerBrush {
                     if !self.mask {
                         self.color_stack(ui,&l);
                         if l.mask.is_none() {ui.horizontal(|ui| {
-                            for (name,value) in [("+ White mask",255),("+ Black mask",0)] {
+                            for (name,value) in [("Add Mask",255)] {
                                 if ui.button(name).clicked(){self.layer_cmd("mask.add",json!({"value":value}),"Add mask");self.mask=true;}
                             }
                         });}
@@ -1450,12 +1677,8 @@ impl PeerBrush {
                                 .color(MUTED),
                         );
                         ui.horizontal(|ui| {
-                            if ui.button("+ White mask").clicked() {
+                            if ui.button("Add Mask").clicked() {
                                 self.layer_cmd("mask.add", json!({"value":255}), "Add mask");
-                                self.mask = true;
-                            }
-                            if ui.button("+ Black mask").clicked() {
-                                self.layer_cmd("mask.add", json!({"value":0}), "Add mask");
                                 self.mask = true;
                             }
                         });
@@ -1796,15 +2019,23 @@ impl PeerBrush {
         );
         let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
         let to_doc = |p: Pos2| [(p.x - rect.min.x) / scale, (p.y - rect.min.y) / scale];
-        let size_mode = [Tool::Brush, Tool::Eraser].contains(&self.tool)
+        let size_mode = [Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Liquify]
+            .contains(&self.tool)
             && ui.input(|i| i.key_down(egui::Key::S) && !i.modifiers.command);
         if size_mode && (response.hovered() || self.size_drag.is_some()) {
             if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
                 let (anchor, start) = *self.size_drag.get_or_insert((pointer, self.radius));
                 self.radius = (start * ((pointer.x - anchor.x) * 0.012).exp()).clamp(0.5, 512.0);
                 self.points.clear();
+                self.stroke_pressures.clear();
+                self.stroke_has_pressure = false;
+                self.current_pressure = None;
                 self.drag_start = None;
-                self.tip_outline(&painter, pointer, scale);
+                if self.tool == Tool::Liquify {
+                    liquify::cursor(&painter, pointer, self.radius, scale);
+                } else {
+                    self.tip_outline(&painter, pointer, scale);
+                }
                 painter.text(
                     pointer + Vec2::new(16.0, 20.0),
                     egui::Align2::LEFT_TOP,
@@ -1817,10 +2048,29 @@ impl PeerBrush {
             return;
         } else if self.size_drag.take().is_some() {
             self.points.clear();
+            self.stroke_pressures.clear();
+            self.stroke_has_pressure = false;
+            self.current_pressure = None;
             self.drag_start = None;
             return;
         }
-        selection::polygon(ui, &painter, &self.selection_points(doc, rect, scale));
+        let coverage = self
+            .canvas_selection
+            .as_ref()
+            .filter(|p| p.document == doc.id && p.revision == doc.revision)
+            .and_then(|p| p.coverage.as_ref())
+            .or(doc
+                .selection_coverage
+                .as_ref()
+                .filter(|m| doc.selection == Some(m.bounds)));
+        if let Some(coverage) = coverage {
+            for contour in &coverage.contours {
+                let points = contour.iter().map(|p| to_screen(*p)).collect::<Vec<_>>();
+                selection::polygon(ui, &painter, &points);
+            }
+        } else {
+            selection::polygon(ui, &painter, &self.selection_points(doc, rect, scale));
+        }
         self.ai_canvas(ui, &painter, doc, rect, scale);
         for lease in &self.shared.lock().unwrap().leases {
             for scope in &lease.scopes {
@@ -1851,7 +2101,7 @@ impl PeerBrush {
             }
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                 if rect.contains(p)
-                    && (self.tool == Tool::Brush || self.tool == Tool::Eraser)
+                    && ([Tool::Brush, Tool::Eraser, Tool::Smudge].contains(&self.tool))
                     && !(self.tool == Tool::Brush && ui.input(|i| i.modifiers.alt))
                 {
                     self.tip_outline(&painter, p, scale);
@@ -1890,6 +2140,9 @@ impl PeerBrush {
                 };
                 self.paint_command(self.points.clone(), color, "Brush stroke");
                 self.points.clear();
+                self.stroke_pressures.clear();
+                self.stroke_has_pressure = false;
+                self.current_pressure = None;
                 self.live_gesture = None;
             }
             if response.hovered() {
@@ -1921,9 +2174,35 @@ impl PeerBrush {
             self.drag_start = None;
             return;
         }
+        if self.tool == Tool::Selection {
+            self.selection_canvas(ui, doc, &response, &painter, rect, scale);
+            return;
+        }
         if [Tool::Move, Tool::Rotate, Tool::Scale].contains(&self.tool) {
             self.gizmo(ui, doc, rect, scale, available);
             return;
+        }
+        if self.tool == Tool::Liquify && response.hovered() {
+            if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
+                liquify::cursor(&painter, pointer, self.radius, scale);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            }
+        }
+        if let Some(force) = Self::pointer_pressure(ui) {
+            self.current_pressure = Some(force);
+        }
+        if ui.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Touch {
+                        phase: egui::TouchPhase::End | egui::TouchPhase::Cancel,
+                        ..
+                    }
+                )
+            })
+        }) {
+            self.current_pressure = None;
         }
         if response.drag_started() {
             if let Some(pos) = ui
@@ -1934,6 +2213,8 @@ impl PeerBrush {
                     let point = to_doc(pos);
                     self.drag_start = Some(point);
                     self.points = vec![point];
+                    self.stroke_pressures = vec![self.current_pressure.unwrap_or(1.)];
+                    self.stroke_has_pressure = self.current_pressure.is_some();
                     self.live_gesture = Some(crate::engine::id());
                 }
             }
@@ -1948,11 +2229,14 @@ impl PeerBrush {
                     .unwrap_or(true)
                 {
                     self.points.push(p);
+                    self.stroke_pressures
+                        .push(self.current_pressure.unwrap_or(1.));
+                    self.stroke_has_pressure |= self.current_pressure.is_some();
                 }
             }
         }
         if !self.points.is_empty() {
-            if ![Tool::Brush, Tool::Eraser].contains(&self.tool) {
+            if ![Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Liquify].contains(&self.tool) {
                 if let (Some(a), Some(b)) = (self.drag_start, self.points.last()) {
                     let r = Rect::from_two_pos(to_screen(a), to_screen(*b));
                     if self.tool == Tool::Selection {
@@ -1989,7 +2273,8 @@ impl PeerBrush {
                     a[1].max(b[1]) as i32,
                 ];
                 match self.tool{
-            Tool::Brush|Tool::Eraser=>{let c=if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color};self.paint_command(self.points.clone(),c,"Brush stroke");},
+            Tool::Brush|Tool::Eraser|Tool::Smudge=>{let c=if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color};self.paint_command(self.points.clone(),c,"Brush stroke");},
+            Tool::Liquify=>{let command=self.liquify_command(&self.points);self.edit(vec![command],"Liquify stroke");},
             Tool::Move=>self.layer_cmd("move",json!({"dx":(b[0]-a[0]) as i32,"dy":(b[1]-a[1]) as i32}),"Move layer"),
             Tool::Rectangle|Tool::Ellipse=>self.layer_cmd("shape",json!({"kind":if self.tool==Tool::Ellipse{"ellipse"}else{"rectangle"},"rect":area,"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}),"Draw shape"),
             Tool::Selection=>self.edit(vec![json!({"op":"selection","rect":area})],"Select region"),
@@ -1997,6 +2282,9 @@ impl PeerBrush {
         }
             }
             self.points.clear();
+            self.stroke_pressures.clear();
+            self.stroke_has_pressure = false;
+            self.current_pressure = None;
             self.drag_start = None;
         }
         if response.clicked() {
@@ -2004,7 +2292,7 @@ impl PeerBrush {
                 if rect.contains(pos) {
                     let p = to_doc(pos);
                     match self.tool {
-                        Tool::Brush | Tool::Eraser => {
+                        Tool::Brush | Tool::Eraser | Tool::Smudge => {
                             let c = if self.mask {
                                 [
                                     self.mask_value,
@@ -2015,8 +2303,10 @@ impl PeerBrush {
                             } else {
                                 self.color
                             };
+                            self.stroke_pressures=vec![self.current_pressure.unwrap_or(1.)];self.stroke_has_pressure=self.current_pressure.is_some();
                             self.paint_command(vec![p],c,"Brush dot");
                         }
+                        Tool::Liquify => {self.edit(vec![self.liquify_command(&[p])],"Liquify dab");}
                         Tool::Fill => {
                             self.layer_cmd("paint.fill", json!({"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}), "Fill layer")
                         }
@@ -2252,11 +2542,11 @@ impl PeerBrush {
             let (copy, cut, paste, merged) = ctx.input(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy))
-                        || (i.modifiers.command && i.key_pressed(egui::Key::C)),
+                        || (command_key(i, egui::Key::C)),
                     i.events.iter().any(|e| matches!(e, egui::Event::Cut))
-                        || (i.modifiers.command && i.key_pressed(egui::Key::X)),
+                        || (command_key(i, egui::Key::X)),
                     i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
-                        || (i.modifiers.command && i.key_pressed(egui::Key::V)),
+                        || (command_key(i, egui::Key::V)),
                     i.modifiers.shift,
                 )
             });
@@ -2293,8 +2583,8 @@ impl PeerBrush {
                     let color=if self.mask {[self.mask_value,self.mask_value,self.mask_value,255]}else{self.color};
                     self.layer_cmd("paint.fill",json!({"color":color,"mask":self.mask,"step":self.mask_step}),"Fill foreground");
                 }
-                if i.modifiers.command && i.key_pressed(egui::Key::Z) {
-                    let r = if i.modifiers.shift {
+                if command_key(i,egui::Key::Z) {
+                    let r = if key_modifiers(i,egui::Key::Z).shift {
                         self.shared.lock().unwrap().redo("human")
                     } else {
                         self.shared.lock().unwrap().undo("human")
@@ -2304,20 +2594,24 @@ impl PeerBrush {
                     }
                     self.last_preview = None;
                 }
-                if i.modifiers.command && i.key_pressed(egui::Key::S) {
-                    self.save(i.modifiers.shift);
+                if command_key(i,egui::Key::S) {
+                    self.save(key_modifiers(i,egui::Key::S).shift);
                 }
-                if i.modifiers.command && i.key_pressed(egui::Key::O) {
+                if command_key(i,egui::Key::O) {
                     self.open();
                 }
-                if i.modifiers.command && i.key_pressed(egui::Key::E) {
+                if command_key(i,egui::Key::E) {
                     self.merge_layers(ctx, &doc);
                 }
-                if i.modifiers.command && i.key_pressed(egui::Key::D) && self.layer_clipboard {
-                    self.duplicate_layers(&doc);
+                if command_key(i,egui::Key::D) {
+                    self.edit(vec![json!({"op":if key_modifiers(i,egui::Key::D).shift{"selection.reselect"}else{"selection.clear"}})],if key_modifiers(i,egui::Key::D).shift{"Reselect"}else{"Deselect"});
                 }
+                if command_key(i,egui::Key::A) {self.edit(vec![json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})],"Select all");}
+                if command_key(i,egui::Key::J) && self.layer_clipboard {self.duplicate_layers(&doc);}
                 for (key, tool) in [
                     (egui::Key::B, Tool::Brush),
+                    (egui::Key::U, Tool::Smudge),
+                    (egui::Key::L, Tool::Liquify),
                     (egui::Key::D, Tool::Eraser),
                     (egui::Key::Q, Tool::None),
                     (egui::Key::W, Tool::Move),
@@ -2329,11 +2623,11 @@ impl PeerBrush {
                     (egui::Key::M, Tool::Selection),
                     (egui::Key::K, Tool::SmartMask),
                 ] {
-                    if !i.modifiers.command && !i.modifiers.alt && (i.key_pressed(key)
+                    if !key_modifiers(i,key).command && !key_modifiers(i,key).ctrl && !key_modifiers(i,key).alt && (i.key_pressed(key)
                         || i.events.iter().any(|e| matches!(e, egui::Event::Key { physical_key: Some(k), pressed: true, .. } if *k == key))) {
                         self.tool = tool;
                         self.drag_start = None;
-                        self.points.clear();
+                        self.points.clear();self.stroke_pressures.clear();self.stroke_has_pressure=false;self.current_pressure=None;
                         self.gizmo_handle = 0;
                     }
                 }
@@ -2341,14 +2635,14 @@ impl PeerBrush {
                     self.frame_pending = true;
                 }
                 if i.key_pressed(egui::Key::Escape) {
-                    self.points.clear();
+                    self.points.clear();self.stroke_pressures.clear();self.stroke_has_pressure=false;self.current_pressure=None;
                     self.drag_start = None;
                     self.gizmo_handle = 0;
                 }
                 if i.key_pressed(egui::Key::X) && !i.modifiers.command {
                     self.swap_colors();
                 }
-                if !i.modifiers.command && [Tool::Brush, Tool::Eraser].contains(&self.tool) {
+                if !i.modifiers.command && [Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Liquify].contains(&self.tool) {
                     let smaller = i.key_pressed(egui::Key::OpenBracket)
                         || i.events
                             .iter()
@@ -2396,18 +2690,9 @@ impl PeerBrush {
                     ui.add_space(5.0);
                     ui.add(egui::Image::new((self.logo.id(), Vec2::splat(42.0))));
                     ui.add_space(9.0);
-                    ui.label(
-                        RichText::new("Peer")
-                            .size(21.0)
-                            .family(egui::FontFamily::Name("semibold".into())),
-                    );
-                    ui.label(
-                        RichText::new("Brush")
-                            .size(21.0)
-                            .family(egui::FontFamily::Name("semibold".into()))
-                            .color(ACCENT),
-                    )
-                    .on_hover_text("You and your AI. Same canvas.");
+                    let aspect=self.wordmark.size_vec2().x/self.wordmark.size_vec2().y;
+                    ui.add(egui::Image::new((self.wordmark.id(),Vec2::new(136.0,136.0/aspect))))
+                        .on_hover_text("PeerBrush · You and your AI. Same canvas.");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
                         let settings = icons::small_button(ui, Icon::Adjust, "AI connection settings");
@@ -2528,6 +2813,12 @@ impl PeerBrush {
                             ui.close_menu();
                         }
                     });
+                    ui.menu_button("Select",|ui| {
+                        for (label,op) in [("All · Ctrl+A","all"),("Deselect · Ctrl+D","selection.clear"),("Reselect · Ctrl+Shift+D","selection.reselect"),("Inverse","selection.invert")] {
+                            if ui.button(label).clicked(){self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);ui.close_menu();}
+                        }
+                        for (label,mode) in [("Expand by 1 px","expand"),("Contract by 1 px","contract")] {if ui.button(label).clicked(){self.edit(vec![json!({"op":"selection.modify","mode":mode,"radius":1})],label);ui.close_menu();}}
+                    });
                     if ui
                         .add_enabled_ui(!self.busy, |ui| {
                             icons::button(ui, Icon::Save, "Save PSD · Ctrl/Cmd+S")
@@ -2546,7 +2837,7 @@ impl PeerBrush {
                     if self.mask {
                         ui.label(RichText::new("MASK").size(10.0).color(ACCENT));
                     }
-                    if self.tool == Tool::Brush || self.tool == Tool::Eraser {
+                    if [Tool::Brush, Tool::Eraser, Tool::Smudge].contains(&self.tool) {
                         controls::label(ui, "Size");
                         let mut size = self.radius * 2.0;
                         controls::range(
@@ -2563,6 +2854,9 @@ impl PeerBrush {
                         if icons::button(ui, Icon::Adjust, "Brush settings").clicked() {
                             self.show_brush = !self.show_brush;
                         }
+                    }
+                    if self.tool == Tool::Liquify {
+                        liquify::toolbar(ui, &mut self.radius, &mut self.liquify);
                     }
                     if self.tool == Tool::SmartMask {
                         controls::label(ui, "Tolerance");
@@ -2610,11 +2904,18 @@ impl PeerBrush {
                     });
                 });
             });
+        if self.tool == Tool::Selection {
+            egui::TopBottomPanel::top("selection context")
+                .exact_height(40.)
+                .show(ctx, |ui| self.selection_toolbar(ui));
+        }
         egui::TopBottomPanel::bottom("status")
             .exact_height(28.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new(format!("{} × {}", doc.width, doc.height)).color(MUTED));
+                    ui.add(egui::Label::new(RichText::new(format!("{} × {} · {} bit", doc.width, doc.height, doc.bit_depth)).color(MUTED)).sense(egui::Sense::click())).on_hover_text("Right-click for canvas dimensions and channel depth").context_menu(|ui| {
+                        if ui.button("Project dimensions and depth…").clicked(){self.project_settings=Some((doc.width,doc.height,doc.bit_depth));ui.close_menu();}
+                    });
                     ui.separator();
                     ui.label(
                         RichText::new(format!(
@@ -2634,6 +2935,10 @@ impl PeerBrush {
                     if doc.read_only {
                         ui.label(RichText::new("READ ONLY").size(10.0).color(ACCENT))
                             .on_hover_text(doc.warnings.join("\n"));
+                        if ui.button(format!("Edit {}-bit copy",doc.bit_depth)).on_hover_text("Create a flattened editable copy at the original color precision. Unsupported Photoshop layers are flattened; the source file stays untouched.").clicked() {
+                            let shared=self.shared.clone();let revision=doc.revision;
+                            self.job(move||{server::compatible_copy(&shared,"human",Some(revision))?;Ok("Editing a flattened copy at original precision · save under a new name".into())});
+                        }
                     }
                     let leases = self.shared.lock().unwrap().leases.clone();
                     if !leases.is_empty() {
@@ -2680,6 +2985,8 @@ impl PeerBrush {
                             Tool::Rotate,
                             Tool::Scale,
                             Tool::Brush,
+                            Tool::Smudge,
+                            Tool::Liquify,
                             Tool::Eraser,
                             Tool::Fill,
                             Tool::Gradient,
@@ -2730,6 +3037,8 @@ impl PeerBrush {
                             let ai_active = matches!(
                                 (ai_tool, tool),
                                 (Some("brush"), Tool::Brush)
+                                    | (Some("smudge"), Tool::Smudge)
+                                    | (Some("liquify"), Tool::Liquify)
                                     | (Some("eraser"), Tool::Eraser)
                                     | (Some("move"), Tool::Move)
                                     | (Some("rotate"), Tool::Rotate)
@@ -2758,6 +3067,9 @@ impl PeerBrush {
                                 self.tool = tool;
                                 self.drag_start = None;
                                 self.points.clear();
+                                self.stroke_pressures.clear();
+                                self.stroke_has_pressure = false;
+                                self.current_pressure = None;
                                 self.gizmo_handle = 0;
                             }
                         }
@@ -2787,6 +3099,55 @@ impl PeerBrush {
             });
 
         self.request_preview(ctx, &doc);
+        if self.liquify_effect.as_ref().is_some_and(|id| {
+            !doc.layers
+                .iter()
+                .find(|l| l.id == self.selected)
+                .is_some_and(|l| {
+                    l.effects
+                        .iter()
+                        .any(|e| e.id == *id && e.kind == "liquify" && e.enabled)
+                })
+        }) {
+            self.liquify_effect = None;
+        }
+        if let Some((mut w, mut h, mut depth)) = self.project_settings {
+            let mut open = true;
+            let mut apply = false;
+            egui::Window::new("Project dimensions and depth")
+                .open(&mut open)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Width");
+                        ui.add(egui::DragValue::new(&mut w).range(1..=8192).suffix(" px"));
+                        ui.label("Height");
+                        ui.add(egui::DragValue::new(&mut h).range(1..=8192).suffix(" px"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Channels");
+                        ui.selectable_value(&mut depth, 8, "8 bit");
+                        ui.selectable_value(&mut depth, 16, "16 bit");
+                    });
+                    ui.label("Canvas size preserves layer pixels and positions.");
+                    if depth == 8 && doc.bit_depth == 16 {
+                        ui.colored_label(
+                            ACCENT,
+                            "Converting to 8 bit quantizes the channels. Undo restores 16 bit.",
+                        );
+                    }
+                    apply = ui.button("Apply dimensions and depth").clicked();
+                });
+            self.project_settings = if open { Some((w, h, depth)) } else { None };
+            if apply {
+                self.edit(
+                    vec![json!({"op":"document.settings","width":w,"height":h,"bit_depth":depth})],
+                    "Project dimensions and depth",
+                );
+                self.project_settings = None;
+                self.frame_pending = true;
+            }
+        }
         if self.show_brush {
             self.brush_settings(ctx);
         }
@@ -2804,6 +3165,11 @@ impl PeerBrush {
                         ui.label("Height");
                         controls::numeric(ui, &mut self.new_height, 16..=8192);
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Color");
+                        ui.selectable_value(&mut self.new_bit_depth, 8, "8 bit");
+                        ui.selectable_value(&mut self.new_bit_depth, 16, "16 bit");
+                    });
                     if {
                         let e = self.shared.lock().unwrap();
                         e.doc.revision != e.saved_revision
@@ -2811,8 +3177,12 @@ impl PeerBrush {
                         ui.label("Creating a canvas replaces unsaved work.");
                     }
                     if ui.button("Create canvas").clicked() {
-                        let result = Document::new(self.new_width, self.new_height)
-                            .and_then(|d| self.shared.lock().unwrap().replace(d, None));
+                        let result = Document::new_depth(
+                            self.new_width,
+                            self.new_height,
+                            self.new_bit_depth,
+                        )
+                        .and_then(|d| self.shared.lock().unwrap().replace(d, None));
                         match result {
                             Ok(_) => {
                                 self.texture = None;
@@ -4012,10 +4382,12 @@ mod tests {
                 revision: doc.revision,
                 selection: doc.selection,
                 selection_polygon: doc.selection_polygon.clone(),
+                selection_coverage: doc.selection_coverage.clone(),
                 target: variant,
                 mask: false,
                 w: 1,
                 h: 1,
+                dirty: None,
                 bytes: vec![255, 80, 20, 255],
             })
             .unwrap();
@@ -4322,7 +4694,7 @@ mod tests {
         assert!(app.shared.lock().unwrap().undo.is_empty());
     }
     #[test]
-    fn command_d_duplicates_all_selected_roots_in_one_undo_and_selects_copies() {
+    fn command_j_duplicates_all_selected_roots_in_one_undo_and_selects_copies() {
         let (mut app, ctx) = small_fixture();
         let original = {
             let mut e = app.shared.lock().unwrap();
@@ -4347,7 +4719,7 @@ mod tests {
         modified_key(
             &mut app,
             &ctx,
-            egui::Key::D,
+            egui::Key::J,
             egui::Modifiers {
                 command: true,
                 ctrl: true,
@@ -4587,6 +4959,7 @@ mod tests {
             revision: doc.revision,
             bounds: Some([8, 5, 16, 13]),
             polygon: Some(preview_polygon.clone()),
+            coverage: None,
         });
         let points = app.selection_points(&doc, rect, 2.0);
         assert_eq!(
@@ -4680,5 +5053,314 @@ mod tests {
             app.shared.lock().unwrap().undo.is_empty(),
             "Live rotation preview must not commit history"
         );
+    }
+    #[test]
+    fn liquify_and_wet_blend_shortcuts_preserve_text_editing() {
+        let (mut app, ctx) = small_fixture();
+        key(&mut app, &ctx, egui::Key::L);
+        assert!(app.tool == Tool::Liquify);
+        key(&mut app, &ctx, egui::Key::U);
+        assert!(app.tool == Tool::Smudge);
+        let text_id = egui::Id::new("Liquify shortcut text guard");
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut text = String::new();
+                ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
+                    .request_focus();
+            });
+        });
+        key(&mut app, &ctx, egui::Key::L);
+        assert!(app.tool == Tool::Smudge);
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+    }
+    #[test]
+    fn liquify_and_wet_blend_show_actual_live_pixels_then_commit_the_identical_single_edit() {
+        for (shortcut, tool) in [(egui::Key::L, Tool::Liquify), (egui::Key::U, Tool::Smudge)] {
+            let (mut app, ctx) = small_fixture();
+            let mut source = vec![];
+            for _ in 0..32 {
+                for x in 0..32 {
+                    source.extend_from_slice(if x < 16 {
+                        &[220, 20, 30, 255]
+                    } else {
+                        &[20, 60, 200, 255]
+                    });
+                }
+            }
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc.layers[0].pixels =
+                    crate::raster::Raster::from_rgba(32, 32, &source).unwrap();
+            }
+            key(&mut app, &ctx, shortcut);
+            assert!(app.tool == tool);
+            app.radius = 8.0;
+            frame(&mut app, &ctx, vec![], Default::default());
+            let rect = app.view_rect.unwrap();
+            let scale = rect.width() / 32.0;
+            let start = rect.min + Vec2::new(10.0 * scale, 16.0 * scale);
+            let end = rect.min + Vec2::new(22.0 * scale, 16.0 * scale);
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    button(
+                        start,
+                        egui::PointerButton::Primary,
+                        true,
+                        Default::default(),
+                    ),
+                ],
+                Default::default(),
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(end)],
+                Default::default(),
+            );
+            assert!(app.points.len() >= 2);
+            let command = if tool == Tool::Liquify {
+                app.liquify_command(&app.points)
+            } else {
+                app.stroke_command(app.points.clone(), app.color)
+            };
+            let document = app.shared.lock().unwrap().doc.clone();
+            let preview = Engine::preview_edits(document.clone(), &[command]).unwrap();
+            let expected = preview.preview(None, 32, None, false).unwrap().2;
+            assert_ne!(
+                expected, source,
+                "The gesture must change visible pixels while held"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while app
+                .canvas_pixels
+                .as_ref()
+                .is_none_or(|(_, _, pixels)| *pixels != expected)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+                frame(&mut app, &ctx, vec![], Default::default());
+            }
+            assert_eq!(
+                app.canvas_pixels.as_ref().unwrap().2,
+                expected,
+                "Rendered live preview must show the engine's actual edited pixels"
+            );
+            assert_eq!(app.shared.lock().unwrap().doc.revision, document.revision);
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            frame(
+                &mut app,
+                &ctx,
+                vec![button(
+                    end,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+                Default::default(),
+            );
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(
+                engine.doc.preview(None, 32, None, false).unwrap().2,
+                expected
+            );
+            assert_eq!(engine.undo.len(), 1);
+            if tool == Tool::Liquify {
+                assert_eq!(engine.doc.layers[0].pixels.rgba(), source);
+                assert_eq!(engine.doc.layers[0].effects[0].kind, "liquify");
+            } else {
+                assert_ne!(engine.doc.layers[0].pixels.rgba(), source);
+            }
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels.rgba(), source);
+        }
+    }
+    #[test]
+    fn liquify_on_mask_does_not_silently_change_layer_color() {
+        let (mut app, ctx) = small_fixture();
+        let id = app.selected.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"mask.add","layer":id})],
+                None,
+                None,
+                "Setup",
+            )
+            .unwrap();
+        app.shared.lock().unwrap().undo.clear();
+        key(&mut app, &ctx, egui::Key::L);
+        app.mask = true;
+        let source = app.shared.lock().unwrap().doc.clone();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let start = app.view_rect.unwrap().center();
+        let end = start + Vec2::new(25.0, 0.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                button(
+                    start,
+                    egui::PointerButton::Primary,
+                    true,
+                    Default::default(),
+                ),
+            ],
+            Default::default(),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(end)],
+            Default::default(),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![button(
+                end,
+                egui::PointerButton::Primary,
+                false,
+                Default::default(),
+            )],
+            Default::default(),
+        );
+        let engine = app.shared.lock().unwrap();
+        assert!(engine.doc.layers[0].effects.is_empty());
+        assert_eq!(
+            engine.doc.layers[0].pixels.rgba(),
+            source.layers[0].pixels.rgba()
+        );
+        assert!(engine.undo.is_empty());
+        assert!(
+            app.message.contains("Color"),
+            "Explain the unsupported mask channel compactly"
+        );
+    }
+    #[test]
+    fn command_d_deselects_in_layer_focus_and_shift_d_reselects() {
+        let (mut app, ctx) = small_fixture();
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"selection","kind":"ellipse","rect":[2,2,10,10]})],
+                None,
+                None,
+                "Select",
+            )
+            .unwrap();
+        app.layer_clipboard = true;
+        let count = app.shared.lock().unwrap().doc.layers.len();
+        modified_key(
+            &mut app,
+            &ctx,
+            egui::Key::D,
+            egui::Modifiers {
+                command: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert!(app.shared.lock().unwrap().doc.selection.is_none());
+        assert_eq!(app.shared.lock().unwrap().doc.layers.len(), count);
+        modified_key(
+            &mut app,
+            &ctx,
+            egui::Key::D,
+            egui::Modifiers {
+                command: true,
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            app.shared.lock().unwrap().doc.selection,
+            Some([2, 2, 10, 10])
+        );
+    }
+    #[test]
+    fn completed_gestures_reject_old_revision_previews_even_when_given_old_ui_snapshot() {
+        for op in [
+            "paint",
+            "move",
+            "transform",
+            "layer.reorder",
+            "layer.update",
+        ] {
+            let (mut app, ctx) = small_fixture();
+            let source = app.shared.lock().unwrap().doc.clone();
+            let layer = app.selected.clone();
+            let command = match op {
+                "paint" => {
+                    json!({"op":op,"layer":layer,"points":[[4,4],[10,10]],"radius":2,"color":[255,0,0,255]})
+                }
+                "move" => json!({"op":op,"layer":layer,"dx":2,"dy":1}),
+                "transform" => json!({"op":op,"layer":layer,"angle":15,"scale_x":1,"scale_y":1}),
+                "layer.reorder" => json!({"op":op,"layer":layer,"index":0}),
+                _ => json!({"op":op,"layer":layer,"visible":false}),
+            };
+            app.shared
+                .lock()
+                .unwrap()
+                .edit("human", &[command], None, None, "Commit gesture")
+                .unwrap();
+            app.set_canvas(&ctx, 1, 1, vec![111, 22, 33, 255]);
+            app.pending = true;
+            app.preview_tx
+                .send(Preview {
+                    live: String::new(),
+                    doc_id: source.id.clone(),
+                    revision: source.revision,
+                    w: 1,
+                    h: 1,
+                    bytes: vec![0, 0, 0, 255],
+                    dirty: None,
+                    selection: None,
+                    selection_polygon: None,
+                    selection_coverage: None,
+                    target: format!("{};;1536", app.preview_variant()),
+                    mask: false,
+                })
+                .unwrap();
+            app.request_preview(&ctx, &source);
+            assert_eq!(
+                app.canvas_pixels.as_ref().unwrap().2,
+                vec![111, 22, 33, 255],
+                "{op} flashed an old image"
+            );
+            assert_eq!(app.last_preview.as_ref().unwrap().1, source.revision + 1);
+        }
+    }
+    #[test]
+    fn fast_native_control_chord_uses_event_modifiers_after_control_is_released() {
+        let (mut app, ctx) = small_fixture();
+        app.shared.lock().unwrap().doc.selection = Some([2, 2, 8, 8]);
+        app.tool = Tool::Selection;
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::D,
+                physical_key: Some(egui::Key::D),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                },
+            }],
+            Default::default(),
+        );
+        assert!(app.shared.lock().unwrap().doc.selection.is_none());
+        assert!(app.tool == Tool::Selection);
     }
 }

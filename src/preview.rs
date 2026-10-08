@@ -1,0 +1,343 @@
+//! Derived live-preview pixels. Dirty updates preserve the full preview sampling grid.
+//! Cache keys identify a gesture and its baseline/commands; this never edits source tiles/history.
+use crate::{
+    compositor::Plan,
+    engine::{Document, Engine},
+    raster::Pixel,
+};
+use serde_json::Value;
+
+#[derive(Default)]
+pub struct Cache {
+    key: Option<(String, String, u64, u32, Option<String>, bool)>,
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+    previous: Option<[i32; 4]>,
+    stroke: Option<Stroke>,
+}
+struct Stroke {
+    key: String,
+    prepared: Document,
+    layer: usize,
+    step: Option<usize>,
+    session: crate::brush::Session,
+}
+pub struct Rendered {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+    pub dirty: Option<[u32; 4]>,
+}
+
+/// Spatial effects and adjustments can propagate outside a painted rectangle; use a full render.
+pub fn supports_dirty(doc: &Document) -> bool {
+    doc.layers.iter().all(|layer| {
+        layer.kind != "adjustment"
+            && !layer.effects.iter().any(|effect| effect.enabled)
+            && layer.mask.as_ref().is_none_or(|mask| {
+                mask.steps.iter().all(|step| {
+                    !step.enabled || ["fill", "paint", "invert"].contains(&step.kind.as_str())
+                })
+            })
+    })
+}
+impl Cache {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+    /// Reuse exact gesture coverage for a single paint command; other operations use the Engine.
+    pub fn edit(
+        &mut self,
+        base: Document,
+        commands: &[Value],
+        gesture: &str,
+    ) -> Result<Document, String> {
+        if commands.len() != 1
+            || commands[0]["op"] != "paint"
+            || gesture.is_empty()
+            || base.selection_coverage.is_some()
+        {
+            self.stroke = None;
+            return Engine::preview_edits(base, commands);
+        }
+        let command = &commands[0];
+        let settings = crate::brush::Settings::from_command(command)?;
+        let (mut points, pressures) = crate::brush::points_from_command(command)?;
+        let mut metadata = command.clone();
+        metadata
+            .as_object_mut()
+            .ok_or("Invalid paint command")?
+            .remove("points");
+        metadata.as_object_mut().unwrap().remove("pressures");
+        let key = serde_json::to_string(&serde_json::json!([
+            gesture,
+            base.id,
+            base.revision,
+            base.width,
+            base.height,
+            base.bit_depth,
+            base.read_only,
+            base.selection,
+            base.selection_polygon,
+            metadata
+        ]))
+        .map_err(|e| e.to_string())?;
+        if self.stroke.as_ref().is_none_or(|stroke| stroke.key != key) {
+            // Preparation follows the same Engine target, mask-step, lock and input rules.
+            let mut preparation = command.clone();
+            preparation["opacity"] = serde_json::json!(0.0);
+            let prepared = Engine::preview_edits(base, &[preparation])?;
+            let layer = prepared
+                .layers
+                .iter()
+                .position(|layer| Some(layer.id.as_str()) == command["layer"].as_str())
+                .ok_or("Paint target no longer exists")?;
+            let selected = &prepared.layers[layer];
+            let mask = command["mask"].as_bool().unwrap_or(false);
+            let step = if mask {
+                let steps = &selected.mask.as_ref().ok_or("Layer has no mask")?.steps;
+                let index = if let Some(id) = command["step"].as_str() {
+                    steps
+                        .iter()
+                        .position(|step| step.kind == "paint" && step.id == id)
+                } else {
+                    steps.iter().rposition(|step| step.kind == "paint")
+                };
+                Some(index.ok_or("Add a paint step to the mask")?)
+            } else {
+                None
+            };
+            let mut color = crate::engine::color(command);
+            if mask {
+                color = [color[0], color[0], color[0], color[3]];
+            }
+            let clip = prepared.selection.map(|area| {
+                [
+                    area[0] - selected.x,
+                    area[1] - selected.y,
+                    area[2] - selected.x,
+                    area[3] - selected.y,
+                ]
+            });
+            let polygon = crate::selection::polygon(&prepared).map(|points| {
+                points
+                    .iter()
+                    .map(|point| [point[0] - selected.x as f32, point[1] - selected.y as f32])
+                    .collect::<Vec<_>>()
+            });
+            let raster = step.map_or(&selected.pixels, |index| {
+                &selected.mask.as_ref().unwrap().steps[index].pixels
+            });
+            let session = crate::brush::Session::new(
+                raster,
+                settings,
+                color,
+                command["erase"].as_bool().unwrap_or(false),
+                clip,
+                polygon.as_deref(),
+            )?;
+            self.stroke = Some(Stroke {
+                key,
+                prepared,
+                layer,
+                step,
+                session,
+            });
+        }
+        let stroke = self.stroke.as_mut().unwrap();
+        let selected = &stroke.prepared.layers[stroke.layer];
+        for point in &mut points {
+            point[0] -= selected.x as f32;
+            point[1] -= selected.y as f32;
+        }
+        let raster = stroke
+            .session
+            .update(&points, pressures.as_deref())?
+            .clone();
+        let mut doc = stroke.prepared.clone();
+        let layer = &mut doc.layers[stroke.layer];
+        if let Some(index) = stroke.step {
+            layer.mask.as_mut().unwrap().steps[index].pixels = raster;
+        } else {
+            layer.pixels = raster;
+        }
+        crate::mask::validate_budget(&doc.layers)?;
+        crate::effects::validate_budget(&doc)?;
+        if doc.bit_depth == 16 {
+            crate::depth16::validate_budget(&doc)?;
+        }
+        crate::effects::invalidate(&mut doc, commands);
+        Ok(doc)
+    }
+    /// `dirty` is the complete document-space bounds of the replayed paint stroke.
+    /// Use a new `key` when the baseline, isolation target or non-paint preview commands change.
+    pub fn render(
+        &mut self,
+        doc: &Document,
+        key: &str,
+        dirty: Option<[i32; 4]>,
+        edge: u32,
+        target: Option<&str>,
+        mask: bool,
+    ) -> Result<Rendered, String> {
+        let identity = (
+            key.to_owned(),
+            doc.id.clone(),
+            doc.revision,
+            edge,
+            target.map(String::from),
+            mask,
+        );
+        if self.key.as_ref() != Some(&identity) || dirty.is_none() || !supports_dirty(doc) {
+            let (width, height, bytes, _) = doc.preview(None, edge, target, mask)?;
+            self.key = Some(identity);
+            self.width = width;
+            self.height = height;
+            self.bytes = bytes;
+            self.previous = dirty;
+            return Ok(Rendered {
+                width,
+                height,
+                bytes: self.bytes.clone(),
+                dirty: None,
+            });
+        }
+        let mut area = dirty.unwrap();
+        if let Some(previous) = self.previous {
+            area = [
+                area[0].min(previous[0]),
+                area[1].min(previous[1]),
+                area[2].max(previous[2]),
+                area[3].max(previous[3]),
+            ];
+        }
+        self.previous = dirty;
+        let scale = (edge.clamp(1, 8192) as f32 / doc.width.max(doc.height) as f32).min(1.0);
+        // Expand around the floor-sampled source grid. Extra border samples are harmless;
+        // conservative mapping avoids seams at fractional preview scales.
+        let bounds = [
+            ((area[0].saturating_sub(2) as f32 * scale).floor() as i32).clamp(0, self.width as i32)
+                as u32,
+            ((area[1].saturating_sub(2) as f32 * scale).floor() as i32).clamp(0, self.height as i32)
+                as u32,
+            ((area[2].saturating_add(2) as f32 * scale).ceil() as i32).clamp(0, self.width as i32)
+                as u32,
+            ((area[3].saturating_add(2) as f32 * scale).ceil() as i32).clamp(0, self.height as i32)
+                as u32,
+        ];
+        if bounds[0] < bounds[2] && bounds[1] < bounds[3] {
+            let target_index = target
+                .map(|id| {
+                    doc.layers
+                        .iter()
+                        .position(|layer| layer.id == id)
+                        .ok_or("Layer no longer exists")
+                })
+                .transpose()?;
+            if doc.bit_depth == 16 {
+                let plan = crate::depth16::Plan16::new(doc)?;
+                let native_scale =
+                    (edge.clamp(1, 8192) as f64 / doc.width.max(doc.height) as f64).min(1.0);
+                crate::render::area8(&mut self.bytes, self.width, bounds, |x, y| {
+                    let sx = (x as f64 / native_scale) as i32;
+                    let sy = (y as f64 / native_scale) as i32;
+                    let word = if let Some(index) = target_index {
+                        if mask {
+                            let v = (plan.mask(index, sx, sy, true) * 65535.)
+                                .round()
+                                .clamp(0., 65535.) as u16;
+                            [v, v, v, 65535]
+                        } else {
+                            plan.layer(index, sx, sy)
+                        }
+                    } else {
+                        plan.sample(0, sx, sy)
+                    };
+                    crate::depth16::display_pixel(word)
+                })?;
+                return Ok(Rendered {
+                    width: self.width,
+                    height: self.height,
+                    bytes: self.bytes.clone(),
+                    dirty: Some(bounds),
+                });
+            }
+            crate::mask::validate_budget(&doc.layers)?;
+            let masks: Vec<_> = doc
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .mask
+                        .as_ref()
+                        .and_then(|mask| mask.prepare(layer.pixels.width, layer.pixels.height))
+                })
+                .collect();
+            let colors = crate::effects::prepare(doc, &masks)?;
+            let plan = Plan::new(doc, &masks, &colors);
+            crate::render::area8(&mut self.bytes, self.width, bounds, |x, y| {
+                let sx = (x as f32 / scale) as i32;
+                let sy = (y as f32 / scale) as i32;
+                let pixel = if let Some(index) = target_index {
+                    if mask {
+                        let layer = &doc.layers[index];
+                        let value = (layer.mask_value_prepared(
+                            sx - layer.x,
+                            sy - layer.y,
+                            masks[index].as_deref(),
+                            true,
+                        ) * 255.0) as u8;
+                        [value, value, value, 255]
+                    } else {
+                        plan.layer(index, sx, sy)
+                    }
+                } else {
+                    plan.sample(0, sx, sy)
+                };
+                pixel
+            })?;
+        }
+        Ok(Rendered {
+            width: self.width,
+            height: self.height,
+            bytes: self.bytes.clone(),
+            dirty: Some(bounds),
+        })
+    }
+}
+
+/// Baseline compositor retained for performance/equivalence measurements.
+pub fn reference(doc: &Document, edge: u32) -> Result<(u32, u32, Vec<u8>), String> {
+    crate::mask::validate_budget(&doc.layers)?;
+    let masks: Vec<_> = doc
+        .layers
+        .iter()
+        .map(|layer| {
+            layer
+                .mask
+                .as_ref()
+                .and_then(|mask| mask.prepare(layer.pixels.width, layer.pixels.height))
+        })
+        .collect();
+    let colors = crate::effects::prepare(doc, &masks)?;
+    let scale = (edge.clamp(1, 8192) as f32 / doc.width.max(doc.height) as f32).min(1.0);
+    let width = ((doc.width as f32 * scale).round() as u32).max(1);
+    let height = ((doc.height as f32 * scale).round() as u32).max(1);
+    let mut bytes = vec![0; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let pixel: Pixel = crate::compositor::sample_group(
+                doc,
+                None,
+                (x as f32 / scale) as i32,
+                (y as f32 / scale) as i32,
+                &masks,
+                &colors,
+            );
+            let at = ((y * width + x) * 4) as usize;
+            bytes[at..at + 4].copy_from_slice(&pixel);
+        }
+    }
+    Ok((width, height, bytes))
+}

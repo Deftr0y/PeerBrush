@@ -8,7 +8,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
 use std::{io::Cursor, path::Path};
 
-fn decode(command: &Value) -> Result<image::RgbaImage, String> {
+fn decode(command: &Value, depth: u16) -> Result<Raster, String> {
     let bytes = match (command.get("path"), command.get("png")) {
         (Some(path), None) => {
             let path = Path::new(path.as_str().ok_or("Image path must be a string")?);
@@ -41,11 +41,16 @@ fn decode(command: &Value) -> Result<image::RgbaImage, String> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader.decode().map_err(|e| e.to_string())?.to_rgba8();
-    check_size(image.width(), image.height())?;
-    Ok(image)
+    let image = reader.decode().map_err(|e| e.to_string())?;
+    if depth == 16 {
+        let image = image.to_rgba16();
+        Raster::from_rgba16(image.width(), image.height(), image.as_raw())
+    } else {
+        let image = image.to_rgba8();
+        Raster::from_rgba(image.width(), image.height(), image.as_raw())
+    }
 }
 
 fn unlocked(doc: &Document, target: &str) -> Result<(), String> {
@@ -121,7 +126,7 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
     if !["over", "replace"].contains(&mode) {
         return Err("Image mode must be over or replace".into());
     }
-    let image = decode(command)?;
+    let source = decode(command, doc.bit_depth)?;
     let bounds = if let Some(value) = command.get("rect") {
         let area = crate::engine::rect(value).ok_or("Invalid destination rectangle")?;
         if area[0] == area[2] || area[1] == area[3] {
@@ -140,14 +145,13 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
             }
         };
         let (x, y) = (coordinate("x")?, coordinate("y")?);
-        [x, y, x + image.width() as i32, y + image.height() as i32]
+        [x, y, x + source.width as i32, y + source.height as i32]
     };
     let (width, height) = (
         (bounds[2] - bounds[0]) as u32,
         (bounds[3] - bounds[1]) as u32,
     );
     check_size(width, height)?;
-    let source = Raster::from_rgba(image.width(), image.height(), image.as_raw())?;
     let natural_size = (width, height) == (source.width, source.height);
     // Premultiplied interpolation prevents transparent generated edges acquiring black fringes.
     let sample = |x: u32, y: u32| {
@@ -161,6 +165,17 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
                 .clamp(0.0, source.height as f32 - 1.0),
         )
     };
+    let sample16 = |x: u32, y: u32| {
+        if natural_size {
+            return source.get16(x as i32, y as i32);
+        }
+        source.sample16(
+            ((x as f32 + 0.5) * source.width as f32 / width as f32 - 0.5)
+                .clamp(0., source.width as f32 - 1.),
+            ((y as f32 + 0.5) * source.height as f32 / height as f32 - 0.5)
+                .clamp(0., source.height as f32 - 1.),
+        )
+    };
     if new_layer {
         let name = command
             .get("name")
@@ -170,12 +185,17 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
         layer.x = bounds[0];
         layer.y = bounds[1];
         layer.parent = parent.clone();
+        layer.pixels = Raster::new_depth(width, height, doc.bit_depth);
         if natural_size {
             layer.pixels = source.clone();
         } else {
             for y in 0..height {
                 for x in 0..width {
-                    layer.pixels.set(x as i32, y as i32, sample(x, y));
+                    if doc.bit_depth == 16 {
+                        layer.pixels.set16(x as i32, y as i32, sample16(x, y));
+                    } else {
+                        layer.pixels.set(x as i32, y as i32, sample(x, y));
+                    }
                 }
             }
         }
@@ -201,7 +221,7 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
         let unchanged_bounds =
             (left, top, w, h) == (old_x, old_y, layer.pixels.width, layer.pixels.height);
         let mut pixels = if layer.kind == "fill" {
-            let mut pixels = Raster::new(w, h);
+            let mut pixels = Raster::new_depth(w, h, doc.bit_depth);
             for y in 0..layer.pixels.height {
                 for x in 0..layer.pixels.width {
                     pixels.set(x as i32 + old_x - left, y as i32 + old_y - top, layer.color);
@@ -216,6 +236,19 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
         for y in 0..height {
             for x in 0..width {
                 let (tx, ty) = (bounds[0] - left + x as i32, bounds[1] - top + y as i32);
+                if doc.bit_depth == 16 {
+                    let pixel = sample16(x, y);
+                    pixels.set16(
+                        tx,
+                        ty,
+                        if mode == "replace" {
+                            pixel
+                        } else {
+                            crate::raster::blend16(pixels.get16(tx, ty), pixel, 1., "normal")
+                        },
+                    );
+                    continue;
+                }
                 let pixel = sample(x, y);
                 pixels.set(
                     tx,

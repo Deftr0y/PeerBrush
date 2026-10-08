@@ -12,12 +12,13 @@ platform={'win32':'Windows','darwin':'macOS'}.get(sys.platform,'Linux')
 bundle=output/f'PeerBrush-{platform}';bundle.mkdir(exist_ok=True)
 exe='peerbrush.exe' if sys.platform=='win32' else 'peerbrush'
 shutil.copy2(args.binary or root/'target'/'release'/exe,bundle/exe)
+if sys.platform=='win32':shutil.copy2(root/'scripts'/'start-windows.cmd',bundle/'Start PeerBrush.cmd')
 for name in ['LICENSE','README.md','FOLLOWUPS.MD']:shutil.copy2(root/name,bundle/name)
-shutil.copytree(root/'docs',bundle/'docs',dirs_exist_ok=True)
+shutil.copytree(root/'docs',bundle/'docs',dirs_exist_ok=True,ignore=shutil.ignore_patterns('development-handoff.md'))
 shutil.copytree(root/'assets',bundle/'assets',dirs_exist_ok=True)
 source_files=[root/name for name in ['Cargo.toml','Cargo.lock','LICENSE','README.md','AGENTS.md','FOLLOWUPS.MD','.gitignore']]
 for directory in ['src','tests','scripts','docs','assets','.github','vendor','examples']:
-    source_files.extend(p for p in (root/directory).rglob('*') if p.is_file() and '__pycache__' not in p.parts)
+    source_files.extend(p for p in (root/directory).rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.name!='development-handoff.md')
 source_zip=output/'PeerBrush-source.zip'
 with zipfile.ZipFile(source_zip,'w',zipfile.ZIP_DEFLATED,strict_timestamps=False) as archive:
     for path in source_files:archive.write(path,path.relative_to(root))

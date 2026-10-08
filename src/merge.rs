@@ -37,7 +37,7 @@ pub fn requested(command: &Value) -> Result<Vec<String>, String> {
     }
 }
 
-fn resolve(doc: &Document, ids: &[String]) -> Result<Vec<String>, String> {
+pub(crate) fn resolve(doc: &Document, ids: &[String]) -> Result<Vec<String>, String> {
     if ids.is_empty() || ids.len() > 100 {
         return Err("Choose 1–100 layers to merge".into());
     }
@@ -133,6 +133,22 @@ pub fn prepare(doc: &Document, ids: &[String], name: Option<&str>) -> Result<Pre
             parent = l.parent.as_deref();
         }
     }
+    if doc.layers.iter().any(|l| {
+        l.clip_to
+            .as_ref()
+            .is_some_and(|base| removed.contains(&l.id) != removed.contains(base))
+    }) {
+        return Err("Merge the complete clipping group, or its containing folder".into());
+    }
+    if roots.iter().any(|id| {
+        doc.layers
+            .iter()
+            .any(|l| l.id == *id && l.kind == "adjustment" && l.clip_to.is_none())
+    }) {
+        return Err(
+            "Put a shared adjustment and its artwork in a folder, then merge the folder".into(),
+        );
+    }
     let mut isolated = doc.clone();
     isolated.layers.retain(|l| removed.contains(&l.id));
     for l in &mut isolated.layers {
@@ -149,7 +165,12 @@ pub fn prepare(doc: &Document, ids: &[String], name: Option<&str>) -> Result<Pre
                 doc.width as i32,
                 doc.height as i32,
             ])
-        } else if l.kind == "fill" || l.effects.iter().any(|e| e.enabled && e.kind == "blur") {
+        } else if l.kind == "fill"
+            || l.effects
+                .iter()
+                .any(|e| e.enabled && ["blur", "bloom", "liquify"].contains(&e.kind.as_str()))
+            || l.kind == "adjustment"
+        {
             Some([0, 0, l.pixels.width as i32, l.pixels.height as i32])
         } else {
             l.pixels.content_bounds()
@@ -181,37 +202,51 @@ pub fn prepare(doc: &Document, ids: &[String], name: Option<&str>) -> Result<Pre
     let h = u32::try_from(bounds[3] - bounds[1]).map_err(|_| "Merged layer is too tall")?;
     check_size(w, h)?;
     crate::mask::validate_budget(&isolated.layers)?;
-    let masks: Vec<_> = isolated
-        .layers
-        .iter()
-        .map(|l| {
-            l.mask
-                .as_ref()
-                .and_then(|m| m.prepare(l.pixels.width, l.pixels.height))
-        })
-        .collect();
-    let colors = crate::effects::prepare(&isolated, &masks)?;
-    let mut pixels = Raster::new(w, h);
-    for ty in 0..h.div_ceil(TILE) {
-        for tx in 0..w.div_ceil(TILE) {
-            let mut tile = vec![0; (TILE * TILE * 4) as usize];
-            let mut nonempty = false;
-            for y in 0..TILE.min(h - ty * TILE) {
-                for x in 0..TILE.min(w - tx * TILE) {
-                    let p = isolated.sample_group(
-                        None,
-                        bounds[0] as i32 + (tx * TILE + x) as i32,
-                        bounds[1] as i32 + (ty * TILE + y) as i32,
-                        &masks,
-                        &colors,
-                    );
-                    let at = ((y * TILE + x) * 4) as usize;
-                    tile[at..at + 4].copy_from_slice(&p);
-                    nonempty |= p[3] != 0;
+    let mut pixels = if doc.bit_depth == 16 {
+        let image = crate::depth16::render_crop(
+            &isolated,
+            [
+                bounds[0] as i32,
+                bounds[1] as i32,
+                bounds[2] as i32,
+                bounds[3] as i32,
+            ],
+        )?;
+        Raster::from_rgba16(w, h, &image.words)?
+    } else {
+        Raster::new(w, h)
+    };
+    if doc.bit_depth == 8 {
+        let masks: Vec<_> = isolated
+            .layers
+            .iter()
+            .map(|l| {
+                l.mask
+                    .as_ref()
+                    .and_then(|m| m.prepare(l.pixels.width, l.pixels.height))
+            })
+            .collect();
+        let colors = crate::effects::prepare(&isolated, &masks)?;
+        let plan = crate::compositor::Plan::new(&isolated, &masks, &colors);
+        for ty in 0..h.div_ceil(TILE) {
+            for tx in 0..w.div_ceil(TILE) {
+                let mut tile = vec![0; (TILE * TILE * 4) as usize];
+                let mut nonempty = false;
+                for y in 0..TILE.min(h - ty * TILE) {
+                    for x in 0..TILE.min(w - tx * TILE) {
+                        let p = plan.sample(
+                            0,
+                            bounds[0] as i32 + (tx * TILE + x) as i32,
+                            bounds[1] as i32 + (ty * TILE + y) as i32,
+                        );
+                        let at = ((y * TILE + x) * 4) as usize;
+                        tile[at..at + 4].copy_from_slice(&p);
+                        nonempty |= p[3] != 0;
+                    }
                 }
-            }
-            if nonempty {
-                pixels.tiles.insert((tx, ty), Arc::new(tile));
+                if nonempty {
+                    pixels.tiles.insert((tx, ty), Arc::new(tile));
+                }
             }
         }
     }

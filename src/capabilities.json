@@ -8,10 +8,14 @@
     "raster_budget_mib": 512,
     "color_effect_budget_mib": 256,
     "mask_effect_budget_mib": 128,
-    "selection_vertices": 64
+    "selection_vertices": 8192,
+    "native16_color_effect_budget_mib": 128,
+    "native16_mask_effect_budget_mib": 128,
+    "selection_pixels": 16000000,
+    "selection_boundary_edges": 500000
   },
   "formats": {
-    "work": "PSD v1, 8-bit RGB",
+    "work": "PSD v1, 8-bit and 16-bit RGB",
     "import": [
       "PNG",
       "JPEG"
@@ -409,21 +413,165 @@
           60
         ]
       ]
+    },
+    {
+      "op": "paint",
+      "layer": "ID",
+      "points": [
+        [
+          50,
+          50,
+          0.1
+        ],
+        [
+          100,
+          80,
+          1
+        ],
+        [
+          170,
+          110,
+          0.2
+        ]
+      ],
+      "radius": 16,
+      "tip": "bristle",
+      "density": 0.6,
+      "grain": 2,
+      "taper_start": 20,
+      "taper_end": 35,
+      "color": [
+        90,
+        150,
+        75,
+        255
+      ]
+    },
+    {
+      "op": "smudge",
+      "layer": "ID",
+      "points": [
+        [
+          100,
+          100
+        ],
+        [
+          160,
+          100
+        ]
+      ],
+      "radius": 24,
+      "wetness": 0.8,
+      "load": 0,
+      "pickup": 0.25,
+      "opacity": 0.5
+    },
+    {
+      "op": "adjustment.add",
+      "layers": [
+        "TARGET_ID"
+      ],
+      "kind": "color_balance",
+      "settings": {
+        "shadows": [
+          0,
+          0,
+          0.12
+        ],
+        "highlights": [
+          0.15,
+          0,
+          -0.05
+        ]
+      }
+    },
+    {
+      "op": "layer.clip",
+      "layer": "UPPER_LAYER_ID",
+      "base": "BASE_BELOW_ID"
+    },
+    {
+      "op": "effect.add",
+      "layer": "ID",
+      "kind": "hsl",
+      "settings": {
+        "hue": 15,
+        "saturation": 0.1,
+        "lightness": 0
+      }
+    },
+    {
+      "op": "effect.add",
+      "layer": "ID",
+      "kind": "bloom",
+      "settings": {
+        "threshold": 0.75,
+        "spread": 12,
+        "strength": 0.5
+      }
+    },
+    {
+      "op": "liquify.stroke",
+      "layer": "ID",
+      "mode": "push",
+      "points": [
+        [
+          100,
+          100
+        ],
+        [
+          120,
+          105
+        ]
+      ],
+      "radius": 40,
+      "strength": 0.5
+    },
+    {
+      "op": "selection",
+      "kind": "ellipse",
+      "rect": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "mode": "replace",
+      "feather": 2
+    },
+    {
+      "op": "selection.clear"
+    },
+    {
+      "op": "selection.reselect"
+    },
+    {
+      "op": "selection.invert"
+    },
+    {
+      "op": "selection.modify",
+      "mode": "expand",
+      "radius": 2
+    },
+    {
+      "op": "document.settings",
+      "width": 1024,
+      "height": 768,
+      "bit_depth": 16
     }
   ],
   "not_yet": [
     "remote clients",
     "Photoshop text/vector editing",
     "smart objects",
-    "clipping",
     "color management",
-    "liquify",
     "subject/object segmentation",
     "heal/clone",
     "freehand/lasso selection tools",
     "tiled GPU compositor",
     "disk eviction",
-    "selective task undo"
+    "selective task undo",
+    "broader Photoshop clipping/pass-through group compatibility"
   ],
   "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local PNG/JPEG path or base64 PNG. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",
   "merge_layers": {
@@ -435,5 +583,81 @@
     "blend": "Multiple selected roots must be contiguous normal-blend siblings. Flattening a single folder preserves its external blend. Unsupported backdrop-dependent merges are rejected."
   },
   "foreground_fill": "paint.fill blends foreground RGBA into the current selection, or the visible canvas when unselected. Expands a raster layer to cover that area while preserving surrounding pixels, masks and effects. mask:true fills the requested/latest paint mask step in grayscale. Layer and folder locks, reservations and undo apply. A folder color target creates one ordinary child paint layer. Legacy fill source layers remain readable for PSD compatibility.",
-  "selection_geometry": "selection.rect stays the axis-aligned bounding rectangle. After W/E/R selection transforms, document.selection_polygon retains the exact transformed shape. Brush, fill, shapes, gradients and copied image pixels clip to pixel centers inside this polygon. selection commands with rect reset the polygon; polygon points can also be supplied explicitly. Repeated layer transforms in one gesture use the same original selection."
+  "selection_geometry": "selection.rect stays the axis-aligned bounding rectangle. After W/E/R selection transforms, document.selection_polygon retains the exact transformed shape. Brush, fill, shapes, gradients and copied image pixels clip to pixel centers inside this polygon. selection commands with rect reset the polygon; polygon points can also be supplied explicitly. Repeated layer transforms in one gesture use the same original selection.",
+  "blend_modes": [
+    "normal",
+    "darken",
+    "multiply",
+    "color_burn",
+    "linear_burn",
+    "lighten",
+    "screen",
+    "color_dodge",
+    "linear_dodge",
+    "overlay",
+    "soft_light",
+    "hard_light",
+    "difference",
+    "exclusion",
+    "subtract",
+    "divide"
+  ],
+  "effects": [
+    "levels",
+    "curves",
+    "blur",
+    "adjust",
+    "invert",
+    "grayscale",
+    "color_balance",
+    "hsl",
+    "bloom",
+    "liquify"
+  ],
+  "painting": {
+    "tips": [
+      "round",
+      "dry",
+      "chalk",
+      "grain",
+      "bristle"
+    ],
+    "pressure": "points:[x,y,pressure] OR aligned pressures array, 0..1; unavailable mouse force defaults to 1",
+    "taper": "taper_start/taper_end:document-pixel distance, taper_size/taper_opacity booleans",
+    "smudge": "wetness/load/pickup:0..1; load0 carries existing pigment",
+    "native_pressure": "Used when the platform supplies Touch.force; taper also works with ordinary mouse input."
+  },
+  "adjustments": "One target paint layer gets a clipped adjustment; a folder gets an adjustment inside it; multiple selected roots get a scoped folder. Clip base and followers stay together; copy/delete/reorder refuse incomplete clipping units.",
+  "psd_sources": "Private format 5 retains native 16-bit samples and editable PeerBrush sources; older 8-bit formats remain readable. Standard PSD raster appearance is baked for other editors. Unsupported Photoshop structure opens protected at its original precision; compatible_copy explicitly creates a flattened editable copy at the same bit depth without touching the source.",
+  "color_depth": {
+    "supported": [
+      8,
+      16
+    ],
+    "new_document": "document action new accepts bit_depth:8 or 16 (default8)",
+    "preservation": "Native samples, edits, masks, internal clipboard, effects and PSD/PNG saves retain document precision. Screen/MCP PNG previews project to 8 bits for fast observation. Importing retained native 16-bit sources promotes the document.",
+    "limits": "RGB PSD v1; unsupported profiles/Photoshop source features remain protected; full ICC management and HDR/32-bit are not implemented."
+  },
+  "selection": {
+    "tools": [
+      "rectangle",
+      "ellipse",
+      "row",
+      "column",
+      "lasso",
+      "polygon",
+      "magnetic",
+      "wand",
+      "quick",
+      "object"
+    ],
+    "modes": [
+      "replace",
+      "add",
+      "subtract",
+      "intersect"
+    ],
+    "empty": "Active zero-coverage selection; selection=null means deselected.",
+    "object_region": "Deterministic perimeter-color extraction, not learned object segmentation."
+  }
 }

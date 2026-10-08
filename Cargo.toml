@@ -1,6 +1,6 @@
 [package]
 name = "peerbrush"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "You and your AI. Same canvas."
@@ -15,6 +15,7 @@ toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 base64 = "0.22"
+bytemuck = "1"
 tiny_http = "0.12"
 ureq = { version = "2.12", default-features = false, features = ["json"] }
 rfd = "0.15"

@@ -1,7 +1,7 @@
 //! Whole-layer copy-on-write snapshots. The shared Engine owns undo and reservations.
 use crate::{
     engine::{id, Document, Layer},
-    raster::{check_size, Raster, TILE},
+    raster::{check_size, Raster},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -64,6 +64,15 @@ pub fn copy(doc: &Document, ids: &[String]) -> Result<Layers, String> {
             break;
         }
     }
+    if doc.layers.iter().any(|l| {
+        l.clip_to
+            .as_ref()
+            .is_some_and(|base| included.contains(&l.id) != included.contains(base))
+    }) {
+        return Err(
+            "Copy the base and its clipped layers together, or release clipping first".into(),
+        );
+    }
     let snapshot = Layers {
         width: doc.width,
         height: doc.height,
@@ -93,10 +102,9 @@ pub fn validate(snapshot: &Layers) -> Result<(), String> {
         if !(0.0..=1.0).contains(&l.opacity) {
             return Err("Clipboard layer opacity must be between 0 and 1".into());
         }
-        if ![
-            "normal", "multiply", "screen", "overlay", "darken", "lighten",
-        ]
-        .contains(&l.blend.as_str())
+        if !crate::raster::BLENDS
+            .iter()
+            .any(|(mode, _)| *mode == l.blend)
         {
             return Err("Clipboard contains an unsupported layer blend".into());
         }
@@ -124,6 +132,7 @@ pub fn validate(snapshot: &Layers) -> Result<(), String> {
         }
     }
     let mut draft = Document::new(snapshot.width, snapshot.height)?;
+    draft.bit_depth = snapshot.layers[0].pixels.depth;
     draft.layers = snapshot.layers.clone();
     for layer in &mut draft.layers {
         if roots.contains(layer.id.as_str()) {
@@ -134,16 +143,9 @@ pub fn validate(snapshot: &Layers) -> Result<(), String> {
 }
 fn validate_raster(r: &Raster) -> Result<(), String> {
     check_size(r.width, r.height)?;
-    for (&(x, y), tile) in &r.tiles {
-        if x >= r.width.div_ceil(TILE)
-            || y >= r.height.div_ceil(TILE)
-            || tile.len() != (TILE * TILE * 4) as usize
-        {
-            return Err("Clipboard contains an invalid raster tile".into());
-        }
-    }
-    Ok(())
+    r.validate_layout()
 }
+
 fn unlocked(doc: &Document, target: &str) -> Result<(), String> {
     let mut next = Some(target);
     for depth in 0..=16 {
@@ -196,6 +198,7 @@ fn cloned(snapshot: &Layers, parent: Option<&str>, keep_parent: bool) -> (Vec<La
         .map(|old| {
             let mut layer = old.clone();
             layer.id = mapping[old.id.as_str()].clone();
+            layer.psd_metadata = crate::psd::metadata_for_duplicate(&old.psd_metadata);
             layer.parent = if root_set.contains(old.id.as_str()) {
                 if keep_parent {
                     old.parent.clone()
@@ -208,6 +211,10 @@ fn cloned(snapshot: &Layers, parent: Option<&str>, keep_parent: bool) -> (Vec<La
             if root_set.contains(old.id.as_str()) {
                 layer.name.push_str(" copy");
             }
+            layer.clip_to = old
+                .clip_to
+                .as_deref()
+                .map(|base| mapping.get(base).cloned().unwrap_or_else(|| base.into()));
             layer.effect_key = id();
             for effect in &mut layer.effects {
                 effect.id = id();
@@ -254,6 +261,7 @@ fn commit(doc: &mut Document, mut draft: Document) -> Result<(), String> {
             layer.effect_key = id();
         }
     }
+    draft.ensure_depth();
     crate::psd::validate(&draft)?;
     *doc = draft;
     Ok(())
@@ -272,30 +280,45 @@ pub fn duplicate(doc: &mut Document, ids: &[String]) -> Result<Vec<String>, Stri
         return Err("Initial version supports up to 100 layers".into());
     }
     let (clones, created) = cloned(&snapshot, None, true);
-    let mut forest = HashMap::new();
-    for (old, new) in snapshot.roots.iter().zip(&created) {
-        let mut subtree = vec![];
-        let mut descendants = HashSet::from([new.as_str()]);
-        for layer in &clones {
-            if layer.id == *new
-                || layer
-                    .parent
-                    .as_deref()
-                    .is_some_and(|p| descendants.contains(p))
-            {
-                descendants.insert(layer.id.as_str());
-                subtree.push(layer.clone());
-            }
-        }
-        forest.insert(old.as_str(), subtree);
-    }
     let mut draft = doc.clone();
-    draft.layers.clear();
-    for layer in &doc.layers {
-        if let Some(block) = forest.remove(layer.id.as_str()) {
-            draft.layers.extend(block);
+    let at = doc
+        .layers
+        .iter()
+        .position(|l| snapshot.roots.contains(&l.id))
+        .unwrap();
+    if snapshot.layers.iter().any(|l| l.clip_to.is_some()) {
+        draft.layers.splice(at..at, clones);
+    } else {
+        let mut forest = HashMap::new();
+        for (old, new) in snapshot.roots.iter().zip(&created) {
+            let mut ids = HashSet::from([new.clone()]);
+            loop {
+                let n = ids.len();
+                for l in &clones {
+                    if l.parent.as_ref().is_some_and(|p| ids.contains(p)) {
+                        ids.insert(l.id.clone());
+                    }
+                }
+                if ids.len() == n {
+                    break;
+                }
+            }
+            forest.insert(
+                old.as_str(),
+                clones
+                    .iter()
+                    .filter(|l| ids.contains(&l.id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
         }
-        draft.layers.push(layer.clone());
+        draft.layers.clear();
+        for l in &doc.layers {
+            if let Some(block) = forest.remove(l.id.as_str()) {
+                draft.layers.extend(block)
+            }
+            draft.layers.push(l.clone());
+        }
     }
     commit(doc, draft)?;
     Ok(created)
@@ -326,18 +349,33 @@ pub fn paste(doc: &mut Document, snapshot: &Layers, target: &str) -> Result<Vec<
     let (at, parent) = if let Some(index) = selected {
         let current = draft.layers[index].clone();
         if wrap {
+            let base = current.clip_to.as_deref().unwrap_or(&current.id);
+            let members: Vec<_> = draft
+                .layers
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    l.parent == current.parent
+                        && (l.id == base || l.clip_to.as_deref() == Some(base))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let at = *members.iter().min().unwrap();
+            let base_at = draft.layers.iter().position(|l| l.id == base).unwrap();
             let mut folder = Layer::new(
-                &format!("{} group", current.name),
+                &format!("{} group", draft.layers[base_at].name),
                 "group",
                 doc.width,
                 doc.height,
             );
-            folder.blend = current.blend.clone();
-            draft.layers[index].blend = "normal".into();
-            draft.layers[index].parent = Some(folder.id.clone());
+            folder.blend = draft.layers[base_at].blend.clone();
+            draft.layers[base_at].blend = "normal".into();
+            for member in members {
+                draft.layers[member].parent = Some(folder.id.clone());
+            }
             let parent = Some(folder.id.clone());
-            draft.layers.insert(index, folder);
-            (index + 1, parent)
+            draft.layers.insert(at, folder);
+            (at + 1, parent)
         } else if current.kind == "group" {
             (index + 1, Some(current.id))
         } else {

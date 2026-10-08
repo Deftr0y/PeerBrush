@@ -6,6 +6,14 @@ use crate::{
 use serde_json::Value;
 use std::collections::VecDeque;
 pub fn from_color(layer: &mut Layer, source: &Image, c: &Value) -> Result<(), String> {
+    from_color_with_native(layer, source, c, None)
+}
+pub fn from_color_with_native(
+    layer: &mut Layer,
+    source: &Image,
+    c: &Value,
+    native: Option<&crate::depth16::Image16>,
+) -> Result<(), String> {
     let x = c["point"][0].as_i64().ok_or("Missing mask point x")? - layer.x as i64;
     let y = c["point"][1].as_i64().ok_or("Missing mask point y")? - layer.y as i64;
     let tolerance = c["tolerance"].as_f64().unwrap_or(0.12);
@@ -69,15 +77,21 @@ pub fn from_color(layer: &mut Layer, source: &Image, c: &Value) -> Result<(), St
         .mask
         .as_ref()
         .and_then(|m| m.prepare(source.width, source.height));
-    let mut pixels = Raster::new(source.width, source.height);
+    let mut pixels = Raster::new_depth(source.width, source.height, layer.pixels.depth);
+    let maximum = if pixels.depth == 16 { 65535u16 } else { 255u16 };
     for y in 0..h {
         for x in 0..w {
             let hit = selected[y * w + x] == 1;
             let old = if mode == "replace" {
                 0
             } else {
-                (layer.mask_value_prepared(x as i32, y as i32, prepared.as_deref(), true) * 255.0)
-                    .round() as u8
+                if let Some(native) = native {
+                    native.get(x as i32, y as i32)[0]
+                } else {
+                    (layer.mask_value_prepared(x as i32, y as i32, prepared.as_deref(), true)
+                        * f32::from(maximum))
+                    .round() as u16
+                }
             };
             let value = match mode {
                 "subtract" => {
@@ -89,21 +103,29 @@ pub fn from_color(layer: &mut Layer, source: &Image, c: &Value) -> Result<(), St
                 }
                 "add" => {
                     if hit {
-                        255
+                        maximum
                     } else {
                         old
                     }
                 }
                 _ => {
                     if hit {
-                        255
+                        maximum
                     } else {
                         0
                     }
                 }
             };
             if value > 0 {
-                pixels.set(x as i32, y as i32, [value, value, value, 255]);
+                if pixels.depth == 16 {
+                    pixels.set16(x as i32, y as i32, [value, value, value, maximum]);
+                } else {
+                    pixels.set(
+                        x as i32,
+                        y as i32,
+                        [value as u8, value as u8, value as u8, 255],
+                    );
+                }
             }
         }
     }
@@ -125,8 +147,14 @@ pub fn from_color(layer: &mut Layer, source: &Image, c: &Value) -> Result<(), St
         let mut step = step;
         for y in 0..h {
             for x in 0..w {
-                let p = step.pixels.get(x as i32, y as i32);
-                step.pixels.set(x as i32, y as i32, [p[0], p[0], p[0], 255]);
+                if step.pixels.depth == 16 {
+                    let p = step.pixels.get16(x as i32, y as i32);
+                    step.pixels
+                        .set16(x as i32, y as i32, [p[0], p[0], p[0], 65535]);
+                } else {
+                    let p = step.pixels.get(x as i32, y as i32);
+                    step.pixels.set(x as i32, y as i32, [p[0], p[0], p[0], 255]);
+                }
             }
         }
         mask.steps.push(step);
@@ -142,7 +170,7 @@ pub fn from_color(layer: &mut Layer, source: &Image, c: &Value) -> Result<(), St
                     kind: "fill".into(),
                     enabled: true,
                     value: 0.0,
-                    pixels: Raster::new(source.width, source.height),
+                    pixels: Raster::new_depth(source.width, source.height, layer.pixels.depth),
                     settings: Value::Null,
                 },
                 step,

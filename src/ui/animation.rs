@@ -319,11 +319,19 @@ fn crossfade(from: &[u8], to: &[u8], t: f32) -> Vec<u8> {
     out
 }
 impl PeerBrush {
-    pub(super) fn ai_layer(&self, id: &str, time: f64) -> bool {
-        self.animation.layer(id, time)
-            || self.shared.lock().unwrap().leases.iter().any(|l| {
-                l.owner != "human" && l.scopes.iter().any(|s| s.target.as_deref() == Some(id))
+    pub(super) fn ai_reserved(&self, id: &str) -> bool {
+        let e = self.shared.lock().unwrap();
+        e.leases
+            .iter()
+            .filter(|l| l.owner != "human" && l.expires > crate::engine::now())
+            .any(|l| {
+                l.scopes
+                    .iter()
+                    .any(|s| e.scope_overlap(s, &Scope::layer(id)))
             })
+    }
+    pub(super) fn ai_layer(&self, id: &str, time: f64) -> bool {
+        self.ai_reserved(id) || self.animation.layer(id, time)
     }
     pub(super) fn ai_canvas(
         &self,

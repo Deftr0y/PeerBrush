@@ -1,5 +1,7 @@
 //! Document-space selection geometry. The public rectangle stays its bounding box.
 use crate::engine::Document;
+mod system;
+pub use system::*;
 
 pub fn rectangle(area: [i32; 4]) -> Vec<[f32; 2]> {
     vec![
@@ -11,13 +13,15 @@ pub fn rectangle(area: [i32; 4]) -> Vec<[f32; 2]> {
 }
 
 pub fn bounds(points: &[[f32; 2]]) -> Result<[i32; 4], String> {
-    if !(3..=64).contains(&points.len())
+    if !(3..=8192).contains(&points.len())
         || points
             .iter()
             .flatten()
             .any(|p| !p.is_finite() || p.abs() > 100000.0)
     {
-        return Err("Selection needs 3–64 finite points within document coordinate limits".into());
+        return Err(
+            "Selection needs 3–8192 finite points within document coordinate limits".into(),
+        );
     }
     let mut bounds = [
         f32::INFINITY,
@@ -82,6 +86,11 @@ pub fn polygon(doc: &Document) -> Option<&[[f32; 2]]> {
 }
 
 pub fn contains_pixel(doc: &Document, x: i32, y: i32) -> bool {
+    if let Some(coverage) = &doc.selection_coverage {
+        if doc.selection == Some(coverage.bounds) {
+            return coverage.value(x, y) > 0.0;
+        }
+    }
     let Some(area) = doc.selection else {
         return true;
     };

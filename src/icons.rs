@@ -7,6 +7,8 @@ pub enum Icon {
     Rotate,
     Scale,
     Brush,
+    Smudge,
+    Liquify,
     Eraser,
     Fill,
     Gradient,
@@ -37,6 +39,29 @@ pub enum Icon {
     Wand,
 }
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
+    let cell = match icon {
+        Icon::Cursor => Some(0),
+        Icon::Move => Some(1),
+        Icon::Rotate => Some(2),
+        Icon::Scale => Some(3),
+        Icon::Brush => Some(4),
+        Icon::Smudge => Some(5),
+        Icon::Liquify => Some(6),
+        Icon::Eraser => Some(7),
+        Icon::Fill => Some(8),
+        Icon::Gradient => Some(9),
+        Icon::Rectangle => Some(10),
+        Icon::Ellipse => Some(11),
+        Icon::Selection => Some(12),
+        Icon::Picker => Some(13),
+        Icon::Pan => Some(14),
+        Icon::Wand => Some(15),
+        _ => None,
+    };
+    if let Some(cell) = cell {
+        paint_generated(painter, rect, cell, enabled);
+        return;
+    }
     let f = rect.width().min(rect.height()) / 32.0;
     let color = Color32::from_gray(if enabled { 240 } else { 100 });
     let point = |x: f32, y: f32| rect.center() + Vec2::new(x, y) * f;
@@ -72,6 +97,33 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
             (0., 2.),
             (8., 1.),
         ]),
+        Icon::Smudge => {
+            line(&[
+                (-10., 9.),
+                (-5., 4.),
+                (-4., -7.),
+                (-1., -9.),
+                (1., -7.),
+                (1., 0.),
+                (4., -5.),
+                (7., -4.),
+                (7., 3.),
+                (3., 10.),
+            ]);
+            line(&[(-10., -1.), (-7., -3.)]);
+            line(&[(9., 7.), (11., 9.)]);
+        }
+        Icon::Liquify => {
+            for y in [-8., 0., 8.] {
+                line(&[
+                    (-11., y),
+                    (-5., y - 3.),
+                    (2., y + 3.),
+                    (7., y + 1.),
+                    (11., y - 2.),
+                ]);
+            }
+        }
         Icon::Move => {
             line(&[(-11., 0.), (11., 0.)]);
             line(&[(0., -11.), (0., 11.)]);
@@ -311,6 +363,42 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
             line(&[(10., -10.), (13., -13.)]);
         }
     }
+}
+pub fn paint_generated(painter: &egui::Painter, rect: Rect, cell: usize, enabled: bool) {
+    let id = egui::Id::new("generated tool atlas");
+    let texture = if let Some(t) = painter
+        .ctx()
+        .data(|d| d.get_temp::<egui::TextureHandle>(id))
+    {
+        t
+    } else {
+        let img = image::load_from_memory(include_bytes!("../assets/tool-icons.png"))
+            .unwrap()
+            .to_rgba8();
+        let t = painter.ctx().load_texture(
+            "PeerBrush tools",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [img.width() as usize, img.height() as usize],
+                img.as_raw(),
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+        painter.ctx().data_mut(|d| d.insert_temp(id, t.clone()));
+        t
+    };
+    let col = (cell % 6) as f32;
+    let row = (cell / 6) as f32;
+    // Discard only the generous transparent cell padding, preserving the actual generated art.
+    let uv = Rect::from_min_max(
+        egui::pos2((col + 0.08) / 6.0, (row + 0.08) / 4.0),
+        egui::pos2((col + 0.92) / 6.0, (row + 0.92) / 4.0),
+    );
+    painter.image(
+        texture.id(),
+        rect,
+        uv,
+        Color32::WHITE.gamma_multiply(if enabled { 1.0 } else { 0.35 }),
+    );
 }
 pub fn button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
     button_size(ui, icon, tip, [30., 30.])

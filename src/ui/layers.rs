@@ -117,6 +117,7 @@ impl PeerBrush {
         }
     }
     pub(super) fn select_content(&mut self, id: &str) {
+        self.liquify_effect = None;
         self.selected = id.into();
         self.selection_layers = [id.to_string()].into_iter().collect();
         self.selection_anchor = id.into();
@@ -266,6 +267,12 @@ impl PeerBrush {
                 if response.clicked() {
                     self.select_row(ui, doc, &l.id);
                 }
+            } else if l.kind == "adjustment" {
+                let (r, response) = ui.allocate_exact_size(Vec2::splat(30.), egui::Sense::click());
+                icons::paint(ui.painter(), r, Icon::Adjust, true);
+                if response.clicked() {
+                    self.select_row(ui, doc, &l.id);
+                }
             } else if self
                 .thumb_button(
                     ui,
@@ -276,6 +283,17 @@ impl PeerBrush {
                 .clicked()
             {
                 self.select_row(ui, doc, &l.id);
+            }
+            if l.clip_to.is_some() {
+                ui.label(RichText::new("↳").color(MUTED))
+                    .on_hover_text("Clipped to the base below");
+            }
+            let reserved = self.ai_reserved(&l.id);
+            if reserved {
+                ui.label(RichText::new("AI").size(10.).color(AI_BLUE))
+                    .on_hover_text(
+                        "AI has reserved this layer or a region; visibility stays available",
+                    );
             }
             let mask_width = if l.mask.is_some() { 35.0 } else { 0.0 };
             let name_width =
@@ -300,7 +318,7 @@ impl PeerBrush {
                                     egui::FontFamily::Proportional
                                 },
                             ))
-                            .color(if self.ai_layer(&l.id, ui.input(|i| i.time)) {
+                            .color(if reserved {
                                 AI_BLUE
                             } else if l.visible {
                                 Color32::WHITE

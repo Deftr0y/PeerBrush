@@ -13,7 +13,7 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/AI_interface-MCP-5aaaff.svg)](docs/mcp.md)
 
-[Download Windows](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.2/PeerBrush-Windows.zip) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development](docs/development.md) · [Roadmap](FOLLOWUPS.MD)
+[Download Windows](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.4/PeerBrush-Windows.zip) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development](docs/development.md) · [Roadmap](FOLLOWUPS.MD)
 
 </div>
 
@@ -35,23 +35,26 @@ You stay in control while AI works directly alongside you inside the same editin
 
 | Create and edit | Work with AI | Keep control |
 | --- | --- | --- |
-| Paint, erase, fill, shapes and selections | MCP and CLI access to the live document | Shared undo/redo with participant checks |
+| Paint, erase, fill, shapes, lassos, wand and soft selections | MCP and CLI access to the live document | Shared undo/redo with participant checks |
 | Layer and folder hierarchy, multi-selection | Actual PNG views with pixel coordinates | Atomic edits and conflicting-revision checks |
 | Separate editable color and mask effect stacks | Place generated images into exact regions | Optional layer/region reservations and takeover |
-| Levels, curves, blur and color adjustments | Blue activity markers and animated changes | PSD working files and PNG export |
+| Color balance, hue, curves, bloom and editable liquify | Blue activity markers and animated changes | PSD working files and PNG export |
 
 ### Built for the way you work
 
 - **Visual, compact controls.** White tool glyphs, Ubuntu Sans, uncluttered range values and live canvas feedback.
-- **A useful hierarchy.** Distinct folders, multi-layer editing, drag into or out of folders, animated reorder previews, and visibility sweep gestures, inline renaming, grouping and merging.
+- **A useful hierarchy.** Distinct folders, multi-layer editing, drag into or out of folders, animated reorder previews, visibility sweep gestures, inline renaming, grouping and merging.
 - **Editable effects.** Each layer or folder has independent color and mask stacks. The top effect runs last. Return to an effect and change its settings after later edits; blend and opacity sit beneath the stack.
 - **Familiar navigation.** Maya-style W/E/R gizmos, Q to hide, F to frame, middle drag to pan, wheel or Alt + right drag to zoom.
-- **A practical brush.** Hardness, flow, opacity, spacing, angle, roundness and smoothing; live size changes, Alt eyedropper, two colors and X to swap.
+- **A painting brush.** Round, dry, chalk, grain and bristle tips; size and opacity pressure, start/end taper, flow, spacing and smoothing. Wet blending carries pigment along the stroke. Live size changes, Alt eyedropper, two colors and X to swap.
+- **Native 16-bit precision.** Open supported 16-bit RGB PSD layers, retain channel precision through edits and history, and save PSD or PNG at the same depth. Unsupported Photoshop structures stay protected, with an explicit copy that flattens structure while keeping 16-bit samples.
+- **Color that stays editable.** Warm highlights and cool shadows independently, shift hue/saturation, add threshold-controlled bloom, and brush an editable liquify warp. Clipped adjustments target one layer; a shared adjustment can affect selected artwork inside a folder.
+- **More blend choices.** Linear dodge / Add, dodge/burn, soft/hard light, difference, exclusion, subtract and divide, with hover previews.
 - **Real clipboard support.** Copy, cut, paste or duplicate whole layers and folders, including masks and effects; copy selected pixels or the composite; accept images copied in other applications.
 
 ## Run PeerBrush
 
-[Download the Windows x64 portable build](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.2/PeerBrush-Windows.zip), extract it, and run `PeerBrush-Windows/peerbrush.exe`. **No Rust installation is needed to use it.** Open/import/drop an image, work in layers, save PSD, and export PNG.
+[Download the Windows x64 portable build](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.4/PeerBrush-Windows.zip), extract it, and run `PeerBrush-Windows/peerbrush.exe`. **No Rust installation is needed to use it.** Open/import/drop an image, work in layers, save PSD, and export PNG.
 
 To develop from source:
 
@@ -114,18 +117,21 @@ The long-term goal is an MCP-native creative application where compatible AI age
 - Local and remote model support through connected agents
 - Extensible tool and plugin architecture
 
-The next slices include incremental/GPU rendering, broader selection tools and subject masking, liquify, text/vector source layers, stronger PSD fidelity, and selective task undo. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status.
+The next slices include broader GPU editing, tiled compositing, broader selection tools and subject masking, text/vector source layers, stronger Photoshop fidelity, and selective task undo. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status.
 
 ## Status
 
-🚧 **Early development — [v0.1.2 checkpoint](docs/checkpoint-0.1.2.md)**
+🚧 **Early development — [v0.1.4 checkpoint](docs/checkpoint-0.1.4.md)**
 
 PeerBrush is currently experimental and under active development. Features, APIs, and project structure are expected to change.
 
 Editable PSD support currently targets **PSD v1, 8-bit RGB**, basic raster layers, isolated groups, supported blend modes and raster masks. PeerBrush preserves editable effect sources in private metadata and writes current standard raster/mask data and a merged composite. Unsupported Photoshop features open as a read-only merged preview. Full Photoshop compatibility, PSB and full color management are future work.
 
-The shell uses Rust, egui/eframe and wgpu. Sparse copy-on-write tiles share unchanged image data with history. Compositing currently runs on a CPU worker, with bounded effect caches and screen-sized previews. Full incremental and GPU compositing remain on the roadmap.
+The shell uses Rust, egui/eframe and wgpu. Sparse copy-on-write tiles share unchanged image data with history. Incremental strokes reuse coverage and composite affected regions, then upload only changed preview pixels. Larger previews use bounded parallel CPU rendering. Common expensive 8-bit effects use optional GPU compute with a measured CPU fallback; native 16-bit sources retain their precision through the renderer. Full tiled GPU compositing remains on the roadmap.
 
 ## License
 
 GNU General Public License v3. See [LICENSE](LICENSE). Bundled fonts and dependencies retain their own licenses; portable packages include source and third-party notices.
+
+
+The local Windows 0.1.4 build adds the selection toolbar and Select menu (Ctrl+D deselects, Ctrl+Shift+D reselects, Ctrl+J duplicates layers), on-canvas editable Liquify, visual Levels and smooth Curves controls, one Add Mask action, connected Color/Mask buttons, generated tool artwork and wordmark, precise AI reservations with blue AI tags, and right-click canvas dimensions/depth settings. The download link above remains the separately published release. See [getting started](docs/getting-started.md) for behavior and selection limits.

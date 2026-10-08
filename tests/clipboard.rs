@@ -73,6 +73,7 @@ fn external_image_centers_in_selected_folder_and_sibling_paste_keeps_parent() {
         height: 2,
         bytes: vec![100; 16],
         origin: None,
+        samples16: None,
     };
     e.edit(
         "human",
@@ -112,6 +113,7 @@ fn paste_obeys_locks_reservations_revisions_and_rolls_back_invalid_pixels() {
         height: 2,
         bytes: vec![255; 16],
         origin: None,
+        samples16: None,
     };
     let command = image.command(&id).unwrap();
     e.doc.layers[0].locked = true;

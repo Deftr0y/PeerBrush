@@ -34,3 +34,18 @@ Derived mask and color caches have 128 MiB and 256 MiB budgets respectively and 
 Embedded format 3 supports color effects and extended mask settings. Older PeerBrush builds open these PSDs as a read-only merged preview rather than dropping effect sources. Compatible versions restore editable sources only when standard PSD hashes still match.
 
 Clipboard reads, selection rendering and PNG preparation run on a dedicated worker. Pixel paste uses the shared `image.paste` command; whole-layer paste uses a typed copy-on-write transaction, including revision/reservation checks and transactional undo. The clipboard provider stays alive for Linux ownership; arboard includes Wayland data-control support with X11 fallback. `vendor/egui-winit` contains a single input adapter patch so image-only clipboard shortcuts reach the canvas; see its patch note and upstream licenses. Windows clipboard behavior is tested locally; macOS/Linux validation depends on CI and native desktop checks.
+
+Native 16-bit sources use sparse copy-on-write u16 tiles. A separate full-precision compositor keeps color, masks, selection transformations and effect sources native; screen and MCP previews project only at the output boundary. Standard PSD layer/mask channels and PNG exports retain the document depth. Native color and spatial-mask derived caches are independently bounded to 128 MiB. Blur/bloom use a bounded u32 premultiplied working image with u64 running sums. See the checkpoint for measured GPU coverage and remaining CPU paths.
+
+
+## Windows 0.1.4 selection and preview changes
+
+`selection::Coverage` stores a sparse 8-bit coverage mask, its document-space origin/bounds and separate boundary contours. An active empty selection has zero bounds and a coverage object; deselection has no selection. Raster edits apply coverage to source changes at native channel precision. Clipboard alpha uses the same coverage, selected transforms move both source alpha and coverage, and Liquify snapshots a local coverage source for each stroke. Derived previews and contours never replace standard PSD raster channels. Invalid/oversized coverage is rejected by document validation.
+
+Preview requests take the latest committed document after UI mutations and accept only that document/revision, while retaining the last displayed pixels until the replacement finishes. Active gesture images may arrive from an earlier point within the same gesture. Regression tests cover release/commit, move, transform, reorder and visibility rejection of stale images.
+
+Visibility-only updates have an internal visibility conflict scope and still use ordinary revisions/history. They neither overlap pixel reservations nor invalidate pixel-only expected revisions. Commands mixing visibility with other changes use the ordinary layer scope. Structural scope collection names source trees and destinations instead of locking unrelated siblings. Reservation visuals call the same ancestor-aware overlap routine as engine checks.
+
+Private PSD source format 6 identifies selection coverage, smooth curve interpolation and coverage-aware liquify sources. Older readers reject that version and use the protected standard saved appearance. Documents without these sources retain the earlier compatible format where possible.
+
+`document.settings` changes canvas dimensions without resampling sources and explicitly converts all color/mask rasters to the requested native depth in one undo transaction. Selection geometry is cleared after canvas/depth changes. Build and QA must use a separate target executable and `--state-dir` when a user's editor is already running.
