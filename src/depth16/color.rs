@@ -137,6 +137,18 @@ pub fn apply_cpu(image: &mut Image16, kind: &str, settings: &Value) -> Result<()
     let settings = validated(image, kind, settings)?;
     apply_cpu_prepared(image, kind, settings)
 }
+pub(crate) fn apply_region(
+    image: &mut Image16,
+    kind: &str,
+    settings: &Value,
+    source_pixels: u64,
+) -> Result<(), String> {
+    let settings = validated(image, kind, settings)?;
+    if crate::gpu::try_apply16_region(image, kind, &settings, source_pixels) {
+        return Ok(());
+    }
+    apply_cpu_prepared(image, kind, settings)
+}
 fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Result<(), String> {
     match kind {
         "blur" => return blur(image, number(&settings, "radius", 8.0) as f32),

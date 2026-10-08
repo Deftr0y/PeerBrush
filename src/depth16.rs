@@ -118,7 +118,7 @@ pub fn prepare(doc: &Document) -> Result<Vec<Option<Arc<Image16>>>, String> {
     let masks = prepare_masks(doc)?;
     prepare_with_masks(doc, &masks)
 }
-fn prepare_with_masks(
+pub(crate) fn prepare_with_masks(
     doc: &Document,
     masks: &[Option<Arc<Gray16>>],
 ) -> Result<Vec<Option<Arc<Image16>>>, String> {

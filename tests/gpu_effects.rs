@@ -230,3 +230,86 @@ fn native16_pointwise_device_matches_cpu_without_projection_and_across_tiles() {
         .is_err());
     assert_eq!(unchanged.words, words);
 }
+
+#[test]
+#[ignore = "requires native compute adapter"]
+fn padded_gpu_windows_match_full_device_filtering_and_native_pointwise_words() {
+    let backend = gpu::headless().unwrap();
+    let source = pattern(513, 277);
+    for (kind, settings, radius) in [
+        ("blur", json!({"radius":8}), 8.),
+        (
+            "bloom",
+            json!({"threshold":0.65,"strength":1.5,"spread":8}),
+            8.,
+        ),
+    ] {
+        let reach = effects::gaussian_radii(radius).iter().sum::<usize>() as i32;
+        for output in [[91, 81, 149, 123], [0, 0, 31, 29], [491, 260, 513, 277]] {
+            let work = [
+                (output[0] - reach).max(0),
+                (output[1] - reach).max(0),
+                (output[2] + reach).min(513),
+                (output[3] + reach).min(277),
+            ];
+            let (w, h) = ((work[2] - work[0]) as u32, (work[3] - work[1]) as u32);
+            let mut full = source.clone();
+            assert!(backend.apply(&mut full, kind, &settings).unwrap());
+            let mut cropped = Image {
+                width: w,
+                height: h,
+                bytes: Vec::new(),
+            };
+            for y in work[1]..work[3] {
+                for x in work[0]..work[2] {
+                    cropped.bytes.extend(source.get(x, y));
+                }
+            }
+            assert!(backend.apply(&mut cropped, kind, &settings).unwrap());
+            for y in output[1]..output[3] {
+                for x in output[0]..output[2] {
+                    assert_eq!(
+                        cropped.get(x - work[0], y - work[1]),
+                        full.get(x, y),
+                        "{kind}, output {output:?}, pixel {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+    let source = native_pattern(1024, 129);
+    for (kind, settings) in [
+        ("hsl", json!({"hue":47,"saturation":0.4,"lightness":0.1})),
+        (
+            "adjust",
+            json!({"brightness":0.13,"contrast":1.4,"saturation":2.1}),
+        ),
+        (
+            "color_balance",
+            json!({"shadows":[0.8,-0.3,0.1],"midtones":[-0.2,0.6,0.2],"highlights":[0.2,0.1,-0.7],"preserve_luminosity":true}),
+        ),
+    ] {
+        let mut full = source.clone();
+        assert!(backend.apply16(&mut full, kind, &settings).unwrap());
+        let mut cropped = peerbrush::depth16::Image16 {
+            width: 31,
+            height: 19,
+            words: Vec::new(),
+        };
+        for y in 57..76 {
+            for x in 501..532 {
+                cropped.words.extend(source.get(x, y));
+            }
+        }
+        assert!(backend.apply16(&mut cropped, kind, &settings).unwrap());
+        for y in 57..76 {
+            for x in 501..532 {
+                assert_eq!(
+                    cropped.get(x - 501, y - 57),
+                    full.get(x, y),
+                    "{kind}, native pixel {x},{y}"
+                );
+            }
+        }
+    }
+}

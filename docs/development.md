@@ -49,3 +49,20 @@ Visibility-only updates have an internal visibility conflict scope and still use
 Private PSD source format 6 identifies selection coverage, smooth curve interpolation and coverage-aware liquify sources. Older readers reject that version and use the protected standard saved appearance. Documents without these sources retain the earlier compatible format where possible.
 
 `document.settings` changes canvas dimensions without resampling sources and explicitly converts all color/mask rasters to the requested native depth in one undo transaction. Selection geometry is cleared after canvas/depth changes. Build and QA must use a separate target executable and `--state-dir` when a user's editor is already running.
+
+## Retained regional effects (PB-075)
+
+Gesture previews retain separate derived 8-bit/native-16 color and mask images. Source changes re-evaluate only conservative padded windows, including nested folder and clipped-adjustment dependencies. Padding includes each Gaussian/legacy mask-blur pass. Raw isolated masks refresh outward clamped edge strips. Liquify/unknown filter support uses the full renderer. Metadata/revision/isolation changes and errors reset the gesture cache; copy-on-write isolates global baseline images. Native uniform masks return to constant storage when painted coverage is removed. Derived images obey the existing color/mask budgets and never enter editable sources or history; one gesture may retain its own bounded images alongside the global caches.
+
+Regional GPU effects keep the full layer's dispatch threshold, so small input windows use the same arithmetic as a full GPU render. Device failure/busy fallback remains intact. Verification passed 97 engine/codec/protocol/UI checks, seven final preview checks, three actual-device parity checks (including padded windows), and native failure injection. Real native16 painting through levels/blur/bloom/GPU HSL rendered correctly; one undo restored byte-identical PNG16 output.
+
+Release measurements on the Windows NVIDIA RTX 3070 Ti Laptop system, with nine layers and a 1536-pixel preview, compare five successive brush updates. Every retained result was asserted equal to its full-render reference. Effects ran on CPU for this benchmark; timings are local observations, not project-wide guarantees.
+
+| Canvas / channels | Full replay + rendering | Retained replay + regional rendering |
+| --- | ---: | ---: |
+| 2048² / 8-bit, levels + blur | 7392 ms | 338 ms |
+| 4096² / 8-bit, levels + blur | 37354 ms | 567 ms |
+| 2048² / native 16-bit, levels + blur | 12864 ms | 621 ms |
+| 4096² / native 16-bit, levels + blur | 65044 ms | 565 ms |
+
+Run `cargo run --release --example preview_performance` or add `-- --effects16` for native effects. Tiled GPU composition, finer dirty-tile tracking and progressive large-document handling remain queued.

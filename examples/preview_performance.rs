@@ -61,13 +61,14 @@ fn elapsed(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 fn main() {
-    let native = std::env::args().any(|arg| arg == "--native16");
+    let native = std::env::args().any(|arg| arg == "--native16" || arg == "--effects16");
+    let native_effects = std::env::args().any(|arg| arg == "--effects16");
     let depth = if native { 16 } else { 8 };
     for edge in [2048, 4096] {
         for heavy in [false, true] {
             // Native effects have dedicated fidelity tests. This flag measures native live
             // painting; default runs both byte scenes, including cold CPU effect fallback.
-            if native && heavy {
+            if native && heavy && !native_effects {
                 continue;
             }
             let doc = fixture(edge, heavy, depth);
@@ -97,13 +98,15 @@ fn main() {
             assert_eq!(old.2, new.2);
             let mut full_replay = 0.;
             let mut full_render = 0.;
+            let mut expected = Vec::new();
             for count in [16, 32, 64, 96, 128] {
                 let start = Instant::now();
                 let image = Engine::preview_edits(doc.clone(), &[command(count)]).unwrap();
                 full_replay += elapsed(start);
                 let start = Instant::now();
-                std::hint::black_box(image.preview(None, 1536, None, false).unwrap());
+                let reference = image.preview(None, 1536, None, false).unwrap();
                 full_render += elapsed(start);
+                expected.push(reference.2);
             }
             let mut cache = Cache::default();
             cache
@@ -112,7 +115,7 @@ fn main() {
             let mut cached_replay = 0.;
             let mut cached_render = 0.;
             let mut partial = 0;
-            for count in [16, 32, 64, 96, 128] {
+            for (sample, count) in [16, 32, 64, 96, 128].into_iter().enumerate() {
                 let start = Instant::now();
                 let image = cache
                     .edit(doc.clone(), &[command(count)], "stroke")
@@ -129,6 +132,10 @@ fn main() {
                     .render(&image, "stroke", dirty, 1536, None, false)
                     .unwrap();
                 cached_render += elapsed(start);
+                assert_eq!(
+                    result.bytes, expected[sample],
+                    "retained update {count} must match full rendering"
+                );
                 partial += usize::from(result.dirty.is_some());
             }
             println!("{edge}² {depth}-bit {}: {} {reference:.2}ms / full render {compiled:.2}ms; five replay {full_replay:.2}ms +render {full_render:.2}ms; incremental replay {cached_replay:.2}ms +dirty render {cached_render:.2}ms ({partial}/5 partial)",if heavy{"levels+blur"}else{"effect-free 9 layers"},if native{"serial native compositor"}else{"legacy compositor"});

@@ -6,6 +6,7 @@ use crate::{
     raster::Pixel,
 };
 use serde_json::Value;
+pub(crate) mod regions;
 
 #[derive(Default)]
 pub struct Cache {
@@ -15,6 +16,8 @@ pub struct Cache {
     bytes: Vec<u8>,
     previous: Option<[i32; 4]>,
     stroke: Option<Stroke>,
+    prepared8: Option<regions::Prepared8>,
+    prepared16: Option<regions::Prepared16>,
 }
 struct Stroke {
     key: String,
@@ -30,17 +33,42 @@ pub struct Rendered {
     pub dirty: Option<[u32; 4]>,
 }
 
-/// Spatial effects and adjustments can propagate outside a painted rectangle; use a full render.
+/// Filters with finite support can update a padded rectangle. Warps require a full render.
 pub fn supports_dirty(doc: &Document) -> bool {
-    doc.layers.iter().all(|layer| {
-        layer.kind != "adjustment"
-            && !layer.effects.iter().any(|effect| effect.enabled)
-            && layer.mask.as_ref().is_none_or(|mask| {
-                mask.steps.iter().all(|step| {
-                    !step.enabled || ["fill", "paint", "invert"].contains(&step.kind.as_str())
-                })
-            })
-    })
+    dirty_padding(doc).is_some()
+}
+
+/// Sum all active kernel reaches conservatively: nesting, clipping and adjustment backdrops
+/// may compose several filters. This also includes disabled masks shown in isolation.
+fn dirty_padding(doc: &Document) -> Option<i32> {
+    let gaussian = |radius| crate::effects::gaussian_radii(radius).iter().sum::<usize>() as i32;
+    let mut padding = 0i32;
+    for layer in &doc.layers {
+        for effect in layer.effects.iter().filter(|effect| effect.enabled) {
+            let reach = match effect.kind.as_str() {
+                "blur" => gaussian(crate::effects::number(&effect.settings, "radius", 8.)),
+                "bloom" => gaussian(crate::effects::number(&effect.settings, "spread", 12.)),
+                "levels" | "curves" | "adjust" | "color_balance" | "hsl" | "invert"
+                | "grayscale" => 0,
+                _ => return None,
+            };
+            padding = padding.saturating_add(reach);
+        }
+        if let Some(mask) = &layer.mask {
+            for step in mask.steps.iter().filter(|step| step.enabled) {
+                let reach = match step.kind.as_str() {
+                    "gaussian" => gaussian(crate::effects::number(&step.settings, "radius", 8.)),
+                    "blur" if step.value >= 0.5 => {
+                        3 * ((step.value.round().clamp(1., 64.) as i32 + 2) / 3)
+                    }
+                    "fill" | "paint" | "invert" | "levels" | "curves" | "adjust" | "blur" => 0,
+                    _ => return None,
+                };
+                padding = padding.saturating_add(reach);
+            }
+        }
+    }
+    Some(padding)
 }
 impl Cache {
     pub fn clear(&mut self) {
@@ -181,6 +209,21 @@ impl Cache {
         target: Option<&str>,
         mask: bool,
     ) -> Result<Rendered, String> {
+        let result = self.render_inner(doc, key, dirty, edge, target, mask);
+        if result.is_err() {
+            self.clear();
+        }
+        result
+    }
+    fn render_inner(
+        &mut self,
+        doc: &Document,
+        key: &str,
+        dirty: Option<[i32; 4]>,
+        edge: u32,
+        target: Option<&str>,
+        mask: bool,
+    ) -> Result<Rendered, String> {
         let identity = (
             key.to_owned(),
             doc.id.clone(),
@@ -189,13 +232,34 @@ impl Cache {
             target.map(String::from),
             mask,
         );
-        if self.key.as_ref() != Some(&identity) || dirty.is_none() || !supports_dirty(doc) {
+        let padding = dirty_padding(doc);
+        let compatible = padding.is_some()
+            && if doc.bit_depth == 16 {
+                self.prepared16.as_ref().is_some_and(|p| p.compatible(doc))
+            } else {
+                self.prepared8.as_ref().is_some_and(|p| p.compatible(doc))
+            };
+        if self.key.as_ref() != Some(&identity)
+            || dirty.is_none()
+            || padding.is_none()
+            || !compatible
+        {
             let (width, height, bytes, _) = doc.preview(None, edge, target, mask)?;
             self.key = Some(identity);
             self.width = width;
             self.height = height;
             self.bytes = bytes;
             self.previous = dirty;
+            self.prepared8 = if padding.is_some() && doc.bit_depth == 8 {
+                Some(regions::Prepared8::new(doc)?)
+            } else {
+                None
+            };
+            self.prepared16 = if padding.is_some() && doc.bit_depth == 16 {
+                Some(regions::Prepared16::new(doc)?)
+            } else {
+                None
+            };
             return Ok(Rendered {
                 width,
                 height,
@@ -213,6 +277,49 @@ impl Cache {
             ];
         }
         self.previous = dirty;
+        let padding = padding.unwrap();
+        area = [
+            area[0].saturating_sub(padding),
+            area[1].saturating_sub(padding),
+            area[2].saturating_add(padding),
+            area[3].saturating_add(padding),
+        ];
+        // Cached raw masks clamp their edge pixels beyond their local raster. When an edge
+        // changes, update its entire outward strip as well, including offset small layers.
+        if let Some(layer) = target
+            .filter(|_| mask)
+            .and_then(|target| doc.layers.iter().find(|layer| layer.id == target))
+            .filter(|layer| {
+                layer
+                    .mask
+                    .as_ref()
+                    .is_some_and(crate::engine::Mask::needs_cache)
+            })
+        {
+            if area[0] <= layer.x {
+                area[0] = 0;
+            }
+            if area[1] <= layer.y {
+                area[1] = 0;
+            }
+            if area[2] >= layer.x.saturating_add(layer.pixels.width as i32) {
+                area[2] = doc.width as i32;
+            }
+            if area[3] >= layer.y.saturating_add(layer.pixels.height as i32) {
+                area[3] = doc.height as i32;
+            }
+        }
+        if doc.bit_depth == 16 {
+            self.prepared16
+                .as_mut()
+                .ok_or("Native preview baseline is missing")?
+                .update(doc, area)?;
+        } else {
+            self.prepared8
+                .as_mut()
+                .ok_or("Preview baseline is missing")?
+                .update(doc, area)?;
+        }
         let scale = (edge.clamp(1, 8192) as f32 / doc.width.max(doc.height) as f32).min(1.0);
         // Expand around the floor-sampled source grid. Extra border samples are harmless;
         // conservative mapping avoids seams at fractional preview scales.
@@ -236,7 +343,9 @@ impl Cache {
                 })
                 .transpose()?;
             if doc.bit_depth == 16 {
-                let plan = crate::depth16::Plan16::new(doc)?;
+                let prepared = self.prepared16.as_ref().unwrap();
+                let plan =
+                    crate::depth16::Plan16::with_prepared(doc, &prepared.masks, &prepared.colors);
                 let native_scale =
                     (edge.clamp(1, 8192) as f64 / doc.width.max(doc.height) as f64).min(1.0);
                 crate::render::area8(&mut self.bytes, self.width, bounds, |x, y| {
@@ -263,19 +372,9 @@ impl Cache {
                     dirty: Some(bounds),
                 });
             }
-            crate::mask::validate_budget(&doc.layers)?;
-            let masks: Vec<_> = doc
-                .layers
-                .iter()
-                .map(|layer| {
-                    layer
-                        .mask
-                        .as_ref()
-                        .and_then(|mask| mask.prepare(layer.pixels.width, layer.pixels.height))
-                })
-                .collect();
-            let colors = crate::effects::prepare(doc, &masks)?;
-            let plan = Plan::new(doc, &masks, &colors);
+            let prepared = self.prepared8.as_ref().unwrap();
+            let masks = &prepared.masks;
+            let plan = Plan::new(doc, masks, &prepared.colors);
             crate::render::area8(&mut self.bytes, self.width, bounds, |x, y| {
                 let sx = (x as f32 / scale) as i32;
                 let sy = (y as f32 / scale) as i32;

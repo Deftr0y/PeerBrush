@@ -6,12 +6,62 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Gray16 {
     pub width: u32,
     pub height: u32,
     pub words: Vec<u16>,
     constant: Option<u16>,
+}
+
+pub(crate) fn regional(
+    layer: &Layer,
+    previous: Option<Arc<Gray16>>,
+    area: [i32; 4],
+) -> Result<Option<Arc<Gray16>>, String> {
+    let Some(mask) = layer.mask.as_ref().filter(|mask| mask.needs_cache()) else {
+        return Ok(None);
+    };
+    let (width, height) = (layer.pixels.width, layer.pixels.height);
+    if uniform(mask) {
+        return Ok(Some(Arc::new(evaluate(mask, width, height)?)));
+    }
+    let output = crate::preview::regions::intersect(area, width, height);
+    let mut result = match previous {
+        Some(image) => image,
+        None => Arc::new(evaluate(mask, width, height)?),
+    };
+    if output[0] >= output[2] || output[1] >= output[3] {
+        return Ok(Some(result));
+    }
+    let work = crate::preview::regions::window(
+        output,
+        crate::preview::regions::mask_reach(mask),
+        width,
+        height,
+    );
+    let mut cropped = mask.clone();
+    for step in &mut cropped.steps {
+        if step.kind == "paint" {
+            step.pixels = crate::preview::regions::crop(&step.pixels, work);
+        }
+    }
+    let image = evaluate(
+        &cropped,
+        (work[2] - work[0]) as u32,
+        (work[3] - work[1]) as u32,
+    )?;
+    let destination = Arc::make_mut(&mut result);
+    if let Some(constant) = destination.constant.take() {
+        destination.words = vec![constant; width as usize * height as usize];
+    }
+    for y in output[1]..output[3] {
+        for x in output[0]..output[2] {
+            destination.words[y as usize * width as usize + x as usize] =
+                image.get(x - work[0], y - work[1]);
+        }
+    }
+    Ok(Some(result))
 }
 impl Gray16 {
     pub fn get(&self, x: i32, y: i32) -> u16 {

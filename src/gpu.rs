@@ -92,17 +92,30 @@ pub fn install(state: &eframe::egui_wgpu::RenderState) -> Result<(), String> {
 
 /// False requests the existing CPU path. Failed compute never modifies pixels.
 pub fn try_apply(image: &mut Image, kind: &str, settings: &Value) -> bool {
+    try_apply_region(
+        image,
+        kind,
+        settings,
+        u64::from(image.width) * u64::from(image.height),
+    )
+}
+/// Keep the full layer's CPU/GPU decision when evaluating a smaller padded window.
+pub(crate) fn try_apply_region(
+    image: &mut Image,
+    kind: &str,
+    settings: &Value,
+    source_pixels: u64,
+) -> bool {
     let Some(backend) = BACKEND.get() else {
         return false;
     };
     // Transfers and dispatch cost more than byte loops on small previews.
-    let pixels = u64::from(image.width) * u64::from(image.height);
     let minimum = if matches!(kind, "blur" | "bloom") {
         128 * 1024
     } else {
         512 * 1024
     };
-    if pixels < minimum || !AUTOMATIC.contains(&kind) {
+    if source_pixels < minimum || !AUTOMATIC.contains(&kind) {
         return false;
     }
     let start = Instant::now();
@@ -126,10 +139,23 @@ pub fn try_apply(image: &mut Image, kind: &str, settings: &Value) -> bool {
 }
 
 pub fn try_apply16(image: &mut crate::depth16::Image16, kind: &str, settings: &Value) -> bool {
+    try_apply16_region(
+        image,
+        kind,
+        settings,
+        u64::from(image.width) * u64::from(image.height),
+    )
+}
+pub(crate) fn try_apply16_region(
+    image: &mut crate::depth16::Image16,
+    kind: &str,
+    settings: &Value,
+    source_pixels: u64,
+) -> bool {
     let Some(backend) = BACKEND.get() else {
         return false;
     };
-    if !NATIVE16.contains(&kind) || u64::from(image.width) * u64::from(image.height) < 128 * 1024 {
+    if !NATIVE16.contains(&kind) || source_pixels < 128 * 1024 {
         return false;
     }
     let start = Instant::now();

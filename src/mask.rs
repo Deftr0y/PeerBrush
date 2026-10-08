@@ -8,11 +8,50 @@ use std::{
 
 pub const CACHE_BUDGET: usize = 128 * 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct GrayMask {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+}
+
+/// Update only affected output samples; include the complete filter support in the input crop.
+pub(crate) fn regional(
+    mask: &Mask,
+    width: u32,
+    height: u32,
+    previous: Option<Arc<GrayMask>>,
+    area: [i32; 4],
+) -> Option<Arc<GrayMask>> {
+    if !mask.needs_cache() {
+        return None;
+    }
+    let output = crate::preview::regions::intersect(area, width, height);
+    let mut result = previous.unwrap_or_else(|| Arc::new(evaluate(mask, width, height)));
+    if output[0] >= output[2] || output[1] >= output[3] {
+        return Some(result);
+    }
+    let reach = crate::preview::regions::mask_reach(mask);
+    let work = crate::preview::regions::window(output, reach, width, height);
+    let mut cropped = mask.clone();
+    for step in &mut cropped.steps {
+        if step.kind == "paint" {
+            step.pixels = crate::preview::regions::crop(&step.pixels, work);
+        }
+    }
+    let image = evaluate(
+        &cropped,
+        (work[2] - work[0]) as u32,
+        (work[3] - work[1]) as u32,
+    );
+    let destination = Arc::make_mut(&mut result);
+    for y in output[1]..output[3] {
+        for x in output[0]..output[2] {
+            destination.pixels[y as usize * width as usize + x as usize] = image.pixels
+                [(y - work[1]) as usize * image.width as usize + (x - work[0]) as usize];
+        }
+    }
+    Some(result)
 }
 impl GrayMask {
     pub fn value(&self, x: i32, y: i32) -> f32 {

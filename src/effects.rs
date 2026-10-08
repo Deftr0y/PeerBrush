@@ -260,7 +260,7 @@ pub fn curve_value64(settings: &Value, v: f64) -> f64 {
     }
     point(points.len() - 1).1
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
@@ -511,6 +511,18 @@ pub fn apply(image: &mut Image, kind: &str, settings: &Value) -> Result<(), Stri
 }
 pub fn apply_cpu(image: &mut Image, kind: &str, settings: &Value) -> Result<(), String> {
     let settings = validated_settings(image, kind, settings)?;
+    apply_cpu_prepared(image, kind, settings)
+}
+pub(crate) fn apply_region(
+    image: &mut Image,
+    kind: &str,
+    settings: &Value,
+    source_pixels: u64,
+) -> Result<(), String> {
+    let settings = validated_settings(image, kind, settings)?;
+    if crate::gpu::try_apply_region(image, kind, &settings, source_pixels) {
+        return Ok(());
+    }
     apply_cpu_prepared(image, kind, settings)
 }
 fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<(), String> {

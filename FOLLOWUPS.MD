@@ -83,13 +83,22 @@ See [development notes](docs/development.md) for the engine and validation workf
 | PB-059 | Editable liquify | Implemented and verified | Shared engine, live rendered previews, reversible edits and UI/MCP/CLI access. |
 
 | PB-060 | Open the Hippo PSD | Implemented and verified | All eleven originals unchanged. Egg has three editable 16-bit layers; other ten open protected with an explicit native-precision editing copy. |
-| PB-061 | Smooth tools on medium/large canvases | In development | Profile actual release builds; reduce preview work, measure timings, and progress toward GPU editing. Portable packaging is not a speed constraint. |
+| PB-061 | Smooth tools on medium/large canvases | In development; effects-aware regional previews verified (PB-075) | Profile actual release builds; reduce preview work, measure timings, and progress toward GPU editing. Portable packaging is not a speed constraint. |
 
 | PB-062 | Preserve 16-bit color through editing and saving | Implemented and verified | Native COW samples, brush/transform/effects/masks/clipboard, PSD16 and PNG16; display/agent previews project only at the boundary. |
 
 ## Next development slices
 
-Extend incremental previews to effects and adjustments, progress tiled GPU compositing, implement folder transforms, and strengthen selective task undo that preserves interleaved human changes. Then develop the following slices in the user's requested priority order:
+The remaining technical slices precede the user's ordered feature list:
+
+| ID | Work | Status | Acceptance |
+| --- | --- | --- | --- |
+| PB-075 | Effects-aware incremental previews | Implemented and verified | Retain gesture-local color/mask results and re-evaluate padded filter windows for color effects, nested folders and clipped adjustments at 8/16 bits. Handle isolated mask edge clamping; reset on layout/settings/revision changes and errors; keep global caches, sources and history unchanged. CPU/GPU padded windows match full renders. Native filtered painting and one-step undo restore exact PNG16 output. |
+| PB-076 | Tiled GPU compositing | Planned | Bounded derived GPU tiles, measured latency, shared CPU equivalence, native precision and reliable CPU fallback; caches remain outside document sources and history. |
+| PB-077 | Folder transforms | Planned | Transform selected roots and descendants with a shared pivot, preserve masks/effects and native precision, actual shared-engine previews, atomic lock/reservation checks and one undo per gesture. |
+| PB-078 | Selective task undo | Planned | Revert agent tasks while preserving interleaved human work, expose precise scope/conflicts and keep subsequent undo/redo coherent through the shared engine. |
+
+Then develop the following slices in the user's requested priority order:
 
 | Priority | ID | Feature | Status | Acceptance |
 | --- | --- | --- | --- | --- |
