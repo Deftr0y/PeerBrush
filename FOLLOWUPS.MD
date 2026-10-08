@@ -2,13 +2,13 @@
 
 This is the living backlog for ideas raised during development. Add new requests here as they arrive, keep the user's intent, and move them to the appropriate milestone. Update status only after implementation and verification.
 
-## First priority — Finish and publish the current checkpoint
+## Completed checkpoint
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
-| PB-074 | Reconcile the shared source, verify and publish the Windows checkpoint | Verification complete; packaging/publication in progress | Preserve concurrent work. Freeze the final source, rerun engine/codec/protocol/UI and actual GPU checks, verify native 16-bit PSD/PNG and undo/reopen, fix README/release links, package matching source plus GPL/dependency notices, commit and push, publish the portable Windows build and return its download link. |
+| PB-074 | Reconcile the shared source, verify and publish the Windows checkpoint | Implemented, verified and published — v0.1.4 | Preserve concurrent work. Freeze the final source, rerun engine/codec/protocol/UI and actual GPU checks, verify native 16-bit PSD/PNG and undo/reopen, fix README/release links, package matching source plus GPL/dependency notices, commit and push, publish the portable Windows build and return its download link. |
 
-The reconciled 0.1.4 checkpoint passed 252 regression tests, three actual-device GPU checks, native painting/MCP/CLI and independent 16-bit PSD/PNG checks, and all eleven Hippo PSD checks with original hashes unchanged. Matching source, licensing and native workspace documentation are prepared for publication. See [checkpoint verification](docs/checkpoint-0.1.4.md). The earlier 0.1.3 candidate remains historical validation documentation.
+The reconciled 0.1.4 checkpoint passed 252 regression tests, three actual-device GPU checks, native painting/MCP/CLI and independent 16-bit PSD/PNG checks, and all eleven Hippo PSD checks with original hashes unchanged. [Windows portable download](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.4/PeerBrush-Windows.zip) and [matching source](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.4/PeerBrush-source.zip) are published from commit `8adadb8`. Archive integrity, committed source, licensing/artwork, binary hashes and the packaged native16 CLI were verified. See [checkpoint verification](docs/checkpoint-0.1.4.md). The earlier 0.1.3 candidate remains historical validation documentation.
 
 See [development notes](docs/development.md) for the engine and validation workflow. The planned effects-stack/weight/icons, Procreate brush library and transform-toolbar requests remain in the backlog.
 
@@ -89,7 +89,7 @@ See [development notes](docs/development.md) for the engine and validation workf
 
 ## Next development slices
 
-Finish the current checkpoint verification, extend incremental previews to effects and adjustments, progress tiled GPU compositing, implement folder transforms, and strengthen selective task undo that preserves interleaved human changes. Then develop the following slices in the user's requested priority order:
+Extend incremental previews to effects and adjustments, progress tiled GPU compositing, implement folder transforms, and strengthen selective task undo that preserves interleaved human changes. Then develop the following slices in the user's requested priority order:
 
 | Priority | ID | Feature | Status | Acceptance |
 | --- | --- | --- | --- | --- |
