@@ -62,6 +62,84 @@ struct Canvas {
     connection: server::Connection,
     dir: PathBuf,
 }
+
+#[test]
+fn modern_proposal_feedback_is_explicit_and_acceptance_is_atomic() {
+    let canvas = Canvas::new();
+    let (document, layer) = {
+        let mut e = canvas.shared.lock().unwrap();
+        e.doc = peerbrush::engine::Document::new_depth(16, 16, 16).unwrap();
+        (e.doc.id.clone(), e.doc.layers[0].id.clone())
+    };
+    let call = |name: &str, arguments: Value| -> Value {
+        let q = modern_request(
+            json!(name),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        );
+        response(canvas.modern(&q).send_json(q.clone()))
+            .into_json()
+            .unwrap()
+    };
+    let reply = call(
+        "peerbrush_proposal",
+        json!({"action":"create","actor":"draft-agent","document_id":document,"expected_revision":0,"commands":[{"op":"paint.fill","layer":layer,"rect":[2,3,6,7],"color":[230,40,80,255]}]}),
+    );
+    assert_eq!(reply["result"]["isError"], false);
+    let content = reply["result"]["content"].as_array().unwrap();
+    let metadata: Value = serde_json::from_str(
+        content.iter().find(|v| v["type"] == "text").unwrap()["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let id = metadata["proposal"]["id"].as_str().unwrap();
+    assert_eq!(metadata["views"][0]["preview_only"], true);
+    assert_eq!(metadata["views"][0]["document_rect"], json!([0, 0, 16, 16]));
+    let png = STANDARD
+        .decode(
+            content.iter().find(|v| v["type"] == "image").unwrap()["data"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        image::load_from_memory(&png)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(3, 4)
+            .0,
+        [230, 40, 80, 255]
+    );
+    {
+        let e = canvas.shared.lock().unwrap();
+        assert_eq!(e.doc.layers[0].pixels.get16(3, 4), [0; 4]);
+        assert_eq!(e.doc.revision, 0);
+        assert!(e.undo.is_empty());
+    }
+    let refused = call(
+        "peerbrush_proposal",
+        json!({"action":"accept","actor":"draft-agent","proposal":id,"document_id":document,"expected_revision":0}),
+    );
+    assert_eq!(refused["result"]["isError"], true);
+    let accepted = call(
+        "peerbrush_proposal",
+        json!({"action":"accept","actor":"human","proposal":id,"document_id":document,"expected_revision":0,"feedback":"request"}),
+    );
+    assert_eq!(accepted["result"]["isError"], false);
+    let mut e = canvas.shared.lock().unwrap();
+    assert_eq!(e.doc.revision, 1);
+    assert_eq!(e.undo.len(), 1);
+    assert_eq!(
+        e.doc.layers[0].pixels.get16(3, 4),
+        [230 * 257, 40 * 257, 80 * 257, 65535]
+    );
+    e.undo("human").unwrap();
+    assert_eq!(e.doc.layers[0].pixels.get16(3, 4), [0; 4]);
+    drop(e);
+    let recovery = call("peerbrush_task", json!({"action":"recovery"}));
+    assert_eq!(recovery["result"]["isError"], false);
+}
 impl Canvas {
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!("peerbrush-http-{}", uuid::Uuid::new_v4()));

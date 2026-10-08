@@ -205,6 +205,10 @@ pub struct PeerBrush {
     geometry: Option<geometry::Editor>,
     source_editor: Option<source::Editor>,
     task_undo_review: Option<Value>,
+    proposal_review: Option<String>,
+    proposal_original: bool,
+    proposal_error: Option<String>,
+    proposal_rendered: Option<String>,
     refinement: Option<refinement::Editor>,
     retouch_source: Option<retouch::Anchor>,
     retouch_aligned: bool,
@@ -452,6 +456,10 @@ impl PeerBrush {
             geometry: None,
             source_editor: None,
             task_undo_review: None,
+            proposal_review: None,
+            proposal_original: false,
+            proposal_error: None,
+            proposal_rendered: None,
             refinement: None,
             retouch_source: None,
             retouch_aligned: true,
@@ -555,6 +563,7 @@ impl PeerBrush {
         }
     }
     fn edit(&mut self, commands: Vec<Value>, label: &str) {
+        self.close_proposal();
         let result = self
             .shared
             .lock()
@@ -1029,6 +1038,9 @@ impl PeerBrush {
             "Liquify: paint on the canvas · Choose Push, Expand, Pinch or Restore above".into();
     }
     fn preview_variant(&self) -> String {
+        if let Some(id) = &self.proposal_review {
+            return format!("proposal:{id}:{}", self.proposal_original);
+        }
         let target = if self.isolate {
             self.selected.as_str()
         } else {
@@ -1075,6 +1087,9 @@ impl PeerBrush {
         )
     }
     fn live_key(&self) -> String {
+        if let Some(id) = &self.proposal_review {
+            return format!("proposal:{id}:{}", self.proposal_original);
+        }
         if let Some(editor) = &self.refinement {
             return format!(
                 "refinement:{}:{}:{}",
@@ -1174,6 +1189,8 @@ impl PeerBrush {
             self.cancel_refinement();
         }
         let doc = &current;
+        let proposal_doc = self.review_document(&current);
+        let preview_mask = self.mask && self.isolate && self.proposal_review.is_none();
         let time = ctx.input(|i| i.time);
         let edge = self
             .view_rect
@@ -1200,7 +1217,7 @@ impl PeerBrush {
             if p.doc_id == doc.id
                 && p.revision == doc.revision
                 && (p.target == variant || (!live.is_empty() && p.live == live))
-                && p.mask == (self.mask && self.isolate)
+                && p.mask == preview_mask
                 && (self.source_editor.is_none() || p.live == live)
             {
                 if let Some(editor) = &mut self.geometry {
@@ -1208,6 +1225,12 @@ impl PeerBrush {
                 }
                 if let Some(editor) = &mut self.source_editor {
                     editor.error = p.error.clone();
+                }
+                if self.proposal_review.is_some() {
+                    self.proposal_error = p.error.clone();
+                    if p.error.is_none() && !p.bytes.is_empty() {
+                        self.proposal_rendered = Some(p.live.clone());
+                    }
                 }
                 if !p.bytes.is_empty() {
                     self.canvas_selection = Some(CanvasSelection {
@@ -1237,16 +1260,12 @@ impl PeerBrush {
         if self.animation.fading() || self.animation.progress(time) < 1.0 {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
-        let key = (
-            doc.id.clone(),
-            doc.revision,
-            variant.clone(),
-            self.mask && self.isolate,
-        );
+        let key = (doc.id.clone(), doc.revision, variant.clone(), preview_mask);
         if !self.pending && self.last_preview.as_ref() != Some(&key) {
             self.pending = true;
             self.last_preview = Some(key);
-            let mut doc = self.animation.document(doc, time, true);
+            let mut doc = proposal_doc.unwrap_or_else(|| self.animation.document(doc, time, true));
+            doc.revision = current.revision;
             let mut commands = self.transient.clone();
             if let Some((layer, blend)) = &self.blend_hover {
                 commands.push(json!({"op":"layer.update","layer":layer,"blend":blend}));
@@ -1276,6 +1295,9 @@ impl PeerBrush {
             if self.tool == Tool::Liquify && !self.points.is_empty() {
                 commands.push(self.liquify_command(&self.points));
             }
+            if self.proposal_review.is_some() {
+                commands.clear();
+            }
             let dirty = if !live.is_empty()
                 && commands.len() == 1
                 && matches!(commands[0]["op"].as_str(), Some("paint" | "smudge"))
@@ -1292,12 +1314,12 @@ impl PeerBrush {
             let cache = self.preview_cache.clone();
             let tx = self.preview_tx.clone();
             let ctx = ctx.clone();
-            let layer = if self.isolate {
+            let layer = if self.isolate && self.proposal_review.is_none() {
                 Some(self.selected.clone())
             } else {
                 None
             };
-            let mask = self.mask && self.isolate;
+            let mask = self.mask && self.isolate && self.proposal_review.is_none();
             let refinement = self
                 .refinement
                 .as_ref()
@@ -2210,7 +2232,10 @@ impl PeerBrush {
                 );
             }
         }
-        if let Some(texture) = &self.texture {
+        if let Some(texture) = self.texture.as_ref().filter(|_| {
+            self.proposal_review.is_none()
+                || self.proposal_rendered.as_deref() == Some(self.live_key().as_str())
+        }) {
             painter.image(
                 texture.id(),
                 rect,
@@ -2224,6 +2249,25 @@ impl PeerBrush {
             Stroke::new(1.0_f32, Color32::from_rgb(90, 84, 93)),
             egui::StrokeKind::Outside,
         );
+        if self.proposal_review.is_some() {
+            painter.text(
+                rect.left_top() + Vec2::new(8., 8.),
+                egui::Align2::LEFT_TOP,
+                if self.proposal_original {
+                    "Original · AI proposal review"
+                } else {
+                    "AI proposal · preview only"
+                },
+                egui::FontId::proportional(12.),
+                AI_BLUE,
+            );
+            if response.clicked() || response.drag_started() {
+                self.close_proposal();
+                self.message = "Proposal preview closed · current work preserved".into();
+                ui.ctx().request_repaint();
+            }
+            return;
+        }
         if self.geometry.is_some() || self.source_editor.is_some() {
             return;
         }
@@ -3280,8 +3324,7 @@ impl PeerBrush {
                             {
                                 {
                                     let mut e = self.shared.lock().unwrap();
-                                    e.leases.clear();
-                                    e.activity.clear();
+                                    e.take_over_tasks();
                                 }
                                 self.message = "AI reservations released".into();
                             }
@@ -3430,7 +3473,8 @@ impl PeerBrush {
                     .inner_margin(8),
             )
             .show(ctx, |ui| {
-                self.canvas(ui, &doc);
+                let display = self.review_document(&doc);
+                self.canvas(ui, display.as_ref().unwrap_or(&doc));
             });
 
         self.request_preview(ctx, &doc);
@@ -3488,6 +3532,7 @@ impl PeerBrush {
         }
         self.color_window(ctx);
         self.task_history_review(ctx, &doc);
+        self.proposal_window(ctx, &doc);
         self.refinement_window(ctx, &doc);
         self.geometry_window(ctx, &doc);
         self.source_window(ctx, &doc);
@@ -3645,6 +3690,36 @@ mod tests {
     use super::*;
     use crate::engine::Engine;
     use std::sync::{Arc, Mutex};
+    #[test]
+    fn stale_proposal_clears_reviewed_pixels_before_current_project_preview() {
+        let (mut app, ctx) = small_fixture();
+        let source = app.shared.lock().unwrap().doc.clone();
+        let proposal = crate::collaboration::propose(&app.shared, "draft-agent", &json!({"document_id":source.id,"expected_revision":source.revision,"commands":[{"op":"paint.fill","layer":app.selected,"rect":[0,0,4,4],"color":[0,80,255,255]}]})).unwrap();
+        app.proposal_review = Some(proposal["id"].as_str().unwrap().into());
+        app.proposal_rendered = Some(app.live_key());
+        app.set_canvas(&ctx, 1, 1, vec![0, 80, 255, 255]);
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":app.selected,"name":"Human change"})],
+                None,
+                None,
+                "Rename",
+            )
+            .unwrap();
+        app.pending = true; // No new worker can replace the image during this assertion.
+        app.request_preview(&ctx, &source);
+        assert!(app.proposal_original);
+        assert!(app.proposal_rendered.is_none());
+        assert!(app.canvas_pixels.is_none());
+        assert!(app.texture.is_none());
+        assert!(app.proposal_error.as_deref().unwrap().contains("changed"));
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        app.close_proposal();
+        assert!(app.proposal_review.is_none());
+    }
     fn frame(
         app: &mut PeerBrush,
         ctx: &egui::Context,

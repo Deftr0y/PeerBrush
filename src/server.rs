@@ -248,7 +248,8 @@ pub fn tools() -> Value {
     json!([
         {"name":"peerbrush_observe","description":"Inspect live document structure and actual PNG image content. Coordinates are document pixels, origin top left. Request layer/mask/rect views, max_edge and since_revision to reduce image traffic.","inputSchema":{"type":"object","properties":{"layer":{"type":"string"},"mask":{"type":"boolean"},"selection_view":{"type":"string","enum":["cutout","mask","overlay"]},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"since_revision":{"type":"integer"},"image":{"type":"boolean"}},"additionalProperties":false}},
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
-        {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
+        {"name":"peerbrush_proposal","description":"Create and render frozen proposed edits for explicit human review. create needs observed document_id/expected_revision and ordinary engine commands; the shared project and history stay unchanged. preview returns actual PNG pixels with document coordinates. Only actor human can accept; agents can list, preview or reject their proposals. A changed project or ended/expired/taken-over task invalidates its draft. Never silently reacquire a task. Direct edits remain available when already authorized.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","preview","accept","reject"]},"actor":{"type":"string"},"proposal":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"task":{"type":"string"},"label":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"feedback":{"type":"string","enum":["batch","request"]}},"required":["action"],"additionalProperties":false}},
+        {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status","recovery"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
         {"name":"peerbrush_document","description":"New/open/save PSD or export PNG. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","export","compatible_copy"]},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply an absolute local PNG/JPEG path or base64 PNG, and exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
@@ -322,6 +323,74 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             Ok(json!({"focused":true}))
         }
         "observe" => observation(shared, p),
+        "proposal" => {
+            let action = p["action"].as_str().ok_or("Missing proposal action")?;
+            if action == "list" {
+                let mut e = shared.lock().unwrap();
+                return Ok(json!({"proposals":e.proposals_state(),"tasks":e.task_recovery()}));
+            }
+            let id = if action == "create" {
+                crate::collaboration::propose(shared, actor, p)?["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            } else {
+                p["proposal"]
+                    .as_str()
+                    .ok_or("Missing proposal ID")?
+                    .to_owned()
+            };
+            if action == "reject" {
+                return shared.lock().unwrap().reject_proposal(actor, &id);
+            }
+            if action == "accept" {
+                let result = shared.lock().unwrap().accept_proposal(
+                    actor,
+                    &id,
+                    p["document_id"]
+                        .as_str()
+                        .ok_or("Acceptance needs the reviewed document_id")?,
+                    p["expected_revision"]
+                        .as_u64()
+                        .ok_or("Acceptance needs the reviewed expected_revision")?,
+                )?;
+                let mut result = result;
+                if p["feedback"] != "request" {
+                    result["images"] = observation(shared, p)?["images"].clone();
+                }
+                return Ok(result);
+            }
+            if !["create", "preview"].contains(&action) {
+                return Err("Unknown proposal action".into());
+            }
+            let (doc, proposal) = {
+                let mut e = shared.lock().unwrap();
+                let doc = e.proposal_document(&id)?;
+                let proposal = e
+                    .proposals_state()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|p| p["id"] == id)
+                    .unwrap()
+                    .clone();
+                (doc, proposal)
+            };
+            let mut result = json!({"proposal":proposal,"images":[]});
+            if action == "preview" || p["feedback"] != "request" {
+                let (w, h, rgba, rect) = doc.preview(
+                    p["rect"].as_array().and_then(|_| engine::rect(&p["rect"])),
+                    p["max_edge"].as_u64().unwrap_or(768).clamp(32, 4096) as u32,
+                    None,
+                    false,
+                )?;
+                result["images"] = json!([{"mime_type":"image/png","data":STANDARD.encode(raster::png(w,h,&rgba)?),"width":w,"height":h,"document_rect":rect,"revision":proposal["source_revision"],"proposal":id,"preview_only":true}]);
+            }
+            // Rendering runs without the shared lock. Report interruption rather than a
+            // ready proposal if human input changed its source while pixels were sampled.
+            shared.lock().unwrap().proposal_document(&id)?;
+            Ok(result)
+        }
         "client_state" => {
             let client = p
                 .get("client")
@@ -464,10 +533,8 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                     if !e.leases.iter().any(|l| l.id == task && l.owner == actor) {
                         return Err("Task not owned or already released".into());
                     }
-                    e.leases.retain(|l| l.id != task);
-                    if e.leases.is_empty() {
-                        e.activity.clear();
-                    }
+                    e.finish_task(task, "ended");
+                    e.expire_proposals();
                     Ok(json!({"released":task}))
                 }
                 "update" => {
@@ -494,6 +561,7 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                     Ok(json!(e.leases[pos]))
                 }
                 "status" => Ok(json!(e.leases)),
+                "recovery" => Ok(e.task_recovery()),
                 _ => Err("Unknown task action".into()),
             }
         }
@@ -686,6 +754,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
                 "capabilities",
                 "observe",
                 "edit",
+                "proposal",
                 "place_image",
                 "segment",
                 "task",
@@ -702,6 +771,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
                     e.activity = match method {
                         "observe" => "Looking at the canvas",
                         "edit" => "Updating the shared canvas",
+                        "proposal" => "Reviewing proposed canvas changes",
                         "place_image" => "Placing image pixels",
                         "segment" => "Selecting the subject",
                         "document" => "Working with your document",

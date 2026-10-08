@@ -386,6 +386,8 @@ pub struct Engine {
     ai_serial: u64,
     pub focus_requested: bool,
     pub loading: Option<crate::loading::Control>,
+    pub(crate) proposals: Vec<crate::collaboration::Proposal>,
+    pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
 }
 fn num(v: &Value, key: &str, default: f64) -> f64 {
     v.get(key).and_then(Value::as_f64).unwrap_or(default)
@@ -457,11 +459,22 @@ impl Engine {
             ai_serial: 0,
             focus_requested: false,
             loading: None,
+            proposals: vec![],
+            recent_tasks: vec![],
         }
     }
     pub fn expire(&mut self) {
-        self.leases.retain(|l| l.expires > now());
+        let expired: Vec<_> = self
+            .leases
+            .iter()
+            .filter(|l| l.expires <= now())
+            .map(|l| l.id.clone())
+            .collect();
+        for task in expired {
+            self.finish_task(&task, "expired");
+        }
         self.mcp_clients.retain(|_, expiry| *expiry > now());
+        self.expire_proposals();
     }
     pub(crate) fn mark_ai(&mut self, actor: &str, label: &str, tool: &str, scopes: Vec<Scope>) {
         if actor == "human" {
@@ -478,6 +491,12 @@ impl Engine {
         });
     }
     pub fn state(&mut self) -> Value {
+        let mut result = self.state_core();
+        result["proposals"] = json!(self.proposals.iter().map(|p| p.state()).collect::<Vec<_>>());
+        result["task_recovery"] = self.task_recovery();
+        result
+    }
+    fn state_core(&mut self) -> Value {
         self.expire();
         json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
@@ -822,7 +841,9 @@ impl Engine {
         label: &str,
         gesture: Option<&str>,
     ) -> Result<Value, String> {
-        self.edit_transaction(actor, commands, expected, task, label, gesture, None, None)
+        self.edit_transaction(
+            actor, commands, expected, task, label, gesture, None, None, None,
+        )
     }
     pub(crate) fn edit_prepared_merge(
         &mut self,
@@ -840,6 +861,7 @@ impl Engine {
             "Merge layers",
             None,
             Some(prepared),
+            None,
             None,
         )
     }
@@ -861,6 +883,30 @@ impl Engine {
             None,
             None,
             Some(snapshot.clone()),
+            None,
+        )
+    }
+    pub(crate) fn commit_proposal(
+        &mut self,
+        proposal: &crate::collaboration::Proposal,
+    ) -> Result<Value, String> {
+        let doc = proposal
+            .draft
+            .clone()
+            .ok_or("This proposal is no longer available")?;
+        if proposal.document != self.doc.id || proposal.revision != self.doc.revision {
+            return Err("Proposal source changed; request a fresh proposal".into());
+        }
+        self.edit_transaction(
+            &proposal.actor,
+            &proposal.commands,
+            Some(proposal.revision),
+            proposal.task.as_deref(),
+            &proposal.label,
+            None,
+            None,
+            None,
+            Some(doc),
         )
     }
     fn edit_transaction(
@@ -873,6 +919,7 @@ impl Engine {
         gesture: Option<&str>,
         mut prepared: Option<crate::merge::Prepared>,
         mut clipboard: Option<crate::layer_clipboard::Layers>,
+        prepared_doc: Option<Document>,
     ) -> Result<Value, String> {
         if self.doc.read_only {
             return Err("This PSD is read-only. Create a compatible copy first.".into());
@@ -923,22 +970,39 @@ impl Engine {
             Vec<String>,
             Option<crate::selection::Coverage>,
         )> = None;
-        for c in commands {
-            if matches!(c["op"].as_str(), Some("move" | "transform"))
-                && c["selection_only"] != false
-            {
-                let mut signature = c.clone();
-                if let Some(object) = signature.as_object_mut() {
-                    object.remove("layer");
-                }
-                let target = c["layer"].as_str().unwrap_or("").to_owned();
-                if let Some((previous, bounds, polygon, targets, coverage)) = &mut selection_gesture
+        if let Some(mut doc) = prepared_doc {
+            if doc.id != before.id || doc.revision != before.revision + 1 {
+                return Err("Proposal source changed; request a fresh proposal".into());
+            }
+            doc.name = self.doc.name.clone();
+            self.doc = doc;
+        } else {
+            for c in commands {
+                if matches!(c["op"].as_str(), Some("move" | "transform"))
+                    && c["selection_only"] != false
                 {
-                    if *previous == signature && !targets.contains(&target) {
-                        self.doc.selection = *bounds;
-                        self.doc.selection_polygon = polygon.clone();
-                        self.doc.selection_coverage = coverage.clone();
-                        targets.push(target);
+                    let mut signature = c.clone();
+                    if let Some(object) = signature.as_object_mut() {
+                        object.remove("layer");
+                    }
+                    let target = c["layer"].as_str().unwrap_or("").to_owned();
+                    if let Some((previous, bounds, polygon, targets, coverage)) =
+                        &mut selection_gesture
+                    {
+                        if *previous == signature && !targets.contains(&target) {
+                            self.doc.selection = *bounds;
+                            self.doc.selection_polygon = polygon.clone();
+                            self.doc.selection_coverage = coverage.clone();
+                            targets.push(target);
+                        } else {
+                            selection_gesture = Some((
+                                signature,
+                                self.doc.selection,
+                                self.doc.selection_polygon.clone(),
+                                vec![target],
+                                self.doc.selection_coverage.clone(),
+                            ));
+                        }
                     } else {
                         selection_gesture = Some((
                             signature,
@@ -949,38 +1013,34 @@ impl Engine {
                         ));
                     }
                 } else {
-                    selection_gesture = Some((
-                        signature,
-                        self.doc.selection,
-                        self.doc.selection_polygon.clone(),
-                        vec![target],
-                        self.doc.selection_coverage.clone(),
-                    ));
+                    selection_gesture = None;
                 }
-            } else {
-                selection_gesture = None;
-            }
-            let applied = if c["op"] == "layer.paste" {
-                if let Some(snapshot) = clipboard.take() {
-                    crate::layer_clipboard::paste(&mut self.doc, &snapshot, text(c, "layer", ""))
+                let applied = if c["op"] == "layer.paste" {
+                    if let Some(snapshot) = clipboard.take() {
+                        crate::layer_clipboard::paste(
+                            &mut self.doc,
+                            &snapshot,
+                            text(c, "layer", ""),
+                        )
                         .map(|roots| {
                             pasted_roots = Some(roots);
                         })
-                } else {
-                    Err("Use the typed layer clipboard to paste layers".into())
-                }
-            } else if c["op"] == "layer.merge" {
-                if let Some(prepared) = prepared.take() {
-                    prepared.apply(&mut self.doc)
+                    } else {
+                        Err("Use the typed layer clipboard to paste layers".into())
+                    }
+                } else if c["op"] == "layer.merge" {
+                    if let Some(prepared) = prepared.take() {
+                        prepared.apply(&mut self.doc)
+                    } else {
+                        self.apply(c)
+                    }
                 } else {
                     self.apply(c)
+                };
+                if let Err(err) = applied {
+                    self.doc = before;
+                    return Err(err);
                 }
-            } else {
-                self.apply(c)
-            };
-            if let Err(err) = applied {
-                self.doc = before;
-                return Err(err);
             }
         }
         self.doc.ensure_depth();
@@ -2230,6 +2290,8 @@ impl Engine {
         self.changes.clear();
         self.truncated_tasks.clear();
         self.ai_change = None;
+        self.proposals.clear();
+        self.recent_tasks.clear();
         Ok(())
     }
 }

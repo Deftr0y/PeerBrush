@@ -20,7 +20,7 @@ args = ["mcp"]
 
 Codex shares MCP configuration across desktop, CLI and IDE. Restart Codex or start a fresh session after registering to load the tools. [Official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
-Tools: `peerbrush_observe`, `peerbrush_edit`, `peerbrush_task`, `peerbrush_document`, `peerbrush_history`, and `peerbrush_capabilities`, and `peerbrush_place_image`.
+Tools: `peerbrush_observe`, `peerbrush_edit`, `peerbrush_proposal`, `peerbrush_task`, `peerbrush_document`, `peerbrush_history`, `peerbrush_capabilities`, `peerbrush_place_image`, and `peerbrush_segment`.
 
 Observe before editing. Use layer IDs, document pixel coordinates, and `expected_revision`. The upper-left pixel is (0,0). Rectangles are `[left, top, right, bottom]`, with right and bottom excluded.
 
@@ -76,6 +76,20 @@ The task inverse commits as one new history step. Undoing that compensation rest
 Undo and redo return PNG feedback by default; use `feedback:"request"` to suppress it. Ordinary edit batches group into one history entry. A new edit after undo clears redo history.
 
 Stdio client presence uses a heartbeat and disconnects at EOF. Abruptly killed adapters and idle direct HTTP clients expire. The green indicator means client presence, not merely that the local server is listening.
+
+## Optional proposed edits
+
+Direct edits remain available. To offer a result for human review, call `peerbrush_proposal` with `action:"create"`, the observed `document_id`, exact `expected_revision`, `actor`, optional `task`/`label`, and an ordinary `commands` batch. The engine prepares a frozen native-depth draft without changing project pixels, revision, dirty state or history. Default feedback includes actual image content with `document_rect`, `proposal` and `preview_only:true`; `feedback:"request"` suppresses the image. `action:"preview"` with the returned proposal ID always returns draft image content. CLI uses the same actions and writes its PNG feedback to the isolated workspace.
+
+```json
+{"action":"create","actor":"my-agent","document_id":"DOCUMENT_ID","expected_revision":7,"label":"Softer background","commands":[{"op":"layer.update","layer":"LAYER_ID","opacity":0.7}]}
+```
+
+The native **AI tasks** menu opens a blue review with scopes and Original/Proposed result views. Accept becomes available after the proposed canvas renders. Acceptance requires `actor:"human"`, the reviewed `document_id` and exact `expected_revision`; it commits the frozen result as one AI-authored undoable edit. Local clients supply actor strings as in existing edit/history calls; this is a cooperative workspace convention, not authentication of human identity. Reject releases the draft without an edit. Close/Escape returns to the current project and leaves the proposal pending. Human canvas input closes review before editing.
+
+Any project edit makes pending drafts stale, even if unrelated. New/open clears them. Expiry, task end and takeover release draft pixels; acceptance rechecks current reservations. An external image file changing after preparation cannot change the reviewed result. Task-bound proposals require the task to stay active during review; a finished reservation is never silently restarted. Up to four proposals share COW sources with a 256 MiB additional unique native-tile budget; each batch is bounded to 100 commands/8 MiB, expires after 15 minutes, and retains only bounded transient metadata afterward. Drafts and task-recovery records are absent from PSD sources and autosave.
+
+`peerbrush_task` action `recovery` reports active scopes and the latest 100 ended, expired or taken-over tasks. The menu shows recent interruptions and existing task undo. Already committed AI edits and human work remain; choose an explicit selective task compensation when needed. See [collaboration behavior](collaboration.md).
 
 ## Generated and edited image placement
 

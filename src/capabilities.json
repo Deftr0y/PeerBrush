@@ -1,6 +1,13 @@
 {
   "version": "build",
   "coordinates": "Document pixels. rect=[left,top,right,bottom], right/bottom exclusive.",
+  "ai_proposals": {
+    "tool": "peerbrush_proposal",
+    "actions": ["create", "list", "preview", "accept", "reject"],
+    "behavior": "Optional frozen native-depth drafts. Direct peerbrush_edit remains available. Create requires document_id and expected_revision. Preview returns actual PNG content, document_rect and preview_only:true. Human acceptance commits the reviewed result as one AI-authored history step; changed sources, reservations and ended tasks reject acceptance.",
+    "limits": "Four pending drafts, 256 MiB additional unique native raster tiles, 100 commands/8 MiB per draft, 15-minute expiry, 16 transient metadata records. No proposals are saved in PSD or recovery files. Task-bound drafts require their reservation to remain active.",
+    "task_recovery": "peerbrush_task action recovery returns active tasks and up to 100 recent ended/expired/taken-over task records with scopes. Committed edits remain; no automatic rollback or reservation restart. Use selective task undo for an explicit compensation."
+  },
   "selective_task_undo": {
     "tool": "peerbrush_history",
     "inspect": {
