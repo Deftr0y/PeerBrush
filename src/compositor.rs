@@ -12,7 +12,11 @@ type Colors = [Option<Arc<Image>>];
 fn raw(doc: &Document, i: usize, x: i32, y: i32, masks: &Masks, colors: &Colors) -> Pixel {
     let l = &doc.layers[i];
     if let Some(image) = &colors[i] {
-        return image.get(x - l.x, y - l.y);
+        return if ["group", "adjustment"].contains(&l.kind.as_str()) {
+            image.get(x, y)
+        } else {
+            image.get(x - l.x, y - l.y)
+        };
     }
     match l.kind.as_str() {
         "group" => sample_group(doc, Some(&l.id), x, y, masks, colors),
@@ -279,7 +283,7 @@ impl<'a> Plan<'a> {
             }
             let layer = &doc.layers[index];
             let bounds = if let Some(image) = &colors[index] {
-                let [x, y] = if matches!(kinds[index], Kind::Adjustment) {
+                let [x, y] = if matches!(kinds[index], Kind::Adjustment | Kind::Group(_)) {
                     [0, 0]
                 } else {
                     [layer.x, layer.y]
@@ -406,7 +410,11 @@ impl<'a> Plan<'a> {
             return [0; 4];
         }
         if let Some(image) = &self.colors[i] {
-            return image.get(lx, ly);
+            return if matches!(self.kinds[i], Kind::Group(_) | Kind::Adjustment) {
+                image.get(x, y)
+            } else {
+                image.get(lx, ly)
+            };
         }
         match self.kinds[i] {
             Kind::Group(group) => self.sample(group, x, y),

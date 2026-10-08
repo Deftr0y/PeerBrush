@@ -567,8 +567,6 @@
     "color management",
     "subject/object segmentation",
     "heal/clone",
-    "freehand/lasso selection tools",
-    "tiled GPU compositor",
     "disk eviction",
     "selective task undo",
     "broader Photoshop clipping/pass-through group compatibility"
@@ -628,6 +626,7 @@
     "native_pressure": "Used when the platform supplies Touch.force; taper also works with ordinary mouse input."
   },
   "adjustments": "One target paint layer gets a clipped adjustment; a folder gets an adjustment inside it; multiple selected roots get a scoped folder. Clip base and followers stay together; copy/delete/reorder refuse incomplete clipping units.",
+  "folder_transforms": "move/transform on a folder in Color mode changes all descendants, including hidden children, around one document-space pivot. Omit pivot to use descendant bounds; selection_only:false explicitly transforms the whole folder with an active selection. Masks keep their editable native frame, group/adjustment effects sample document coordinates, and locked/reserved descendants reject the entire batch. UI selected roots exclude selected descendants and commit one gesture. Folder mask-only and selected-pixel transforms require selecting a child instead.",
   "psd_sources": "Private format 5 retains native 16-bit samples and editable PeerBrush sources; older 8-bit formats remain readable. Standard PSD raster appearance is baked for other editors. Unsupported Photoshop structure opens protected at its original precision; compatible_copy explicitly creates a flattened editable copy at the same bit depth without touching the source.",
   "color_depth": {
     "supported": [

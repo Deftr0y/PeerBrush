@@ -262,6 +262,9 @@ impl Raster {
     }
     /// Bilinear premultiplied resampling keeps source precision until final storage.
     pub fn sample16(&self, x: f32, y: f32) -> Pixel16 {
+        if x.fract() == 0.0 && y.fract() == 0.0 {
+            return self.get16(x as i32, y as i32);
+        }
         let ix = x.floor() as i32;
         let iy = y.floor() as i32;
         let fx = (x - x.floor()) as f64;
@@ -460,6 +463,9 @@ impl Raster {
     }
     /// Interpolate premultiplied color to keep transparent edges clean.
     pub fn sample(&self, x: f32, y: f32) -> Pixel {
+        if x.fract() == 0.0 && y.fract() == 0.0 {
+            return self.get(x as i32, y as i32);
+        }
         let ix = x.floor() as i32;
         let iy = y.floor() as i32;
         let (fx, fy) = (x - x.floor(), y - y.floor());
@@ -488,6 +494,13 @@ impl Raster {
         ]
     }
     pub fn content_bounds(&self) -> Option<[i32; 4]> {
+        self.data_bounds(false)
+    }
+    /// Editable support includes hidden RGB; a whole-source transform must not crop it away.
+    pub fn source_bounds(&self) -> Option<[i32; 4]> {
+        self.data_bounds(true)
+    }
+    fn data_bounds(&self, hidden: bool) -> Option<[i32; 4]> {
         if self.is16() {
             let mut bounds = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
             for (&(tx, ty), tile) in &self.samples16 {
@@ -495,7 +508,7 @@ impl Raster {
                     continue;
                 }
                 for (i, p) in tile.chunks_exact(4).enumerate() {
-                    if p[3] == 0 {
+                    if p[3] == 0 && (!hidden || p[..3].iter().all(|v| *v == 0)) {
                         continue;
                     }
                     let x = tx * TILE + i as u32 % TILE;
@@ -519,7 +532,7 @@ impl Raster {
                 continue;
             }
             for (i, p) in tile.chunks_exact(4).enumerate() {
-                if p[3] == 0 {
+                if p[3] == 0 && (!hidden || p[..3].iter().all(|v| *v == 0)) {
                     continue;
                 }
                 let x = tx * TILE + i as u32 % TILE;

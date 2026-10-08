@@ -1,6 +1,6 @@
 use crate::{
-    engine::Layer,
-    raster::{blend, check_size, Raster},
+    engine::{Document, Layer},
+    raster::{blend, check_size, Pixel, Raster},
 };
 use serde_json::Value;
 pub(crate) fn copy_shift(source: &Raster, w: u32, h: u32, dx: i32, dy: i32) -> Raster {
@@ -317,7 +317,9 @@ pub(crate) fn resample(
                     for x in 0..crate::raster::TILE.min(w - tx * crate::raster::TILE) {
                         let [u, v] =
                             map(tx * crate::raster::TILE + x, ty * crate::raster::TILE + y);
-                        let p = if let Some(color) = fill {
+                        let p = if fill.is_none() && u.fract() == 0.0 && v.fract() == 0.0 {
+                            source.get16(u as i32, v as i32)
+                        } else if let Some(color) = fill {
                             sample_fill16(source, u, v, color)
                         } else if let Some(words) = &dense {
                             sample_words16(words, source.width, source.height, u, v)
@@ -365,7 +367,9 @@ pub(crate) fn resample(
             for y in 0..TILE.min(h - ty * TILE) {
                 for x in 0..TILE.min(w - tx * TILE) {
                     let [ux, uy] = map(tx * TILE + x, ty * TILE + y);
-                    let p = if let Some(color) = fill {
+                    let p = if fill.is_none() && ux.fract() == 0.0 && uy.fract() == 0.0 {
+                        get(ux as i32, uy as i32)
+                    } else if let Some(color) = fill {
                         if ux >= -0.5
                             && uy >= -0.5
                             && ux < source.width as f32 - 0.5
@@ -525,4 +529,217 @@ fn sample_words16(words: &[u16], w: u32, h: u32, x: f32, y: f32) -> [u16; 4] {
             (sum[3] * 65535.0).round().clamp(0.0, 65535.0) as u16,
         ]
     }
+}
+
+/// The shared whole-layer affine operation, including native mask sources.
+pub(crate) fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    let n = |key: &str, default: f64| c[key].as_f64().unwrap_or(default);
+    if c["op"] == "move" {
+        let nx = layer.x as f64 + n("dx", 0.0);
+        let ny = layer.y as f64 + n("dy", 0.0);
+        if !nx.is_finite() || !ny.is_finite() || nx.abs() > 100000.0 || ny.abs() > 100000.0 {
+            return Err("Move is outside the initial coordinate limits".into());
+        }
+        layer.x = nx.round() as i32;
+        layer.y = ny.round() as i32;
+        if layer.kind == "adjustment" && layer.mask.is_none() {
+            layer.x = 0;
+            layer.y = 0;
+        }
+        return Ok(());
+    }
+    let angle = n("angle", 0.0) as f32;
+    let sx = n("scale_x", 1.0) as f32;
+    let sy = n("scale_y", 1.0) as f32;
+    if !angle.is_finite() || !(0.05..=20.0).contains(&sx) || !(0.05..=20.0).contains(&sy) {
+        return Err("Transform scale must be 0.05–20 and rotation must be finite".into());
+    }
+    let pivot = c.get("pivot").and_then(Value::as_array);
+    let px = pivot
+        .and_then(|v| v.first())
+        .and_then(Value::as_f64)
+        .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.0) as f32;
+    let py = pivot
+        .and_then(|v| v.get(1))
+        .and_then(Value::as_f64)
+        .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.0) as f32;
+    if !px.is_finite() || !py.is_finite() || px.abs() > 100000.0 || py.abs() > 100000.0 {
+        return Err("Invalid transform pivot".into());
+    }
+    if ["group", "adjustment"].contains(&layer.kind.as_str()) && layer.mask.is_none() {
+        return Ok(());
+    }
+    if angle.rem_euclid(360.0) == 0.0 && sx == 1.0 && sy == 1.0 {
+        return Ok(());
+    }
+    let (mut sin, mut cos) = angle.to_radians().sin_cos();
+    if sin.abs() < 0.000001 {
+        sin = 0.0;
+    }
+    if cos.abs() < 0.000001 {
+        cos = 0.0;
+    }
+    let forward = |x: f32, y: f32| {
+        let (x, y) = ((x - px) * sx, (y - py) * sy);
+        [px + x * cos - y * sin, py + x * sin + y * cos]
+    };
+    let (x, y, w, h) = (layer.x, layer.y, layer.pixels.width, layer.pixels.height);
+    let b = if layer.kind == "paint"
+        && layer
+            .mask
+            .as_ref()
+            .is_none_or(|m| m.steps.iter().all(|s| s.pixels.bytes() == 0))
+    {
+        layer
+            .pixels
+            .source_bounds()
+            .unwrap_or([0, 0, w as i32, h as i32])
+    } else {
+        [0, 0, w as i32, h as i32]
+    };
+    let corners = [
+        forward((x + b[0]) as f32, (y + b[1]) as f32),
+        forward((x + b[2]) as f32, (y + b[1]) as f32),
+        forward((x + b[2]) as f32, (y + b[3]) as f32),
+        forward((x + b[0]) as f32, (y + b[3]) as f32),
+    ];
+    let left = corners
+        .iter()
+        .map(|p| p[0])
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i32;
+    let top = corners
+        .iter()
+        .map(|p| p[1])
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i32;
+    let right = corners
+        .iter()
+        .map(|p| p[0])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i32;
+    let bottom = corners
+        .iter()
+        .map(|p| p[1])
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i32;
+    let (nw, nh) = ((right - left) as u32, (bottom - top) as u32);
+    if left.unsigned_abs() > 100000 || top.unsigned_abs() > 100000 {
+        return Err("Transform is outside the coordinate limits".into());
+    }
+    check_size(nw, nh)?;
+    let resample = |source: &Raster, fill: Option<Pixel>| {
+        resample(source, nw, nh, fill, |xx, yy| {
+            let (dx, dy) = (
+                left as f32 + xx as f32 + 0.5 - px,
+                top as f32 + yy as f32 + 0.5 - py,
+            );
+            [
+                (dx * cos + dy * sin) / sx + px - x as f32 - 0.5,
+                (-dx * sin + dy * cos) / sy + py - y as f32 - 0.5,
+            ]
+        })
+    };
+    layer.pixels = if ["group", "adjustment"].contains(&layer.kind.as_str()) {
+        Raster::new_depth(nw, nh, layer.pixels.depth)
+    } else {
+        resample(
+            &layer.pixels,
+            if layer.kind == "fill" {
+                Some(layer.color)
+            } else {
+                None
+            },
+        )
+    };
+    if let Some(mask) = &mut layer.mask {
+        mask.cache_key = crate::engine::id();
+        for step in &mut mask.steps {
+            step.pixels = if step.kind == "paint" {
+                resample(&step.pixels, None)
+            } else {
+                Raster::new_depth(nw, nh, layer.pixels.depth)
+            };
+        }
+    }
+    if !["group", "adjustment"].contains(&layer.kind.as_str()) {
+        layer.kind = "paint".into();
+    }
+    layer.x = left;
+    layer.y = top;
+    Ok(())
+}
+
+/// Includes hidden descendants so a later visibility change cannot leave old geometry behind.
+pub fn tree_ids(doc: &Document, roots: &[String]) -> Vec<String> {
+    let mut ids: std::collections::HashSet<_> = roots.iter().cloned().collect();
+    for _ in 0..=16 {
+        let before = ids.len();
+        for layer in &doc.layers {
+            if layer.parent.as_ref().is_some_and(|p| ids.contains(p)) {
+                ids.insert(layer.id.clone());
+            }
+        }
+        if ids.len() == before {
+            break;
+        }
+    }
+    doc.layers
+        .iter()
+        .filter(|l| ids.contains(&l.id))
+        .map(|l| l.id.clone())
+        .collect()
+}
+pub fn tree_bounds(doc: &Document, roots: &[String]) -> Option<[i32; 4]> {
+    let ids = tree_ids(doc, roots);
+    doc.layers
+        .iter()
+        .filter(|l| ids.contains(&l.id) && !["group", "adjustment"].contains(&l.kind.as_str()))
+        .map(|l| {
+            let p = l.pixels.content_bounds().unwrap_or([
+                0,
+                0,
+                l.pixels.width as i32,
+                l.pixels.height as i32,
+            ]);
+            [p[0] + l.x, p[1] + l.y, p[2] + l.x, p[3] + l.y]
+        })
+        .reduce(|a, b| {
+            [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ]
+        })
+}
+pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), String> {
+    if c["mask"] == true {
+        return Err("Select Color to transform the folder and its children".into());
+    }
+    if doc.selection.is_some() && c["selection_only"] != false {
+        return Err(
+            "Use selection_only:false for a whole-folder transform, or select a child layer".into(),
+        );
+    }
+    let ids = tree_ids(doc, &[root.into()]);
+    if doc.layers.iter().any(|l| ids.contains(&l.id) && l.locked) {
+        return Err("A layer inside the folder is locked".into());
+    }
+    let bounds =
+        tree_bounds(doc, &[root.into()]).unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
+    let mut command = c.clone();
+    if command["pivot"].is_null() {
+        command["pivot"] = serde_json::json!([
+            (bounds[0] as f64 + bounds[2] as f64) / 2.,
+            (bounds[1] as f64 + bounds[3] as f64) / 2.
+        ]);
+    }
+    for node in &mut doc.layers {
+        if ids.contains(&node.id) {
+            layer(node, &command)?;
+            node.effect_key = crate::engine::id();
+        }
+    }
+    Ok(())
 }

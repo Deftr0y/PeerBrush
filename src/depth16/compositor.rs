@@ -165,7 +165,7 @@ impl<'a> Plan16<'a> {
             }
             let layer = &doc.layers[index];
             let bounds = if let Some(image) = &colors[index] {
-                let [x, y] = if matches!(kinds[index], Kind::Adjustment) {
+                let [x, y] = if matches!(kinds[index], Kind::Adjustment | Kind::Group(_)) {
                     [0, 0]
                 } else {
                     [layer.x, layer.y]
@@ -299,7 +299,11 @@ impl<'a> Plan16<'a> {
             return [0; 4];
         }
         if let Some(image) = &self.colors[i] {
-            return image.get(lx, ly);
+            return if matches!(self.kinds[i], Kind::Group(_) | Kind::Adjustment) {
+                image.get(x, y)
+            } else {
+                image.get(lx, ly)
+            };
         }
         match self.kinds[i] {
             Kind::Group(group) => self.sample(group, x, y),

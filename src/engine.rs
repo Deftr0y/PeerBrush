@@ -274,7 +274,11 @@ impl Document {
                     ) * 255.0) as u8;
                     [m, m, m, 255]
                 } else if let Some(image) = target_index.and_then(|i| colors[i].as_ref()) {
-                    image.get(sx - l.x, sy - l.y)
+                    if ["group", "adjustment"].contains(&l.kind.as_str()) {
+                        image.get(sx, sy)
+                    } else {
+                        image.get(sx - l.x, sy - l.y)
+                    }
                 } else if l.kind == "fill" {
                     if sx >= l.x
                         && sy >= l.y
@@ -564,6 +568,16 @@ impl Engine {
                 target: Some("@selection".into()),
                 rect: None,
             }];
+        }
+        if ["move", "transform"].contains(&op)
+            && target.as_ref().is_some_and(|t| {
+                self.doc
+                    .layers
+                    .iter()
+                    .any(|l| l.id == *t && l.kind == "group")
+            })
+        {
+            return vec![Scope { target, rect: None }];
         }
         if op == "layer.merge" {
             return crate::merge::requested(c)
@@ -1518,6 +1532,17 @@ impl Engine {
                     bytes,
                 })
             };
+            let source = if ["group", "adjustment"].contains(&l.kind.as_str()) {
+                Arc::new(crate::effects::Image {
+                    width: l.pixels.width,
+                    height: l.pixels.height,
+                    bytes: crate::render::rgba8(l.pixels.width, l.pixels.height, |x, y| {
+                        source.get(x as i32 + l.x, y as i32 + l.y)
+                    }),
+                })
+            } else {
+                source
+            };
             crate::smart_mask::from_color(&mut self.doc.layers[i], &source, c)?;
             return Ok(());
         }
@@ -1788,6 +1813,9 @@ impl Engine {
             self.doc.layers.insert(i + 1, child);
             return Ok(());
         }
+        if ["move", "transform"].contains(&op) && self.doc.layers[i].kind == "group" {
+            return crate::transform::folder(&mut self.doc, target, c);
+        }
         let layer = &mut self.doc.layers[i];
         if ["move", "transform"].contains(&op) && c["selection_only"].as_bool() != Some(false) {
             if let Some(coverage) = selection_coverage {
@@ -1812,124 +1840,8 @@ impl Engine {
                 m.cache_key = id();
             }
         }
-        if op == "transform" {
-            if layer.kind == "group" {
-                return Err("Transform individual layers in this initial version".into());
-            }
-            let angle = num(c, "angle", 0.0) as f32;
-            let sx = num(c, "scale_x", 1.0) as f32;
-            let sy = num(c, "scale_y", 1.0) as f32;
-            if !angle.is_finite() || !(0.05..=20.0).contains(&sx) || !(0.05..=20.0).contains(&sy) {
-                return Err("Transform scale must be 0.05–20 and rotation must be finite".into());
-            }
-            let pivot = c.get("pivot").and_then(Value::as_array);
-            let px = pivot
-                .and_then(|v| v.first())
-                .and_then(Value::as_f64)
-                .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.0)
-                as f32;
-            let py = pivot
-                .and_then(|v| v.get(1))
-                .and_then(Value::as_f64)
-                .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.0)
-                as f32;
-            if !px.is_finite() || !py.is_finite() || px.abs() > 100000.0 || py.abs() > 100000.0 {
-                return Err("Invalid transform pivot".into());
-            }
-            let (mut sin, mut cos) = angle.to_radians().sin_cos();
-            if sin.abs() < 0.000001 {
-                sin = 0.0;
-            }
-            if cos.abs() < 0.000001 {
-                cos = 0.0;
-            }
-            let forward = |x: f32, y: f32| {
-                let (x, y) = ((x - px) * sx, (y - py) * sy);
-                [px + x * cos - y * sin, py + x * sin + y * cos]
-            };
-            let (x, y, w, h) = (layer.x, layer.y, layer.pixels.width, layer.pixels.height);
-            let b = if layer.kind == "paint" {
-                layer
-                    .pixels
-                    .content_bounds()
-                    .unwrap_or([0, 0, w as i32, h as i32])
-            } else {
-                [0, 0, w as i32, h as i32]
-            };
-            let corners = [
-                forward((x + b[0]) as f32, (y + b[1]) as f32),
-                forward((x + b[2]) as f32, (y + b[1]) as f32),
-                forward((x + b[2]) as f32, (y + b[3]) as f32),
-                forward((x + b[0]) as f32, (y + b[3]) as f32),
-            ];
-            let left = corners
-                .iter()
-                .map(|p| p[0])
-                .fold(f32::INFINITY, f32::min)
-                .floor() as i32;
-            let top = corners
-                .iter()
-                .map(|p| p[1])
-                .fold(f32::INFINITY, f32::min)
-                .floor() as i32;
-            let right = corners
-                .iter()
-                .map(|p| p[0])
-                .fold(f32::NEG_INFINITY, f32::max)
-                .ceil() as i32;
-            let bottom = corners
-                .iter()
-                .map(|p| p[1])
-                .fold(f32::NEG_INFINITY, f32::max)
-                .ceil() as i32;
-            let (nw, nh) = ((right - left) as u32, (bottom - top) as u32);
-            check_size(nw, nh)?;
-            let resample = |source: &Raster, fill: Option<Pixel>| {
-                crate::transform::resample(source, nw, nh, fill, |xx, yy| {
-                    let (dx, dy) = (
-                        left as f32 + xx as f32 + 0.5 - px,
-                        top as f32 + yy as f32 + 0.5 - py,
-                    );
-                    [
-                        (dx * cos + dy * sin) / sx + px - x as f32 - 0.5,
-                        (-dx * sin + dy * cos) / sy + py - y as f32 - 0.5,
-                    ]
-                })
-            };
-            layer.pixels = resample(
-                &layer.pixels,
-                if layer.kind == "fill" {
-                    Some(layer.color)
-                } else {
-                    None
-                },
-            );
-            if let Some(mask) = &mut layer.mask {
-                for step in &mut mask.steps {
-                    step.pixels = if step.kind == "paint" {
-                        resample(&step.pixels, None)
-                    } else {
-                        Raster::new_depth(nw, nh, layer.pixels.depth)
-                    };
-                }
-            }
-            layer.kind = "paint".into();
-            layer.x = left;
-            layer.y = top;
-            return Ok(());
-        }
-        if op == "move" {
-            if layer.kind == "group" {
-                return Err("Move the group's individual layers in this initial version".into());
-            }
-            let nx = layer.x as f64 + num(c, "dx", 0.0);
-            let ny = layer.y as f64 + num(c, "dy", 0.0);
-            if !nx.is_finite() || !ny.is_finite() || nx.abs() > 100000.0 || ny.abs() > 100000.0 {
-                return Err("Move is outside the initial coordinate limits".into());
-            }
-            layer.x = nx.round() as i32;
-            layer.y = ny.round() as i32;
-            return Ok(());
+        if ["move", "transform"].contains(&op) {
+            return crate::transform::layer(layer, c);
         }
         if op == "fill" && !c["mask"].as_bool().unwrap_or(false) {
             if layer.kind == "fill" && selection.is_none() {

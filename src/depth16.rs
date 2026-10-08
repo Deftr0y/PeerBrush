@@ -247,11 +247,7 @@ pub fn full_composite(doc: &Document) -> Result<Image16, String> {
 pub fn layer_image(doc: &Document, index: usize) -> Result<Image16, String> {
     let layer = doc.layers.get(index).ok_or("Unknown16-bit color layer")?;
     let plan = Plan16::new(doc)?;
-    let (width, height) = if ["group", "adjustment"].contains(&layer.kind.as_str()) {
-        (doc.width, doc.height)
-    } else {
-        (layer.pixels.width, layer.pixels.height)
-    };
+    let (width, height) = (layer.pixels.width, layer.pixels.height);
     check_size(width, height)?;
     Ok(Image16 {
         width,

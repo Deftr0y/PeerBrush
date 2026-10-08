@@ -343,6 +343,10 @@ impl<'a> Scene<'a> {
             node[5] = layer.y as u32;
             node[6] = layer.opacity.to_bits();
             if let Some(image) = colors[i].as_deref() {
+                if layer.kind == "group" {
+                    node[4] = 0;
+                    node[5] = 0;
+                }
                 node[1] = image.width;
                 node[2] = image.height;
                 self.source(&mut node, Source::Image(image, &layer.effect_key));

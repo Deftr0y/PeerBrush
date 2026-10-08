@@ -299,17 +299,32 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     let mut records = vec![];
     let mut channels = vec![];
     for (l, section) in &ordered {
+        let baked_group = *section == 0 && l.kind == "group" && crate::effects::active(l);
         let (w, h) = if *section == 0 {
-            (l.pixels.width, l.pixels.height)
+            if baked_group {
+                (doc.width, doc.height)
+            } else {
+                (l.pixels.width, l.pixels.height)
+            }
         } else {
             (0, 0)
         };
-        let (x, y) = if *section == 0 { (l.x, l.y) } else { (0, 0) };
+        let (x, y) = if *section == 0 && !baked_group {
+            (l.x, l.y)
+        } else {
+            (0, 0)
+        };
         i32b(&mut records, y);
         i32b(&mut records, x);
         i32b(&mut records, y + h as i32);
         i32b(&mut records, x + w as i32);
         let mask = l.mask.as_ref();
+        // Folder masks cover the standard canvas; private sources retain off-canvas frames.
+        let (mask_w, mask_h, mask_x, mask_y) = if l.kind == "group" {
+            (doc.width, doc.height, 0, 0)
+        } else {
+            (l.pixels.width, l.pixels.height, l.x, l.y)
+        };
         let has_mask = mask.is_some() && *section != 3;
         let prepared = if has_mask {
             mask.and_then(|m| m.prepare(l.pixels.width, l.pixels.height))
@@ -327,19 +342,15 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         {
             let mut data = vec![];
             u16b(&mut data, 0);
-            let (cw, ch_height) = if ch == -2 {
-                (l.pixels.width, l.pixels.height)
-            } else {
-                (w, h)
-            };
+            let (cw, ch_height) = if ch == -2 { (mask_w, mask_h) } else { (w, h) };
             for yy in 0..ch_height {
                 for xx in 0..cw {
                     if high {
                         let value = if ch == -2 {
                             (crate::depth16::mask_value_prepared(
                                 l,
-                                xx as i32,
-                                yy as i32,
+                                xx as i32 + mask_x - l.x,
+                                yy as i32 + mask_y - l.y,
                                 mask16.map(|m| m.as_ref()),
                                 true,
                             ) * 65535.)
@@ -358,8 +369,12 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
                         u16b(&mut data, value);
                     } else {
                         data.push(if ch == -2 {
-                            (l.mask_value_prepared(xx as i32, yy as i32, prepared.as_deref(), true)
-                                * 255.)
+                            (l.mask_value_prepared(
+                                xx as i32 + mask_x - l.x,
+                                yy as i32 + mask_y - l.y,
+                                prepared.as_deref(),
+                                true,
+                            ) * 255.)
                                 .round() as u8
                         } else {
                             let p = if let Some(image) = derived {
@@ -404,10 +419,10 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         let mut extra = vec![];
         if has_mask {
             let mut m = vec![];
-            i32b(&mut m, y);
-            i32b(&mut m, x);
-            i32b(&mut m, y + l.pixels.height as i32);
-            i32b(&mut m, x + l.pixels.width as i32);
+            i32b(&mut m, mask_y);
+            i32b(&mut m, mask_x);
+            i32b(&mut m, mask_y + mask_h as i32);
+            i32b(&mut m, mask_x + mask_w as i32);
             m.extend_from_slice(&[
                 255,
                 if mask.is_some_and(|m| !m.enabled) {
@@ -508,7 +523,15 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc.selection_coverage.is_some()
+        format: if doc.layers.iter().any(|l| {
+            ["group", "adjustment"].contains(&l.kind.as_str())
+                && (l.x != 0
+                    || l.y != 0
+                    || l.pixels.width != doc.width
+                    || l.pixels.height != doc.height)
+        }) {
+            7
+        } else if doc.selection_coverage.is_some()
             || doc.selection_previous.is_some()
             || doc.layers.iter().any(|l| {
                 l.effects.iter().any(|e| {
@@ -522,7 +545,8 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
                         .iter()
                         .any(|s| s.kind == "curves" && s.settings["interpolation"] != "linear")
                 })
-            }) {
+            })
+        {
             6
         } else if high {
             5
@@ -1048,7 +1072,7 @@ pub fn decode(data: &[u8]) -> Result<Document, String> {
                 }
         {
             if let Ok(e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=6).contains(&e.format)
+                if (1..=7).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ hash(composite_data)
@@ -1402,6 +1426,7 @@ pub fn validate(doc: &Document) -> Result<(), String> {
             return Err("Invalid blend mode".into());
         }
         if l.kind == "adjustment"
+            && l.mask.is_none()
             && (l.x != 0
                 || l.y != 0
                 || l.pixels.width != doc.width

@@ -1698,11 +1698,13 @@ impl PeerBrush {
         scale: f32,
         available: Rect,
     ) {
+        let roots = crate::tree::roots(doc, &self.selection_layers.iter().cloned().collect());
         let targets = doc
             .layers
             .iter()
-            .filter(|l| self.selection_layers.contains(&l.id) && l.kind != "group")
+            .filter(|l| roots.contains(&l.id))
             .collect::<Vec<_>>();
+        let tree = crate::transform::tree_ids(doc, &roots);
         if targets.is_empty() {
             return;
         }
@@ -1716,30 +1718,22 @@ impl PeerBrush {
             .as_ref()
             .is_none_or(|(ids, rev, _)| *ids != key || *rev != doc.revision)
         {
-            let b = targets
-                .iter()
-                .map(|l| {
-                    let p = l.pixels.content_bounds().unwrap_or([
-                        0,
-                        0,
-                        l.pixels.width as i32,
-                        l.pixels.height as i32,
-                    ]);
-                    [p[0] + l.x, p[1] + l.y, p[2] + l.x, p[3] + l.y]
-                })
-                .reduce(|a, b| {
-                    [
-                        a[0].min(b[0]),
-                        a[1].min(b[1]),
-                        a[2].max(b[2]),
-                        a[3].max(b[3]),
-                    ]
-                })
-                .unwrap();
+            let b = crate::transform::tree_bounds(doc, &roots).unwrap_or([
+                0,
+                0,
+                doc.width as i32,
+                doc.height as i32,
+            ]);
             self.gizmo_bounds = Some((key, doc.revision, b));
         }
         let b = self.gizmo_bounds.as_ref().unwrap().2;
-        let b = doc.selection.unwrap_or(b);
+        let folders = targets.iter().any(|l| l.kind == "group");
+        let selection_only = doc.selection.is_some() && !folders;
+        let b = if selection_only {
+            doc.selection.unwrap()
+        } else {
+            b
+        };
         let pivot = [(b[0] + b[2]) as f32 / 2.0, (b[1] + b[3]) as f32 / 2.0];
         let screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
         let center = screen(pivot);
@@ -1787,7 +1781,11 @@ impl PeerBrush {
         }
         if hit != 0
             && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
-            && targets.iter().all(|l| !l.locked)
+            && doc
+                .layers
+                .iter()
+                .filter(|l| tree.contains(&l.id))
+                .all(|l| !l.locked)
         {
             if let Some(pos) = pointer {
                 self.gizmo_handle = hit;
@@ -1843,8 +1841,8 @@ impl PeerBrush {
         if self.gizmo_handle != 0 {
             for target in &targets {
                 self.transient.push(if self.tool==Tool::Move {
-                    json!({"op":"move","layer":target.id,"dx":dx.round(),"dy":dy.round(),"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":doc.selection.is_some()})
-                } else {json!({"op":"transform","layer":target.id,"angle":angle,"scale_x":sx,"scale_y":sy,"pivot":pivot,"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":doc.selection.is_some()})});
+                    json!({"op":"move","layer":target.id,"dx":dx.round(),"dy":dy.round(),"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":selection_only})
+                } else {json!({"op":"transform","layer":target.id,"angle":angle,"scale_x":sx,"scale_y":sy,"pivot":pivot,"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":selection_only})});
             }
         }
         let painter = ui.painter().with_clip_rect(available);
@@ -5053,6 +5051,103 @@ mod tests {
             app.shared.lock().unwrap().undo.is_empty(),
             "Live rotation preview must not commit history"
         );
+    }
+    #[test]
+    fn folder_gizmo_transforms_selected_root_once_and_previews_actual_children() {
+        let (mut app, ctx) = small_fixture();
+        let (root, child) = {
+            let mut e = app.shared.lock().unwrap();
+            let mut folder = crate::engine::Layer::new("Folder", "group", 32, 32);
+            folder.pixels = crate::raster::Raster::new(32, 32);
+            let root = folder.id.clone();
+            let child = e.doc.layers[0].id.clone();
+            e.doc.layers[0].parent = Some(root.clone());
+            for y in 5..13 {
+                for x in 4..12 {
+                    e.doc.layers[0].pixels.set(x, y, [200, 87, 31, 255]);
+                }
+            }
+            e.doc.layers[0].pixels.set(4, 5, [31, 87, 200, 255]);
+            e.doc.layers.push(folder);
+            e.undo.clear();
+            (root, child)
+        };
+        app.selected = root.clone();
+        app.selection_layers = [root.clone(), child].into_iter().collect();
+        app.tool = Tool::Rotate;
+        frame(&mut app, &ctx, vec![], Default::default());
+        let rect = app.view_rect.unwrap();
+        let scale = rect.width() / 32.;
+        let center = rect.min + Vec2::new(8. * scale, 9. * scale);
+        let start = center + Vec2::new(58., 0.);
+        let end = center + Vec2::new(0., 58.);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                button(
+                    start,
+                    egui::PointerButton::Primary,
+                    true,
+                    Default::default(),
+                ),
+            ],
+            Default::default(),
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(end)],
+            Default::default(),
+        );
+        let transforms = app
+            .transient
+            .iter()
+            .filter(|c| c["op"] == "transform")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(transforms.len(), 1);
+        assert_eq!(transforms[0]["layer"], root);
+        assert_eq!(transforms[0]["pivot"], json!([8., 9.]));
+        let doc = app.shared.lock().unwrap().doc.clone();
+        let preview = Engine::preview_edits(doc.clone(), &transforms).unwrap();
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        // An asymmetric test mark distinguishes the rendered rotation from a bounding-box update.
+        assert_eq!(
+            preview
+                .layers
+                .iter()
+                .find(|l| l.kind == "paint")
+                .unwrap()
+                .pixels
+                .get(0, 0),
+            [200, 87, 31, 255]
+        );
+        assert_eq!(
+            preview
+                .layers
+                .iter()
+                .find(|l| l.kind == "paint")
+                .unwrap()
+                .pixels
+                .get(7, 0),
+            [31, 87, 200, 255]
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![button(
+                end,
+                egui::PointerButton::Primary,
+                false,
+                Default::default(),
+            )],
+            Default::default(),
+        );
+        let e = app.shared.lock().unwrap();
+        assert_eq!(e.undo.len(), 1);
+        assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
     }
     #[test]
     fn liquify_and_wet_blend_shortcuts_preserve_text_editing() {
