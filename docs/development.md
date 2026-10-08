@@ -65,4 +65,19 @@ Release measurements on the Windows NVIDIA RTX 3070 Ti Laptop system, with nine 
 | 2048² / native 16-bit, levels + blur | 12864 ms | 621 ms |
 | 4096² / native 16-bit, levels + blur | 65044 ms | 565 ms |
 
-Run `cargo run --release --example preview_performance` or add `-- --effects16` for native effects. Tiled GPU composition, finer dirty-tile tracking and progressive large-document handling remain queued.
+Run `cargo run --release --example preview_performance` or add `-- --effects16` for native effects. Finer dirty-tile tracking and progressive large-document handling remain queued.
+
+## Tiled GPU previews (PB-076)
+
+Downsampled whole-document 8-bit previews can composite normal layers and isolated folders on the native renderer's shared device. Prepared color effects use the same tile path. The CPU supplies its exact crop/zoom sampling coordinates; each layer/folder quantizes in the same order. The derived LRU atlas holds at most 256 RGBA tiles (64 MiB), identifies raw COW tiles through weak references, and keys derived tiles by invalidated effect sources. Output and readback are each capped at 16 MiB; pending metadata is capped at 32 MiB. Uploads poll after 16 MiB of staging (one tile working set may be larger, bounded by the atlas). Dispatches submit before slots are reused; a single final readback avoids one map/wait per output tile.
+
+GPU error scopes and effects share a nonblocking device gate. Unsupported/busy/failed paths return the complete region to CPU rendering; a failed dispatch clears resident entries and exposes no partial frame. Native16, enabled masks, clipping, adjustments, other blends, isolated targets and full-resolution exports/saves stay on the CPU. Editable source data and history never contain GPU caches. This is preview acceleration, not expanded PSD compatibility. Actual-device tests allow a one-byte preview-channel rounding difference; measured dense fixtures were byte-identical. Standard saved pixels remain CPU authoritative.
+
+`cargo run --release --example tile_performance` compares the current compiled shared CPU renderer with the actual device, including upload/readback costs. On this Windows RTX 3070 Ti Laptop/Vulkan system, three dense normal layers at a 1536² preview measured:
+
+| Canvas | Shared CPU | GPU cold | GPU repeated | Resident atlas |
+| --- | ---: | ---: | ---: | ---: |
+| 2048² | 133 ms | 24 ms | 9 ms | 48 MiB |
+| 4096² | 159 ms | 52 ms | 48 ms | 64 MiB |
+
+The larger scene evicts tiles and uploaded 384 MiB across two frames; source data stays unchanged. These are local measurements. Native device tests cover fractional/cropped coordinates, moved layers, folder opacity/effect images, COW edits and undo, bounded eviction, busy fallback and simulated failure after a completed tile, followed by successful retry. Engine/codec/protocol regressions and native painting/one-step undo are also required for this slice. Capabilities expose the supported mode, fallback cases and cache/frame statistics.

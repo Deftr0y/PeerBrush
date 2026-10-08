@@ -4,6 +4,7 @@
 //! readback only after validation and mapping succeed. Unsupported sizes, driver
 //! errors, and busy devices leave the source intact for the CPU implementation.
 use crate::effects::{self, Image};
+pub mod composite;
 use eframe::wgpu;
 use serde::Serialize;
 use serde_json::Value;
@@ -212,6 +213,8 @@ pub struct Backend {
     parameter_stride: u64,
     limits: wgpu::Limits,
     workspace: Mutex<Workspace>,
+    // Error scopes are a device stack; effect and compositor workers must share this gate.
+    gate: Arc<Mutex<()>>,
     pub adapter: String,
 }
 impl Backend {
@@ -308,11 +311,15 @@ impl Backend {
             parameter_stride,
             limits,
             workspace: Mutex::new(Workspace::default()),
+            gate: Arc::new(Mutex::new(())),
             adapter,
         })
     }
 
     pub fn apply(&self, image: &mut Image, kind: &str, settings: &Value) -> Result<bool, String> {
+        let Ok(_gate) = self.gate.try_lock() else {
+            return Ok(false);
+        };
         if !SUPPORTED.contains(&kind) {
             return Ok(false);
         }
@@ -372,6 +379,9 @@ impl Backend {
         settings: &Value,
         mut before_tile: impl FnMut(usize) -> Result<(), String>,
     ) -> Result<bool, String> {
+        let Ok(_gate) = self.gate.try_lock() else {
+            return Ok(false);
+        };
         if !NATIVE16.contains(&kind) || cfg!(target_endian = "big") {
             return Ok(false);
         }

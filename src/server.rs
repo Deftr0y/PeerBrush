@@ -214,6 +214,11 @@ pub fn capabilities() -> Value {
         "effects": crate::gpu::status(),
         "brush": "incremental tiled CPU coverage",
         "compositing": "compiled CPU layer tree with regional gesture updates",
+        "tile_compositor": {
+            "mode": "downsampled 8-bit normal layers and isolated folders",
+            "fallback": "native16, masks, clipping, adjustments, other blends and full-resolution saves use CPU",
+            "status": crate::gpu::composite::status()
+        },
         "liquify": "CPU displacement grid"
     });
     result

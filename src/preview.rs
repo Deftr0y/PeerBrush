@@ -374,6 +374,31 @@ impl Cache {
             }
             let prepared = self.prepared8.as_ref().unwrap();
             let masks = &prepared.masks;
+            if target.is_none() && !mask && scale < 1.0 {
+                let xs: Vec<_> = (bounds[0]..bounds[2])
+                    .map(|x| (x as f32 / scale) as i32)
+                    .collect();
+                let ys: Vec<_> = (bounds[1]..bounds[3])
+                    .map(|y| (y as f32 / scale) as i32)
+                    .collect();
+                if let Some(bytes) =
+                    crate::gpu::composite::try_render(doc, &prepared.colors, &xs, &ys)
+                {
+                    let row_bytes = xs.len() * 4;
+                    for (row, source) in bytes.chunks_exact(row_bytes).enumerate() {
+                        let start = ((bounds[1] as usize + row) * self.width as usize
+                            + bounds[0] as usize)
+                            * 4;
+                        self.bytes[start..start + row_bytes].copy_from_slice(source);
+                    }
+                    return Ok(Rendered {
+                        width: self.width,
+                        height: self.height,
+                        bytes: self.bytes.clone(),
+                        dirty: Some(bounds),
+                    });
+                }
+            }
             let plan = Plan::new(doc, masks, &prepared.colors);
             crate::render::area8(&mut self.bytes, self.width, bounds, |x, y| {
                 let sx = (x as f32 / scale) as i32;

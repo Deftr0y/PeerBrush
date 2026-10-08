@@ -246,6 +246,18 @@ impl Document {
             })
             .collect();
         let colors = crate::effects::prepare(self, &prepared)?;
+        // Downsampled whole-document previews only; full-resolution export stays on the CPU.
+        if target.is_none() && !mask && scale < 1.0 {
+            let xs: Vec<_> = (0..w)
+                .map(|x| rect[0] + (x as f32 / scale) as i32)
+                .collect();
+            let ys: Vec<_> = (0..h)
+                .map(|y| rect[1] + (y as f32 / scale) as i32)
+                .collect();
+            if let Some(bytes) = crate::gpu::composite::try_render(self, &colors, &xs, &ys) {
+                return Ok((w, h, bytes, rect));
+            }
+        }
         let target_index = target.and_then(|id| self.layers.iter().position(|l| l.id == id));
         let plan = crate::compositor::Plan::new(self, &prepared, &colors);
         let root = plan.group(None);
