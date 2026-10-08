@@ -166,7 +166,7 @@ fn finish(mask: Raster) -> Result<Coverage, String> {
         contours,
     })
 }
-fn put(doc: &mut Document, mask: Raster) -> Result<(), String> {
+pub(super) fn put(doc: &mut Document, mask: Raster) -> Result<(), String> {
     doc.selection_previous = current(doc).or_else(|| doc.selection_previous.clone());
     let coverage = finish(mask)?;
     doc.selection = Some(coverage.bounds);
@@ -174,7 +174,7 @@ fn put(doc: &mut Document, mask: Raster) -> Result<(), String> {
     doc.selection_coverage = Some(coverage);
     Ok(())
 }
-fn snapshot(doc: &Document, c: &Value) -> Result<(u32, u32, Vec<u8>), String> {
+pub(super) fn snapshot(doc: &Document, c: &Value) -> Result<(u32, u32, Vec<u8>), String> {
     let target = if c["sample_merged"] == true {
         None
     } else {
@@ -192,6 +192,12 @@ fn difference(a: &[u8], b: &[u8]) -> f32 {
     rgb.max((a[3] as f32 - b[3] as f32).abs())
 }
 pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
+    if c["op"] == "selection.import" {
+        return super::import::apply(doc, c);
+    }
+    if c["op"] == "selection.refine" {
+        return super::refine::apply(doc, c);
+    }
     let kind = text(c, "kind", "rectangle");
     let op = text(c, "op", "selection");
     if op == "selection.reselect" {
@@ -658,9 +664,9 @@ pub fn magnetic_point(doc: &Document, point: [f32; 2], width: f32) -> [f32; 2] {
     best
 }
 
-fn morph(line: &[u8], radius: usize, expand: bool) -> Vec<u8> {
+pub(super) fn morph<T: Copy + Ord + Default>(line: &[T], radius: usize, expand: bool) -> Vec<T> {
     let mut queue: VecDeque<usize> = VecDeque::new();
-    let mut out = vec![0; line.len()];
+    let mut out = vec![T::default(); line.len()];
     let mut end = 0;
     for (i, value) in out.iter_mut().enumerate() {
         while end < (i + radius + 1).min(line.len()) {
@@ -680,7 +686,7 @@ fn morph(line: &[u8], radius: usize, expand: bool) -> Vec<u8> {
             queue.pop_front();
         }
         *value = if !expand && (i < radius || i + radius >= line.len()) {
-            0
+            T::default()
         } else {
             line[*queue.front().unwrap()]
         };

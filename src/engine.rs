@@ -1070,6 +1070,8 @@ impl Engine {
             "fill" | "paint.fill" => "fill",
             op if op.starts_with("effect.") => "effects",
             op if op.starts_with("mask.") => "mask",
+            "selection" => "selection",
+            op if op.starts_with("selection.") => "selection",
             op if op.starts_with("layer.") => "layers",
             _ => "canvas",
         };
@@ -1116,6 +1118,15 @@ impl Engine {
         )
     }
     fn apply(&mut self, c: &Value) -> Result<(), String> {
+        if c.get("source_revision")
+            .is_some_and(|r| r.as_u64() != Some(self.doc.revision))
+            || c.get("document_id")
+                .is_some_and(|id| id.as_str() != Some(self.doc.id.as_str()))
+        {
+            return Err(
+                "The source project changed. Review it again before applying this result.".into(),
+            );
+        }
         if matches!(
             c["op"].as_str(),
             Some(
@@ -1481,6 +1492,9 @@ impl Engine {
         if op == "mask.remove" {
             self.doc.layers[i].mask = None;
             return Ok(());
+        }
+        if op == "mask.refine" || op == "mask.from_selection" {
+            return crate::selection::masks::apply(&mut self.doc, i, c);
         }
         if op == "mask.from_color" {
             if self.doc.bit_depth == 16 {

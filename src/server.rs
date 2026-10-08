@@ -190,12 +190,13 @@ pub fn export(shared: &Shared, path: &Path) -> Result<(), String> {
 
 pub fn tools() -> Value {
     json!([
-        {"name":"peerbrush_observe","description":"Inspect live document structure and actual PNG image content. Coordinates are document pixels, origin top left. Request layer/mask/rect views, max_edge and since_revision to reduce image traffic.","inputSchema":{"type":"object","properties":{"layer":{"type":"string"},"mask":{"type":"boolean"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"since_revision":{"type":"integer"},"image":{"type":"boolean"}},"additionalProperties":false}},
+        {"name":"peerbrush_observe","description":"Inspect live document structure and actual PNG image content. Coordinates are document pixels, origin top left. Request layer/mask/rect views, max_edge and since_revision to reduce image traffic.","inputSchema":{"type":"object","properties":{"layer":{"type":"string"},"mask":{"type":"boolean"},"selection_view":{"type":"string","enum":["cutout","mask","overlay"]},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"since_revision":{"type":"integer"},"image":{"type":"boolean"}},"additionalProperties":false}},
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
         {"name":"peerbrush_document","description":"New/open/save PSD or export PNG. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","save","export","compatible_copy"]},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply an absolute local PNG/JPEG path or base64 PNG, and exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
+        {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
         {"name":"peerbrush_capabilities","description":"Get concise supported operations and runnable JSON examples before editing.","inputSchema":{"type":"object","properties":{}}}
     ])
 }
@@ -221,6 +222,7 @@ pub fn capabilities() -> Value {
         },
         "liquify": "CPU displacement grid"
     });
+    result["segmentation"]["configured"] = json!(crate::segmentation::configured());
     result
 }
 
@@ -243,6 +245,13 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
             p.get("layer").and_then(Value::as_str),
             p.get("mask").and_then(Value::as_bool).unwrap_or(false),
         )?;
+        let mut rgba = rgba;
+        if let Some(mode) = p.get("selection_view").and_then(Value::as_str) {
+            if !["cutout", "mask", "overlay"].contains(&mode) {
+                return Err("Unknown selection view".into());
+            }
+            crate::selection::display::apply_region(&doc, w, h, &mut rgba, rect, mode);
+        }
         let bytes = raster::png(w, h, &rgba)?;
         result["images"] = json!([{"mime_type":"image/png","data":STANDARD.encode(bytes),"width":w,"height":h,"document_rect":rect,"revision":revision}]);
     }
@@ -318,6 +327,17 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             };
             result["placement"] =
                 json!({"layer":layer,"rect":area,"new_layer":p["new_layer"] != false});
+            Ok(result)
+        }
+        "segment" => {
+            let mut result = crate::segmentation::run(shared, actor, p)?;
+            if p["feedback"] != "request" {
+                let view = observation(
+                    shared,
+                    &json!({"selection_view":"mask","rect":p.get("rect"),"max_edge":p.get("max_edge").and_then(Value::as_u64).unwrap_or(768)}),
+                )?;
+                result["images"] = view["images"].clone();
+            }
             Ok(result)
         }
         "edit" => {
@@ -554,6 +574,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
                 "observe",
                 "edit",
                 "place_image",
+                "segment",
                 "task",
                 "document",
                 "history",
@@ -569,6 +590,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
                         "observe" => "Looking at the canvas",
                         "edit" => "Updating the shared canvas",
                         "place_image" => "Placing image pixels",
+                        "segment" => "Selecting the subject",
                         "document" => "Working with your document",
                         "history" => "Reviewing recent changes",
                         _ => "Getting ready to work together",

@@ -6,6 +6,7 @@ mod effects;
 mod history;
 mod layers;
 mod liquify;
+mod refinement;
 mod selection;
 use crate::{controls, thumbnails};
 use crate::{
@@ -191,6 +192,7 @@ pub struct PeerBrush {
     selection_gesture_mode: Option<String>,
     project_settings: Option<(u32, u32, u16)>,
     task_undo_review: Option<Value>,
+    refinement: Option<refinement::Editor>,
     color: Pixel,
     mask_value: u8,
     radius: f32,
@@ -427,6 +429,7 @@ impl PeerBrush {
             selection_gesture_mode: None,
             project_settings: None,
             task_undo_review: None,
+            refinement: None,
             color: [233, 84, 32, 255],
             mask_value: 0,
             radius: 18.0,
@@ -997,13 +1000,23 @@ impl PeerBrush {
             stroke
         };
         format!(
-            "{target};{:?};{};{}",
+            "{target};{:?};{};{};{}",
             self.blend_hover,
             stroke.map(|v| v.to_string()).unwrap_or_default(),
-            serde_json::to_string(&self.transient).unwrap()
+            serde_json::to_string(&self.transient).unwrap(),
+            self.refinement
+                .as_ref()
+                .map(|r| r.preview.as_str())
+                .unwrap_or("")
         )
     }
     fn live_key(&self) -> String {
+        if let Some(editor) = &self.refinement {
+            return format!(
+                "refinement:{}:{}:{}",
+                editor.gesture, editor.document, editor.revision
+            );
+        }
         if let Some(sweep) = &self.eye_sweep {
             return format!("visibility:{}:{}", sweep.gesture, sweep.revision);
         }
@@ -1065,6 +1078,23 @@ impl PeerBrush {
     }
     fn request_preview(&mut self, ctx: &egui::Context, _doc: &Document) {
         let current = self.shared.lock().unwrap().doc.clone();
+        if self
+            .refinement
+            .as_ref()
+            .is_some_and(|r| r.document != current.id || r.revision != current.revision)
+            || (self.refinement.is_some()
+                && (!self.points.is_empty()
+                    || self.gizmo_handle != 0
+                    || self.layer_drag.is_some()
+                    || self.eye_sweep.is_some()
+                    || self.blend_hover.is_some()
+                    || self
+                        .transient
+                        .iter()
+                        .any(|c| c["op"] != "selection.refine" && c["op"] != "mask.refine")))
+        {
+            self.cancel_refinement();
+        }
         let doc = &current;
         let time = ctx.input(|i| i.time);
         let edge = self
@@ -1174,6 +1204,10 @@ impl PeerBrush {
                 None
             };
             let mask = self.mask && self.isolate;
+            let refinement = self
+                .refinement
+                .as_ref()
+                .map(|r| (r.target.clone(), r.preview.clone()));
             std::thread::spawn(move || {
                 let id = doc.id.clone();
                 let revision = doc.revision;
@@ -1184,10 +1218,29 @@ impl PeerBrush {
                             .map_err(|_| "Preview worker cache unavailable")?
                             .edit(doc, &commands, &live)?;
                     }
-                    let rendered = cache
+                    let mut rendered = cache
                         .lock()
                         .map_err(|_| "Preview worker cache unavailable")?
                         .render(&doc, &live, dirty, edge, layer.as_deref(), mask)?;
+                    if let Some((target, mode)) = &refinement {
+                        if target.is_none() {
+                            crate::selection::display::apply(
+                                &doc,
+                                rendered.width,
+                                rendered.height,
+                                &mut rendered.bytes,
+                                mode,
+                            );
+                            rendered.dirty = None;
+                        } else if mode == "mask" {
+                            let (w, h, bytes, _) =
+                                doc.preview(None, edge, target.as_deref(), true)?;
+                            rendered.width = w;
+                            rendered.height = h;
+                            rendered.bytes = bytes;
+                            rendered.dirty = None;
+                        }
+                    }
                     Ok::<_, String>((
                         rendered.width,
                         rendered.height,
@@ -1937,6 +1990,9 @@ impl PeerBrush {
     }
     fn canvas(&mut self, ui: &mut egui::Ui, doc: &Document) {
         self.transient.clear();
+        if let Some(editor) = &self.refinement {
+            self.transient.push(editor.command());
+        }
         if let Some(drag) = &self.layer_drag {
             self.transient.extend(drag.commands.clone());
         }
@@ -2817,6 +2873,12 @@ impl PeerBrush {
                         }
                     });
                     ui.menu_button("Select",|ui| {
+                        let learned = crate::segmentation::configured() && !doc.read_only && !self.busy;
+                        if ui.add_enabled(learned, egui::Button::new("Select subject")).on_hover_text("Uses the externally configured local selection provider").clicked(){self.segment_subject(&doc,false);ui.close_menu();}
+                        if ui.add_enabled(learned && doc.selection.is_some(), egui::Button::new("Select subject in region")).clicked(){self.segment_subject(&doc,true);ui.close_menu();}
+                        if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Refine selection…")).clicked(){self.open_refinement(&doc,None);ui.close_menu();}
+                        if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Mask from selection")).clicked(){self.layer_cmd("mask.from_selection",json!({}),"Mask from selection");ui.close_menu();}
+                        if ui.add_enabled(doc.layers.iter().any(|l|l.id==self.selected&&l.mask.is_some())&&!doc.read_only,egui::Button::new("Refine layer mask…")).clicked(){self.open_refinement(&doc,Some(self.selected.clone()));ui.close_menu();}
                         for (label,op) in [("All · Ctrl+A","all"),("Deselect · Ctrl+D","selection.clear"),("Reselect · Ctrl+Shift+D","selection.reselect"),("Inverse","selection.invert")] {
                             if ui.button(label).clicked(){self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);ui.close_menu();}
                         }
@@ -3156,6 +3218,7 @@ impl PeerBrush {
         }
         self.color_window(ctx);
         self.task_history_review(ctx, &doc);
+        self.refinement_window(ctx, &doc);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")
@@ -5463,5 +5526,66 @@ mod tests {
         );
         assert!(app.shared.lock().unwrap().doc.selection.is_none());
         assert!(app.tool == Tool::Selection);
+    }
+    #[test]
+    fn refinement_previews_real_cutout_without_history_and_cancels_on_source_changes() {
+        let (mut app, ctx) = small_fixture();
+        {
+            let mut e = app.shared.lock().unwrap();
+            for y in 0..16 {
+                for x in 0..16 {
+                    e.doc.layers[0].pixels.set(x, y, [233, 84, 32, 255]);
+                }
+            }
+            e.edit(
+                "human",
+                &[json!({"op":"selection","rect":[4,4,12,12]})],
+                None,
+                None,
+                "Select",
+            )
+            .unwrap();
+        }
+        let doc = app.shared.lock().unwrap().doc.clone();
+        let count = app.shared.lock().unwrap().undo.len();
+        app.open_refinement(&doc, None);
+        app.refinement.as_mut().unwrap().values[1] = 2.;
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert_eq!(app.transient.len(), 1);
+        let preview = crate::engine::Engine::preview_edits(doc.clone(), &app.transient).unwrap();
+        let (w, h, mut pixels, _) = preview.preview(None, 64, None, false).unwrap();
+        let original = pixels.clone();
+        crate::selection::display::apply(&preview, w, h, &mut pixels, "cutout");
+        assert!(pixels != original, "Cutout must alter rendered alpha");
+        assert_eq!(app.shared.lock().unwrap().undo.len(), count);
+        assert_eq!(app.shared.lock().unwrap().doc.revision, doc.revision);
+        app.pending = false;
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(
+            app.last_preview
+                .as_ref()
+                .unwrap()
+                .2
+                .contains("\"feather\":2.0"),
+            "Canvas preview lost the live refinement command"
+        );
+        app.cancel_refinement();
+        assert!(app.transient.is_empty());
+        app.open_refinement(&doc, None);
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.update","layer":app.selected,"name":"Human rename"})],
+                None,
+                None,
+                "Rename",
+            )
+            .unwrap();
+        }
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.refinement.is_none());
+        assert!(app.transient.is_empty());
+        assert_eq!(app.shared.lock().unwrap().undo.len(), count + 1);
     }
 }

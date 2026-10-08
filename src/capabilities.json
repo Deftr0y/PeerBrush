@@ -663,6 +663,16 @@
       "intersect"
     ],
     "empty": "Active zero-coverage selection; selection=null means deselected.",
-    "object_region": "Deterministic perimeter-color extraction, not learned object segmentation."
+    "object_region": "Deterministic perimeter-color extraction. Use peerbrush_segment for learned subject/object confidence.",
+    "refinement": "selection.refine and mask.refine accept smooth 0–32 px, feather 0–64 px, shift -32–32 px, contrast 0–100%, edge 0–100% and edge_radius 1–32 px. Image-guided feathering uses merged colors by default; sample_merged:false and layer select one source. Native16 mask words and original mask steps remain intact. source_revision/document_id protect snapshot-dependent results.",
+    "mask_from_selection": "mask.from_selection on a layer maps document coverage into its native local mask frame. mode replace/add/subtract/intersect; one undoable editable paint step.",
+    "confidence_import": "selection.import accepts one PNG path or base64 png, an explicit in-canvas document rect, channel luma/alpha and selection mode. Bilinear confidence resampling preserves soft edges. Maximum document/mask size 16 megapixels; original image channels stay unchanged.",
+    "preview": "peerbrush_observe selection_view cutout/mask/overlay returns presentation-only PNG feedback with actual document coordinates."
+  },
+  "segmentation": {
+    "configured": false,
+    "provider": "Optional local executable configured with PEERBRUSH_SEGMENTATION_CONFIG. Model choice, runtime and weights remain outside the application; see docs/segmentation.md.",
+    "request": {"tool":"peerbrush_segment","expected_revision":12,"rect":[0,0,640,480],"point":[220,180],"mode":"replace"},
+    "limits": "One inference at a time, 2048-pixel preview edge, 16-megapixel document, 16 MiB JSON input/output and configurable 1–180 second timeout. Source revision/project changes cancel the result; leases and history use the shared engine."
   }
 }

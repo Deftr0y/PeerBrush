@@ -21,6 +21,7 @@ pub mod preview;
 pub mod psd;
 pub mod raster;
 pub(crate) mod render;
+pub mod segmentation;
 pub mod selection;
 pub mod server;
 pub mod smart_mask;

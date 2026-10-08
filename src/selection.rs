@@ -1,5 +1,9 @@
 //! Document-space selection geometry. The public rectangle stays its bounding box.
 use crate::engine::Document;
+pub mod display;
+pub mod import;
+pub mod masks;
+pub mod refine;
 mod system;
 pub use system::*;
 

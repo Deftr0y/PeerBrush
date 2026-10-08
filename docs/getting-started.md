@@ -83,6 +83,8 @@ Press **M** or click Select in the toolbar. The selection toolbar offers rectang
 
 Selections retain disconnected regions, holes and feather coverage through painting, copying and selected-region transforms. Color-connected Quick Selection and perimeter-based Object region are deterministic helpers, not Photoshop's learned object segmentation. Raster selection operations currently support canvases up to 16 megapixels; boundary and brush work budgets report an error instead of truncating a selection.
 
+**Select → Refine selection** previews the cutout, confidence mask or overlay while changing Smooth, Feather, Shift edge, Contrast and Follow image edge. Apply commits one edit; Cancel keeps the original selection. **Mask from selection** maps the selection into the selected layer's mask frame; **Refine layer mask** retains previous editable steps and native 16-bit mask values. Optional **Select subject** and **Select subject in region** use a local learned provider configured outside the application. See [provider setup and commands](segmentation.md).
+
 Levels provides a black-to-white gradient with draggable black, midpoint and white handles. Curves uses a smooth, shape-preserving curve for newly created or edited effects: double-click to add points, drag to shape, and right-click an interior point to remove it. Older saved curve sources retain their original linear interpolation until edited.
 
 To edit a Liquify effect, choose **Edit on canvas** in that effect's controls. Choose Push, Expand, Pinch or Restore, radius and strength above the canvas, then paint. Each stroke remains editable in its chosen effect and captures the current selection. **Add Mask** creates a white mask by default; the connected **Color / Mask** buttons select the channel.
