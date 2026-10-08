@@ -10,6 +10,7 @@ pub mod engine;
 pub mod fill;
 pub mod gpu;
 pub mod grouping;
+pub mod history;
 pub mod icons;
 pub mod layer_clipboard;
 pub mod liquify;

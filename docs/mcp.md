@@ -63,7 +63,11 @@ Local Claude Desktop, Cursor and Gemini setup follows their [Claude guide](https
 
 Observe → edit a small batch → inspect the actual result → undo if it is weak → refine and retry. Use redo to compare versions. Do not assume an initial edit is perfect. Publish concise natural-language progress with `peerbrush_task` begin/update descriptions; an empty `scopes` array publishes activity without locking anything.
 
-Use the same unique `actor` in every call. AI undo/redo requires the current revision and only reverses its own latest batch. If another participant edited afterward, inspect again and preserve their changes; selective task undo is on the backlog. Human undo is chronological and can reverse either participant's latest batch.
+Use the same unique `actor` in every call. AI chronological undo/redo requires the current revision and only reverses its own latest batch. Human undo is chronological and can reverse either participant's latest batch. To undo an agent task across interleaved edits, inspect its inverse with `history` action `inspect_task`, then use `undo_task` with the same `task` ID and current `expected_revision`. `list` includes tasks and their active batch counts. Human calls can set `task_actor` to choose an agent; agents can compensate only their own tasks.
+
+Selective undo preserves unrelated pixel edits, mask pixels, source properties and individual effect settings. Inspection returns affected `scopes`, batch revisions, `can_undo` and structured `conflicts` with target, field and document rectangle where available. Overlapping changes, later edits to task-created sources, incompatible frames/hierarchy, reservations and protected documents prevent the entire undo. There is no conflict override. A task whose batches were evicted from the 40-step in-memory history is refused rather than partially undone. History resets on new/open; saved PSD source data does not contain task history.
+
+The task inverse commits as one new history step. Undoing that compensation restores exactly the document immediately before task undo; redo applies it again. New edits still clear redo. Native 16-bit pixels remain native; comparisons do not use display projections. The native **AI tasks** menu exposes the same scope/conflict review and operation.
 
 ```json
 {"action":"undo","actor":"my-agent","expected_revision":7,"max_edge":768}

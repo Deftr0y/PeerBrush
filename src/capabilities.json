@@ -1,6 +1,13 @@
 {
   "version": "build",
   "coordinates": "Document pixels. rect=[left,top,right,bottom], right/bottom exclusive.",
+  "selective_task_undo": {
+    "tool": "peerbrush_history",
+    "inspect": {"action":"inspect_task","actor":"my-agent","task":"TASK_ID"},
+    "undo": {"action":"undo_task","actor":"my-agent","task":"TASK_ID","expected_revision":7},
+    "behavior": "Compensates all retained active batches for one agent task, preserving later unrelated pixels and source settings. Returns precise affected scopes and conflicts. Conflicts reject the whole operation. A human may provide task_actor to select an agent; agents may undo only their own tasks. The compensation is one chronological undo/redo step.",
+    "limits": "40 in-memory history steps. Tasks with evicted batches are refused rather than partially undone. New/open documents reset history. No conflict override. Task-created sources with later edits and incompatible hierarchy/frame changes are protected."
+  },
   "limits": {
     "max_edge": 8192,
     "max_pixels": 33554432,
@@ -568,7 +575,6 @@
     "subject/object segmentation",
     "heal/clone",
     "disk eviction",
-    "selective task undo",
     "broader Photoshop clipping/pass-through group compatibility"
   ],
   "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local PNG/JPEG path or base64 PNG. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",

@@ -3,6 +3,7 @@ mod animation;
 mod brush;
 mod color;
 mod effects;
+mod history;
 mod layers;
 mod liquify;
 mod selection;
@@ -189,6 +190,7 @@ pub struct PeerBrush {
     selection_path: Vec<[f32; 2]>,
     selection_gesture_mode: Option<String>,
     project_settings: Option<(u32, u32, u16)>,
+    task_undo_review: Option<Value>,
     color: Pixel,
     mask_value: u8,
     radius: f32,
@@ -424,6 +426,7 @@ impl PeerBrush {
             selection_path: vec![],
             selection_gesture_mode: None,
             project_settings: None,
+            task_undo_review: None,
             color: [233, 84, 32, 255],
             mask_value: 0,
             radius: 18.0,
@@ -2691,6 +2694,8 @@ impl PeerBrush {
                     let aspect=self.wordmark.size_vec2().x/self.wordmark.size_vec2().y;
                     ui.add(egui::Image::new((self.wordmark.id(),Vec2::new(136.0,136.0/aspect))))
                         .on_hover_text("PeerBrush · You and your AI. Same canvas.");
+                    ui.add_space(12.0);
+                    self.task_history_menu(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
                         let settings = icons::small_button(ui, Icon::Adjust, "AI connection settings");
@@ -3150,6 +3155,7 @@ impl PeerBrush {
             self.brush_settings(ctx);
         }
         self.color_window(ctx);
+        self.task_history_review(ctx, &doc);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")

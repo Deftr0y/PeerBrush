@@ -22,7 +22,7 @@ pub fn check_size(w: u32, h: u32) -> Result<(), String> {
 }
 
 /// Copy-on-write sparse tiles: empty layers and history do not duplicate full canvases.
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Raster {
     pub width: u32,
     pub height: u32,

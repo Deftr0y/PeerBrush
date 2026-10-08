@@ -2,7 +2,7 @@ use crate::raster::{blend, check_size, png, Pixel, Raster};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -350,6 +350,8 @@ pub struct History {
     pub task: Option<String>,
     pub scopes: Vec<Scope>,
     pub gesture: Option<String>,
+    /// Revisions compensated by a selective undo; never part of editable sources.
+    pub reverted: Vec<u64>,
 }
 /// Ephemeral visual activity; never stored in PSDs or undo snapshots.
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -366,6 +368,7 @@ pub struct Engine {
     pub leases: Vec<Lease>,
     pub undo: Vec<History>,
     pub redo: Vec<History>,
+    pub(crate) truncated_tasks: BTreeSet<(String, String)>,
     pub changes: Vec<(u64, Vec<Scope>)>,
     pub saved_revision: u64,
     pub feedback: BTreeMap<String, String>,
@@ -435,6 +438,7 @@ impl Engine {
             leases: vec![],
             undo: vec![],
             redo: vec![],
+            truncated_tasks: BTreeSet::new(),
             changes: vec![],
             saved_revision: 0,
             feedback: BTreeMap::new(),
@@ -454,7 +458,7 @@ impl Engine {
         self.leases.retain(|l| l.expires > now());
         self.mcp_clients.retain(|_, expiry| *expiry > now());
     }
-    fn mark_ai(&mut self, actor: &str, label: &str, tool: &str, scopes: Vec<Scope>) {
+    pub(crate) fn mark_ai(&mut self, actor: &str, label: &str, tool: &str, scopes: Vec<Scope>) {
         if actor == "human" {
             return;
         }
@@ -1092,11 +1096,10 @@ impl Engine {
                 task: task.map(String::from),
                 scopes: scopes.clone(),
                 gesture: gesture.map(String::from),
+                reverted: vec![],
             });
         }
-        if self.undo.len() > 40 {
-            self.undo.remove(0);
-        }
+        self.trim_history();
         self.redo.clear();
         self.changes.push((revision, scopes));
         if self.changes.len() > 200 {
@@ -2072,7 +2075,7 @@ impl Engine {
     pub fn undo(&mut self, actor: &str) -> Result<(), String> {
         let h = self.undo.last().ok_or("Nothing to undo")?.clone();
         if actor != "human" && h.actor != actor {
-            return Err("Latest change belongs to another participant. Observe again; selective task undo is planned.".into());
+            return Err("Latest change belongs to another participant. Observe again or inspect selective task undo.".into());
         }
         self.check(actor, &h.scopes)?;
         let revision = self.doc.revision + 1;
@@ -2135,6 +2138,7 @@ impl Engine {
         self.undo.clear();
         self.redo.clear();
         self.changes.clear();
+        self.truncated_tasks.clear();
         self.ai_change = None;
         Ok(())
     }

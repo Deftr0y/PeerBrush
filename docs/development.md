@@ -1,5 +1,9 @@
 # Development
 
+Selective task undo uses three-way source deltas, applied in reverse batch order to a copy of the current document. Sparse raster deltas compare whole RGBA pixels at native depth; mask steps/effects use stable IDs and individual source settings. Current unrelated work stays in place. Conflicting pixels/settings, task-created sources with later edits, hierarchy/frame incompatibilities, reservations and read-only documents reject the entire inverse. Inspection exposes scopes, field/region conflicts and source batch revisions through the engine, HTTP/MCP/CLI and the native AI tasks review. Pixel scopes follow the current layer origin; reparent/restoration checks include source/destination dependencies.
+
+Successful compensation is one new chronological history entry, so undo restores the precise pre-compensation state and redo reapplies it. Original batch revisions mark compensated entries; fresh batches on the same task can be undone separately. Tasks that exceed the retained 40 history entries are explicitly refused rather than partially reverted. Derived keys refresh independently; PSD sources contain no task history or caches. Engine/protocol/native checks cover interleaved native pixels and masks, independent effect settings, strict conflicts, created/deleted sources, reservations, stale revisions and chronological undo/redo.
+
 Use stable Rust with native platform build prerequisites. The desktop shell uses egui/eframe and wgpu; document edits, PSD handling, and transports remain separate modules.
 
 ```sh

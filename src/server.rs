@@ -194,7 +194,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
         {"name":"peerbrush_document","description":"New/open/save PSD or export PNG. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","save","export","compatible_copy"]},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"expected_revision":{"type":"integer"}},"required":["action"]}},
-        {"name":"peerbrush_history","description":"Work like an artist: inspect each result, undo unsatisfactory attempts, revise and try again, or redo to compare. AI undo/redo requires expected_revision and only reverses its own latest batch; preserve interleaved human work. Returns visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
+        {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply an absolute local PNG/JPEG path or base64 PNG, and exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_capabilities","description":"Get concise supported operations and runnable JSON examples before editing.","inputSchema":{"type":"object","properties":{}}}
     ])
@@ -424,11 +424,16 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
         "history" => {
             let mut e = shared.lock().unwrap();
             let action = p.get("action").and_then(Value::as_str).unwrap_or("list");
+            let task = p.get("task").and_then(Value::as_str).unwrap_or("");
+            let owner = p.get("task_actor").and_then(Value::as_str).unwrap_or(actor);
+            if action == "inspect_task" {
+                return e.inspect_task_undo(actor, owner, task);
+            }
             if action != "list" {
                 if actor != "human" && p.get("expected_revision").and_then(Value::as_u64).is_none()
                 {
                     return Err(
-                        "AI undo/redo requires expected_revision from the latest observation"
+                        "AI history changes require expected_revision from the latest observation"
                             .into(),
                     );
                 }
@@ -442,10 +447,13 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             match action {
                 "undo" => e.undo(actor)?,
                 "redo" => e.redo(actor)?,
+                "undo_task" => {
+                    e.undo_task(actor, owner, task)?;
+                }
                 "list" => {}
                 _ => return Err("Unknown history action".into()),
             }
-            let mut result = json!({"revision":e.doc.revision,"undo":e.undo.iter().map(|h|json!({"actor":h.actor,"label":h.label,"task":h.task})).collect::<Vec<_>>(),"redo_count":e.redo.len()});
+            let mut result = json!({"revision":e.doc.revision,"undo":e.undo.iter().map(|h|json!({"actor":h.actor,"label":h.label,"task":h.task,"revision":h.after.revision,"reverted_batches":h.reverted})).collect::<Vec<_>>(),"redo_count":e.redo.len(),"tasks":e.task_history()});
             drop(e);
             if action != "list" && p["feedback"] != "request" {
                 result["images"] = observation(
