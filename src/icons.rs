@@ -8,6 +8,8 @@ pub enum Icon {
     Scale,
     Brush,
     Smudge,
+    Clone,
+    Heal,
     Liquify,
     Eraser,
     Fill,
@@ -112,6 +114,24 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
             ]);
             line(&[(-10., -1.), (-7., -3.)]);
             line(&[(9., 7.), (11., 9.)]);
+        }
+        Icon::Clone => {
+            line(&[(-9., 9.), (-9., 4.), (9., 4.), (9., 9.), (-9., 9.)]);
+            line(&[
+                (-5., 4.),
+                (-4., -1.),
+                (-4., -8.),
+                (4., -8.),
+                (4., -1.),
+                (5., 4.),
+            ]);
+            line(&[(-11., 12.), (11., 12.)]);
+        }
+        Icon::Heal => {
+            line(&[(-10., -5.), (-5., -10.), (10., 5.), (5., 10.), (-10., -5.)]);
+            line(&[(-3., -6.), (6., 3.)]);
+            line(&[(-6., -3.), (3., 6.)]);
+            painter.circle_filled(point(0., 0.), f, color);
         }
         Icon::Liquify => {
             for y in [-8., 0., 8.] {

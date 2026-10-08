@@ -471,6 +471,31 @@ pub(crate) fn work_budget(dabs: &[Dab], clip: [i32; 4]) -> Result<(), String> {
     Ok(())
 }
 
+/// Shared pressure/texture/flow coverage for tools that sample pixels instead of pigment.
+pub(crate) fn sampled_coverage(
+    raster: &Raster,
+    points: &[[f32; 2]],
+    pressures: Option<&[f32]>,
+    settings: Settings,
+    clip: Option<[i32; 4]>,
+    polygon: Option<&[[f32; 2]]>,
+) -> Result<BTreeMap<(u32, u32), Vec<u16>>, String> {
+    let dabs = dabs(points, pressures, settings)?;
+    let area = clip.unwrap_or([0, 0, raster.width as i32, raster.height as i32]);
+    let area = [
+        area[0].max(0),
+        area[1].max(0),
+        area[2].min(raster.width as i32),
+        area[3].min(raster.height as i32),
+    ];
+    work_budget(&dabs, area)?;
+    let mut coverage = BTreeMap::new();
+    if settings.opacity > 0. && settings.flow > 0. {
+        accumulate16(&mut coverage, &dabs, settings, area, polygon);
+    }
+    Ok(coverage)
+}
+
 pub fn paint(
     raster: &mut Raster,
     points: &[[f32; 2]],

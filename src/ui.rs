@@ -7,6 +7,7 @@ mod history;
 mod layers;
 mod liquify;
 mod refinement;
+mod retouch;
 mod selection;
 use crate::{controls, thumbnails};
 use crate::{
@@ -55,6 +56,8 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, _color: Color32) 
         Tool::Scale => Icon::Scale,
         Tool::Brush => Icon::Brush,
         Tool::Smudge => Icon::Smudge,
+        Tool::Clone => Icon::Clone,
+        Tool::Heal => Icon::Heal,
         Tool::Liquify => Icon::Liquify,
         Tool::Eraser => Icon::Eraser,
         Tool::Fill => Icon::Fill,
@@ -83,6 +86,8 @@ enum Tool {
     Scale,
     Brush,
     Smudge,
+    Clone,
+    Heal,
     Liquify,
     Eraser,
     Fill,
@@ -103,6 +108,8 @@ impl Tool {
             Self::Scale => "Scale · R",
             Self::Brush => "Brush · B",
             Self::Smudge => "Wet blend · U",
+            Self::Clone => "Clone · C",
+            Self::Heal => "Heal · J",
             Self::Liquify => "Liquify · L",
             Self::Eraser => "Eraser",
             Self::Fill => "Fill",
@@ -193,6 +200,11 @@ pub struct PeerBrush {
     project_settings: Option<(u32, u32, u16)>,
     task_undo_review: Option<Value>,
     refinement: Option<refinement::Editor>,
+    retouch_source: Option<retouch::Anchor>,
+    retouch_aligned: bool,
+    retouch_merged: bool,
+    retouch_revision: Option<u64>,
+    retouch_pick: bool,
     color: Pixel,
     mask_value: u8,
     radius: f32,
@@ -430,6 +442,11 @@ impl PeerBrush {
             project_settings: None,
             task_undo_review: None,
             refinement: None,
+            retouch_source: None,
+            retouch_aligned: true,
+            retouch_merged: false,
+            retouch_revision: None,
+            retouch_pick: false,
             color: [233, 84, 32, 255],
             mask_value: 0,
             radius: 18.0,
@@ -977,7 +994,14 @@ impl PeerBrush {
         } else {
             ""
         };
-        let stroke = if [Tool::Brush, Tool::Eraser, Tool::Smudge].contains(&self.tool)
+        let stroke = if [
+            Tool::Brush,
+            Tool::Eraser,
+            Tool::Smudge,
+            Tool::Clone,
+            Tool::Heal,
+        ]
+        .contains(&self.tool)
             && !self.points.is_empty()
         {
             let color = if self.mask {
@@ -1164,7 +1188,14 @@ impl PeerBrush {
             if let Some((layer, blend)) = &self.blend_hover {
                 commands.push(json!({"op":"layer.update","layer":layer,"blend":blend}));
             }
-            if [Tool::Brush, Tool::Eraser, Tool::Smudge].contains(&self.tool)
+            if [
+                Tool::Brush,
+                Tool::Eraser,
+                Tool::Smudge,
+                Tool::Clone,
+                Tool::Heal,
+            ]
+            .contains(&self.tool)
                 && !self.points.is_empty()
             {
                 let color = if self.mask {
@@ -1989,6 +2020,15 @@ impl PeerBrush {
         }
     }
     fn canvas(&mut self, ui: &mut egui::Ui, doc: &Document) {
+        if [Tool::Clone, Tool::Heal].contains(&self.tool)
+            && !self.points.is_empty()
+            && self.retouch_revision != Some(doc.revision)
+        {
+            self.points.clear();
+            self.drag_start = None;
+            self.live_gesture = None;
+            self.message = "Image changed during retouch · stroke cancelled".into();
+        }
         self.transient.clear();
         if let Some(editor) = &self.refinement {
             self.transient.push(editor.command());
@@ -2076,8 +2116,15 @@ impl PeerBrush {
         );
         let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
         let to_doc = |p: Pos2| [(p.x - rect.min.x) / scale, (p.y - rect.min.y) / scale];
-        let size_mode = [Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Liquify]
-            .contains(&self.tool)
+        let size_mode = [
+            Tool::Brush,
+            Tool::Eraser,
+            Tool::Smudge,
+            Tool::Clone,
+            Tool::Heal,
+            Tool::Liquify,
+        ]
+        .contains(&self.tool)
             && ui.input(|i| i.key_down(egui::Key::S) && !i.modifiers.command);
         if size_mode && (response.hovered() || self.size_drag.is_some()) {
             if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
@@ -2158,7 +2205,14 @@ impl PeerBrush {
             }
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                 if rect.contains(p)
-                    && ([Tool::Brush, Tool::Eraser, Tool::Smudge].contains(&self.tool))
+                    && ([
+                        Tool::Brush,
+                        Tool::Eraser,
+                        Tool::Smudge,
+                        Tool::Clone,
+                        Tool::Heal,
+                    ]
+                    .contains(&self.tool))
                     && !(self.tool == Tool::Brush && ui.input(|i| i.modifiers.alt))
                 {
                     self.tip_outline(&painter, p, scale);
@@ -2182,6 +2236,62 @@ impl PeerBrush {
         {
             self.pan += response.drag_delta();
             return;
+        }
+        if [Tool::Clone, Tool::Heal].contains(&self.tool) {
+            if let Some(source) = &self.retouch_source {
+                if source.project == doc.id {
+                    let point = if self.retouch_aligned {
+                        if let (Some(destination), Some(pointer)) =
+                            (source.destination, response.hover_pos())
+                        {
+                            let p = to_doc(pointer);
+                            [
+                                source.point[0] + p[0] - destination[0],
+                                source.point[1] + p[1] - destination[1],
+                            ]
+                        } else {
+                            source.point
+                        }
+                    } else {
+                        source.point
+                    };
+                    let p = to_screen(point);
+                    for (width, color) in [(3_f32, Color32::BLACK), (1_f32, Color32::WHITE)] {
+                        painter.circle_stroke(p, 5., Stroke::new(width, color));
+                        painter.line_segment(
+                            [p - Vec2::new(8., 0.), p + Vec2::new(8., 0.)],
+                            Stroke::new(width, color),
+                        );
+                        painter.line_segment(
+                            [p - Vec2::new(0., 8.), p + Vec2::new(0., 8.)],
+                            Stroke::new(width, color),
+                        );
+                    }
+                }
+            }
+            if ui.input(|i| i.modifiers.alt) || self.retouch_pick {
+                let pick = if self.retouch_pick {
+                    response.clicked()
+                } else {
+                    ui.input(|i| i.pointer.primary_pressed())
+                };
+                if response.hovered() && pick {
+                    if let Some(p) = response.hover_pos().filter(|p| rect.contains(*p)) {
+                        self.retouch_source = Some(retouch::Anchor {
+                            project: doc.id.clone(),
+                            layer: self.selected.clone(),
+                            mask: self.mask,
+                            point: to_doc(p),
+                            destination: None,
+                        });
+                        self.message = "Clone/heal source set · paint to retouch".into();
+                        self.retouch_pick = false;
+                    }
+                }
+                self.points.clear();
+                self.drag_start = None;
+                return;
+            }
         }
         if self.tool == Tool::Brush && ui.input(|i| i.modifiers.alt) {
             if !self.points.is_empty() {
@@ -2268,6 +2378,9 @@ impl PeerBrush {
             {
                 if rect.contains(pos) {
                     let point = to_doc(pos);
+                    if !self.begin_retouch(doc, point) {
+                        return;
+                    }
                     self.drag_start = Some(point);
                     self.points = vec![point];
                     self.stroke_pressures = vec![self.current_pressure.unwrap_or(1.)];
@@ -2293,7 +2406,16 @@ impl PeerBrush {
             }
         }
         if !self.points.is_empty() {
-            if ![Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Liquify].contains(&self.tool) {
+            if ![
+                Tool::Brush,
+                Tool::Eraser,
+                Tool::Smudge,
+                Tool::Clone,
+                Tool::Heal,
+                Tool::Liquify,
+            ]
+            .contains(&self.tool)
+            {
                 if let (Some(a), Some(b)) = (self.drag_start, self.points.last()) {
                     let r = Rect::from_two_pos(to_screen(a), to_screen(*b));
                     if self.tool == Tool::Selection {
@@ -2330,7 +2452,7 @@ impl PeerBrush {
                     a[1].max(b[1]) as i32,
                 ];
                 match self.tool{
-            Tool::Brush|Tool::Eraser|Tool::Smudge=>{let c=if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color};self.paint_command(self.points.clone(),c,"Brush stroke");},
+            Tool::Brush|Tool::Eraser|Tool::Smudge|Tool::Clone|Tool::Heal=>{let c=if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color};self.paint_command(self.points.clone(),c,"Brush stroke");},
             Tool::Liquify=>{let command=self.liquify_command(&self.points);self.edit(vec![command],"Liquify stroke");},
             Tool::Move=>self.layer_cmd("move",json!({"dx":(b[0]-a[0]) as i32,"dy":(b[1]-a[1]) as i32}),"Move layer"),
             Tool::Rectangle|Tool::Ellipse=>self.layer_cmd("shape",json!({"kind":if self.tool==Tool::Ellipse{"ellipse"}else{"rectangle"},"rect":area,"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}),"Draw shape"),
@@ -2348,8 +2470,11 @@ impl PeerBrush {
             if let Some(pos) = response.interact_pointer_pos() {
                 if rect.contains(pos) {
                     let p = to_doc(pos);
+                    if !self.begin_retouch(doc, p) {
+                        return;
+                    }
                     match self.tool {
-                        Tool::Brush | Tool::Eraser | Tool::Smudge => {
+                        Tool::Brush | Tool::Eraser | Tool::Smudge | Tool::Clone | Tool::Heal => {
                             let c = if self.mask {
                                 [
                                     self.mask_value,
@@ -2522,6 +2647,9 @@ impl PeerBrush {
         }
         self.thumb_worker.document(&doc);
         if self.thumb_document != doc.id {
+            self.retouch_source = None;
+            self.retouch_revision = None;
+            self.retouch_pick = false;
             self.thumbs.clear();
             self.thumb_pending.clear();
             self.thumb_document = doc.id.clone();
@@ -2668,6 +2796,8 @@ impl PeerBrush {
                 for (key, tool) in [
                     (egui::Key::B, Tool::Brush),
                     (egui::Key::U, Tool::Smudge),
+                    (egui::Key::C, Tool::Clone),
+                    (egui::Key::J, Tool::Heal),
                     (egui::Key::L, Tool::Liquify),
                     (egui::Key::D, Tool::Eraser),
                     (egui::Key::Q, Tool::None),
@@ -2699,7 +2829,7 @@ impl PeerBrush {
                 if i.key_pressed(egui::Key::X) && !i.modifiers.command {
                     self.swap_colors();
                 }
-                if !i.modifiers.command && [Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Liquify].contains(&self.tool) {
+                if !i.modifiers.command && [Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Clone, Tool::Heal, Tool::Liquify].contains(&self.tool) {
                     let smaller = i.key_pressed(egui::Key::OpenBracket)
                         || i.events
                             .iter()
@@ -2902,7 +3032,7 @@ impl PeerBrush {
                     if self.mask {
                         ui.label(RichText::new("MASK").size(10.0).color(ACCENT));
                     }
-                    if [Tool::Brush, Tool::Eraser, Tool::Smudge].contains(&self.tool) {
+                    if [Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Clone, Tool::Heal].contains(&self.tool) {
                         controls::label(ui, "Size");
                         let mut size = self.radius * 2.0;
                         controls::range(
@@ -2923,6 +3053,7 @@ impl PeerBrush {
                     if self.tool == Tool::Liquify {
                         liquify::toolbar(ui, &mut self.radius, &mut self.liquify);
                     }
+                    self.retouch_toolbar(ui);
                     if self.tool == Tool::SmartMask {
                         controls::label(ui, "Tolerance");
                         controls::range(
@@ -3051,6 +3182,8 @@ impl PeerBrush {
                             Tool::Scale,
                             Tool::Brush,
                             Tool::Smudge,
+                            Tool::Clone,
+                            Tool::Heal,
                             Tool::Liquify,
                             Tool::Eraser,
                             Tool::Fill,
@@ -3103,6 +3236,8 @@ impl PeerBrush {
                                 (ai_tool, tool),
                                 (Some("brush"), Tool::Brush)
                                     | (Some("smudge"), Tool::Smudge)
+                                    | (Some("clone"), Tool::Clone)
+                                    | (Some("heal"), Tool::Heal)
                                     | (Some("liquify"), Tool::Liquify)
                                     | (Some("eraser"), Tool::Eraser)
                                     | (Some("move"), Tool::Move)
@@ -4700,6 +4835,107 @@ mod tests {
         // Invert then gamma 2 gives 63; reversing execution would give 191.
         assert_eq!(expected[3], 63);
         assert_eq!(e.undo.len(), 1);
+    }
+    #[test]
+    fn retouch_source_alignment_live_pixels_and_one_undo_follow_native_input() {
+        for shortcut in [egui::Key::C, egui::Key::J] {
+            let (mut app, ctx) = small_fixture();
+            {
+                let mut e = app.shared.lock().unwrap();
+                for y in 0..32 {
+                    for x in 0..32 {
+                        e.doc.layers[0].pixels.set(
+                            x,
+                            y,
+                            [if x < 16 { 210 } else { 40 }, 80, 35, 255],
+                        );
+                    }
+                }
+                e.doc.layers[0].pixels.set(23, 16, [250, 180, 120, 255]);
+            }
+            key(&mut app, &ctx, shortcut);
+            app.radius = 3.;
+            app.brush.hardness = 1.;
+            frame(&mut app, &ctx, vec![], Default::default());
+            let rect = app.view_rect.unwrap();
+            let scale = rect.width() / 32.;
+            let source = rect.min + Vec2::new(7., 16.) * scale;
+            let start = rect.min + Vec2::new(22., 16.) * scale;
+            let end = rect.min + Vec2::new(24., 16.) * scale;
+            click(&mut app, &ctx, start);
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            assert!(app.message.contains("Alt-click"));
+            let alt = egui::Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(source),
+                    button(source, egui::PointerButton::Primary, true, alt),
+                ],
+                alt,
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![button(source, egui::PointerButton::Primary, false, alt)],
+                alt,
+            );
+            assert!(app.retouch_source.is_some());
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    button(
+                        start,
+                        egui::PointerButton::Primary,
+                        true,
+                        Default::default(),
+                    ),
+                ],
+                Default::default(),
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(end)],
+                Default::default(),
+            );
+            let before = app.shared.lock().unwrap().doc.clone();
+            let command = app.stroke_command(app.points.clone(), app.color);
+            let preview = Engine::preview_edits(before.clone(), &[command]).unwrap();
+            assert_ne!(preview.export_png().unwrap(), before.export_png().unwrap());
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            frame(
+                &mut app,
+                &ctx,
+                vec![button(
+                    end,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+                Default::default(),
+            );
+            let mut e = app.shared.lock().unwrap();
+            assert_eq!(e.undo.len(), 1);
+            assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            drop(e);
+            let doc = app.shared.lock().unwrap().doc.clone();
+            assert!(app.begin_retouch(&doc, [26., 16.]));
+            let next = app.stroke_command(vec![[26., 16.]], app.color);
+            assert_eq!(next["source"], json!([11., 16.]));
+            app.mask = true;
+            assert!(!app.begin_retouch(&doc, [26., 16.]));
+            assert!(app.retouch_source.is_none());
+        }
     }
     fn small_fixture() -> (PeerBrush, egui::Context) {
         let (mut app, ctx) = fixture();

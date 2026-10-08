@@ -103,7 +103,7 @@ Then develop the following slices in the user's requested priority order:
 | Priority | ID | Feature | Status | Acceptance |
 | --- | --- | --- | --- | --- |
 | 1 | PB-063 | Better selections and masking | Implemented and verified | Selection tools, confidence import, Smooth/Feather/Shift/Contrast/image-guided edge refinement, layer-mask conversion and native mask refinement share the engine. Compact native controls preview actual cutout/mask/overlay pixels and commit once. Optional externally configured learned subject/object provider returns confidence with exact document coordinates; stale/failed/reserved results leave work intact. Native16 source/mask precision, one undo and standard PSD16 composite/reopen checks passed. See [provider/refinement documentation](docs/segmentation.md). |
-| 2 | PB-064 | Clone and heal tools | Planned | Cleanup and retouching with shared human/AI controls, explicit source coordinates, selection/mask support, live rendered previews and undoable gestures. |
+| 2 | PB-064 | Clone and heal tools | Implemented and verified | Cleanup and retouching with shared human/AI controls, explicit source coordinates, selection/mask support, live rendered previews and undoable gestures. |
 | 3 | PB-065 | Crop, canvas resize and image resize | Planned | Clear anchors, explicit document dimensions and coordinates, live previews and reversible changes through the shared engine. |
 | 4 | PB-066 | Editable text and vector shapes | Planned | Preserve editable source properties alongside current standard PSD raster output and merged composite; shared UI/MCP/CLI editing. |
 | 5 | PB-067 | Non-destructive transforms | Planned | Retain original pixels so repeated rotation and scaling do not degrade artwork; render the actual result live, preserve masks/effects and finish each gesture as one undo step. |
@@ -136,3 +136,5 @@ These requests are queued for later development; they do not replace the active 
 ## Working rule
 
 Keep the initial editing/PSD/MCP slice usable before adding breadth. Prioritize reliability and human–AI cooperation. New feature ideas do not replace the active implementation task unless the user explicitly says so.
+
+PB-064 verification: 117 engine, codec, protocol, native UI, painting and selection checks passed across the targeted suites. Native C/J tools, source picking and aligned sampling were visually checked; clone/heal each committed one gesture, one undo restored the original PNG16 exactly, and both standard PSD16 composites and editable reopen preserved original channel precision. See [retouch behavior and commands](docs/retouch.md).

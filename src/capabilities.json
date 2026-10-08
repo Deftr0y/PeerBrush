@@ -3,8 +3,17 @@
   "coordinates": "Document pixels. rect=[left,top,right,bottom], right/bottom exclusive.",
   "selective_task_undo": {
     "tool": "peerbrush_history",
-    "inspect": {"action":"inspect_task","actor":"my-agent","task":"TASK_ID"},
-    "undo": {"action":"undo_task","actor":"my-agent","task":"TASK_ID","expected_revision":7},
+    "inspect": {
+      "action": "inspect_task",
+      "actor": "my-agent",
+      "task": "TASK_ID"
+    },
+    "undo": {
+      "action": "undo_task",
+      "actor": "my-agent",
+      "task": "TASK_ID",
+      "expected_revision": 7
+    },
     "behavior": "Compensates all retained active batches for one agent task, preserving later unrelated pixels and source settings. Returns precise affected scopes and conflicts. Conflicts reject the whole operation. A human may provide task_actor to select an agent; agents may undo only their own tasks. The compensation is one chronological undo/redo step.",
     "limits": "40 in-memory history steps. Tasks with evicted batches are refused rather than partially undone. New/open documents reset history. No conflict override. Task-created sources with later edits and incompatible hierarchy/frame changes are protected."
   },
@@ -565,6 +574,48 @@
       "width": 1024,
       "height": 768,
       "bit_depth": 16
+    },
+    {
+      "op": "clone",
+      "layer": "ID",
+      "source": [
+        120,
+        80
+      ],
+      "points": [
+        [
+          300,
+          200
+        ],
+        [
+          320,
+          205
+        ]
+      ],
+      "radius": 12,
+      "hardness": 0.8,
+      "opacity": 0.7
+    },
+    {
+      "op": "heal",
+      "layer": "ID",
+      "source": [
+        120,
+        80
+      ],
+      "points": [
+        [
+          300,
+          200
+        ],
+        [
+          320,
+          205
+        ]
+      ],
+      "radius": 12,
+      "heal_radius": 16,
+      "sample_merged": true
     }
   ],
   "not_yet": [
@@ -664,7 +715,7 @@
     ],
     "empty": "Active zero-coverage selection; selection=null means deselected.",
     "object_region": "Deterministic perimeter-color extraction. Use peerbrush_segment for learned subject/object confidence.",
-    "refinement": "selection.refine and mask.refine accept smooth 0–32 px, feather 0–64 px, shift -32–32 px, contrast 0–100%, edge 0–100% and edge_radius 1–32 px. Image-guided feathering uses merged colors by default; sample_merged:false and layer select one source. Native16 mask words and original mask steps remain intact. source_revision/document_id protect snapshot-dependent results.",
+    "refinement": "selection.refine and mask.refine accept smooth 0\u201332 px, feather 0\u201364 px, shift -32\u201332 px, contrast 0\u2013100%, edge 0\u2013100% and edge_radius 1\u201332 px. Image-guided feathering uses merged colors by default; sample_merged:false and layer select one source. Native16 mask words and original mask steps remain intact. source_revision/document_id protect snapshot-dependent results.",
     "mask_from_selection": "mask.from_selection on a layer maps document coverage into its native local mask frame. mode replace/add/subtract/intersect; one undoable editable paint step.",
     "confidence_import": "selection.import accepts one PNG path or base64 png, an explicit in-canvas document rect, channel luma/alpha and selection mode. Bilinear confidence resampling preserves soft edges. Maximum document/mask size 16 megapixels; original image channels stay unchanged.",
     "preview": "peerbrush_observe selection_view cutout/mask/overlay returns presentation-only PNG feedback with actual document coordinates."
@@ -672,7 +723,33 @@
   "segmentation": {
     "configured": false,
     "provider": "Optional local executable configured with PEERBRUSH_SEGMENTATION_CONFIG. Model choice, runtime and weights remain outside the application; see docs/segmentation.md.",
-    "request": {"tool":"peerbrush_segment","expected_revision":12,"rect":[0,0,640,480],"point":[220,180],"mode":"replace"},
-    "limits": "One inference at a time, 2048-pixel preview edge, 16-megapixel document, 16 MiB JSON input/output and configurable 1–180 second timeout. Source revision/project changes cancel the result; leases and history use the shared engine."
+    "request": {
+      "tool": "peerbrush_segment",
+      "expected_revision": 12,
+      "rect": [
+        0,
+        0,
+        640,
+        480
+      ],
+      "point": [
+        220,
+        180
+      ],
+      "mode": "replace"
+    },
+    "limits": "One inference at a time, 2048-pixel preview edge, 16-megapixel document, 16 MiB JSON input/output and configurable 1\u2013180 second timeout. Source revision/project changes cancel the result; leases and history use the shared engine."
+  },
+  "retouch": {
+    "commands": [
+      "clone",
+      "heal"
+    ],
+    "source": "Required [x,y] document coordinates; source_layer defaults to destination paint layer. source offset is relative to first destination point; frozen before destination edits. Optional sample_merged includes visible effects/masks.",
+    "guards": "Optional document_id and exact source_revision reject stale or different source documents. Shared expected_revision, task reservations and locks apply.",
+    "mask": "mask:true writes the active paint mask step. Source is evaluated layer mask or explicit source_step paint ID. No merged artwork into masks.",
+    "precision": "Native16 source samples, premultiplied fractional interpolation and grayscale values remain native16. Heal preserves destination alpha and transparent hidden pixels.",
+    "limits": "Merged sampling 16 MP; heal_radius integer 1\u201364 (default brush radius clamped 1\u201332). Brush work budgets apply.",
+    "algorithm": "Clone copies sampled color/alpha through brush coverage. Heal transfers texture with local average color adaptation; not full Photoshop healing."
   }
 }

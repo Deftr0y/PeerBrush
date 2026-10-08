@@ -716,7 +716,7 @@ impl Engine {
                 rect: None,
             }];
         }
-        let mut area = if ["paint", "smudge", "liquify.stroke"].contains(&op) {
+        let mut area = if ["paint", "smudge", "clone", "heal", "liquify.stroke"].contains(&op) {
             c.get("points").and_then(Value::as_array).map(|p| {
                 let r = num(c, "radius", 10.0) as f32 + 2.0;
                 let mut a = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
@@ -1060,6 +1060,8 @@ impl Engine {
             "paint" if command["erase"] == true => "eraser",
             "paint" => "brush",
             "smudge" => "smudge",
+            "clone" => "clone",
+            "heal" => "heal",
             "liquify.stroke" => "liquify",
             "adjustment.add" => "effects",
             "move" => "move",
@@ -1132,6 +1134,8 @@ impl Engine {
             Some(
                 "paint"
                     | "smudge"
+                    | "clone"
+                    | "heal"
                     | "shape"
                     | "gradient"
                     | "fill"
@@ -1833,6 +1837,9 @@ impl Engine {
         if ["move", "transform"].contains(&op) && self.doc.layers[i].kind == "group" {
             return crate::transform::folder(&mut self.doc, target, c);
         }
+        if ["clone", "heal"].contains(&op) {
+            return crate::retouch::apply(&mut self.doc, i, c);
+        }
         let layer = &mut self.doc.layers[i];
         if ["move", "transform"].contains(&op) && c["selection_only"].as_bool() != Some(false) {
             if let Some(coverage) = selection_coverage {
@@ -2178,7 +2185,10 @@ fn mask_parameter(kind: &str, value: f64) -> Result<f32, String> {
     }
     Ok(value as f32)
 }
-fn edit_raster<'a>(layer: &'a mut Layer, command: &Value) -> Result<&'a mut Raster, String> {
+pub(crate) fn edit_raster<'a>(
+    layer: &'a mut Layer,
+    command: &Value,
+) -> Result<&'a mut Raster, String> {
     if command
         .get("mask")
         .and_then(Value::as_bool)

@@ -117,7 +117,7 @@ The long-term goal is an MCP-native creative application where compatible AI age
 - Local and remote model support through connected agents
 - Extensible tool and plugin architecture
 
-Development now includes retained regional previews, tiled GPU previews, folder transforms, selective agent-task undo, richer edge refinement and optional local learned subject/object selection. The next slices include clone/heal, crop/resize, editable text/vector sources, original-retaining transforms, large-document handling, AI proposals and stronger Photoshop fidelity, followed by the requested effects/brush/toolbar UX and project lifecycle work. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status; [learned-selection setup](docs/segmentation.md) keeps model choice outside the editor.
+Development now includes retained regional previews, tiled GPU previews, folder transforms, selective agent-task undo, richer edge refinement, optional local learned subject/object selection and native clone/heal. The next slices include crop/resize, editable text/vector sources, original-retaining transforms, large-document handling, AI proposals and stronger Photoshop fidelity, followed by the requested effects/brush/toolbar UX and project lifecycle work. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status; [learned-selection setup](docs/segmentation.md) keeps model choice outside the editor.
 
 ## Status
 

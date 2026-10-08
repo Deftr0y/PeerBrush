@@ -131,6 +131,7 @@ impl PeerBrush {
         let b = self.brush;
         let pressures = (self.stroke_has_pressure && self.stroke_pressures.len() == points.len())
             .then_some(&self.stroke_pressures);
+        let sampled_points = points.clone();
         let mut command = json!({"op":if self.tool==Tool::Smudge {"smudge"}else{"paint"},"layer":self.selected,"points":points,"radius":self.radius,"color":color,
             "mask":self.mask,"step":self.mask_step,"erase":self.tool==Tool::Eraser,
             "hardness":b.hardness,"opacity":b.opacity,"flow":b.flow,"spacing":b.spacing,
@@ -142,11 +143,12 @@ impl PeerBrush {
         if let Some(pressures) = pressures {
             command["pressures"] = json!(pressures);
         }
+        self.retouch_command(&mut command, &sampled_points);
         command
     }
     pub(super) fn brush_settings(&mut self, ctx: &egui::Context) {
         let mut open = true;
-        egui::Window::new(if self.tool==Tool::Smudge {"Smudge"}else{"Brush"})
+        egui::Window::new(match self.tool {Tool::Smudge=>"Smudge",Tool::Clone=>"Clone",Tool::Heal=>"Heal",_=>"Brush"})
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
