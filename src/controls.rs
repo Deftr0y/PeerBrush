@@ -69,7 +69,15 @@ pub fn range_with_color(
                         .max_decimals(decimals),
                 )
             })
-            .inner;
+            .inner
+            .interact(egui::Sense::click_and_drag());
+        // A click focuses the control; actual pointer movement edits it. This
+        // avoids changing the value/history while opening the numeric editor.
+        if (response.is_pointer_button_down_on() && !response.dragged())
+            || (response.clicked() && !response.drag_stopped())
+        {
+            *value = before;
+        }
         let rect = Rect::from_center_size(
             response.rect.center(),
             Vec2::new(response.rect.width(), 22.0),
@@ -78,7 +86,7 @@ pub fn range_with_color(
         if response.double_clicked() && ui.is_enabled() {
             *value = before;
             ui.ctx()
-                .data_mut(|d| d.insert_temp(editor_id, format!("{value:.decimals$}")));
+                .data_mut(|d| d.insert_temp(editor_id, value.to_string()));
         }
         let enabled = ui.is_enabled();
         let muted = if enabled { 1.0 } else { 0.4 };
@@ -111,18 +119,28 @@ pub fn range_with_color(
             let edit = ui.put(
                 rect.shrink2(Vec2::new(7.0, 1.0)),
                 egui::TextEdit::singleline(&mut text)
+                    .id(editor_id)
                     .frame(false)
                     .font(egui::TextStyle::Body)
                     .horizontal_align(egui::Align::RIGHT),
             );
             if response.double_clicked() {
                 edit.request_focus();
+                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), editor_id) {
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(text.chars().count()),
+                        )));
+                    state.store(ui.ctx(), editor_id);
+                }
             }
             let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
             let commit = edit.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
             if cancel || commit {
                 if !cancel {
-                    if let Ok(parsed) = text.parse::<f32>() {
+                    if let Ok(parsed) = text.trim().parse::<f32>() {
                         if parsed.is_finite() {
                             *value = parsed.clamp(low, high);
                         }
@@ -177,6 +195,15 @@ pub fn numeric<N: egui::emath::Numeric>(
         ui.add(egui::DragValue::new(value).range(limits))
     })
     .inner
+}
+
+pub fn number_editing(ctx: &egui::Context, control: egui::Id) -> bool {
+    ctx.data(|data| data.get_temp::<String>(control.with("number")).is_some())
+}
+pub fn cancel_number_edit(ctx: &egui::Context, control: egui::Id) {
+    let editor = control.with("number");
+    ctx.data_mut(|data| data.remove::<String>(editor));
+    ctx.memory_mut(|memory| memory.surrender_focus(editor));
 }
 
 pub fn label(ui: &mut egui::Ui, text: &str) {

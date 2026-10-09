@@ -63,7 +63,7 @@ pub(super) fn settings(
                     },
                     false,
                 );
-                if response.changed() {
+                if response.changed() || response.double_clicked() {
                     settings[key] = json!(value / scale);
                     changed = Some(response);
                 }
@@ -108,7 +108,7 @@ pub(super) fn settings(
                         0,
                         false,
                     );
-                    if response.changed() {
+                    if response.changed() || response.double_clicked() {
                         values[i] = value / 100.0;
                         settings[band] = json!(values);
                         changed = Some(response);
@@ -118,7 +118,7 @@ pub(super) fn settings(
             });
         let mut preserve = settings["preserve_luminosity"].as_bool().unwrap_or(true);
         let response = ui.checkbox(&mut preserve, "Preserve luminosity");
-        if response.changed() {
+        if response.changed() || response.double_clicked() {
             settings["preserve_luminosity"] = json!(preserve);
             changed = Some(response);
         }
@@ -168,7 +168,7 @@ pub(super) fn settings(
                                             0,
                                             false,
                                         );
-                                        if response.changed() {
+                                        if response.changed() || response.double_clicked() {
                                             stroke[key] = json!(value / scale);
                                             edited = true;
                                             changed = Some(response);
@@ -460,7 +460,7 @@ impl PeerBrush {
             false,
         )
         .on_hover_text("Effect strength");
-        if response.changed() {
+        if response.changed() || response.double_clicked() {
             let extra = if mask {
                 json!({"step":effect,"weight":value/100.0})
             } else {

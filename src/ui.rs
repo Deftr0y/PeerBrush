@@ -245,6 +245,8 @@ struct ParameterEdit {
     revision: u64,
     commands: Vec<Value>,
     label: String,
+    typing: Option<egui::Context>,
+    dirty: bool,
 }
 pub struct PeerBrush {
     shared: Shared,
@@ -953,7 +955,10 @@ impl PeerBrush {
             return;
         };
         self.last_preview = None;
-        if cancel {
+        if let Some(ctx) = &edit.typing {
+            controls::cancel_number_edit(ctx, edit.control);
+        }
+        if cancel || !edit.dirty {
             return;
         }
         let mut engine = self.shared.lock().unwrap();
@@ -995,6 +1000,35 @@ impl PeerBrush {
         } else {
             vec![command]
         };
+        if response.double_clicked() && controls::number_editing(&response.ctx, response.id) {
+            self.finish_parameter(false);
+            let doc = self.shared.lock().unwrap().doc.clone();
+            self.parameter_gesture = Some(ParameterEdit {
+                control: response.id,
+                gesture: crate::engine::id(),
+                document: doc.id,
+                revision: doc.revision,
+                commands,
+                label: label.into(),
+                typing: Some(response.ctx.clone()),
+                dirty: false,
+            });
+            self.animation.cancel();
+            return;
+        }
+        if self
+            .parameter_gesture
+            .as_ref()
+            .is_some_and(|edit| edit.control == response.id && edit.typing.is_some())
+        {
+            if response.changed() {
+                let edit = self.parameter_gesture.as_mut().unwrap();
+                edit.commands = commands;
+                edit.dirty = true;
+                self.finish_parameter(false);
+            }
+            return;
+        }
         if down {
             if self
                 .parameter_gesture
@@ -1027,6 +1061,8 @@ impl PeerBrush {
                         revision,
                         commands,
                         label: label.into(),
+                        typing: None,
+                        dirty: true,
                     });
                     self.animation.cancel();
                 }
@@ -1929,7 +1965,7 @@ impl PeerBrush {
                 false,
             );
             self.opacity_rect = Some(response.rect);
-            if response.changed() {
+            if response.changed() || response.double_clicked() {
                 self.layer_parameter(json!({"opacity":percent/100.0}), "Layer opacity", &response);
             }
         });
@@ -2113,7 +2149,7 @@ impl PeerBrush {
                                             ui.horizontal(|ui| {
                                                 controls::label(ui,if step.kind=="fill"{"Value"}else if step.kind=="blur"{"Radius"}else{"Gamma"});
                                                 let response=controls::range(ui,(&step.id,"value"),&mut value,range,180.0,if step.kind=="blur"{" px"}else{""},if step.kind=="levels"{1}else{0},false);
-                                                if response.changed(){self.layer_parameter(json!({"step":step.id,"value":value}),"Mask parameter",&response);}
+                                                if response.changed() || response.double_clicked(){self.layer_parameter(json!({"step":step.id,"value":value}),"Mask parameter",&response);}
                                             });
                                         }
                                         if ["curves","gaussian","adjust"].contains(&step.kind.as_str()) {
@@ -2935,7 +2971,7 @@ impl PeerBrush {
             },
         );
         self.select_tool(self.tool);
-        self.parameter_gesture = None;
+        self.finish_parameter(true);
         self.rename_edit = None;
         self.eye_sweep = None;
         self.layer_drag = None;
@@ -3534,7 +3570,13 @@ impl PeerBrush {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.finish_parameter(true);
-        } else if !ctx.input(|i| i.pointer.any_down()) {
+        } else if !ctx.input(|i| i.pointer.any_down())
+            && !self.parameter_gesture.as_ref().is_some_and(|edit| {
+                edit.typing
+                    .as_ref()
+                    .is_some_and(|ctx| controls::number_editing(ctx, edit.control))
+            })
+        {
             self.finish_parameter(false);
         }
         let (doc, ai_change) = {
@@ -4828,6 +4870,224 @@ mod tests {
         }
     }
     #[test]
+    fn typed_effect_strength_preserves_native_sources_and_commits_only_on_accept() {
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let (mut app, ctx) = fixture();
+                let before = {
+                    let mut engine = app.shared.lock().unwrap();
+                    engine.doc = Document::new_depth(8, 8, depth).unwrap();
+                    if depth == 16 {
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(2, 3, [12347, 33559, 51237, 45679]);
+                    } else {
+                        engine.doc.layers[0].pixels.set(2, 3, [48, 131, 200, 177]);
+                    }
+                    let layer = engine.doc.layers[0].id.clone();
+                    let commands = if mask {
+                        vec![
+                            json!({"op":"mask.add","layer":layer}),
+                            json!({"op":"mask.step.add","layer":layer,"kind":"invert"}),
+                        ]
+                    } else {
+                        vec![json!({"op":"effect.add","layer":layer,"kind":"invert"})]
+                    };
+                    engine
+                        .edit("human", &commands, None, None, "Fixture")
+                        .unwrap();
+                    engine.undo.clear();
+                    app.selected = layer.clone();
+                    app.selection_layers = [layer].into_iter().collect();
+                    engine.doc.clone()
+                };
+                app.mask = mask;
+                let mut time = 0.0;
+                let mut draw = |app: &mut PeerBrush, events| {
+                    time += 0.05;
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1100., 900.),
+                            )),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                let output = draw(&mut app, vec![]);
+                let name = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "Invert" => {
+                            Some(text.pos)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let pos = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text)
+                            if text.galley.job.text == "100%"
+                                && text.pos.x > name.x
+                                && (text.pos.y - name.y).abs() < 5. =>
+                        {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()).center())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                for _ in 0..2 {
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            button(pos, egui::PointerButton::Primary, true, Default::default()),
+                        ],
+                    );
+                    draw(
+                        &mut app,
+                        vec![button(
+                            pos,
+                            egui::PointerButton::Primary,
+                            false,
+                            Default::default(),
+                        )],
+                    );
+                }
+                assert!(ctx.wants_keyboard_input());
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::Key {
+                            key: egui::Key::W,
+                            physical_key: Some(egui::Key::W),
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        },
+                        egui::Event::Text("23.5".into()),
+                    ],
+                );
+                assert!(app.tool == Tool::Brush, "Typing must retain tool focus");
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                draw(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                );
+                let mut engine = app.shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), 1);
+                let weight = if mask {
+                    engine.doc.layers[0]
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .steps
+                        .last()
+                        .unwrap()
+                        .weight
+                } else {
+                    engine.doc.layers[0].effects[0].weight
+                };
+                assert!((weight - 0.235).abs() < 0.00001);
+                assert_eq!(engine.doc.bit_depth, depth);
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                let rendered = |doc: &Document| {
+                    if depth == 16 {
+                        crate::depth16::render(doc).unwrap().words
+                    } else {
+                        doc.preview(None, 8, None, false)
+                            .unwrap()
+                            .2
+                            .into_iter()
+                            .map(u16::from)
+                            .collect()
+                    }
+                };
+                assert_ne!(rendered(&engine.doc), rendered(&before));
+                engine.undo("human").unwrap();
+                assert_eq!(rendered(&engine.doc), rendered(&before));
+            }
+        }
+    }
+    #[test]
+    fn typed_parameters_cancel_on_newer_work_and_project_switches() {
+        for switch in [false, true] {
+            let (mut app, ctx) = fixture();
+            frame(&mut app, &ctx, vec![], Default::default());
+            let source = app.shared.clone();
+            let before = source.lock().unwrap().doc.clone();
+            let pos = app.opacity_rect.unwrap().center();
+            click(&mut app, &ctx, pos);
+            click(&mut app, &ctx, pos);
+            let control = app.parameter_gesture.as_ref().unwrap().control;
+            assert!(controls::number_editing(&ctx, control));
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Text("35".into())],
+                Default::default(),
+            );
+            assert!(source.lock().unwrap().undo.is_empty());
+            if switch {
+                let destination = crate::workspace::new_project(
+                    &app.workspace_root,
+                    8,
+                    8,
+                    8,
+                    Some(&app.project_id),
+                )
+                .unwrap();
+                let project = destination.lock().unwrap().project_id.clone();
+                app.switch_project(&project);
+            } else {
+                source.lock().unwrap().edit("human",&[json!({"op":"layer.update","layer":app.selected,"name":"Newer human work","opacity":0.8})],None,None,"Human edit").unwrap();
+            }
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                Default::default(),
+            );
+            assert!(app.parameter_gesture.is_none());
+            assert!(!controls::number_editing(&ctx, control));
+            let original = source.lock().unwrap();
+            if switch {
+                assert_eq!(original.doc.revision, before.revision);
+                assert_eq!(original.doc.layers[0].opacity, 1.0);
+                assert!(original.undo.is_empty());
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+            } else {
+                assert_eq!(original.doc.layers[0].name, "Newer human work");
+                assert_eq!(original.doc.layers[0].opacity, 0.8);
+                assert_eq!(original.undo.len(), 1);
+                assert!(app.message.contains("cancelled"));
+            }
+        }
+    }
+    #[test]
     fn parameter_preview_waits_for_release_and_cancels_when_source_changes() {
         let (mut app, ctx) = fixture();
         let layer = app.selected.clone();
@@ -4907,6 +5167,8 @@ mod tests {
             revision: doc.revision,
             commands: vec![json!({"op":"layer.update","layer":layer,"opacity":0.2})],
             label: "Opacity".into(),
+            typing: None,
+            dirty: true,
         });
         app.shared
             .lock()
