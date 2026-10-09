@@ -150,6 +150,12 @@ Regular layers and folders are the creation choices. `paint.fill` floods a regul
 
 Color effects add `color_balance`, `hsl`, `bloom` and `liquify`. Balance uses shadows/midtones/highlights RGB complementary-axis arrays in −1–1, with preserve_luminosity. HSL uses hue degrees −180–180 and saturation/lightness −1–1. Bloom uses threshold 0–1, spread 0–64 document pixels and strength 0–3.
 
+`posterize` uses an integer `levels` from 2 to 256 (default 4). It selects the nearest evenly spaced RGB channel levels at native 8/16-bit precision, preserves alpha and editable source pixels, and supports the ordinary independent `weight`, bypass, reorder, removal and preview/undo guards. It works on layers, isolated folders and explicitly requested adjustment layers; it is excluded from mask stacks. Fractional/out-of-range Levels reject atomically. PSD source format 13 prevents older readers from silently treating these sources as editable; standard rendered channels and the current merged image remain present.
+
+```json
+{"op":"effect.add","layer":"LAYER_ID","kind":"posterize","settings":{"levels":4},"weight":0.75}
+```
+
 `liquify.stroke` accepts document-space points, mode push/expand/pinch/restore, radius and strength. It appends to the latest enabled liquify effect, or creates one; optional `effect` chooses an existing effect ID. Stored strokes use layer-local coordinates and retain their selection clipping. Inspect the result, undo a poor stroke, revise and retry. `effect.update` edits the retained source settings after later work.
 
 Supported 8-bit and 16-bit RGB PSD raster layers, masks and default grouped raster clipping remain editable at their native depth. Raster clipping relationships appear in each observed layer's `clip_to` and use ordinary shared commands, reservations and history. Standard PSD saves preserve those raster stacks; adjustment layers and clipping involving folders still require a standard composite bake. Unsupported Photoshop structures open protected from their saved composite, with specific reasons in `document.warnings`. Document action `compatible_copy` explicitly creates a flattened editable project at the original bit depth with no source filename, so saving requires a new path. This copy preserves channel precision; unsupported Photoshop source structure remains in the original file. See [current fidelity limits](photoshop-fidelity.md).

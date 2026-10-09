@@ -11,6 +11,7 @@ pub const BUDGET: usize = 256 * 1024 * 1024;
 // Caches and transient effect buffers have separate, bounded budgets.
 pub const WORKING_BUDGET: usize = 256 * 1024 * 1024;
 pub mod catalog;
+pub mod posterize;
 pub const KINDS: &[&str] = &[
     "levels",
     "curves",
@@ -22,6 +23,7 @@ pub const KINDS: &[&str] = &[
     "liquify",
     "invert",
     "grayscale",
+    "posterize",
 ];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Effect {
@@ -123,6 +125,7 @@ pub(crate) fn apply_effect(
 }
 pub fn defaults(kind: &str) -> Value {
     match kind {
+        "posterize" => json!({"levels":posterize::DEFAULT_LEVELS}),
         "levels" => json!({"black":0.0,"white":1.0,"gamma":1.0}),
         "curves" => json!({"points":[[0.0,0.0],[0.5,0.5],[1.0,1.0]],"interpolation":"smooth"}),
         "blur" => json!({"radius":8.0}),
@@ -160,6 +163,9 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
         Ok(())
     };
     match kind {
+        "posterize" => {
+            posterize::levels(v)?;
+        }
         "levels" => {
             check("black", 0.0, 0.99)?;
             check("white", 0.01, 1.0)?;
@@ -255,7 +261,7 @@ pub fn normalized(kind: &str, settings: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn color_only(kind: &str) -> bool {
-    ["color_balance", "hsl", "bloom"].contains(&kind)
+    ["color_balance", "hsl", "bloom", "posterize"].contains(&kind)
 }
 /// Largest scratch buffer used by a single effect, excluding the cached output.
 pub fn working_bytes(kind: &str, width: u32, height: u32, settings: &Value) -> Result<u64, String> {
@@ -616,6 +622,17 @@ pub(crate) fn apply_region(
 fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<(), String> {
     let (w, h) = (image.width as usize, image.height as usize);
     match kind {
+        "posterize" => {
+            let levels = posterize::levels(&settings)?;
+            let table: [u8; 256] =
+                std::array::from_fn(|i| posterize::sample(i as u16, 255, levels) as u8);
+            for pixel in image.bytes.chunks_exact_mut(4) {
+                for channel in &mut pixel[..3] {
+                    *channel = table[*channel as usize];
+                }
+            }
+            return Ok(());
+        }
         "blur" => {
             blur_rgba(&mut image.bytes, w, h, number(&settings, "radius", 8.0));
             return Ok(());

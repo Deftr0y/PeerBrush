@@ -10,6 +10,7 @@ pub(super) fn settings(
         changed = levels_slider(ui, settings);
     }
     let params: Vec<(&str, &str, f32, f32, &str)> = match kind {
+        "posterize" => vec![("levels", "Levels", 2.0, 256.0, "")],
         "blur" | "gaussian" => vec![("radius", "Radius", 0.0, 64.0, " px")],
         "levels" => vec![
             ("black", "Black", 0.0, 0.99, ""),
@@ -56,7 +57,7 @@ pub(super) fn settings(
                     min * scale..=max * scale,
                     160.0,
                     suffix,
-                    if scale == 100.0 || ["radius", "spread", "hue"].contains(&key) {
+                    if scale == 100.0 || ["radius", "spread", "hue", "levels"].contains(&key) {
                         0
                     } else {
                         2
@@ -64,7 +65,11 @@ pub(super) fn settings(
                     false,
                 );
                 if response.changed() || response.double_clicked() {
-                    settings[key] = json!(value / scale);
+                    settings[key] = if key == "levels" {
+                        json!(value.round() as u16)
+                    } else {
+                        json!(value / scale)
+                    };
                     changed = Some(response);
                 }
                 ui.end_row();
@@ -352,7 +357,7 @@ pub(super) fn effect_icon(kind: &str) -> Icon {
     match kind {
         "paint" => Icon::Brush,
         "fill" => Icon::Fill,
-        "levels" => Icon::Levels,
+        "levels" | "posterize" => Icon::Levels,
         "curves" => Icon::Curves,
         "blur" | "gaussian" => Icon::Blur,
         "adjust" => Icon::Adjust,

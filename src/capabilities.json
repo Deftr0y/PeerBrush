@@ -779,7 +779,8 @@
     "color_balance",
     "hsl",
     "bloom",
-    "liquify"
+    "liquify",
+    "posterize"
   ],
   "painting": {
     "tips": [
@@ -942,5 +943,14 @@
       "kind": "Disposable evicted 8/16-bit color effects, isolated per instance, checksum/dimension/depth/source-key guarded; failures recompute from sources"
     },
     "limits": "PSD v1, encoded 256 MiB, 8192 per edge, 32 MP, raster sources including originals 512 MiB; bounded mask/private-JSON memory paths; no PSB or out-of-core editable sources"
+  },
+  "posterize": {
+    "settings": {
+      "levels": "Integer 2–256, default 4"
+    },
+    "channels": "RGB only; alpha and editable source pixels are preserved",
+    "processing": "Nearest evenly spaced channel levels at native 8/16-bit depth; strength interpolates before/after at native precision",
+    "sources": "Layer, isolated folder and explicitly requested adjustment effects; settings, bypass, removal, preview and undo share the document engine",
+    "psd": "Private source format 13 protects older readers; standard raster/mask channels and current merged composite are still written"
   }
 }

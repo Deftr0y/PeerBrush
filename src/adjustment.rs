@@ -15,6 +15,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<String, String> {
         "adjust",
         "invert",
         "grayscale",
+        "posterize",
     ]
     .contains(&kind)
     {

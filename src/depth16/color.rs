@@ -194,6 +194,18 @@ pub(crate) fn apply_region(
 }
 fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Result<(), String> {
     match kind {
+        "posterize" => {
+            let levels = effects::posterize::levels(&settings)?;
+            let table: Vec<u16> = (0..=65535u16)
+                .map(|v| effects::posterize::sample(v, 65535, levels))
+                .collect();
+            for pixel in image.words.chunks_exact_mut(4) {
+                for channel in &mut pixel[..3] {
+                    *channel = table[*channel as usize];
+                }
+            }
+            return Ok(());
+        }
         "blur" => return blur(image, number(&settings, "radius", 8.0) as f32),
         "bloom" => return bloom(image, &settings),
         "liquify" => {

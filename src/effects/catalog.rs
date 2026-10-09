@@ -45,6 +45,14 @@ impl Entry {
 }
 pub const ENTRIES: &[Entry] = &[
     Entry {
+        kind: "posterize",
+        name: "Posterize",
+        category: "Tone",
+        color: true,
+        mask_name: None,
+        keywords: "levels quantize tonal palette",
+    },
+    Entry {
         kind: "levels",
         name: "Levels",
         category: "Tone",

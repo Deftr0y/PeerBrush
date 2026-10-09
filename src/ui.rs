@@ -2267,7 +2267,7 @@ impl PeerBrush {
                 self.new_folder_rect = Some(folder.rect);
                 if folder.clicked() { self.create_folder(doc); }
                 ui.menu_button("◐",|ui| {
-                    for (kind,label) in [("color_balance","Color balance"),("hsl","Hue / saturation"),("levels","Levels"),("curves","Curves")] {
+                    for (kind,label) in [("color_balance","Color balance"),("hsl","Hue / saturation"),("levels","Levels"),("curves","Curves"),("posterize","Posterize")] {
                         if ui.button(label).clicked() {
                             let ids:Vec<_>=doc.layers.iter().filter(|l|self.selection_layers.contains(&l.id)).map(|l|l.id.clone()).collect();
                             self.edit(vec![json!({"op":"adjustment.add","layers":ids,"kind":kind,"name":label})],"New adjustment");
@@ -5032,6 +5032,197 @@ mod tests {
             );
             let rect = app.transform_rects[3].unwrap();
             assert!(rect.right() <= size.x && rect.bottom() <= size.y);
+        }
+    }
+    #[test]
+    fn posterize_levels_drag_previews_native_pixels_and_typing_commits_one_edit() {
+        for depth in [8, 16] {
+            for typed in [false, true] {
+                let (mut app, ctx) = fixture();
+                let before = {
+                    let mut e = app.shared.lock().unwrap();
+                    e.doc = Document::new_depth(8, 8, depth).unwrap();
+                    for y in 0..8 {
+                        for x in 0..8 {
+                            if depth == 16 {
+                                e.doc.layers[0]
+                                    .pixels
+                                    .set16(x, y, [10001, 30003, 50007, 65535]);
+                            } else {
+                                e.doc.layers[0].pixels.set(x, y, [39, 117, 195, 255]);
+                            }
+                        }
+                    }
+                    let layer = e.doc.layers[0].id.clone();
+                    e.edit(
+                        "human",
+                        &[json!({"op":"effect.add","layer":layer,"kind":"posterize"})],
+                        None,
+                        None,
+                        "Fixture",
+                    )
+                    .unwrap();
+                    e.undo.clear();
+                    app.selected = layer.clone();
+                    app.selection_layers = [layer.clone()].into_iter().collect();
+                    app.effect_selected =
+                        Some((layer, false, e.doc.layers[0].effects[0].id.clone()));
+                    e.doc.clone()
+                };
+                let native = |doc: &Document| {
+                    if depth == 16 {
+                        crate::depth16::render(doc).unwrap().words
+                    } else {
+                        doc.preview(None, 8, None, false)
+                            .unwrap()
+                            .2
+                            .into_iter()
+                            .map(u16::from)
+                            .collect()
+                    }
+                };
+                let mut time = 0.;
+                let mut draw = |app: &mut PeerBrush, events| {
+                    time += 0.05;
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1100., 900.),
+                            )),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                let position = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "4" => {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()).center())
+                        }
+                        _ => None,
+                    })
+                    .expect("Integer Levels value");
+                let end = position + Vec2::new(35., 0.);
+                if typed {
+                    for _ in 0..2 {
+                        draw(
+                            &mut app,
+                            vec![
+                                egui::Event::PointerMoved(position),
+                                button(
+                                    position,
+                                    egui::PointerButton::Primary,
+                                    true,
+                                    Default::default(),
+                                ),
+                            ],
+                        );
+                        draw(
+                            &mut app,
+                            vec![button(
+                                position,
+                                egui::PointerButton::Primary,
+                                false,
+                                Default::default(),
+                            )],
+                        );
+                    }
+                    assert!(ctx.wants_keyboard_input());
+                    draw(&mut app, vec![egui::Event::Text("8".into())]);
+                } else {
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(position),
+                            button(
+                                position,
+                                egui::PointerButton::Primary,
+                                true,
+                                Default::default(),
+                            ),
+                        ],
+                    );
+                    draw(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(position + Vec2::new(25., 0.))],
+                    );
+                    draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                }
+                let gesture = app
+                    .parameter_gesture
+                    .as_ref()
+                    .expect("Posterize parameter edit");
+                let commands = if typed {
+                    // Text remains provisional until Enter; the accepted value
+                    // must match the same engine preview used by drag gestures.
+                    assert_eq!(
+                        app.shared.lock().unwrap().doc.layers[0].effects[0].settings["levels"],
+                        4
+                    );
+                    vec![
+                        json!({"op":"effect.update","layer":before.layers[0].id,"effect":before.layers[0].effects[0].id,"settings":{"levels":8}}),
+                    ]
+                } else {
+                    gesture.commands.clone()
+                };
+                let draft = Engine::preview_edits(before.clone(), &commands).unwrap();
+                assert!(draft.layers[0].effects[0].settings["levels"]
+                    .as_u64()
+                    .is_some());
+                assert_ne!(
+                    draft.layers[0].effects[0].settings["levels"],
+                    before.layers[0].effects[0].settings["levels"],
+                    "depth={depth} typed={typed} commands={commands:?}"
+                );
+                assert_ne!(native(&draft), native(&before));
+                assert_eq!(
+                    draft.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(app.shared.lock().unwrap().doc.revision, before.revision);
+                if typed {
+                    draw(
+                        &mut app,
+                        vec![egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                } else {
+                    draw(
+                        &mut app,
+                        vec![button(
+                            end,
+                            egui::PointerButton::Primary,
+                            false,
+                            Default::default(),
+                        )],
+                    );
+                }
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1);
+                assert_eq!(native(&e.doc), native(&draft));
+                if typed {
+                    assert_eq!(e.doc.layers[0].effects[0].settings["levels"], 8);
+                }
+                e.undo("human").unwrap();
+                assert_eq!(native(&e.doc), native(&before));
+                assert_eq!(
+                    e.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+            }
         }
     }
     #[test]
