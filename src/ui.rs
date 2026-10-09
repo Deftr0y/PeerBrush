@@ -244,6 +244,7 @@ pub struct PeerBrush {
     brush_name: String,
     brush_save_category: String,
     brush_thumbnails: HashMap<String, (crate::brush::Settings, TextureHandle)>,
+    transform_rects: [Option<Rect>; 4],
     color_editor: Option<color::Editor>,
     layer_drag: Option<LayerDrag>,
     layer_rects: HashMap<String, Rect>,
@@ -502,6 +503,7 @@ impl PeerBrush {
             brush_name: "My brush".into(),
             brush_save_category: "Paint".into(),
             brush_thumbnails: HashMap::new(),
+            transform_rects: [None; 4],
             color_editor: None,
             layer_drag: None,
             layer_rects: HashMap::new(),
@@ -609,6 +611,101 @@ impl PeerBrush {
             }
             Err(e) => self.message = e,
         }
+    }
+    fn select_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+        self.drag_start = None;
+        self.drag_revision = None;
+        self.gizmo_bounds = None;
+        self.gizmo_handle = 0;
+        self.points.clear();
+        self.stroke_pressures.clear();
+        self.stroke_has_pressure = false;
+        self.current_pressure = None;
+        self.transient.clear();
+        self.size_drag = None;
+        self.live_gesture = None;
+        self.animation.cancel();
+        self.last_preview = None;
+    }
+    fn transform_controls(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        // Standard button minimums exceed the footer's inner height.
+        let height = ui.available_height().clamp(14.0, 20.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for (index, (tool, key)) in [
+                (Tool::None, "Q"),
+                (Tool::Move, "W"),
+                (Tool::Rotate, "E"),
+                (Tool::Scale, "R"),
+            ]
+            .into_iter()
+            .enumerate()
+            .rev()
+            {
+                let (_, response) =
+                    ui.allocate_exact_size(Vec2::new(34.0, height), egui::Sense::click());
+                let response = response.on_hover_text(tool.label());
+                self.transform_rects[index] = Some(response.rect);
+                let active = self.tool == tool;
+                if active || response.hovered() {
+                    ui.painter().rect_filled(
+                        response.rect,
+                        2,
+                        if active {
+                            Color32::from_rgb(74, 48, 71)
+                        } else {
+                            Color32::from_white_alpha(8)
+                        },
+                    );
+                }
+                let ai = matches!(
+                    (self.animation.tool(ui.input(|i| i.time)), tool),
+                    (Some("move"), Tool::Move)
+                        | (Some("rotate"), Tool::Rotate)
+                        | (Some("scale"), Tool::Scale)
+                );
+                if ai {
+                    ui.painter()
+                        .rect_filled(response.rect, 2, AI_BLUE.gamma_multiply(0.12));
+                    ui.painter().line_segment(
+                        [response.rect.left_top(), response.rect.right_top()],
+                        Stroke::new(1.5, AI_BLUE),
+                    );
+                }
+                if active {
+                    ui.painter().line_segment(
+                        [response.rect.left_bottom(), response.rect.right_bottom()],
+                        Stroke::new(1.5, ACCENT),
+                    );
+                }
+                paint_tool(
+                    ui.painter(),
+                    Rect::from_center_size(
+                        response.rect.left_center() + Vec2::new(10., 0.),
+                        Vec2::splat(height.min(17.)),
+                    ),
+                    tool,
+                    MUTED,
+                );
+                ui.painter().text(
+                    response.rect.right_center() - Vec2::new(3., 0.),
+                    egui::Align2::RIGHT_CENTER,
+                    key,
+                    egui::FontId::proportional(10.),
+                    if ai {
+                        AI_BLUE
+                    } else if active {
+                        ACCENT
+                    } else {
+                        MUTED
+                    },
+                );
+                if response.clicked() {
+                    self.select_tool(tool);
+                }
+            }
+        });
     }
     fn selected_layer_ids(&self, doc: &Document) -> Vec<String> {
         doc.layers
@@ -3026,10 +3123,7 @@ impl PeerBrush {
                 ] {
                     if !key_modifiers(i,key).command && !key_modifiers(i,key).ctrl && !key_modifiers(i,key).alt && (i.key_pressed(key)
                         || i.events.iter().any(|e| matches!(e, egui::Event::Key { physical_key: Some(k), pressed: true, .. } if *k == key))) {
-                        self.tool = tool;
-                        self.drag_start = None;
-                        self.points.clear();self.stroke_pressures.clear();self.stroke_has_pressure=false;self.current_pressure=None;
-                        self.gizmo_handle = 0;
+                        self.select_tool(tool);
                     }
                 }
                 if !i.modifiers.command && i.key_pressed(egui::Key::F) {
@@ -3337,6 +3431,10 @@ impl PeerBrush {
         egui::TopBottomPanel::bottom("status")
             .exact_height(28.0)
             .show(ctx, |ui| {
+                let bounds=ui.max_rect();
+                let mut modes=ui.new_child(egui::UiBuilder::new().id_salt("transform modes").max_rect(Rect::from_min_max(egui::pos2(bounds.right()-150.,bounds.top()),bounds.max)));
+                self.transform_controls(&mut modes);
+                ui.set_max_width((bounds.width()-160.).max(0.));
                 ui.horizontal_centered(|ui| {
                     ui.add(egui::Label::new(RichText::new(format!("{} × {} · {} bit", doc.width, doc.height, doc.bit_depth)).color(MUTED)).sense(egui::Sense::click())).on_hover_text("Right-click for canvas dimensions and channel depth").context_menu(|ui| {
                         if ui.button("Project dimensions and depth…").clicked(){self.project_settings=Some((doc.width,doc.height,doc.bit_depth));ui.close_menu();}
@@ -3390,10 +3488,6 @@ impl PeerBrush {
                                 },
                             ));
                         });
-                    } else {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new("You and your AI. Same canvas.").color(MUTED));
-                        });
                     }
                 });
             });
@@ -3408,10 +3502,6 @@ impl PeerBrush {
                     .max_height((ui.available_height() - 70.0).max(60.0))
                     .show(ui, |ui| {
                         for (index, tool) in [
-                            Tool::None,
-                            Tool::Move,
-                            Tool::Rotate,
-                            Tool::Scale,
                             Tool::Brush,
                             Tool::Smudge,
                             Tool::Clone,
@@ -3430,7 +3520,7 @@ impl PeerBrush {
                         .into_iter()
                         .enumerate()
                         {
-                            if index == 4 || index == 10 {
+                            if index == 6 {
                                 ui.add_space(4.0);
                                 ui.separator();
                                 ui.add_space(4.0);
@@ -3496,13 +3586,7 @@ impl PeerBrush {
                                 if self.tool == tool { ACCENT } else { MUTED },
                             );
                             if r.clicked() {
-                                self.tool = tool;
-                                self.drag_start = None;
-                                self.points.clear();
-                                self.stroke_pressures.clear();
-                                self.stroke_has_pressure = false;
-                                self.current_pressure = None;
-                                self.gizmo_handle = 0;
+                                self.select_tool(tool);
                             }
                         }
                     });
@@ -3860,6 +3944,58 @@ mod tests {
             app.shared.lock().unwrap().doc.export_png().unwrap(),
             before.export_png().unwrap()
         );
+    }
+    #[test]
+    fn bottom_right_transform_modes_click_without_editing_and_keep_ai_feedback() {
+        let (mut app, ctx) = fixture();
+        frame(&mut app, &ctx, vec![], Default::default());
+        for (index, tool) in [Tool::None, Tool::Move, Tool::Rotate, Tool::Scale]
+            .into_iter()
+            .enumerate()
+        {
+            let rect = app.transform_rects[index].unwrap();
+            assert!(
+                rect.left() > 1180. && rect.top() > 870. && rect.bottom() <= 900.,
+                "Transform mode is not at the bottom right: {rect:?}"
+            );
+            if index > 0 {
+                assert!(rect.left() > app.transform_rects[index - 1].unwrap().right());
+            }
+            click(&mut app, &ctx, rect.center());
+            assert!(app.tool == tool);
+        }
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        let id = app.selected.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "ai",
+                &[json!({"op":"move","layer":id,"dx":12,"dy":7})],
+                None,
+                None,
+                "AI move",
+            )
+            .unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert_eq!(app.animation.tool(ctx.input(|i| i.time)), Some("move"));
+        assert_eq!(app.shared.lock().unwrap().doc.layers[0].x, 12);
+        let q = app.transform_rects[0].unwrap().center();
+        click(&mut app, &ctx, q);
+        assert!(app.tool == Tool::None);
+        assert!(app.animation.tool(ctx.input(|i| i.time)).is_none());
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        for size in [Vec2::new(1100., 600.), Vec2::new(1360., 900.)] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            let rect = app.transform_rects[3].unwrap();
+            assert!(rect.right() <= size.x && rect.bottom() <= size.y);
+        }
     }
     #[test]
     fn parameter_preview_waits_for_release_and_cancels_when_source_changes() {

@@ -44,6 +44,7 @@ You stay in control while AI works directly alongside you inside the same editin
 
 - **Progressive document loading.** Cancellable native16 PSD decoding, saved-image feedback and bounded disposable effect caches. See [large-document behavior](docs/large-documents.md).
 - **Visual, compact controls.** White tool glyphs, Ubuntu Sans, uncluttered range values and live canvas feedback.
+- **Compact transform modes.** Q/W/E/R sit at the bottom right, with the same shortcuts, live rendered gizmos and blue AI feedback.
 - **A browsable brush library.** Twenty-one original procedural presets, six categories, search and readable stroke previews. Edit pressure response, texture, taper and flow, then save custom brushes; the UI and agents use the same native-depth painting engine.
 - **A useful hierarchy.** Distinct folders, multi-layer editing, drag into or out of folders, animated reorder previews, visibility sweep gestures, inline renaming, grouping and merging.
 - **Editable effects.** Compact color and mask stacks have recognizable icons and an always-visible Weight for every effect. Select a row to open its settings; top effects run last. Parameter drags preview through the shared engine and commit once on release. Blend and opacity sit beneath the stack.

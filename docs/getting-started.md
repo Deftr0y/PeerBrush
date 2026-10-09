@@ -34,6 +34,8 @@ AI can reserve specific layers or rectangular regions while you edit elsewhere. 
 
 ## Maya-style transforms
 
+Use the small **Q / W / E / R** controls at the bottom right for Select, Move, Rotate and Scale. The active mode has an Ember underline; recent AI transform activity appears in blue. The same keyboard shortcuts work after clicking controls, and text fields retain normal typing. Transform modes no longer occupy the left painting toolbar.
+
 **Q** hides gizmos; **W** shows move; **E** shows rotation; **R** shows scale. Select a layer, then drag the colored X/Y handles or the center handle. Move/scale axis handles constrain that axis. Shift snaps rotation to 15° or makes scaling uniform. Escape cancels a drag. **D** selects the eraser.
 
 Gizmos preview the actual pixels and apply one undoable edit on release. An active selection transforms its pixels while preserving the remainder of the layer. Its outline rotates, scales and moves with the content; subsequent painting, fills and copying respect that shape. Without a selection, the whole layer transforms. Rotation and scaling resample raster content; undo before trying another transform to retain the original pixels. Whole-group transforms remain planned.
