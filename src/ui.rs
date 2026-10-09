@@ -845,13 +845,44 @@ impl PeerBrush {
         }
     }
     fn create_folder(&mut self, doc: &Document) {
+        if self.busy {
+            return;
+        }
+        self.close_proposal();
+        self.finish_parameter(true);
         let ids = self.selected_layer_ids(doc);
-        self.edit(
-            vec![json!({"op":"group.create_selected","layers":ids,"name":"Folder"})],
-            "Group selected layers",
-        );
-        self.layer_clipboard = true;
-        self.collapsed.remove(&self.selected);
+        let result = {
+            let mut engine = self.shared.lock().unwrap();
+            if engine.doc.id != doc.id {
+                Err("The document changed before grouping layers".into())
+            } else if engine.doc.revision != doc.revision {
+                Err("The project revision changed before grouping layers".into())
+            } else {
+                engine.edit(
+                    "human",
+                    &[json!({"op":"group.create_selected","layers":ids,"name":"Folder"})],
+                    Some(doc.revision),
+                    None,
+                    "Group selected layers",
+                )
+            }
+        };
+        match result {
+            Ok(result) => {
+                if let Some(id) = result["created"]
+                    .as_array()
+                    .and_then(|ids| ids.first())
+                    .and_then(Value::as_str)
+                {
+                    self.select_content(id);
+                    self.collapsed.remove(id);
+                }
+                self.layer_clipboard = true;
+                self.last_preview = None;
+                self.message = "Grouped selected layers".into();
+            }
+            Err(error) => self.message = error,
+        }
     }
     fn selection_points(&self, doc: &Document, rect: Rect, scale: f32) -> Vec<Pos2> {
         let preview = self
@@ -1182,6 +1213,8 @@ impl PeerBrush {
         if self.busy {
             return;
         }
+        self.close_proposal();
+        self.finish_parameter(true);
         let mut ids = doc
             .layers
             .iter()
@@ -1840,10 +1873,27 @@ impl PeerBrush {
         if ui
             .add_enabled(
                 !self.busy && !doc.read_only,
-                egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os = "macos") {
-                    "⌘ E"
+                egui::Button::new("Group layers").shortcut_text(if cfg!(target_os = "macos") {
+                    "⌘ G"
                 } else {
-                    "Ctrl+E"
+                    "Ctrl+G"
+                }),
+            )
+            .clicked()
+        {
+            if !self.selection_layers.contains(&l.id) {
+                self.select_content(&l.id);
+            }
+            self.create_folder(doc);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                !self.busy && !doc.read_only,
+                egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os = "macos") {
+                    "⌘ ⇧ G"
+                } else {
+                    "Ctrl+Shift+G"
                 }),
             )
             .on_hover_text(
@@ -2077,7 +2127,7 @@ impl PeerBrush {
         ui.add_space(10.0);
         ui.horizontal(|ui|{ui.label(RichText::new("Layers").size(15.0).strong());ui.label(RichText::new(doc.layers.len().to_string()).size(11.0).color(MUTED));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
-                let folder = icons::button(ui, Icon::Folder, "New folder · contains selected layers");
+                let folder = ui.add_enabled_ui(!self.busy && !doc.read_only,|ui|icons::button(ui, Icon::Folder, "Group selected layers · Ctrl/Cmd+G")).inner;
                 self.new_folder_rect = Some(folder.rect);
                 if folder.clicked() { self.create_folder(doc); }
                 ui.menu_button("◐",|ui| {
@@ -3818,6 +3868,13 @@ impl PeerBrush {
                 if command_key(i,egui::Key::E) {
                     self.merge_layers(ctx, &doc);
                 }
+                if command_key(i,egui::Key::G) {
+                    if key_modifiers(i,egui::Key::G).shift {
+                        self.merge_layers(ctx, &doc);
+                    } else {
+                        self.create_folder(&doc);
+                    }
+                }
                 if i.key_pressed(egui::Key::Delete)
                     && self.selection_path.is_empty()
                     && !key_modifiers(i,egui::Key::Delete).any()
@@ -3924,6 +3981,9 @@ impl PeerBrush {
                         }
                     });
                     ui.menu_button("Layer",|ui| {
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Group layers").shortcut_text(if cfg!(target_os="macos") {"⌘ G"} else {"Ctrl+G"})).clicked(){self.create_folder(&doc);ui.close_menu();}
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ G"} else {"Ctrl+Shift+G"})).clicked(){self.merge_layers(ctx,&doc);ui.close_menu();}
+                        ui.separator();
                         for (label,kind) in [("New text…","text"),("New vector shape…","shape"),("Edit text/vector…","edit")] {
                             let enabled=!doc.read_only&&!self.busy && (kind!="edit"||doc.layers.iter().any(|l|l.id==self.selected&&l.source.is_some()));
                             if ui.add_enabled(enabled,egui::Button::new(label)).clicked(){self.open_source(&doc,kind);ui.close_menu();}
@@ -6981,6 +7041,318 @@ mod tests {
                 .collect::<Vec<_>>(),
             ids
         );
+    }
+    #[test]
+    fn command_g_groups_and_shift_g_merges_native_sources_with_one_undo_each() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = fixture();
+            let before = {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc = Document::new_depth(12, 10, depth).unwrap();
+                let first = engine.doc.layers[0].id.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[
+                            json!({"op":"layer.add","name":"Middle"}),
+                            json!({"op":"layer.add","name":"Top"}),
+                            json!({"op":"mask.add","layer":first,"value":153}),
+                        ],
+                        None,
+                        None,
+                        "Fixture",
+                    )
+                    .unwrap();
+                for (i, layer) in engine.doc.layers.iter_mut().enumerate() {
+                    layer
+                        .pixels
+                        .set16(i as i32 + 2, 3, [12347, 33559, 51237, 45679]);
+                }
+                engine.undo.clear();
+                engine.doc.clone()
+            };
+            let ids = before
+                .layers
+                .iter()
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>();
+            app.select_content(&ids[0]);
+            app.selection_layers.insert(ids[1].clone());
+            frame(&mut app, &ctx, vec![], Default::default());
+            let command = egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            };
+            // Event modifiers remain authoritative when Control was released
+            // before this frame's final input state.
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::G,
+                    physical_key: Some(egui::Key::G),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command,
+                }],
+                Default::default(),
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::G,
+                    physical_key: Some(egui::Key::G),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                Default::default(),
+            );
+            assert!(app.tool == Tool::Brush);
+            let folder = app.selected.clone();
+            let grouped = {
+                let engine = app.shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(app.selection_layers, [folder.clone()].into_iter().collect());
+                assert!(engine
+                    .doc
+                    .layers
+                    .iter()
+                    .any(|l| l.id == folder && l.kind == "group"));
+                for old in &before.layers {
+                    let mut current = engine
+                        .doc
+                        .layers
+                        .iter()
+                        .find(|l| l.id == old.id)
+                        .unwrap()
+                        .clone();
+                    assert_eq!(
+                        current.parent.as_deref(),
+                        if ids[..2].contains(&old.id) {
+                            Some(folder.as_str())
+                        } else {
+                            None
+                        }
+                    );
+                    current.parent = old.parent.clone();
+                    assert_eq!(
+                        serde_json::to_value(current).unwrap(),
+                        serde_json::to_value(old).unwrap()
+                    );
+                }
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    before.export_png().unwrap()
+                );
+                engine.doc.clone()
+            };
+            // Selecting a child as well must not merge it twice.
+            app.selection_layers.insert(ids[0].clone());
+            let shifted = egui::Modifiers {
+                shift: true,
+                ..command
+            };
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::G,
+                    physical_key: Some(egui::Key::G),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: shifted,
+                }],
+                Default::default(),
+            );
+            let reply = app.merge_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(reply.result.is_ok(), "{:?}", reply.result);
+            app.merge_tx.send(reply).unwrap();
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::G,
+                    physical_key: Some(egui::Key::G),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                Default::default(),
+            );
+            assert!(!app.busy);
+            assert!(app.tool == Tool::Brush);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), 2);
+            assert_eq!(engine.doc.layers.len(), 2);
+            assert_eq!(
+                app.selection_layers,
+                [app.selected.clone()].into_iter().collect()
+            );
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                before.export_png().unwrap()
+            );
+            assert_eq!(engine.doc.bit_depth, depth);
+            let loaded = crate::psd::decode(&crate::psd::encode(&engine.doc).unwrap()).unwrap();
+            assert!(!loaded.read_only);
+            assert_eq!(loaded.bit_depth, depth);
+            assert_eq!(loaded.export_png().unwrap(), before.export_png().unwrap());
+            engine.undo("human").unwrap();
+            assert_eq!(
+                serde_json::to_value(&engine.doc.layers).unwrap(),
+                serde_json::to_value(&grouped.layers).unwrap()
+            );
+            engine.undo("human").unwrap();
+            assert_eq!(
+                serde_json::to_value(&engine.doc.layers).unwrap(),
+                serde_json::to_value(&before.layers).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn group_merge_shortcuts_preserve_text_and_reject_locked_reserved_or_stale_sources() {
+        for failure in ["typing", "locked", "reserved", "stale", "replaced"] {
+            let (mut app, ctx) = small_fixture();
+            let top = {
+                let mut engine = app.shared.lock().unwrap();
+                let result = engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"layer.add","name":"Other"})],
+                        None,
+                        None,
+                        "Fixture",
+                    )
+                    .unwrap();
+                engine.undo.clear();
+                result["created"][0].as_str().unwrap().to_string()
+            };
+            app.select_content(&top);
+            app.selection_layers = app
+                .shared
+                .lock()
+                .unwrap()
+                .doc
+                .layers
+                .iter()
+                .map(|layer| layer.id.clone())
+                .collect();
+            let old = app.shared.lock().unwrap().doc.clone();
+            let selected = app.selected.clone();
+            match failure {
+                "typing" => {
+                    app.begin_rename(&old, &selected);
+                    frame(&mut app, &ctx, vec![], Default::default());
+                    for shift in [false, true] {
+                        modified_key(
+                            &mut app,
+                            &ctx,
+                            egui::Key::G,
+                            egui::Modifiers {
+                                ctrl: true,
+                                command: true,
+                                shift,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    assert!(app.rename_edit.is_some());
+                    assert!(!app.busy);
+                }
+                "locked" | "reserved" => {
+                    {
+                        let mut engine = app.shared.lock().unwrap();
+                        if failure == "locked" {
+                            engine.doc.layers[0].locked = true;
+                        } else {
+                            engine
+                                .reserve(
+                                    "agent",
+                                    "Layer work",
+                                    vec![crate::engine::Scope::layer(&selected)],
+                                )
+                                .unwrap();
+                        }
+                    }
+                    for shift in [false, true] {
+                        frame(
+                            &mut app,
+                            &ctx,
+                            vec![egui::Event::Key {
+                                key: egui::Key::G,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers {
+                                    ctrl: true,
+                                    command: true,
+                                    shift,
+                                    ..Default::default()
+                                },
+                            }],
+                            Default::default(),
+                        );
+                        if shift {
+                            let reply = app.merge_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                            assert!(reply.result.is_err());
+                            app.merge_tx.send(reply).unwrap();
+                        }
+                        frame(
+                            &mut app,
+                            &ctx,
+                            vec![egui::Event::Key {
+                                key: egui::Key::G,
+                                physical_key: None,
+                                pressed: false,
+                                repeat: false,
+                                modifiers: Default::default(),
+                            }],
+                            Default::default(),
+                        );
+                        assert_eq!(app.selected, selected);
+                        assert!(!app.busy);
+                    }
+                }
+                "stale" => {
+                    app.shared
+                        .lock()
+                        .unwrap()
+                        .edit(
+                            "human",
+                            &[json!({"op":"layer.update","layer":selected,"name":"Newer name"})],
+                            None,
+                            None,
+                            "New work",
+                        )
+                        .unwrap();
+                    app.create_folder(&old);
+                    assert!(app.message.contains("revision"));
+                }
+                "replaced" => {
+                    app.shared.lock().unwrap().doc = Document::new_depth(8, 8, 16).unwrap();
+                    let current = app.shared.lock().unwrap().doc.export_png().unwrap();
+                    app.create_folder(&old);
+                    assert!(app.message.contains("document changed"));
+                    assert_eq!(
+                        app.shared.lock().unwrap().doc.export_png().unwrap(),
+                        current
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let engine = app.shared.lock().unwrap();
+            assert_eq!(
+                engine.doc.layers.len(),
+                if failure == "replaced" { 1 } else { 2 }
+            );
+            assert_eq!(engine.undo.len(), usize::from(failure == "stale"));
+            if failure != "replaced" {
+                assert_eq!(engine.doc.export_png().unwrap(), old.export_png().unwrap());
+            }
+        }
     }
     #[test]
     fn mask_stack_displays_last_operation_on_top_without_changing_execution_order() {
