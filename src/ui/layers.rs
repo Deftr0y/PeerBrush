@@ -464,6 +464,26 @@ impl PeerBrush {
         .inner
     }
     pub(super) fn layer_list(&mut self, ui: &mut egui::Ui, doc: &Document) {
+        let mut context_menu = self
+            .layer_context
+            .take()
+            .filter(|(document, _)| document == &doc.id)
+            .map(|(_, menu)| menu)
+            .unwrap_or_default();
+        if let Some(root) = context_menu.as_ref() {
+            let close = ui.input(|input| {
+                input.key_pressed(egui::Key::Escape)
+                    || input.pointer.any_pressed()
+                        && input
+                            .pointer
+                            .interact_pos()
+                            .is_some_and(|position| !root.menu_state.read().area_contains(position))
+            });
+            if close {
+                *context_menu = None;
+            }
+        }
+        let mut context_visible = false;
         if self
             .layer_drag
             .as_ref()
@@ -535,7 +555,7 @@ impl PeerBrush {
                 let rect=Rect::from_min_size(base+Vec2::new((1.0-arrival)*14.0,offset),Vec2::new(width,42.0));
                 self.layer_rects.insert(l.id.clone(),rect);
                 let held=self.layer_drag.as_ref().is_some_and(|d|d.ids.contains(&l.id));
-                let response=ui.interact(rect,ui.id().with((&l.id,"row")),egui::Sense::click_and_drag());
+                let response=ui.interact(rect,ui.id().with((&doc.id,&l.id,"row")),egui::Sense::click_and_drag());
                 if response.drag_started() && self.eye_sweep.is_none() && !self.rename_edit.as_ref().is_some_and(|edit| edit.layer == l.id) {
                     if !self.selection_layers.contains(&l.id) {self.select_content(&l.id);}
                     let start=ui.input(|i|i.pointer.press_origin()).unwrap_or(rect.center());
@@ -566,7 +586,18 @@ impl PeerBrush {
                     }).inner;
                     anchors.insert(l.id.clone(),TreeAnchor {disclosure,ai,opacity:arrival});
                 }
-                response.on_hover_text("Click to select · Ctrl/Cmd or Shift for multiple · Drag into folders · Drag left to move out").context_menu(|ui|self.layer_menu(ui,doc,l));
+                // Child controls own their primary interactions. Test the clipped row
+                // directly for secondary clicks, including over those controls.
+                if !held && ui.rect_contains_pointer(rect)
+                    && ui.input(|i|i.pointer.button_clicked(egui::PointerButton::Secondary) && !i.pointer.primary_down())
+                {
+                    if let Some(position)=ui.input(|i|i.pointer.interact_pos()) {
+                        *context_menu=Some(egui::menu::MenuRoot::new(position,response.id));
+                    }
+                }
+                context_visible |= context_menu.as_ref().is_some_and(|root|root.id==response.id);
+                let response=response.on_hover_text("Click to select · Ctrl/Cmd or Shift for multiple · Drag into folders · Drag left to move out · Right-click anywhere for options");
+                context_menu.show(&response,|ui|self.layer_menu(ui,doc,l));
             }
             paint_tree_guides(ui.painter(),&preview,&anchors);
             if let (Some((layer,thumb,depth)),Some(pointer),Some(drag))=(floating,pointer,&self.layer_drag) {
@@ -599,5 +630,8 @@ impl PeerBrush {
             }
             ui.advance_cursor_after_rect(Rect::from_min_size(base,Vec2::new(width,ordered.len() as f32*46.0)));
         });
+        if context_visible && context_menu.is_some() {
+            self.layer_context = Some((doc.id.clone(), context_menu));
+        }
     }
 }

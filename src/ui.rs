@@ -323,6 +323,7 @@ pub struct PeerBrush {
     layer_drag: Option<LayerDrag>,
     layer_rects: HashMap<String, Rect>,
     eye_rects: HashMap<String, Rect>,
+    layer_context: Option<(String, egui::menu::MenuRootManager)>,
     effect_add_rect: Option<Rect>,
     clipboard: crate::clipboard::Worker,
     zoom: f32,
@@ -603,6 +604,7 @@ impl PeerBrush {
             layer_drag: None,
             layer_rects: HashMap::new(),
             eye_rects: HashMap::new(),
+            layer_context: None,
             effect_add_rect: None,
             clipboard: crate::clipboard::Worker::new(ctx.clone()),
             zoom: 1.0,
@@ -3023,6 +3025,7 @@ impl PeerBrush {
         self.rename_edit = None;
         self.eye_sweep = None;
         self.layer_drag = None;
+        self.layer_context = None;
         self.geometry = None;
         self.source_editor = None;
         self.refinement = None;
@@ -5739,6 +5742,243 @@ mod tests {
         assert_eq!(app.selected, ids[0]);
         click(&mut app, &ctx, eye);
         assert!(app.shared.lock().unwrap().doc.layers[0].visible);
+    }
+    #[test]
+    fn layer_context_opens_over_child_controls_without_primary_side_effects() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = fixture();
+            let (child, other, folder) =
+                {
+                    let mut engine = app.shared.lock().unwrap();
+                    engine.doc = Document::new_depth(8, 8, depth).unwrap();
+                    let child = engine.doc.layers[0].id.clone();
+                    engine.doc.layers[0]
+                        .pixels
+                        .set16(2, 2, [12347, 33559, 51237, 45679]);
+                    let result = engine.edit("human", &[
+                    json!({"op":"layer.add","name":"Outside"}),
+                    json!({"op":"mask.add","layer":child}),
+                    json!({"op":"group.create_selected","layers":[child],"name":"Folder"}),
+                ], None, None, "Fixture").unwrap();
+                    let other = engine
+                        .doc
+                        .layers
+                        .iter()
+                        .find(|l| l.name == "Outside")
+                        .unwrap()
+                        .id
+                        .clone();
+                    let folder = result["created"]
+                        .as_array()
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    engine.undo.clear();
+                    (child, other, folder)
+                };
+            app.select_content(&other);
+            app.selection_layers.insert(folder.clone());
+            let draw = |app: &mut PeerBrush| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            };
+            for _ in 0..3 {
+                draw(&mut app);
+            }
+            let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+            let selected = app.selection_layers.clone();
+            let row = app.layer_rects[&child];
+            let group = app.layer_rects[&folder];
+            let positions = [
+                (row.left_top() + Vec2::new(2., 2.), &child),
+                (app.eye_rects[&child].center(), &child),
+                (row.left_center() + Vec2::new(108., 0.), &child),
+                (row.right_center() - Vec2::new(65., 0.), &child),
+                (row.right_center() - Vec2::new(20., 0.), &child),
+                (row.right_top() + Vec2::new(-2., 2.), &child),
+                (
+                    egui::pos2(app.eye_rects[&folder].right() + 15., group.center().y),
+                    &folder,
+                ),
+                (group.left_center() + Vec2::new(85., 0.), &folder),
+            ];
+            for (position, target) in positions {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        button(
+                            position,
+                            egui::PointerButton::Secondary,
+                            true,
+                            Default::default(),
+                        ),
+                    ],
+                    Default::default(),
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![button(
+                        position,
+                        egui::PointerButton::Secondary,
+                        false,
+                        Default::default(),
+                    )],
+                    Default::default(),
+                );
+                let output = draw(&mut app);
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text=="Rename")),"No menu over {position:?}");
+                assert_eq!(
+                    app.layer_context.as_ref().unwrap().0,
+                    app.shared.lock().unwrap().doc.id
+                );
+                assert_eq!(app.selected, other);
+                assert_eq!(app.selection_layers, selected);
+                assert!(!app.mask);
+                assert!(app.collapsed.is_empty());
+                assert!(
+                    app.layer_drag.is_none()
+                        && app.eye_sweep.is_none()
+                        && app.rename_edit.is_none()
+                );
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                if target == &child && position == row.right_center() - Vec2::new(20., 0.) {
+                    let lock = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.job.text == "Lock" => {
+                                Some(text.visual_bounding_rect().center())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    click(&mut app, &ctx, lock);
+                    assert!(app.layer_context.is_none());
+                    let mut engine = app.shared.lock().unwrap();
+                    assert!(
+                        engine
+                            .doc
+                            .layers
+                            .iter()
+                            .find(|l| l.id == child)
+                            .unwrap()
+                            .locked
+                    );
+                    assert!(
+                        !engine
+                            .doc
+                            .layers
+                            .iter()
+                            .find(|l| l.id == other)
+                            .unwrap()
+                            .locked
+                    );
+                    assert_eq!(engine.undo.len(), 1);
+                    engine.undo("human").unwrap();
+                    drop(engine);
+                    app.select_content(&other);
+                    app.selection_layers.insert(folder.clone());
+                } else {
+                    key(&mut app, &ctx, egui::Key::Escape);
+                    assert!(app.layer_context.is_none());
+                }
+                assert_eq!(app.shared.lock().unwrap().doc.export_png().unwrap(), before);
+            }
+        }
+    }
+    #[test]
+    fn layer_context_respects_scroll_clipping_outside_clicks_and_project_changes() {
+        let (mut app, ctx) = small_fixture();
+        {
+            let mut engine = app.shared.lock().unwrap();
+            let commands = (0..18)
+                .map(|i| json!({"op":"layer.add","name":format!("Row {i}")}))
+                .collect::<Vec<_>>();
+            engine
+                .edit("human", &commands, None, None, "Fixture")
+                .unwrap();
+            engine.undo.clear();
+        }
+        app.tool = Tool::None;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![], Default::default());
+        }
+        let clipped = app
+            .layer_rects
+            .values()
+            .find(|row| {
+                row.center().y > app.color_tab_rect.unwrap().bottom() + 40. && row.center().y < 840.
+            })
+            .unwrap()
+            .left_center()
+            + Vec2::new(2., 0.);
+        let secondary = |app: &mut PeerBrush, position| {
+            frame(
+                app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    button(
+                        position,
+                        egui::PointerButton::Secondary,
+                        true,
+                        Default::default(),
+                    ),
+                ],
+                Default::default(),
+            );
+            frame(
+                app,
+                &ctx,
+                vec![button(
+                    position,
+                    egui::PointerButton::Secondary,
+                    false,
+                    Default::default(),
+                )],
+                Default::default(),
+            );
+            frame(app, &ctx, vec![], Default::default());
+        };
+        secondary(&mut app, clipped);
+        assert!(
+            app.layer_context.is_none(),
+            "Clipped rows cannot open menus through the controls beneath them"
+        );
+        let first = app.shared.lock().unwrap().doc.layers[0].id.clone();
+        let point = app.layer_rects[&first].right_top() + Vec2::new(-2., 2.);
+        secondary(&mut app, point);
+        assert!(app.layer_context.is_some());
+        let canvas = app.view_rect.unwrap().center();
+        click(&mut app, &ctx, canvas);
+        assert!(app.layer_context.is_none());
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        secondary(&mut app, point);
+        assert!(app.layer_context.is_some());
+        let second = crate::workspace::register_in(&app.workspace, Engine::new(), None).unwrap();
+        let second_id = second.lock().unwrap().project_id.clone();
+        crate::workspace::select_in(&app.workspace, &second_id).unwrap();
+        app.switch_project(&second_id);
+        assert!(app.layer_context.is_none());
+        frame(&mut app, &ctx, vec![], Default::default());
+        let point = app.layer_rects[&app.selected].right_top() + Vec2::new(-2., 2.);
+        secondary(&mut app, point);
+        assert!(app.layer_context.is_some());
+        app.shared.lock().unwrap().doc = Document::new(8, 8).unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.layer_context.is_none());
+        assert!(app.shared.lock().unwrap().undo.is_empty());
     }
     #[test]
     fn dragging_a_layer_previews_order_then_commits_one_undoable_edit() {
