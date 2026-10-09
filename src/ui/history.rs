@@ -1,5 +1,28 @@
 use super::*;
 impl PeerBrush {
+    pub(super) fn reconcile_reservation_message(&mut self) {
+        if !self.message.starts_with("Reserved by ") {
+            return;
+        }
+        let Ok(e) = self.shared.try_lock() else {
+            return;
+        };
+        let still_reserved = e
+            .leases
+            .iter()
+            .filter(|l| l.expires > crate::engine::now())
+            .any(|l| {
+                self.message == format!("Reserved by {}: {}", l.owner, l.description)
+                    || self.message
+                        == format!(
+                            "Reserved by {}: {}. Release the reservation or edit elsewhere.",
+                            l.owner, l.description
+                        )
+            });
+        if !still_reserved {
+            self.message = "Reservation released · ready to edit".into();
+        }
+    }
     pub(super) fn review_document(&mut self, current: &Document) -> Option<Document> {
         let id = self.proposal_review.as_ref()?;
         if self.proposal_original {

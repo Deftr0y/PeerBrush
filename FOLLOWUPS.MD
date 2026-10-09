@@ -2,6 +2,8 @@
 
 This is the living backlog for ideas raised during development. Add new requests here as they arrive, keep the user's intent, and move them to the appropriate milestone. Update status only after implementation and verification.
 
+Implementation status describes current development source. Work completed after the published v0.1.4 checkpoint remains unreleased until it is included in a separately verified package.
+
 ## Completed checkpoint
 
 | ID | Work | Status | Acceptance |
@@ -10,7 +12,7 @@ This is the living backlog for ideas raised during development. Add new requests
 
 The reconciled 0.1.4 checkpoint passed 252 regression tests, three actual-device GPU checks, native painting/MCP/CLI and independent 16-bit PSD/PNG checks, and all eleven Hippo PSD checks with original hashes unchanged. [Windows portable download](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.4/PeerBrush-Windows.zip) and [matching source](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.4/PeerBrush-source.zip) are published from commit `8adadb8`. Archive integrity, committed source, licensing/artwork, binary hashes and the packaged native16 CLI were verified. See [checkpoint verification](docs/checkpoint-0.1.4.md). The earlier 0.1.3 candidate remains historical validation documentation.
 
-See [development notes](docs/development.md) for the engine and validation workflow. Compact weighted effects stacks, the brush library and bottom-right transform controls are verified. Project tabs, lifecycle protection and the remaining performance work continue below.
+See [development notes](docs/development.md) for the engine and validation workflow. Compact weighted effects stacks, the brush library, bottom-right transform controls, project tabs, lifecycle protection and supported regional/GPU performance paths are verified.
 
 ## Current release
 
@@ -46,7 +48,7 @@ See [development notes](docs/development.md) for the engine and validation workf
 
 | PB-027 | Remove Adjust layer from brush toolbar | Implemented and verified | Keep brush settings focused on brush behavior; tone adjustments live in editable effect stacks. |
 
-| PB-028 | Multiple layer selection and shared editing | Raster multi-edit verified; group transforms planned | Ctrl/Cmd and Shift selection; shared W/E/R pivot for raster layers; atomic opacity, blend, effect and mask edits. |
+| PB-028 | Multiple layer selection and shared editing | Implemented and verified | Ctrl/Cmd and Shift selection; shared W/E/R pivot for raster layers and complete folder trees (PB-077); atomic opacity, blend, effect and mask edits. |
 | PB-029 | Distinct folder rows and drag into/out of folders | Implemented and verified | Folder glyph and stronger name, cycle/lock checks, live hierarchy canvas preview and one undo step. |
 | PB-030 | Sweep layer eyes to show/hide | Implemented and verified | One consistent visibility value while dragging vertically across eyes, live feedback, one undo on release and Escape cancellation. |
 | PB-031 | Photoshop-style selection boundary | Implemented and verified | Animated alternating black/white dashes, fixed screen thickness and bounded painting at large zoom. |
@@ -55,13 +57,13 @@ See [development notes](docs/development.md) for the engine and validation workf
 
 | PB-034 | Contrast-safe brush cursor | Implemented and verified | Black and white tip outline and center marker remain readable on light, dark and tiny-zoom canvases. |
 | PB-035 | True foreground/background color swap | Implemented and verified | X swaps both stored colors rather than copying; keep artwork and mask palettes independent. |
-| PB-036 | Faster brush strokes | Implemented and benchmarked; incremental/GPU follow-up | Tile-based coverage and one destination COW access per tile; preserve byte-identical stroke rendering; measure on medium/large canvases. Retained Session/dirty previews are now implemented; full GPU compositing remains a later slice. |
+| PB-036 | Faster brush strokes | Implemented and benchmarked for supported paths | Tile-based coverage and one destination COW access per tile; byte-identical stroke rendering and medium/large canvas measurements. Retained effects-aware previews (PB-075), bounded GPU preview tiles (PB-076) and whole-image regional filters (PB-061) are verified. Broader GPU modes retain documented CPU fallback. |
 | PB-037 | Alt temporary eyedropper | Implemented and verified | Holding Alt in Brush samples composite artwork or the selected mask without painting; releasing restores Brush; Alt + right zoom remains available. |
 | PB-038 | Reliable MCP setup and reconnection | Implemented and verified | Explain listener versus client, provide Codex setup, initialize/catalog while editor is closed, reconnect when it opens, clear presence at EOF. |
 | PB-039 | Agent image placement | Implemented and verified | One-call placement from absolute PNG/JPEG path or base64 PNG, explicit pixel rectangle, new/current layer, editable masks/effects retained, undo and cropped PNG feedback. |
 | PB-040 | Blue AI activity markers | Implemented and verified | Blue identifies recent AI edits and reservations on affected layers, tools, controls and canvas areas; human interaction keeps Ember orange. |
-| PB-041 | Animated AI edits | Initial animation coverage verified; extend with tools | Ease numeric controls and actual canvas opacity/move feedback, lerp hierarchy rows including folder indentation, transition discrete rendered results. Shared state commits immediately; human edits interrupt presentation animation. Extend animation coverage as tools grow. |
-| PB-042 | Refine P logo toward MayaMCP | Interlocking P accepted provisionally; further refinement planned | Crisp geometric orange/ivory/plum P, genuine transparency, clear at toolbar and app-icon sizes. |
+| PB-041 | Animated AI edits | Implemented and verified; standing rule for new tools | Ease numeric controls and actual canvas opacity/move feedback, lerp hierarchy rows including folder indentation, transition discrete rendered results. Whole-image filter controls and procedural canvas changes use the same presentation paths. Shared state commits immediately; human edits interrupt presentation animation. Extend coverage as tools grow. |
+| PB-042 | Refine P logo toward MayaMCP | Current interlocking P implemented and visually checked; design feedback remains open | Crisp geometric orange/ivory/plum P, genuine transparency, clear at toolbar and app-icon sizes. The current design is provisionally accepted; additional visual refinement follows design feedback. |
 
 | PB-043 | One-click local MCP registration and discovery | Implemented and verified | Register detected Codex/Claude/Cursor/Gemini clients, preserve settings, publish token-free manifest; green only for a real connection. |
 | PB-044 | Merge layers and folders | Implemented and verified | One undoable bake, preserve masks/effects/current appearance; guard gaps, locks, stale commits and backdrop-dependent blends. |
@@ -113,7 +115,7 @@ Then develop the following slices in the user's requested priority order:
 
 All slices preserve native 16-bit precision, shared engine/reservation rules, current standard PSD raster/mask data and merged composites, and the compact Ember UI. Verify behavior changes with engine/codec/protocol tests and the native workspace.
 
-Signed cross-platform portable packages remain planned. Remote connections and plugin architecture follow once the local editor is dependable.
+Signed cross-platform portable packages, remote connections and plugin architecture remain future work. Broader GPU modes and Photoshop structures retain the documented fallbacks and fidelity limits. These extensions are not part of the completed feature checkpoint.
 
 ## Additional requested work
 
@@ -151,9 +153,9 @@ These requests are queued for later development; they do not replace the active 
 | PB-097 | Double-click sliders to type exact values | Implemented and verified | Shared compact sliders open an exact-value field with selected text. Enter or focus loss accepts finite bounded values; Escape and invalid input preserve the original. Layer/effect entries bind to their source document and revision, cancel on newer work or project switches, and create one edit only on acceptance. Input-event tests cover native8/16 color and mask strengths, exact undo, text guards, drag, cancellation and fractional values. All 141 targeted engine/codec/protocol/library/UI checks passed (two GPU checks skipped), plus native build, workspace inspection and independently decoded current PSD16 composite/reopening checks. |
 | PB-098 | Clear folder containment in the layer tree | Implemented and verified | Aligned visibility controls, 22-point content indentation and connected parent/child branches make nested folder membership explicit. Guides follow the displayed drag/AI positions and remain blue for AI changes; no source/history data is added. Collapsed folders hide descendant guides. Fixed OS theme switching so the existing Ember palette persists. All 133 targeted engine/tree/grouping/codec/protocol/library/UI checks passed (two GPU checks skipped), including nested collapse, child selection, drag, inline rename and AI animation. Native nested PSD16 workspace inspection, exact organization/undo/reopening and independently decoded standard composite words passed. |
 | PB-099 | Live AI code execution for canvas editing | Implemented and verified; unreleased | Bounded Rhai loops, functions, frozen native pixel reads/buffers and shared commands prepare one atomic edit outside the live document lock. Exact project/document/revision, owned task and declared blue scopes enforce layer locks, reservations and coworking rules before execution and commit. Cancellation, takeover, expiry, invalid scripts and newer human work discard unfinished results without reacquiring tasks. Actual MCP PNG content/coordinates, native workspace markers/results, single undo and editable PSD16 reopening passed; independent decoding verified every standard merged word and procedural low bits. Full regression suite passed, followed by 138 targeted final checks (three GPU-only checks skipped). See [interface and limits](docs/live-code.md). |
+| PB-100 | Clear obsolete reservation errors after release | Implemented and verified; unreleased | The native footer keeps a current reservation error while its owner/description remains active, and clears it after release, expiry or takeover. Other reservations/activity and unrelated file errors remain visible. All 165 targeted engine/codec/protocol/UI checks passed (three GPU-only checks skipped). Native rendered before/after captures verified the blocked human fill and restored ready message; native16 artwork/revision/history stayed unchanged. |
 
-- Clear obsolete reservation errors after takeover/release; keep current participant activity readable.
-- Extend AI tool highlighting to every new operation and refine transition timing from user feedback.
+Blue AI tool highlighting and presentation transitions remain standing requirements for new operations; refine timing from user feedback.
 
 ## Working rule
 

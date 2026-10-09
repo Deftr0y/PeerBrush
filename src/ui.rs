@@ -3686,6 +3686,7 @@ impl PeerBrush {
             self.message = status.clone();
             self.last_status = status;
         }
+        self.reconcile_reservation_message();
         while let Ok(reply) = self.import_rx.try_recv() {
             self.jobs.remove(&reply.project);
             self.busy = self.jobs.contains(&self.project_id);
@@ -4624,6 +4625,68 @@ impl eframe::App for PeerBrush {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn released_or_expired_reservation_errors_clear_without_hiding_other_work() {
+        for action in ["end", "expire", "takeover"] {
+            let (mut app, ctx) = fixture();
+            frame(&mut app, &ctx, vec![], Default::default());
+            let layer = app.selected.clone();
+            let (task, other) = {
+                let mut e = app.shared.lock().unwrap();
+                let task = e
+                    .reserve(
+                        "sky-agent",
+                        "Sky texture",
+                        vec![crate::engine::Scope {
+                            target: Some(layer.clone()),
+                            rect: Some([0, 0, 16, 16]),
+                        }],
+                    )
+                    .unwrap()
+                    .id;
+                let other = e
+                    .reserve(
+                        "detail-agent",
+                        "Small detail",
+                        vec![crate::engine::Scope {
+                            target: Some(layer.clone()),
+                            rect: Some([16, 0, 32, 16]),
+                        }],
+                    )
+                    .unwrap()
+                    .id;
+                (task, other)
+            };
+            let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+            app.edit(
+                vec![json!({"op":"paint","layer":layer,"points":[[4,4]],"radius":2})],
+                "Paint",
+            );
+            assert!(app.message.starts_with("Reserved by sky-agent:"));
+            frame(&mut app, &ctx, vec![], Default::default());
+            assert!(app.message.starts_with("Reserved by sky-agent:"));
+            {
+                let mut e = app.shared.lock().unwrap();
+                match action {
+                    "end" => e.finish_task(&task, "ended"),
+                    "expire" => e.leases.iter_mut().find(|l| l.id == task).unwrap().expires = 0,
+                    _ => e.take_over_tasks(),
+                }
+            }
+            frame(&mut app, &ctx, vec![], Default::default());
+            assert!(!app.message.starts_with("Reserved by"), "{}", app.message);
+            if action != "takeover" {
+                let e = app.shared.lock().unwrap();
+                assert!(e.leases.iter().any(|l| l.id == other));
+                assert_eq!(e.activity, "Small detail");
+            }
+            assert_eq!(app.shared.lock().unwrap().doc.export_png().unwrap(), before);
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            app.message = "Cannot save this file".into();
+            frame(&mut app, &ctx, vec![], Default::default());
+            assert_eq!(app.message, "Cannot save this file");
+        }
+    }
     #[test]
     fn tabs_keep_selection_channels_view_and_background_job_results_separate() {
         let (mut app, ctx) = fixture();
