@@ -705,6 +705,7 @@ impl Engine {
             "layer.delete",
             "layer.merge",
             "layer.duplicate",
+            "layer.duplicate_selection",
             "layer.paste",
             "group.create_selected",
             "adjustment.add",
@@ -797,6 +798,7 @@ impl Engine {
             "layer.delete",
             "layer.merge",
             "layer.duplicate",
+            "layer.duplicate_selection",
             "layer.paste",
             "group.create_selected",
             "adjustment.add",
@@ -1377,6 +1379,10 @@ impl Engine {
         }
         if op == "adjustment.add" {
             crate::adjustment::add(&mut self.doc, c)?;
+            return Ok(());
+        }
+        if op == "layer.duplicate_selection" {
+            crate::layer_clipboard::duplicate_selection(&mut self.doc, c)?;
             return Ok(());
         }
         if op == "layer.duplicate" {

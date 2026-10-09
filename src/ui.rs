@@ -915,6 +915,29 @@ impl PeerBrush {
             Err(e) => self.message = e,
         }
     }
+    fn duplicate_selection(&mut self, doc: &Document) {
+        self.close_proposal();
+        let result = self.shared.lock().unwrap().edit(
+            "human",
+            &[json!({"op":"layer.duplicate_selection","layer":self.selected,"document_id":doc.id,"source_revision":doc.revision})],
+            Some(doc.revision), None, "Duplicate layer selection",
+        );
+        match result {
+            Ok(result) => {
+                if let Some(id) = result["created_roots"]
+                    .as_array()
+                    .and_then(|ids| ids.first())
+                    .and_then(Value::as_str)
+                {
+                    self.select_content(id);
+                }
+                self.layer_clipboard = true;
+                self.message = "Duplicated layer selection".into();
+                self.last_preview = None;
+            }
+            Err(error) => self.message = error,
+        }
+    }
     fn layer_cmd(&mut self, op: &str, extra: Value, label: &str) {
         if !self.selection_layers.contains(&self.selected) {
             self.selection_layers = [self.selected.clone()].into_iter().collect();
@@ -3771,7 +3794,11 @@ impl PeerBrush {
                     self.layer_cmd("layer.delete",json!({}),"Delete selected layers");
                 }
                 if command_key(i,egui::Key::D) {
-                    self.edit(vec![json!({"op":if key_modifiers(i,egui::Key::D).shift{"selection.reselect"}else{"selection.clear"}})],if key_modifiers(i,egui::Key::D).shift{"Reselect"}else{"Deselect"});
+                    if key_modifiers(i,egui::Key::D).shift {
+                        self.edit(vec![json!({"op":"selection.reselect"})],"Reselect");
+                    } else {
+                        self.duplicate_selection(&doc);
+                    }
                 }
                 if command_key(i,egui::Key::A) {self.edit(vec![json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})],"Select all");}
                 if command_key(i,egui::Key::J) && self.layer_clipboard {self.duplicate_layers(&doc);}
@@ -3879,7 +3906,7 @@ impl PeerBrush {
                         if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Refine selection…")).clicked(){self.open_refinement(&doc,None);ui.close_menu();}
                         if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Mask from selection")).clicked(){self.layer_cmd("mask.from_selection",json!({}),"Mask from selection");ui.close_menu();}
                         if ui.add_enabled(doc.layers.iter().any(|l|l.id==self.selected&&l.mask.is_some())&&!doc.read_only,egui::Button::new("Refine layer mask…")).clicked(){self.open_refinement(&doc,Some(self.selected.clone()));ui.close_menu();}
-                        for (label,op) in [("All · Ctrl+A","all"),("Deselect · Ctrl+D","selection.clear"),("Reselect · Ctrl+Shift+D","selection.reselect"),("Inverse","selection.invert")] {
+                        for (label,op) in [("All · Ctrl+A","all"),("Deselect","selection.clear"),("Reselect · Ctrl+Shift+D","selection.reselect"),("Inverse","selection.invert")] {
                             if ui.button(label).clicked(){self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);ui.close_menu();}
                         }
                         for (label,mode) in [("Expand by 1 px","expand"),("Contract by 1 px","contract")] {if ui.button(label).clicked(){self.edit(vec![json!({"op":"selection.modify","mode":mode,"radius":1})],label);ui.close_menu();}}
@@ -7933,48 +7960,87 @@ mod tests {
         );
     }
     #[test]
-    fn command_d_deselects_in_layer_focus_and_shift_d_reselects() {
-        let (mut app, ctx) = small_fixture();
-        app.shared
-            .lock()
-            .unwrap()
-            .edit(
-                "human",
-                &[json!({"op":"selection","kind":"ellipse","rect":[2,2,10,10]})],
-                None,
-                None,
-                "Select",
-            )
-            .unwrap();
-        app.layer_clipboard = true;
-        let count = app.shared.lock().unwrap().doc.layers.len();
-        modified_key(
-            &mut app,
-            &ctx,
-            egui::Key::D,
-            egui::Modifiers {
+    fn command_d_duplicates_active_pixels_or_layer_and_preserves_typing() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = fixture();
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc = Document::new_depth(16, 16, depth).unwrap();
+                for y in 0..16 {
+                    for x in 0..16 {
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(x, y, [12347, 33559, 51237, 45679]);
+                    }
+                }
+            }
+            let id = app.shared.lock().unwrap().doc.layers[0].id.clone();
+            app.select_content(&id);
+            app.shared
+                .lock()
+                .unwrap()
+                .edit(
+                    "human",
+                    &[json!({"op":"selection","kind":"ellipse","rect":[2,2,12,12],"feather":1})],
+                    None,
+                    None,
+                    "Select",
+                )
+                .unwrap();
+            app.shared.lock().unwrap().undo.clear();
+            frame(&mut app, &ctx, vec![], Default::default());
+            app.layer_clipboard = true;
+            let mods = egui::Modifiers {
                 command: true,
                 ctrl: true,
                 ..Default::default()
-            },
-        );
-        assert!(app.shared.lock().unwrap().doc.selection.is_none());
-        assert_eq!(app.shared.lock().unwrap().doc.layers.len(), count);
-        modified_key(
-            &mut app,
-            &ctx,
-            egui::Key::D,
-            egui::Modifiers {
-                command: true,
-                ctrl: true,
-                shift: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            app.shared.lock().unwrap().doc.selection,
-            Some([2, 2, 10, 10])
-        );
+            };
+            modified_key(&mut app, &ctx, egui::Key::D, mods);
+            {
+                let mut engine = app.shared.lock().unwrap();
+                assert_eq!(engine.doc.layers.len(), 2);
+                assert_eq!(engine.doc.selection, Some([1, 1, 13, 13]));
+                assert_eq!(app.selected, engine.doc.layers[0].id);
+                assert_eq!((engine.doc.layers[0].x, engine.doc.layers[0].y), (1, 1));
+                assert_eq!(engine.doc.layers[0].pixels.depth, depth);
+                assert_eq!(engine.undo.len(), 1);
+                engine.undo("human").unwrap();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"selection.clear"})],
+                        None,
+                        None,
+                        "Deselect",
+                    )
+                    .unwrap();
+                engine.undo.clear();
+            }
+            app.select_content(&id);
+            modified_key(&mut app, &ctx, egui::Key::D, mods);
+            {
+                let engine = app.shared.lock().unwrap();
+                assert_eq!(engine.doc.layers.len(), 2);
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    engine.doc.layers[1].pixels.rgba16()
+                );
+                assert_eq!(engine.undo.len(), 1);
+            }
+            // Ctrl+D remains ordinary text input when a numeric/text editor owns focus.
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut String::new())
+                            .id(egui::Id::new("duplicate typing")),
+                    )
+                    .request_focus();
+                });
+            });
+            modified_key(&mut app, &ctx, egui::Key::D, mods);
+            assert_eq!(app.shared.lock().unwrap().doc.layers.len(), 2);
+            assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        }
     }
     #[test]
     fn completed_gestures_reject_old_revision_previews_even_when_given_old_ui_snapshot() {
@@ -8035,6 +8101,9 @@ mod tests {
     fn fast_native_control_chord_uses_event_modifiers_after_control_is_released() {
         let (mut app, ctx) = small_fixture();
         app.shared.lock().unwrap().doc.selection = Some([2, 2, 8, 8]);
+        app.shared.lock().unwrap().doc.layers[0]
+            .pixels
+            .set(4, 4, [200, 80, 30, 255]);
         app.tool = Tool::Selection;
         frame(
             &mut app,
@@ -8052,7 +8121,9 @@ mod tests {
             }],
             Default::default(),
         );
-        assert!(app.shared.lock().unwrap().doc.selection.is_none());
+        assert_eq!(app.shared.lock().unwrap().doc.selection, Some([2, 2, 8, 8]));
+        assert_eq!(app.shared.lock().unwrap().doc.layers.len(), 2);
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
         assert!(app.tool == Tool::Selection);
     }
     #[test]

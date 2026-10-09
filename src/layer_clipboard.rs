@@ -268,6 +268,87 @@ fn commit(doc: &mut Document, mut draft: Document) -> Result<(), String> {
     Ok(())
 }
 
+/// Duplicate the active selected image at its document coordinates, or its whole
+/// editable layer tree when no pixel selection is active. No OS clipboard is used.
+pub fn duplicate_selection(doc: &mut Document, command: &Value) -> Result<Vec<String>, String> {
+    if command
+        .get("document_id")
+        .is_some_and(|value| value.as_str() != Some(doc.id.as_str()))
+        || command
+            .get("source_revision")
+            .is_some_and(|value| value.as_u64() != Some(doc.revision))
+    {
+        return Err("The source document changed before duplication".into());
+    }
+    if doc.read_only {
+        return Err("This PSD is read-only".into());
+    }
+    let target = command["layer"]
+        .as_str()
+        .ok_or("Choose an active layer to duplicate")?;
+    if doc.selection.is_none() {
+        return duplicate(doc, &[target.into()]);
+    }
+    unlocked(doc, target)?;
+    if doc.layers.len() >= 100 {
+        return Err("Initial version supports up to 100 layers".into());
+    }
+    let at = doc
+        .layers
+        .iter()
+        .position(|layer| layer.id == target)
+        .ok_or("The active layer no longer exists")?;
+    let source = &doc.layers[at];
+    if source.kind == "adjustment" {
+        return Err("Choose a paint layer or folder to duplicate selected pixels".into());
+    }
+    let image = crate::clipboard::Image::copy(doc, target, false, false)?;
+    let pixels = if let Some(words) = &image.samples16 {
+        Raster::from_rgba16(image.width, image.height, words)?
+    } else {
+        Raster::from_rgba(image.width, image.height, &image.bytes)?
+    };
+    let has_pixels = image.samples16.as_ref().map_or_else(
+        || image.bytes.chunks_exact(4).any(|pixel| pixel[3] != 0),
+        |words| words.chunks_exact(4).any(|pixel| pixel[3] != 0),
+    );
+    if !has_pixels {
+        return Err("The selection contains no visible pixels on this layer".into());
+    }
+    let origin = image
+        .origin
+        .ok_or("Selected pixels need document coordinates")?;
+    let mut layer = Layer::new(
+        &format!("{} selection", source.name),
+        "paint",
+        image.width,
+        image.height,
+    );
+    layer.parent = source.parent.clone();
+    layer.x = origin[0];
+    layer.y = origin[1];
+    layer.pixels = pixels;
+    let created = layer.id.clone();
+    // A clipped source remains clipped to the same base. The base itself must
+    // stay adjacent to its followers, so insert a base selection above the unit.
+    layer.clip_to = source.clip_to.clone();
+    let insert = if source.clip_to.is_none() {
+        doc.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| layer.clip_to.as_deref() == Some(target))
+            .map(|(index, _)| index)
+            .min()
+            .unwrap_or(at)
+    } else {
+        at
+    };
+    let mut draft = doc.clone();
+    draft.layers.insert(insert, layer);
+    commit(doc, draft)?;
+    Ok(vec![created])
+}
+
 /// Duplicate each root immediately above its original, retaining its original parent.
 pub fn duplicate(doc: &mut Document, ids: &[String]) -> Result<Vec<String>, String> {
     if doc.read_only {

@@ -474,6 +474,7 @@ pub fn invalidate(doc: &mut Document, commands: &[Value]) {
             "layer.delete",
             "layer.merge",
             "layer.duplicate",
+            "layer.duplicate_selection",
             "layer.paste",
             "group.create_selected",
             "image.place",
