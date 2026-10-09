@@ -18,6 +18,8 @@ Click a layer row to work with whole layers. **Ctrl/Cmd+J** duplicates the selec
 
 Click the canvas to work with pixels. **Ctrl/Cmd+C** copies the active layer's selection, including its visible color effects and mask. A rotated selection clips copied pixels to its exact shape. **Ctrl/Cmd+Shift+C** copies the visible composite. **Ctrl/Cmd+V** also accepts images copied in another application. A PeerBrush pixel copy retains its position; an external image is centered. Paste uses the selected folder or the selected layer's folder. At the top level it creates a folder containing the original and pasted content. Paste and any folder creation are one undo step. Text fields keep normal text shortcuts.
 
+On Windows, you can also copy PNG, JPEG or BMP files in Explorer and paste them directly. Up to 16 files paste together in one undo step. PNG16 input keeps its native samples and promotes an 8-bit destination to 16 bit; undo restores the original depth. Image-only clipboards and older Windows bitmap formats are supported. A project with no layers accepts a pasted image as a root layer. Clipboard files are limited to 128 MiB each, with a 256 MiB combined decoded paste budget; invalid files leave the project intact. Other image/vector imports are tracked in PB-091.
+
 
 ## Compatibility
 

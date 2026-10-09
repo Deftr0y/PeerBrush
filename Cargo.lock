@@ -2120,6 +2120,7 @@ dependencies = [
  "arboard",
  "base64",
  "bytemuck",
+ "clipboard-win",
  "eframe",
  "flate2",
  "image",

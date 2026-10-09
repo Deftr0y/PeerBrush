@@ -6,7 +6,17 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use std::{borrow::Cow, sync::mpsc};
+use std::{borrow::Cow, path::PathBuf, sync::mpsc};
+#[cfg(windows)]
+mod windows;
+
+fn image_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits
+}
 
 #[derive(Clone)]
 pub struct Image {
@@ -18,6 +28,105 @@ pub struct Image {
     pub origin: Option<[i32; 2]>,
 }
 impl Image {
+    fn decoded(image: image::DynamicImage) -> Result<Self, String> {
+        let (width, height) = (image.width(), image.height());
+        check_size(width, height)?;
+        let native16 = matches!(
+            image,
+            image::DynamicImage::ImageLuma16(_)
+                | image::DynamicImage::ImageLumaA16(_)
+                | image::DynamicImage::ImageRgb16(_)
+                | image::DynamicImage::ImageRgba16(_)
+        );
+        let (bytes, samples16) = if native16 {
+            let words = image.into_rgba16().into_raw();
+            let bytes = words
+                .iter()
+                .copied()
+                .map(crate::raster::project16)
+                .collect();
+            (bytes, Some(words))
+        } else {
+            (image.into_rgba8().into_raw(), None)
+        };
+        Ok(Self {
+            width,
+            height,
+            bytes,
+            samples16,
+            origin: None,
+        })
+    }
+    fn decoder(mut decoder: impl image::ImageDecoder, budget: usize) -> Result<Self, String> {
+        let (width, height) = decoder.dimensions();
+        check_size(width, height)?;
+        let color = decoder.color_type();
+        let native16 = color.bits_per_pixel() / color.channel_count() as u16 > 8;
+        let memory = width as u64 * height as u64 * if native16 { 12 } else { 4 };
+        if memory > budget as u64 {
+            return Err(
+                "Clipboard images exceed the 256 MiB paste budget; paste smaller or fewer images"
+                    .into(),
+            );
+        }
+        decoder
+            .set_limits(image_limits())
+            .map_err(|e| e.to_string())?;
+        Self::decoded(
+            image::DynamicImage::from_decoder(decoder)
+                .map_err(|e| format!("Cannot decode clipboard image: {e}"))?,
+        )
+    }
+    fn png_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        let mut reader =
+            image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
+        reader.limits(image_limits());
+        Self::decoder(
+            reader
+                .into_decoder()
+                .map_err(|e| format!("Cannot decode clipboard PNG: {e}"))?,
+            256 * 1024 * 1024,
+        )
+    }
+    fn file(path: &std::path::Path, budget: usize) -> Result<Self, String> {
+        if !path.is_absolute() {
+            return Err("Clipboard image paths must be absolute".into());
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !["png", "jpg", "jpeg", "bmp"].contains(&ext.as_str()) {
+            return Err("Paste PNG, JPEG or BMP image files; use Open for PSD projects".into());
+        }
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("Cannot read clipboard image: {e}"))?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() > 128 * 1024 * 1024 {
+            return Err("Clipboard image must be a file smaller than 128 MiB".into());
+        }
+        // Bound the actual read too, even if another application grows the file.
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.take(128 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 128 * 1024 * 1024 {
+            return Err("Clipboard image is too large".into());
+        }
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?;
+        if !matches!(
+            reader.format(),
+            Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::Bmp)
+        ) {
+            return Err("Clipboard file is not a supported image".into());
+        }
+        reader.limits(image_limits());
+        Self::decoder(reader.into_decoder().map_err(|e| e.to_string())?, budget)
+    }
     pub fn copy(doc: &Document, target: &str, mask: bool, merged: bool) -> Result<Self, String> {
         if doc.bit_depth == 16 {
             return Self::copy16(doc, target, mask, merged);
@@ -173,16 +282,18 @@ pub fn copy_document_pixels(
 
 /// Called inside an Engine transaction so grouping, pixels and selection share one undo step.
 pub fn paste(doc: &mut Document, command: &Value) -> Result<(), String> {
+    if doc.read_only {
+        return Err("This PSD is read-only".into());
+    }
     let context = command["layer"]
         .as_str()
         .ok_or("Choose a layer or folder before pasting")?;
-    let index = doc
-        .layers
-        .iter()
-        .position(|l| l.id == context)
-        .ok_or("Paste destination no longer exists")?;
-    let selected = &doc.layers[index];
-    let mut parent = Some(selected.id.as_str());
+    let index = doc.layers.iter().position(|l| l.id == context);
+    if index.is_none() && !doc.layers.is_empty() {
+        return Err("Paste destination no longer exists".into());
+    }
+    let selected = index.map(|index| doc.layers[index].clone());
+    let mut parent = selected.as_ref().map(|l| l.id.as_str());
     for _ in 0..=16 {
         let Some(pid) = parent else { break };
         let l = doc
@@ -195,7 +306,9 @@ pub fn paste(doc: &mut Document, command: &Value) -> Result<(), String> {
         }
         parent = l.parent.as_deref();
     }
-    let wrap = selected.kind != "group" && selected.parent.is_none();
+    let wrap = selected
+        .as_ref()
+        .is_some_and(|l| l.kind != "group" && l.parent.is_none());
     if doc.layers.len() + if wrap { 2 } else { 1 } > 100 {
         return Err("Initial version supports up to 100 layers".into());
     }
@@ -206,27 +319,26 @@ pub fn paste(doc: &mut Document, command: &Value) -> Result<(), String> {
         return Err("Clipboard image is too large".into());
     }
     let encoded = STANDARD.decode(encoded).map_err(|e| e.to_string())?;
-    let mut reader =
-        image::ImageReader::with_format(std::io::Cursor::new(encoded), image::ImageFormat::Png);
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(256 * 1024 * 1024);
-    reader.limits(limits);
-    let image = reader.decode().map_err(|e| e.to_string())?;
-    check_size(image.width(), image.height())?;
-    let mut pasted = Layer::new("Pasted image", "paint", image.width(), image.height());
-    pasted.pixels = if doc.bit_depth == 16 {
-        let image = image.to_rgba16();
-        Raster::from_rgba16(image.width(), image.height(), image.as_raw())?
+    let image = Image::png_bytes(encoded)?;
+    let depth = if image.samples16.is_some() {
+        16
     } else {
-        let image = image.to_rgba8();
-        Raster::from_rgba(image.width(), image.height(), image.as_raw())?
+        doc.bit_depth
+    };
+    let mut pasted = Layer::new("Pasted image", "paint", image.width, image.height);
+    pasted.pixels = if let Some(words) = &image.samples16 {
+        Raster::from_rgba16(image.width, image.height, words)?
+    } else {
+        let mut pixels = Raster::from_rgba(image.width, image.height, &image.bytes)?;
+        if depth == 16 {
+            pixels.promote16();
+        }
+        pixels
     };
     let origin = if command["origin"].is_null() {
         [
-            (doc.width as i32 - image.width() as i32) / 2,
-            (doc.height as i32 - image.height() as i32) / 2,
+            (doc.width as i32 - image.width as i32) / 2,
+            (doc.height as i32 - image.height as i32) / 2,
         ]
     } else {
         let a = command["origin"]
@@ -243,35 +355,45 @@ pub fn paste(doc: &mut Document, command: &Value) -> Result<(), String> {
     };
     pasted.x = origin[0];
     pasted.y = origin[1];
+    let mut draft = doc.clone();
+    if depth == 16 && draft.bit_depth == 8 {
+        draft.bit_depth = 16;
+        draft.ensure_depth();
+    }
     if wrap {
+        let selected = selected.as_ref().unwrap();
+        let index = index.unwrap();
         let mut folder = Layer::new(
             &format!("{} group", selected.name),
             "group",
             doc.width,
             doc.height,
         );
-        folder.pixels = Raster::new_depth(doc.width, doc.height, doc.bit_depth);
+        folder.pixels = Raster::new_depth(doc.width, doc.height, depth);
         // Retain the source interaction with the backdrop when introducing a group.
         folder.blend = selected.blend.clone();
         folder.parent = selected.parent.clone();
-        doc.layers[index].blend = "normal".into();
+        draft.layers[index].blend = "normal".into();
         pasted.parent = Some(folder.id.clone());
-        doc.layers[index].parent = Some(folder.id.clone());
-        doc.layers.insert(index, folder);
-        doc.layers.insert(index + 1, pasted);
+        draft.layers[index].parent = Some(folder.id.clone());
+        draft.layers.insert(index, folder);
+        draft.layers.insert(index + 1, pasted);
     } else {
-        pasted.parent = if selected.kind == "group" {
-            Some(selected.id.clone())
-        } else {
-            selected.parent.clone()
-        };
-        let at = index + usize::from(selected.kind == "group");
-        doc.layers.insert(at, pasted);
+        pasted.parent = selected.as_ref().and_then(|l| {
+            if l.kind == "group" {
+                Some(l.id.clone())
+            } else {
+                l.parent.clone()
+            }
+        });
+        let at =
+            index.unwrap_or(0) + usize::from(selected.as_ref().is_some_and(|l| l.kind == "group"));
+        draft.layers.insert(at, pasted);
     }
-    doc.selection = None;
-    doc.selection_coverage = None;
-    doc.selection_polygon = None;
-    doc.selection_polygon = None;
+    draft.selection = None;
+    draft.selection_coverage = None;
+    draft.selection_polygon = None;
+    *doc = draft;
     Ok(())
 }
 
@@ -352,6 +474,12 @@ trait Provider {
     fn read_image(&mut self) -> Result<Image, String>;
     fn write_text(&mut self, text: &str) -> Result<(), String>;
     fn read_text(&mut self) -> Result<String, String>;
+    fn read_files(&mut self) -> Result<Vec<PathBuf>, String> {
+        Ok(vec![])
+    }
+    fn sequence(&mut self) -> Option<u64> {
+        None
+    }
 }
 impl Provider for arboard::Clipboard {
     fn write_image(&mut self, image: &Image) -> Result<(), String> {
@@ -363,9 +491,20 @@ impl Provider for arboard::Clipboard {
         .map_err(|e| e.to_string())
     }
     fn read_image(&mut self) -> Result<Image, String> {
+        #[cfg(windows)]
+        if let Some(image) = windows::png()? {
+            return Ok(image);
+        }
         let pixels = self
             .get_image()
-            .map_err(|_| "Copy an image or layers before pasting".to_owned())?;
+            .map_err(|_| "Copy an image, image file or layers before pasting".to_owned());
+        #[cfg(windows)]
+        let pixels = match pixels {
+            Ok(pixels) => pixels,
+            Err(error) => return windows::dib()?.ok_or(error),
+        };
+        #[cfg(not(windows))]
+        let pixels = pixels?;
         let width = u32::try_from(pixels.width).map_err(|_| "Clipboard image is too large")?;
         let height = u32::try_from(pixels.height).map_err(|_| "Clipboard image is too large")?;
         check_size(width, height)?;
@@ -383,6 +522,30 @@ impl Provider for arboard::Clipboard {
     fn read_text(&mut self) -> Result<String, String> {
         self.get_text().map_err(|e| e.to_string())
     }
+    fn read_files(&mut self) -> Result<Vec<PathBuf>, String> {
+        #[cfg(windows)]
+        {
+            match self.get().file_list() {
+            Ok(files)=>Ok(files),
+            Err(arboard::Error::ContentNotAvailable)=>Ok(vec![]),
+            Err(e)=>Err(format!("Cannot read clipboard files: {e}. Retry after the other clipboard operation finishes")),
+        }
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(vec![])
+        }
+    }
+    fn sequence(&mut self) -> Option<u64> {
+        #[cfg(windows)]
+        {
+            clipboard_win::seq_num().map(|s| s.get() as u64)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
 }
 struct LayerBuffer {
     marker: String,
@@ -391,6 +554,7 @@ struct LayerBuffer {
 #[derive(Default)]
 struct Session {
     image: Option<Image>,
+    image_sequence: Option<u64>,
     layers: Option<LayerBuffer>,
 }
 impl Session {
@@ -435,6 +599,7 @@ impl Session {
             } => {
                 let image = Image::copy(&doc, &target, mask, merged)?;
                 clipboard.write_image(&image)?;
+                self.image_sequence = clipboard.sequence();
                 self.image = Some(image);
                 self.layers = None;
                 Ok("Selection copied".into())
@@ -449,12 +614,20 @@ impl Session {
                 target,
                 revision,
             } => {
+                {
+                    let engine = shared.lock().unwrap();
+                    crate::workspace::guard(&engine, &document, revision)?;
+                }
+                let sequence = clipboard.sequence();
                 let text = clipboard.read_text().ok();
                 if let Some(buffer) = self
                     .layers
                     .as_ref()
                     .filter(|buffer| text.as_deref() == Some(buffer.marker.as_str()))
                 {
+                    if clipboard.sequence() != sequence {
+                        return Err("Clipboard changed while preparing paste; try again".into());
+                    }
                     let mut engine = shared.lock().unwrap();
                     crate::workspace::guard(&engine, &document, revision)?;
                     let result = engine.paste_layers(
@@ -476,32 +649,74 @@ impl Session {
                     selected = selected_layers.first().cloned();
                     return Ok("Pasted editable layers".into());
                 }
-                let mut image = clipboard.read_image()?;
-                let retained = self.image.as_ref().filter(|old| {
-                    old.width == image.width
-                        && old.height == image.height
-                        && old.bytes == image.bytes
-                });
-                image.origin = retained.and_then(|old| old.origin);
-                image.samples16 = retained.and_then(|old| old.samples16.clone());
-                let command = image.command(&target)?;
+                let files = clipboard.read_files()?;
+                let mut images = vec![];
+                if files.is_empty() {
+                    let mut image = clipboard.read_image()?;
+                    if let Some(retained) = self.image.as_ref().filter(|old| {
+                        self.image_sequence == sequence
+                            && old.width == image.width
+                            && old.height == image.height
+                            && old.bytes == image.bytes
+                    }) {
+                        image.origin = retained.origin;
+                        if retained.samples16.is_some() {
+                            image.samples16 = retained.samples16.clone();
+                        }
+                    }
+                    images.push(image);
+                } else {
+                    if files.len() > 16 {
+                        return Err("Paste up to 16 image files at a time".into());
+                    }
+                    let mut budget = 0usize;
+                    for file in files {
+                        let image = Image::file(&file, 256 * 1024 * 1024 - budget)?;
+                        budget = budget.saturating_add(image.bytes.len()).saturating_add(
+                            image.samples16.as_ref().map_or(0, |words| words.len() * 2),
+                        );
+                        if budget > 256 * 1024 * 1024 {
+                            return Err("Clipboard images exceed the 256 MiB paste budget; paste fewer files".into());
+                        }
+                        images.push(image);
+                    }
+                }
+                if clipboard.sequence() != sequence {
+                    return Err("Clipboard changed while preparing paste; try again".into());
+                }
+                let commands = images
+                    .iter()
+                    .map(|image| image.command(&target))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut engine = shared.lock().unwrap();
                 crate::workspace::guard(&engine, &document, revision)?;
                 let result =
-                    engine.edit("human", &[command], Some(revision), None, "Paste image")?;
-                selected = result["created"]
+                    engine.edit("human", &commands, Some(revision), None, "Paste images")?;
+                let pasted = result["created"]
                     .as_array()
-                    .and_then(|ids| {
-                        ids.iter().filter_map(Value::as_str).find(|id| {
-                            engine
-                                .doc
-                                .layers
-                                .iter()
-                                .any(|l| l.id == *id && l.kind == "paint")
-                        })
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(Value::as_str)
+                            .filter(|id| {
+                                engine
+                                    .doc
+                                    .layers
+                                    .iter()
+                                    .any(|l| l.id == **id && l.kind == "paint")
+                            })
+                            .map(String::from)
+                            .collect::<Vec<_>>()
                     })
-                    .map(String::from);
-                Ok("Pasted as a new layer".into())
+                    .unwrap_or_default();
+                selected = pasted.first().cloned();
+                if images.len() > 1 {
+                    selected_layers = pasted;
+                }
+                Ok(if images.len() == 1 {
+                    "Pasted as a new layer".into()
+                } else {
+                    format!("Pasted {} images as new layers", images.len())
+                })
             }
         })();
         Reply {
@@ -534,6 +749,9 @@ mod tests {
         text: Option<String>,
         image: Option<Image>,
         fail_write: bool,
+        files: Vec<PathBuf>,
+        sequence: Option<u64>,
+        change_on_read: bool,
     }
     impl Provider for Fake {
         fn write_image(&mut self, image: &Image) -> Result<(), String> {
@@ -542,9 +760,14 @@ mod tests {
             }
             self.image = Some(image.clone());
             self.text = None;
+            self.files.clear();
+            self.sequence = self.sequence.map(|n| n + 1);
             Ok(())
         }
         fn read_image(&mut self) -> Result<Image, String> {
+            if self.change_on_read {
+                self.sequence = self.sequence.map(|n| n + 1);
+            }
             self.image.clone().ok_or_else(|| "no OS image".into())
         }
         fn write_text(&mut self, text: &str) -> Result<(), String> {
@@ -553,10 +776,18 @@ mod tests {
             }
             self.text = Some(text.into());
             self.image = None;
+            self.files.clear();
+            self.sequence = self.sequence.map(|n| n + 1);
             Ok(())
         }
         fn read_text(&mut self) -> Result<String, String> {
             self.text.clone().ok_or_else(|| "no OS text".into())
+        }
+        fn read_files(&mut self) -> Result<Vec<PathBuf>, String> {
+            Ok(self.files.clone())
+        }
+        fn sequence(&mut self) -> Option<u64> {
+            self.sequence
         }
     }
     fn fixture() -> (Shared, Document, String) {
@@ -786,5 +1017,130 @@ mod tests {
             .find(|l| Some(&l.id) == reply.selected.as_ref())
             .unwrap();
         assert_eq!(pasted.pixels.get16(0, 0), [10001, 30003, 50007, 65535]);
+    }
+    #[test]
+    fn changing_clipboard_during_prepare_never_edits_or_reuses_native_data() {
+        let (shared, doc, id) = fixture();
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut fake = Fake {
+            sequence: Some(1),
+            change_on_read: true,
+            image: Some(Image {
+                width: 1,
+                height: 1,
+                bytes: vec![23, 45, 67, 255],
+                samples16: None,
+                origin: None,
+            }),
+            ..Default::default()
+        };
+        let reply = Session::default().process(
+            &mut fake,
+            Request::Paste {
+                shared: shared.clone(),
+                document: doc.id,
+                target: id,
+                revision: 0,
+            },
+        );
+        assert!(reply.result.unwrap_err().contains("Clipboard changed"));
+        let e = shared.lock().unwrap();
+        assert!(e.undo.is_empty());
+        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+    }
+    #[test]
+    fn copied_image_files_take_priority_over_thumbnail_pixels_and_batch_once() {
+        let (shared, doc, id) = fixture();
+        let mut files = vec![];
+        for (extension, format) in [
+            ("bmp", image::ImageFormat::Bmp),
+            ("jpg", image::ImageFormat::Jpeg),
+        ] {
+            let file = std::env::temp_dir().join(format!(
+                "peerbrush-file-paste-{}.{}",
+                uuid::Uuid::new_v4(),
+                extension
+            ));
+            image::RgbImage::from_pixel(2, 2, image::Rgb([23, 45, 67]))
+                .save_with_format(&file, format)
+                .unwrap();
+            files.push(file);
+        }
+        let mut fake = Fake {
+            files: files.clone(),
+            image: Some(Image {
+                width: 1,
+                height: 1,
+                bytes: vec![255, 0, 0, 255],
+                samples16: None,
+                origin: None,
+            }),
+            ..Default::default()
+        };
+        let reply = Session::default().process(
+            &mut fake,
+            Request::Paste {
+                shared: shared.clone(),
+                document: doc.id,
+                target: id,
+                revision: 0,
+            },
+        );
+        reply.result.unwrap();
+        assert_eq!(reply.selected_layers.len(), 2);
+        let mut e = shared.lock().unwrap();
+        assert_eq!(e.undo.len(), 1);
+        for id in reply.selected_layers {
+            let l = e.doc.layers.iter().find(|l| l.id == id).unwrap();
+            assert_eq!((l.pixels.width, l.pixels.height), (2, 2));
+            let color = l.pixels.get(0, 0);
+            for (actual, expected) in color.into_iter().zip([23u8, 45, 67, 255]) {
+                assert!(actual.abs_diff(expected) <= 2);
+            }
+        }
+        e.undo("human").unwrap();
+        assert_eq!(e.doc.layers.len(), 1);
+        for file in files {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+    #[test]
+    fn invalid_clipboard_file_counts_and_project_sources_preserve_work() {
+        let (shared, doc, id) = fixture();
+        for stale in [false, true] {
+            let mut fake = Fake {
+                files: vec![PathBuf::from("not-an-absolute-image.png"); if stale { 1 } else { 17 }],
+                ..Default::default()
+            };
+            let reply = Session::default().process(
+                &mut fake,
+                Request::Paste {
+                    shared: shared.clone(),
+                    document: if stale {
+                        "stale".into()
+                    } else {
+                        doc.id.clone()
+                    },
+                    target: id.clone(),
+                    revision: 0,
+                },
+            );
+            let error = reply.result.unwrap_err();
+            assert!(
+                if stale {
+                    error.contains("changed")
+                } else {
+                    error.contains("16 image files")
+                },
+                "{error}"
+            );
+        }
+        let e = shared.lock().unwrap();
+        assert!(e.undo.is_empty());
+        assert_eq!(
+            serde_json::to_value(&e.doc).unwrap(),
+            serde_json::to_value(&doc).unwrap()
+        );
+        assert!(Image::file(std::path::Path::new("relative.png"), 1024).is_err());
     }
 }

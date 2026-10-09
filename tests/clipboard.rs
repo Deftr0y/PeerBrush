@@ -173,38 +173,22 @@ fn merged_copy_uses_composite_and_rejects_an_empty_selection() {
 }
 
 #[cfg(target_os = "windows")]
+#[path = "support/isolated_clipboard.rs"]
+mod isolated_clipboard;
+#[cfg(target_os = "windows")]
 #[test]
-#[ignore = "Requires a native OS clipboard; manually run with --ignored. Restores prior text/image."]
-fn native_image_clipboard_copy_and_external_paste_roundtrip() {
+fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_paste() {
     use std::{
         borrow::Cow,
         sync::{Arc, Mutex},
-        time::Duration,
     };
-    struct Restore {
-        clipboard: arboard::Clipboard,
-        image: Option<arboard::ImageData<'static>>,
-        text: Option<String>,
+    if isolated_clipboard::child(
+        "windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_paste",
+    ) {
+        return;
     }
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            if let Some(image) = self.image.take() {
-                let _ = self.clipboard.set_image(image);
-            } else if let Some(text) = self.text.take() {
-                let _ = self.clipboard.set_text(text);
-            } else {
-                let _ = self.clipboard.clear();
-            }
-        }
-    }
+    let station = isolated_clipboard::Station::new();
     let mut native = arboard::Clipboard::new().unwrap();
-    let image = native.get_image().ok();
-    let text = native.get_text().ok();
-    let mut restore = Restore {
-        clipboard: native,
-        image,
-        text,
-    };
     let (mut e, id) = setup();
     e.doc.selection = Some([4, 5, 8, 9]);
     let expected = Image::copy(&e.doc, &id, false, false).unwrap();
@@ -217,13 +201,8 @@ fn native_image_clipboard_copy_and_external_paste_roundtrip() {
             merged: false,
         })
         .unwrap();
-    worker
-        .replies
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .result
-        .unwrap();
-    let read = restore.clipboard.get_image().unwrap();
+    station.receive(&worker.replies).result.unwrap();
+    let read = native.get_image().unwrap();
     assert_eq!((read.width, read.height), (4, 4));
     assert_eq!(read.bytes.as_ref(), expected.bytes);
     // Emulate a picture copied in another application, with no accompanying text.
@@ -231,8 +210,7 @@ fn native_image_clipboard_copy_and_external_paste_roundtrip() {
         120, 200, 20, 255, 30, 40, 50, 255, 230, 10, 100, 255, 25, 50, 70, 255, 10, 70, 90, 255,
         50, 200, 30, 255,
     ];
-    restore
-        .clipboard
+    native
         .set_image(arboard::ImageData {
             width: 3,
             height: 2,
@@ -249,7 +227,7 @@ fn native_image_clipboard_copy_and_external_paste_roundtrip() {
             revision: 0,
         })
         .unwrap();
-    let reply = worker.replies.recv_timeout(Duration::from_secs(5)).unwrap();
+    let reply = station.receive(&worker.replies);
     reply.result.unwrap();
     let e = shared.lock().unwrap();
     let layer = e
@@ -261,4 +239,331 @@ fn native_image_clipboard_copy_and_external_paste_roundtrip() {
     assert_eq!((layer.x, layer.y), (14, 11));
     assert_eq!(layer.pixels.rgba(), pixels);
     assert_eq!(e.undo.len(), 1);
+    drop(e);
+    let paste = |target: &str| {
+        let e = shared.lock().unwrap();
+        worker
+            .request(clipboard::Request::Paste {
+                document: e.doc.id.clone(),
+                shared: shared.clone(),
+                target: target.into(),
+                revision: e.doc.revision,
+            })
+            .unwrap();
+        drop(e);
+        station.receive(&worker.replies)
+    };
+    let undo = || {
+        shared.lock().unwrap().undo("human").unwrap();
+    };
+    let root = shared
+        .lock()
+        .unwrap()
+        .doc
+        .layers
+        .iter()
+        .find(|l| l.name == "Paint 1")
+        .unwrap()
+        .id
+        .clone();
+    undo();
+    let baseline = shared.lock().unwrap().doc.clone();
+
+    // An old 24-bit CF_DIB bitmap, without a file header or registered PNG.
+    let mut dib = vec![0u8; 40];
+    dib[..4].copy_from_slice(&40u32.to_le_bytes());
+    dib[4..8].copy_from_slice(&3i32.to_le_bytes());
+    dib[8..12].copy_from_slice(&2i32.to_le_bytes());
+    dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+    dib[14..16].copy_from_slice(&24u16.to_le_bytes());
+    for row in pixels.chunks_exact(12).rev() {
+        for rgba in row.chunks_exact(4) {
+            dib.extend([rgba[2], rgba[1], rgba[0]]);
+        }
+        dib.extend([0; 3]);
+    }
+    station.set_raw(clipboard_win::formats::CF_DIB, &dib);
+    let reply = paste(&root);
+    reply.result.unwrap();
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .doc
+            .layers
+            .iter()
+            .find(|l| Some(&l.id) == reply.selected.as_ref())
+            .unwrap()
+            .pixels
+            .rgba(),
+        pixels
+    );
+    undo();
+
+    // Actual registered PNG16 transport promotes an 8-bit destination, including
+    // existing pixels/masks, rather than projecting the incoming words to 8 bit.
+    let words = vec![
+        12347, 23459, 34571, 65535, 44321, 33219, 22117, 40001, 12347, 23459, 34571, 65535, 44321,
+        33219, 22117, 40001,
+    ];
+    let png = peerbrush::raster::png16(2, 2, &words).unwrap();
+    station.set_raw(clipboard_win::register_format("PNG").unwrap().get(), &png);
+    let reply = paste(&root);
+    reply.result.unwrap();
+    {
+        let e = shared.lock().unwrap();
+        assert_eq!(e.doc.bit_depth, 16);
+        assert!(e.doc.layers.iter().all(|l| l.pixels.depth == 16));
+        let l = e
+            .doc
+            .layers
+            .iter()
+            .find(|l| Some(&l.id) == reply.selected.as_ref())
+            .unwrap();
+        assert_eq!(l.pixels.rgba16(), words);
+        assert_eq!((l.x, l.y), (15, 11));
+        let loaded = peerbrush::psd::decode(&peerbrush::psd::encode(&e.doc).unwrap()).unwrap();
+        assert_eq!(loaded.export_png().unwrap(), e.doc.export_png().unwrap());
+    }
+    undo();
+    assert_eq!(
+        shared.lock().unwrap().doc.export_png().unwrap(),
+        baseline.export_png().unwrap()
+    );
+    assert_eq!(shared.lock().unwrap().doc.bit_depth, 8);
+
+    // Explorer-style image file copying uses CF_HDROP, including batches.
+    let file =
+        std::env::temp_dir().join(format!("peerbrush-clipboard-{}.png", uuid::Uuid::new_v4()));
+    let bad =
+        std::env::temp_dir().join(format!("peerbrush-clipboard-{}.png", uuid::Uuid::new_v4()));
+    std::fs::write(&file, &png).unwrap();
+    std::fs::write(&bad, b"invalid PNG").unwrap();
+    native.set().file_list(&[&file]).unwrap();
+    let reply = paste(&root);
+    reply.result.unwrap();
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .doc
+            .layers
+            .iter()
+            .find(|l| Some(&l.id) == reply.selected.as_ref())
+            .unwrap()
+            .pixels
+            .rgba16(),
+        words
+    );
+    undo();
+    native.set().file_list(&[&file, &file]).unwrap();
+    let reply = paste(&root);
+    reply.result.unwrap();
+    assert_eq!(reply.selected_layers.len(), 2);
+    assert_eq!(shared.lock().unwrap().undo.len(), 1);
+    assert!(reply.selected_layers.iter().all(|id| shared
+        .lock()
+        .unwrap()
+        .doc
+        .layers
+        .iter()
+        .find(|l| l.id == *id)
+        .unwrap()
+        .pixels
+        .rgba16()
+        == words));
+    undo();
+    native.set().file_list(&[&file, &bad]).unwrap();
+    let reply = paste(&root);
+    assert!(reply.result.is_err());
+    assert_eq!(
+        shared.lock().unwrap().doc.export_png().unwrap(),
+        baseline.export_png().unwrap()
+    );
+    assert!(shared.lock().unwrap().undo.is_empty());
+    std::fs::remove_file(file).unwrap();
+    std::fs::remove_file(bad).unwrap();
+
+    // Internal native words/coordinates survive display transport while owned.
+    // An external copy of identical display bytes must supersede that cache.
+    let native_copy = {
+        let mut e = shared.lock().unwrap();
+        e.doc = Document::new_depth(32, 24, 16).unwrap();
+        e.doc.layers[0]
+            .pixels
+            .set16(5, 6, [12347, 23459, 34571, 40001]);
+        e.doc.selection = Some([4, 5, 8, 9]);
+        Image::copy(&e.doc, &e.doc.layers[0].id, false, false).unwrap()
+    };
+    let doc = shared.lock().unwrap().doc.clone();
+    let root = doc.layers[0].id.clone();
+    worker
+        .request(clipboard::Request::Copy {
+            doc,
+            target: root.clone(),
+            mask: false,
+            merged: false,
+        })
+        .unwrap();
+    station.receive(&worker.replies).result.unwrap();
+    let reply = paste(&root);
+    reply.result.unwrap();
+    {
+        let e = shared.lock().unwrap();
+        let l = e
+            .doc
+            .layers
+            .iter()
+            .find(|l| Some(&l.id) == reply.selected.as_ref())
+            .unwrap();
+        assert_eq!(l.pixels.rgba16(), *native_copy.samples16.as_ref().unwrap());
+        assert_eq!((l.x, l.y), (4, 5));
+    }
+    undo();
+    native
+        .set_image(arboard::ImageData {
+            width: 4,
+            height: 4,
+            bytes: Cow::Borrowed(&native_copy.bytes),
+        })
+        .unwrap();
+    let reply = paste(&root);
+    reply.result.unwrap();
+    let e = shared.lock().unwrap();
+    let l = e
+        .doc
+        .layers
+        .iter()
+        .find(|l| Some(&l.id) == reply.selected.as_ref())
+        .unwrap();
+    assert_eq!((l.x, l.y), (14, 10));
+    assert_eq!(
+        l.pixels.rgba16(),
+        native_copy
+            .bytes
+            .iter()
+            .map(|v| *v as u16 * 257)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn native16_image_paste_promotes_existing_sources_atomically_and_undoes_depth() {
+    let (mut e, id) = setup();
+    e.edit(
+        "human",
+        &[
+            json!({"op":"mask.add","layer":id,"value":128}),
+            json!({"op":"transform","layer":id,"scale_x":0.75,"scale_y":0.75,"selection_only":false}),
+        ],
+        None,
+        None,
+        "Sources",
+    )
+    .unwrap();
+    e.undo.clear();
+    let before = e.doc.clone();
+    assert!(before.layers[0].pixels.retained.is_some());
+    let words = vec![12347, 23459, 34571, 40001];
+    let image = Image {
+        width: 1,
+        height: 1,
+        bytes: words
+            .iter()
+            .copied()
+            .map(peerbrush::raster::project16)
+            .collect(),
+        samples16: Some(words.clone()),
+        origin: None,
+    };
+    let mut invalid = image.command(&id).unwrap();
+    invalid["origin"] = json!([1.5, 0]);
+    assert!(clipboard::paste(&mut e.doc, &invalid).is_err());
+    assert_eq!(
+        serde_json::to_value(&e.doc).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    e.edit(
+        "human",
+        &[image.command(&id).unwrap()],
+        Some(e.doc.revision),
+        None,
+        "Paste",
+    )
+    .unwrap();
+    assert_eq!(e.doc.bit_depth, 16);
+    assert_eq!(e.doc.layers[1].pixels.rgba16(), words);
+    assert!(e.doc.layers.iter().all(|l| l.pixels.depth == 16));
+    let old = e.doc.layers.iter().find(|l| l.id == id).unwrap();
+    let original = &before.layers[0];
+    assert_eq!(
+        old.pixels.rgba16(),
+        original
+            .pixels
+            .rgba()
+            .iter()
+            .map(|v| *v as u16 * 257)
+            .collect::<Vec<_>>()
+    );
+    assert!(old
+        .mask
+        .as_ref()
+        .unwrap()
+        .steps
+        .iter()
+        .all(|s| s.pixels.depth == 16));
+    assert!(old
+        .pixels
+        .retained
+        .as_ref()
+        .is_some_and(|r| r.pixels.depth == 16));
+    e.undo("human").unwrap();
+    assert_eq!(e.doc.bit_depth, 8);
+    assert_eq!(
+        serde_json::to_value(&e.doc.layers).unwrap(),
+        serde_json::to_value(&before.layers).unwrap()
+    );
+}
+
+#[test]
+fn image_paste_into_empty_document_never_redirects_a_stale_nonempty_target() {
+    let (mut e, id) = setup();
+    let image = Image {
+        width: 1,
+        height: 1,
+        bytes: vec![23, 45, 67, 255],
+        samples16: None,
+        origin: None,
+    };
+    assert!(e
+        .edit(
+            "human",
+            &[image.command("missing").unwrap()],
+            Some(0),
+            None,
+            "Paste"
+        )
+        .is_err());
+    e.edit(
+        "human",
+        &[json!({"op":"layer.delete","layer":id})],
+        None,
+        None,
+        "Delete",
+    )
+    .unwrap();
+    let before = e.doc.clone();
+    e.edit(
+        "human",
+        &[image.command(&id).unwrap()],
+        Some(e.doc.revision),
+        None,
+        "Paste",
+    )
+    .unwrap();
+    assert_eq!(e.doc.layers.len(), 1);
+    assert!(e.doc.layers[0].parent.is_none());
+    assert_eq!(e.doc.layers[0].pixels.rgba(), image.bytes);
+    e.undo("human").unwrap();
+    assert_eq!(e.doc.layers.len(), before.layers.len());
 }
