@@ -6,6 +6,7 @@ mod effects;
 mod geometry;
 mod history;
 mod layers;
+mod lifecycle;
 mod liquify;
 mod refinement;
 mod retouch;
@@ -275,6 +276,9 @@ pub struct PeerBrush {
     project_labels: HashMap<String, String>,
     doc_snapshot: Document,
     jobs: HashSet<String>,
+    lifecycle: Option<lifecycle::Review>,
+    lifecycle_frame: bool,
+    exit_approved: bool,
     connected: bool,
     tab_transfer: Option<TabTransfer>,
     tab_preview_requested: Option<TabTransfer>,
@@ -559,6 +563,9 @@ impl PeerBrush {
             project_labels: HashMap::new(),
             doc_snapshot,
             jobs: HashSet::new(),
+            lifecycle: None,
+            lifecycle_frame: false,
+            exit_approved: false,
             connected: false,
             tab_transfer: None,
             tab_preview_requested: None,
@@ -1309,7 +1316,7 @@ impl PeerBrush {
                     .pick_file()
             });
             let Some(path) = path else {
-                return Ok("Ready".into());
+                return Ok("Open canceled · current projects preserved".into());
             };
             server::open_progress(&s, &path, &control)?;
             if recover {
@@ -1344,7 +1351,7 @@ impl PeerBrush {
                     .save_file()
             });
             let Some(path) = path else {
-                return Ok("Ready".into());
+                return Ok("Save canceled · project remains open".into());
             };
             server::save_source(&s, &path, &document)?;
             Ok("PSD saved".into())
@@ -2764,6 +2771,9 @@ impl PeerBrush {
             Stroke::new(1.0_f32, Color32::from_rgb(90, 84, 93)),
             egui::StrokeKind::Outside,
         );
+        if self.lifecycle.is_some() || self.lifecycle_frame {
+            return;
+        }
         if self.proposal_review.is_some() {
             painter.text(
                 rect.left_top() + Vec2::new(8., 8.),
@@ -3285,6 +3295,9 @@ impl PeerBrush {
         egui::TopBottomPanel::top("header")
             .exact_height(54.0)
             .show(ctx, |ui| {
+                if self.lifecycle.is_some() || self.lifecycle_frame {
+                    ui.disable();
+                }
                 let bounds = ui.max_rect();
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -3399,6 +3412,9 @@ impl PeerBrush {
         egui::TopBottomPanel::top("project tabs")
             .exact_height(32.)
             .show(ctx, |ui| {
+                if self.lifecycle.is_some() || self.lifecycle_frame {
+                    ui.disable();
+                }
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.;
@@ -3621,25 +3637,12 @@ impl PeerBrush {
                 self.switch_project(&id);
             }
         }
-        if let Some((id, shared)) = close {
-            if let Ok(e) = shared.try_lock() {
-                let document = e.doc.id.clone();
-                let revision = e.doc.revision;
-                drop(e);
-                self.message = crate::workspace::close_in(
-                    &self.workspace,
-                    &id,
-                    &document,
-                    revision,
-                    false,
-                    "human",
-                )
-                .map(|_| "Project closed".into())
-                .unwrap_or_else(|error| error);
-            }
+        if let Some((id, _shared)) = close {
+            self.request_close(lifecycle::Intent::Close(id));
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.lifecycle_frame = false;
         let panel = self
             .workspace_root
             .try_lock()
@@ -3820,8 +3823,19 @@ impl PeerBrush {
             self.message = result.unwrap_or_else(|e| e);
             self.last_preview = None;
         }
+        self.lifecycle_dialog(ctx);
+        if self.exit_approved {
+            return;
+        }
+        let had_review = self.lifecycle.is_some();
         self.draw_header(ctx);
         self.project_tabs(ctx);
+        if !had_review && self.lifecycle.is_some() {
+            self.lifecycle_dialog(ctx);
+            if self.exit_approved {
+                return;
+            }
+        }
         if self.shared.try_lock().is_err() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.label("Working on this project… Switch tabs to continue elsewhere.");
@@ -3829,7 +3843,9 @@ impl PeerBrush {
             ctx.request_repaint_after(Duration::from_millis(16));
             return;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if self.lifecycle.is_some() || self.lifecycle_frame {
+            // The review owns keyboard/canvas input for the entire frame.
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.finish_parameter(true);
         } else if !ctx.input(|i| i.pointer.any_down())
             && !self.parameter_gesture.as_ref().is_some_and(|edit| {
@@ -3846,7 +3862,9 @@ impl PeerBrush {
             (e.doc.clone(), e.ai_change.clone())
         };
         self.doc_snapshot = doc.clone();
-        self.import_dialog(ctx);
+        if self.lifecycle.is_none() && !self.lifecycle_frame {
+            self.import_dialog(ctx);
+        }
         if self.rename_edit.as_ref().is_some_and(|edit| {
             edit.document != doc.id || !doc.layers.iter().any(|l| l.id == edit.layer)
         }) {
@@ -3936,7 +3954,7 @@ impl PeerBrush {
                 .filter_map(|f| f.path.clone())
                 .collect::<Vec<_>>()
         });
-        if !dropped.is_empty() {
+        if !dropped.is_empty() && self.lifecycle.is_none() && !self.lifecycle_frame {
             self.drop_files(dropped);
         }
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -3959,7 +3977,9 @@ impl PeerBrush {
                 Color32::WHITE,
             );
         }
-        let typing = self.rename_edit.is_some()
+        let typing = self.lifecycle.is_some()
+            || self.lifecycle_frame
+            || self.rename_edit.is_some()
             || ctx
                 .memory(|m| m.focused())
                 .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
@@ -4108,6 +4128,9 @@ impl PeerBrush {
         egui::TopBottomPanel::top("context")
             .exact_height(48.0)
             .show(ctx, |ui| {
+                if self.lifecycle.is_some() || self.lifecycle_frame {
+                    ui.disable();
+                }
                 ui.horizontal_centered(|ui| {
                     ui.menu_button("File", |ui| {
                         if ui.button("New canvas").clicked() {
@@ -4230,11 +4253,19 @@ impl PeerBrush {
         if matches!(self.tool, Tool::Selection | Tool::MagicWand) {
             egui::TopBottomPanel::top("selection context")
                 .exact_height(40.)
-                .show(ctx, |ui| self.selection_toolbar(ui));
+                .show(ctx, |ui| {
+                    if self.lifecycle.is_some() || self.lifecycle_frame {
+                        ui.disable();
+                    }
+                    self.selection_toolbar(ui);
+                });
         }
         egui::TopBottomPanel::bottom("status")
             .exact_height(28.0)
             .show(ctx, |ui| {
+                if self.lifecycle.is_some() || self.lifecycle_frame {
+                    ui.disable();
+                }
                 let bounds=ui.max_rect();
                 let mut modes=ui.new_child(egui::UiBuilder::new().id_salt("transform modes").max_rect(Rect::from_min_max(egui::pos2(bounds.right()-150.,bounds.top()),bounds.max)));
                 self.transform_controls(&mut modes);
@@ -4299,6 +4330,9 @@ impl PeerBrush {
             .exact_width(60.0)
             .resizable(false)
             .show(ctx, |ui| {
+                if self.lifecycle.is_some() || self.lifecycle_frame {
+                    ui.disable();
+                }
                 ui.add_space(6.0);
                 ui.spacing_mut().item_spacing.y = 4.0;
                 egui::ScrollArea::vertical()
@@ -4402,6 +4436,9 @@ impl PeerBrush {
             .min_width(300.0)
             .max_width(470.0)
             .show(ctx, |ui| {
+                if self.lifecycle.is_some() || self.lifecycle_frame {
+                    ui.disable();
+                }
                 let mut display = self.animation.document(&doc, ui.input(|i| i.time), false);
                 if let Some(edit) = &self.parameter_gesture {
                     if let Ok(preview) =
@@ -4447,6 +4484,9 @@ impl PeerBrush {
 
         if self.tab_transfer.is_none() {
             self.request_preview(ctx, &doc);
+        }
+        if self.lifecycle.is_some() || self.lifecycle_frame {
+            return;
         }
         if self.liquify_effect.as_ref().is_some_and(|id| {
             !doc.layers

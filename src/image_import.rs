@@ -291,7 +291,9 @@ impl Encoded {
             _ => ENCODED_LIMIT,
         };
         if !metadata.is_file() || metadata.len() > encoded_limit as u64 {
-            return Err("Encoded image must be a file at most 128 MiB".into());
+            return Err(format!(
+                "Encoded {ext} image must be a file at most {encoded_limit} bytes"
+            ));
         }
         let mut bytes = Vec::new();
         file.take(encoded_limit as u64 + 1)

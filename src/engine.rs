@@ -426,6 +426,8 @@ pub struct Engine {
     pub status: String,
     pub file_version: Option<(u64, u128)>,
     pub capture_ui: Option<std::path::PathBuf>,
+    /// A human-requested native close review; never serialized into documents.
+    pub native_close_review: Option<(String, u64)>,
     pub capture_panel: Option<String>,
     pub mcp_clients: BTreeMap<String, u64>,
     pub activity: String,
@@ -515,6 +517,7 @@ impl Engine {
             status: "Ready".into(),
             file_version: None,
             capture_ui: None,
+            native_close_review: None,
             capture_panel: None,
             mcp_clients: BTreeMap::new(),
             activity: String::new(),

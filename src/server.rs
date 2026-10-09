@@ -236,6 +236,18 @@ pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
 pub fn save_source(shared: &Shared, path: &Path, document: &str) -> Result<(), String> {
     save_guarded(shared, path, &json!({"document_id":document}))
 }
+pub fn save_reviewed_source(
+    shared: &Shared,
+    path: &Path,
+    document: &str,
+    revision: u64,
+) -> Result<(), String> {
+    save_guarded(
+        shared,
+        path,
+        &json!({"document_id":document,"expected_revision":revision}),
+    )
+}
 fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     if path
         .extension()
@@ -349,7 +361,7 @@ pub fn tools() -> Value {
         }
     }
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_image_info","description":"Inspect a supported local image without editing. Reports channel depth and explicit zero-based frame/page/variant choices for image.import and place_image. Float, CMYK and PNG16 animation require explicit supported conversion.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}));
-    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_projects","description":"List stable project IDs, create/open independent projects, select a tab (human only), close with exact source guards, or copy/move editable layer trees between projects. Background AI writes must supply project_id, document_id and expected_revision; never depend on the visible tab. Transfers need both source identities/revisions and preserve native precision, masks and effects. preview_transfer returns actual destination pixels without history. move creates one undo step in each document; failures change neither.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","new","open","select","close","copy","move","preview_transfer"]},"actor":{"type":"string"},"project_id":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"activate":{"type":"boolean"},"discard":{"type":"boolean"},"source_project_id":{"type":"string"},"source_document_id":{"type":"string"},"source_revision":{"type":"integer"},"source_task":{"type":"string"},"task":{"type":"string"},"layers":{"type":"array","items":{"type":"string"}},"target":{"type":"string"},"move":{"type":"boolean"},"max_edge":{"type":"integer"}},"required":["action"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_projects","description":"List stable project IDs, create/open independent projects, select a tab or request native Save/Don't Save/Cancel close review (human only), close with exact source guards, or copy/move editable layer trees between projects. Background AI writes must supply project_id, document_id and expected_revision; never depend on the visible tab. Transfers need both source identities/revisions and preserve native precision, masks and effects. preview_transfer returns actual destination pixels without history. move creates one undo step in each document; failures change neither.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","new","open","select","request_close","close","copy","move","preview_transfer"]},"actor":{"type":"string"},"project_id":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"activate":{"type":"boolean"},"discard":{"type":"boolean"},"source_project_id":{"type":"string"},"source_document_id":{"type":"string"},"source_revision":{"type":"integer"},"source_task":{"type":"string"},"task":{"type":"string"},"layers":{"type":"array","items":{"type":"string"}},"target":{"type":"string"},"move":{"type":"boolean"},"max_edge":{"type":"integer"}},"required":["action"],"additionalProperties":false}}));
     tools
 }
 pub fn capabilities() -> Value {
@@ -474,6 +486,16 @@ fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
             }
             w::select(root, text("project_id")?)?;
             Ok(w::state(root))
+        }
+        "request_close" => {
+            w::lifecycle::request_close(
+                root,
+                text("project_id")?,
+                text("document_id")?,
+                number("expected_revision")?,
+                actor,
+            )?;
+            Ok(json!({"requested":true,"closed":false,"native_review":true}))
         }
         "close" => {
             w::close(

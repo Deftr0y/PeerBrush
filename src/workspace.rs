@@ -1,4 +1,5 @@
 //! Stable project engines. Registry locks never acquire existing engine locks.
+pub mod lifecycle;
 use crate::{
     engine::{self, Document, Engine, Scope},
     server::Shared,
@@ -280,8 +281,14 @@ pub fn close_in(
     discard: bool,
     actor: &str,
 ) -> Result<(), String> {
-    let shared = get_in(workspace, id)?;
-    let mut e = shared.lock().unwrap();
+    let shared = entries_in(workspace)
+        .into_iter()
+        .find(|(project, _, _)| project == id)
+        .map(|(_, _, shared)| shared)
+        .ok_or("Missing or closed project ID")?;
+    let mut e = shared
+        .try_lock()
+        .map_err(|_| "The project is still working. Try closing again when it finishes.")?;
     guard(&e, document, revision)?;
     if e.doc.revision != e.saved_revision && !discard {
         return Err("Unsaved project: save first, cancel, or explicitly choose Don't Save".into());
