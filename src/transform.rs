@@ -31,7 +31,7 @@ pub(crate) fn copy_shift(source: &Raster, w: u32, h: u32, dx: i32, dy: i32) -> R
     let mut out = Raster::new(w, h);
     for (&(tx, ty), tile) in &source.tiles {
         for (i, p) in tile.chunks_exact(4).enumerate() {
-            if p[3] == 0 {
+            if p.iter().all(|v| *v == 0) {
                 continue;
             }
             let x = (tx * crate::raster::TILE + i as u32 % crate::raster::TILE) as i32;

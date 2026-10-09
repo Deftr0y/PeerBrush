@@ -9,6 +9,7 @@ pub mod controls;
 pub mod depth16;
 pub mod discovery;
 pub mod disk_cache;
+mod edit_bounds;
 pub mod effects;
 pub mod engine;
 pub mod fill;

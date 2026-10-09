@@ -226,7 +226,7 @@ fn mapped_coverage(m: &Coverage, scale: [f32; 2], offset: [i32; 2]) -> Result<Co
     }
     Ok(crate::selection::from_mask(pixels)?.local(-origin[0], -origin[1]))
 }
-fn map_effect(
+pub(crate) fn map_effect(
     kind: &str,
     settings: &mut Value,
     scale: [f32; 2],

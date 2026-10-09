@@ -90,6 +90,10 @@ impl Cache {
             || commands[0]["op"] != "paint"
             || gesture.is_empty()
             || base.selection_coverage.is_some()
+            || !crate::edit_bounds::covers_canvas(
+                &base,
+                commands[0]["layer"].as_str().unwrap_or(""),
+            )
         {
             self.stroke = None;
             return Engine::preview_edits(base, commands);

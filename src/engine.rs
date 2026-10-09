@@ -1273,6 +1273,10 @@ impl Engine {
         )
     }
     fn apply(&mut self, c: &Value) -> Result<(), String> {
+        // Reframe before taking native-original and soft-selection baselines. The
+        // outer transaction still owns the complete pre-gesture undo snapshot.
+        self.doc.ensure_depth();
+        crate::edit_bounds::prepare(&mut self.doc, c)?;
         let before = crate::retained::has_originals(&self.doc).then(|| self.doc.clone());
         self.apply_retained(c)?;
         if let Some(before) = before {
@@ -2028,6 +2032,7 @@ impl Engine {
             .filter(|m| self.doc.selection == Some(m.bounds));
         let selection_polygon = crate::selection::polygon(&self.doc).map(Vec::from);
         let selection = self.doc.selection;
+        let canvas = [0, 0, self.doc.width as i32, self.doc.height as i32];
         if op == "fill"
             && self.doc.layers[i].kind == "group"
             && !c["mask"].as_bool().unwrap_or(false)
@@ -2160,12 +2165,7 @@ impl Engine {
             return Ok(());
         }
         if op == "fill" || op == "shape" || op == "gradient" {
-            let area = c.get("rect").and_then(rect).or(selection).unwrap_or([
-                layer.x,
-                layer.y,
-                layer.x + layer.pixels.width as i32,
-                layer.y + layer.pixels.height as i32,
-            ]);
+            let area = c.get("rect").and_then(rect).or(selection).unwrap_or(canvas);
             let mut col = color(c);
             if c.get("mask").and_then(Value::as_bool).unwrap_or(false) {
                 col = [col[0], col[0], col[0], col[3]];
