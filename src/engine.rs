@@ -1590,6 +1590,14 @@ impl Engine {
                     break;
                 }
             }
+            if self
+                .doc
+                .layers
+                .iter()
+                .any(|l| ids.contains(&l.id) && l.locked)
+            {
+                return Err("Unlock the selected layers and their children before deleting".into());
+            }
             if self.doc.layers.iter().any(|l| {
                 l.clip_to.as_ref().is_some_and(|b| ids.contains(b)) && !ids.contains(&l.id)
             }) {

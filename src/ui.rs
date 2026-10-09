@@ -3734,6 +3734,12 @@ impl PeerBrush {
                 if command_key(i,egui::Key::E) {
                     self.merge_layers(ctx, &doc);
                 }
+                if i.key_pressed(egui::Key::Delete)
+                    && self.selection_path.is_empty()
+                    && !key_modifiers(i,egui::Key::Delete).any()
+                {
+                    self.layer_cmd("layer.delete",json!({}),"Delete selected layers");
+                }
                 if command_key(i,egui::Key::D) {
                     self.edit(vec![json!({"op":if key_modifiers(i,egui::Key::D).shift{"selection.reselect"}else{"selection.clear"}})],if key_modifiers(i,egui::Key::D).shift{"Reselect"}else{"Deselect"});
                 }
@@ -6724,6 +6730,80 @@ mod tests {
             .layers
             .iter()
             .any(|l| &l.id == id && l.parent.as_deref() == Some(group.id.as_str()))));
+    }
+    #[test]
+    fn delete_key_removes_selected_roots_once_and_preserves_native_undo() {
+        let (mut app, ctx) = small_fixture();
+        let (roots, child, baseline) = {
+            let mut e = app.shared.lock().unwrap();
+            e.doc.bit_depth = 16;
+            e.doc.ensure_depth();
+            let child = e.doc.layers[0].id.clone();
+            e.doc.layers[0]
+                .pixels
+                .set16(3, 5, [12347, 23459, 34571, 65535]);
+            e.edit(
+                "human",
+                &[
+                    json!({"op":"group.create_selected","layer":child,"name":"Folder"}),
+                    json!({"op":"layer.add","name":"Outside"}),
+                    json!({"op":"layer.add","name":"Keep"}),
+                ],
+                None,
+                None,
+                "Setup",
+            )
+            .unwrap();
+            let roots = e
+                .doc
+                .layers
+                .iter()
+                .filter(|l| ["Folder", "Outside"].contains(&l.name.as_str()))
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>();
+            e.undo.clear();
+            (roots, child, e.doc.clone())
+        };
+        app.select_content(&roots[0]);
+        app.selection_layers.extend(roots.iter().cloned());
+        app.selection_layers.insert(child);
+        frame(&mut app, &ctx, vec![], Default::default());
+        key(&mut app, &ctx, egui::Key::Delete);
+        let mut e = app.shared.lock().unwrap();
+        assert_eq!(e.doc.layers.len(), 1);
+        assert_eq!(e.doc.layers[0].name, "Keep");
+        assert_eq!(e.undo.len(), 1);
+        e.undo("human").unwrap();
+        assert_eq!(
+            serde_json::to_value(&e.doc.layers).unwrap(),
+            serde_json::to_value(&baseline.layers).unwrap()
+        );
+        assert_eq!(e.doc.export_png().unwrap(), baseline.export_png().unwrap());
+    }
+    #[test]
+    fn delete_key_preserves_typing_and_unfinished_selection_anchors() {
+        for typing in [true, false] {
+            let (mut app, ctx) = small_fixture();
+            frame(&mut app, &ctx, vec![], Default::default());
+            let id = app.selected.clone();
+            if typing {
+                let doc = app.shared.lock().unwrap().doc.clone();
+                app.begin_rename(&doc, &id);
+                frame(&mut app, &ctx, vec![], Default::default());
+            } else {
+                app.tool = Tool::Selection;
+                app.selection_kind = "polygon".into();
+                app.selection_path = vec![[2., 2.], [8., 4.]];
+            }
+            key(&mut app, &ctx, egui::Key::Delete);
+            let e = app.shared.lock().unwrap();
+            assert_eq!(e.doc.layers.len(), 1);
+            assert_eq!(e.doc.layers[0].id, id);
+            assert!(e.undo.is_empty());
+            if !typing {
+                assert_eq!(app.selection_path.len(), 1);
+            }
+        }
     }
     #[test]
     fn new_folder_button_contains_selected_layers_and_selects_folder() {
