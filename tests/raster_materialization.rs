@@ -13,6 +13,7 @@ fn pixel_reference(raster: &Raster) -> Vec<u8> {
 }
 fn identity_effect() -> Effect {
     Effect {
+        weight: 1.0,
         id: id(),
         kind: "hsl".into(),
         enabled: true,
@@ -184,6 +185,7 @@ fn prepared_folder_uses_child_effects_and_offsets_before_its_own_effect() {
     let mut doc = Document::new(9, 7).unwrap();
     let mut folder = Layer::new("Folder", "group", 9, 7);
     folder.effects.push(Effect {
+        weight: 1.0,
         id: id(),
         kind: "invert".into(),
         enabled: true,
@@ -200,6 +202,7 @@ fn prepared_folder_uses_child_effects_and_offsets_before_its_own_effect() {
         }
     }
     child.effects.push(Effect {
+        weight: 1.0,
         id: id(),
         kind: "hsl".into(),
         enabled: true,

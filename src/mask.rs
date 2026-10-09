@@ -98,6 +98,7 @@ impl Mask {
     pub fn needs_cache(&self) -> bool {
         self.steps.iter().any(|s| {
             s.enabled
+                && s.weight > 0.0
                 && (["curves", "adjust", "gaussian"].contains(&s.kind.as_str())
                     || (s.kind == "blur" && s.value >= 0.5))
         })
@@ -138,7 +139,8 @@ fn evaluate(mask: &Mask, width: u32, height: u32) -> GrayMask {
     let (w, h) = (width as usize, height as usize);
     let mut pixels = vec![255; w * h];
     let mut scratch = Vec::new();
-    for step in mask.steps.iter().filter(|s| s.enabled) {
+    for step in mask.steps.iter().filter(|s| s.enabled && s.weight > 0.0) {
+        let before = (step.weight < 1.0).then(|| pixels.clone());
         match step.kind.as_str() {
             "fill" => pixels.fill(step.value.round().clamp(0., 255.) as u8),
             "paint" => {
@@ -199,6 +201,13 @@ fn evaluate(mask: &Mask, width: u32, height: u32) -> GrayMask {
                 }
             }
             _ => {}
+        }
+        if let Some(before) = before {
+            for (v, old) in pixels.iter_mut().zip(before) {
+                *v = (old as f64 * (1.0 - step.weight as f64) + *v as f64 * step.weight as f64)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
         }
     }
     GrayMask {

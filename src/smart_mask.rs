@@ -131,6 +131,7 @@ pub fn from_color_with_native(
     }
     // Add/subtract append a refinement to the existing stack; replace starts a fresh editable mask.
     let step = MaskStep {
+        weight: 1.0,
         id: id(),
         kind: "paint".into(),
         enabled: true,
@@ -166,6 +167,7 @@ pub fn from_color_with_native(
             cache_key: id(),
             steps: vec![
                 MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "fill".into(),
                     enabled: true,

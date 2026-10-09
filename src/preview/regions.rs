@@ -230,11 +230,10 @@ impl Prepared8 {
             };
             drop(plan);
             for effect in layer.effects.iter().filter(|e| e.enabled) {
-                effects::apply_region(
+                effects::apply_effect(
                     &mut image,
-                    &effect.kind,
-                    &effect.settings,
-                    u64::from(width) * u64::from(height),
+                    effect,
+                    Some(u64::from(width) * u64::from(height)),
                 )?;
             }
             let dest = Arc::make_mut(self.colors[i].as_mut().unwrap());
@@ -322,11 +321,10 @@ impl Prepared16 {
             };
             drop(plan);
             for effect in layer.effects.iter().filter(|e| e.enabled) {
-                crate::depth16::color::apply_region(
+                crate::depth16::color::apply_effect(
                     &mut image,
-                    &effect.kind,
-                    &effect.settings,
-                    u64::from(width) * u64::from(height),
+                    effect,
+                    Some(u64::from(width) * u64::from(height)),
                 )?;
             }
             let dest = Arc::make_mut(self.colors[i].as_mut().unwrap());

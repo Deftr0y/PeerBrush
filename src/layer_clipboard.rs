@@ -105,8 +105,12 @@ pub fn validate(snapshot: &Layers) -> Result<(), String> {
         if !crate::raster::layer_blends(&l.kind).any(|(mode, _)| mode == l.blend) {
             return Err("Clipboard contains an unsupported layer blend".into());
         }
+        for effect in &l.effects {
+            crate::effects::validate_weight(effect.weight)?;
+        }
         if let Some(mask) = &l.mask {
             for step in &mask.steps {
+                crate::effects::validate_weight(step.weight)?;
                 validate_raster(&step.pixels)?;
             }
         }

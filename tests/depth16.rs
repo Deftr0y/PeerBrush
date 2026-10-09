@@ -22,6 +22,7 @@ fn paint_mask(width: u32, height: u32, value: u16) -> Mask {
         cache_key: id(),
         steps: vec![
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "fill".into(),
                 enabled: true,
@@ -30,6 +31,7 @@ fn paint_mask(width: u32, height: u32, value: u16) -> Mask {
                 settings: json!({}),
             },
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "paint".into(),
                 enabled: true,
@@ -226,6 +228,7 @@ fn local_and_spatial_masks_keep_native_precision_and_disabled_raw_source() {
         [12345, 30001, 50003, 12346]
     );
     let spatial = MaskStep {
+        weight: 1.0,
         id: id(),
         kind: "gaussian".into(),
         enabled: true,
@@ -261,6 +264,7 @@ fn clipped_adjustments_apply_native_base_mask_opacity_and_folder_scope_once() {
     adjustment.clip_to = Some(base.id.clone());
     adjustment.pixels.promote16();
     adjustment.effects.push(effects::Effect {
+        weight: 1.0,
         id: id(),
         kind: "invert".into(),
         enabled: true,

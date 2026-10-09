@@ -21,8 +21,22 @@ pub fn srgb_profile() -> &'static [u8] {
     PROFILE.get_or_init(|| {
         let mut profile = ColorProfile::new_srgb();
         profile.cicp = None;
-        profile.encode().expect("Built-in sRGB ICC profile")
+        let mut bytes = profile.encode().expect("Built-in sRGB ICC profile");
+        // moxcms writes the current time even when the profile properties are
+        // fixed. A standard output tag must be stable across app processes.
+        bytes[24..36].copy_from_slice(&[0x07, 0xcc, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+        bytes
     })
+}
+pub fn is_srgb_profile(bytes: &[u8]) -> bool {
+    let standard = srgb_profile();
+    // Earlier PeerBrush saves used the same tag with an encoder timestamp.
+    // Ignore only that cosmetic header field; matrices/TRCs and all other
+    // header/tag bytes must still be identical to our standard output.
+    bytes.len() == standard.len()
+        && bytes[..24] == standard[..24]
+        && bytes[36..] == standard[36..]
+        && parse(bytes).is_ok()
 }
 
 fn number(bytes: &[u8], at: usize) -> Result<usize, String> {

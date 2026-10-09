@@ -5,7 +5,7 @@ pub mod color;
 mod compositor;
 pub mod mask;
 pub use crate::raster::Pixel16;
-use crate::{effects, engine::Document, raster::check_size};
+use crate::{engine::Document, raster::check_size};
 pub use compositor::Plan16;
 pub use mask::Gray16;
 use std::{
@@ -65,7 +65,7 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
         masks = masks
             .checked_add(mask::buffer_bytes(layer))
             .ok_or("16-bit mask budget overflow")?;
-        if layer.effects.iter().any(|e| e.enabled) {
+        if crate::effects::active(layer) {
             let (width, height) = if ["group", "adjustment"].contains(&layer.kind.as_str()) {
                 (doc.width, doc.height)
             } else {
@@ -74,9 +74,8 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
             colors = colors
                 .checked_add(u64::from(width) * u64::from(height) * 8)
                 .ok_or("16-bit color budget overflow")?;
-            for effect in layer.effects.iter().filter(|e| e.enabled) {
-                let settings = effects::normalized(&effect.kind, &effect.settings)?;
-                if color::working_bytes(width, height, &effect.kind, &settings)? > WORKING_BUDGET {
+            for effect in layer.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
+                if color::weighted_working_bytes(effect, width, height)? > WORKING_BUDGET {
                     return Err("16-bit effect temporary buffers exceed the bounded budget".into());
                 }
             }
@@ -127,7 +126,7 @@ pub(crate) fn prepare_with_masks(
     let cache = COLORS.get_or_init(|| Mutex::new(ColorCache::default()));
     for index in crate::compositor::effect_order(doc) {
         let layer = &doc.layers[index];
-        if !layer.effects.iter().any(|e| e.enabled) {
+        if !crate::effects::active(layer) {
             continue;
         }
         let (width, height) = if ["group", "adjustment"].contains(&layer.kind.as_str()) {
@@ -195,8 +194,8 @@ pub(crate) fn prepare_with_masks(
                 words: layer.pixels.rgba16(),
             },
         };
-        for effect in layer.effects.iter().filter(|e| e.enabled) {
-            color::apply(&mut image, &effect.kind, &effect.settings)?;
+        for effect in layer.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
+            color::apply_effect(&mut image, effect, None)?;
         }
         let image = Arc::new(image);
         let mut cache = cache.lock().map_err(|_| "16-bit color cache unavailable")?;

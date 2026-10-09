@@ -295,6 +295,53 @@ fn converted_standard_psd_and_png_keep_an_explicit_working_profile_without_priva
 }
 
 #[test]
+fn srgb_tags_are_stable_and_earlier_encoder_dates_reopen_without_reconversion() {
+    let standard = color_profile::srgb_profile();
+    assert_eq!(
+        &standard[24..36],
+        &[0x07, 0xcc, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]
+    );
+    let mut earlier = standard.to_vec();
+    earlier[24..36].copy_from_slice(&[0x07, 0xe4, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6]);
+    assert!(color_profile::is_srgb_profile(&earlier));
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(4, 1, depth).unwrap();
+        source.srgb_tagged = true;
+        for (x, pixel) in PIXELS.iter().enumerate() {
+            source.layers[0].pixels.set16(x as i32, 0, *pixel);
+        }
+        let bytes = psd::encode(&source).unwrap();
+        let size = u32::from_be_bytes(bytes[30..34].try_into().unwrap()) as usize;
+        let resources = resource(&earlier);
+        let mut timestamped = bytes[..30].to_vec();
+        timestamped.extend((resources.len() as u32).to_be_bytes());
+        timestamped.extend(resources);
+        timestamped.extend(&bytes[34 + size..]);
+        let opened = psd::decode(&timestamped).unwrap();
+        assert!(!opened.read_only);
+        assert!(opened.srgb_tagged);
+        assert!(opened.icc_profile.is_none());
+        assert_eq!(
+            opened.layers[0].pixels.rgba16(),
+            if depth == 16 {
+                PIXELS.concat()
+            } else {
+                PIXELS
+                    .concat()
+                    .into_iter()
+                    .map(|v| u16::from(peerbrush::raster::project16(v)) * 257)
+                    .collect()
+            }
+        );
+    }
+    let mut changed = earlier;
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    assert!(!color_profile::is_srgb_profile(&changed));
+    assert!(psd::decode(&fixture(&changed, 16)).unwrap().read_only);
+}
+
+#[test]
 fn unsupported_malformed_ambiguous_and_oversized_profiles_never_become_editable() {
     let profile = linear_profile();
     let mut lut = profile.clone();

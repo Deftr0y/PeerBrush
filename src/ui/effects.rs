@@ -348,17 +348,82 @@ fn bounded_curve_x(x: f64, previous: f64, next: f64, original: f64) -> f64 {
         original
     }
 }
+pub(super) fn effect_icon(kind: &str) -> Icon {
+    match kind {
+        "paint" => Icon::Brush,
+        "fill" => Icon::Fill,
+        "levels" => Icon::Levels,
+        "curves" => Icon::Curves,
+        "blur" | "gaussian" => Icon::Blur,
+        "adjust" => Icon::Adjust,
+        "color_balance" => Icon::ColorBalance,
+        "hsl" => Icon::Hue,
+        "bloom" => Icon::Bloom,
+        "liquify" => Icon::Liquify,
+        "invert" => Icon::Invert,
+        "grayscale" => Icon::Grayscale,
+        _ => Icon::Adjust,
+    }
+}
+pub(super) fn menu_effect(ui: &mut egui::Ui, kind: &str, label: &str) -> egui::Response {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
+        icons::paint(ui.painter(), rect, effect_icon(kind), ui.is_enabled());
+        ui.button(label)
+    })
+    .inner
+}
 impl PeerBrush {
+    pub(super) fn effect_is_selected(&self, layer: &str, mask: bool, effect: &str) -> bool {
+        self.effect_selected
+            .as_ref()
+            .is_some_and(|(l, m, e)| l == layer && *m == mask && e == effect)
+    }
+    pub(super) fn select_effect(&mut self, layer: &str, mask: bool, effect: &str) {
+        self.effect_selected = if self.effect_is_selected(layer, mask, effect) {
+            None
+        } else {
+            Some((layer.into(), mask, effect.into()))
+        };
+    }
+    pub(super) fn effect_weight(
+        &mut self,
+        ui: &mut egui::Ui,
+        effect: &str,
+        weight: f32,
+        mask: bool,
+    ) {
+        ui.horizontal(|ui| {
+            controls::label(ui, "Weight");
+            let mut value = weight * 100.0;
+            let width = ui.available_width().min(210.0).max(70.0);
+            let response = controls::range(
+                ui,
+                (effect, "weight"),
+                &mut value,
+                0.0..=100.0,
+                width,
+                "%",
+                0,
+                false,
+            );
+            if response.changed() {
+                let extra = if mask {
+                    json!({"step":effect,"weight":value/100.0})
+                } else {
+                    json!({"effect":effect,"weight":value/100.0})
+                };
+                self.layer_parameter(extra, "Effect weight", &response);
+            }
+        });
+    }
     pub(super) fn color_stack(&mut self, ui: &mut egui::Ui, l: &Layer) {
         ui.horizontal(|ui| {
             controls::label(ui, "COLOR EFFECTS");
             let add = ui.menu_button("+ Add effect", |ui| {
                 for kind in effects::KINDS {
-                    if ui.button(effect_name(kind)).clicked() {
+                    if menu_effect(ui, kind, effect_name(kind)).clicked() {
                         self.layer_cmd("effect.add", json!({"kind":kind}), "Add color effect");
-                        if *kind == "liquify" {
-                            self.activate_liquify(None);
-                        }
                         ui.close_menu();
                     }
                 }
@@ -371,76 +436,102 @@ impl PeerBrush {
                 (ui.available_height() - if l.mask.is_none() { 38.0 } else { 8.0 }).max(24.0),
             )
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
                 for (index, effect) in l.effects.iter().enumerate().rev() {
                     ui.push_id(&effect.id, |ui| {
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             let mut enabled = effect.enabled;
-                            if ui.checkbox(&mut enabled, "").changed() {
+                            if ui
+                                .checkbox(&mut enabled, "")
+                                .on_hover_text("Enable effect")
+                                .changed()
+                            {
                                 self.layer_cmd(
                                     "effect.update",
                                     json!({"effect":effect.id,"enabled":enabled}),
                                     "Toggle color effect",
                                 );
                             }
-                            ui.label(effect_name(&effect.kind));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if icons::small_button(ui, Icon::Trash, "Remove effect")
-                                        .clicked()
-                                    {
-                                        self.layer_cmd(
-                                            "effect.delete",
-                                            json!({"effect":effect.id}),
-                                            "Remove effect",
-                                        );
-                                    }
-                                    if index > 0
-                                        && icons::small_button(ui, Icon::Down, "Move effect down")
-                                            .clicked()
-                                    {
-                                        self.layer_cmd(
-                                            "effect.reorder",
-                                            json!({"effect":effect.id,"index":index-1}),
-                                            "Reorder effects",
-                                        );
-                                    }
-                                    if index + 1 < l.effects.len()
-                                        && icons::small_button(ui, Icon::Up, "Move effect up")
-                                            .clicked()
-                                    {
-                                        self.layer_cmd(
-                                            "effect.reorder",
-                                            json!({"effect":effect.id,"index":index+1}),
-                                            "Reorder effects",
-                                        );
-                                    }
-                                },
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
+                            icons::paint(
+                                ui.painter(),
+                                rect,
+                                effect_icon(&effect.kind),
+                                effect.enabled,
                             );
-                        });
-                        if effect.kind == "liquify" {
                             if ui
-                                .button("Edit on canvas")
-                                .on_hover_text("Paint an editable distortion")
+                                .selectable_label(
+                                    self.effect_is_selected(&l.id, false, &effect.id),
+                                    RichText::new(effect_name(&effect.kind)).size(12.0),
+                                )
+                                .on_hover_text("Select to edit settings · click again to close")
                                 .clicked()
+                            {
+                                self.select_effect(&l.id, false, &effect.id);
+                            }
+                            if self.effect_is_selected(&l.id, false, &effect.id) {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if icons::small_button(ui, Icon::Trash, "Remove effect")
+                                            .clicked()
+                                        {
+                                            self.layer_cmd(
+                                                "effect.delete",
+                                                json!({"effect":effect.id}),
+                                                "Remove effect",
+                                            );
+                                            self.effect_selected = None;
+                                        }
+                                        if index > 0
+                                            && icons::small_button(
+                                                ui,
+                                                Icon::Down,
+                                                "Move effect down",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.layer_cmd(
+                                                "effect.reorder",
+                                                json!({"effect":effect.id,"index":index-1}),
+                                                "Reorder effects",
+                                            );
+                                        }
+                                        if index + 1 < l.effects.len()
+                                            && icons::small_button(ui, Icon::Up, "Move effect up")
+                                                .clicked()
+                                        {
+                                            self.layer_cmd(
+                                                "effect.reorder",
+                                                json!({"effect":effect.id,"index":index+1}),
+                                                "Reorder effects",
+                                            );
+                                        }
+                                    },
+                                );
+                            }
+                        });
+                        self.effect_weight(ui, &effect.id, effect.weight, false);
+                        if self.effect_is_selected(&l.id, false, &effect.id) {
+                            if effect.kind == "liquify"
+                                && ui
+                                    .button("Edit on canvas")
+                                    .on_hover_text("Paint an editable distortion")
+                                    .clicked()
                             {
                                 self.activate_liquify(Some(effect.id.clone()));
                             }
-                            ui.label(
-                                RichText::new("Paint on canvas · Each stroke stays editable below")
-                                    .size(11.0)
-                                    .color(MUTED),
-                            );
+                            let mut values = effect.settings.clone();
+                            if let Some(response) = settings(ui, &effect.kind, &mut values) {
+                                self.layer_parameter(
+                                    json!({"effect":effect.id,"settings":values}),
+                                    "Effect parameter",
+                                    &response,
+                                );
+                            }
                         }
-                        let mut values = effect.settings.clone();
-                        if let Some(response) = settings(ui, &effect.kind, &mut values) {
-                            self.layer_parameter(
-                                json!({"effect":effect.id,"settings":values}),
-                                "Effect parameter",
-                                &response,
-                            );
-                        }
-                        ui.add_space(5.0);
                     });
                 }
             });
@@ -456,6 +547,8 @@ pub(super) fn effect_name(kind: &str) -> &str {
         "liquify" => "Liquify",
         "grayscale" => "Grayscale",
         "levels" => "Levels",
+        "paint" => "Paint",
+        "fill" => "Fill",
         "curves" => "Curves",
         "invert" => "Invert",
         _ => kind,
@@ -514,6 +607,40 @@ mod tests {
                 .unwrap()
         };
         assert!(y("Color adjustment") < y("Invert"));
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text=="Weight"))
+                .count(),
+            2
+        );
+        assert!(!output
+            .shapes
+            .iter()
+            .any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text=="Brightness")));
+        app.select_effect(&id, false, &layer.effects[1].id);
+        let selected = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 600.))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, &layer));
+            },
+        );
+        assert!(selected
+            .shapes
+            .iter()
+            .any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text=="Brightness")));
+        assert_eq!(
+            selected
+                .shapes
+                .iter()
+                .filter(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text=="Weight"))
+                .count(),
+            2
+        );
         let e = shared.lock().unwrap();
         assert_eq!(
             serde_json::to_value(&e.doc.layers[0].effects).unwrap(),

@@ -39,6 +39,14 @@ pub enum Icon {
     Connect,
     Swap,
     Wand,
+    Levels,
+    Curves,
+    Blur,
+    ColorBalance,
+    Hue,
+    Bloom,
+    Invert,
+    Grayscale,
 }
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
     let cell = match icon {
@@ -309,6 +317,68 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
                 line(&[(x, -11.), (x, 11.)]);
                 painter.circle_filled(point(x, y), 3. * f, Color32::from_rgb(41, 39, 43));
                 painter.circle_stroke(point(x, y), 3. * f, stroke);
+            }
+        }
+        Icon::Levels => {
+            line(&[(-11., 10.), (11., 10.)]);
+            for (x, h) in [(-8., 6.), (-4., 14.), (0., 20.), (4., 16.), (8., 8.)] {
+                line(&[(x, 8.), (x, 8. - h)]);
+            }
+        }
+        Icon::Curves => {
+            line(&[(-11., -11.), (-11., 11.), (11., 11.)]);
+            line(&[
+                (-9., 8.),
+                (-5., 7.),
+                (-1., 3.),
+                (2., -4.),
+                (6., -8.),
+                (10., -9.),
+            ]);
+        }
+        Icon::Blur => {
+            for (x, y, a) in [(-5., -3., 0.45), (5., -3., 0.6), (0., 5., 0.9)] {
+                painter.circle_stroke(
+                    point(x, y),
+                    6.0 * f,
+                    Stroke::new(1.7 * f, color.gamma_multiply(a)),
+                );
+            }
+        }
+        Icon::ColorBalance => {
+            line(&[(0., -10.), (0., 11.)]);
+            line(&[(-11., -5.), (11., -5.)]);
+            line(&[(-5., 11.), (5., 11.)]);
+            for x in [-8., 8.] {
+                line(&[(x, -5.), (x - 4., 4.), (x + 4., 4.), (x, -5.)]);
+            }
+        }
+        Icon::Hue => {
+            painter.circle_stroke(rect.center(), 10. * f, stroke);
+            for a in [0.0f32, 2.0944, 4.1888] {
+                line(&[(0., 0.), (a.cos() * 10., a.sin() * 10.)]);
+            }
+        }
+        Icon::Bloom => {
+            painter.circle_stroke(rect.center(), 5. * f, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.;
+                line(&[(a.cos() * 8., a.sin() * 8.), (a.cos() * 12., a.sin() * 12.)]);
+            }
+        }
+        Icon::Invert => {
+            painter.circle_stroke(rect.center(), 9. * f, stroke);
+            polygon(&[(0., -9.), (0., 9.), (6., 6.), (9., 0.), (6., -6.)]);
+            line(&[(-12., -10.), (-7., -13.), (-7., -8.)]);
+            line(&[(12., 10.), (7., 13.), (7., 8.)]);
+        }
+        Icon::Grayscale => {
+            for (x, c) in [(-7., 100), (0., 175), (7., 240)] {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(point(x - 3., -10.), point(x + 3., 10.)),
+                    0,
+                    Color32::from_gray(c),
+                );
             }
         }
         Icon::Frame => {

@@ -45,7 +45,7 @@ You stay in control while AI works directly alongside you inside the same editin
 - **Progressive document loading.** Cancellable native16 PSD decoding, saved-image feedback and bounded disposable effect caches. See [large-document behavior](docs/large-documents.md).
 - **Visual, compact controls.** White tool glyphs, Ubuntu Sans, uncluttered range values and live canvas feedback.
 - **A useful hierarchy.** Distinct folders, multi-layer editing, drag into or out of folders, animated reorder previews, visibility sweep gestures, inline renaming, grouping and merging.
-- **Editable effects.** Each layer or folder has independent color and mask stacks. The top effect runs last. Return to an effect and change its settings after later edits; blend and opacity sit beneath the stack.
+- **Editable effects.** Compact color and mask stacks have recognizable icons and an always-visible Weight for every effect. Select a row to open its settings; top effects run last. Parameter drags preview through the shared engine and commit once on release. Blend and opacity sit beneath the stack.
 - **Editable text and vectors.** Plain text with bundled font weights, multiline alignment, rectangles, ellipses and editable path points; native fill/stroke colors, live property previews and retained source placement. PSD files also contain current standard raster layers. See [supported source behavior](docs/editable-sources.md).
 - **Retained transform originals.** Whole-layer rotation/scaling sample original native artwork and painted masks across gestures and PSD reopening; later pixel edits establish a fresh baseline for the changed source. See [transform behavior](docs/retained-transforms.md).
 - **Familiar navigation.** Maya-style W/E/R gizmos, Q to hide, F to frame, middle drag to pan, wheel or Alt + right drag to zoom.
@@ -120,7 +120,7 @@ The long-term goal is an MCP-native creative application where compatible AI age
 - Local and remote model support through connected agents
 - Extensible tool and plugin architecture
 
-Development now includes retained regional previews, tiled GPU previews, folder transforms, selective agent-task undo, richer edge refinement, optional local learned subject/object selection, native clone/heal, crop/canvas/image resizing, editable text/vector sources, transforms that retain original pixels, progressive loading and optional AI proposals with interrupted-task feedback. The next slices include stronger Photoshop fidelity, followed by the requested effects/brush/toolbar UX and project lifecycle work. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status; [learned-selection setup](docs/segmentation.md) keeps model choice outside the editor, and [AI collaboration](docs/collaboration.md) describes optional review.
+Development now includes retained regional previews, tiled GPU previews, folder transforms, selective agent-task undo, richer edge refinement, optional local learned subject/object selection, native clone/heal, crop/canvas/image resizing, editable text/vector sources, transforms that retain original pixels, progressive loading, optional AI proposals, stronger raster PSD fidelity and compact weighted effects stacks. The next slices cover the brush library, transform controls and project lifecycle. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status; [learned-selection setup](docs/segmentation.md) keeps model choice outside the editor, and [AI collaboration](docs/collaboration.md) describes optional review.
 
 ## Status
 

@@ -620,6 +620,7 @@ mod tests {
                 enabled: case % 5 != 0,
                 cache_key: id(),
                 steps: vec![MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "fill".into(),
                     enabled: true,
@@ -630,6 +631,7 @@ mod tests {
             });
             if case % 2 == 0 {
                 child.effects.push(Effect {
+                    weight: 1.0,
                     id: id(),
                     kind: "invert".into(),
                     enabled: true,
@@ -640,6 +642,7 @@ mod tests {
             adjustment.opacity = 0.3;
             adjustment.blend = BLENDS[(case + 9) % BLENDS.len()].0.into();
             adjustment.effects.push(Effect {
+                weight: 1.0,
                 id: id(),
                 kind: "adjust".into(),
                 enabled: true,

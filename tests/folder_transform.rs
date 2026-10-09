@@ -21,6 +21,7 @@ fn fixture(depth: u16, effects: bool) -> (Engine, String) {
         cache_key: id(),
         steps: vec![
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "fill".into(),
                 enabled: true,
@@ -29,6 +30,7 @@ fn fixture(depth: u16, effects: bool) -> (Engine, String) {
                 settings: Value::Null,
             },
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "paint".into(),
                 enabled: true,
@@ -40,6 +42,7 @@ fn fixture(depth: u16, effects: bool) -> (Engine, String) {
     });
     if effects {
         root.effects.push(Effect {
+            weight: 1.0,
             id: id(),
             kind: "invert".into(),
             enabled: true,
@@ -246,6 +249,7 @@ fn default_folder_pivot_uses_descendants_and_adjustment_masks_retain_native_fram
     adjustment.parent = Some(root.clone());
     adjustment.pixels = Raster::new_depth(40, 32, 16);
     adjustment.effects.push(Effect {
+        weight: 1.0,
         id: id(),
         kind: "levels".into(),
         enabled: true,

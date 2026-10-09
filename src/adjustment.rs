@@ -42,6 +42,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<String, String> {
         doc.height,
     );
     adjustment.effects.push(effects::Effect {
+        weight: 1.0,
         id: crate::engine::id(),
         kind: kind.into(),
         enabled: true,
@@ -84,6 +85,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<String, String> {
             enabled: true,
             steps: vec![
                 MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "fill".into(),
                     enabled: true,
@@ -92,6 +94,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<String, String> {
                     settings: Value::Null,
                 },
                 MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "paint".into(),
                     enabled: true,

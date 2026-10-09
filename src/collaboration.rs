@@ -350,6 +350,7 @@ mod tests {
             enabled: true,
             cache_key: engine::id(),
             steps: vec![MaskStep {
+                weight: 1.0,
                 id: engine::id(),
                 kind: "paint".into(),
                 enabled: true,

@@ -4,6 +4,49 @@ use crate::{effects, liquify};
 use serde_json::Value;
 const MAX: f64 = 65535.0;
 const PREMULT_MAX: f64 = MAX * MAX;
+pub fn weighted_working_bytes(
+    effect: &effects::Effect,
+    width: u32,
+    height: u32,
+) -> Result<u64, String> {
+    Ok(
+        working_bytes(width, height, &effect.kind, &effect.settings)?
+            + if effect.weight > 0.0 && effect.weight < 1.0 {
+                u64::from(width) * u64::from(height) * 8
+            } else {
+                0
+            },
+    )
+}
+pub(crate) fn apply_effect(
+    image: &mut Image16,
+    effect: &effects::Effect,
+    region_source: Option<u64>,
+) -> Result<(), String> {
+    effects::validate_weight(effect.weight)?;
+    if !effect.enabled || effect.weight == 0.0 {
+        return Ok(());
+    }
+    if weighted_working_bytes(effect, image.width, image.height)? > WORKING_BUDGET {
+        return Err("Weighted native16 effect exceeds the bounded working budget".into());
+    }
+    let before = (effect.weight < 1.0).then(|| image.words.clone());
+    if let Some(source_pixels) = region_source {
+        apply_region(image, &effect.kind, &effect.settings, source_pixels)?;
+    } else {
+        apply(image, &effect.kind, &effect.settings)?;
+    }
+    if let Some(before) = before {
+        for (source, target) in before.chunks_exact(4).zip(image.words.chunks_exact_mut(4)) {
+            target.copy_from_slice(&effects::weighted_pixel(
+                source.try_into().unwrap(),
+                (&*target).try_into().unwrap(),
+                effect.weight,
+            ));
+        }
+    }
+    Ok(())
+}
 fn number(settings: &Value, key: &str, default: f64) -> f64 {
     settings[key].as_f64().unwrap_or(default)
 }

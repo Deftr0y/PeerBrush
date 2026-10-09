@@ -22,6 +22,8 @@ pub struct MaskStep {
     pub id: String,
     pub kind: String,
     pub enabled: bool,
+    #[serde(default = "crate::effects::full_weight")]
+    pub weight: f32,
     pub value: f32,
     pub pixels: Raster,
     #[serde(default)]
@@ -114,9 +116,10 @@ impl Layer {
         }
         let mut v = 255.0;
         for step in &m.steps {
-            if !step.enabled {
+            if !step.enabled || step.weight == 0.0 {
                 continue;
             }
+            let before = v;
             match step.kind.as_str() {
                 "fill" => v = step.value,
                 "paint" => {
@@ -130,6 +133,7 @@ impl Layer {
                 }
                 _ => {}
             }
+            v = before * (1.0 - step.weight) + v * step.weight;
         }
         v.clamp(0.0, 255.0) / 255.0
     }
@@ -535,7 +539,7 @@ impl Engine {
     }
     fn state_core(&mut self) -> Value {
         self.expire();
-        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -1632,6 +1636,7 @@ impl Engine {
                 cache_key: id(),
                 steps: vec![
                     MaskStep {
+                        weight: 1.0,
                         id: id(),
                         kind: "fill".into(),
                         enabled: true,
@@ -1644,6 +1649,7 @@ impl Engine {
                         settings: Value::Null,
                     },
                     MaskStep {
+                        weight: 1.0,
                         id: id(),
                         kind: "paint".into(),
                         enabled: true,
@@ -1747,6 +1753,7 @@ impl Engine {
                         .unwrap_or_else(|| crate::effects::defaults(kind));
                     let settings = crate::effects::normalized(kind, &settings)?;
                     l.effects.push(crate::effects::Effect {
+                        weight: crate::effects::command_weight(c)?,
                         id: id(),
                         kind: kind.into(),
                         enabled: true,
@@ -1761,6 +1768,9 @@ impl Engine {
                         .ok_or("Unknown effect")?;
                     if let Some(v) = c.get("enabled").and_then(Value::as_bool) {
                         e.enabled = v;
+                    }
+                    if c.get("weight").is_some() {
+                        e.weight = crate::effects::command_weight(c)?;
                     }
                     if let Some(settings) = c.get("settings") {
                         e.settings = crate::effects::normalized(&e.kind, settings)?;
@@ -1819,6 +1829,7 @@ impl Engine {
                         );
                     }
                     m.steps.push(MaskStep {
+                        weight: crate::effects::command_weight(c)?,
                         id: id(),
                         kind: kind.into(),
                         enabled: true,
@@ -1867,6 +1878,9 @@ impl Engine {
                         };
                         crate::effects::validate(kind, settings)?;
                         s.settings = settings.clone();
+                    }
+                    if c.get("weight").is_some() {
+                        s.weight = crate::effects::command_weight(c)?;
                     }
                     if c.get("value").is_some() {
                         s.value = mask_parameter(&s.kind, num(c, "value", 1.0))?;
@@ -1950,6 +1964,7 @@ impl Engine {
                     return Err("Effect stack limit: 32".into());
                 }
                 l.effects.push(crate::effects::Effect {
+                    weight: 1.0,
                     id: id(),
                     kind: "liquify".into(),
                     enabled: true,

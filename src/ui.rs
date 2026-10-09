@@ -182,6 +182,14 @@ struct EyeSweep {
     visible: bool,
     ids: HashSet<String>,
 }
+struct ParameterEdit {
+    control: egui::Id,
+    gesture: String,
+    document: String,
+    revision: u64,
+    commands: Vec<Value>,
+    label: String,
+}
 pub struct PeerBrush {
     shared: Shared,
     connection: Connection,
@@ -254,7 +262,7 @@ pub struct PeerBrush {
     thumb_worker: thumbnails::Worker,
     thumb_pending: HashMap<String, u64>,
     thumb_document: String,
-    parameter_gesture: Option<(egui::Id, String)>,
+    parameter_gesture: Option<ParameterEdit>,
     blend_hover: Option<(String, String)>,
     transient: Vec<Value>,
     mask_tolerance: f32,
@@ -298,6 +306,7 @@ pub struct PeerBrush {
     new_folder_rect: Option<Rect>,
     collapsed: HashSet<String>,
     mask_step: Option<String>,
+    effect_selected: Option<(String, bool, String)>,
     activity_text: String,
     activity_changed: std::time::Instant,
     gizmo_handle: u8,
@@ -555,6 +564,7 @@ impl PeerBrush {
             new_folder_rect: None,
             collapsed: HashSet::new(),
             mask_step: None,
+            effect_selected: None,
             activity_text: String::new(),
             activity_changed: std::time::Instant::now(),
             gizmo_handle: 0,
@@ -735,21 +745,32 @@ impl PeerBrush {
         };
         self.edit(commands, label);
     }
+    fn finish_parameter(&mut self, cancel: bool) {
+        let Some(edit) = self.parameter_gesture.take() else {
+            return;
+        };
+        self.last_preview = None;
+        if cancel {
+            return;
+        }
+        let mut engine = self.shared.lock().unwrap();
+        if engine.doc.id != edit.document || engine.doc.revision != edit.revision {
+            self.message = "Image changed during parameter edit · preview cancelled".into();
+            return;
+        }
+        self.message = engine
+            .edit(
+                "human",
+                &edit.commands,
+                Some(edit.revision),
+                None,
+                &edit.label,
+            )
+            .map(|_| edit.label)
+            .unwrap_or_else(|error| error);
+    }
     fn layer_parameter(&mut self, extra: Value, label: &str, response: &egui::Response) {
         let down = response.is_pointer_button_down_on() || response.dragged();
-        if down
-            && self
-                .parameter_gesture
-                .as_ref()
-                .is_none_or(|(id, _)| *id != response.id)
-        {
-            self.parameter_gesture = Some((response.id, crate::engine::id()));
-        }
-        let gesture = if down {
-            self.parameter_gesture.as_ref().map(|(_, key)| key.as_str())
-        } else {
-            None
-        };
         let mut command = extra;
         command["op"] = json!(if command.get("effect").is_some() {
             "effect.update"
@@ -759,7 +780,7 @@ impl PeerBrush {
             "layer.update"
         });
         command["layer"] = json!(self.selected);
-        let commands = if command["op"] == "layer.update" {
+        let mut commands = if command["op"] == "layer.update" {
             self.selection_layers
                 .iter()
                 .map(|id| {
@@ -771,12 +792,56 @@ impl PeerBrush {
         } else {
             vec![command]
         };
-        let result = self
-            .shared
-            .lock()
-            .unwrap()
-            .edit_with_gesture("human", &commands, None, None, label, gesture);
-        self.message = result.map(|_| label.into()).unwrap_or_else(|e| e);
+        if down {
+            if self
+                .parameter_gesture
+                .as_ref()
+                .is_some_and(|edit| edit.control != response.id)
+            {
+                self.finish_parameter(false);
+            }
+            let doc = self.shared.lock().unwrap().doc.clone();
+            let (document, revision) = self
+                .parameter_gesture
+                .as_ref()
+                .map(|edit| (edit.document.clone(), edit.revision))
+                .unwrap_or((doc.id.clone(), doc.revision));
+            for command in &mut commands {
+                command["document_id"] = json!(document);
+                command["source_revision"] = json!(revision);
+            }
+            match crate::engine::Engine::preview_edits(doc, &commands) {
+                Ok(_) => {
+                    let gesture = self
+                        .parameter_gesture
+                        .as_ref()
+                        .map(|edit| edit.gesture.clone())
+                        .unwrap_or_else(crate::engine::id);
+                    self.parameter_gesture = Some(ParameterEdit {
+                        control: response.id,
+                        gesture,
+                        document,
+                        revision,
+                        commands,
+                        label: label.into(),
+                    });
+                    self.animation.cancel();
+                }
+                Err(error) => {
+                    self.parameter_gesture = None;
+                    self.message = error;
+                }
+            }
+        } else {
+            self.finish_parameter(true);
+            self.message = self
+                .shared
+                .lock()
+                .unwrap()
+                .edit("human", &commands, None, None, label)
+                .map(|_| label.into())
+                .unwrap_or_else(|error| error);
+        }
         self.last_preview = None;
     }
     fn job<F: FnOnce() -> Result<String, String> + Send + 'static>(&mut self, f: F) {
@@ -1079,7 +1144,11 @@ impl PeerBrush {
             "{target};{:?};{};{};{}",
             self.blend_hover,
             stroke.map(|v| v.to_string()).unwrap_or_default(),
-            serde_json::to_string(&self.transient).unwrap(),
+            serde_json::to_string(&(
+                &self.transient,
+                self.parameter_gesture.as_ref().map(|edit| &edit.commands)
+            ))
+            .unwrap(),
             self.refinement
                 .as_ref()
                 .map(|r| r.preview.as_str())
@@ -1087,6 +1156,12 @@ impl PeerBrush {
         )
     }
     fn live_key(&self) -> String {
+        if let Some(edit) = &self.parameter_gesture {
+            return format!(
+                "parameter:{}:{}:{}",
+                edit.gesture, edit.document, edit.revision
+            );
+        }
         if let Some(id) = &self.proposal_review {
             return format!("proposal:{id}:{}", self.proposal_original);
         }
@@ -1267,6 +1342,9 @@ impl PeerBrush {
             let mut doc = proposal_doc.unwrap_or_else(|| self.animation.document(doc, time, true));
             doc.revision = current.revision;
             let mut commands = self.transient.clone();
+            if let Some(edit) = &self.parameter_gesture {
+                commands.extend(edit.commands.clone());
+            }
             if let Some((layer, blend)) = &self.blend_hover {
                 commands.push(json!({"op":"layer.update","layer":layer,"blend":blend}));
             }
@@ -1773,7 +1851,7 @@ impl PeerBrush {
                         });
                         let add = ui.menu_button("+ Add effect", |ui| {
                             for kind in ["paint", "fill", "invert", "levels", "blur", "curves", "gaussian", "adjust"] {
-                                if ui.button(if kind=="blur"{"Feather"}else{effects::effect_name(kind)}).clicked() {
+                                if effects::menu_effect(ui,kind,if kind=="blur"{"Feather"}else{effects::effect_name(kind)}).clicked() {
                                     self.layer_cmd(
                                         "mask.step.add",
                                         json!({"kind":kind}),
@@ -1784,99 +1862,50 @@ impl PeerBrush {
                             }
                         });
                         self.effect_add_rect = Some(add.response.rect);
-                        egui::ScrollArea::vertical()
-                            .id_salt("mask effects")
-                            .max_height((ui.available_height() - 8.0).max(24.0))
-                            .show(ui, |ui| {
-                                for (index, step) in m.steps.iter().enumerate().rev() {
-                                    let preview=self.thumbnail_for(doc,&l.id,true,Some(index));
+                        egui::ScrollArea::vertical().id_salt("mask effects").max_height((ui.available_height()-8.0).max(24.0)).show(ui,|ui| {
+                            ui.spacing_mut().item_spacing.y=3.0;
+                            for (index,step) in m.steps.iter().enumerate().rev() {
+                                ui.push_id(&step.id,|ui| {
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x=5.0;
-                                        let mut enabled = step.enabled;
-                                        if ui.checkbox(&mut enabled, "").changed() {
-                                            self.layer_cmd(
-                                                "mask.step.update",
-                                                json!({"step":step.id,"enabled":enabled}),
-                                                "Toggle mask step",
-                                            );
+                                        ui.spacing_mut().item_spacing.x=4.0;
+                                        let mut enabled=step.enabled;
+                                        if ui.checkbox(&mut enabled,"").on_hover_text("Enable mask effect").changed() {self.layer_cmd("mask.step.update",json!({"step":step.id,"enabled":enabled}),"Toggle mask step");}
+                                        let (rect,_) = ui.allocate_exact_size(Vec2::splat(18.0),egui::Sense::hover());
+                                        icons::paint(ui.painter(),rect,effects::effect_icon(&step.kind),step.enabled);
+                                        let name=if step.kind=="blur" {"Feather"} else {effects::effect_name(&step.kind)};
+                                        if ui.selectable_label(self.effect_is_selected(&l.id,true,&step.id),RichText::new(name).size(12.0)).on_hover_text("Select to edit settings · click again to close").clicked() {
+                                            self.select_effect(&l.id,true,&step.id);
+                                            self.mask_step=if step.kind=="paint" {Some(step.id.clone())} else {None};
+                                            self.last_preview=None;
                                         }
-                                        if let Some(preview)=preview {
-                                            if ui.add(egui::ImageButton::new((preview.id(),Vec2::splat(23.0))).frame(false)).on_hover_text("Result through this effect · click to target its paint step").clicked() {
-                                                self.mask=true;
-                                                self.mask_step=if step.kind=="paint"{Some(step.id.clone())}else{None};
-                                            }
-                                        } else {ui.allocate_space(Vec2::splat(23.0));}
-                                        let name=if step.kind=="blur" {"Feather".into()} else {format!("{}{}",step.kind[..1].to_uppercase(),&step.kind[1..])};
-                                        if ui
-                                            .selectable_label(
-                                                self.mask_step.as_deref() == Some(&step.id),
-                                                RichText::new(name).size(12.0),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.mask = true;
-                                            self.mask_step = if step.kind == "paint" {
-                                                Some(step.id.clone())
-                                            } else {
-                                                None
-                                            };
-                                            self.last_preview = None;
+                                        if self.effect_is_selected(&l.id,true,&step.id) {
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
+                                                if icons::small_button(ui,Icon::Trash,"Remove mask effect").clicked() {self.layer_cmd("mask.step.delete",json!({"step":step.id}),"Remove mask step");self.mask_step=None;self.effect_selected=None;}
+                                                if index>0 && icons::small_button(ui,Icon::Down,"Move mask effect down").clicked() {self.layer_cmd("mask.step.reorder",json!({"step":step.id,"index":index-1}),"Reorder mask step");}
+                                                if index+1<m.steps.len() && icons::small_button(ui,Icon::Up,"Move mask effect up").clicked() {self.layer_cmd("mask.step.reorder",json!({"step":step.id,"index":index+1}),"Reorder mask step");}
+                                            });
                                         }
+                                    });
+                                    self.effect_weight(ui,&step.id,step.weight,true);
+                                    if self.effect_is_selected(&l.id,true,&step.id) {
+                                        if let Some(preview)=self.thumbnail_for(doc,&l.id,true,Some(index)) { ui.add(egui::Image::new((preview.id(),Vec2::splat(40.0)))).on_hover_text("Result through this effect"); }
                                         if ["fill","levels","blur"].contains(&step.kind.as_str()) {
                                             let mut value=step.value;
                                             let range=match step.kind.as_str(){"fill"=>0.0..=255.0,"blur"=>0.0..=64.0,_=>0.1..=5.0};
-                                            let response=controls::range(ui,&step.id,&mut value,range,80.0,if step.kind=="blur"{" px"}else{""},if step.kind=="levels"{1}else{0},false);
-                                            if response.changed() {self.layer_parameter(json!({"step":step.id,"value":value}),"Mask parameter",&response);}
+                                            ui.horizontal(|ui| {
+                                                controls::label(ui,if step.kind=="fill"{"Value"}else if step.kind=="blur"{"Radius"}else{"Gamma"});
+                                                let response=controls::range(ui,(&step.id,"value"),&mut value,range,180.0,if step.kind=="blur"{" px"}else{""},if step.kind=="levels"{1}else{0},false);
+                                                if response.changed(){self.layer_parameter(json!({"step":step.id,"value":value}),"Mask parameter",&response);}
+                                            });
                                         }
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if icons::small_button(
-                                                    ui,
-                                                    Icon::Trash,
-                                                    "Remove mask effect",
-                                                )
-                                                .on_hover_text("Remove step")
-                                                .clicked()
-                                                {
-                                                    self.layer_cmd(
-                                                        "mask.step.delete",
-                                                        json!({"step":step.id}),
-                                                        "Remove mask step",
-                                                    );
-                                                    self.mask_step = None;
-                                                }
-                                                if index + 1 < m.steps.len()
-                                                    && icons::small_button(
-                                                        ui,
-                                                        Icon::Up,
-                                                        "Move mask effect up",
-                                                    )
-                                                    .on_hover_text("Move step up")
-                                                    .clicked()
-                                                {
-                                                    self.layer_cmd(
-                                                        "mask.step.reorder",
-                                                        json!({"step":step.id,"index":index+1}),
-                                                        "Reorder mask step",
-                                                    );
-                                                }
-                                                if index > 0 && icons::small_button(ui, Icon::Down, "Move mask effect down").clicked() {
-                                                    self.layer_cmd("mask.step.reorder", json!({"step":step.id,"index":index-1}), "Reorder mask step");
-                                                }
-                                            },
-                                        );
-                                    });
-                                    if !step.settings.is_null() {
-                                        ui.push_id((&step.id,"mask settings"),|ui| {
+                                        if ["curves","gaussian","adjust"].contains(&step.kind.as_str()) {
                                             let mut values=step.settings.clone();
-                                            if let Some(response)=effects::settings(ui,&step.kind,&mut values) {
-                                                self.layer_parameter(json!({"step":step.id,"settings":values}),"Mask effect parameter",&response);
-                                            }
-                                        });
+                                            if let Some(response)=effects::settings(ui,&step.kind,&mut values) {self.layer_parameter(json!({"step":step.id,"settings":values}),"Mask parameter",&response);}
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            }
+                        });
                     } else {
                         ui.label(
                             RichText::new("Reveal. Hide. Refine.")
@@ -2770,6 +2799,11 @@ impl PeerBrush {
             self.message = result.unwrap_or_else(|e| e);
             self.last_preview = None;
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.finish_parameter(true);
+        } else if !ctx.input(|i| i.pointer.any_down()) {
+            self.finish_parameter(false);
+        }
         let (doc, ai_change) = {
             let mut e = self.shared.lock().unwrap();
             e.expire();
@@ -2805,8 +2839,13 @@ impl PeerBrush {
         if ctx.input(|i| i.pointer.any_pressed()) {
             self.animation.cancel();
         }
-        if !ctx.input(|i| i.pointer.any_down()) {
-            self.parameter_gesture = None;
+        if self
+            .parameter_gesture
+            .as_ref()
+            .is_some_and(|edit| edit.document != doc.id || edit.revision != doc.revision)
+        {
+            self.finish_parameter(true);
+            self.message = "Image changed during parameter edit · preview cancelled".into();
         }
         self.thumb_worker.document(&doc);
         if self.thumb_document != doc.id {
@@ -3463,7 +3502,14 @@ impl PeerBrush {
             .min_width(300.0)
             .max_width(470.0)
             .show(ctx, |ui| {
-                let display = self.animation.document(&doc, ui.input(|i| i.time), false);
+                let mut display = self.animation.document(&doc, ui.input(|i| i.time), false);
+                if let Some(edit) = &self.parameter_gesture {
+                    if let Ok(preview) =
+                        crate::engine::Engine::preview_edits(doc.clone(), &edit.commands)
+                    {
+                        display = preview;
+                    }
+                }
                 if self.ai_layer(&self.selected, ui.input(|i| i.time)) {
                     ui.style_mut().visuals.selection.stroke.color = AI_BLUE;
                 }
@@ -3750,6 +3796,106 @@ mod tests {
             },
         );
         (app, ctx)
+    }
+    #[test]
+    fn parameter_preview_waits_for_release_and_cancels_when_source_changes() {
+        let (mut app, ctx) = fixture();
+        let layer = app.selected.clone();
+        let before = app.shared.lock().unwrap().doc.clone();
+        let mut rect = Rect::NOTHING;
+        let mut draw = |app: &mut PeerBrush, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 200.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut opacity = app.parameter_gesture.as_ref().map_or(100., |edit| {
+                            edit.commands[0]["opacity"].as_f64().unwrap() as f32 * 100.
+                        });
+                        let response = controls::range(
+                            ui,
+                            "opacity-test",
+                            &mut opacity,
+                            0.0..=100.0,
+                            200.,
+                            "%",
+                            0,
+                            false,
+                        );
+                        rect = response.rect;
+                        if response.changed() {
+                            app.layer_parameter(
+                                json!({"opacity":opacity/100.}),
+                                "Opacity",
+                                &response,
+                            );
+                        }
+                    });
+                },
+            );
+            rect
+        };
+        let bar = draw(&mut app, vec![]);
+        let pos = bar.center();
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(pos + Vec2::new(-30., 0.))],
+        );
+        let edit = app.parameter_gesture.as_ref().unwrap();
+        let draft = Engine::preview_edits(before.clone(), &edit.commands).unwrap();
+        assert!(draft.layers[0].opacity < 0.5);
+        assert_eq!(app.shared.lock().unwrap().doc.layers[0].opacity, 1.);
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        app.finish_parameter(false);
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].opacity,
+            draft.layers[0].opacity
+        );
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        app.shared.lock().unwrap().undo("human").unwrap();
+        assert_eq!(app.shared.lock().unwrap().doc.layers[0].opacity, 1.);
+        let doc = app.shared.lock().unwrap().doc.clone();
+        app.parameter_gesture = Some(ParameterEdit {
+            control: egui::Id::new("test"),
+            gesture: "test".into(),
+            document: doc.id,
+            revision: doc.revision,
+            commands: vec![json!({"op":"layer.update","layer":layer,"opacity":0.2})],
+            label: "Opacity".into(),
+        });
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":layer,"name":"Human rename"})],
+                None,
+                None,
+                "Rename",
+            )
+            .unwrap();
+        app.finish_parameter(false);
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].name,
+            "Human rename"
+        );
+        assert_eq!(app.shared.lock().unwrap().doc.layers[0].opacity, 1.);
+        assert!(app.message.contains("cancelled"));
     }
     fn key(app: &mut PeerBrush, ctx: &egui::Context, key: egui::Key) {
         frame(

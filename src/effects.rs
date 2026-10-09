@@ -27,7 +27,98 @@ pub struct Effect {
     pub id: String,
     pub kind: String,
     pub enabled: bool,
+    #[serde(default = "full_weight")]
+    pub weight: f32,
     pub settings: Value,
+}
+pub fn full_weight() -> f32 {
+    1.0
+}
+pub fn validate_weight(weight: f32) -> Result<(), String> {
+    if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+        return Err("Effect weight must be between 0 and 1".into());
+    }
+    Ok(())
+}
+pub fn command_weight(command: &Value) -> Result<f32, String> {
+    let weight = match command.get("weight") {
+        None => 1.0,
+        Some(value) => value.as_f64().ok_or("Effect weight must be a number")?,
+    };
+    if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+        return Err("Effect weight must be between 0 and 1".into());
+    }
+    Ok(weight as f32)
+}
+/// Interpolate straight samples in premultiplied space. Alpha-changing spatial
+/// effects fade continuously without halos; hidden RGB remains native too.
+pub fn weighted_pixel(before: [u16; 4], after: [u16; 4], weight: f32) -> [u16; 4] {
+    if weight <= 0.0 {
+        return before;
+    }
+    if weight >= 1.0 {
+        return after;
+    }
+    let t = f64::from(weight);
+    let a = f64::from(before[3]) * (1.0 - t);
+    let b = f64::from(after[3]) * t;
+    let alpha = a + b;
+    let mut result = [0; 4];
+    for c in 0..3 {
+        result[c] = (if alpha == 0.0 {
+            f64::from(before[c]) * (1.0 - t) + f64::from(after[c]) * t
+        } else {
+            (f64::from(before[c]) * a + f64::from(after[c]) * b) / alpha
+        })
+        .round()
+        .clamp(0.0, 65535.0) as u16;
+    }
+    result[3] = alpha.round().clamp(0.0, 65535.0) as u16;
+    result
+}
+pub fn weighted_working_bytes(effect: &Effect, w: u32, h: u32) -> Result<u64, String> {
+    Ok(working_bytes(&effect.kind, w, h, &effect.settings)?
+        + if effect.weight > 0.0 && effect.weight < 1.0 {
+            u64::from(w) * u64::from(h) * 4
+        } else {
+            0
+        })
+}
+pub(crate) fn apply_effect(
+    image: &mut Image,
+    effect: &Effect,
+    region_source: Option<u64>,
+) -> Result<(), String> {
+    validate_weight(effect.weight)?;
+    if !effect.enabled || effect.weight == 0.0 {
+        return Ok(());
+    }
+    if weighted_working_bytes(effect, image.width, image.height)? > WORKING_BUDGET as u64 {
+        return Err("Weighted effect working buffers exceed the 256 MiB budget".into());
+    }
+    let before = (effect.weight < 1.0).then(|| image.bytes.clone());
+    if let Some(source_pixels) = region_source {
+        apply_region(image, &effect.kind, &effect.settings, source_pixels)?;
+    } else {
+        apply(image, &effect.kind, &effect.settings)?;
+    }
+    if let Some(before) = before {
+        for (source, target) in before.chunks_exact(4).zip(image.bytes.chunks_exact_mut(4)) {
+            let result = weighted_pixel(
+                source
+                    .try_into()
+                    .map(|p: [u8; 4]| p.map(u16::from))
+                    .unwrap(),
+                (&*target)
+                    .try_into()
+                    .map(|p: [u8; 4]| p.map(u16::from))
+                    .unwrap(),
+                effect.weight,
+            );
+            target.copy_from_slice(&result.map(|v| v as u8));
+        }
+    }
+    Ok(())
 }
 pub fn defaults(kind: &str) -> Value {
     match kind {
@@ -312,7 +403,7 @@ impl Cache {
     }
 }
 pub fn active(l: &Layer) -> bool {
-    l.kind == "adjustment" || l.effects.iter().any(|e| e.enabled)
+    l.kind == "adjustment" || l.effects.iter().any(|e| e.enabled && e.weight > 0.0)
 }
 pub fn validate_budget(doc: &Document) -> Result<(), String> {
     let bytes: u64 = doc
@@ -333,8 +424,8 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
         } else {
             (layer.pixels.width, layer.pixels.height)
         };
-        for effect in layer.effects.iter().filter(|e| e.enabled) {
-            if working_bytes(&effect.kind, w, h, &effect.settings)? > WORKING_BUDGET as u64 {
+        for effect in layer.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
+            if weighted_working_bytes(effect, w, h)? > WORKING_BUDGET as u64 {
                 return Err("Effect working buffers exceed the 256 MiB budget; reduce the affected layer dimensions".into());
             }
         }
@@ -471,8 +562,8 @@ pub fn prepare(
             height: h,
             bytes,
         };
-        for effect in l.effects.iter().filter(|e| e.enabled) {
-            apply(&mut image, &effect.kind, &effect.settings)?;
+        for effect in l.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
+            apply_effect(&mut image, effect, None)?;
         }
         let image = Arc::new(image);
         let mut cache = cache.lock().unwrap();

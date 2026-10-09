@@ -222,6 +222,7 @@ impl Animation {
                         .iter()
                         .find(|e| e.id == effect.id && e.kind == effect.kind)
                     {
+                        effect.weight = lerp(old.weight, effect.weight, t);
                         values(&old.settings, &mut effect.settings, t);
                     }
                 }
@@ -238,6 +239,7 @@ impl Animation {
                             .iter()
                             .find(|s| s.id == step.id && s.kind == step.kind)
                         {
+                            step.weight = lerp(old.weight, step.weight, t);
                             step.value = lerp(old.value, step.value, t);
                             values(&old.settings, &mut step.settings, t);
                         }

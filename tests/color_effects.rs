@@ -298,6 +298,7 @@ fn invalid_effects_and_color_only_mask_requests_roll_back_atomically() {
 fn effects_enforce_derived_and_transient_budgets_before_rendering() {
     let mut doc = Document::new(8192, 4096).unwrap();
     doc.layers[0].effects.push(effects::Effect {
+        weight: 1.0,
         id: "large".into(),
         kind: "blur".into(),
         enabled: true,

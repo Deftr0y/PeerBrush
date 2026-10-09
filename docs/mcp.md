@@ -24,6 +24,8 @@ Tools: `peerbrush_observe`, `peerbrush_edit`, `peerbrush_proposal`, `peerbrush_t
 
 Observe before editing. Use layer IDs, document pixel coordinates, and `expected_revision`. The upper-left pixel is (0,0). Rectangles are `[left, top, right, bottom]`, with right and bottom excluded.
 
+Color effects and mask steps accept `weight` in `effect.add/update` and `mask.step.add/update`. Use 0–1; omitted new weights default to 1 and omitted update weights keep the existing value. Weight blends the step's input with its result, independently of settings such as blur Radius or bloom Strength. Observe returns each weight. Native 16-bit samples, clipboard sources, PSD sources, reservations and undo share the same engine path.
+
 ```json
 {"commands":[{"op":"paint","layer":"LAYER_ID","points":[[60,60],[180,120]],"radius":14,"color":[233,84,32,255]}],"expected_revision":0,"actor":"my-agent","label":"Paint orange accent"}
 ```

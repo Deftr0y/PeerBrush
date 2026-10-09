@@ -25,6 +25,7 @@ fn fixture() -> Document {
         cache_key: engine::id(),
         steps: vec![
             MaskStep {
+                weight: 1.0,
                 id: engine::id(),
                 kind: "fill".into(),
                 enabled: true,
@@ -33,6 +34,7 @@ fn fixture() -> Document {
                 settings: json!(null),
             },
             MaskStep {
+                weight: 1.0,
                 id: engine::id(),
                 kind: "paint".into(),
                 enabled: true,

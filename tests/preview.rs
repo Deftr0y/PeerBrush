@@ -18,6 +18,7 @@ fn dirty_stroke_cache_matches_full_render_for_fractional_scales_isolation_and_ta
             cache_key: id(),
             steps: vec![
                 MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "fill".into(),
                     enabled: true,
@@ -26,6 +27,7 @@ fn dirty_stroke_cache_matches_full_render_for_fractional_scales_isolation_and_ta
                     settings: json!({}),
                 },
                 MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "paint".into(),
                     enabled: true,
@@ -102,6 +104,7 @@ fn cache_resets_for_baselines_and_unbounded_effects() {
     assert!(reset.dirty.is_none());
     assert_eq!(reset.bytes, doc.preview(None, 16, None, false).unwrap().2);
     doc.layers[0].effects.push(Effect {
+        weight: 1.0,
         id: id(),
         kind: "liquify".into(),
         enabled: true,
@@ -118,6 +121,7 @@ fn cache_resets_for_baselines_and_unbounded_effects() {
         enabled: false,
         cache_key: id(),
         steps: vec![MaskStep {
+            weight: 1.0,
             id: id(),
             kind: "blur".into(),
             enabled: true,
@@ -140,6 +144,7 @@ fn incremental_engine_previews_match_full_replay_and_reset_settings_baselines_an
         cache_key: id(),
         steps: vec![
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "fill".into(),
                 enabled: true,
@@ -148,6 +153,7 @@ fn incremental_engine_previews_match_full_replay_and_reset_settings_baselines_an
                 settings: json!({}),
             },
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "paint".into(),
                 enabled: true,
@@ -226,6 +232,7 @@ fn native_dirty_previews_match_full_projection_with_local_masks_and_fractional_s
         cache_key: id(),
         steps: vec![
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "fill".into(),
                 enabled: true,
@@ -234,6 +241,7 @@ fn native_dirty_previews_match_full_projection_with_local_masks_and_fractional_s
                 settings: json!({}),
             },
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "paint".into(),
                 enabled: true,
@@ -295,6 +303,7 @@ fn filtered_fixture(depth: u16) -> Document {
     let mut doc = Document::new_depth(199, 131, depth).unwrap();
     let mut folder = Layer::new("Filtered folder", "group", 199, 131);
     folder.effects.push(Effect {
+        weight: 1.0,
         id: id(),
         kind: "blur".into(),
         enabled: true,
@@ -306,12 +315,14 @@ fn filtered_fixture(depth: u16) -> Document {
     paint.parent = Some(folder.id.clone());
     paint.effects = vec![
         Effect {
+            weight: 1.0,
             id: id(),
             kind: "levels".into(),
             enabled: true,
             settings: json!({"gamma":0.8}),
         },
         Effect {
+            weight: 1.0,
             id: id(),
             kind: "bloom".into(),
             enabled: true,
@@ -323,6 +334,7 @@ fn filtered_fixture(depth: u16) -> Document {
         cache_key: id(),
         steps: vec![
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "fill".into(),
                 enabled: true,
@@ -331,6 +343,7 @@ fn filtered_fixture(depth: u16) -> Document {
                 settings: json!({}),
             },
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "paint".into(),
                 enabled: true,
@@ -339,6 +352,7 @@ fn filtered_fixture(depth: u16) -> Document {
                 settings: json!({}),
             },
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "gaussian".into(),
                 enabled: true,
@@ -347,6 +361,7 @@ fn filtered_fixture(depth: u16) -> Document {
                 settings: json!({"radius":2}),
             },
             MaskStep {
+                weight: 1.0,
                 id: id(),
                 kind: "curves".into(),
                 enabled: true,
@@ -360,6 +375,7 @@ fn filtered_fixture(depth: u16) -> Document {
     adjustment.parent = Some(folder.id.clone());
     adjustment.clip_to = Some(paint.id.clone());
     adjustment.effects.push(Effect {
+        weight: 1.0,
         id: id(),
         kind: "hsl".into(),
         enabled: true,
@@ -480,6 +496,7 @@ fn raw_disabled_small_mask_updates_clamped_edge_strips_at_both_depths() {
             cache_key: id(),
             steps: vec![
                 MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "fill".into(),
                     enabled: true,
@@ -488,6 +505,7 @@ fn raw_disabled_small_mask_updates_clamped_edge_strips_at_both_depths() {
                     settings: json!({}),
                 },
                 MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "paint".into(),
                     enabled: true,
@@ -496,6 +514,7 @@ fn raw_disabled_small_mask_updates_clamped_edge_strips_at_both_depths() {
                     settings: json!({}),
                 },
                 MaskStep {
+                    weight: 1.0,
                     id: id(),
                     kind: "blur".into(),
                     enabled: true,

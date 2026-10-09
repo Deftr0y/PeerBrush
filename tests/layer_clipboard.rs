@@ -26,6 +26,7 @@ fn rich_tree() -> (Document, String, String) {
         cache_key: engine::id(),
         steps: vec![
             MaskStep {
+                weight: 1.0,
                 id: engine::id(),
                 kind: "fill".into(),
                 enabled: true,
@@ -34,6 +35,7 @@ fn rich_tree() -> (Document, String, String) {
                 settings: json!({}),
             },
             MaskStep {
+                weight: 1.0,
                 id: engine::id(),
                 kind: "paint".into(),
                 enabled: true,
@@ -44,6 +46,7 @@ fn rich_tree() -> (Document, String, String) {
         ],
     });
     child.effects.push(Effect {
+        weight: 1.0,
         id: engine::id(),
         kind: "invert".into(),
         enabled: true,
@@ -401,6 +404,7 @@ fn pasted_content_invalidates_cached_destination_folder_effects() {
     let mut doc = Document::new(4, 4).unwrap();
     doc.layers[0].kind = "group".into();
     doc.layers[0].effects.push(Effect {
+        weight: 1.0,
         id: engine::id(),
         kind: "invert".into(),
         enabled: true,
@@ -471,6 +475,7 @@ fn native_layer_copy_duplicate_and_cross_depth_paste_preserve_every_word() {
         enabled: true,
         cache_key: engine::id(),
         steps: vec![MaskStep {
+            weight: 1.0,
             id: engine::id(),
             kind: "paint".into(),
             enabled: true,

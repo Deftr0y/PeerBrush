@@ -67,6 +67,7 @@ fn mask(l: &mut Layer, depth: u16, values: [u16; 2]) {
         enabled: true,
         cache_key: id(),
         steps: vec![MaskStep {
+            weight: 1.0,
             id: id(),
             kind: "paint".into(),
             enabled: true,
@@ -78,6 +79,7 @@ fn mask(l: &mut Layer, depth: u16, values: [u16; 2]) {
 }
 fn invert(l: &mut Layer) {
     l.effects.push(Effect {
+        weight: 1.0,
         id: id(),
         kind: "invert".into(),
         enabled: true,

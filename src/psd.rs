@@ -612,7 +612,14 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc.layers.iter().any(|l| l.blend == "pass_through") {
+        format: if doc.layers.iter().any(|l| {
+            l.effects.iter().any(|e| e.weight != 1.0)
+                || l.mask
+                    .as_ref()
+                    .is_some_and(|m| m.steps.iter().any(|s| s.weight != 1.0))
+        }) {
+            11
+        } else if doc.layers.iter().any(|l| l.blend == "pass_through") {
             10
         } else if crate::retained::has_originals(doc) {
             9
@@ -1260,7 +1267,7 @@ fn decode_parts(
             if payload.len() > crate::color_profile::MAX_PROFILE_BYTES {
                 return Err("Photoshop ICC profile exceeds the 4 MiB limit".into());
             }
-            if payload == crate::color_profile::srgb_profile() {
+            if crate::color_profile::is_srgb_profile(payload) {
                 // Exact built-in working profile: no conversion or semantic
                 // change is needed. Similar/unknown profiles stay protected.
                 srgb_tagged = true;
@@ -1314,7 +1321,7 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=10).contains(&e.format)
+                if (1..=11).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash
@@ -1617,6 +1624,7 @@ fn decode_parts(
                                     enabled: rec.mask_enabled,
                                     steps: vec![
                                         MaskStep {
+                                            weight: 1.0,
                                             id: id(),
                                             kind: "fill".into(),
                                             enabled: true,
@@ -1625,6 +1633,7 @@ fn decode_parts(
                                             settings: serde_json::Value::Null,
                                         },
                                         MaskStep {
+                                            weight: 1.0,
                                             id: id(),
                                             kind: "paint".into(),
                                             enabled: true,
@@ -1978,6 +1987,7 @@ pub fn validate(doc: &Document) -> Result<(), String> {
             return Err("Effect stack limit".into());
         }
         for e in &l.effects {
+            crate::effects::validate_weight(e.weight)?;
             crate::effects::validate(&e.kind, &e.settings)?;
         }
         if let Some(m) = &l.mask {
@@ -1985,6 +1995,7 @@ pub fn validate(doc: &Document) -> Result<(), String> {
                 return Err("Too many mask steps".into());
             }
             for s in &m.steps {
+                crate::effects::validate_weight(s.weight)?;
                 s.pixels.validate_layout()?;
                 if s.pixels.depth != doc.bit_depth {
                     return Err("Mask precision does not match the document".into());

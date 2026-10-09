@@ -88,6 +88,7 @@ pub fn apply(doc: &mut Document, index: usize, c: &Value) -> Result<(), String> 
         cache_key: id(),
     });
     mask.steps.push(MaskStep {
+        weight: 1.0,
         id: id(),
         kind: "paint".into(),
         enabled: true,

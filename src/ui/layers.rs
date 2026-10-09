@@ -414,7 +414,7 @@ impl PeerBrush {
         self.eye_rects.clear();
         let reserve = (ui.available_height() * 0.58).clamp(280.0, 480.0);
         let height = (ui.available_height() - reserve).max(46.0);
-        egui::ScrollArea::vertical().max_height(height).auto_shrink([false,false]).show(ui,|ui| {
+        egui::ScrollArea::vertical().max_height(height).auto_shrink([false,true]).show(ui,|ui| {
             let mut original=vec![];rows(doc,None,0,&self.collapsed,&mut original);
             let base=ui.cursor().min;let width=ui.available_width();
             let pointer=ui.input(|i|i.pointer.interact_pos());

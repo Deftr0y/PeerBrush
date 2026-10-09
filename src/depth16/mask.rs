@@ -89,6 +89,7 @@ static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 fn uniform(mask: &Mask) -> bool {
     !mask.steps.iter().any(|s| {
         s.enabled
+            && s.weight > 0.0
             && s.kind == "paint"
             && (!s.pixels.tiles.is_empty() || !s.pixels.samples16.is_empty())
     })
@@ -148,7 +149,8 @@ pub fn value(layer: &Layer, x: i32, y: i32, prepared: Option<&Gray16>, raw: bool
         return image.value(x, y);
     }
     let mut value = 65535.0;
-    for step in mask.steps.iter().filter(|s| s.enabled) {
+    for step in mask.steps.iter().filter(|s| s.enabled && s.weight > 0.0) {
+        let before = value;
         match step.kind.as_str() {
             "fill" => value = f64::from(step.value) * 257.0,
             "paint" => {
@@ -165,6 +167,7 @@ pub fn value(layer: &Layer, x: i32, y: i32, prepared: Option<&Gray16>, raw: bool
             }
             _ => {}
         }
+        value = before * (1.0 - f64::from(step.weight)) + value * f64::from(step.weight);
     }
     value.clamp(0.0, 65535.0) / 65535.0
 }
@@ -175,7 +178,8 @@ fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, String> {
     }
     let constant = uniform(mask);
     let mut values = vec![65535u16; if constant { 1 } else { count }];
-    for step in mask.steps.iter().filter(|s| s.enabled) {
+    for step in mask.steps.iter().filter(|s| s.enabled && s.weight > 0.0) {
+        let before = (step.weight < 1.0).then(|| values.clone());
         match step.kind.as_str() {
             "fill" => {
                 values.fill((f64::from(step.value) * 257.0).round().clamp(0.0, 65535.0) as u16)
@@ -265,6 +269,13 @@ fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, String> {
                 }
             }
             _ => {}
+        }
+        if let Some(before) = before {
+            for (v, old) in values.iter_mut().zip(before) {
+                *v = (old as f64 * (1.0 - step.weight as f64) + *v as f64 * step.weight as f64)
+                    .round()
+                    .clamp(0.0, 65535.0) as u16;
+            }
         }
     }
     Ok(Gray16 {

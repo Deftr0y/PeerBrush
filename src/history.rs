@@ -312,6 +312,7 @@ impl Inverse {
                             now.kind = meta["kind"].as_str().unwrap().into();
                             now.enabled = meta["enabled"].as_bool().unwrap();
                             now.value = meta["value"].as_f64().unwrap() as f32;
+                            now.weight = meta["weight"].as_f64().unwrap() as f32;
                             now.settings = meta["settings"].clone();
                             self.raster(
                                 &old.pixels,
@@ -611,7 +612,7 @@ fn extend(rect: &mut Option<[i32; 4]>, p: [i32; 2]) {
     }));
 }
 fn step_meta(s: &MaskStep) -> Value {
-    json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings})
+    json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings})
 }
 fn step_equal(a: &MaskStep, b: &MaskStep) -> bool {
     step_meta(a) == step_meta(b) && a.pixels == b.pixels

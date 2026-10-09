@@ -15,12 +15,14 @@ fn fixture(edge: u32, effects: bool, depth: u16) -> Document {
     if effects {
         active.effects = vec![
             Effect {
+                weight: 1.0,
                 id: id(),
                 kind: "levels".into(),
                 enabled: true,
                 settings: json!({"gamma":0.9}),
             },
             Effect {
+                weight: 1.0,
                 id: id(),
                 kind: "blur".into(),
                 enabled: true,
