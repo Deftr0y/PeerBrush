@@ -1994,7 +1994,36 @@ impl PeerBrush {
             }
         });
     }
-    fn channel_tabs(&mut self, ui: &mut egui::Ui, has_mask: bool) {
+    fn add_selected_masks(&mut self, doc: &Document) {
+        let mut ids = self.selected_layer_ids(doc);
+        if !ids.contains(&self.selected) {
+            ids.push(self.selected.clone());
+        }
+        let commands: Vec<_> = doc
+            .layers
+            .iter()
+            .filter(|layer| ids.contains(&layer.id) && layer.mask.is_none())
+            .map(|layer| json!({"op":"mask.add","layer":layer.id,"value":255}))
+            .collect();
+        let result = {
+            let mut engine = self.shared.lock().unwrap();
+            if engine.doc.id != doc.id {
+                Err("The document changed before adding masks".into())
+            } else {
+                engine.edit("human", &commands, Some(doc.revision), None, "Add masks")
+            }
+        };
+        match result {
+            Ok(_) => {
+                self.mask = true;
+                self.mask_step = None;
+                self.last_preview = None;
+                self.message = "Added masks".into();
+            }
+            Err(error) => self.message = error,
+        }
+    }
+    fn channel_tabs(&mut self, ui: &mut egui::Ui, doc: &Document, has_mask: bool) {
         ui.spacing_mut().item_spacing.x = 0.0;
         let color = ui.add(
             egui::Button::new("Color")
@@ -2009,13 +2038,14 @@ impl PeerBrush {
         );
         self.color_tab_rect = Some(color.rect);
         if color.clicked() {
+            self.finish_parameter(true);
             self.mask = false;
             self.last_preview = None;
         }
         let mask = ui.add_enabled(
-            has_mask,
-            egui::Button::new("Mask")
-                .selected(self.mask)
+            has_mask || !doc.read_only,
+            egui::Button::new(if has_mask { "Mask" } else { "Add mask" })
+                .selected(self.mask && has_mask)
                 .corner_radius(egui::CornerRadius {
                     nw: 0,
                     sw: 0,
@@ -2026,13 +2056,18 @@ impl PeerBrush {
         );
         self.mask_tab_rect = Some(mask.rect);
         if mask.clicked() {
-            self.mask = true;
-            self.last_preview = None;
+            self.finish_parameter(true);
+            if has_mask {
+                self.mask = true;
+                self.last_preview = None;
+            } else {
+                self.add_selected_masks(doc);
+            }
         }
         mask.on_hover_text(if has_mask {
             "Edit mask"
         } else {
-            "Add a mask first"
+            "Create white masks for selected layers that do not have one"
         });
     }
 
@@ -2070,6 +2105,10 @@ impl PeerBrush {
         self.mask_tab_rect = None;
         self.effect_area_rect = None;
         if let Some(l) = selected {
+            if l.mask.is_none() {
+                self.mask = false;
+                self.mask_step = None;
+            }
             let remaining = ui.available_rect_before_wrap();
             let stack_rect = Rect::from_min_max(
                 remaining.min,
@@ -2091,7 +2130,7 @@ impl PeerBrush {
                 .show(&mut stack_ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        self.channel_tabs(ui, l.mask.is_some());
+                        self.channel_tabs(ui, doc, l.mask.is_some());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .selectable_label(self.isolate, "Solo")
@@ -2114,11 +2153,6 @@ impl PeerBrush {
                     }
                     if !self.mask {
                         self.color_stack(ui,&l);
-                        if l.mask.is_none() {ui.horizontal(|ui| {
-                            for (name,value) in [("Add Mask",255)] {
-                                if ui.button(name).clicked(){self.layer_cmd("mask.add",json!({"value":value}),"Add mask");self.mask=true;}
-                            }
-                        });}
                     } else if let Some(m) = &l.mask {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("MASK STACK").size(10.0).color(MUTED)).on_hover_text("Bottom runs first · Top runs last");
@@ -2190,12 +2224,6 @@ impl PeerBrush {
                                 .size(12.0)
                                 .color(MUTED),
                         );
-                        ui.horizontal(|ui| {
-                            if ui.button("Add Mask").clicked() {
-                                self.layer_cmd("mask.add", json!({"value":255}), "Add mask");
-                                self.mask = true;
-                            }
-                        });
                     }
                 });
             ui.advance_cursor_after_rect(stack_rect);
@@ -4413,6 +4441,17 @@ mod tests {
         frame(&mut app, &ctx, vec![], Default::default());
         let first = app.project_id.clone();
         let selected = app.selected.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"mask.add","layer":selected})],
+                None,
+                None,
+                "Add tab mask",
+            )
+            .unwrap();
         app.mask = true;
         app.mask_step = Some("step-view".into());
         app.zoom = 1.75;
@@ -7297,6 +7336,180 @@ mod tests {
             "Assets"
         );
         assert_eq!(e.undo.len(), 1);
+    }
+    #[test]
+    fn connected_add_mask_batches_only_missing_masks_and_undo_restores_color() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = fixture();
+            let (before, existing) = {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc = Document::new_depth(8, 8, depth).unwrap();
+                engine
+                    .edit(
+                        "human",
+                        &[
+                            json!({"op":"layer.add","name":"Second"}),
+                            json!({"op":"layer.add","name":"Third"}),
+                        ],
+                        None,
+                        None,
+                        "Fixture",
+                    )
+                    .unwrap();
+                for (index, layer) in engine.doc.layers.iter_mut().enumerate() {
+                    layer
+                        .pixels
+                        .set16(index as i32 + 1, 2, [12347, 33559, 51237, 45679]);
+                }
+                let existing = engine.doc.layers[1].id.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":existing,"value":129})],
+                        None,
+                        None,
+                        "Existing mask",
+                    )
+                    .unwrap();
+                engine.undo.clear();
+                (engine.doc.clone(), existing)
+            };
+            app.select_content(&before.layers[0].id);
+            app.selection_layers = before.layers.iter().map(|layer| layer.id.clone()).collect();
+            let draw = |app: &mut PeerBrush| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            };
+            draw(&mut app);
+            let output = draw(&mut app);
+            let labels = |output: &egui::FullOutput| {
+                output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                        _ => None,
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                labels(&output)
+                    .iter()
+                    .filter(|label| label.as_str() == "Add mask")
+                    .count(),
+                1
+            );
+            assert!(!labels(&output).iter().any(|label| label == "Add Mask"));
+            let color = app.color_tab_rect.unwrap();
+            let add = app.mask_tab_rect.unwrap();
+            assert!((add.center().y - color.center().y).abs() < 1.0);
+            assert!((add.left() - color.right()).abs() < 1.0);
+            click(&mut app, &ctx, add.center());
+            assert!(app.mask);
+            let output = draw(&mut app);
+            assert!(labels(&output).iter().any(|label| label == "Mask"));
+            assert!(!labels(&output)
+                .iter()
+                .any(|label| label == "Add mask" || label == "Add Mask"));
+            {
+                let mut engine = app.shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), 1);
+                assert!(engine.doc.layers.iter().all(|layer| layer.mask.is_some()));
+                assert!(engine
+                    .doc
+                    .layers
+                    .iter()
+                    .flat_map(|layer| &layer.mask.as_ref().unwrap().steps)
+                    .all(|step| step.pixels.depth == depth));
+                let kept = engine
+                    .doc
+                    .layers
+                    .iter()
+                    .find(|layer| layer.id == existing)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&kept.mask).unwrap(),
+                    serde_json::to_value(&before.layers[1].mask).unwrap()
+                );
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    before.export_png().unwrap()
+                );
+                engine.undo("human").unwrap();
+                assert_eq!(
+                    engine
+                        .doc
+                        .layers
+                        .iter()
+                        .filter(|layer| layer.mask.is_some())
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+            }
+            let output = draw(&mut app);
+            assert!(!app.mask);
+            assert!(labels(&output).iter().any(|label| label == "Add mask"));
+        }
+    }
+    #[test]
+    fn connected_add_mask_keeps_color_and_sources_on_lock_reservation_or_stale_failure() {
+        for failure in ["locked", "reserved", "stale"] {
+            let (mut app, ctx) = small_fixture();
+            let id = app.selected.clone();
+            let before = app.shared.lock().unwrap().doc.clone();
+            {
+                let mut engine = app.shared.lock().unwrap();
+                match failure {
+                    "locked" => engine.doc.layers[0].locked = true,
+                    "reserved" => {
+                        engine
+                            .reserve("agent", "Mask work", vec![crate::engine::Scope::layer(&id)])
+                            .unwrap();
+                    }
+                    "stale" => {
+                        engine
+                            .edit(
+                                "human",
+                                &[json!({"op":"layer.update","layer":id,"name":"New human name"})],
+                                None,
+                                None,
+                                "Newer work",
+                            )
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if failure == "stale" {
+                app.add_selected_masks(&before);
+            } else {
+                frame(&mut app, &ctx, vec![], Default::default());
+                let add = app.mask_tab_rect.unwrap().center();
+                click(&mut app, &ctx, add);
+            }
+            assert!(!app.mask);
+            let engine = app.shared.lock().unwrap();
+            assert!(engine.doc.layers[0].mask.is_none());
+            assert_eq!(
+                engine.doc.layers[0].pixels.rgba16(),
+                before.layers[0].pixels.rgba16()
+            );
+            assert_eq!(engine.undo.len(), usize::from(failure == "stale"));
+            if failure == "stale" {
+                assert_eq!(engine.doc.layers[0].name, "New human name");
+            }
+            assert!(!app.message.is_empty());
+        }
     }
     #[test]
     fn footer_stays_below_effects_with_connected_color_mask_tabs() {

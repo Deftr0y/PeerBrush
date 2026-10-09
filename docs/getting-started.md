@@ -97,7 +97,7 @@ Selections retain disconnected regions, holes and feather coverage through paint
 
 Levels provides a black-to-white gradient with draggable black, midpoint and white handles. Curves uses a smooth, shape-preserving curve for newly created or edited effects: double-click to add points, drag to shape, and right-click an interior point to remove it. Older saved curve sources retain their original linear interpolation until edited.
 
-To edit a Liquify effect, choose **Edit on canvas** in that effect's controls. Choose Push, Expand, Pinch or Restore, radius and strength above the canvas, then paint. Each stroke remains editable in its chosen effect and captures the current selection. **Add Mask** creates a white mask by default; the connected **Color / Mask** buttons select the channel.
+To edit a Liquify effect, choose **Edit on canvas** in that effect's controls. Choose Push, Expand, Pinch or Restore, radius and strength above the canvas, then paint. Each stroke remains editable in its chosen effect and captures the current selection. When a layer has no mask, the Mask side of the connected selector reads **Add mask**. It creates white masks for selected layers that need them in one undo step, preserves existing masks and switches to Mask after success. The selector then reads **Color / Mask**; undoing creation returns to Color.
 
 AI reservations cover the affected layers or regions. Reserved layers show blue names and an **AI** tag, including children of reserved folders. Unreserved layers remain editable. Eye toggles remain available during reservations, and visibility-only changes do not invalidate an agent's pixel revision. Mixed commands that also alter opacity, names or pixels still enforce reservations.
 
