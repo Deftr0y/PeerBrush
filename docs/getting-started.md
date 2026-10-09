@@ -78,7 +78,7 @@ The **◐** layer-header menu adds an adjustment. One selected paint layer gets 
 
 **Bloom** has Threshold, Spread and Strength. **Linear dodge / Add** is available in the blend menu and previews on hover.
 
-Color and mask effects start with settings closed. Select a row to open its settings and management buttons; select it again to close. Every row has an icon and an always-visible **Weight** from 0–100%, independent of its own parameters. Top effects run last. Dragging Weight, settings or layer opacity renders the shared engine result while held and creates one undo step on release. Escape cancels the preview. A concurrent document change also cancels it, preserving the newer work. Existing saved effects open at 100% weight.
+Color and mask effects start with settings closed. Select a row to open its settings and management buttons; select it again to close. Every row has an icon and a compact 0–100% strength slider beside its name, independent of its own parameters. Top effects run last. Dragging strength, settings or layer opacity renders the shared engine result while held and creates one undo step on release. Escape cancels the preview. A concurrent document change also cancels it, preserving the newer work. Existing saved effects open at 100% weight.
 
 **L** selects Liquify. Choose Push, Expand, Pinch or Restore, then brush on the artwork. The rendered warp previews during the drag and commits as one undo step. Its effect remains in the color stack; revisit Amount and individual stroke radius/strength, disable strokes by removal, reorder the effect, or undo. Folder liquify warps its composite. Color liquify is the current scope; this release does not claim Photoshop's full face-aware liquify feature set.
 

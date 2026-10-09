@@ -2100,21 +2100,21 @@ impl PeerBrush {
                                         let (rect,_) = ui.allocate_exact_size(Vec2::splat(18.0),egui::Sense::hover());
                                         icons::paint(ui.painter(),rect,effects::effect_icon(&step.kind),step.enabled);
                                         let name=if step.kind=="blur" {"Feather"} else {effects::effect_name(&step.kind)};
-                                        if ui.selectable_label(self.effect_is_selected(&l.id,true,&step.id),RichText::new(name).size(12.0)).on_hover_text("Select to edit settings · click again to close").clicked() {
+                                        if Self::effect_title(ui,name,self.effect_is_selected(&l.id,true,&step.id)).clicked() {
                                             self.select_effect(&l.id,true,&step.id);
                                             self.mask_step=if step.kind=="paint" {Some(step.id.clone())} else {None};
                                             self.last_preview=None;
                                         }
-                                        if self.effect_is_selected(&l.id,true,&step.id) {
+                                        self.effect_weight(ui,&step.id,step.weight,true);
+                                    });
+                                    if self.effect_is_selected(&l.id,true,&step.id) {
+                                        ui.horizontal(|ui| {
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
                                                 if icons::small_button(ui,Icon::Trash,"Remove mask effect").clicked() {self.layer_cmd("mask.step.delete",json!({"step":step.id}),"Remove mask step");self.mask_step=None;self.effect_selected=None;}
                                                 if index>0 && icons::small_button(ui,Icon::Down,"Move mask effect down").clicked() {self.layer_cmd("mask.step.reorder",json!({"step":step.id,"index":index-1}),"Reorder mask step");}
                                                 if index+1<m.steps.len() && icons::small_button(ui,Icon::Up,"Move mask effect up").clicked() {self.layer_cmd("mask.step.reorder",json!({"step":step.id,"index":index+1}),"Reorder mask step");}
                                             });
-                                        }
-                                    });
-                                    self.effect_weight(ui,&step.id,step.weight,true);
-                                    if self.effect_is_selected(&l.id,true,&step.id) {
+                                        });
                                         if let Some(preview)=self.thumbnail_for(doc,&l.id,true,Some(index)) { ui.add(egui::Image::new((preview.id(),Vec2::splat(40.0)))).on_hover_text("Result through this effect"); }
                                         if ["fill","levels","blur"].contains(&step.kind.as_str()) {
                                             let mut value=step.value;
@@ -4697,6 +4697,143 @@ mod tests {
             );
             let rect = app.transform_rects[3].unwrap();
             assert!(rect.right() <= size.x && rect.bottom() <= size.y);
+        }
+    }
+    #[test]
+    fn inline_effect_strength_previews_pixels_and_commits_once_at_both_depths() {
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let (mut app, ctx) = fixture();
+                let before = {
+                    let mut engine = app.shared.lock().unwrap();
+                    engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                    for y in 0..32 {
+                        for x in 0..32 {
+                            if depth == 16 {
+                                engine.doc.layers[0].pixels.set16(
+                                    x,
+                                    y,
+                                    [12347, 33559, 51237, 65535],
+                                );
+                            } else {
+                                engine.doc.layers[0].pixels.set(x, y, [48, 131, 200, 255]);
+                            }
+                        }
+                    }
+                    let layer = engine.doc.layers[0].id.clone();
+                    let commands = if mask {
+                        vec![
+                            json!({"op":"mask.add","layer":layer,"value":255}),
+                            json!({"op":"mask.step.add","layer":layer,"kind":"invert"}),
+                        ]
+                    } else {
+                        vec![json!({"op":"effect.add","layer":layer,"kind":"invert"})]
+                    };
+                    engine
+                        .edit("human", &commands, None, None, "Fixture")
+                        .unwrap();
+                    engine.undo.clear();
+                    app.selected = layer.clone();
+                    app.selection_layers = [layer].into_iter().collect();
+                    engine.doc.clone()
+                };
+                app.mask = mask;
+                let draw = |app: &mut PeerBrush, events| {
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1100., 900.),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                let output = draw(&mut app, vec![]);
+                let name = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "Invert" => {
+                            Some(text.pos)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let slider = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text)
+                            if text.galley.job.text == "100%"
+                                && text.pos.x > name.x
+                                && (text.pos.y - name.y).abs() < 5. =>
+                        {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(app.effect_area_rect.unwrap().contains_rect(slider));
+                assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.job.text == "Weight")));
+                let start = slider.center();
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(start),
+                        button(
+                            start,
+                            egui::PointerButton::Primary,
+                            true,
+                            Default::default(),
+                        ),
+                    ],
+                );
+                let end = start - Vec2::new(15., 0.);
+                draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                let edit = app.parameter_gesture.as_ref().expect("inline slider drag");
+                let draft = Engine::preview_edits(before.clone(), &edit.commands).unwrap();
+                let rendered = |doc: &Document| {
+                    if depth == 16 {
+                        crate::depth16::render(doc).unwrap().words
+                    } else {
+                        doc.preview(None, 32, None, false)
+                            .unwrap()
+                            .2
+                            .into_iter()
+                            .map(u16::from)
+                            .collect()
+                    }
+                };
+                assert_ne!(rendered(&draft), rendered(&before));
+                assert_eq!(
+                    draft.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(app.shared.lock().unwrap().doc.revision, before.revision);
+                draw(
+                    &mut app,
+                    vec![button(
+                        end,
+                        egui::PointerButton::Primary,
+                        false,
+                        Default::default(),
+                    )],
+                );
+                let mut engine = app.shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(rendered(&engine.doc), rendered(&draft));
+                engine.undo("human").unwrap();
+                assert_eq!(rendered(&engine.doc), rendered(&before));
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+            }
         }
     }
     #[test]

@@ -392,30 +392,43 @@ impl PeerBrush {
         effect: &str,
         weight: f32,
         mask: bool,
-    ) {
-        ui.horizontal(|ui| {
-            controls::label(ui, "Weight");
-            let mut value = weight * 100.0;
-            let width = ui.available_width().min(210.0).max(70.0);
-            let response = controls::range(
-                ui,
-                (effect, "weight"),
-                &mut value,
-                0.0..=100.0,
-                width,
-                "%",
-                0,
-                false,
-            );
-            if response.changed() {
-                let extra = if mask {
-                    json!({"step":effect,"weight":value/100.0})
-                } else {
-                    json!({"effect":effect,"weight":value/100.0})
-                };
-                self.layer_parameter(extra, "Effect weight", &response);
-            }
-        });
+    ) -> egui::Response {
+        let mut value = weight * 100.0;
+        let width = ui.available_width().clamp(70.0, 210.0);
+        let response = controls::range(
+            ui,
+            (effect, "weight"),
+            &mut value,
+            0.0..=100.0,
+            width,
+            "%",
+            0,
+            false,
+        )
+        .on_hover_text("Effect strength");
+        if response.changed() {
+            let extra = if mask {
+                json!({"step":effect,"weight":value/100.0})
+            } else {
+                json!({"effect":effect,"weight":value/100.0})
+            };
+            self.layer_parameter(extra, "Effect weight", &response);
+        }
+        response
+    }
+    pub(super) fn effect_title(ui: &mut egui::Ui, name: &str, selected: bool) -> egui::Response {
+        // Reserve room for the inline strength even when an effect has a long name.
+        let width = (ui.available_width() - 84.0).clamp(24.0, 125.0);
+        ui.add_sized(
+            [width, 22.0],
+            egui::Button::new(RichText::new(name).size(12.0))
+                .selected(selected)
+                .frame(false)
+                .truncate(),
+        )
+        .on_hover_text(format!(
+            "{name} · Select to edit settings · click again to close"
+        ))
     }
     pub(super) fn color_stack(&mut self, ui: &mut egui::Ui, l: &Layer) {
         ui.horizontal(|ui| {
@@ -461,17 +474,19 @@ impl PeerBrush {
                                 effect_icon(&effect.kind),
                                 effect.enabled,
                             );
-                            if ui
-                                .selectable_label(
-                                    self.effect_is_selected(&l.id, false, &effect.id),
-                                    RichText::new(effect_name(&effect.kind)).size(12.0),
-                                )
-                                .on_hover_text("Select to edit settings · click again to close")
-                                .clicked()
+                            if Self::effect_title(
+                                ui,
+                                effect_name(&effect.kind),
+                                self.effect_is_selected(&l.id, false, &effect.id),
+                            )
+                            .clicked()
                             {
                                 self.select_effect(&l.id, false, &effect.id);
                             }
-                            if self.effect_is_selected(&l.id, false, &effect.id) {
+                            self.effect_weight(ui, &effect.id, effect.weight, false);
+                        });
+                        if self.effect_is_selected(&l.id, false, &effect.id) {
+                            ui.horizontal(|ui| {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -511,10 +526,7 @@ impl PeerBrush {
                                         }
                                     },
                                 );
-                            }
-                        });
-                        self.effect_weight(ui, &effect.id, effect.weight, false);
-                        if self.effect_is_selected(&l.id, false, &effect.id) {
+                            });
                             if effect.kind == "liquify"
                                 && ui
                                     .button("Edit on canvas")
@@ -607,13 +619,18 @@ mod tests {
                 .unwrap()
         };
         assert!(y("Color adjustment") < y("Invert"));
+        for label in ["Color adjustment", "Invert"] {
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == "100%"
+                    && (text.pos.y-y(label)).abs() < 5.0)));
+        }
         assert_eq!(
             output
                 .shapes
                 .iter()
                 .filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text=="Weight"))
                 .count(),
-            2
+            0
         );
         assert!(!output
             .shapes
@@ -639,7 +656,7 @@ mod tests {
                 .iter()
                 .filter(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text=="Weight"))
                 .count(),
-            2
+            0
         );
         let e = shared.lock().unwrap();
         assert_eq!(
