@@ -41,6 +41,9 @@ pub fn supports_dirty(doc: &Document) -> bool {
 /// Sum all active kernel reaches conservatively: nesting, clipping and adjustment backdrops
 /// may compose several filters. This also includes disabled masks shown in isolation.
 fn dirty_padding(doc: &Document) -> Option<i32> {
+    if crate::filters::active(doc) {
+        return None;
+    }
     // Profiled sources are protected; their full display path converts native
     // samples before projection and must not mix with raw regional pixels.
     if doc.icc_profile.is_some() {

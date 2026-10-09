@@ -33,6 +33,7 @@ fn native_color(ui: &mut egui::Ui, label: &str, color: &mut [u16; 4], depth: u16
 }
 impl PeerBrush {
     pub(super) fn open_source(&mut self, doc: &Document, kind: &str) {
+        self.cancel_filters();
         self.cancel_geometry();
         self.cancel_refinement();
         self.cancel_source();

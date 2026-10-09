@@ -134,7 +134,7 @@ impl Animation {
                 t.change
                     .scopes
                     .iter()
-                    .any(|s| s.target.as_deref() == Some(id))
+                    .any(|s| s.target.is_none() || s.target.as_deref() == Some(id))
             })
     }
     pub(super) fn tool(&self, time: f64) -> Option<&str> {
@@ -197,6 +197,19 @@ impl Animation {
             format!("ui{}", (time * 1000.0).round() as u64)
         };
         let mut display = doc.clone();
+        if !canvas {
+            for filter in &mut display.filters {
+                if let Some(old) = transition
+                    .before
+                    .filters
+                    .iter()
+                    .find(|f| f.id == filter.id && f.kind == filter.kind)
+                {
+                    filter.weight = lerp(old.weight, filter.weight, t);
+                    values(&old.settings, &mut filter.settings, t);
+                }
+            }
+        }
         for l in &mut display.layers {
             let Some(old) = transition.before.layers.iter().find(|old| old.id == l.id) else {
                 continue;
@@ -404,6 +417,42 @@ impl PeerBrush {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ai_document_filters_highlight_whole_image_and_interpolate_only_controls() {
+        let mut e = crate::engine::Engine::new();
+        e.doc = Document::new_depth(12, 8, 16).unwrap();
+        e.edit(
+            "human",
+            &[json!({"op":"filter.add","kind":"posterize","settings":{"levels":3},"weight":1.0})],
+            None,
+            None,
+            "Posterize",
+        )
+        .unwrap();
+        let id = e.doc.filters[0].id.clone();
+        let mut a = Animation::default();
+        a.observe(&e.doc, None, 0.);
+        e.edit(
+            "agent",
+            &[json!({"op":"filter.update","filter":id,"weight":0.2})],
+            None,
+            None,
+            "Soften posterize",
+        )
+        .unwrap();
+        let history = e.undo.len();
+        let saved = e.doc.export_png().unwrap();
+        a.observe(&e.doc, e.ai_change.clone(), 1.);
+        assert!(a.layer(&e.doc.layers[0].id, 1.18));
+        assert_eq!(a.tool(1.18), Some("effects"));
+        assert!((a.document(&e.doc, 1.18, false).filters[0].weight - 0.6).abs() < 0.001);
+        assert_eq!(a.document(&e.doc, 1.18, true).filters[0].weight, 0.2);
+        assert_eq!(e.doc.export_png().unwrap(), saved);
+        assert_eq!(e.undo.len(), history);
+        a.cancel();
+        assert!(!a.active(1.18));
+        assert_eq!(e.doc.filters[0].weight, 0.2);
+    }
     #[test]
     fn fade_preserves_transparency_and_does_not_leave_old_pixels() {
         assert_eq!(

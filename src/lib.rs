@@ -13,6 +13,8 @@ mod edit_bounds;
 pub mod effects;
 pub mod engine;
 pub mod fill;
+pub mod filter_library;
+pub mod filters;
 pub mod geometry;
 pub mod gpu;
 pub mod grouping;

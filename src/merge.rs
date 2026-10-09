@@ -157,6 +157,8 @@ pub fn prepare(doc: &Document, ids: &[String], name: Option<&str>) -> Result<Pre
         );
     }
     let mut isolated = doc.clone();
+    // Merging source layers must not bake the document's final filter stack twice.
+    isolated.filters.clear();
     isolated.layers.retain(|l| removed.contains(&l.id));
     for l in &mut isolated.layers {
         if roots.contains(&l.id) {

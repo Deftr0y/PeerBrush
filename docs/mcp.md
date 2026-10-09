@@ -30,6 +30,8 @@ Paint, smudge, clone and heal commands accept `preset:"brush-pen"` with optional
 
 Observe before editing. Use layer IDs, document pixel coordinates, and `expected_revision`. The upper-left pixel is (0,0). Rectangles are `[left, top, right, bottom]`, with right and bottom excluded.
 
+`peerbrush_filters` lists whole-image presets, renders thumbnails in `filter_thumbnail` coordinates, and previews an explicitly targeted current project without history. Preview returns actual PNG content with `document_rect` and frozen commands to apply through `peerbrush_edit`. `filter.add/update/delete/reorder` processes the entire composite and uses document-wide reservations, locks and revision guards. Observe `document.filters`; settings, strength and bypass remain editable at native 8/16-bit depth. Custom preset save/rename/delete/import/export lives outside history. See [whole-image filter behavior and limits](filters.md).
+
 Color effects and mask steps accept `weight` in `effect.add/update` and `mask.step.add/update`. Use 0–1; omitted new weights default to 1 and omitted update weights keep the existing value. Weight blends the step's input with its result, independently of settings such as blur Radius or bloom Strength. Observe returns each weight. Native 16-bit samples, clipboard sources, PSD sources, reservations and undo share the same engine path.
 
 ```json

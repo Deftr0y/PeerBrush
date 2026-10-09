@@ -349,6 +349,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_capabilities","description":"Get concise supported operations and runnable JSON examples before editing.","inputSchema":{"type":"object","properties":{}}}
         ,{"name":"peerbrush_brushes","description":"Browse original brush presets, render actual stroke previews, and save/update/delete instance-local custom brushes. Presets work in paint/smudge/clone/heal commands via preset ID with explicit setting overrides. This library is outside document history; curated presets are immutable. Preview coordinates refer to brush_preview, not the document.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","preview","save","delete"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"settings":{"type":"object"},"width":{"type":"integer","minimum":64,"maximum":512},"height":{"type":"integer","minimum":24,"maximum":128}},"required":["action"],"additionalProperties":false}}
     ]);
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_filters","description":"Browse whole-image filter presets; thumbnail renders a standard reference image, preview renders the explicitly targeted current project without history and returns frozen commands. Apply with peerbrush_edit filter.add/update; edit settings, strength, bypass, delete and reorder non-destructively. Top filters run last after the composite. Save/rename/delete/import/export validated instance-local custom presets outside history. Curated presets are immutable. Preview requires current project_id/document_id/expected_revision; original 8/16-bit sources stay editable.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","thumbnail","preview","save","rename","delete","import","export"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"kind":{"type":"string"},"settings":{"type":"object"},"weight":{"type":"number","minimum":0,"maximum":1},"data":{"type":"object"},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["action"],"additionalProperties":false}}));
     for tool in tools.as_array_mut().unwrap() {
         if !matches!(
             tool["name"].as_str(),
@@ -390,6 +391,11 @@ pub fn capabilities() -> Value {
     result["projects"] = json!({"tool":"peerbrush_projects","max_open":crate::workspace::MAX_PROJECTS,"targeting":"Use project_id, document_id and expected_revision for every background AI mutation. Switching tabs never changes a project's engine.","transfer":"Editable trees, masks, effects and native16 sources; copy changes destination, move is atomic with one undo step per project."});
     result["image_import"] = json!({"extensions":crate::image_import::EXTENSIONS,"inspect_tool":"peerbrush_image_info","choices":"Explicit zero-based frame/page/variant when image_info reports choice; never silently flatten animations or multipage files.","precision":"Raster imports retain native 8/16-bit RGB and gray. Supported embedded RGB ICC is converted to sRGB at original depth. Float, CMYK and PNG16 animation are rejected. Static supported SVG/SVGZ retains editable markup; its colors and coverage project through RGBA8 and promote in native16 projects without quantizing existing raster channels. image.place and external image-file paste rasterize SVG."});
     result["effect_catalog"] = crate::effects::catalog::discovery();
+    result["commands"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"op":"filter.add","preset":"posterize","settings":{"levels":5},"weight":0.6}));
+    result["filter_library"] = json!({"tool":"peerbrush_filters","actions":["list","thumbnail","preview","save","rename","delete","import","export"],"curated":15,"custom_limit":crate::filter_library::LIMIT,"file_limit":crate::filter_library::FILE_LIMIT,"scope":"Whole document; filter.add/update/delete/reorder run after the composite, independent of selected layer. Top runs last. Locks, reservations and revision guards apply.","precision":"Native 8/16-bit sources, effects and strength; previews project only for display.","preview":"Explicit current project/document/revision. Actual PNG/document_rect plus frozen commands; no shared edit or history. Thumbnails use filter_thumbnail reference coordinates.","storage":"Instance-local filters.json outside history; strict versioned import/export. Curated immutable, invalid or externally changed files preserved.","psd":"Format 15 editable sources plus current filtered standard raster/mask/composite; older readers remain protected.","cache_bytes":crate::filters::CACHE_BUDGET,"limits":"32 document filters; native derived output/scratch budgets apply. Liquify is a layer effect."});
     result
 }
 
@@ -428,6 +434,9 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
 pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
     if method == "projects" {
         return projects(shared, p);
+    }
+    if method == "filters" && p["action"] != "preview" {
+        return filter_library(shared, p);
     }
     if matches!(
         method,
@@ -547,6 +556,97 @@ fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
         _ => Err("Unknown project action".into()),
     }
 }
+fn filter_library(shared: &Shared, p: &Value) -> Result<Value, String> {
+    let library = shared.lock().unwrap().filter_library.clone();
+    let action = p["action"]
+        .as_str()
+        .ok_or("Missing filter library action")?;
+    let id = || p["id"].as_str().ok_or("Missing filter preset ID");
+    match action {
+        "list" => {
+            let l = library.lock().unwrap();
+            Ok(
+                json!({"presets":l.presets(),"error":l.error,"kinds":crate::effects::catalog::ENTRIES.iter().filter(|e|crate::filters::supports(e.kind)).map(|e|json!({"kind":e.kind,"name":e.name,"category":e.category})).collect::<Vec<_>>()}),
+            )
+        }
+        "save" => {
+            let preset = library.lock().unwrap().save(
+                p.get("id")
+                    .map(|v| v.as_str().ok_or("Filter ID must be text"))
+                    .transpose()?,
+                p["name"].as_str().ok_or("Missing filter name")?,
+                p["category"].as_str().ok_or("Missing filter category")?,
+                p["kind"].as_str().ok_or("Missing filter kind")?,
+                p["settings"].clone(),
+                crate::effects::command_weight(p)?,
+            )?;
+            Ok(json!({"preset":preset}))
+        }
+        "rename" => Ok(
+            json!({"preset":library.lock().unwrap().rename(id()?,p["name"].as_str().ok_or("Missing filter name")?)?}),
+        ),
+        "delete" => {
+            library.lock().unwrap().delete(id()?)?;
+            Ok(json!({"deleted":true}))
+        }
+        "import" => Ok(json!({"preset":library.lock().unwrap().import(&p["data"])?})),
+        "export" => Ok(json!({"data":library.lock().unwrap().export(id()?)?})),
+        "thumbnail" => {
+            let preset = library.lock().unwrap().get(id()?)?;
+            let rgba = crate::filter_library::thumbnail(&preset)?;
+            Ok(
+                json!({"preset":preset,"images":[{"mime_type":"image/png","data":STANDARD.encode(raster::png(96,64,&rgba)?),"width":96,"height":64,"coordinate_space":"filter_thumbnail","rect":[0,0,96,64]}]}),
+            )
+        }
+        "preview" => {
+            let doc = {
+                let mut e = shared.lock().unwrap();
+                crate::workspace::validate_target(&e, p)?;
+                if p["document_id"].as_str() != Some(e.doc.id.as_str())
+                    || p["expected_revision"].as_u64() != Some(e.doc.revision)
+                {
+                    return Err(
+                        "Filter preview needs the current document_id and expected_revision".into(),
+                    );
+                }
+                e.expire();
+                e.check(
+                    p["actor"].as_str().unwrap_or("agent"),
+                    &[Scope {
+                        target: None,
+                        rect: None,
+                    }],
+                )?;
+                e.doc.clone()
+            };
+            let mut command = json!({"op":"filter.add","preset":id()?,"settings":p.get("settings").cloned().unwrap_or(json!({}))});
+            if let Some(weight) = p.get("weight") {
+                command["weight"] = weight.clone();
+            }
+            let mut commands = library.lock().unwrap().resolve_commands(&[command])?;
+            for command in &mut commands {
+                command["document_id"] = json!(doc.id);
+                command["source_revision"] = json!(doc.revision);
+            }
+            let preview = crate::engine::Engine::preview_edits(doc.clone(), &commands)?;
+            let edge = p.get("max_edge").map_or(Ok(1024), |v| {
+                v.as_u64()
+                    .filter(|v| (32..=4096).contains(v))
+                    .map(|v| v as u32)
+                    .ok_or("Preview max_edge must be 32–4096")
+            })?;
+            let (w, h, rgba, rect) = preview.preview(None, edge, None, false)?;
+            let e = shared.lock().unwrap();
+            if e.closed || e.doc.id != doc.id || e.doc.revision != doc.revision {
+                return Err("Project changed during filter preview; observe again".into());
+            }
+            Ok(
+                json!({"project_id":e.project_id,"document_id":doc.id,"revision":doc.revision,"preview_only":true,"commands":commands,"images":[{"mime_type":"image/png","data":STANDARD.encode(raster::png(w,h,&rgba)?),"width":w,"height":h,"document_rect":rect,"revision":doc.revision}]}),
+            )
+        }
+        _ => Err("Unknown filter library action".into()),
+    }
+}
 fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
     let actor = p.get("actor").and_then(Value::as_str).unwrap_or("agent");
     match method {
@@ -560,6 +660,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
             Ok(json!({"focused":true}))
         }
         "observe" => observation(shared, p),
+        "filters" => filter_library(shared, p),
         "brushes" => {
             let library = shared.lock().unwrap().brush_library.clone();
             let mut library = library.lock().unwrap();
@@ -693,7 +794,8 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 .and_then(Value::as_str)
                 .ok_or("Missing PNG path")?;
             let panel = p.get("panel").and_then(Value::as_str);
-            if panel.is_some_and(|name| !["workspace", "brush", "color"].contains(&name)) {
+            if panel.is_some_and(|name| !["workspace", "brush", "color", "filters"].contains(&name))
+            {
                 return Err("Unknown capture panel".into());
             }
             let mut engine = shared.lock().unwrap();
@@ -1818,6 +1920,11 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().brush_library.lock().unwrap() = library;
+    let library = crate::filter_library::Library::load(state_dir.join("filters.json"));
+    if let Some(error) = &library.error {
+        shared.lock().unwrap().status = error.clone();
+    }
+    *shared.lock().unwrap().filter_library.lock().unwrap() = library;
     let workspace = crate::workspace::attach(&shared);
     // Preserve the preceding session's index before the running session updates its own.
     if let Ok(bytes) = fs::read(state_dir.join("recoveries.json")) {

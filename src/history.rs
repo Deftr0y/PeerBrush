@@ -457,6 +457,26 @@ impl Inverse {
         }
         macro_rules! field {($($f:ident),*)=>{$(self.field(&before.$f,&after.$f,&mut current.$f,None,stringify!($f));)*};}
         field!(id, name, width, height, bit_depth, read_only, warnings);
+        let mut filters = serde_json::to_value(&current.filters).unwrap();
+        self.value(
+            &serde_json::to_value(&before.filters).unwrap(),
+            &serde_json::to_value(&after.filters).unwrap(),
+            &mut filters,
+            None,
+            "document.filters",
+        );
+        if filters != serde_json::to_value(&current.filters).unwrap()
+            && current.layers.iter().any(|l| l.locked)
+        {
+            self.conflict(
+                None,
+                "document.filters",
+                None,
+                "Unlock layers before undoing whole-image filters",
+            );
+        } else {
+            current.filters = serde_json::from_value(filters).unwrap();
+        }
         // Selection state is one coupled source: never mix coverage with an unrelated rectangle.
         let b = (
             &before.selection,
@@ -635,6 +655,9 @@ fn layer_equal(a: &Layer, b: &Layer) -> bool {
     layer_meta(a) == layer_meta(b) && a.pixels == b.pixels && mask_equal(&a.mask, &b.mask)
 }
 fn document_equal(a: &Document, b: &Document) -> bool {
+    if serde_json::to_value(&a.filters).unwrap() != serde_json::to_value(&b.filters).unwrap() {
+        return false;
+    }
     (
         a.id.as_str(),
         a.name.as_str(),

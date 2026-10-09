@@ -459,6 +459,7 @@ impl PeerBrush {
         if affects_active
             && (self.geometry.is_some()
                 || self.source_editor.is_some()
+                || self.filter_editor.is_some()
                 || self.refinement.is_some()
                 || self.pending_import.is_some()
                 || self.rename_edit.is_some()

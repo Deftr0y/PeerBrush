@@ -14,6 +14,7 @@ pub struct Plan {
     pub scale: [f32; 2],
     pub image: bool,
     effect_settings: Vec<Vec<Value>>,
+    filter_settings: Vec<Value>,
     mask_settings: Vec<Vec<Option<Value>>>,
     radius_scale: f32,
 }
@@ -84,6 +85,12 @@ pub fn plan(doc: &Document, c: &Value) -> Result<Plan, String> {
         || (height as f64 - width as f64 * doc.height as f64 / doc.width as f64).abs() <= 0.500001
         || (width as f64 - height as f64 * doc.width as f64 / doc.height as f64).abs() <= 0.500001;
     let radius_scale = (scale[0] * scale[1]).sqrt();
+    let mut filter_settings = vec![];
+    for filter in &doc.filters {
+        let mut settings = filter.settings.clone();
+        map_effect(&filter.kind, &mut settings, scale, offset, proportional)?;
+        filter_settings.push(settings);
+    }
     let mut effect_settings = vec![];
     let mut mask_settings = vec![];
     if changing && doc.layers.iter().any(|l| l.locked) {
@@ -158,6 +165,7 @@ pub fn plan(doc: &Document, c: &Value) -> Result<Plan, String> {
         scale,
         image,
         effect_settings,
+        filter_settings,
         mask_settings,
         radius_scale,
     })
@@ -338,6 +346,9 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
             effect.settings = settings.clone();
         }
         layer.effect_key = id();
+    }
+    for (filter, settings) in doc.filters.iter_mut().zip(&p.filter_settings) {
+        filter.settings = settings.clone();
     }
     doc.width = p.width;
     doc.height = p.height;

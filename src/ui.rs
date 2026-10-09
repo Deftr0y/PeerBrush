@@ -3,6 +3,7 @@ mod animation;
 mod brush;
 mod color;
 mod effects;
+mod filters;
 mod geometry;
 mod history;
 mod layers;
@@ -307,6 +308,7 @@ pub struct PeerBrush {
     project_settings: Option<(u32, u32, u16)>,
     geometry: Option<geometry::Editor>,
     source_editor: Option<source::Editor>,
+    filter_editor: Option<filters::Editor>,
     task_undo_review: Option<Value>,
     proposal_review: Option<String>,
     proposal_original: bool,
@@ -595,6 +597,7 @@ impl PeerBrush {
             project_settings: None,
             geometry: None,
             source_editor: None,
+            filter_editor: None,
             task_undo_review: None,
             proposal_review: None,
             proposal_original: false,
@@ -1068,14 +1071,18 @@ impl PeerBrush {
     fn layer_parameter(&mut self, extra: Value, label: &str, response: &egui::Response) {
         let down = response.is_pointer_button_down_on() || response.dragged();
         let mut command = extra;
-        command["op"] = json!(if command.get("effect").is_some() {
+        command["op"] = json!(if command.get("filter").is_some() {
+            "filter.update"
+        } else if command.get("effect").is_some() {
             "effect.update"
         } else if command.get("step").is_some() {
             "mask.step.update"
         } else {
             "layer.update"
         });
-        command["layer"] = json!(self.selected);
+        if command["op"] != "filter.update" {
+            command["layer"] = json!(self.selected);
+        }
         let mut commands = if command["op"] == "layer.update" {
             self.selection_layers
                 .iter()
@@ -1688,6 +1695,14 @@ impl PeerBrush {
     fn request_preview(&mut self, ctx: &egui::Context, _doc: &Document) {
         let current = self.shared.lock().unwrap().doc.clone();
         if self
+            .filter_editor
+            .as_ref()
+            .is_some_and(|e| e.document != current.id || e.revision != current.revision)
+        {
+            self.cancel_filters();
+            self.message = "Filter preview cancelled · project changed".into();
+        }
+        if self
             .source_editor
             .as_ref()
             .is_some_and(|e| e.document != current.id || e.revision != current.revision)
@@ -1751,12 +1766,16 @@ impl PeerBrush {
                 && p.revision == doc.revision
                 && (p.target == variant || (!live.is_empty() && p.live == live))
                 && p.mask == preview_mask
-                && (self.source_editor.is_none() || p.live == live)
+                && ((self.source_editor.is_none() && self.filter_editor.is_none())
+                    || p.live == live)
             {
                 if let Some(editor) = &mut self.geometry {
                     editor.error = p.error.clone();
                 }
                 if let Some(editor) = &mut self.source_editor {
+                    editor.error = p.error.clone();
+                }
+                if let Some(editor) = &mut self.filter_editor {
                     editor.error = p.error.clone();
                 }
                 if self.proposal_review.is_some() {
@@ -2679,6 +2698,9 @@ impl PeerBrush {
         if let Some(editor) = &self.source_editor {
             self.transient.push(editor.command());
         }
+        if let Some(editor) = &self.filter_editor {
+            self.transient.extend(editor.preview_commands(doc));
+        }
         if let Some(editor) = &self.refinement {
             self.transient.push(editor.command());
         }
@@ -2793,7 +2815,7 @@ impl PeerBrush {
             }
             return;
         }
-        if self.geometry.is_some() || self.source_editor.is_some() {
+        if self.geometry.is_some() || self.source_editor.is_some() || self.filter_editor.is_some() {
             return;
         }
         let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
@@ -3217,6 +3239,7 @@ impl PeerBrush {
         self.layer_context = None;
         self.geometry = None;
         self.source_editor = None;
+        self.filter_editor = None;
         self.refinement = None;
         self.retouch_source = None;
         self.task_undo_review = None;
@@ -3655,6 +3678,10 @@ impl PeerBrush {
             } else {
                 self.color_editor = None;
             }
+            if panel == "filters" {
+                let doc = self.shared.lock().unwrap().doc.clone();
+                self.open_filters(&doc);
+            }
         }
         {
             if let Ok(mut e) = self.workspace_root.try_lock() {
@@ -3978,6 +4005,7 @@ impl PeerBrush {
             );
         }
         let typing = self.lifecycle.is_some()
+            || self.filter_editor.is_some()
             || self.lifecycle_frame
             || self.rename_edit.is_some()
             || ctx
@@ -4160,6 +4188,8 @@ impl PeerBrush {
                         }
                     });
                     ui.menu_button("Image",|ui| {
+                        if ui.add_enabled(!doc.read_only&&!self.busy,egui::Button::new("Whole-image filters…")).clicked(){self.open_filters(&doc);ui.close_menu();}
+                        if !doc.filters.is_empty(){ui.menu_button("Filter stack",|ui|self.document_filter_stack(ui,&doc));}
                         for (label,mode) in [("Crop…","crop"),("Canvas size…","canvas.resize"),("Image size…","image.resize")] {
                             if ui.add_enabled(!doc.read_only && !self.busy,egui::Button::new(label)).clicked() {self.open_geometry(&doc,mode);ui.close_menu();}
                         }
@@ -4546,6 +4576,7 @@ impl PeerBrush {
         self.refinement_window(ctx, &doc);
         self.geometry_window(ctx, &doc);
         self.source_window(ctx, &doc);
+        self.filters_window(ctx, &doc);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")

@@ -158,6 +158,8 @@ pub struct Document {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub srgb_tagged: bool,
     pub layers: Vec<Layer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<crate::effects::Effect>,
     pub selection: Option<[i32; 4]>,
     #[serde(default)]
     pub selection_polygon: Option<Vec<[f32; 2]>>,
@@ -181,6 +183,7 @@ impl Document {
             icc_profile: None,
             srgb_tagged: false,
             layers: vec![Layer::new("Paint 1", "paint", w, h)],
+            filters: vec![],
             selection: None,
             selection_polygon: None,
             selection_coverage: None,
@@ -258,6 +261,16 @@ impl Document {
         let scale = (edge.max(1).min(8192) as f32 / rw.max(rh) as f32).min(1.0);
         let w = ((rw as f32 * scale).round() as u32).max(1);
         let h = ((rh as f32 * scale).round() as u32).max(1);
+        if target.is_none() && !mask && crate::filters::active(self) {
+            let image = crate::filters::prepare8(self)?;
+            let bytes = crate::render::rgba8(w, h, |x, y| {
+                image.get(
+                    rect[0] + (x as f32 / scale) as i32,
+                    rect[1] + (y as f32 / scale) as i32,
+                )
+            });
+            return Ok((w, h, bytes, rect));
+        }
         let layer = if let Some(target) = target {
             Some(
                 self.layers
@@ -436,6 +449,7 @@ pub struct Engine {
     pub focus_requested: bool,
     pub loading: Option<crate::loading::Control>,
     pub brush_library: std::sync::Arc<std::sync::Mutex<crate::brush_library::Library>>,
+    pub filter_library: std::sync::Arc<std::sync::Mutex<crate::filter_library::Library>>,
     pub(crate) proposals: Vec<crate::collaboration::Proposal>,
     pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
 }
@@ -475,11 +489,16 @@ impl Engine {
     pub fn preview_edits(doc: Document, commands: &[Value]) -> Result<Document, String> {
         let mut engine = Self::new();
         engine.doc = doc;
+        let commands = engine
+            .filter_library
+            .lock()
+            .unwrap()
+            .resolve_commands(commands)?;
         let resolved = engine
             .brush_library
             .lock()
             .unwrap()
-            .resolve_commands(commands)?;
+            .resolve_commands(&commands)?;
         let mut imported_bytes = 0;
         for command in &resolved {
             if command["op"] == "image.import" {
@@ -496,7 +515,7 @@ impl Engine {
         if engine.doc.bit_depth == 16 {
             crate::depth16::validate_budget(&engine.doc)?;
         }
-        crate::effects::invalidate(&mut engine.doc, commands);
+        crate::effects::invalidate(&mut engine.doc, &commands);
         Ok(engine.doc)
     }
     pub fn new() -> Self {
@@ -527,6 +546,9 @@ impl Engine {
             loading: None,
             brush_library: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::brush_library::Library::default(),
+            )),
+            filter_library: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::filter_library::Library::default(),
             )),
             proposals: vec![],
             recent_tasks: vec![],
@@ -576,7 +598,7 @@ impl Engine {
     }
     fn state_core(&mut self) -> Value {
         self.expire();
-        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -664,6 +686,12 @@ impl Engine {
     }
     pub fn scopes(&self, c: &Value) -> Vec<Scope> {
         let op = text(c, "op", "");
+        if op.starts_with("filter.") {
+            return vec![Scope {
+                target: None,
+                rect: None,
+            }];
+        }
         let target = c.get("layer").and_then(Value::as_str).map(String::from);
         if visibility_only(c) {
             return vec![Scope {
@@ -1075,11 +1103,16 @@ impl Engine {
         if commands.is_empty() || commands.len() > 100 {
             return Err("A batch must contain 1–100 commands".into());
         }
+        let commands = self
+            .filter_library
+            .lock()
+            .unwrap()
+            .resolve_commands(commands)?;
         let resolved = self
             .brush_library
             .lock()
             .unwrap()
-            .resolve_commands(commands)?;
+            .resolve_commands(&commands)?;
         let commands = resolved.as_slice();
         let before = self.doc.clone();
         let mut scopes = vec![];
@@ -1314,7 +1347,7 @@ impl Engine {
             "image.place" | "image.import" | "image.paste" | "image.patch" => "place",
             "layer.update" if command.get("opacity").is_some() => "opacity",
             "fill" | "paint.fill" => "fill",
-            op if op.starts_with("effect.") => "effects",
+            op if op.starts_with("effect.") || op.starts_with("filter.") => "effects",
             op if op.starts_with("mask.") => "mask",
             "selection" => "selection",
             op if op.starts_with("selection.") => "selection",
@@ -1422,6 +1455,9 @@ impl Engine {
         self.doc.ensure_depth();
         let op = text(c, "op", "");
         let target = text(c, "layer", "");
+        if op.starts_with("filter.") {
+            return crate::filters::apply(&mut self.doc, c);
+        }
         if op == "source.add" {
             return crate::source::add(&mut self.doc, c);
         }

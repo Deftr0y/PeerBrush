@@ -37,6 +37,7 @@ pub struct Workspace {
     active: String,
     pub(crate) exiting: bool,
     pub brush_library: Arc<Mutex<crate::brush_library::Library>>,
+    pub filter_library: Arc<Mutex<crate::filter_library::Library>>,
 }
 pub type Registry = Arc<Mutex<Workspace>>;
 pub const MAX_PROJECTS: usize = 16;
@@ -68,6 +69,7 @@ pub fn attach(root: &Shared) -> Registry {
         active: e.project_id.clone(),
         exiting: false,
         brush_library: e.brush_library.clone(),
+        filter_library: e.filter_library.clone(),
     }));
     e.workspace = Some(Arc::downgrade(&workspace));
     e.workspace_owner = Some(workspace.clone());
@@ -217,6 +219,7 @@ pub fn register_in(
 ) -> Result<Shared, String> {
     engine.ensure_open()?;
     engine.brush_library = workspace.lock().unwrap().brush_library.clone();
+    engine.filter_library = workspace.lock().unwrap().filter_library.clone();
     engine.workspace = Some(Arc::downgrade(workspace));
     engine.workspace_owner = None;
     // A runtime source identity distinguishes multiple opens of the same serialized PSD.
@@ -326,6 +329,7 @@ pub fn close_in(
     if workspace_guard.entries.is_empty() {
         let mut blank = Engine::new();
         blank.brush_library = e.brush_library.clone();
+        blank.filter_library = e.filter_library.clone();
         blank.workspace = Some(Arc::downgrade(workspace));
         let id = blank.project_id.clone();
         workspace_guard.entries.push(Entry {

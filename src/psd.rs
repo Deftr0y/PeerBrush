@@ -327,7 +327,10 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     };
     // Ordinary raster clipping remains standard, editable PSD layer data.
     // Adjustments and unsupported clipping units still need a standard bake.
-    let baked = if doc.layers.iter().any(|l| l.kind == "adjustment") || !standard_clipping(doc) {
+    let baked = if !doc.filters.is_empty()
+        || doc.layers.iter().any(|l| l.kind == "adjustment")
+        || !standard_clipping(doc)
+    {
         let mut layer = Layer::new(
             "PeerBrush composite · editable sources in PeerBrush",
             "paint",
@@ -345,6 +348,21 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         None
     };
     let mut ordered = Vec::new();
+    // Keep standard original raster/mask channels alongside a visible filtered
+    // composite. Their root visibility is presentation-only in the saved PSD;
+    // private sources retain the actual editable visibility and filter stack.
+    let standard_sources = if !doc.filters.is_empty() {
+        let mut source = doc.clone();
+        source.filters.clear();
+        for layer in &mut source.layers {
+            if layer.parent.is_none() {
+                layer.visible = false;
+            }
+        }
+        Some(source)
+    } else {
+        None
+    };
     fn order<'a>(doc: &'a Document, parent: Option<&str>, out: &mut Vec<(&'a Layer, u32)>) {
         for l in doc.layers.iter().filter(|l| l.parent.as_deref() == parent) {
             if l.kind == "group" && crate::effects::active(l) {
@@ -361,6 +379,9 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     }
     if let Some(layer) = &baked {
         ordered.push((layer, 0));
+        if let Some(source) = &standard_sources {
+            order(source, None, &mut ordered);
+        }
     } else {
         order(doc, None, &mut ordered);
     }
@@ -612,7 +633,9 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc
+        format: if !doc.filters.is_empty() {
+            15
+        } else if doc
             .layers
             .iter()
             .any(|l| l.effects.iter().any(|e| e.kind == "channel_clamp"))
@@ -1339,7 +1362,7 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=14).contains(&e.format)
+                if (1..=15).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash

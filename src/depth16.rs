@@ -59,6 +59,7 @@ pub fn display_pixel(pixel: Pixel16) -> [u8; 4] {
 }
 pub fn validate_budget(doc: &Document) -> Result<(), String> {
     check_size(doc.width, doc.height)?;
+    crate::filters::validate(doc)?;
     let mut colors = 0u64;
     let mut masks = 0u64;
     for layer in &doc.layers {
@@ -243,6 +244,16 @@ pub fn render_crop(doc: &Document, rect: [i32; 4]) -> Result<Image16, String> {
     let height = u32::try_from(i64::from(rect[3]) - i64::from(rect[1]))
         .map_err(|_| "Invalid16-bit render rectangle")?;
     check_size(width, height)?;
+    if crate::filters::active(doc) {
+        let image = crate::filters::prepare16(doc)?;
+        return Ok(Image16 {
+            width,
+            height,
+            words: crate::render::rgba16(width, height, |x, y| {
+                image.get(rect[0] + x as i32, rect[1] + y as i32)
+            }),
+        });
+    }
     let plan = Plan16::new(doc)?;
     Ok(Image16 {
         width,
@@ -297,6 +308,16 @@ pub fn preview16(
                 .ok_or("Layer no longer exists")
         })
         .transpose()?;
+    if index.is_none() && !mask && crate::filters::active(doc) {
+        let image = crate::filters::prepare16(doc)?;
+        let words = crate::render::rgba16(width, height, |x, y| {
+            image.get(
+                rect[0] + (x as f64 / scale) as i32,
+                rect[1] + (y as f64 / scale) as i32,
+            )
+        });
+        return Ok((width, height, words, rect));
+    }
     let plan = Plan16::new(doc)?;
     check_size(width, height)?;
     let words = crate::render::rgba16(width, height, |x, y| {

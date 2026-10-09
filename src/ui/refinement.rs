@@ -32,6 +32,7 @@ impl PeerBrush {
         self.last_preview = None;
     }
     pub(super) fn open_refinement(&mut self, doc: &Document, target: Option<String>) {
+        self.cancel_filters();
         self.points.clear();
         self.drag_start = None;
         self.gizmo_handle = 0;

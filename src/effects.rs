@@ -426,6 +426,7 @@ pub fn active(l: &Layer) -> bool {
     l.kind == "adjustment" || l.effects.iter().any(|e| e.enabled && e.weight > 0.0)
 }
 pub fn validate_budget(doc: &Document) -> Result<(), String> {
+    crate::filters::validate(doc)?;
     for layer in &doc.layers {
         validate_target(layer)?;
     }
@@ -468,6 +469,9 @@ pub(crate) fn validate_target(layer: &Layer) -> Result<(), String> {
 pub fn invalidate(doc: &mut Document, commands: &[Value]) {
     let mut changed = HashSet::new();
     for c in commands {
+        if c["op"].as_str().is_some_and(|op| op.starts_with("filter.")) {
+            continue;
+        }
         if c["op"] == "selection" {
             continue;
         }
