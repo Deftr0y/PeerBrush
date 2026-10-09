@@ -134,6 +134,7 @@ pub fn mutating(method: &str, p: &Value) -> bool {
         "task" => !matches!(p["action"].as_str(), Some("status" | "recovery")),
         "history" => !matches!(p["action"].as_str(), None | Some("list" | "inspect_task")),
         "proposal" => matches!(p["action"].as_str(), Some("create" | "accept" | "reject")),
+        "code" => p["action"] == "start",
         _ => true,
     }
 }

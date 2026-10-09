@@ -350,6 +350,7 @@ pub fn tools() -> Value {
         ,{"name":"peerbrush_brushes","description":"Browse original brush presets, render actual stroke previews, and save/update/delete instance-local custom brushes. Presets work in paint/smudge/clone/heal commands via preset ID with explicit setting overrides. This library is outside document history; curated presets are immutable. Preview coordinates refer to brush_preview, not the document.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","preview","save","delete"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"settings":{"type":"object"},"width":{"type":"integer","minimum":64,"maximum":512},"height":{"type":"integer","minimum":24,"maximum":128}},"required":["action"],"additionalProperties":false}}
     ]);
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_filters","description":"Browse whole-image filter presets; thumbnail renders a standard reference image, preview renders the explicitly targeted current project without history and returns frozen commands. Apply with peerbrush_edit filter.add/update; edit settings, strength, bypass, delete and reorder non-destructively. Top filters run last after the composite. Save/rename/delete/import/export validated instance-local custom presets outside history. Curated presets are immutable. Preview requires current project_id/document_id/expected_revision; original 8/16-bit sources stay editable.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","thumbnail","preview","save","rename","delete","import","export"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"kind":{"type":"string"},"settings":{"type":"object"},"weight":{"type":"number","minimum":0,"maximum":1},"data":{"type":"object"},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["action"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_code","description":"Run bounded Rhai code against a frozen native 8/16-bit project, then commit shared commands atomically. start requires explicit project/document/revision, a named AI actor, active owned task, description and declared scopes. Code cannot bypass locks/reservations or read files/network. Returns run ID immediately; status returns completion and actual PNG with document coordinates. cancel or human takeover discards unfinished work. read_pixel, begin_pixels, write_pixel, commit_pixels and edit are documented in capabilities. One undo step; source changes reject the whole run.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","cancel"]},"actor":{"type":"string"},"task":{"type":"string"},"run":{"type":"string"},"description":{"type":"string","maxLength":240},"scopes":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}},"additionalProperties":false}},"script":{"type":"string","maxLength":65536},"max_edge":{"type":"integer","minimum":32,"maximum":1024}},"required":["action","project_id","document_id"],"additionalProperties":false}}));
     for tool in tools.as_array_mut().unwrap() {
         if !matches!(
             tool["name"].as_str(),
@@ -660,6 +661,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
             Ok(json!({"focused":true}))
         }
         "observe" => observation(shared, p),
+        "code" => crate::code::dispatch(shared, actor, p),
         "filters" => filter_library(shared, p),
         "brushes" => {
             let library = shared.lock().unwrap().brush_library.clone();
@@ -1162,6 +1164,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
                 "projects",
                 "observe",
                 "edit",
+                "code",
                 "proposal",
                 "place_image",
                 "segment",

@@ -22,6 +22,7 @@ pub(crate) fn prepare(doc: &mut Document, c: &Value) -> Result<(), String> {
         "paint.fill",
         "shape",
         "gradient",
+        "pixels.replace",
     ]
     .contains(&op)
     {

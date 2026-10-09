@@ -6,6 +6,7 @@ license = "GPL-3.0-only"
 description = "You and your AI. Same canvas."
 
 [dependencies]
+rhai = { version = "1.24", features = ["serde", "sync", "no_module", "no_time", "no_custom_syntax"] }
 resvg = { version = "0.48.1", default-features = false }
 roxmltree = "0.21"
 svgtypes = "0.16"

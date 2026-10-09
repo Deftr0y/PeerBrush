@@ -22,10 +22,10 @@ impl PeerBrush {
         }
     }
     pub(super) fn task_history_menu(&mut self, ui: &mut egui::Ui) {
-        let (tasks, proposals, recovery) = {
+        let (tasks, proposals, recovery, code) = {
             let mut e = self.shared.lock().unwrap();
             let p = e.proposals_state();
-            (e.task_history(), p, e.task_recovery())
+            (e.task_history(), p, e.task_recovery(), e.code_states())
         };
         let pending = proposals
             .as_array()
@@ -39,6 +39,16 @@ impl PeerBrush {
             format!("AI tasks · {pending} to review")
         };
         ui.menu_button(RichText::new(title).color(AI_BLUE), |ui| {
+            for run in code.as_array().unwrap().iter().rev() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{} · {}",run["status"].as_str().unwrap(),run["description"].as_str().unwrap())).color(AI_BLUE))
+                        .on_hover_text(run["error"].as_str().map(str::to_owned).unwrap_or_else(||scope_text(&run["scopes"],&self.shared.lock().unwrap().doc)));
+                    if run["running"]==true && ui.button("Cancel").clicked() {
+                        self.shared.lock().unwrap().cancel_code(run["run"].as_str().unwrap());
+                        self.message="Canceling AI work · current canvas preserved".into();
+                    }
+                });
+            }
             for proposal in proposals.as_array().unwrap().iter().rev() {
                 let pending=proposal["status"]=="pending";
                 let label=format!("{} · {}",proposal["label"].as_str().unwrap(),if pending {"Review proposal"}else{proposal["status"].as_str().unwrap()});

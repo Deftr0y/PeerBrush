@@ -452,6 +452,7 @@ pub struct Engine {
     pub filter_library: std::sync::Arc<std::sync::Mutex<crate::filter_library::Library>>,
     pub(crate) proposals: Vec<crate::collaboration::Proposal>,
     pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
+    pub(crate) code_jobs: Vec<crate::code::Job>,
 }
 fn num(v: &Value, key: &str, default: f64) -> f64 {
     v.get(key).and_then(Value::as_f64).unwrap_or(default)
@@ -552,6 +553,7 @@ impl Engine {
             )),
             proposals: vec![],
             recent_tasks: vec![],
+            code_jobs: vec![],
         }
     }
     pub fn expire(&mut self) {
@@ -878,7 +880,7 @@ impl Engine {
         } else {
             None
         };
-        if ["shape", "gradient", "fill", "adjust"].contains(&op) {
+        if ["shape", "gradient", "fill", "adjust", "pixels.replace"].contains(&op) {
             area = c["rect"]
                 .as_array()
                 .and_then(|_| rect(&c["rect"]))
@@ -1015,6 +1017,27 @@ impl Engine {
             Some(proposal.revision),
             proposal.task.as_deref(),
             &proposal.label,
+            None,
+            None,
+            None,
+            Some(doc),
+            None,
+        )
+    }
+    pub(crate) fn commit_code(
+        &mut self,
+        actor: &str,
+        commands: &[Value],
+        task: &str,
+        label: &str,
+        doc: Document,
+    ) -> Result<Value, String> {
+        self.edit_transaction(
+            actor,
+            commands,
+            Some(self.doc.revision),
+            Some(task),
+            label,
             None,
             None,
             None,
@@ -1435,6 +1458,7 @@ impl Engine {
                     | "paint.fill"
                     | "adjust"
                     | "image.patch"
+                    | "pixels.replace"
             )
         ) {
             if let Some(coverage) = self
@@ -1655,6 +1679,7 @@ impl Engine {
                         | "gradient"
                         | "adjust"
                         | "image.patch"
+                        | "pixels.replace"
                 )
             {
                 return Err("Edit this layer's text/vector properties, paint its mask, or explicitly rasterize it first".into());
@@ -2366,6 +2391,9 @@ impl Engine {
                 }
             }
             return Ok(());
+        }
+        if op == "pixels.replace" {
+            return crate::code::replace_pixels(&mut self.doc, c);
         }
         if op == "image.patch" {
             let path = text(c, "path", "");

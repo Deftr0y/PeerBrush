@@ -1,0 +1,30 @@
+{
+  "version": "development-d70f64e",
+  "label": "Development · d70f64e",
+  "commit": "d70f64eca57083bf4bf43c39cd74eaad6fb8298a",
+  "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/development-d70f64e",
+  "buildUrl": "https://github.com/Deftr0y/PeerBrush/actions/runs/37944831643",
+  "platforms": [
+    {
+      "id": "windows",
+      "name": "Windows",
+      "architecture": "x64",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/development-d70f64e/PeerBrush-Windows.zip",
+      "bytes": 24323001
+    },
+    {
+      "id": "linux",
+      "name": "Linux",
+      "architecture": "x64",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/development-d70f64e/PeerBrush-Linux.zip",
+      "bytes": 26859482
+    },
+    {
+      "id": "macos",
+      "name": "macOS",
+      "architecture": "arm64",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/development-d70f64e/PeerBrush-macOS.zip",
+      "bytes": 23718559
+    }
+  ]
+}
