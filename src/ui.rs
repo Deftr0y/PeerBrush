@@ -470,6 +470,8 @@ impl PeerBrush {
             ),
             egui::TextureOptions::LINEAR,
         );
+        // Ember is the workspace palette even when the OS reports light mode.
+        ctx.set_theme(egui::Theme::Dark);
         let mut v = egui::Visuals::dark();
         v.panel_fill = Color32::from_rgb(41, 39, 43);
         v.window_fill = Color32::from_rgb(51, 49, 54);
@@ -6293,6 +6295,107 @@ mod tests {
         click(&mut app, &ctx, point);
         assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
         assert_eq!(app.shared.lock().unwrap().doc.revision, 1);
+    }
+    #[test]
+    fn folder_guides_show_nested_containment_and_collapse_without_source_edits() {
+        let (mut app, ctx) = fixture();
+        let outer = crate::engine::Layer::new("Outer folder", "group", 8, 8);
+        let mut inner = crate::engine::Layer::new("Inner folder", "group", 8, 8);
+        inner.parent = Some(outer.id.clone());
+        let mut leaf = crate::engine::Layer::new("Nested paint", "paint", 8, 8);
+        leaf.parent = Some(inner.id.clone());
+        leaf.pixels.set(2, 2, [201, 81, 31, 177]);
+        let mut sibling = crate::engine::Layer::new("Folder sibling", "paint", 8, 8);
+        sibling.parent = Some(outer.id.clone());
+        let loose = crate::engine::Layer::new("Outside folder", "paint", 8, 8);
+        {
+            let mut engine = app.shared.lock().unwrap();
+            engine.doc.layers = vec![
+                outer.clone(),
+                inner.clone(),
+                leaf.clone(),
+                sibling.clone(),
+                loose.clone(),
+            ];
+        }
+        app.select_content(&loose.id);
+        let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+        let mut time = 1.0;
+        let mut draw = |app: &mut PeerBrush| {
+            time += 1.0;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 900.0))),
+                    time: Some(time),
+                    system_theme: Some(egui::Theme::Light),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            )
+        };
+        draw(&mut app);
+        let output = draw(&mut app);
+        assert_eq!(
+            ctx.style().visuals.panel_fill,
+            Color32::from_rgb(41, 39, 43)
+        );
+        let guides = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::LineSegment { points, stroke }
+                        if stroke.color == MUTED.gamma_multiply(0.8) =>
+                    {
+                        Some(*points)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let lines = guides(&output);
+        assert_eq!(lines.len(), 5, "Two parent trunks and three child branches");
+        let mut columns = lines
+            .iter()
+            .filter(|points| points[0].x == points[1].x)
+            .map(|points| points[0].x)
+            .collect::<Vec<_>>();
+        columns.sort_by(f32::total_cmp);
+        assert!((columns[1] - columns[0] - 22.0).abs() < 0.1);
+        let eyes = [&outer, &inner, &leaf, &sibling, &loose]
+            .map(|layer| app.eye_rects[&layer.id].center().x);
+        assert!(eyes.iter().all(|x| (*x - eyes[0]).abs() < 0.1));
+        let nested_name = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == leaf.name => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        click(&mut app, &ctx, nested_name);
+        assert_eq!(app.selected, leaf.id);
+        // Click the nested folder's disclosure, then the outer folder's.
+        let inner_toggle = egui::pos2(columns[1], app.layer_rects[&inner.id].center().y);
+        click(&mut app, &ctx, inner_toggle);
+        assert!(app.collapsed.contains(&inner.id));
+        let output = draw(&mut app);
+        assert_eq!(guides(&output).len(), 3);
+        assert!(!app.layer_rects.contains_key(&leaf.id));
+        assert!(app.layer_rects.contains_key(&sibling.id));
+        let outer_toggle = egui::pos2(columns[0], app.layer_rects[&outer.id].center().y);
+        click(&mut app, &ctx, outer_toggle);
+        assert!(app.collapsed.contains(&outer.id));
+        let output = draw(&mut app);
+        assert!(guides(&output).is_empty());
+        assert_eq!(app.layer_rects.len(), 2);
+        assert!(app.layer_rects.contains_key(&loose.id));
+        let engine = app.shared.lock().unwrap();
+        assert!(engine.undo.is_empty());
+        assert_eq!(engine.doc.revision, 0);
+        assert_eq!(engine.doc.export_png().unwrap(), before);
     }
     #[test]
     fn ai_hierarchy_moves_reveal_folders_and_animate_without_extra_edits() {

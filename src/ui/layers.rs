@@ -1,5 +1,62 @@
 use super::*;
 use crate::engine::Layer;
+const TREE_INDENT: f32 = 22.0;
+struct TreeAnchor {
+    disclosure: Rect,
+    ai: bool,
+    opacity: f32,
+}
+fn paint_tree_guides(
+    painter: &egui::Painter,
+    doc: &Document,
+    anchors: &HashMap<String, TreeAnchor>,
+) {
+    for parent in doc.layers.iter().filter(|layer| layer.kind == "group") {
+        let Some(root) = anchors.get(&parent.id) else {
+            continue;
+        };
+        let children: Vec<_> = doc
+            .layers
+            .iter()
+            .filter(|layer| layer.parent.as_deref() == Some(&parent.id))
+            .filter_map(|layer| anchors.get(&layer.id).map(|anchor| (layer, anchor)))
+            .collect();
+        let x = root.disclosure.center().x;
+        let start = root.disclosure.bottom();
+        let end = children
+            .iter()
+            .map(|(_, child)| child.disclosure.center().y)
+            .max_by(f32::total_cmp);
+        if let Some(end) = end {
+            let color = if root.ai {
+                AI_BLUE
+            } else {
+                MUTED.gamma_multiply(0.8)
+            };
+            painter.line_segment(
+                [egui::pos2(x, start), egui::pos2(x, end)],
+                Stroke::new(1.0, color.gamma_multiply(root.opacity)),
+            );
+        }
+        for (layer, child) in children {
+            let y = child.disclosure.center().y;
+            let end = if layer.kind == "group" {
+                child.disclosure.left() - 2.0
+            } else {
+                child.disclosure.right() - 4.0
+            };
+            let color = if root.ai || child.ai {
+                AI_BLUE
+            } else {
+                MUTED.gamma_multiply(0.8)
+            };
+            painter.line_segment(
+                [egui::pos2(x, y), egui::pos2(end, y)],
+                Stroke::new(1.0, color.gamma_multiply(root.opacity.min(child.opacity))),
+            );
+        }
+    }
+}
 fn click_modifiers(ui: &egui::Ui) -> egui::Modifiers {
     ui.input(|i| {
         i.events
@@ -224,10 +281,9 @@ impl PeerBrush {
         indent: f32,
         thumb: Option<&TextureHandle>,
         mask_thumb: Option<&TextureHandle>,
-    ) {
+    ) -> Rect {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
-            ui.add_space(indent);
             let (grip, _) = ui.allocate_exact_size(Vec2::new(6.0, 28.0), egui::Sense::hover());
             for x in 0..2 {
                 for y in 0..3 {
@@ -261,8 +317,9 @@ impl PeerBrush {
                     }
                 }
             }
-            if l.kind == "group" {
-                if icons::small_button(
+            ui.add_space(indent);
+            let disclosure = if l.kind == "group" {
+                let response = icons::small_button(
                     ui,
                     if self.collapsed.contains(&l.id) {
                         Icon::Right
@@ -270,14 +327,17 @@ impl PeerBrush {
                         Icon::Down
                     },
                     "Expand / collapse group",
-                )
-                .clicked()
-                {
+                );
+                if response.clicked() {
                     if !self.collapsed.remove(&l.id) {
                         self.collapsed.insert(l.id.clone());
                     }
                 }
-            }
+                response.rect
+            } else {
+                ui.allocate_exact_size(Vec2::new(20.0, 24.0), egui::Sense::hover())
+                    .0
+            };
             if l.kind == "group" {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
                 icons::paint(ui.painter(), r, Icon::Folder, true);
@@ -399,8 +459,9 @@ impl PeerBrush {
                 let (_, r) = ui.allocate_space(Vec2::splat(16.0));
                 icons::paint(ui.painter(), r, Icon::Lock, true);
             }
-        });
-        let _ = doc;
+            disclosure
+        })
+        .inner
     }
     pub(super) fn layer_list(&mut self, ui: &mut egui::Ui, doc: &Document) {
         if self
@@ -462,13 +523,14 @@ impl PeerBrush {
             if let Some(sweep)=&self.eye_sweep {for l in &mut preview.layers {if sweep.ids.contains(&l.id){l.visible=sweep.visible;}}}
             let mut ordered=vec![];rows(&preview,None,0,&open,&mut ordered);
             let mut floating=None;
+            let mut anchors=HashMap::new();
             for (slot,(index,depth)) in ordered.iter().copied().enumerate() {
                 let l=&preview.layers[index];let target=slot as f32*46.0;
                 let time=ui.input(|i| i.time);
                 let ai=self.ai_layer(&l.id,time);
                 let duration=if ai {0.36}else{0.12};
                 let offset=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,&l.id,"position")),target,duration);
-                let indent=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,&l.id,"indent")),depth as f32*10.0,duration);
+                let indent=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,&l.id,"indent")),depth as f32*TREE_INDENT,duration);
                 let arrival=self.animation.arrival(&l.id,time);
                 let rect=Rect::from_min_size(base+Vec2::new((1.0-arrival)*14.0,offset),Vec2::new(width,42.0));
                 self.layer_rects.insert(l.id.clone(),rect);
@@ -498,20 +560,22 @@ impl PeerBrush {
                         ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,4.0),Vec2::new(2.0,34.0)),1,AI_BLUE);
                     }
                     if drop_folder.as_deref()==Some(&l.id){ui.painter().rect_stroke(rect,4,Stroke::new(1.0_f32,ACCENT),egui::StrokeKind::Inside);}
-                    ui.scope_builder(egui::UiBuilder::new().id_salt(&l.id).max_rect(rect.shrink2(Vec2::new(4.0,4.0))),|ui| {
+                    let disclosure=ui.scope_builder(egui::UiBuilder::new().id_salt(&l.id).max_rect(rect.shrink2(Vec2::new(4.0,4.0))),|ui| {
                         ui.set_opacity(arrival);
-                        self.layer_contents(ui,doc,l,indent,thumb.as_ref(),mask_thumb.as_ref());
-                    });
+                        self.layer_contents(ui,doc,l,indent,thumb.as_ref(),mask_thumb.as_ref())
+                    }).inner;
+                    anchors.insert(l.id.clone(),TreeAnchor {disclosure,ai,opacity:arrival});
                 }
                 response.on_hover_text("Click to select · Ctrl/Cmd or Shift for multiple · Drag into folders · Drag left to move out").context_menu(|ui|self.layer_menu(ui,doc,l));
             }
+            paint_tree_guides(ui.painter(),&preview,&anchors);
             if let (Some((layer,thumb,depth)),Some(pointer),Some(drag))=(floating,pointer,&self.layer_drag) {
                 let painter=ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip,ui.id().with("held layer")));
                 let rect=Rect::from_min_size(egui::pos2(base.x,pointer.y-drag.offset),Vec2::new(width,42.0));
                 painter.rect_filled(rect.translate(Vec2::new(0.0,3.0)),5,Color32::BLACK.gamma_multiply(0.35));
                 painter.rect_filled(rect,5,Color32::from_rgb(74,48,71));
                 painter.line_segment([rect.left_top(),rect.left_bottom()],Stroke::new(2.0_f32,ACCENT));
-                let x=rect.left()+45.0+depth as f32*10.0;
+                let x=rect.left()+75.0+depth as f32*TREE_INDENT;
                 let image_rect=Rect::from_min_size(egui::pos2(x,rect.top()+6.0),Vec2::splat(30.0));
                 if layer.kind=="group"{icons::paint(&painter,image_rect,Icon::Folder,true);}
                 else if let Some(t)=thumb {painter.image(t.id(),image_rect,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);}
