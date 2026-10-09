@@ -167,6 +167,23 @@ struct MergeReply {
     document: String,
     result: Result<Value, String>,
 }
+struct ImportFile {
+    path: PathBuf,
+    encoded: crate::image_import::Encoded,
+    index: usize,
+}
+struct PendingImport {
+    project: String,
+    document: String,
+    revision: u64,
+    files: Vec<ImportFile>,
+}
+struct ImportReply {
+    project: String,
+    document: String,
+    revision: u64,
+    result: Result<Vec<ImportFile>, String>,
+}
 struct JobReply {
     project: String,
     result: Result<String, String>,
@@ -352,6 +369,9 @@ pub struct PeerBrush {
     view_rect: Option<Rect>,
     message: String,
     last_status: String,
+    import_tx: mpsc::Sender<ImportReply>,
+    import_rx: mpsc::Receiver<ImportReply>,
+    pending_import: Option<PendingImport>,
     job_rx: mpsc::Receiver<JobReply>,
     job_tx: mpsc::Sender<JobReply>,
     busy: bool,
@@ -521,6 +541,7 @@ impl PeerBrush {
             .unwrap_or_default();
         let (preview_tx, preview_rx) = mpsc::channel();
         let (job_tx, job_rx) = mpsc::channel();
+        let (import_tx, import_rx) = mpsc::channel();
         let (connect_tx, connect_rx) = mpsc::channel();
         let (merge_tx, merge_rx) = mpsc::channel();
         let (transfer_tx, transfer_rx) = mpsc::channel();
@@ -633,6 +654,9 @@ impl PeerBrush {
             view_rect: None,
             message: "Ready".into(),
             last_status: "Ready".into(),
+            import_tx,
+            import_rx,
+            pending_import: None,
             job_rx,
             job_tx,
             busy: false,
@@ -1342,31 +1366,155 @@ impl PeerBrush {
         });
     }
     fn import(&mut self) {
-        let shared = self.shared.clone();
-        let document = self.doc_snapshot.id.clone();
-        let revision = self.doc_snapshot.revision;
-        self.job(move || {
-            let Some(paths) = rfd::FileDialog::new()
-                .add_filter("Images", &["png", "jpg", "jpeg"])
-                .pick_files()
-            else {
-                return Ok("Ready".into());
-            };
-            let commands: Vec<Value> = paths
-                .iter()
-                .map(|path| json!({"op":"image.import","path":path,"document_id":document}))
-                .collect();
-            shared.lock().unwrap().edit(
-                "human",
-                &commands,
-                Some(revision),
-                None,
-                "Import images",
-            )?;
-            Ok(format!("Imported {} image layers", paths.len()))
+        self.begin_import(None);
+    }
+    fn begin_import(&mut self, paths: Option<Vec<PathBuf>>) {
+        if self.busy || self.pending_import.is_some() {
+            self.message = "Finish or cancel the current import first".into();
+            return;
+        }
+        self.close_proposal();
+        self.finish_parameter(true);
+        let project = self.project_id.clone();
+        let (document, revision) = {
+            let e = self.shared.lock().unwrap();
+            (e.doc.id.clone(), e.doc.revision)
+        };
+        self.busy = true;
+        self.jobs.insert(project.clone());
+        let tx = self.import_tx.clone();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let paths = paths.or_else(|| {
+                    rfd::FileDialog::new()
+                        .add_filter("Images", crate::image_import::EXTENSIONS)
+                        .pick_files()
+                });
+                let Some(paths) = paths else {
+                    return Ok(Vec::new());
+                };
+                if paths.len() > 16 {
+                    return Err("Import at most 16 images at once".into());
+                }
+                let mut bytes = 0usize;
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let encoded = crate::image_import::Encoded::file(&path)?;
+                        bytes += encoded.encoded_len();
+                        if bytes > 128 * 1024 * 1024 {
+                            return Err("Encoded image batch exceeds 128 MiB".into());
+                        }
+                        Ok(ImportFile {
+                            path,
+                            encoded,
+                            index: 0,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            }))
+            .unwrap_or_else(|_| {
+                Err("Image import could not complete; current work preserved".into())
+            });
+            let _ = tx.send(ImportReply {
+                project,
+                document,
+                revision,
+                result,
+            });
         });
     }
-    fn drop_files(&mut self, paths: Vec<std::path::PathBuf>) {
+    fn commit_import(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(pending) = self.pending_import.take() else {
+            return;
+        };
+        if pending.project != self.project_id {
+            self.pending_import = Some(pending);
+            return;
+        }
+        let shared = self.shared.clone();
+        self.job(move || {
+            crate::workspace::guard(&shared.lock().unwrap(),&pending.document,pending.revision)?;
+            let mut budget = crate::image_import::BUDGET; let mut commands = Vec::new(); let mut pixels = Vec::new();
+            for file in pending.files {
+                let mut command = json!({"op":"image.import","path":file.path,"document_id":pending.document,"source_revision":pending.revision});
+                if let Some(choice) = file.encoded.info.choice {command[choice]=json!(file.index);}
+                let image = file.encoded.decode(&command,budget)?;
+                budget = budget.checked_sub(image.stored_bytes()).ok_or("Image batch exceeds 256 MiB")?;
+                commands.push(command); pixels.push(image);
+            }
+            let count = commands.len(); let mut engine = shared.lock().unwrap();
+            if engine.doc.id != pending.document || engine.doc.revision != pending.revision { return Err("The source project changed; import the images again".into()); }
+            engine.import_images(&commands,pixels,pending.revision)?;
+            Ok(format!("Imported {count} image layers"))
+        });
+    }
+    fn import_dialog(&mut self, ctx: &egui::Context) {
+        if self
+            .pending_import
+            .as_ref()
+            .is_some_and(|p| crate::workspace::get_in(&self.workspace, &p.project).is_err())
+        {
+            self.pending_import = None;
+            self.message = "Import source project was closed; current work preserved".into();
+        }
+        let Some(pending) = &mut self.pending_import else {
+            return;
+        };
+        if pending.project != self.project_id {
+            return;
+        }
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Choose image content")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Choose a frame, page or icon variant for each image.");
+                for file in &mut pending.files {
+                    ui.horizontal(|ui| {
+                        ui.label(file.path.file_name().unwrap_or_default().to_string_lossy());
+                        if let Some(choice) = file.encoded.info.choice {
+                            egui::ComboBox::from_id_salt((&file.path, choice))
+                                .selected_text(format!(
+                                    "{choice} {} of {}",
+                                    file.index + 1,
+                                    file.encoded.info.count
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for index in 0..file.encoded.info.count {
+                                        ui.selectable_value(
+                                            &mut file.index,
+                                            index,
+                                            format!("{choice} {}", index + 1),
+                                        );
+                                    }
+                                });
+                        } else {
+                            ui.weak(&file.encoded.info.format);
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    apply = ui
+                        .add_enabled(!self.busy, egui::Button::new("Import"))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.pending_import = None;
+            self.message = "Import canceled".into();
+        } else if apply {
+            self.commit_import();
+        }
+    }
+    fn drop_files(&mut self, paths: Vec<PathBuf>) {
         if self.busy {
             self.message = "Finish the current file operation before dropping files".into();
             return;
@@ -1380,30 +1528,11 @@ impl PeerBrush {
             })
             .count();
         if psds > 0 && paths.len() != 1 {
-            self.message =
-                "Drop one PSD to open it, or several PNG/JPEG images to add layers".into();
-            return;
-        }
-        let shared = self.shared.clone();
-        if psds == 1 {
+            self.message = "Drop one PSD to open it, or image files to add layers".into();
+        } else if psds == 1 {
             self.open_job(Some(paths[0].clone()), false);
         } else if !paths.is_empty() {
-            let document = self.doc_snapshot.id.clone();
-            let revision = self.doc_snapshot.revision;
-            self.job(move || {
-                let commands: Vec<Value> = paths
-                    .iter()
-                    .map(|p| json!({"op":"image.import","path":p,"document_id":document}))
-                    .collect();
-                shared.lock().unwrap().edit(
-                    "human",
-                    &commands,
-                    Some(revision),
-                    None,
-                    "Drop images",
-                )?;
-                Ok(format!("Added {} image layers", paths.len()))
-            });
+            self.begin_import(Some(paths));
         }
     }
     fn liquify_command(&self, points: &[[f32; 2]]) -> Value {
@@ -3633,6 +3762,37 @@ impl PeerBrush {
             self.message = status.clone();
             self.last_status = status;
         }
+        while let Ok(reply) = self.import_rx.try_recv() {
+            self.jobs.remove(&reply.project);
+            self.busy = self.jobs.contains(&self.project_id);
+            match reply.result {
+                Ok(files) if !files.is_empty() => {
+                    let needs_choice = files.iter().any(|f| f.encoded.info.choice.is_some());
+                    self.pending_import = Some(PendingImport {
+                        project: reply.project,
+                        document: reply.document,
+                        revision: reply.revision,
+                        files,
+                    });
+                    if !needs_choice
+                        && self
+                            .pending_import
+                            .as_ref()
+                            .is_some_and(|p| p.project == self.project_id)
+                    {
+                        self.commit_import();
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if reply.project == self.project_id {
+                        self.message = error;
+                    } else if let Some(view) = self.project_views.get_mut(&reply.project) {
+                        view.message = error;
+                    }
+                }
+            }
+        }
         while let Ok(reply) = self.job_rx.try_recv() {
             self.jobs.remove(&reply.project);
             self.busy = self.jobs.contains(&self.project_id);
@@ -3686,6 +3846,7 @@ impl PeerBrush {
             (e.doc.clone(), e.ai_change.clone())
         };
         self.doc_snapshot = doc.clone();
+        self.import_dialog(ctx);
         if self.rename_edit.as_ref().is_some_and(|edit| {
             edit.document != doc.id || !doc.layers.iter().any(|l| l.id == edit.layer)
         }) {
@@ -5739,6 +5900,125 @@ mod tests {
         assert_eq!(app.selected, engine.doc.layers[0].id);
         engine.undo("human").unwrap();
         assert_eq!(engine.doc.layers.len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+    fn import_choice_fixture(app: &mut PeerBrush, ctx: &egui::Context) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("peerbrush-choice-{}.gif", uuid::Uuid::new_v4()));
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+        encoder
+            .encode_frames([[255, 0, 0, 255], [0, 255, 0, 255]].map(|color| {
+                image::Frame::new(image::RgbaImage::from_pixel(2, 1, image::Rgba(color)))
+            }))
+            .unwrap();
+        drop(encoder);
+        std::fs::write(&path, bytes).unwrap();
+        app.begin_import(Some(vec![path.clone()]));
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(10));
+            frame(app, ctx, vec![], Default::default());
+            if !app.busy {
+                break;
+            }
+        }
+        assert!(app.pending_import.is_some());
+        path
+    }
+    fn wait_import(app: &mut PeerBrush, ctx: &egui::Context) {
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(10));
+            frame(app, ctx, vec![], Default::default());
+            if !app.busy {
+                break;
+            }
+        }
+        assert!(!app.busy);
+    }
+    #[test]
+    fn import_choice_cancel_and_captured_frame_preserve_history_and_original_words() {
+        let (mut app, ctx) = fixture();
+        let path = import_choice_fixture(&mut app, &ctx);
+        assert_eq!(app.shared.lock().unwrap().doc.revision, 0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            Default::default(),
+        );
+        assert!(app.pending_import.is_none());
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        std::fs::remove_file(path).unwrap();
+        let path = import_choice_fixture(&mut app, &ctx);
+        app.pending_import.as_mut().unwrap().files[0].index = 1;
+        std::fs::write(&path, b"Changed after inspection").unwrap();
+        app.commit_import();
+        wait_import(&mut app, &ctx);
+        let mut e = app.shared.lock().unwrap();
+        assert_eq!(e.doc.layers[0].pixels.get(0, 0), [0, 255, 0, 255]);
+        assert_eq!(e.undo.len(), 1);
+        assert_eq!(app.selected, e.doc.layers[0].id);
+        e.undo("human").unwrap();
+        assert_eq!(e.doc.layers.len(), 1);
+        drop(e);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn pending_import_rejects_newer_work_and_cannot_apply_to_another_or_closed_project() {
+        let (mut app, ctx) = fixture();
+        let path = import_choice_fixture(&mut app, &ctx);
+        let layer = app.shared.lock().unwrap().doc.layers[0].id.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":layer,"name":"Newer human work"})],
+                None,
+                None,
+                "Rename",
+            )
+            .unwrap();
+        app.commit_import();
+        wait_import(&mut app, &ctx);
+        assert_eq!(app.shared.lock().unwrap().doc.layers.len(), 1);
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].name,
+            "Newer human work"
+        );
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        assert!(app.message.contains("changed"));
+        std::fs::remove_file(path).unwrap();
+        let path = import_choice_fixture(&mut app, &ctx);
+        let source = app.shared.clone();
+        let project = app.project_id.clone();
+        let doc = source.lock().unwrap().doc.clone();
+        let other = crate::workspace::register(&app.workspace_root, Engine::new(), None).unwrap();
+        let other_id = other.lock().unwrap().project_id.clone();
+        crate::workspace::select(&app.workspace_root, &other_id).unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        app.commit_import();
+        assert!(app.pending_import.is_some());
+        assert!(other.lock().unwrap().undo.is_empty());
+        assert_eq!(source.lock().unwrap().undo.len(), 1);
+        crate::workspace::close(
+            &app.workspace_root,
+            &project,
+            &doc.id,
+            doc.revision,
+            true,
+            "human",
+        )
+        .unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.pending_import.is_none());
+        assert!(other.lock().unwrap().undo.is_empty());
         std::fs::remove_file(path).unwrap();
     }
     fn click(app: &mut PeerBrush, ctx: &egui::Context, pos: Pos2) {

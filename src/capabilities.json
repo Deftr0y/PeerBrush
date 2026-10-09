@@ -49,16 +49,24 @@
   },
   "color_profiles": {
     "supported": "PSD ICC v2/v4 RGB matrix/TRC with XYZ connection space; sRGB/Adobe RGB/Display P3/ProPhoto matrix profiles. Display and loading previews convert to sRGB at native depth before projection.",
-    "source": "Profiled imports remain read-only saved composites; raw channels and exact ICC bytes survive protected PNG export. Observed document.color_profile exposes source/preview/conversion_available/reason without profile bytes.",
+    "source": "Profiled PSD imports remain read-only saved composites; raw channels and exact ICC bytes survive protected PNG export. Observed document.color_profile exposes source/preview/conversion_available/reason without profile bytes. Supported raster image imports normalize RGB matrix/TRC ICC to sRGB at original channel depth before editing.",
     "copy": "document action compatible_copy requires convert_to_srgb:true for a profiled source. Flattens/converts at original 8/16-bit depth, preserves alpha, creates new identity/path and rechecks reservations/revision. Converted PSD/PNG carries a standard sRGB ICC tag; exact built-in working profile reopens without repeated conversion.",
     "intent": "Relative colorimetric, no black-point compensation; out-of-gamut values clip. Screen assumed sRGB, no monitor profile or HDR mapping.",
-    "limits": "4 MiB profile, 128 tags, 65536 TRC entries, four disposable cache entries. LUT/non-RGB/non-XYZ/device-link/abstract/named/HDR profiles remain protected with unmanaged-preview reason and unavailable conversion; ambiguous duplicate PSD resources reject. Editable profiled stacks, assignment, soft proofing and PNG/JPEG import normalization remain pending."
+    "limits": "4 MiB profile, 128 tags, 65536 TRC entries, four disposable cache entries. LUT/non-RGB/non-XYZ/device-link/abstract/named/HDR PSD profiles remain protected with unmanaged-preview reason and unavailable conversion; unsupported raster import profiles reject. Ambiguous duplicate PSD resources reject. Editable profiled PSD stacks, assignment and soft proofing remain pending."
   },
   "formats": {
     "work": "PSD v1, 8-bit and 16-bit RGB",
     "import": [
       "PNG",
-      "JPEG"
+      "JPEG",
+      "BMP",
+      "GIF",
+      "TIFF",
+      "WebP",
+      "ICO",
+      "Netpbm",
+      "TGA",
+      "QOI"
     ],
     "export": [
       "PNG"
@@ -728,7 +736,7 @@
     "disk eviction",
     "broader Photoshop clipping/group compatibility"
   ],
-  "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local PNG/JPEG path or base64 PNG. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",
+  "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local supported raster path or base64 PNG. Consult image_import extensions and peerbrush_image_info; select an explicit zero-based frame/page/variant when required. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Native16 input promotes the project before resampling or compositing; imported working RGB carries a standard sRGB tag on save. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",
   "duplicate_selection": "layer.duplicate_selection duplicates the active layer's selected rendered pixels at their original document coordinates in one edit. Irregular/feathered coverage, effects, masks and opacity are baked once into a new native-depth paint sibling; source layers stay editable and selection is retained. Without a pixel selection, duplicate the active editable layer tree; complete clipping units are required for whole-layer copies. Empty selected pixels and adjustment-only targets are refused. Optional document_id/source_revision plus shared revision, lock and reservation guards apply. Ctrl+D invokes this command; Deselect remains in Select.",
   "merge_layers": {
     "command": "layer.merge",

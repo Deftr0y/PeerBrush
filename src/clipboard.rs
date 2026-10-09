@@ -10,14 +10,6 @@ use std::{borrow::Cow, path::PathBuf, sync::mpsc};
 #[cfg(windows)]
 mod windows;
 
-fn image_limits() -> image::Limits {
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(256 * 1024 * 1024);
-    limits
-}
-
 #[derive(Clone)]
 pub struct Image {
     pub width: u32,
@@ -28,105 +20,31 @@ pub struct Image {
     pub origin: Option<[i32; 2]>,
 }
 impl Image {
-    fn decoded(image: image::DynamicImage) -> Result<Self, String> {
-        let (width, height) = (image.width(), image.height());
-        check_size(width, height)?;
-        let native16 = matches!(
-            image,
-            image::DynamicImage::ImageLuma16(_)
-                | image::DynamicImage::ImageLumaA16(_)
-                | image::DynamicImage::ImageRgb16(_)
-                | image::DynamicImage::ImageRgba16(_)
-        );
-        let (bytes, samples16) = if native16 {
-            let words = image.into_rgba16().into_raw();
-            let bytes = words
-                .iter()
-                .copied()
-                .map(crate::raster::project16)
-                .collect();
-            (bytes, Some(words))
-        } else {
-            (image.into_rgba8().into_raw(), None)
-        };
-        Ok(Self {
-            width,
-            height,
-            bytes,
-            samples16,
-            origin: None,
-        })
+    fn decoder(decoder: impl image::ImageDecoder, budget: usize) -> Result<Self, String> {
+        Ok(Self::from_raster(crate::image_import::decoder(
+            decoder, budget,
+        )?))
     }
-    fn decoder(mut decoder: impl image::ImageDecoder, budget: usize) -> Result<Self, String> {
-        let (width, height) = decoder.dimensions();
-        check_size(width, height)?;
-        let color = decoder.color_type();
-        let native16 = color.bits_per_pixel() / color.channel_count() as u16 > 8;
-        let memory = width as u64 * height as u64 * if native16 { 12 } else { 4 };
-        if memory > budget as u64 {
-            return Err(
-                "Clipboard images exceed the 256 MiB paste budget; paste smaller or fewer images"
-                    .into(),
-            );
+    fn from_raster(pixels: Raster) -> Self {
+        Self {
+            width: pixels.width,
+            height: pixels.height,
+            bytes: pixels.rgba(),
+            samples16: (pixels.depth == 16).then(|| pixels.rgba16()),
+            origin: None,
         }
-        decoder
-            .set_limits(image_limits())
-            .map_err(|e| e.to_string())?;
-        Self::decoded(
-            image::DynamicImage::from_decoder(decoder)
-                .map_err(|e| format!("Cannot decode clipboard image: {e}"))?,
-        )
     }
     fn png_bytes(bytes: Vec<u8>) -> Result<Self, String> {
-        let mut reader =
-            image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
-        reader.limits(image_limits());
-        Self::decoder(
-            reader
-                .into_decoder()
-                .map_err(|e| format!("Cannot decode clipboard PNG: {e}"))?,
-            256 * 1024 * 1024,
-        )
+        Ok(Self::from_raster(
+            crate::image_import::Encoded::png(bytes)?
+                .decode(&json!({}), crate::image_import::BUDGET)?,
+        ))
     }
     fn file(path: &std::path::Path, budget: usize) -> Result<Self, String> {
-        if !path.is_absolute() {
-            return Err("Clipboard image paths must be absolute".into());
-        }
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !["png", "jpg", "jpeg", "bmp"].contains(&ext.as_str()) {
-            return Err("Paste PNG, JPEG or BMP image files; use Open for PSD projects".into());
-        }
-        let file =
-            std::fs::File::open(path).map_err(|e| format!("Cannot read clipboard image: {e}"))?;
-        let metadata = file.metadata().map_err(|e| e.to_string())?;
-        if !metadata.is_file() || metadata.len() > 128 * 1024 * 1024 {
-            return Err("Clipboard image must be a file smaller than 128 MiB".into());
-        }
-        // Bound the actual read too, even if another application grows the file.
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        file.take(128 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > 128 * 1024 * 1024 {
-            return Err("Clipboard image is too large".into());
-        }
-        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-            .with_guessed_format()
-            .map_err(|e| e.to_string())?;
-        if !matches!(
-            reader.format(),
-            Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::Bmp)
-        ) {
-            return Err("Clipboard file is not a supported image".into());
-        }
-        reader.limits(image_limits());
-        Self::decoder(reader.into_decoder().map_err(|e| e.to_string())?, budget)
+        let pixels = crate::image_import::decode_file(path, &json!({}), budget)?;
+        Ok(Self::from_raster(pixels))
     }
+
     pub fn copy(doc: &Document, target: &str, mask: bool, merged: bool) -> Result<Self, String> {
         if doc.bit_depth == 16 {
             return Self::copy16(doc, target, mask, merged);

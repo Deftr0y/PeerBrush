@@ -478,8 +478,14 @@ impl Engine {
             .lock()
             .unwrap()
             .resolve_commands(commands)?;
+        let mut imported_bytes = 0;
         for command in &resolved {
-            engine.apply(command)?;
+            if command["op"] == "image.import" {
+                engine.validate_source(command)?;
+                engine.apply_import(command, None, &mut imported_bytes)?;
+            } else {
+                engine.apply(command)?;
+            }
         }
         engine.doc.ensure_depth();
         crate::compositor::validate_clipping(&engine.doc)?;
@@ -915,7 +921,7 @@ impl Engine {
         gesture: Option<&str>,
     ) -> Result<Value, String> {
         self.edit_transaction(
-            actor, commands, expected, task, label, gesture, None, None, None,
+            actor, commands, expected, task, label, gesture, None, None, None, None,
         )
     }
     pub(crate) fn edit_prepared_merge(
@@ -934,6 +940,7 @@ impl Engine {
             "Merge layers",
             None,
             Some(prepared),
+            None,
             None,
             None,
         )
@@ -956,6 +963,7 @@ impl Engine {
             None,
             None,
             Some(snapshot.clone()),
+            None,
             None,
         )
     }
@@ -980,7 +988,69 @@ impl Engine {
             None,
             None,
             Some(doc),
+            None,
         )
+    }
+    /// Decode outside the engine lock, then atomically commit the captured pixels.
+    pub(crate) fn import_images(
+        &mut self,
+        commands: &[Value],
+        pixels: Vec<Raster>,
+        revision: u64,
+    ) -> Result<Value, String> {
+        if commands.len() != pixels.len() || commands.iter().any(|c| c["op"] != "image.import") {
+            return Err("Invalid prepared image batch".into());
+        }
+        let bytes: usize = pixels.iter().map(Raster::stored_bytes).sum();
+        if bytes > crate::image_import::BUDGET {
+            return Err("Image batch exceeds 256 MiB".into());
+        }
+        self.edit_transaction(
+            "human",
+            commands,
+            Some(revision),
+            None,
+            "Import images",
+            None,
+            None,
+            None,
+            None,
+            Some(pixels.into()),
+        )
+    }
+    fn validate_source(&self, c: &Value) -> Result<(), String> {
+        if c.get("source_revision")
+            .is_some_and(|r| r.as_u64() != Some(self.doc.revision))
+            || c.get("document_id")
+                .is_some_and(|id| id.as_str() != Some(self.doc.id.as_str()))
+        {
+            return Err(
+                "The source project changed. Review it again before applying this result.".into(),
+            );
+        }
+        Ok(())
+    }
+    fn apply_import(
+        &mut self,
+        c: &Value,
+        pixels: Option<Raster>,
+        imported_bytes: &mut usize,
+    ) -> Result<(), String> {
+        let pixels = match pixels {
+            Some(pixels) => pixels,
+            None => crate::image_import::decode_file(
+                std::path::Path::new(c["path"].as_str().ok_or("Missing image path")?),
+                c,
+                crate::image_import::BUDGET - *imported_bytes,
+            )?,
+        };
+        *imported_bytes = imported_bytes
+            .checked_add(pixels.stored_bytes())
+            .ok_or("Image batch exceeds 256 MiB")?;
+        if *imported_bytes > crate::image_import::BUDGET {
+            return Err("Image batch exceeds 256 MiB".into());
+        }
+        crate::image_import::apply(&mut self.doc, c, pixels)
     }
     fn edit_transaction(
         &mut self,
@@ -993,6 +1063,7 @@ impl Engine {
         mut prepared: Option<crate::merge::Prepared>,
         mut clipboard: Option<crate::layer_clipboard::Layers>,
         prepared_doc: Option<Document>,
+        mut imports: Option<std::collections::VecDeque<Raster>>,
     ) -> Result<Value, String> {
         self.ensure_open()?;
         if self.doc.read_only {
@@ -1043,6 +1114,7 @@ impl Engine {
             }
         }
         let mut pasted_roots = None;
+        let mut imported_bytes = 0usize;
         let mut selection_gesture: Option<(
             Value,
             Option<[i32; 4]>,
@@ -1095,7 +1167,21 @@ impl Engine {
                 } else {
                     selection_gesture = None;
                 }
-                let applied = if c["op"] == "layer.paste" {
+                if let Err(error) = self.validate_source(c) {
+                    self.doc = before;
+                    return Err(error);
+                }
+                let applied = if c["op"] == "image.import" {
+                    let pixels = imports
+                        .as_mut()
+                        .map(|items| {
+                            items
+                                .pop_front()
+                                .ok_or_else(|| "Missing prepared image".to_owned())
+                        })
+                        .transpose();
+                    pixels.and_then(|pixels| self.apply_import(c, pixels, &mut imported_bytes))
+                } else if c["op"] == "layer.paste" {
                     if let Some(snapshot) = clipboard.take() {
                         crate::layer_clipboard::paste(
                             &mut self.doc,
@@ -1409,48 +1495,7 @@ impl Engine {
             return crate::placement::place(&mut self.doc, c);
         }
         if op == "image.import" {
-            if self.doc.layers.len() >= 100 {
-                return Err("Initial version supports up to 100 layers".into());
-            }
-            let path = std::path::Path::new(text(c, "path", ""));
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !["png", "jpg", "jpeg"].contains(&ext.as_str()) {
-                return Err("Import PNG or JPEG images; open PSDs as documents".into());
-            }
-            let mut reader = image::ImageReader::open(path)
-                .map_err(|e| e.to_string())?
-                .with_guessed_format()
-                .map_err(|e| e.to_string())?;
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(8192);
-            limits.max_image_height = Some(8192);
-            limits.max_alloc = Some(128 * 1024 * 1024);
-            reader.limits(limits);
-            let img = reader.decode().map_err(|e| e.to_string())?;
-            let mut layer = Layer::new(
-                &path.file_stem().unwrap_or_default().to_string_lossy(),
-                "paint",
-                img.width(),
-                img.height(),
-            );
-            layer.pixels = if self.doc.bit_depth == 16
-                || matches!(
-                    img,
-                    image::DynamicImage::ImageLuma16(_)
-                        | image::DynamicImage::ImageLumaA16(_)
-                        | image::DynamicImage::ImageRgb16(_)
-                        | image::DynamicImage::ImageRgba16(_)
-                ) {
-                Raster::from_rgba16(img.width(), img.height(), img.to_rgba16().as_raw())?
-            } else {
-                Raster::from_rgba(img.width(), img.height(), img.to_rgba8().as_raw())?
-            };
-            self.doc.layers.insert(0, layer);
-            return Ok(());
+            return self.apply_import(c, None, &mut 0);
         }
         if op == "new" {
             self.doc = Document::new(

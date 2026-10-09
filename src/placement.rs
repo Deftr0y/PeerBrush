@@ -6,51 +6,29 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
-use std::{io::Cursor, path::Path};
+use std::path::Path;
 
 fn decode(command: &Value, depth: u16) -> Result<Raster, String> {
-    let bytes = match (command.get("path"), command.get("png")) {
-        (Some(path), None) => {
-            let path = Path::new(path.as_str().ok_or("Image path must be a string")?);
-            if !path.is_absolute() {
-                return Err("Use an absolute local image path".into());
-            }
-            if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
-                return Err("Encoded image exceeds 128 MiB".into());
-            }
-            std::fs::read(path).map_err(|e| e.to_string())?
-        }
+    let mut pixels = match (command.get("path"), command.get("png")) {
+        (Some(path), None) => crate::image_import::decode_file(
+            Path::new(path.as_str().ok_or("Image path must be a string")?),
+            command,
+            crate::image_import::BUDGET,
+        )?,
         (None, Some(png)) => {
             let png = png.as_str().ok_or("png must contain base64 PNG bytes")?;
             if png.len() > 180 * 1024 * 1024 {
                 return Err("Encoded image is too large".into());
             }
-            let bytes = STANDARD.decode(png).map_err(|e| e.to_string())?;
-            if image::guess_format(&bytes).ok() != Some(image::ImageFormat::Png) {
-                return Err("png must contain a PNG image".into());
-            }
-            bytes
+            crate::image_import::Encoded::png(STANDARD.decode(png).map_err(|e| e.to_string())?)?
+                .decode(command, crate::image_import::BUDGET)?
         }
         _ => return Err("Provide exactly one absolute path or base64 png".into()),
     };
-    let format = image::guess_format(&bytes).map_err(|e| e.to_string())?;
-    if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg) {
-        return Err("Place PNG or JPEG pixels".into());
-    }
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(256 * 1024 * 1024);
-    reader.limits(limits);
-    let image = reader.decode().map_err(|e| e.to_string())?;
     if depth == 16 {
-        let image = image.to_rgba16();
-        Raster::from_rgba16(image.width(), image.height(), image.as_raw())
-    } else {
-        let image = image.to_rgba8();
-        Raster::from_rgba(image.width(), image.height(), image.as_raw())
+        pixels.promote16();
     }
+    Ok(pixels)
 }
 
 pub(crate) fn unlocked(doc: &Document, target: &str) -> Result<(), String> {
@@ -132,6 +110,10 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
         return Err("Image mode must be over or replace".into());
     }
     let source = decode(command, doc.bit_depth)?;
+    if source.depth == 16 && doc.bit_depth != 16 {
+        doc.bit_depth = 16;
+        doc.ensure_depth();
+    }
     let bounds = if let Some(value) = command.get("rect") {
         let area = crate::engine::rect(value).ok_or("Invalid destination rectangle")?;
         if area[0] == area[2] || area[1] == area[3] {
@@ -279,5 +261,6 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
         layer.x = left;
         layer.y = top;
     }
+    doc.srgb_tagged = true;
     Ok(())
 }
