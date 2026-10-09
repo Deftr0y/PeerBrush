@@ -14,31 +14,35 @@ const TOOLS: &[(&str, &str, usize)] = &[
 impl PeerBrush {
     pub(super) fn selection_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
-            egui::ComboBox::from_id_salt("selection tool")
-                .width(150.)
-                .selected_text(
-                    TOOLS
-                        .iter()
-                        .find(|t| t.0 == self.selection_kind)
-                        .map_or("Marquee", |t| t.1),
-                )
-                .show_ui(ui, |ui| {
-                    for &(kind, label, cell) in TOOLS {
-                        ui.horizontal(|ui| {
-                            let (r, _) =
-                                ui.allocate_exact_size(Vec2::splat(22.), egui::Sense::hover());
-                            icons::paint_generated(ui.painter(), r, cell, true);
-                            if ui
-                                .selectable_value(&mut self.selection_kind, kind.into(), label)
-                                .changed()
-                            {
-                                self.selection_path.clear();
-                                self.points.clear();
-                                self.drag_start = None;
-                            }
-                        });
-                    }
-                });
+            if self.tool == Tool::MagicWand {
+                ui.label("Magic Wand");
+            } else {
+                egui::ComboBox::from_id_salt("selection tool")
+                    .width(150.)
+                    .selected_text(
+                        TOOLS
+                            .iter()
+                            .find(|t| t.0 == self.selection_kind)
+                            .map_or("Marquee", |t| t.1),
+                    )
+                    .show_ui(ui, |ui| {
+                        for &(kind, label, cell) in TOOLS {
+                            ui.horizontal(|ui| {
+                                let (r, _) =
+                                    ui.allocate_exact_size(Vec2::splat(22.), egui::Sense::hover());
+                                icons::paint_generated(ui.painter(), r, cell, true);
+                                if ui
+                                    .selectable_value(&mut self.selection_kind, kind.into(), label)
+                                    .changed()
+                                {
+                                    self.selection_path.clear();
+                                    self.points.clear();
+                                    self.drag_start = None;
+                                }
+                            });
+                        }
+                    });
+            }
             egui::ComboBox::from_id_salt("selection operation")
                 .width(85.)
                 .selected_text(&self.selection_mode)

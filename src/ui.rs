@@ -69,7 +69,7 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, _color: Color32) 
         Tool::Selection => Icon::Selection,
         Tool::Picker => Icon::Picker,
         Tool::Pan => Icon::Pan,
-        Tool::SmartMask => Icon::Wand,
+        Tool::MagicWand => Icon::Wand,
     };
     icons::paint(painter, rect, icon, true);
 }
@@ -99,7 +99,7 @@ enum Tool {
     Picker,
     Pan,
     Gradient,
-    SmartMask,
+    MagicWand,
 }
 impl Tool {
     fn label(self) -> &'static str {
@@ -121,7 +121,7 @@ impl Tool {
             Self::Picker => "Pick color",
             Self::Pan => "Pan",
             Self::Gradient => "Gradient",
-            Self::SmartMask => "Smart mask · K",
+            Self::MagicWand => "Magic Wand · K",
         }
     }
 }
@@ -346,9 +346,6 @@ pub struct PeerBrush {
     parameter_gesture: Option<ParameterEdit>,
     blend_hover: Option<(String, String)>,
     transient: Vec<Value>,
-    mask_tolerance: f32,
-    mask_contiguous: bool,
-    smart_mask_mode: String,
     points: Vec<[f32; 2]>,
     drag_start: Option<[f32; 2]>,
     view_rect: Option<Rect>,
@@ -629,9 +626,6 @@ impl PeerBrush {
             parameter_gesture: None,
             blend_hover: None,
             transient: vec![],
-            mask_tolerance: 12.0,
-            mask_contiguous: true,
-            smart_mask_mode: "replace".into(),
             points: vec![],
             drag_start: None,
             view_rect: None,
@@ -712,6 +706,11 @@ impl PeerBrush {
     }
     fn select_tool(&mut self, tool: Tool) {
         self.tool = tool;
+        if tool == Tool::MagicWand {
+            self.selection_kind = "wand".into();
+        }
+        self.selection_path.clear();
+        self.selection_gesture_mode = None;
         self.drag_start = None;
         self.drag_revision = None;
         self.gizmo_bounds = None;
@@ -2782,7 +2781,7 @@ impl PeerBrush {
             self.drag_start = None;
             return;
         }
-        if self.tool == Tool::Selection {
+        if matches!(self.tool, Tool::Selection | Tool::MagicWand) {
             self.selection_canvas(ui, doc, &response, &painter, rect, scale);
             return;
         }
@@ -2932,10 +2931,6 @@ impl PeerBrush {
                         Tool::Liquify => {self.edit(vec![self.liquify_command(&[p])],"Liquify dab");}
                         Tool::Fill => {
                             self.layer_cmd("paint.fill", json!({"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}), "Fill layer")
-                        }
-                        Tool::SmartMask => {
-                            self.layer_cmd("mask.from_color",json!({"point":[p[0] as i32,p[1] as i32],"tolerance":self.mask_tolerance/100.0,"contiguous":self.mask_contiguous,"mode":self.smart_mask_mode}),"Smart mask");
-                            self.mask=true;self.mask_step=None;
                         }
                         Tool::Picker => self.pick_color(doc, p),
                         _ => {}
@@ -3795,7 +3790,7 @@ impl PeerBrush {
                     (egui::Key::I, Tool::Picker),
                     (egui::Key::H, Tool::Pan),
                     (egui::Key::M, Tool::Selection),
-                    (egui::Key::K, Tool::SmartMask),
+                    (egui::Key::K, Tool::MagicWand),
                 ] {
                     if !key_modifiers(i,key).command && !key_modifiers(i,key).ctrl && !key_modifiers(i,key).alt && (i.key_pressed(key)
                         || i.events.iter().any(|e| matches!(e, egui::Event::Key { physical_key: Some(k), pressed: true, .. } if *k == key))) {
@@ -3929,31 +3924,6 @@ impl PeerBrush {
                         liquify::toolbar(ui, &mut self.radius, &mut self.liquify);
                     }
                     self.retouch_toolbar(ui);
-                    if self.tool == Tool::SmartMask {
-                        controls::label(ui, "Tolerance");
-                        controls::range(
-                            ui,
-                            "mask tolerance",
-                            &mut self.mask_tolerance,
-                            0.0..=100.0,
-                            110.0,
-                            "%",
-                            0,
-                            false,
-                        );
-                        ui.checkbox(&mut self.mask_contiguous, "Contiguous");
-                        egui::ComboBox::from_id_salt("mask mode")
-                            .selected_text(&self.smart_mask_mode)
-                            .show_ui(ui, |ui| {
-                                for name in ["replace", "add", "subtract"] {
-                                    ui.selectable_value(
-                                        &mut self.smart_mask_mode,
-                                        name.into(),
-                                        name,
-                                    );
-                                }
-                            });
-                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::button(ui, Icon::Frame, "Frame selection or canvas · F").clicked()
                         {
@@ -3978,7 +3948,7 @@ impl PeerBrush {
                     });
                 });
             });
-        if self.tool == Tool::Selection {
+        if matches!(self.tool, Tool::Selection | Tool::MagicWand) {
             egui::TopBottomPanel::top("selection context")
                 .exact_height(40.)
                 .show(ctx, |ui| self.selection_toolbar(ui));
@@ -4070,7 +4040,7 @@ impl PeerBrush {
                             Tool::Selection,
                             Tool::Picker,
                             Tool::Pan,
-                            Tool::SmartMask,
+                            Tool::MagicWand,
                         ]
                         .into_iter()
                         .enumerate()
@@ -4120,7 +4090,7 @@ impl PeerBrush {
                                     | (Some("move"), Tool::Move)
                                     | (Some("rotate"), Tool::Rotate)
                                     | (Some("scale"), Tool::Scale)
-                                    | (Some("mask"), Tool::SmartMask)
+                                    | (Some("selection"), Tool::MagicWand)
                                     | (Some("fill"), Tool::Fill)
                                     | (Some("selection"), Tool::Selection)
                             );
@@ -7041,6 +7011,79 @@ mod tests {
         app.shared.lock().unwrap().doc = doc;
         app.select_content(&id);
         (app, ctx)
+    }
+    #[test]
+    fn magic_wand_selects_without_creating_or_changing_native_masks() {
+        for depth in [8, 16] {
+            for existing_mask in [false, true] {
+                let (mut app, ctx) = fixture();
+                let before = {
+                    let mut engine = app.shared.lock().unwrap();
+                    engine.doc = Document::new_depth(8, 8, depth).unwrap();
+                    for y in 0..8 {
+                        for x in 0..8 {
+                            engine.doc.layers[0].pixels.set16(
+                                x,
+                                y,
+                                if x < 4 {
+                                    [12347, 33559, 51237, 65535]
+                                } else {
+                                    [51239, 12349, 33561, 65535]
+                                },
+                            );
+                        }
+                    }
+                    let id = engine.doc.layers[0].id.clone();
+                    if existing_mask {
+                        engine
+                            .edit(
+                                "human",
+                                &[json!({"op":"mask.add","layer":id})],
+                                None,
+                                None,
+                                "Fixture mask",
+                            )
+                            .unwrap();
+                    }
+                    engine.undo.clear();
+                    engine.doc.clone()
+                };
+                app.select_content(&before.layers[0].id);
+                app.mask = existing_mask;
+                app.selection_tolerance = 0.0;
+                app.selection_merged = false;
+                frame(&mut app, &ctx, vec![], Default::default());
+                modified_key(&mut app, &ctx, egui::Key::K, Default::default());
+                assert!(app.tool == Tool::MagicWand);
+                assert_eq!(app.selection_kind, "wand");
+                let canvas = app.view_rect.unwrap();
+                let point = canvas.min + Vec2::new(1.5, 2.5) * (canvas.width() / 8.0);
+                click(&mut app, &ctx, point);
+                assert_eq!(app.mask, existing_mask, "Wand preserves the active channel");
+                let mut engine = app.shared.lock().unwrap();
+                assert_eq!(engine.doc.selection, Some([0, 0, 4, 8]));
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert_eq!(
+                    serde_json::to_value(&engine.doc.layers[0].mask).unwrap(),
+                    serde_json::to_value(&before.layers[0].mask).unwrap()
+                );
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    before.export_png().unwrap()
+                );
+                assert_eq!(engine.doc.bit_depth, depth);
+                assert_eq!(engine.undo.len(), 1);
+                engine.undo("human").unwrap();
+                assert!(engine.doc.selection.is_none());
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    before.export_png().unwrap()
+                );
+            }
+        }
     }
     fn modified_key(
         app: &mut PeerBrush,
