@@ -66,7 +66,9 @@
       "ICO",
       "Netpbm",
       "TGA",
-      "QOI"
+      "QOI",
+      "SVG",
+      "SVGZ"
     ],
     "export": [
       "PNG"
@@ -736,7 +738,7 @@
     "disk eviction",
     "broader Photoshop clipping/group compatibility"
   ],
-  "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local supported raster path or base64 PNG. Consult image_import extensions and peerbrush_image_info; select an explicit zero-based frame/page/variant when required. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Native16 input promotes the project before resampling or compositing; imported working RGB carries a standard sRGB tag on save. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",
+  "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local supported image path or base64 PNG. SVG/SVGZ placement rasterizes; image.import retains the editable source. Consult image_import extensions and peerbrush_image_info; select an explicit zero-based frame/page/variant when required. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Native16 input promotes the project before resampling or compositing; imported working RGB carries a standard sRGB tag on save. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",
   "duplicate_selection": "layer.duplicate_selection duplicates the active layer's selected rendered pixels at their original document coordinates in one edit. Irregular/feathered coverage, effects, masks and opacity are baked once into a new native-depth paint sibling; source layers stay editable and selection is retained. Without a pixel selection, duplicate the active editable layer tree; complete clipping units are required for whole-layer copies. Empty selected pixels and adjustment-only targets are refused. Optional document_id/source_revision plus shared revision, lock and reservation guards apply. Ctrl+D invokes this command; Deselect remains in Select.",
   "merge_layers": {
     "command": "layer.merge",
@@ -918,11 +920,12 @@
     "observation": "Each layer exposes its complete source definition or null. Preserve current width/height/matrix when editing content.",
     "text": "Bundled Ubuntu Sans regular/medium/semibold, explicit multiline plain text, kerning, size, line_height, left/center/right alignment, native RGBA16 color. Missing glyphs or scripts needing shaping/bidi are refused.",
     "shapes": "Rectangle, ellipse, or straight-segment path with editable points, even-odd fill, open/closed flag, stroke and stroke_width. Native RGBA16 fill/stroke colors.",
+    "svg": "Self-contained static UTF-8 SVG/SVGZ retains original markup and editable affine placement. Paths/curves, basic shapes, groups, solid colors, linear/radial gradients, local use and clip paths are supported. Text must be outlined; raster images, filters, masks, patterns, stylesheets, scripts/animation, external resources and unknown visual properties reject. SVG coverage/colors project through RGBA8, promoted for native16 projects; existing native16 raster channels remain exact. image.import retains the definition; image.place and external image-file paste rasterize it.",
     "coordinates": "Source width/height define original local frame. x/y on add are document origins. Optional matrix=[a,b,c,d,tx,ty] maps original coordinates to current raster frame, identity by default.",
-    "precision": "Colors are 0–65535 regardless of document depth; native16 projections preserve words and sub-byte antialias coverage. 8-bit documents project at their own boundary.",
+    "precision": "Native text/shapes use colors 0–65535 regardless of document depth; native16 projections preserve words and sub-byte antialias coverage. 8-bit documents project at their own boundary. SVG uses the explicitly described RGBA8 projection while retaining its original markup.",
     "guards": "Complete-layer transforms preserve definitions; selected-pixel/mask transforms require explicit rasterization. Color painting/placement refuses source layers. Mask painting and effects remain editable. Shared stale/revision/lock/reservation guards are atomic.",
-    "psd": "Private source format 8 supplements current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
-    "limits": "4 MP original source frame, 4096 characters / 96 lines, size 1–1024, line_height 0.5–4, 128 path points, stroke_width 0–256, 32 million outline/path work budget."
+    "psd": "Private source format 8 supports native text/shapes; SVG requires format 12. Both supplement current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
+    "limits": "4 MP original source frame. Native text/shapes: 4096 characters / 96 lines, size 1–1024, line_height 0.5–4, 128 path points, stroke_width 0–256, 32 million outline/path work budget. SVG: 512 KiB UTF-8 markup, 1 MiB compressed SVGZ, 4096 XML nodes, bounded reference expansion, geometry, nesting, render work and memory. External resource resolvers are disabled."
   },
   "large_documents": {
     "document_actions": [

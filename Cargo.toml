@@ -6,6 +6,9 @@ license = "GPL-3.0-only"
 description = "You and your AI. Same canvas."
 
 [dependencies]
+resvg = { version = "0.48.1", default-features = false }
+roxmltree = "0.21"
+svgtypes = "0.16"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp", "ico", "pnm", "tga", "qoi"] }

@@ -37,6 +37,7 @@ pub mod server;
 pub mod smart_mask;
 pub mod smudge;
 pub mod source;
+pub mod svg;
 pub mod thumbnails;
 pub mod transform;
 pub mod tree;

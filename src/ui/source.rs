@@ -153,6 +153,22 @@ impl PeerBrush {
                     });
                 }
                 match &mut e.source.content {
+                    Content::Svg { svg } => {
+                        ui.label("SVG source");
+                        egui::ScrollArea::vertical()
+                            .id_salt("svg source")
+                            .max_height(180.)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(svg)
+                                        .code_editor()
+                                        .desired_rows(8)
+                                        .desired_width(390.)
+                                        .char_limit(crate::svg::MARKUP_LIMIT)
+                                        .frame(false),
+                                );
+                            });
+                    }
                     Content::Text {
                         text,
                         font,

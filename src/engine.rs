@@ -995,13 +995,13 @@ impl Engine {
     pub(crate) fn import_images(
         &mut self,
         commands: &[Value],
-        pixels: Vec<Raster>,
+        pixels: Vec<crate::image_import::Prepared>,
         revision: u64,
     ) -> Result<Value, String> {
         if commands.len() != pixels.len() || commands.iter().any(|c| c["op"] != "image.import") {
             return Err("Invalid prepared image batch".into());
         }
-        let bytes: usize = pixels.iter().map(Raster::stored_bytes).sum();
+        let bytes: usize = pixels.iter().map(|p| p.pixels.stored_bytes()).sum();
         if bytes > crate::image_import::BUDGET {
             return Err("Image batch exceeds 256 MiB".into());
         }
@@ -1033,19 +1033,19 @@ impl Engine {
     fn apply_import(
         &mut self,
         c: &Value,
-        pixels: Option<Raster>,
+        pixels: Option<crate::image_import::Prepared>,
         imported_bytes: &mut usize,
     ) -> Result<(), String> {
         let pixels = match pixels {
             Some(pixels) => pixels,
-            None => crate::image_import::decode_file(
+            None => crate::image_import::prepare_file(
                 std::path::Path::new(c["path"].as_str().ok_or("Missing image path")?),
                 c,
                 crate::image_import::BUDGET - *imported_bytes,
             )?,
         };
         *imported_bytes = imported_bytes
-            .checked_add(pixels.stored_bytes())
+            .checked_add(pixels.pixels.stored_bytes())
             .ok_or("Image batch exceeds 256 MiB")?;
         if *imported_bytes > crate::image_import::BUDGET {
             return Err("Image batch exceeds 256 MiB".into());
@@ -1063,7 +1063,7 @@ impl Engine {
         mut prepared: Option<crate::merge::Prepared>,
         mut clipboard: Option<crate::layer_clipboard::Layers>,
         prepared_doc: Option<Document>,
-        mut imports: Option<std::collections::VecDeque<Raster>>,
+        mut imports: Option<std::collections::VecDeque<crate::image_import::Prepared>>,
     ) -> Result<Value, String> {
         self.ensure_open()?;
         if self.doc.read_only {

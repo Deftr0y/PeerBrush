@@ -613,6 +613,12 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
         format: if doc.layers.iter().any(|l| {
+            l.source
+                .as_ref()
+                .is_some_and(|s| matches!(s.content, crate::source::Content::Svg { .. }))
+        }) {
+            12
+        } else if doc.layers.iter().any(|l| {
             l.effects.iter().any(|e| e.weight != 1.0)
                 || l.mask
                     .as_ref()
@@ -1321,7 +1327,7 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=11).contains(&e.format)
+                if (1..=12).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash

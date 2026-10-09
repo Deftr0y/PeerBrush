@@ -1442,8 +1442,8 @@ impl PeerBrush {
             for file in pending.files {
                 let mut command = json!({"op":"image.import","path":file.path,"document_id":pending.document,"source_revision":pending.revision});
                 if let Some(choice) = file.encoded.info.choice {command[choice]=json!(file.index);}
-                let image = file.encoded.decode(&command,budget)?;
-                budget = budget.checked_sub(image.stored_bytes()).ok_or("Image batch exceeds 256 MiB")?;
+                let image = file.encoded.prepare(&command,budget)?;
+                budget = budget.checked_sub(image.pixels.stored_bytes()).ok_or("Image batch exceeds 256 MiB")?;
                 commands.push(command); pixels.push(image);
             }
             let count = commands.len(); let mut engine = shared.lock().unwrap();
@@ -6021,6 +6021,56 @@ mod tests {
         assert!(other.lock().unwrap().undo.is_empty());
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn svg_import_worker_retains_captured_source_native_depth_and_exact_single_undo() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = fixture();
+            {
+                let mut e = app.shared.lock().unwrap();
+                e.doc.bit_depth = depth;
+                e.doc.ensure_depth();
+                e.doc.layers[0]
+                    .pixels
+                    .set16(25, 25, [12345, 23457, 34569, 60001]);
+            }
+            let before = app.shared.lock().unwrap().doc.clone();
+            let markup="<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='#ff0000'/></svg>";
+            let path =
+                std::env::temp_dir().join(format!("peerbrush-ui-svg-{}.svg", uuid::Uuid::new_v4()));
+            std::fs::write(&path, markup).unwrap();
+            let encoded = crate::image_import::Encoded::file(&path).unwrap();
+            app.pending_import = Some(PendingImport {
+                project: app.project_id.clone(),
+                document: before.id.clone(),
+                revision: before.revision,
+                files: vec![ImportFile {
+                    path: path.clone(),
+                    encoded,
+                    index: 0,
+                }],
+            });
+            std::fs::write(&path, "Changed after inspection").unwrap();
+            app.commit_import();
+            wait_import(&mut app, &ctx);
+            let mut e = app.shared.lock().unwrap();
+            assert_eq!(e.doc.bit_depth, depth);
+            assert_eq!(e.undo.len(), 1);
+            assert_eq!(
+                e.doc.layers[0].source.as_ref().unwrap().content,
+                crate::source::Content::Svg { svg: markup.into() }
+            );
+            assert_eq!(e.doc.layers[0].pixels.get(4, 4), [255, 0, 0, 255]);
+            assert_eq!(
+                e.doc.layers[1].pixels.rgba16(),
+                before.layers[0].pixels.rgba16()
+            );
+            assert_eq!(app.selected, e.doc.layers[0].id);
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            drop(e);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
     fn click(app: &mut PeerBrush, ctx: &egui::Context, pos: Pos2) {
         frame(
             app,
@@ -7812,7 +7862,7 @@ mod tests {
     }
     #[test]
     fn editable_source_previews_render_pixels_without_painting_and_cancel_on_shared_changes() {
-        for kind in ["text", "shape"] {
+        for kind in ["text", "shape", "svg"] {
             let (mut app, ctx) = small_fixture();
             frame(&mut app, &ctx, vec![], Default::default());
             let doc = app.shared.lock().unwrap().doc.clone();
@@ -7820,6 +7870,9 @@ mod tests {
             let editor = app.source_editor.as_mut().unwrap();
             editor.x = 0;
             editor.y = 0;
+            if kind == "svg" {
+                editor.source=crate::source::Source{width:16,height:16,matrix:[1.,0.,0.,1.,0.,0.],content:crate::source::Content::Svg{svg:"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect x='2' y='2' width='12' height='12' fill='red'/></svg>".into()}};
+            }
             if let crate::source::Content::Text { text, size, .. } = &mut editor.source.content {
                 *text = "Hi".into();
                 *size = 16.;

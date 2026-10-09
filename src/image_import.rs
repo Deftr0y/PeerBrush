@@ -10,7 +10,7 @@ use std::{
 
 pub const EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp", "ico", "pbm", "pgm", "ppm", "pam",
-    "pnm", "tga", "qoi",
+    "pnm", "tga", "qoi", "svg", "svgz",
 ];
 pub const BUDGET: usize = 256 * 1024 * 1024;
 const ENCODED_LIMIT: usize = 128 * 1024 * 1024;
@@ -40,6 +40,11 @@ pub struct Encoded {
     format: ImageFormat,
     pub info: Info,
     offsets: Vec<usize>,
+    source: Option<crate::source::Source>,
+}
+pub struct Prepared {
+    pub pixels: Raster,
+    pub source: Option<crate::source::Source>,
 }
 
 fn bytes_at(bytes: &[u8], at: usize, len: usize) -> Result<&[u8], String> {
@@ -276,17 +281,61 @@ impl Encoded {
             .unwrap_or("")
             .to_ascii_lowercase();
         if !EXTENSIONS.contains(&ext.as_str()) {
-            return Err("Unsupported image format. Import a supported raster image; open PSD projects separately. SVG import is the next development checkpoint.".into());
+            return Err("Unsupported image format. Import a supported raster image or self-contained static SVG; open PSD projects separately. PDF/AI/EPS require explicit supported export from the source application.".into());
         }
         let file = std::fs::File::open(path).map_err(|e| format!("Cannot read image: {e}"))?;
         let metadata = file.metadata().map_err(|e| e.to_string())?;
-        if !metadata.is_file() || metadata.len() > ENCODED_LIMIT as u64 {
+        let encoded_limit = match ext.as_str() {
+            "svg" => crate::svg::MARKUP_LIMIT,
+            "svgz" => 1024 * 1024,
+            _ => ENCODED_LIMIT,
+        };
+        if !metadata.is_file() || metadata.len() > encoded_limit as u64 {
             return Err("Encoded image must be a file at most 128 MiB".into());
         }
         let mut bytes = Vec::new();
-        file.take(ENCODED_LIMIT as u64 + 1)
+        file.take(encoded_limit as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
+        if bytes.len() > encoded_limit {
+            return Err("Encoded image exceeds its raster/SVG import limit".into());
+        }
+        if ["svg", "svgz"].contains(&ext.as_str()) {
+            let mut markup = Vec::new();
+            if ext == "svgz" {
+                flate2::read::GzDecoder::new(bytes.as_slice())
+                    .take(crate::svg::MARKUP_LIMIT as u64 + 1)
+                    .read_to_end(&mut markup)
+                    .map_err(|e| format!("Invalid compressed SVG: {e}"))?;
+            } else {
+                markup = bytes.clone();
+            }
+            if markup.len() > crate::svg::MARKUP_LIMIT {
+                return Err("SVG source exceeds 512 KiB".into());
+            }
+            let svg = String::from_utf8(markup).map_err(|_| "SVG import requires UTF-8 XML")?;
+            let (width, height) = crate::svg::dimensions(&svg)?;
+            let source = crate::source::Source {
+                width,
+                height,
+                matrix: [1., 0., 0., 1., 0., 0.],
+                content: crate::source::Content::Svg { svg },
+            };
+            return Ok(Self {
+                bytes,
+                format: ImageFormat::Png,
+                info: Info {
+                    format: "SVG".into(),
+                    width,
+                    height,
+                    bit_depth: 8,
+                    choice: None,
+                    count: 1,
+                },
+                offsets: Vec::new(),
+                source: Some(source),
+            });
+        }
         let guessed = image::guess_format(&bytes).ok();
         let expected = ImageFormat::from_extension(&ext).ok_or("Unsupported image extension")?;
         let format = guessed
@@ -384,6 +433,7 @@ impl Encoded {
         Ok(Self {
             bytes,
             format,
+            source: None,
             info: Info {
                 format: format!("{format:?}"),
                 width,
@@ -396,6 +446,16 @@ impl Encoded {
         })
     }
     pub fn decode(&self, command: &Value, budget: usize) -> Result<Raster, String> {
+        if let Some(source) = &self.source {
+            if ["frame", "page", "variant"]
+                .iter()
+                .any(|key| command.get(*key).is_some())
+            {
+                return Err("Static SVG import does not accept frame/page/variant choices".into());
+            }
+            check_budget(source.width, source.height, 8, budget)?;
+            return source.render(source.width, source.height, 8);
+        }
         let mut index = None;
         for key in ["frame", "page", "variant"] {
             if let Some(value) = command.get(key) {
@@ -542,6 +602,12 @@ impl Encoded {
             Raster::from_rgba(w, h, &pixels)
         }
     }
+    pub fn prepare(&self, command: &Value, budget: usize) -> Result<Prepared, String> {
+        Ok(Prepared {
+            pixels: self.decode(command, budget)?,
+            source: self.source.clone(),
+        })
+    }
 }
 
 fn frame(mut frames: image::Frames<'_>, index: usize) -> Result<image::RgbaImage, String> {
@@ -624,13 +690,23 @@ pub fn inspect(path: &Path) -> Result<Info, String> {
 pub fn decode_file(path: &Path, command: &Value, budget: usize) -> Result<Raster, String> {
     Encoded::file(path)?.decode(command, budget)
 }
+pub fn prepare_file(path: &Path, command: &Value, budget: usize) -> Result<Prepared, String> {
+    Encoded::file(path)?.prepare(command, budget)
+}
 
 pub fn apply(
     doc: &mut crate::engine::Document,
     command: &Value,
-    mut pixels: Raster,
+    image: Prepared,
 ) -> Result<(), String> {
     use crate::engine::Layer;
+    let Prepared { mut pixels, source } = image;
+    if let Some(source) = &source {
+        source.validate()?;
+        if (source.width, source.height) != (pixels.width, pixels.height) {
+            return Err("Prepared SVG dimensions differ from its source".into());
+        }
+    }
     if doc.layers.len() >= 100 {
         return Err("Initial version supports up to 100 layers".into());
     }
@@ -688,6 +764,7 @@ pub fn apply(
     }
     let mut layer = Layer::new(&name, "paint", pixels.width, pixels.height);
     layer.pixels = pixels;
+    layer.source = source;
     layer.parent = parent.map(str::to_owned);
     layer.x = x;
     layer.y = y;

@@ -39,6 +39,9 @@ pub enum Content {
         stroke: [u16; 4],
         stroke_width: f32,
     },
+    Svg {
+        svg: String,
+    },
 }
 pub fn font(name: &str) -> Result<FontRef<'static>, String> {
     let data: &'static [u8] = match name {
@@ -65,6 +68,11 @@ impl Source {
             return Err("Invalid editable-source transform".into());
         }
         match &self.content {
+            Content::Svg { svg } => {
+                if crate::svg::dimensions(svg)? != (self.width, self.height) {
+                    return Err("SVG viewport must match its editable source frame".into());
+                }
+            }
             Content::Text {
                 text,
                 font: name,
@@ -131,6 +139,7 @@ impl Source {
         match self.content {
             Content::Text { .. } => "Text",
             Content::Shape { .. } => "Vector shape",
+            Content::Svg { .. } => "SVG",
         }
     }
     pub fn render(&self, w: u32, h: u32, depth: u16) -> Result<Raster, String> {
@@ -139,8 +148,12 @@ impl Source {
         if ![8, 16].contains(&depth) {
             return Err("Editable projections require 8 or 16 bit channels".into());
         }
+        if let Content::Svg { svg } = &self.content {
+            return crate::svg::render(svg, [self.width, self.height], self.matrix, w, h, depth);
+        }
         let mut base = Raster::new_depth(self.width, self.height, depth);
         match &self.content {
+            Content::Svg { .. } => unreachable!("SVG projects directly from its vector definition"),
             Content::Text {
                 text,
                 font: name,
