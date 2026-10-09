@@ -8,6 +8,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), 'dist');
 const types = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8', '.png': 'image/png',
+  '.mp4': 'video/mp4',
   '.svg': 'image/svg+xml', '.ttf': 'font/ttf', '.txt': 'text/plain; charset=utf-8',
 };
 

@@ -276,3 +276,9 @@ h1 { letter-spacing: -4.5px; font-size: clamp(58px, 5.5vw, 80px); }
   *, *::before, *::after { transition: none !important; animation: none !important; }
   .reveal { opacity: 1; transform: none; }
 }
+
+/* Native trailer controls remain available at every screen size. */
+.trailer-video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; background: #171518; }
+.trailer-video:focus-visible { outline: 2px solid var(--orange); outline-offset: 5px; }
+.trailer-description { margin-top: 14px; font-size: 14px; }
+.trailer-download { margin-top: 12px; }
