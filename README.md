@@ -43,7 +43,7 @@ You stay in control while AI works directly alongside you inside the same editin
 ### Built for the way you work
 
 - **Progressive document loading.** Cancellable native16 PSD decoding, saved-image feedback and bounded disposable effect caches. See [large-document behavior](docs/large-documents.md).
-- **Independent project tabs.** New/open keeps existing work in its own tab. Copy editable layer trees across projects or drag onto a tab for a rendered destination preview; Shift moves them with an undo step in each project. Background AI edits use stable project handles. See [project targeting](docs/projects.md).
+- **Independent project tabs.** Compact rounded Ember tabs show unsaved changes and blue AI activity. Long names shorten with full-name tooltips; the all-projects picker keeps overflow accessible. New/open keeps existing work in its own tab. Copy editable layer trees across projects or drag onto a tab for a rendered destination preview; Shift moves them with an undo step in each project. Background AI edits use stable project handles. See [project targeting](docs/projects.md).
 - **Visual, compact controls.** White tool glyphs, Ubuntu Sans, uncluttered range values and live canvas feedback.
 - **Compact transform modes.** Q/W/E/R sit at the bottom right, with the same shortcuts, live rendered gizmos and blue AI feedback.
 - **A browsable brush library.** Twenty-one original procedural presets, six categories, search and readable stroke previews. Edit pressure response, texture, taper and flow, then save custom brushes; the UI and agents use the same native-depth painting engine.

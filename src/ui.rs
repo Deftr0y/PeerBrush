@@ -13,6 +13,7 @@ mod refinement;
 mod retouch;
 mod selection;
 mod source;
+mod tabs;
 use crate::{controls, thumbnails};
 use crate::{
     engine::Document,
@@ -274,7 +275,9 @@ pub struct PeerBrush {
     project_id: String,
     project_views: HashMap<String, ProjectView>,
     project_rects: HashMap<String, Rect>,
-    project_labels: HashMap<String, String>,
+    project_labels: HashMap<String, tabs::Label>,
+    tab_active: String,
+    project_picker_rect: Option<Rect>,
     doc_snapshot: Document,
     jobs: HashSet<String>,
     lifecycle: Option<lifecycle::Review>,
@@ -563,6 +566,8 @@ impl PeerBrush {
             project_views: HashMap::new(),
             project_rects: HashMap::new(),
             project_labels: HashMap::new(),
+            tab_active: String::new(),
+            project_picker_rect: None,
             doc_snapshot,
             jobs: HashSet::new(),
             lifecycle: None,
@@ -3423,118 +3428,7 @@ impl PeerBrush {
             });
     }
     fn project_tabs(&mut self, ctx: &egui::Context) {
-        let active = crate::workspace::active_id_in(&self.workspace);
-        self.switch_project(&active);
-        let entries = crate::workspace::entries_in(&self.workspace);
-        let live: HashSet<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
-        self.project_views.retain(|id, _| live.contains(id));
-        self.project_rects.clear();
-        let mut select = None;
-        let mut close = None;
-        let mut hovered = None;
-        egui::TopBottomPanel::top("project tabs")
-            .exact_height(32.)
-            .show(ctx, |ui| {
-                if self.lifecycle.is_some() || self.lifecycle_frame {
-                    ui.disable();
-                }
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.;
-                        for (id, name, shared) in entries {
-                            let mut ai = false;
-                            if let Ok(e) = shared.try_lock() {
-                                self.project_labels.insert(
-                                    id.clone(),
-                                    format!(
-                                        "{}{}",
-                                        e.doc.name,
-                                        if e.doc.revision != e.saved_revision {
-                                            " *"
-                                        } else {
-                                            ""
-                                        }
-                                    ),
-                                );
-                                ai = !e.leases.is_empty()
-                                    || e.ai_change.as_ref().is_some_and(|change| {
-                                        crate::engine::now().saturating_sub(change.at) < 3
-                                    });
-                            }
-                            let label = self.project_labels.get(&id).unwrap_or(&name);
-                            let response = ui.add(
-                                egui::Button::new(RichText::new(label).color(if ai {
-                                    AI_BLUE
-                                } else {
-                                    MUTED
-                                }))
-                                .frame(false)
-                                .selected(id == self.project_id),
-                            );
-                            self.project_rects.insert(id.clone(), response.rect);
-                            if id != self.project_id
-                                && ctx
-                                    .input(|i| i.pointer.interact_pos())
-                                    .is_some_and(|p| response.rect.contains(p))
-                            {
-                                if let Some(drag) = &self.layer_drag {
-                                    if let Ok(e) = shared.try_lock() {
-                                        let target = self
-                                            .project_views
-                                            .get(&id)
-                                            .map(|v| v.selected.clone())
-                                            .filter(|target| {
-                                                e.doc.layers.iter().any(|l| l.id == *target)
-                                            })
-                                            .unwrap_or_else(|| {
-                                                e.doc
-                                                    .layers
-                                                    .first()
-                                                    .map(|l| l.id.clone())
-                                                    .unwrap_or_default()
-                                            });
-                                        hovered = Some(TabTransfer {
-                                            source: self.project_id.clone(),
-                                            destination: id.clone(),
-                                            source_document: self.doc_snapshot.id.clone(),
-                                            destination_document: e.doc.id.clone(),
-                                            source_revision: drag.revision,
-                                            destination_revision: e.doc.revision,
-                                            layers: drag.ids.clone(),
-                                            target,
-                                            move_layers: ctx.input(|i| i.modifiers.shift),
-                                        });
-                                        ui.painter().line_segment(
-                                            [
-                                                response.rect.left_bottom(),
-                                                response.rect.right_bottom(),
-                                            ],
-                                            Stroke::new(2., ACCENT),
-                                        );
-                                    }
-                                }
-                            }
-                            if response.clicked() {
-                                select = Some(id.clone());
-                            }
-                            if ui
-                                .add(egui::Button::new("×").frame(false))
-                                .on_hover_text("Close project")
-                                .clicked()
-                            {
-                                close = Some((id.clone(), shared.clone()));
-                            }
-                        }
-                        if ui
-                            .add(egui::Button::new("+").frame(false))
-                            .on_hover_text("New project")
-                            .clicked()
-                        {
-                            self.show_new = true;
-                        }
-                    })
-                });
-            });
+        let (select, close, hovered) = self.draw_project_tabs(ctx);
         while let Ok(reply) = self.transfer_rx.try_recv() {
             match reply.output {
                 TransferOutput::Preview(result) => {
