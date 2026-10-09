@@ -9,6 +9,7 @@ description = "You and your AI. Same canvas."
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+moxcms = "0.8.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml_edit = "0.25"

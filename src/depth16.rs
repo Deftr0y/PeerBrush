@@ -124,26 +124,8 @@ pub(crate) fn prepare_with_masks(
 ) -> Result<Vec<Option<Arc<Image16>>>, String> {
     validate_budget(doc)?;
     let mut out = vec![None; doc.layers.len()];
-    let depth = |index: usize| {
-        let mut value = 0;
-        let mut parent = doc.layers[index].parent.as_deref();
-        while let Some(id) = parent {
-            value += 1;
-            parent = doc
-                .layers
-                .iter()
-                .find(|l| l.id == id)
-                .and_then(|l| l.parent.as_deref());
-            if value > 16 {
-                break;
-            }
-        }
-        value
-    };
-    let mut order: Vec<_> = (0..doc.layers.len()).collect();
-    order.sort_by_key(|&i| (std::cmp::Reverse(depth(i)), std::cmp::Reverse(i)));
     let cache = COLORS.get_or_init(|| Mutex::new(ColorCache::default()));
-    for index in order {
+    for index in crate::compositor::effect_order(doc) {
         let layer = &doc.layers[index];
         if !layer.effects.iter().any(|e| e.enabled) {
             continue;
@@ -341,7 +323,14 @@ pub fn preview(
     target: Option<&str>,
     mask: bool,
 ) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
-    let (width, height, words, rect) = preview16(doc, rect, edge, target, mask)?;
+    let (width, height, mut words, rect) = preview16(doc, rect, edge, target, mask)?;
+    if !mask {
+        if let Some(profile) = doc.icc_profile.as_deref() {
+            if crate::color_profile::supported(profile).is_ok() {
+                crate::color_profile::convert16(profile, &mut words)?;
+            }
+        }
+    }
     let bytes = crate::render::rgba8(width, height, |x, y| {
         let at = ((y * width + x) * 4) as usize;
         display_pixel(words[at..at + 4].try_into().unwrap())

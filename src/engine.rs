@@ -1,4 +1,4 @@
-use crate::raster::{blend, check_size, png, Pixel, Raster};
+use crate::raster::{blend, check_size, Pixel, Raster};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -148,6 +148,11 @@ pub struct Document {
     pub revision: u64,
     #[serde(default = "default_bit_depth")]
     pub bit_depth: u16,
+    /// Protected source profile; editable copies explicitly convert to sRGB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icc_profile: Option<std::sync::Arc<Vec<u8>>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub srgb_tagged: bool,
     pub layers: Vec<Layer>,
     pub selection: Option<[i32; 4]>,
     #[serde(default)]
@@ -169,6 +174,8 @@ impl Document {
             height: h,
             revision: 0,
             bit_depth: 8,
+            icc_profile: None,
+            srgb_tagged: false,
             layers: vec![Layer::new("Paint 1", "paint", w, h)],
             selection: None,
             selection_polygon: None,
@@ -218,6 +225,25 @@ impl Document {
         if self.bit_depth == 16 {
             return crate::depth16::preview(self, rect, edge, target, mask);
         }
+        let (w, h, mut bytes, rect) = self.preview_native8(rect, edge, target, mask)?;
+        if !mask {
+            if let Some(profile) = self.icc_profile.as_deref() {
+                // Unsupported profiles retain raw feedback with a visible warning.
+                // Explicit conversion uses the strict, fallible path instead.
+                if crate::color_profile::supported(profile).is_ok() {
+                    crate::color_profile::convert8(profile, &mut bytes)?;
+                }
+            }
+        }
+        Ok((w, h, bytes, rect))
+    }
+    pub(crate) fn preview_native8(
+        &self,
+        rect: Option<[i32; 4]>,
+        edge: u32,
+        target: Option<&str>,
+        mask: bool,
+    ) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
         let mut rect = rect.unwrap_or([0, 0, self.width as i32, self.height as i32]);
         rect[0] = rect[0].clamp(0, self.width as i32 - 1);
         rect[1] = rect[1].clamp(0, self.height as i32 - 1);
@@ -305,12 +331,23 @@ impl Document {
         Ok((w, h, bytes, rect))
     }
     pub fn export_png(&self) -> Result<Vec<u8>, String> {
+        let profile = self
+            .icc_profile
+            .as_deref()
+            .map(Vec::as_slice)
+            .or_else(|| self.srgb_tagged.then(crate::color_profile::srgb_profile));
         if self.bit_depth == 16 {
             let image = crate::depth16::render(self)?;
-            return crate::raster::png16(image.width, image.height, &image.words);
+            return crate::raster::png16_with_profile(
+                image.width,
+                image.height,
+                &image.words,
+                profile,
+            );
         }
-        let (w, h, bytes, _) = self.preview(None, self.width.max(self.height), None, false)?;
-        png(w, h, &bytes)
+        let (w, h, bytes, _) =
+            self.preview_native8(None, self.width.max(self.height), None, false)?;
+        crate::raster::png_with_profile(w, h, &bytes, profile)
     }
 }
 
@@ -498,7 +535,7 @@ impl Engine {
     }
     fn state_core(&mut self) -> Value {
         self.expire();
-        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -1575,7 +1612,7 @@ impl Engine {
                 l.opacity = (v as f32).clamp(0.0, 1.0);
             }
             if let Some(v) = c.get("blend").and_then(Value::as_str) {
-                if !crate::raster::BLENDS.iter().any(|(mode, _)| *mode == v) {
+                if !crate::raster::layer_blends(&l.kind).any(|(mode, _)| mode == v) {
                     return Err("Unsupported blend mode".into());
                 }
                 l.blend = v.into();

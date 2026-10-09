@@ -705,6 +705,13 @@ pub const BLENDS: &[(&str, &str)] = &[
     ("subtract", "Subtract"),
     ("divide", "Divide"),
 ];
+/// Pass Through is a backdrop operation for folders, never a pixel blend mode.
+pub fn layer_blends(kind: &str) -> impl Iterator<Item = (&'static str, &'static str)> {
+    (kind == "group")
+        .then_some(("pass_through", "Pass Through"))
+        .into_iter()
+        .chain(BLENDS.iter().copied())
+}
 pub fn blend(dst: Pixel, src: Pixel, opacity: f32, mode: &str) -> Pixel {
     let sa = src[3] as f32 / 255.0 * opacity;
     let da = dst[3] as f32 / 255.0;
@@ -789,9 +796,23 @@ pub fn blend(dst: Pixel, src: Pixel, opacity: f32, mode: &str) -> Pixel {
 }
 
 pub fn png(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    png_with_profile(w, h, rgba, None)
+}
+pub fn png_with_profile(
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+    profile: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
     let mut out = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut out)
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+    if let Some(profile) = profile {
+        encoder
+            .set_icc_profile(profile.to_vec())
+            .map_err(|e| e.to_string())?;
+    }
+    encoder
         .write_image(rgba, w, h, image::ExtendedColorType::Rgba8)
         .map_err(|e| e.to_string())?;
     Ok(out)
@@ -881,6 +902,14 @@ pub fn blend16(dst: Pixel16, src: Pixel16, opacity: f64, mode: &str) -> Pixel16 
     out
 }
 pub fn png16(w: u32, h: u32, rgba: &[u16]) -> Result<Vec<u8>, String> {
+    png16_with_profile(w, h, rgba, None)
+}
+pub fn png16_with_profile(
+    w: u32,
+    h: u32,
+    rgba: &[u16],
+    profile: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
     check_size(w, h)?;
     if rgba.len() != w as usize * h as usize * 4 {
@@ -889,7 +918,13 @@ pub fn png16(w: u32, h: u32, rgba: &[u16]) -> Result<Vec<u8>, String> {
     // image's encoder expects native-endian words and writes PNG's big-endian samples.
     let bytes: Vec<u8> = rgba.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let mut out = vec![];
-    image::codecs::png::PngEncoder::new(&mut out)
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+    if let Some(profile) = profile {
+        encoder
+            .set_icc_profile(profile.to_vec())
+            .map_err(|e| e.to_string())?;
+    }
+    encoder
         .write_image(&bytes, w, h, image::ExtendedColorType::Rgba16)
         .map_err(|e| e.to_string())?;
     Ok(out)

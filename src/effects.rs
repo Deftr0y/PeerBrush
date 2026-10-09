@@ -408,30 +408,7 @@ pub fn prepare(
 ) -> Result<Vec<Option<Arc<Image>>>, String> {
     validate_budget(doc)?;
     let mut out = vec![None; doc.layers.len()];
-    let depth = |l: &Layer| {
-        let mut d = 0;
-        let mut p = l.parent.as_deref();
-        while let Some(parent) = p {
-            d += 1;
-            p = doc
-                .layers
-                .iter()
-                .find(|n| n.id == parent)
-                .and_then(|n| n.parent.as_deref());
-            if d > 16 {
-                break;
-            }
-        }
-        d
-    };
-    let mut order = (0..doc.layers.len()).collect::<Vec<_>>();
-    order.sort_by_key(|&i| {
-        (
-            std::cmp::Reverse(depth(&doc.layers[i])),
-            std::cmp::Reverse(i),
-        )
-    });
-    for i in order {
+    for i in crate::compositor::effect_order(doc) {
         let l = &doc.layers[i];
         if !active(l) {
             continue;

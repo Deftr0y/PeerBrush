@@ -116,24 +116,7 @@ fn color_reach(layer: &crate::engine::Layer) -> i32 {
         .sum()
 }
 fn order(doc: &Document) -> Vec<usize> {
-    let mut out = (0..doc.layers.len()).collect::<Vec<_>>();
-    out.sort_by_key(|&i| {
-        let mut depth = 0;
-        let mut parent = doc.layers[i].parent.as_deref();
-        while let Some(id) = parent {
-            depth += 1;
-            parent = doc
-                .layers
-                .iter()
-                .find(|l| l.id == id)
-                .and_then(|l| l.parent.as_deref());
-            if depth > 16 {
-                break;
-            }
-        }
-        (std::cmp::Reverse(depth), std::cmp::Reverse(i))
-    });
-    out
+    crate::compositor::effect_order(doc)
 }
 fn local(area: [i32; 4], layer: &crate::engine::Layer) -> [i32; 4] {
     [

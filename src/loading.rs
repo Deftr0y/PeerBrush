@@ -66,14 +66,37 @@ impl Control {
     pub fn take_preview(&self) -> Option<(u32, u32, Vec<u8>)> {
         self.status.lock().unwrap().preview.take()
     }
-    pub(crate) fn preview(&self, raster: &crate::raster::Raster) -> Result<(), String> {
+    pub(crate) fn preview(
+        &self,
+        raster: &crate::raster::Raster,
+        profile: Option<&[u8]>,
+    ) -> Result<(), String> {
         self.check()?;
         let scale = (512. / raster.width.max(raster.height) as f64).min(1.);
         let w = (raster.width as f64 * scale).round().max(1.) as u32;
         let h = (raster.height as f64 * scale).round().max(1.) as u32;
-        let bytes = crate::render::rgba8(w, h, |x, y| {
-            raster.get((x as f64 / scale) as i32, (y as f64 / scale) as i32)
-        });
+        let profile = profile.filter(|p| crate::color_profile::supported(p).is_ok());
+        let bytes = if raster.depth == 16 {
+            let mut words = crate::render::rgba16(w, h, |x, y| {
+                raster.get16((x as f64 / scale) as i32, (y as f64 / scale) as i32)
+            });
+            if let Some(profile) = profile {
+                crate::color_profile::convert16(profile, &mut words)?;
+            }
+            words
+                .chunks_exact(4)
+                .flat_map(|p| crate::depth16::display_pixel(p.try_into().unwrap()))
+                .collect()
+        } else {
+            let mut bytes = crate::render::rgba8(w, h, |x, y| {
+                raster.get((x as f64 / scale) as i32, (y as f64 / scale) as i32)
+            });
+            if let Some(profile) = profile {
+                crate::color_profile::convert8(profile, &mut bytes)?;
+            }
+            bytes
+        };
+        self.check()?;
         self.status.lock().unwrap().preview = Some((w, h, bytes));
         Ok(())
     }

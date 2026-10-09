@@ -1,4 +1,4 @@
-//! Shared straight-alpha composition with isolated clipping groups.
+//! Shared straight-alpha composition with clipping and backdrop-aware folders.
 use crate::{
     effects::Image,
     engine::Document,
@@ -124,13 +124,28 @@ fn below(
     masks: &Masks,
     colors: &Colors,
 ) -> Pixel {
-    let mut out = [0; 4];
+    below_on(doc, parent, above, x, y, masks, colors, [0; 4])
+}
+#[allow(clippy::too_many_arguments)]
+fn below_on(
+    doc: &Document,
+    parent: Option<&str>,
+    above: usize,
+    x: i32,
+    y: i32,
+    masks: &Masks,
+    colors: &Colors,
+    mut out: Pixel,
+) -> Pixel {
     for i in (above..doc.layers.len()).rev() {
         let l = &doc.layers[i];
         if l.parent.as_deref() != parent || !l.visible || l.clip_to.is_some() {
             continue;
         }
-        if l.kind == "adjustment" {
+        if l.kind == "group" && l.blend == "pass_through" {
+            let result = below_on(doc, Some(&l.id), 0, x, y, masks, colors, out);
+            out = mix(out, result, amount(doc, i, x, y, masks));
+        } else if l.kind == "adjustment" {
             if let Some(image) = &colors[i] {
                 out = backdrop_adjust(out, image.get(x, y), amount(doc, i, x, y, masks), &l.blend);
             }
@@ -171,12 +186,92 @@ pub(crate) fn adjustment_input(
     {
         unit(doc, base, index + 1, x, y, masks, colors)
     } else {
-        below(doc, l.parent.as_deref(), index + 1, x, y, masks, colors)
+        below_on(
+            doc,
+            l.parent.as_deref(),
+            index + 1,
+            x,
+            y,
+            masks,
+            colors,
+            group_backdrop(doc, l.parent.as_deref(), x, y, masks, colors),
+        )
     }
+}
+
+fn group_backdrop(
+    doc: &Document,
+    parent: Option<&str>,
+    x: i32,
+    y: i32,
+    masks: &Masks,
+    colors: &Colors,
+) -> Pixel {
+    let Some((i, folder)) = doc
+        .layers
+        .iter()
+        .enumerate()
+        .find(|(_, l)| Some(l.id.as_str()) == parent)
+    else {
+        return [0; 4];
+    };
+    if folder.blend != "pass_through" {
+        return [0; 4];
+    }
+    below_on(
+        doc,
+        folder.parent.as_deref(),
+        i + 1,
+        x,
+        y,
+        masks,
+        colors,
+        group_backdrop(doc, folder.parent.as_deref(), x, y, masks, colors),
+    )
+}
+
+/// Prepare lower sibling subtrees before an adjustment that reads their backdrop.
+/// A depth-only sort cannot honor dependencies across pass-through boundaries.
+pub(crate) fn effect_order(doc: &Document) -> Vec<usize> {
+    fn visit(doc: &Document, parent: Option<&str>, out: &mut Vec<usize>) {
+        for (i, layer) in doc
+            .layers
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, l)| l.parent.as_deref() == parent)
+        {
+            if layer.kind == "group" {
+                visit(doc, Some(&layer.id), out);
+            }
+            out.push(i);
+        }
+    }
+    let mut out = Vec::with_capacity(doc.layers.len());
+    visit(doc, None, &mut out);
+    out
 }
 
 pub fn validate_clipping(doc: &Document) -> Result<(), String> {
     for (i, l) in doc.layers.iter().enumerate() {
+        if l.blend == "pass_through" {
+            if l.kind != "group" {
+                return Err("Pass Through is available only for folders".into());
+            }
+            if l.effects.iter().any(|e| e.enabled) {
+                return Err(
+                    "Choose an isolated folder blend before enabling folder effects".into(),
+                );
+            }
+            if l.clip_to.is_some()
+                || doc
+                    .layers
+                    .iter()
+                    .any(|n| n.clip_to.as_deref() == Some(&l.id))
+            {
+                return Err("Release folder clipping before choosing Pass Through".into());
+            }
+        }
         if let Some(id) = &l.clip_to {
             let siblings: Vec<_> = doc
                 .layers
@@ -353,11 +448,23 @@ impl<'a> Plan<'a> {
         self.raw(index, x, y)
     }
     pub fn sample(&self, group: usize, x: i32, y: i32) -> Pixel {
+        self.sample_on(group, x, y, [0; 4])
+    }
+    fn sample_on(&self, group: usize, x: i32, y: i32, mut out: Pixel) -> Pixel {
         let Some(children) = self.groups.get(group) else {
-            return [0; 4];
+            return out;
         };
-        let mut out = [0; 4];
         for &i in children {
+            if let Kind::Group(children) = self.kinds[i] {
+                if self.doc.layers[i].blend == "pass_through" {
+                    out = mix(
+                        out,
+                        self.sample_on(children, x, y, out),
+                        self.amount(i, x, y),
+                    );
+                    continue;
+                }
+            }
             if matches!(self.kinds[i], Kind::Adjustment) {
                 if let Some(image) = &self.colors[i] {
                     out = backdrop_adjust(

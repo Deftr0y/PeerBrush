@@ -68,6 +68,86 @@ fn tag(out: &mut Vec<u8>, key: &[u8; 4], v: &[u8]) {
     }
 }
 
+fn blend_name(key: &[u8]) -> Option<&'static str> {
+    Some(match key {
+        b"norm" => "normal",
+        b"pass" => "pass_through",
+        b"mul " => "multiply",
+        b"scrn" => "screen",
+        b"over" => "overlay",
+        b"dark" => "darken",
+        b"lite" => "lighten",
+        b"lddg" => "linear_dodge",
+        b"lbrn" => "linear_burn",
+        b"div " => "color_dodge",
+        b"idiv" => "color_burn",
+        b"hLit" => "hard_light",
+        b"sLit" => "soft_light",
+        b"diff" => "difference",
+        b"smud" => "exclusion",
+        b"fsub" => "subtract",
+        b"fdiv" => "divide",
+        _ => return None,
+    })
+}
+
+fn read_blend(key: &[u8], warnings: &mut Vec<String>) -> &'static str {
+    blend_name(key).unwrap_or_else(|| {
+        warnings.push(format!(
+            "Unsupported Photoshop blend mode: {}",
+            String::from_utf8_lossy(key)
+        ));
+        "normal"
+    })
+}
+
+// The shared compositor implements Photoshop's default grouped raster clipping.
+// More complicated units keep their standard baked appearance until supported.
+fn standard_clipping(doc: &Document) -> bool {
+    doc.layers.iter().all(|layer| {
+        layer.clip_to.as_ref().is_none_or(|base| {
+            ["paint", "fill"].contains(&layer.kind.as_str())
+                && doc
+                    .layers
+                    .iter()
+                    .any(|l| l.id == *base && ["paint", "fill"].contains(&l.kind.as_str()))
+        })
+    })
+}
+
+fn default_blending_ranges(bytes: &[u8]) -> bool {
+    bytes.is_empty()
+        || (bytes.len() <= 32
+            && bytes.len() % 8 == 0
+            && bytes.chunks_exact(4).all(|range| range == [0, 0, 255, 255]))
+}
+
+fn standard_flag(key: &[u8], bytes: &[u8]) -> Result<(), &'static str> {
+    let boolean = bytes.len() == 4 && bytes[0] <= 1 && bytes[1..] == [0; 3];
+    match key {
+        b"clbl" if boolean && bytes[0] == 1 => Ok(()),
+        b"clbl" => Err("Blend Clipped Layers As Group disabled or invalid (clbl)"),
+        b"knko" if bytes == [0; 4] => Ok(()),
+        b"knko" => Err("Photoshop knockout blending (knko)"),
+        b"iOpa"
+            if (bytes.len() == 1 || bytes.len() == 4)
+                && bytes[0] == 255
+                && bytes[1..].iter().all(|v| *v == 0) =>
+        {
+            Ok(())
+        }
+        b"iOpa" => Err("Photoshop fill opacity (iOpa)"),
+        b"lspf" if bytes == [0; 4] => Ok(()),
+        b"lspf" => Err("Photoshop layer protection flags (lspf)"),
+        // Interior effects and vector sources are separately protected. These
+        // validated flags do not alter ordinary integer-positioned raster layers.
+        b"infx" if boolean => Ok(()),
+        b"sn2P" if bytes.len() == 4 && u32::from_be_bytes(bytes.try_into().unwrap()) <= 1 => Ok(()),
+        b"lyid" if bytes.len() == 4 => Ok(()),
+        _ => Err("Invalid Photoshop layer flag"),
+    }
+}
+
 /// Non-rendering Photoshop layer information that remains standard PSD data.
 /// Only a small, validated allowlist can be emitted by this codec.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,12 +325,9 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     } else {
         None
     };
-    // Standard PSD layers contain the current appearance; private format 4 retains editable adjustment/clipping sources.
-    let baked = if doc
-        .layers
-        .iter()
-        .any(|l| l.kind == "adjustment" || l.clip_to.is_some())
-    {
+    // Ordinary raster clipping remains standard, editable PSD layer data.
+    // Adjustments and unsupported clipping units still need a standard bake.
+    let baked = if doc.layers.iter().any(|l| l.kind == "adjustment") || !standard_clipping(doc) {
         let mut layer = Layer::new(
             "PeerBrush composite · editable sources in PeerBrush",
             "paint",
@@ -395,6 +472,7 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         }
         records.extend_from_slice(b"8BIM");
         records.extend_from_slice(match l.blend.as_str() {
+            "pass_through" if *section != 3 => b"pass",
             "multiply" => b"mul ",
             "screen" => b"scrn",
             "overlay" => b"over",
@@ -413,7 +491,7 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
             _ => b"norm",
         });
         records.push((l.opacity * 255.0).round() as u8);
-        records.push(0);
+        records.push(u8::from(l.clip_to.is_some()));
         records.push(if l.visible { 0 } else { 2 });
         records.push(0);
         let mut extra = vec![];
@@ -456,9 +534,20 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
             u16b(&mut unicode, c);
         }
         tag(&mut extra, b"luni", &unicode);
+        if *section != 3
+            && doc
+                .layers
+                .iter()
+                .any(|n| n.clip_to.as_deref() == Some(&l.id))
+        {
+            tag(&mut extra, b"clbl", &[1, 0, 0, 0]);
+        }
         if *section != 0 {
             let mut s = vec![];
             u32b(&mut s, *section);
+            if *section != 3 && l.blend == "pass_through" {
+                s.extend_from_slice(b"8BIMpass");
+            }
             tag(&mut extra, b"lsct", &s);
         }
         if *section != 3 {
@@ -523,7 +612,9 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if crate::retained::has_originals(doc) {
+        format: if doc.layers.iter().any(|l| l.blend == "pass_through") {
+            10
+        } else if crate::retained::has_originals(doc) {
             9
         } else if doc.layers.iter().any(|l| l.source.is_some()) {
             8
@@ -617,6 +708,16 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     u16b(&mut out, doc.bit_depth);
     u16b(&mut out, 3);
     u32b(&mut out, 0);
+    if doc.srgb_tagged {
+        let profile = crate::color_profile::srgb_profile();
+        resources.extend_from_slice(b"8BIM");
+        u16b(&mut resources, 1039);
+        resources.extend([0; 2]);
+        block(&mut resources, profile);
+        if profile.len() % 2 != 0 {
+            resources.push(0);
+        }
+    }
     block(&mut out, &resources);
     block(&mut out, &layer_section);
     out.extend(composite);
@@ -705,6 +806,7 @@ struct Record {
     mask_default: u8,
     mask_enabled: bool,
     section: u32,
+    clipped: bool,
 }
 fn decoded_storage(records: &[Record], w: u32, h: u32, depth: u16) -> Result<(), String> {
     let tile = crate::raster::TILE as i64;
@@ -1076,7 +1178,6 @@ pub fn decode_reader<R: Read + std::io::Seek>(
             break;
         }
     }
-    control.preview(&merged)?;
     decode_parts(
         &resources,
         &layer_section,
@@ -1130,6 +1231,9 @@ fn decode_parts(
     let mut embedded = None;
     let mut warnings = vec![];
     let mut has_merged_composite = true;
+    let mut icc_profile = None;
+    let mut seen_profile = false;
+    let mut srgb_tagged = false;
     while rr.pos < resources.len() {
         if rr.bytes(4)? != b"8BIM" {
             return Err("Invalid image resource".into());
@@ -1149,17 +1253,37 @@ fn decode_parts(
             has_merged_composite = payload[4] != 0;
         }
         if key == 1039 {
-            warnings.push("Embedded color profiles are not managed by the initial editor".into());
+            if seen_profile {
+                return Err("Duplicate Photoshop ICC profiles are ambiguous".into());
+            }
+            seen_profile = true;
+            if payload.len() > crate::color_profile::MAX_PROFILE_BYTES {
+                return Err("Photoshop ICC profile exceeds the 4 MiB limit".into());
+            }
+            if payload == crate::color_profile::srgb_profile() {
+                // Exact built-in working profile: no conversion or semantic
+                // change is needed. Similar/unknown profiles stay protected.
+                srgb_tagged = true;
+            } else {
+                match crate::color_profile::supported(payload) {
+                    Ok(()) => warnings.push("Embedded RGB color profiles use an sRGB preview. Convert to an sRGB copy to edit; original samples and profile remain protected".into()),
+                    Err(reason) => warnings.push(format!("Embedded color profiles are protected; this preview is unmanaged: {reason}")),
+                }
+                icc_profile = Some(std::sync::Arc::new(payload.to_vec()));
+            }
         }
         if payload.len() % 2 != 0 {
             rr.bytes(1)?;
         }
     }
+    control.preview(&merged, icc_profile.as_deref().map(Vec::as_slice))?;
     let high = depth == 16;
     if high && !has_merged_composite {
         return Err("This 16-bit PSD has no saved compatibility image. Re-save a copy in Photoshop with Maximize PSD Compatibility enabled to preview it in PeerBrush".into());
     }
-    if let Some(bytes) = embedded {
+    // Supplementary sources cannot override an unsupported standard resource
+    // (for example a profile added without changing layer/composite hashes).
+    if let Some(bytes) = embedded.filter(|_| warnings.is_empty()) {
         control.progress("Restoring editable sources", 0, 1)?;
         let mut json = vec![];
         let limit = if high {
@@ -1189,14 +1313,15 @@ fn decode_parts(
                     128 * 1024 * 1024
                 }
         {
-            if let Ok(e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=9).contains(&e.format)
+            if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
+                if (1..=10).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash
                     && validate(&e.document).is_ok()
                 {
                     control.progress("Ready", 1, 1)?;
+                    e.document.srgb_tagged |= srgb_tagged;
                     return Ok(e.document);
                 }
             }
@@ -1252,40 +1377,29 @@ fn decode_parts(
                     return Err("Invalid blend signature".into());
                 }
                 let blendkey = lr.bytes(4)?;
-                let blend = match blendkey {
-                    b"norm" => "normal",
-                    b"mul " => "multiply",
-                    b"scrn" => "screen",
-                    b"over" => "overlay",
-                    b"dark" => "darken",
-                    b"lite" => "lighten",
-                    b"lddg" => "linear_dodge",
-                    b"lbrn" => "linear_burn",
-                    b"div " => "color_dodge",
-                    b"idiv" => "color_burn",
-                    b"hLit" => "hard_light",
-                    b"sLit" => "soft_light",
-                    b"diff" => "difference",
-                    b"smud" => "exclusion",
-                    b"fsub" => "subtract",
-                    b"fdiv" => "divide",
-                    _ => {
-                        warnings.push("Unsupported PSD blending mode".into());
-                        "normal"
-                    }
-                };
+                let mut blend = read_blend(blendkey, &mut warnings);
                 let opacity = lr.u8()? as f32 / 255.0;
-                if lr.u8()? != 0 {
-                    warnings.push("Clipping layers are not editable in the initial version".into());
+                let clipping = lr.u8()?;
+                if clipping > 1 {
+                    warnings.push(format!("Invalid Photoshop clipping flag: {clipping}"));
                 }
                 let flags = lr.u8()?;
-                lr.u8()?;
+                if flags & 1 != 0 || flags & !0x1f != 0 {
+                    warnings.push("Unsupported Photoshop layer protection or flags".into());
+                }
+                if lr.u8()? != 0 {
+                    warnings.push("Invalid Photoshop layer filler".into());
+                }
                 let extra = lr.block()?;
                 let mut ex = Cursor::new(extra);
                 let maskdata = ex.block()?;
                 let mut mask_bounds = None;
                 let mut mask_default = 255;
                 let mut mask_enabled = true;
+                if !maskdata.is_empty() && (maskdata.len() != 20 || maskdata[18..] != [0; 2]) {
+                    warnings
+                        .push("Advanced or invalid Photoshop mask data is not supported".into());
+                }
                 if maskdata.len() >= 18 {
                     let mut m = Cursor::new(maskdata);
                     mask_bounds = Some([m.i32()?, m.i32()?, m.i32()?, m.i32()?]);
@@ -1303,22 +1417,35 @@ fn decode_parts(
                         warnings.push("Advanced PSD mask flags are not supported yet".into());
                     }
                 }
-                ex.block()?;
+                if !default_blending_ranges(ex.block()?) {
+                    warnings.push(
+                        "Photoshop Blend If ranges are not supported; using the saved composite"
+                            .into(),
+                    );
+                }
                 let np = ex.u8()? as usize;
                 let mut name = String::from_utf8_lossy(ex.bytes(np)?).to_string();
                 let padded = (np + 1 + 3) & !3;
                 ex.bytes(padded - np - 1)?;
                 let mut section = 0;
                 let mut psd_metadata = vec![];
+                let mut seen_tags = std::collections::HashSet::new();
                 while ex.pos + 12 <= extra.len() {
                     let signature = ex.bytes(4)?;
                     if signature != b"8BIM" && signature != b"8B64" {
+                        warnings.push("Unrecognized Photoshop layer tag signature".into());
                         break;
                     }
                     let key = ex.bytes(4)?;
                     let payload = ex.block()?;
                     if payload.len() % 2 != 0 {
                         ex.bytes(1)?;
+                    }
+                    if !seen_tags.insert(key) {
+                        warnings.push(format!(
+                            "Duplicate Photoshop layer tag: {}",
+                            String::from_utf8_lossy(key)
+                        ));
                     }
                     match key {
                         b"luni" => {
@@ -1334,7 +1461,29 @@ fn decode_parts(
                             name = String::from_utf16_lossy(&chars);
                         }
                         b"lsct" | b"lsdk" => {
-                            section = Cursor::new(payload).u32()?;
+                            if seen_tags.contains(b"lsct".as_slice())
+                                && seen_tags.contains(b"lsdk".as_slice())
+                            {
+                                warnings.push("Conflicting Photoshop section divider tags".into());
+                            }
+                            let mut divider = Cursor::new(payload);
+                            section = divider.u32()?;
+                            if ![4, 12, 16].contains(&payload.len()) || section > 3 {
+                                warnings.push(
+                                    "Unsupported Photoshop section divider (lsct/lsdk)".into(),
+                                );
+                            }
+                            if payload.len() >= 12 {
+                                if divider.bytes(4)? != b"8BIM" {
+                                    warnings.push("Invalid Photoshop group blend signature".into());
+                                }
+                                blend = read_blend(divider.bytes(4)?, &mut warnings);
+                            }
+                            if payload.len() >= 16 && divider.u32()? != 0 {
+                                warnings.push(
+                                    "Photoshop animation scene groups are not supported".into(),
+                                );
+                            }
                         }
                         b"fxrp" | b"lclr" | b"lnsr" | b"shmd" => {
                             if payload.len() > 128 {
@@ -1362,12 +1511,32 @@ fn decode_parts(
                                 ));
                             }
                         }
-                        b"lyid" | b"lspf" | b"clbl" | b"infx" | b"knko" | b"iOpa" | b"sn2P" => {}
+                        b"lyid" | b"lspf" | b"clbl" | b"infx" | b"knko" | b"iOpa" | b"sn2P" => {
+                            if signature != b"8BIM" {
+                                warnings.push("Unsupported Photoshop layer flag signature".into());
+                            } else if let Err(reason) = standard_flag(key, payload) {
+                                warnings.push(format!(
+                                    "Unsupported Photoshop setting {}: {reason}; using the saved composite",
+                                    String::from_utf8_lossy(key)
+                                ));
+                            }
+                        }
                         _ => warnings.push(format!(
                             "Unsupported Photoshop feature: {}",
                             String::from_utf8_lossy(key)
                         )),
                     }
+                }
+                if ex.pos != extra.len() && extra[ex.pos..].iter().any(|v| *v != 0) {
+                    warnings.push(
+                        "Unrecognized Photoshop layer data; using the saved composite".into(),
+                    );
+                }
+                if section == 0 && flags & 0x18 == 0x18 {
+                    warnings.push("Photoshop layer pixels do not represent its appearance".into());
+                }
+                if section != 0 && clipping != 0 {
+                    warnings.push("Photoshop clipping involving a folder is not supported".into());
                 }
                 let mut layer = Layer::new(
                     &name,
@@ -1394,6 +1563,7 @@ fn decode_parts(
                     mask_default,
                     mask_enabled,
                     section,
+                    clipped: clipping == 1,
                 });
             }
             if warnings.is_empty() {
@@ -1482,16 +1652,22 @@ fn decode_parts(
             }
         }
     }
-    warnings.sort();
-    warnings.dedup();
     let mut doc = Document::new(w, h)?;
     doc.bit_depth = depth;
+    doc.icc_profile = icc_profile;
+    doc.srgb_tagged = srgb_tagged;
     doc.layers.clear();
     let mut parents = Vec::<String>::new();
+    let mut clipped = std::collections::HashSet::new();
     for mut rec in records.into_iter().rev() {
         if rec.section == 3 {
-            parents.pop();
+            if parents.pop().is_none() {
+                warnings.push("Unbalanced Photoshop folder boundaries".into());
+            }
             continue;
+        }
+        if rec.clipped {
+            clipped.insert(rec.layer.id.clone());
         }
         rec.layer.parent = parents.last().cloned();
         if rec.layer.kind == "group" {
@@ -1499,6 +1675,40 @@ fn decode_parts(
         }
         doc.layers.push(rec.layer);
     }
+    if !parents.is_empty() {
+        warnings.push("Unbalanced Photoshop folder boundaries".into());
+    }
+    // Photoshop clipping flags refer to the nearest non-clipped sibling below.
+    // Hidden siblings are still structural bases; folders must not leak bases.
+    let mut bases = std::collections::HashMap::new();
+    for layer in doc.layers.iter_mut().rev() {
+        if clipped.contains(&layer.id) {
+            if let Some((base, kind)) = bases.get(&layer.parent) {
+                if layer.kind == "paint" && kind == "paint" {
+                    layer.clip_to = Some(String::clone(base));
+                } else {
+                    warnings.push(format!(
+                        "Photoshop clipping involving a folder is not supported: {}",
+                        layer.name
+                    ));
+                }
+            } else {
+                warnings.push(format!(
+                    "Photoshop clipping layer has no base in its folder: {}",
+                    layer.name
+                ));
+            }
+        } else {
+            bases.insert(layer.parent.clone(), (layer.id.clone(), layer.kind.clone()));
+        }
+    }
+    if let Err(error) = crate::compositor::validate_clipping(&doc) {
+        warnings.push(format!(
+            "Unsupported Photoshop composition: {error}; using the saved composite"
+        ));
+    }
+    warnings.sort();
+    warnings.dedup();
     if doc.layers.is_empty() || !warnings.is_empty() {
         let mut l = Layer::new("Saved PSD composite", "paint", w, h);
         l.pixels = merged;
@@ -1675,6 +1885,21 @@ fn decode_channel_16(data: &[u8], w: u32, h: u32) -> Result<Vec<u16>, String> {
     decode_planes_16(data, w, h, 1)
 }
 pub fn validate(doc: &Document) -> Result<(), String> {
+    if let Some(profile) = &doc.icc_profile {
+        if doc.srgb_tagged {
+            return Err(
+                "A document cannot have both an original ICC profile and an sRGB tag".into(),
+            );
+        }
+        if !doc.read_only {
+            return Err(
+                "Profiled sources must stay read-only until explicitly converted to sRGB".into(),
+            );
+        }
+        if profile.len() > crate::color_profile::MAX_PROFILE_BYTES {
+            return Err("ICC profile exceeds the 4 MiB limit".into());
+        }
+    }
     crate::compositor::validate_clipping(doc)?;
     for coverage in [&doc.selection_coverage, &doc.selection_previous]
         .into_iter()
@@ -1713,10 +1938,7 @@ pub fn validate(doc: &Document) -> Result<(), String> {
         {
             return Err("Invalid layer coordinates or kind".into());
         }
-        if !crate::raster::BLENDS
-            .iter()
-            .any(|(mode, _)| *mode == l.blend)
-        {
+        if !crate::raster::layer_blends(&l.kind).any(|(mode, _)| mode == l.blend) {
             return Err("Invalid blend mode".into());
         }
         if l.kind == "adjustment"
@@ -1821,6 +2043,7 @@ mod storage_tests {
             mask_default: 255,
             mask_enabled: true,
             section: 0,
+            clipped: false,
         }
     }
     #[test]

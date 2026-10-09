@@ -102,10 +102,7 @@ pub fn validate(snapshot: &Layers) -> Result<(), String> {
         if !(0.0..=1.0).contains(&l.opacity) {
             return Err("Clipboard layer opacity must be between 0 and 1".into());
         }
-        if !crate::raster::BLENDS
-            .iter()
-            .any(|(mode, _)| *mode == l.blend)
-        {
+        if !crate::raster::layer_blends(&l.kind).any(|(mode, _)| mode == l.blend) {
             return Err("Clipboard contains an unsupported layer blend".into());
         }
         if let Some(mask) = &l.mask {

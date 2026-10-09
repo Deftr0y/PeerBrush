@@ -2123,6 +2123,7 @@ dependencies = [
  "eframe",
  "flate2",
  "image",
+ "moxcms",
  "rfd",
  "serde",
  "serde_json",

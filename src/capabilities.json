@@ -37,6 +37,13 @@
     "selection_pixels": 16000000,
     "selection_boundary_edges": 500000
   },
+  "color_profiles": {
+    "supported": "PSD ICC v2/v4 RGB matrix/TRC with XYZ connection space; sRGB/Adobe RGB/Display P3/ProPhoto matrix profiles. Display and loading previews convert to sRGB at native depth before projection.",
+    "source": "Profiled imports remain read-only saved composites; raw channels and exact ICC bytes survive protected PNG export. Observed document.color_profile exposes source/preview/conversion_available/reason without profile bytes.",
+    "copy": "document action compatible_copy requires convert_to_srgb:true for a profiled source. Flattens/converts at original 8/16-bit depth, preserves alpha, creates new identity/path and rechecks reservations/revision. Converted PSD/PNG carries a standard sRGB ICC tag; exact built-in working profile reopens without repeated conversion.",
+    "intent": "Relative colorimetric, no black-point compensation; out-of-gamut values clip. Screen assumed sRGB, no monitor profile or HDR mapping.",
+    "limits": "4 MiB profile, 128 tags, 65536 TRC entries, four disposable cache entries. LUT/non-RGB/non-XYZ/device-link/abstract/named/HDR profiles remain protected with unmanaged-preview reason and unavailable conversion; ambiguous duplicate PSD resources reject. Editable profiled stacks, assignment, soft proofing and PNG/JPEG import normalization remain pending."
+  },
   "formats": {
     "work": "PSD v1, 8-bit and 16-bit RGB",
     "import": [
@@ -703,7 +710,7 @@
     "subject/object segmentation",
     "heal/clone",
     "disk eviction",
-    "broader Photoshop clipping/pass-through group compatibility"
+    "broader Photoshop clipping/group compatibility"
   ],
   "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local PNG/JPEG path or base64 PNG. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",
   "merge_layers": {
@@ -761,7 +768,18 @@
   },
   "adjustments": "One target paint layer gets a clipped adjustment; a folder gets an adjustment inside it; multiple selected roots get a scoped folder. Clip base and followers stay together; copy/delete/reorder refuse incomplete clipping units.",
   "folder_transforms": "move/transform on a folder in Color mode changes all descendants, including hidden children, around one document-space pivot. Omit pivot to use descendant bounds; selection_only:false explicitly transforms the whole folder with an active selection. Masks keep their editable native frame, group/adjustment effects sample document coordinates, and locked/reserved descendants reject the entire batch. UI selected roots exclude selected descendants and commit one gesture. Folder mask-only and selected-pixel transforms require selecting a child instead.",
-  "psd_sources": "Private format 5 retains native 16-bit samples and editable PeerBrush sources; older 8-bit formats remain readable. Standard PSD raster appearance is baked for other editors. Unsupported Photoshop structure opens protected at its original precision; compatible_copy explicitly creates a flattened editable copy at the same bit depth without touching the source.",
+  "psd_sources": "Supplementary PeerBrush formats retain native samples and editable sources alongside current standard raster/mask channels and a merged composite. Default grouped raster clipping stays layered in standard 8/16-bit RGB PSD data, including inside isolated folders. Adjustment layers and clipping involving folders still use a standard composite bake. Unsupported Photoshop structure opens protected at its original precision; compatible_copy explicitly creates a flattened editable copy at the same bit depth without touching the source.",
+  "psd_clipping": {
+    "supported": "Contiguous paint/fill raster followers above a raster base, at root or within an isolated or pass-through folder; standard opacity, supported blends, visibility and raster masks. The base blend applies to the complete clipping unit. Missing clbl uses Photoshop's default grouped behavior; saves explicitly write clbl:true on clipping bases.",
+    "protected": "Imported folder clipping, ungrouped clipping (clbl:false), orphan/cross-folder bases, invalid flags, Blend If ranges, non-default fill opacity, knockout, Photoshop protection flags, unknown/scene groups and unmanaged ICC profiles remain read-only from their saved native-depth composite.",
+    "commands": "Observe clip_to; use layer.clip, layer.update and the ordinary shared editing/history/reservation tools. Private sources cannot override protection caused by an unsupported standard resource."
+  },
+  "pass_through_folders": {
+    "command": "layer.update with blend:pass_through on a group; available in the native folder blend menu. New folders retain the Normal default.",
+    "behavior": "Children and adjustments blend against the external backdrop through nested pass-through folders, stopping at an isolated folder. Folder opacity/masks attenuate the combined change. Native 8/16-bit rendering, live previews, reservations, history and layer clipboard share engine sources.",
+    "psd": "Standard pass keys and lsct/lsdk overrides import; raster-only folders save layered standard dividers, rasters, masks and the current composite. Supplementary format 10 retains pass-through sources. Adjustment documents still use a standard composite bake.",
+    "limits": "Enabled folder color effects, clipping to/from a pass-through folder and merging that folder are rejected; choose an isolated blend or release clipping. Unsupported Photoshop adjustment descriptors/styles remain protected."
+  },
   "color_depth": {
     "supported": [
       8,

@@ -2,6 +2,7 @@ pub mod adjustment;
 pub mod brush;
 pub mod clipboard;
 pub mod collaboration;
+pub mod color_profile;
 pub mod compositor;
 pub mod controls;
 pub mod depth16;

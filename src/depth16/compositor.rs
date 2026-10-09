@@ -97,8 +97,36 @@ impl<'a> Plan16<'a> {
         {
             self.unit_from(base, index + 1, x, y)
         } else {
-            self.sample_below(self.group(layer.parent.as_deref()), index + 1, x, y)
+            self.sample_below(
+                self.group(layer.parent.as_deref()),
+                index + 1,
+                x,
+                y,
+                self.group_backdrop(layer.parent.as_deref(), x, y),
+            )
         }
+    }
+
+    fn group_backdrop(&self, parent: Option<&str>, x: i32, y: i32) -> Pixel {
+        let Some((i, folder)) = self
+            .doc
+            .layers
+            .iter()
+            .enumerate()
+            .find(|(_, l)| Some(l.id.as_str()) == parent)
+        else {
+            return [0; 4];
+        };
+        if folder.blend != "pass_through" {
+            return [0; 4];
+        }
+        self.sample_below(
+            self.group(folder.parent.as_deref()),
+            i + 1,
+            x,
+            y,
+            self.group_backdrop(folder.parent.as_deref(), x, y),
+        )
     }
 
     pub fn with_prepared(doc: &'a Document, masks: &Masks, colors: &Colors) -> Self {
@@ -235,16 +263,25 @@ impl<'a> Plan16<'a> {
         self.raw(index, x, y)
     }
     pub fn sample(&self, group: usize, x: i32, y: i32) -> Pixel {
-        self.sample_below(group, 0, x, y)
+        self.sample_below(group, 0, x, y, [0; 4])
     }
-    fn sample_below(&self, group: usize, above: usize, x: i32, y: i32) -> Pixel {
+    fn sample_below(&self, group: usize, above: usize, x: i32, y: i32, mut out: Pixel) -> Pixel {
         let Some(children) = self.groups.get(group) else {
-            return [0; 4];
+            return out;
         };
-        let mut out = [0; 4];
         for &i in children {
             if i < above {
                 continue;
+            }
+            if let Kind::Group(children) = self.kinds[i] {
+                if self.doc.layers[i].blend == "pass_through" {
+                    out = mix(
+                        out,
+                        self.sample_below(children, 0, x, y, out),
+                        self.amount(i, x, y),
+                    );
+                    continue;
+                }
             }
             if matches!(self.kinds[i], Kind::Adjustment) {
                 if let Some(image) = &self.colors[i] {

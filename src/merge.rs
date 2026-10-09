@@ -102,6 +102,13 @@ pub fn prepare(doc: &Document, ids: &[String], name: Option<&str>) -> Result<Pre
         return Err("This PSD is read-only".into());
     }
     let roots = resolve(doc, ids)?;
+    if roots.iter().any(|id| {
+        doc.layers
+            .iter()
+            .any(|l| l.id == *id && l.blend == "pass_through")
+    }) {
+        return Err("Choose an isolated folder blend before merging a pass-through folder".into());
+    }
     let top = doc.layers.iter().find(|l| l.id == roots[0]).unwrap();
     let mut removed: HashSet<String> = roots.iter().cloned().collect();
     loop {

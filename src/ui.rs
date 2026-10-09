@@ -1590,15 +1590,14 @@ impl PeerBrush {
         self.blend_hover = None;
         let combo = egui::ComboBox::from_id_salt("blend")
             .selected_text(
-                crate::raster::BLENDS
-                    .iter()
+                crate::raster::layer_blends(&l.kind)
                     .find(|(mode, _)| *mode == blend)
-                    .map(|(_, label)| *label)
+                    .map(|(_, label)| label)
                     .unwrap_or("Normal"),
             )
             .width(ui.available_width() - 10.0)
             .show_ui(ui, |ui| {
-                for &(name, label) in crate::raster::BLENDS {
+                for (name, label) in crate::raster::layer_blends(&l.kind) {
                     let response = ui.selectable_value(&mut blend, name.into(), label);
                     if response.hovered() {
                         self.blend_hover = Some((l.id.clone(), name.into()));
@@ -3310,9 +3309,13 @@ impl PeerBrush {
                     if doc.read_only {
                         ui.label(RichText::new("READ ONLY").size(10.0).color(ACCENT))
                             .on_hover_text(doc.warnings.join("\n"));
-                        if ui.button(format!("Edit {}-bit copy",doc.bit_depth)).on_hover_text("Create a flattened editable copy at the original color precision. Unsupported Photoshop layers are flattened; the source file stays untouched.").clicked() {
-                            let shared=self.shared.clone();let revision=doc.revision;
-                            self.job(move||{server::compatible_copy(&shared,"human",Some(revision))?;Ok("Editing a flattened copy at original precision · save under a new name".into())});
+                        let profiled = doc.icc_profile.is_some();
+                        let convertible = !profiled || doc.icc_profile.as_deref().is_some_and(|p| crate::color_profile::supported(p).is_ok());
+                        let label = if profiled { "Convert to sRGB copy".into() } else { format!("Edit {}-bit copy", doc.bit_depth) };
+                        let hint = if profiled { "Convert the saved artwork to sRGB at its original bit depth. Out-of-gamut colors are clipped; Photoshop layers are flattened. Save under a new name." } else { "Create a flattened editable copy at the original color precision. Unsupported Photoshop layers are flattened; the source file stays untouched." };
+                        if ui.add_enabled(convertible, egui::Button::new(label)).on_hover_text(hint).clicked() {
+                            let shared = self.shared.clone(); let revision = doc.revision;
+                            self.job(move || { server::compatible_copy_with_color(&shared, "human", Some(revision), profiled)?; Ok("Editing a flattened copy at original precision · save under a new name".into()) });
                         }
                     }
                     let leases = self.shared.lock().unwrap().leases.clone();
