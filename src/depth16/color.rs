@@ -194,6 +194,14 @@ pub(crate) fn apply_region(
 }
 fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Result<(), String> {
     match kind {
+        "channel_clamp" => {
+            let (channel, minimum, maximum) =
+                effects::channel_clamp::native_bounds(&settings, 65535)?;
+            for pixel in image.words.chunks_exact_mut(4) {
+                pixel[channel] = pixel[channel].clamp(minimum, maximum);
+            }
+            return Ok(());
+        }
         "posterize" => {
             let levels = effects::posterize::levels(&settings)?;
             let table: Vec<u16> = (0..=65535u16)

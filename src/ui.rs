@@ -2359,7 +2359,7 @@ impl PeerBrush {
                             );
                         });
                         let add = ui.menu_button("+ Add effect", |ui| {
-                            self.effect_picker(ui,true);
+                            self.effect_picker(ui,true,l.kind=="adjustment");
                         });
                         self.effect_add_rect = Some(add.response.rect);
                         egui::ScrollArea::vertical().id_salt("mask effects").max_height((ui.available_height()-8.0).max(24.0)).show(ui,|ui| {
@@ -5221,6 +5221,290 @@ mod tests {
                 assert_eq!(
                     e.doc.layers[0].pixels.rgba16(),
                     before.layers[0].pixels.rgba16()
+                );
+            }
+        }
+    }
+    #[test]
+    fn clamp_bounds_drag_preview_and_typed_acceptance_keep_native_sources_and_one_undo() {
+        for depth in [8, 16] {
+            for typed in [false, true] {
+                let (mut app, ctx) = fixture();
+                let before = {
+                    let mut e = app.shared.lock().unwrap();
+                    e.doc = Document::new_depth(8, 8, depth).unwrap();
+                    for y in 0..8 {
+                        for x in 0..8 {
+                            if depth == 16 {
+                                e.doc.layers[0]
+                                    .pixels
+                                    .set16(x, y, [10001, 30003, 50007, 12345]);
+                            } else {
+                                e.doc.layers[0].pixels.set(x, y, [39, 117, 195, 48]);
+                            }
+                        }
+                    }
+                    let layer = e.doc.layers[0].id.clone();
+                    e.edit(
+                        "human",
+                        &[json!({"op":"effect.add","layer":layer,"kind":"channel_clamp"})],
+                        None,
+                        None,
+                        "Fixture",
+                    )
+                    .unwrap();
+                    e.undo.clear();
+                    app.selected = layer.clone();
+                    app.selection_layers = [layer.clone()].into_iter().collect();
+                    app.effect_selected =
+                        Some((layer, false, e.doc.layers[0].effects[0].id.clone()));
+                    e.doc.clone()
+                };
+                let native = |doc: &Document| {
+                    if depth == 16 {
+                        crate::depth16::render(doc).unwrap().words
+                    } else {
+                        doc.preview(None, 8, None, false)
+                            .unwrap()
+                            .2
+                            .into_iter()
+                            .map(u16::from)
+                            .collect()
+                    }
+                };
+                let mut time = 0.;
+                let mut draw = |app: &mut PeerBrush, events| {
+                    time += 0.05;
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1100., 900.),
+                            )),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                let position = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "0.00%" => {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()).center())
+                        }
+                        _ => None,
+                    })
+                    .expect("Clamp minimum value");
+                let end = position + Vec2::new(35., 0.);
+                if typed {
+                    for _ in 0..2 {
+                        draw(
+                            &mut app,
+                            vec![
+                                egui::Event::PointerMoved(position),
+                                button(
+                                    position,
+                                    egui::PointerButton::Primary,
+                                    true,
+                                    Default::default(),
+                                ),
+                            ],
+                        );
+                        draw(
+                            &mut app,
+                            vec![button(
+                                position,
+                                egui::PointerButton::Primary,
+                                false,
+                                Default::default(),
+                            )],
+                        );
+                    }
+                    assert!(ctx.wants_keyboard_input());
+                    draw(&mut app, vec![egui::Event::Text("90".into())]);
+                } else {
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(position),
+                            button(
+                                position,
+                                egui::PointerButton::Primary,
+                                true,
+                                Default::default(),
+                            ),
+                        ],
+                    );
+                    draw(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(position + Vec2::new(25., 0.))],
+                    );
+                    draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                }
+                let gesture = app
+                    .parameter_gesture
+                    .as_ref()
+                    .expect("Clamp parameter edit");
+                let commands = if typed {
+                    // Text remains provisional until Enter; the accepted value
+                    // must match the same engine preview used by drag gestures.
+                    assert_eq!(
+                        app.shared.lock().unwrap().doc.layers[0].effects[0].settings["minimum"],
+                        0.0
+                    );
+                    vec![
+                        json!({"op":"effect.update","layer":before.layers[0].id,"effect":before.layers[0].effects[0].id,"settings":{"channel":"r","minimum":0.9,"maximum":1.0}}),
+                    ]
+                } else {
+                    gesture.commands.clone()
+                };
+                let draft = Engine::preview_edits(before.clone(), &commands).unwrap();
+                assert!(draft.layers[0].effects[0].settings["minimum"]
+                    .as_f64()
+                    .is_some());
+                assert_ne!(
+                    draft.layers[0].effects[0].settings["minimum"],
+                    before.layers[0].effects[0].settings["minimum"],
+                    "depth={depth} typed={typed} commands={commands:?}"
+                );
+                assert_ne!(native(&draft), native(&before));
+                assert_eq!(
+                    draft.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(app.shared.lock().unwrap().doc.revision, before.revision);
+                if typed {
+                    draw(
+                        &mut app,
+                        vec![egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                } else {
+                    draw(
+                        &mut app,
+                        vec![button(
+                            end,
+                            egui::PointerButton::Primary,
+                            false,
+                            Default::default(),
+                        )],
+                    );
+                }
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1);
+                assert_eq!(native(&e.doc), native(&draft));
+                if typed {
+                    assert_eq!(e.doc.layers[0].effects[0].settings["minimum"], 0.9);
+                }
+                e.undo("human").unwrap();
+                assert_eq!(native(&e.doc), native(&before));
+                assert_eq!(
+                    e.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+            }
+        }
+    }
+    #[test]
+    fn clamp_channel_buttons_commit_exact_selected_channels_and_undo_at_both_depths() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = fixture();
+            let before = {
+                let mut e = app.shared.lock().unwrap();
+                e.doc = Document::new_depth(8, 8, depth).unwrap();
+                for y in 0..8 {
+                    for x in 0..8 {
+                        if depth == 16 {
+                            e.doc.layers[0]
+                                .pixels
+                                .set16(x, y, [10001, 30003, 50007, 12345]);
+                        } else {
+                            e.doc.layers[0].pixels.set(x, y, [39, 117, 195, 48]);
+                        }
+                    }
+                }
+                let layer = e.doc.layers[0].id.clone();
+                e.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"channel_clamp","settings":{"channel":"r","minimum":0.8,"maximum":0.9}})], None, None, "Fixture").unwrap();
+                e.undo.clear();
+                app.selected = layer.clone();
+                app.selection_layers = [layer.clone()].into_iter().collect();
+                app.effect_selected = Some((layer, false, e.doc.layers[0].effects[0].id.clone()));
+                e.doc.clone()
+            };
+            let mut time = 0.0;
+            let mut draw = |app: &mut PeerBrush, events| {
+                time += 0.05;
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100., 900.))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            };
+            draw(&mut app, vec![]);
+            for (channel, label) in [("g", "G"), ("b", "B"), ("o", "O")] {
+                let output = draw(&mut app, vec![]);
+                let point = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == label => {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()).center())
+                        }
+                        _ => None,
+                    })
+                    .expect("Clamp channel button");
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        button(
+                            point,
+                            egui::PointerButton::Primary,
+                            true,
+                            Default::default(),
+                        ),
+                    ],
+                );
+                draw(
+                    &mut app,
+                    vec![button(
+                        point,
+                        egui::PointerButton::Primary,
+                        false,
+                        Default::default(),
+                    )],
+                );
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.doc.layers[0].effects[0].settings["channel"], channel);
+                assert_eq!(e.undo.len(), 1);
+                let expected=Engine::preview_edits(before.clone(),&[json!({"op":"effect.update","layer":before.layers[0].id,"effect":before.layers[0].effects[0].id,"settings":{"channel":channel,"minimum":0.8,"maximum":0.9}})]).unwrap();
+                assert_eq!(
+                    e.doc.preview(None, 8, None, false).unwrap().2,
+                    expected.preview(None, 8, None, false).unwrap().2
+                );
+                assert_eq!(
+                    e.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                e.undo("human").unwrap();
+                assert_eq!(
+                    e.doc.preview(None, 8, None, false).unwrap().2,
+                    before.preview(None, 8, None, false).unwrap().2
                 );
             }
         }

@@ -5,6 +5,9 @@ pub(super) fn settings(
     kind: &str,
     settings: &mut Value,
 ) -> Option<egui::Response> {
+    if kind == "channel_clamp" {
+        return channel_clamp_settings(ui, settings);
+    }
     let mut changed = None;
     if kind == "levels" {
         changed = levels_slider(ui, settings);
@@ -357,7 +360,7 @@ pub(super) fn effect_icon(kind: &str) -> Icon {
     match kind {
         "paint" => Icon::Brush,
         "fill" => Icon::Fill,
-        "levels" | "posterize" => Icon::Levels,
+        "levels" | "posterize" | "channel_clamp" => Icon::Levels,
         "curves" => Icon::Curves,
         "blur" | "gaussian" => Icon::Blur,
         "adjust" => Icon::Adjust,
@@ -379,7 +382,7 @@ pub(super) fn menu_effect(ui: &mut egui::Ui, kind: &str, label: &str) -> egui::R
     .inner
 }
 impl PeerBrush {
-    pub(super) fn effect_picker(&mut self, ui: &mut egui::Ui, mask: bool) {
+    pub(super) fn effect_picker(&mut self, ui: &mut egui::Ui, mask: bool, adjustment: bool) {
         let search_id = ui.id().with(("effect search", mask));
         let mut search = ui
             .ctx()
@@ -400,6 +403,7 @@ impl PeerBrush {
         let entries = effects::catalog::ENTRIES
             .iter()
             .filter(|entry| entry.matches(mask, &search))
+            .filter(|entry| !(adjustment && entry.kind == "channel_clamp"))
             .collect::<Vec<_>>();
         if entries.is_empty() {
             ui.label(RichText::new("No matching effects").color(MUTED));
@@ -493,7 +497,7 @@ impl PeerBrush {
         ui.horizontal(|ui| {
             controls::label(ui, "COLOR EFFECTS");
             let add = ui.menu_button("+ Add effect", |ui| {
-                self.effect_picker(ui, false);
+                self.effect_picker(ui, false, l.kind == "adjustment");
             });
             self.effect_add_rect = Some(add.response.rect);
         });
@@ -767,6 +771,60 @@ mod tests {
             }
         }
     }
+}
+
+fn channel_clamp_settings(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Response> {
+    let (channel, minimum, maximum) = effects::channel_clamp::parameters(settings).ok()?;
+    let mut changed = None;
+    ui.horizontal(|ui| {
+        controls::label(ui, "Channel");
+        for (index, (key, label, hint)) in [
+            ("r", "R", "Red"),
+            ("g", "G", "Green"),
+            ("b", "B", "Blue"),
+            ("o", "O", "Opacity / alpha"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut response = ui
+                .selectable_label(channel == index, label)
+                .on_hover_text(hint);
+            if response.clicked() && channel != index {
+                settings["channel"] = json!(key);
+                response.mark_changed();
+                changed = Some(response);
+            }
+        }
+    });
+    egui::Grid::new((ui.id(), "clamp bounds"))
+        .spacing(Vec2::new(8.0, 6.0))
+        .show(ui, |ui| {
+            for (key, label, original, limit) in [
+                ("minimum", "Minimum", minimum, 0.0..=maximum as f32 * 100.0),
+                (
+                    "maximum",
+                    "Maximum",
+                    maximum,
+                    minimum as f32 * 100.0..=100.0,
+                ),
+            ] {
+                controls::label(ui, label);
+                let mut value = original as f32 * 100.0;
+                let response = controls::range(ui, key, &mut value, limit, 145.0, "%", 2, false);
+                if response.changed() || response.double_clicked() {
+                    let value = f64::from(value) / 100.0;
+                    settings[key] = json!(if key == "minimum" {
+                        value.min(maximum)
+                    } else {
+                        value.max(minimum)
+                    });
+                    changed = Some(response);
+                }
+                ui.end_row();
+            }
+        });
+    changed
 }
 
 fn levels_slider(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Response> {

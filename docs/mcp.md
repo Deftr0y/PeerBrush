@@ -156,6 +156,12 @@ Color effects add `color_balance`, `hsl`, `bloom` and `liquify`. Balance uses sh
 {"op":"effect.add","layer":"LAYER_ID","kind":"posterize","settings":{"levels":4},"weight":0.75}
 ```
 
+`channel_clamp` selects one `channel`: `r`, `g`, `b` or `o` (opacity/alpha). Normalized `minimum` and `maximum` are 0–1, default 0 and 1. Bounds convert once to the nearest native sample; values inside them and all other channels stay exact at full strength. Reversed bounds, wrong types and unknown channels reject atomically. Stack instances for independent per-channel limits. Regular layer and isolated folder color stacks support ordinary strength, editable settings, bypass, removal and shared preview/undo/source/reservation guards. Mask and adjustment stacks exclude it; clipped adjustments preserve base opacity. Opacity increases cover empty tiles in the stored layer rectangle or folder's canvas frame. PSD source format 14 protects older readers while retaining standard rendered raster/mask channels and the current merged image.
+
+```json
+{"op":"effect.add","layer":"LAYER_ID","kind":"channel_clamp","settings":{"channel":"r","minimum":0.2,"maximum":0.8}}
+```
+
 `liquify.stroke` accepts document-space points, mode push/expand/pinch/restore, radius and strength. It appends to the latest enabled liquify effect, or creates one; optional `effect` chooses an existing effect ID. Stored strokes use layer-local coordinates and retain their selection clipping. Inspect the result, undo a poor stroke, revise and retry. `effect.update` edits the retained source settings after later work.
 
 Supported 8-bit and 16-bit RGB PSD raster layers, masks and default grouped raster clipping remain editable at their native depth. Raster clipping relationships appear in each observed layer's `clip_to` and use ordinary shared commands, reservations and history. Standard PSD saves preserve those raster stacks; adjustment layers and clipping involving folders still require a standard composite bake. Unsupported Photoshop structures open protected from their saved composite, with specific reasons in `document.warnings`. Document action `compatible_copy` explicitly creates a flattened editable project at the original bit depth with no source filename, so saving requires a new path. This copy preserves channel precision; unsupported Photoshop source structure remains in the original file. See [current fidelity limits](photoshop-fidelity.md).

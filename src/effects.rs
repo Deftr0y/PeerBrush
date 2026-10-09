@@ -11,6 +11,7 @@ pub const BUDGET: usize = 256 * 1024 * 1024;
 // Caches and transient effect buffers have separate, bounded budgets.
 pub const WORKING_BUDGET: usize = 256 * 1024 * 1024;
 pub mod catalog;
+pub mod channel_clamp;
 pub mod posterize;
 pub const KINDS: &[&str] = &[
     "levels",
@@ -24,6 +25,7 @@ pub const KINDS: &[&str] = &[
     "invert",
     "grayscale",
     "posterize",
+    "channel_clamp",
 ];
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Effect {
@@ -125,6 +127,7 @@ pub(crate) fn apply_effect(
 }
 pub fn defaults(kind: &str) -> Value {
     match kind {
+        "channel_clamp" => json!({"channel":"r","minimum":0.0,"maximum":1.0}),
         "posterize" => json!({"levels":posterize::DEFAULT_LEVELS}),
         "levels" => json!({"black":0.0,"white":1.0,"gamma":1.0}),
         "curves" => json!({"points":[[0.0,0.0],[0.5,0.5],[1.0,1.0]],"interpolation":"smooth"}),
@@ -163,6 +166,9 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
         Ok(())
     };
     match kind {
+        "channel_clamp" => {
+            channel_clamp::parameters(v)?;
+        }
         "posterize" => {
             posterize::levels(v)?;
         }
@@ -261,7 +267,14 @@ pub fn normalized(kind: &str, settings: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn color_only(kind: &str) -> bool {
-    ["color_balance", "hsl", "bloom", "posterize"].contains(&kind)
+    [
+        "color_balance",
+        "hsl",
+        "bloom",
+        "posterize",
+        "channel_clamp",
+    ]
+    .contains(&kind)
 }
 /// Largest scratch buffer used by a single effect, excluding the cached output.
 pub fn working_bytes(kind: &str, width: u32, height: u32, settings: &Value) -> Result<u64, String> {
@@ -413,6 +426,9 @@ pub fn active(l: &Layer) -> bool {
     l.kind == "adjustment" || l.effects.iter().any(|e| e.enabled && e.weight > 0.0)
 }
 pub fn validate_budget(doc: &Document) -> Result<(), String> {
+    for layer in &doc.layers {
+        validate_target(layer)?;
+    }
     let bytes: u64 = doc
         .layers
         .iter()
@@ -442,6 +458,12 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+pub(crate) fn validate_target(layer: &Layer) -> Result<(), String> {
+    if layer.kind == "adjustment" && layer.effects.iter().any(|e| e.kind == "channel_clamp") {
+        return Err("RGBO Clamp needs a regular layer or isolated folder; clipped adjustments preserve base opacity".into());
+    }
+    Ok(())
 }
 pub fn invalidate(doc: &mut Document, commands: &[Value]) {
     let mut changed = HashSet::new();
@@ -622,6 +644,13 @@ pub(crate) fn apply_region(
 fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<(), String> {
     let (w, h) = (image.width as usize, image.height as usize);
     match kind {
+        "channel_clamp" => {
+            let (channel, minimum, maximum) = channel_clamp::native_bounds(&settings, 255)?;
+            for pixel in image.bytes.chunks_exact_mut(4) {
+                pixel[channel] = pixel[channel].clamp(minimum as u8, maximum as u8);
+            }
+            return Ok(());
+        }
         "posterize" => {
             let levels = posterize::levels(&settings)?;
             let table: [u8; 256] =

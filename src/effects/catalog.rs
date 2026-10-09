@@ -45,6 +45,14 @@ impl Entry {
 }
 pub const ENTRIES: &[Entry] = &[
     Entry {
+        kind: "channel_clamp",
+        name: "RGBO Clamp",
+        category: "Color",
+        color: true,
+        mask_name: None,
+        keywords: "channel red green blue opacity alpha minimum maximum bounds",
+    },
+    Entry {
         kind: "posterize",
         name: "Posterize",
         category: "Tone",

@@ -141,3 +141,42 @@ fn escape_and_invalid_input_preserve_values_and_drag_still_updates() {
     assert!(fixture.value < 40.0);
     fixture.draw(vec![pointer(end, false)]);
 }
+
+#[test]
+fn fixed_endpoint_ranges_render_finite_geometry_and_preserve_exact_values() {
+    for endpoint in [0.0, 100.0] {
+        let ctx = egui::Context::default();
+        let mut value = endpoint;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 200.))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(!controls::range(
+                        ui,
+                        "fixed",
+                        &mut value,
+                        endpoint..=endpoint,
+                        145.0,
+                        "%",
+                        2,
+                        false
+                    )
+                    .changed());
+                });
+            },
+        );
+        assert_eq!(value, endpoint);
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        for primitive in primitives {
+            if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+                assert!(mesh
+                    .vertices
+                    .iter()
+                    .all(|vertex| vertex.pos.x.is_finite() && vertex.pos.y.is_finite()));
+            }
+        }
+    }
+}

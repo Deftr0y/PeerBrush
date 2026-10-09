@@ -62,6 +62,7 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
     let mut colors = 0u64;
     let mut masks = 0u64;
     for layer in &doc.layers {
+        crate::effects::validate_target(layer)?;
         masks = masks
             .checked_add(mask::buffer_bytes(layer))
             .ok_or("16-bit mask budget overflow")?;

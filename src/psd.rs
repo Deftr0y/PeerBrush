@@ -615,6 +615,12 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         format: if doc
             .layers
             .iter()
+            .any(|l| l.effects.iter().any(|e| e.kind == "channel_clamp"))
+        {
+            14
+        } else if doc
+            .layers
+            .iter()
             .any(|l| l.effects.iter().any(|e| e.kind == "posterize"))
         {
             13
@@ -1333,7 +1339,7 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=13).contains(&e.format)
+                if (1..=14).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash

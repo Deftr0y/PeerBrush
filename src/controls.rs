@@ -97,7 +97,9 @@ pub fn range_with_color(
             Color32::from_rgb(54, 51, 58).gamma_multiply(muted),
         );
         let (low, high) = (*limits.start(), *limits.end());
-        let fraction = if logarithmic && low > 0.0 {
+        let fraction = if high <= low {
+            0.0
+        } else if logarithmic && low > 0.0 {
             ((*value).clamp(low, high).ln() - low.ln()) / (high.ln() - low.ln())
         } else {
             (*value - low) / (high - low)

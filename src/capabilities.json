@@ -780,7 +780,8 @@
     "hsl",
     "bloom",
     "liquify",
-    "posterize"
+    "posterize",
+    "channel_clamp"
   ],
   "painting": {
     "tips": [
@@ -943,6 +944,17 @@
       "kind": "Disposable evicted 8/16-bit color effects, isolated per instance, checksum/dimension/depth/source-key guarded; failures recompute from sources"
     },
     "limits": "PSD v1, encoded 256 MiB, 8192 per edge, 32 MP, raster sources including originals 512 MiB; bounded mask/private-JSON memory paths; no PSB or out-of-core editable sources"
+  },
+  "channel_clamp": {
+    "settings": {
+      "channel": "r, g, b or o (opacity); default r",
+      "minimum": "0–1, default 0",
+      "maximum": "0–1, default 1; must be at least minimum"
+    },
+    "processing": "Clamp one channel at native 8/16-bit precision; in-range values and other channels remain exact; stack instances for independent bounds",
+    "sources": "Layer and isolated folder color stacks; original pixels retained; shared preview, strength, bypass, removal, undo and source/reservation guards",
+    "bounds": "Opacity increases include empty tiles throughout the layer's stored rectangle or the isolated folder's canvas frame",
+    "psd": "Private source format 14 protects older readers; standard raster/mask channels and current merged composite remain present"
   },
   "posterize": {
     "settings": {

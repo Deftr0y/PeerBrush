@@ -54,7 +54,7 @@ You stay in control while AI works directly alongside you inside the same editin
 - **Familiar navigation.** Maya-style W/E/R gizmos, Q to hide, F to frame, middle drag to pan, wheel or Alt + right drag to zoom.
 - **A painting brush.** Round, dry, chalk, grain and bristle tips; size and opacity pressure, start/end taper, flow, spacing and smoothing. Wet blending carries pigment along the stroke. Live size changes, Alt eyedropper, two colors and X to swap.
 - **Native 16-bit precision.** Open supported 16-bit RGB PSD layers, retain channel precision through edits and history, and save PSD or PNG at the same depth. Unsupported Photoshop structures stay protected, with an explicit copy that flattens structure while keeping 16-bit samples.
-- **Color that stays editable.** Warm highlights and cool shadows independently, shift hue/saturation, posterize tonal levels, add threshold-controlled bloom, and brush an editable liquify warp. Clipped adjustments target one layer; a shared adjustment can affect selected artwork inside a folder.
+- **Color that stays editable.** Warm highlights and cool shadows independently, shift hue/saturation, posterize tonal levels, clamp individual RGBO channels, add threshold-controlled bloom, and brush an editable liquify warp. Clipped adjustments target one layer; a shared adjustment can affect selected artwork inside a folder.
 - **More blend choices.** Linear dodge / Add, dodge/burn, soft/hard light, difference, exclusion, subtract and divide, with hover previews.
 - **Real clipboard support.** Copy, cut, paste or duplicate whole layers and folders, including masks and effects; copy selected pixels or the composite; accept images copied in other applications.
 

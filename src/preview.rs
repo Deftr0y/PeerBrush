@@ -54,7 +54,7 @@ fn dirty_padding(doc: &Document) -> Option<i32> {
                 "blur" => gaussian(crate::effects::number(&effect.settings, "radius", 8.)),
                 "bloom" => gaussian(crate::effects::number(&effect.settings, "spread", 12.)),
                 "levels" | "curves" | "adjust" | "color_balance" | "hsl" | "invert"
-                | "grayscale" => 0,
+                | "grayscale" | "posterize" | "channel_clamp" => 0,
                 _ => return None,
             };
             padding = padding.saturating_add(reach);
