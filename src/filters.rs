@@ -19,6 +19,25 @@ pub fn supports(kind: &str) -> bool {
 pub fn active(doc: &Document) -> bool {
     doc.filters.iter().any(|f| f.enabled && f.weight > 0.0)
 }
+/// Conservative finite support of the document stage, in native pixels.
+pub(crate) fn reach(doc: &Document) -> Option<i32> {
+    let mut reach = 0i32;
+    for filter in doc.filters.iter().filter(|f| f.enabled && f.weight > 0.) {
+        let padding = match filter.kind.as_str() {
+            "blur" => effects::gaussian_radii(effects::number(&filter.settings, "radius", 8.))
+                .iter()
+                .sum::<usize>() as i32,
+            "bloom" => effects::gaussian_radii(effects::number(&filter.settings, "spread", 12.))
+                .iter()
+                .sum::<usize>() as i32,
+            "levels" | "curves" | "adjust" | "color_balance" | "hsl" | "invert" | "grayscale"
+            | "posterize" | "channel_clamp" => 0,
+            _ => return None,
+        };
+        reach = reach.saturating_add(padding);
+    }
+    Some(reach)
+}
 pub fn settings(kind: &str, value: &Value) -> Result<Value, String> {
     if !supports(kind) {
         return Err("Unsupported whole-image filter".into());

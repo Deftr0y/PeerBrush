@@ -134,6 +134,220 @@ fn cache_resets_for_baselines_and_unbounded_effects() {
 }
 
 #[test]
+fn whole_image_filters_use_exact_padded_native_regions_and_reset_changed_settings() {
+    for depth in [8, 16] {
+        for edge in [113, 256] {
+            let mut base = filtered_fixture(depth);
+            let target = base.layers[2].id.clone();
+            base = Engine::preview_edits(
+                base,
+                &[json!({"op":"paint","layer":target,"points":[[0,0]],"radius":3,"opacity":0})],
+            )
+            .unwrap();
+            base.filters = vec![
+                Effect {
+                    id: id(),
+                    kind: "posterize".into(),
+                    enabled: true,
+                    weight: 0.63,
+                    settings: json!({"levels":5}),
+                },
+                Effect {
+                    id: id(),
+                    kind: "blur".into(),
+                    enabled: true,
+                    weight: 0.7,
+                    settings: json!({"radius":2}),
+                },
+                Effect {
+                    id: id(),
+                    kind: "bloom".into(),
+                    enabled: true,
+                    weight: 0.4,
+                    settings: json!({"spread":3,"threshold":0.3,"strength":0.8}),
+                },
+                Effect {
+                    id: id(),
+                    kind: "channel_clamp".into(),
+                    enabled: true,
+                    weight: 0.8,
+                    settings: json!({"channel":"o","minimum":0.2,"maximum":0.9}),
+                },
+            ];
+            let target = base.layers[2].id.clone();
+            let original = serde_json::to_value(&base).unwrap();
+            for (isolate, mask) in [(false, false), (true, false), (true, true)] {
+                let mut cache = Cache::default();
+                let baseline = base
+                    .preview(None, edge, isolate.then_some(target.as_str()), mask)
+                    .unwrap()
+                    .2;
+                cache
+                    .render(
+                        &base,
+                        "global",
+                        None,
+                        edge,
+                        isolate.then_some(target.as_str()),
+                        mask,
+                    )
+                    .unwrap();
+                for (x, y) in [(29., 32.), (57., 42.), (0., 0.), (148., 102.)] {
+                    let command = json!({"op":"paint","layer":target,"mask":mask,"points":[[x,y]],"radius":3,"color":[255,245,215,210]});
+                    let doc = cache.edit(base.clone(), &[command], "global").unwrap();
+                    let dirty = [x as i32 - 5, y as i32 - 5, x as i32 + 5, y as i32 + 5];
+                    let copied = cache
+                        .render(
+                            &doc,
+                            "global",
+                            Some(dirty),
+                            edge,
+                            isolate.then_some(target.as_str()),
+                            mask,
+                        )
+                        .unwrap();
+                    if x > 5. && x < 100. {
+                        assert!(
+                            copied.dirty.is_some(),
+                            "{depth}bit {edge} edge {x},{y} isolate {isolate} mask {mask}"
+                        );
+                    }
+                    assert_eq!(
+                        copied.bytes,
+                        doc.preview(None, edge, isolate.then_some(target.as_str()), mask)
+                            .unwrap()
+                            .2,
+                        "{depth}bit {edge} edge {x},{y} isolate {isolate} mask {mask}"
+                    );
+                }
+                assert_eq!(
+                    base.preview(None, edge, isolate.then_some(target.as_str()), mask)
+                        .unwrap()
+                        .2,
+                    baseline
+                );
+                let mut changed = base.clone();
+                changed.filters[0].settings = json!({"levels":9});
+                let reset = cache
+                    .render(
+                        &changed,
+                        "global",
+                        Some([20, 20, 25, 25]),
+                        edge,
+                        isolate.then_some(target.as_str()),
+                        mask,
+                    )
+                    .unwrap();
+                assert!(reset.dirty.is_none());
+                assert_eq!(
+                    reset.bytes,
+                    changed
+                        .preview(None, edge, isolate.then_some(target.as_str()), mask)
+                        .unwrap()
+                        .2
+                );
+                changed.layers[2].mask.as_mut().unwrap().steps[0].weight = 0.23;
+                let reset = cache
+                    .render(
+                        &changed,
+                        "global",
+                        Some([20, 20, 25, 25]),
+                        edge,
+                        isolate.then_some(target.as_str()),
+                        mask,
+                    )
+                    .unwrap();
+                assert!(
+                    reset.dirty.is_none(),
+                    "Mask strength changes require a fresh baseline"
+                );
+                assert_eq!(
+                    reset.bytes,
+                    changed
+                        .preview(None, edge, isolate.then_some(target.as_str()), mask)
+                        .unwrap()
+                        .2
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&base).unwrap(),
+                original,
+                "Derived filter windows cannot change sources"
+            );
+        }
+    }
+}
+
+#[test]
+fn document_filter_regions_match_full_native_canvas_edges_and_pointwise_kinds() {
+    for depth in [8, 16] {
+        for edge in [23, 79] {
+            let mut base = Document::new_depth(67, 43, depth).unwrap();
+            for y in 0..43 {
+                for x in 0..67 {
+                    if depth == 16 {
+                        base.layers[0].pixels.set16(
+                            x,
+                            y,
+                            [12347 + x as u16 * 173, 33459 + y as u16 * 211, 51237, 42199],
+                        );
+                    } else {
+                        base.layers[0]
+                            .pixels
+                            .set(x, y, [45 + x as u8, 95 + y as u8, 180, 164]);
+                    }
+                }
+            }
+            for kind in [
+                "blur",
+                "bloom",
+                "posterize",
+                "channel_clamp",
+                "levels",
+                "curves",
+                "adjust",
+                "hsl",
+                "color_balance",
+                "invert",
+                "grayscale",
+            ] {
+                base.filters = vec![Effect {
+                    id: id(),
+                    kind: kind.into(),
+                    enabled: true,
+                    weight: 0.7,
+                    settings: peerbrush::effects::defaults(kind),
+                }];
+                let target = base.layers[0].id.clone();
+                let mut cache = Cache::default();
+                cache
+                    .render(&base, "edge", None, edge, None, false)
+                    .unwrap();
+                for (x, y) in [(0., 0.), (66., 42.), (30., 20.)] {
+                    let doc=cache.edit(base.clone(),&[json!({"op":"paint","layer":target,"points":[[x,y]],"radius":2,"color":[239,81,38,213]})],"edge").unwrap();
+                    let result = cache
+                        .render(
+                            &doc,
+                            "edge",
+                            Some([x as i32 - 4, y as i32 - 4, x as i32 + 4, y as i32 + 4]),
+                            edge,
+                            None,
+                            false,
+                        )
+                        .unwrap();
+                    assert!(result.dirty.is_some());
+                    assert_eq!(
+                        result.bytes,
+                        doc.preview(None, edge, None, false).unwrap().2,
+                        "{depth}bit {kind} {edge}px {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn incremental_engine_previews_match_full_replay_and_reset_settings_baselines_and_masks() {
     let mut base = Document::new(64, 48).unwrap();
     base.layers[0].x = -2;

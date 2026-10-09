@@ -79,6 +79,26 @@ Release measurements on the Windows NVIDIA RTX 3070 Ti Laptop system, with nine 
 
 Run `cargo run --release --example preview_performance` or add `-- --effects16` for native effects. Finer dirty-tile tracking remains queued. Progressive loading is described below.
 
+## Whole-image regional performance (PB-061)
+
+Retained painting previews now include the whole-image filter stack. Conservative native windows include the complete cumulative Blur/Bloom halo; pointwise filters need no additional padding. Prepared layer/mask windows feed the same native document stage as full rendering. GPU decisions retain full-document thresholds. Changed filter settings, mask strength, source layout, isolation or profiles reset or bypass the cache. Standard PSD/PNG output still uses the complete authoritative native renderer, and all existing output/scratch limits remain enforced.
+
+Actual optimized release measurements on Windows compare five successive brush updates in a nine-layer scene at a 1536-pixel preview. Every retained result was asserted byte-identical to its corresponding full CPU reference. These are local measurements, not universal frame-rate guarantees.
+
+| Canvas / channels / whole-image filters | Full replay + rendering | Retained replay + regional rendering |
+| --- | ---: | ---: |
+| 2048² / 8-bit / Posterize | 648 ms | 112 ms |
+| 4096² / 8-bit / Posterize | 2077 ms | 100 ms |
+| 2048² / 8-bit / Levels + Blur + Posterize | 3451 ms | 206 ms |
+| 4096² / 8-bit / Levels + Blur + Posterize | 20628 ms | 204 ms |
+| 2048² / native16 / Posterize | 712 ms | 109 ms |
+| 4096² / native16 / Posterize, full strength | 1026 ms | 79 ms |
+| 2048² / native16 / Levels + Blur + Posterize | 7915 ms | 348 ms |
+
+The 4096² native16 spatial-filter fixture exceeds the existing 128 MiB scratch limit and was explicitly refused. Run `cargo run --release --example preview_performance -- --filters` or `--filters16` to reproduce. On the NVIDIA RTX 4070 Laptop/Vulkan device, the separate current tiled benchmark measured 2048² CPU/GPU-cold/GPU-repeated at 58.67/15.85/6.44 ms and 4096² at 61.95/38.84/36.35 ms, including upload/readback; tested previews were byte-identical, with 48/64 MiB resident atlases. Existing GPU eligibility and CPU fallbacks described below still apply.
+
+All 170 targeted engine, codec, protocol and UI checks passed; three opt-in GPU checks were skipped in that run. The new actual-device whole-image regional check separately passed at both depths, using the existing one-display-byte GPU tolerance. Native 2048² painting through Posterize/Blur was visually inspected. Exact undo and editable PSD16 reopening passed, and independent decoding verified every standard merged native sample. Source images, caches and history remain separate. Generated benchmarks, fixtures, captures and instance state remain ignored.
+
 ## Tiled GPU previews (PB-076)
 
 Downsampled whole-document 8-bit previews can composite normal layers and isolated folders on the native renderer's shared device. Prepared color effects use the same tile path. The CPU supplies its exact crop/zoom sampling coordinates; each layer/folder quantizes in the same order. The derived LRU atlas holds at most 256 RGBA tiles (64 MiB), identifies raw COW tiles through weak references, and keys derived tiles by invalidated effect sources. Output and readback are each capped at 16 MiB; pending metadata is capped at 32 MiB. Uploads poll after 16 MiB of staging (one tile working set may be larger, bounded by the atlas). Dispatches submit before slots are reused; a single final readback avoids one map/wait per output tile.

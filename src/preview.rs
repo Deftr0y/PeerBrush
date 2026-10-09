@@ -41,16 +41,13 @@ pub fn supports_dirty(doc: &Document) -> bool {
 /// Sum all active kernel reaches conservatively: nesting, clipping and adjustment backdrops
 /// may compose several filters. This also includes disabled masks shown in isolation.
 fn dirty_padding(doc: &Document) -> Option<i32> {
-    if crate::filters::active(doc) {
-        return None;
-    }
     // Profiled sources are protected; their full display path converts native
     // samples before projection and must not mix with raw regional pixels.
     if doc.icc_profile.is_some() {
         return None;
     }
     let gaussian = |radius| crate::effects::gaussian_radii(radius).iter().sum::<usize>() as i32;
-    let mut padding = 0i32;
+    let mut padding = crate::filters::reach(doc)?;
     for layer in &doc.layers {
         for effect in layer.effects.iter().filter(|effect| effect.enabled) {
             let reach = match effect.kind.as_str() {
@@ -346,6 +343,44 @@ impl Cache {
                 as u32,
         ];
         if bounds[0] < bounds[2] && bounds[1] < bounds[3] {
+            if target.is_none() && !mask && crate::filters::active(doc) {
+                let native_scale =
+                    (edge.clamp(1, 8192) as f64 / doc.width.max(doc.height) as f64).min(1.);
+                let coordinate = |x: u32| {
+                    if doc.bit_depth == 16 {
+                        (x as f64 / native_scale) as i32
+                    } else {
+                        (x as f32 / scale) as i32
+                    }
+                };
+                let output = [
+                    coordinate(bounds[0]),
+                    coordinate(bounds[1]),
+                    coordinate(bounds[2] - 1) + 1,
+                    coordinate(bounds[3] - 1) + 1,
+                ];
+                if doc.bit_depth == 16 {
+                    let (work, image) =
+                        regions::filtered16(doc, self.prepared16.as_ref().unwrap(), output)?;
+                    crate::render::area8(&mut self.bytes, self.width, bounds, |x, y| {
+                        crate::depth16::display_pixel(
+                            image.get(coordinate(x) - work[0], coordinate(y) - work[1]),
+                        )
+                    })?;
+                } else {
+                    let (work, image) =
+                        regions::filtered8(doc, self.prepared8.as_ref().unwrap(), output)?;
+                    crate::render::area8(&mut self.bytes, self.width, bounds, |x, y| {
+                        image.get(coordinate(x) - work[0], coordinate(y) - work[1])
+                    })?;
+                }
+                return Ok(Rendered {
+                    width: self.width,
+                    height: self.height,
+                    bytes: self.bytes.clone(),
+                    dirty: Some(bounds),
+                });
+            }
             let target_index = target
                 .map(|id| {
                     doc.layers

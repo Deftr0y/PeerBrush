@@ -16,6 +16,7 @@ fn layout(doc: &Document) -> Value {
         doc.width,
         doc.height,
         doc.bit_depth,
+        doc.filters,
         doc.layers
             .iter()
             .map(|l| json!([
@@ -40,6 +41,7 @@ fn layout(doc: &Document) -> Value {
                             s.id,
                             s.kind,
                             s.enabled,
+                            s.weight,
                             s.value,
                             s.settings,
                             s.pixels.width,
@@ -339,4 +341,65 @@ impl Prepared16 {
         self.keys = keys(doc);
         Ok(())
     }
+}
+
+pub(super) fn filtered8(
+    doc: &Document,
+    prepared: &Prepared8,
+    output: [i32; 4],
+) -> Result<([i32; 4], Image), String> {
+    crate::filters::validate(doc)?;
+    let work = window(
+        output,
+        crate::filters::reach(doc).ok_or("Filter requires full preview")?,
+        doc.width,
+        doc.height,
+    );
+    let (width, height) = ((work[2] - work[0]) as u32, (work[3] - work[1]) as u32);
+    let plan = Plan::new(doc, &prepared.masks, &prepared.colors);
+    let mut image = Image {
+        width,
+        height,
+        bytes: crate::render::rgba8(width, height, |x, y| {
+            plan.sample(0, work[0] + x as i32, work[1] + y as i32)
+        }),
+    };
+    for filter in &doc.filters {
+        effects::apply_effect(
+            &mut image,
+            filter,
+            Some(u64::from(doc.width) * u64::from(doc.height)),
+        )?;
+    }
+    Ok((work, image))
+}
+pub(super) fn filtered16(
+    doc: &Document,
+    prepared: &Prepared16,
+    output: [i32; 4],
+) -> Result<([i32; 4], Image16), String> {
+    crate::filters::validate(doc)?;
+    let work = window(
+        output,
+        crate::filters::reach(doc).ok_or("Filter requires full preview")?,
+        doc.width,
+        doc.height,
+    );
+    let (width, height) = ((work[2] - work[0]) as u32, (work[3] - work[1]) as u32);
+    let plan = Plan16::with_prepared(doc, &prepared.masks, &prepared.colors);
+    let mut image = Image16 {
+        width,
+        height,
+        words: crate::render::rgba16(width, height, |x, y| {
+            plan.sample(0, work[0] + x as i32, work[1] + y as i32)
+        }),
+    };
+    for filter in &doc.filters {
+        crate::depth16::color::apply_effect(
+            &mut image,
+            filter,
+            Some(u64::from(doc.width) * u64::from(doc.height)),
+        )?;
+    }
+    Ok((work, image))
 }

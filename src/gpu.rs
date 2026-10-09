@@ -949,4 +949,93 @@ mod tests {
             "failed work cannot partially overwrite source"
         );
     }
+    #[test]
+    #[ignore = "requires a GPU device for whole-image regional filter parity"]
+    fn document_filter_regions_match_actual_gpu_full_frames_at_both_depths() {
+        use crate::{
+            effects::Effect,
+            engine::{id, Document, Engine},
+            preview::Cache,
+        };
+        let _ = BACKEND.set(headless().unwrap());
+        let before = status().successful_dispatches;
+        for depth in [8, 16] {
+            let mut base = Document::new_depth(1024, 600, depth).unwrap();
+            let target = base.layers[0].id.clone();
+            for y in 0..600 {
+                for x in 0..1024 {
+                    let pixel = [
+                        (12347 + x * 173) as u16,
+                        (33459 + y * 211) as u16,
+                        51237,
+                        42199,
+                    ];
+                    if depth == 16 {
+                        base.layers[0].pixels.set16(x, y, pixel);
+                    } else {
+                        base.layers[0]
+                            .pixels
+                            .set(x, y, pixel.map(|v| (v / 257) as u8));
+                    }
+                }
+            }
+            base.filters = vec![
+                Effect {
+                    id: id(),
+                    kind: "hsl".into(),
+                    enabled: true,
+                    weight: 0.7,
+                    settings: json!({"hue":23,"saturation":0.2}),
+                },
+                Effect {
+                    id: id(),
+                    kind: "blur".into(),
+                    enabled: true,
+                    weight: 0.6,
+                    settings: json!({"radius":3}),
+                },
+                Effect {
+                    id: id(),
+                    kind: "bloom".into(),
+                    enabled: true,
+                    weight: 0.4,
+                    settings: json!({"spread":4,"threshold":0.3,"strength":0.8}),
+                },
+            ];
+            let original = base.layers[0].pixels.clone();
+            let mut cache = Cache::default();
+            cache
+                .render(&base, "device", None, 379, None, false)
+                .unwrap();
+            for (x, y) in [(0., 0.), (400., 250.), (1023., 599.)] {
+                let command = json!({"op":"paint","layer":target,"points":[[x,y]],"radius":4,"color":[239,81,38,213]});
+                let doc = Engine::preview_edits(base.clone(), &[command]).unwrap();
+                let result = cache
+                    .render(
+                        &doc,
+                        "device",
+                        Some([x as i32 - 6, y as i32 - 6, x as i32 + 6, y as i32 + 6]),
+                        379,
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                assert!(result.dirty.is_some());
+                let expected = doc.preview(None, 379, None, false).unwrap().2;
+                let max = result
+                    .bytes
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert!(max <= 1, "{depth}-bit GPU filter preview error {max}");
+            }
+            assert_eq!(base.layers[0].pixels, original);
+        }
+        assert!(
+            status().successful_dispatches > before,
+            "Actual GPU effects must have executed"
+        );
+    }
 }

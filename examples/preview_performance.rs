@@ -63,17 +63,33 @@ fn elapsed(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 fn main() {
-    let native = std::env::args().any(|arg| arg == "--native16" || arg == "--effects16");
+    let native = std::env::args()
+        .any(|arg| arg == "--native16" || arg == "--effects16" || arg == "--filters16");
     let native_effects = std::env::args().any(|arg| arg == "--effects16");
+    let global = std::env::args().any(|arg| arg == "--filters" || arg == "--filters16");
     let depth = if native { 16 } else { 8 };
     for edge in [2048, 4096] {
         for heavy in [false, true] {
             // Native effects have dedicated fidelity tests. This flag measures native live
             // painting; default runs both byte scenes, including cold CPU effect fallback.
-            if native && heavy && !native_effects {
+            if native && heavy && !native_effects && !global {
                 continue;
             }
-            let doc = fixture(edge, heavy, depth);
+            let mut doc = fixture(edge, heavy, depth);
+            if global {
+                doc.filters = std::mem::take(&mut doc.layers[0].effects);
+                doc.filters.push(Effect {
+                    id: id(),
+                    kind: "posterize".into(),
+                    enabled: true,
+                    weight: if depth == 16 && edge == 4096 { 1. } else { 0.7 },
+                    settings: json!({"levels":5}),
+                });
+                if let Err(error) = peerbrush::effects::validate_budget(&doc) {
+                    println!("{edge}² {depth}-bit whole-image {}: unavailable under existing limits: {error}",if heavy {"levels+blur+posterize"} else {"posterize"});
+                    continue;
+                }
+            }
             let target = &doc.layers[0].id;
             let points = (0..128)
                 .map(|i| {
@@ -88,7 +104,10 @@ fn main() {
             let image = Engine::preview_edits(doc.clone(), &[command(128)]).unwrap();
             std::hint::black_box(image.preview(None, 1536, None, false).unwrap());
             let start = Instant::now();
-            let old = if native {
+            let old = if global {
+                let (w, h, bytes, _) = image.preview(None, 1536, None, false).unwrap();
+                (w, h, bytes)
+            } else if native {
                 native_reference(&image, 1536)
             } else {
                 preview::reference(&image, 1536).unwrap()
@@ -140,7 +159,7 @@ fn main() {
                 );
                 partial += usize::from(result.dirty.is_some());
             }
-            println!("{edge}² {depth}-bit {}: {} {reference:.2}ms / full render {compiled:.2}ms; five replay {full_replay:.2}ms +render {full_render:.2}ms; incremental replay {cached_replay:.2}ms +dirty render {cached_render:.2}ms ({partial}/5 partial)",if heavy{"levels+blur"}else{"effect-free 9 layers"},if native{"serial native compositor"}else{"legacy compositor"});
+            println!("{edge}² {depth}-bit {}: {} {reference:.2}ms / full render {compiled:.2}ms; five replay {full_replay:.2}ms +render {full_render:.2}ms; incremental replay {cached_replay:.2}ms +dirty render {cached_render:.2}ms ({partial}/5 partial)",if global {if heavy {"whole-image levels+blur+posterize"} else {"whole-image posterize"}} else if heavy{"levels+blur"}else{"effect-free 9 layers"},if global {"cached native document stage"} else if native{"serial native compositor"}else{"legacy compositor"});
         }
     }
 }

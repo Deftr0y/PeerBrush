@@ -83,7 +83,7 @@ See [development notes](docs/development.md) for the engine and validation workf
 | PB-059 | Editable liquify | Implemented and verified | Shared engine, live rendered previews, reversible edits and UI/MCP/CLI access. |
 
 | PB-060 | Open the Hippo PSD | Implemented and verified | All eleven originals unchanged. Egg has three editable 16-bit layers; other ten open protected with an explicit native-precision editing copy. |
-| PB-061 | Smooth tools on medium/large canvases | In development; effects-aware regional previews verified (PB-075) | Profile actual release builds; reduce preview work, measure timings, and progress toward GPU editing. Portable packaging is not a speed constraint. |
+| PB-061 | Smooth tools on medium/large canvases | Implemented and release-benchmarked for supported regional/GPU paths | Retained native 8/16-bit previews now include whole-image finite-support filters; release measurements and exact reference checks cover 2048²/4096² canvases. Tiled GPU preview coverage and remaining CPU/budget limits are explicit in development documentation. Portable packaging is not a speed constraint. |
 
 | PB-062 | Preserve 16-bit color through editing and saving | Implemented and verified | Native COW samples, brush/transform/effects/masks/clipboard, PSD16 and PNG16; display/agent previews project only at the boundary. |
 
