@@ -240,8 +240,10 @@ fn native_image_clipboard_copy_and_external_paste_roundtrip() {
         })
         .unwrap();
     let shared = Arc::new(Mutex::new(e));
+    let document = shared.lock().unwrap().doc.id.clone();
     worker
         .request(clipboard::Request::Paste {
+            document,
             shared: shared.clone(),
             target: id,
             revision: 0,

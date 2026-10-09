@@ -293,11 +293,13 @@ pub enum Request {
     },
     Paste {
         shared: Shared,
+        document: String,
         target: String,
         revision: u64,
     },
 }
 pub struct Reply {
+    pub document: String,
     pub result: Result<String, String>,
     pub selected: Option<String>,
     pub selected_layers: Vec<String>,
@@ -313,20 +315,21 @@ impl Default for Worker {
 }
 impl Worker {
     pub fn new(ctx: eframe::egui::Context) -> Self {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::sync_channel::<Request>(1);
         let (reply_tx, replies) = mpsc::channel();
         std::thread::spawn(move || {
             // Retain ownership for Linux clipboard providers while the application is open.
             let mut clipboard = arboard::Clipboard::new().ok();
             let mut session = Session::default();
             while let Ok(request) = rx.recv() {
+                let document = request.document().to_owned();
                 if clipboard.is_none() {
                     clipboard = arboard::Clipboard::new().ok();
                 }
                 let reply = if let Some(clipboard) = clipboard.as_mut() {
                     session.process(clipboard, request)
                 } else {
-                    Reply { result: Err("The system clipboard is unavailable. Retry after closing other clipboard operations".into()), selected: None, selected_layers: vec![] }
+                    Reply { document, result: Err("The system clipboard is unavailable. Retry after closing other clipboard operations".into()), selected: None, selected_layers: vec![] }
                 };
                 if reply_tx.send(reply).is_err() {
                     break;
@@ -420,6 +423,7 @@ impl Session {
         }
     }
     fn process(&mut self, clipboard: &mut dyn Provider, request: Request) -> Reply {
+        let document = request.document().to_owned();
         let mut selected = None;
         let mut selected_layers = vec![];
         let result = (|| match request {
@@ -441,6 +445,7 @@ impl Session {
             }
             Request::Paste {
                 shared,
+                document,
                 target,
                 revision,
             } => {
@@ -451,6 +456,7 @@ impl Session {
                     .filter(|buffer| text.as_deref() == Some(buffer.marker.as_str()))
                 {
                     let mut engine = shared.lock().unwrap();
+                    crate::workspace::guard(&engine, &document, revision)?;
                     let result = engine.paste_layers(
                         "human",
                         &buffer.layers,
@@ -480,6 +486,7 @@ impl Session {
                 image.samples16 = retained.and_then(|old| old.samples16.clone());
                 let command = image.command(&target)?;
                 let mut engine = shared.lock().unwrap();
+                crate::workspace::guard(&engine, &document, revision)?;
                 let result =
                     engine.edit("human", &[command], Some(revision), None, "Paste image")?;
                 selected = result["created"]
@@ -498,9 +505,21 @@ impl Session {
             }
         })();
         Reply {
+            document,
             result,
             selected,
             selected_layers,
+        }
+    }
+}
+
+impl Request {
+    fn document(&self) -> &str {
+        match self {
+            Self::Copy { doc, .. } | Self::CopyLayers { doc, .. } | Self::CutLayers { doc, .. } => {
+                &doc.id
+            }
+            Self::Paste { document, .. } => document,
         }
     }
 }
@@ -637,9 +656,11 @@ mod tests {
             )
             .result
             .unwrap();
+        let document = shared.lock().unwrap().doc.id.clone();
         let pasted = session.process(
             &mut fake,
             Request::Paste {
+                document: document.clone(),
                 shared: shared.clone(),
                 target: id.clone(),
                 revision: 0,
@@ -657,9 +678,11 @@ mod tests {
             origin: None,
         });
         let revision = shared.lock().unwrap().doc.revision;
+        let document = shared.lock().unwrap().doc.id.clone();
         let pasted = session.process(
             &mut fake,
             Request::Paste {
+                document: document.clone(),
                 shared: shared.clone(),
                 target: pasted.selected.unwrap(),
                 revision,
@@ -696,9 +719,11 @@ mod tests {
             .result
             .unwrap();
         assert!(shared.lock().unwrap().doc.layers.is_empty());
+        let document = shared.lock().unwrap().doc.id.clone();
         let pasted = session.process(
             &mut fake,
             Request::Paste {
+                document: document.clone(),
                 shared: shared.clone(),
                 target: id,
                 revision: 1,
@@ -742,9 +767,11 @@ mod tests {
         // Native OS image formats expose display bytes to arboard, so only internal retention
         // can preserve these original words during a PeerBrush-to-PeerBrush paste.
         fake.image.as_mut().unwrap().samples16 = None;
+        let document = shared.lock().unwrap().doc.id.clone();
         let reply = session.process(
             &mut fake,
             Request::Paste {
+                document: document.clone(),
                 shared: shared.clone(),
                 target: id,
                 revision: 0,

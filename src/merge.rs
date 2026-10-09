@@ -310,8 +310,22 @@ pub fn edit(
     task: Option<&str>,
     name: Option<&str>,
 ) -> Result<Value, String> {
+    edit_guarded(shared, actor, ids, expected, task, name, None)
+}
+pub fn edit_guarded(
+    shared: &Shared,
+    actor: &str,
+    ids: &[String],
+    expected: Option<u64>,
+    task: Option<&str>,
+    name: Option<&str>,
+    document: Option<&str>,
+) -> Result<Value, String> {
     let doc = {
         let mut e = shared.lock().unwrap();
+        if document.is_some_and(|id| id != e.doc.id) {
+            return Err("Project source changed before merging".into());
+        }
         e.check(
             actor,
             &[Scope {

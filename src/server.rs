@@ -99,6 +99,7 @@ fn open_progress_inner(
     }
     let before = {
         let mut e = shared.lock().unwrap();
+        e.ensure_open()?;
         if e.loading.as_ref().is_some_and(|c| !c.same(control)) {
             return Err("A document is already opening".into());
         }
@@ -147,8 +148,20 @@ pub fn compatible_copy_with_color(
     expected: Option<u64>,
     convert_to_srgb: bool,
 ) -> Result<(), String> {
+    compatible_copy_guarded(shared, actor, expected, convert_to_srgb, None)
+}
+fn compatible_copy_guarded(
+    shared: &Shared,
+    actor: &str,
+    expected: Option<u64>,
+    convert_to_srgb: bool,
+    document: Option<&str>,
+) -> Result<(), String> {
     let source = {
         let mut e = shared.lock().unwrap();
+        if document.is_some_and(|id| id != e.doc.id) {
+            return Err("Project source changed before preparing a compatible copy".into());
+        }
         e.expire();
         e.check(
             actor,
@@ -218,6 +231,12 @@ pub fn compatible_copy_with_color(
     Ok(())
 }
 pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
+    save_guarded(shared, path, &json!({}))
+}
+pub fn save_source(shared: &Shared, path: &Path, document: &str) -> Result<(), String> {
+    save_guarded(shared, path, &json!({"document_id":document}))
+}
+fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -228,6 +247,13 @@ pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
     }
     let (doc, expected) = {
         let e = shared.lock().unwrap();
+        crate::workspace::validate_target(&e, request)?;
+        if request["expected_revision"]
+            .as_u64()
+            .is_some_and(|r| r != e.doc.revision)
+        {
+            return Err("Project revision changed before saving".into());
+        }
         (
             e.doc.clone(),
             if e.path.as_deref() == Some(path) {
@@ -245,6 +271,11 @@ pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
         }
     }
     let bytes = psd::encode(&doc)?;
+    let mut e = shared.lock().unwrap();
+    e.ensure_open()?;
+    if e.doc.id != doc.id {
+        return Err("Project source changed while saving; current work preserved".into());
+    }
     if let Some(expected) = expected {
         if file_version(path)? != expected {
             return Err("PSD changed while preparing the save. Use Save As.".into());
@@ -252,7 +283,6 @@ pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
     }
     atomic_write(path, &bytes)?;
     let version = file_version(path)?;
-    let mut e = shared.lock().unwrap();
     if e.doc.id == doc.id {
         e.path = Some(path.into());
         e.file_version = Some(version);
@@ -266,6 +296,12 @@ pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
     Ok(())
 }
 pub fn export(shared: &Shared, path: &Path) -> Result<(), String> {
+    export_guarded(shared, path, &json!({}))
+}
+pub fn export_source(shared: &Shared, path: &Path, document: &str) -> Result<(), String> {
+    export_guarded(shared, path, &json!({"document_id":document}))
+}
+fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -274,12 +310,22 @@ pub fn export(shared: &Shared, path: &Path) -> Result<(), String> {
     {
         return Err("PNG is the only export format".into());
     }
-    let doc = shared.lock().unwrap().doc.clone();
-    atomic_write(path, &doc.export_png()?)
+    let doc = {
+        let e = shared.lock().unwrap();
+        crate::workspace::validate_target(&e, request)?;
+        e.doc.clone()
+    };
+    let bytes = doc.export_png()?;
+    let e = shared.lock().unwrap();
+    e.ensure_open()?;
+    if e.doc.id != doc.id {
+        return Err("Project source changed before exporting".into());
+    }
+    atomic_write(path, &bytes)
 }
 
 pub fn tools() -> Value {
-    json!([
+    let mut tools = json!([
         {"name":"peerbrush_observe","description":"Inspect live document structure and actual PNG image content. Coordinates are document pixels, origin top left. Request layer/mask/rect views, max_edge and since_revision to reduce image traffic.","inputSchema":{"type":"object","properties":{"layer":{"type":"string"},"mask":{"type":"boolean"},"selection_view":{"type":"string","enum":["cutout","mask","overlay"]},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"since_revision":{"type":"integer"},"image":{"type":"boolean"}},"additionalProperties":false}},
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_proposal","description":"Create and render frozen proposed edits for explicit human review. create needs observed document_id/expected_revision and ordinary engine commands; the shared project and history stay unchanged. preview returns actual PNG pixels with document coordinates. Only actor human can accept; agents can list, preview or reject their proposals. A changed project or ended/expired/taken-over task invalidates its draft. Never silently reacquire a task. Direct edits remain available when already authorized.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","preview","accept","reject"]},"actor":{"type":"string"},"proposal":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"task":{"type":"string"},"label":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"feedback":{"type":"string","enum":["batch","request"]}},"required":["action"],"additionalProperties":false}},
@@ -290,7 +336,20 @@ pub fn tools() -> Value {
         {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
         {"name":"peerbrush_capabilities","description":"Get concise supported operations and runnable JSON examples before editing.","inputSchema":{"type":"object","properties":{}}}
         ,{"name":"peerbrush_brushes","description":"Browse original brush presets, render actual stroke previews, and save/update/delete instance-local custom brushes. Presets work in paint/smudge/clone/heal commands via preset ID with explicit setting overrides. This library is outside document history; curated presets are immutable. Preview coordinates refer to brush_preview, not the document.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","preview","save","delete"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"settings":{"type":"object"},"width":{"type":"integer","minimum":64,"maximum":512},"height":{"type":"integer","minimum":24,"maximum":128}},"required":["action"],"additionalProperties":false}}
-    ])
+    ]);
+    for tool in tools.as_array_mut().unwrap() {
+        if !matches!(
+            tool["name"].as_str(),
+            Some("peerbrush_capabilities" | "peerbrush_brushes")
+        ) {
+            let properties = &mut tool["inputSchema"]["properties"];
+            properties["project_id"] = json!({"type":"string"});
+            properties["document_id"] = json!({"type":"string"});
+            properties["expected_revision"] = json!({"type":"integer"});
+        }
+    }
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_projects","description":"List stable project IDs, create/open independent projects, select a tab (human only), close with exact source guards, or copy/move editable layer trees between projects. Background AI writes must supply project_id, document_id and expected_revision; never depend on the visible tab. Transfers need both source identities/revisions and preserve native precision, masks and effects. preview_transfer returns actual destination pixels without history. move creates one undo step in each document; failures change neither.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","new","open","select","close","copy","move","preview_transfer"]},"actor":{"type":"string"},"project_id":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"activate":{"type":"boolean"},"discard":{"type":"boolean"},"source_project_id":{"type":"string"},"source_document_id":{"type":"string"},"source_revision":{"type":"integer"},"source_task":{"type":"string"},"task":{"type":"string"},"layers":{"type":"array","items":{"type":"string"}},"target":{"type":"string"},"move":{"type":"boolean"},"max_edge":{"type":"integer"}},"required":["action"],"additionalProperties":false}}));
+    tools
 }
 pub fn capabilities() -> Value {
     static DATA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
@@ -315,12 +374,14 @@ pub fn capabilities() -> Value {
         "liquify": "CPU displacement grid"
     });
     result["segmentation"]["configured"] = json!(crate::segmentation::configured());
+    result["projects"] = json!({"tool":"peerbrush_projects","max_open":crate::workspace::MAX_PROJECTS,"targeting":"Use project_id, document_id and expected_revision for every background AI mutation. Switching tabs never changes a project's engine.","transfer":"Editable trees, masks, effects and native16 sources; copy changes destination, move is atomic with one undo step per project."});
     result
 }
 
 fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
     let (state, doc) = {
         let mut e = shared.lock().unwrap();
+        crate::workspace::validate_target(&e, p)?;
         (e.state(), e.doc.clone())
     };
     let revision = doc.revision;
@@ -350,6 +411,118 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
+    if method == "projects" {
+        return projects(shared, p);
+    }
+    if matches!(
+        method,
+        "capabilities" | "brushes" | "focus" | "client_state" | "capture_ui"
+    ) {
+        return dispatch_project(shared, method, p);
+    }
+    let target = crate::workspace::route(shared, method, p)?;
+    let mut result = dispatch_project(&target, method, p)?;
+    if result.is_object() {
+        result["project_id"] = json!(target.lock().unwrap().project_id);
+    }
+    Ok(result)
+}
+fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
+    use crate::workspace as w;
+    let actor = p["actor"].as_str().unwrap_or("agent");
+    let text = |key: &str| p[key].as_str().ok_or_else(|| format!("Missing {key}"));
+    let number = |key: &str| p[key].as_u64().ok_or_else(|| format!("Missing {key}"));
+    match text("action")? {
+        "list" => Ok(w::state(root)),
+        "new" | "open" => {
+            let active = w::active_id(root);
+            let activate = actor == "human" && p["activate"] != false;
+            let engine = if p["action"] == "open" {
+                let shared = Arc::new(Mutex::new(Engine::new()));
+                open(&shared, Path::new(text("path")?))?;
+                let result = shared.lock().unwrap().clone();
+                result
+            } else {
+                let mut engine = Engine::new();
+                let size = |key: &str, default: u32| {
+                    p.get(key).map_or(Ok(default), |v| {
+                        v.as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .ok_or("Invalid canvas size")
+                    })
+                };
+                let depth = p.get("bit_depth").map_or(Ok(8), |v| {
+                    v.as_u64()
+                        .filter(|n| [8, 16].contains(n))
+                        .map(|n| n as u16)
+                        .ok_or("Color depth must be 8 or 16 bits")
+                })?;
+                engine.doc =
+                    engine::Document::new_depth(size("width", 1024)?, size("height", 768)?, depth)?;
+                engine
+            };
+            let shared = w::register(root, engine, activate.then_some(active.as_str()))?;
+            let result = shared.lock().unwrap().state();
+            Ok(result)
+        }
+        "select" => {
+            if actor != "human" {
+                return Err("Only human input can select the visible project".into());
+            }
+            w::select(root, text("project_id")?)?;
+            Ok(w::state(root))
+        }
+        "close" => {
+            w::close(
+                root,
+                text("project_id")?,
+                text("document_id")?,
+                number("expected_revision")?,
+                p["discard"] == true,
+                actor,
+            )?;
+            Ok(w::state(root))
+        }
+        action @ ("copy" | "move" | "preview_transfer") => {
+            let layers = p["layers"]
+                .as_array()
+                .ok_or("Choose layer roots")?
+                .iter()
+                .map(|v| v.as_str().map(String::from).ok_or("Invalid layer ID"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let request = w::Transfer {
+                source: text("source_project_id")?,
+                destination: text("project_id")?,
+                source_document: text("source_document_id")?,
+                destination_document: text("document_id")?,
+                source_revision: number("source_revision")?,
+                destination_revision: number("expected_revision")?,
+                layers: &layers,
+                target: text("target")?,
+                move_layers: action == "move"
+                    || (action == "preview_transfer" && p["move"] == true),
+                actor,
+                source_task: p["source_task"].as_str(),
+                destination_task: p["task"].as_str(),
+            };
+            if action != "preview_transfer" {
+                return w::transfer(root, &request);
+            }
+            let doc = w::transfer_preview(root, &request)?;
+            let (width, height, rgba, rect) = doc.preview(
+                None,
+                p["max_edge"].as_u64().unwrap_or(1024).clamp(32, 4096) as u32,
+                None,
+                false,
+            )?;
+            Ok(
+                json!({"project_id":request.destination,"document_id":request.destination_document,"revision":request.destination_revision,"preview_only":true,"images":[{"mime_type":"image/png","data":STANDARD.encode(raster::png(width,height,&rgba)?),"width":width,"height":height,"document_rect":rect}]}),
+            )
+        }
+        _ => Err("Unknown project action".into()),
+    }
+}
+fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
     let actor = p.get("actor").and_then(Value::as_str).unwrap_or("agent");
     match method {
         "capabilities" => Ok(capabilities()),
@@ -420,7 +593,9 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                     .to_owned()
             };
             if action == "reject" {
-                return shared.lock().unwrap().reject_proposal(actor, &id);
+                let mut e = shared.lock().unwrap();
+                crate::workspace::validate_target(&e, p)?;
+                return e.reject_proposal(actor, &id);
             }
             if action == "accept" {
                 let result = shared.lock().unwrap().accept_proposal(
@@ -523,7 +698,7 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             if p.get("label").is_none() {
                 edit["label"] = json!("Place image");
             }
-            let mut result = dispatch(shared, "edit", &edit)?;
+            let mut result = dispatch_project(shared, "edit", &edit)?;
             let layer = if p["new_layer"] == false {
                 p.get("layer").cloned().unwrap_or(Value::Null)
             } else {
@@ -551,16 +726,19 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                 .ok_or("commands must be an array")?;
             let result = if commands.len() == 1 && commands[0]["op"] == "layer.merge" {
                 let ids = crate::merge::requested(&commands[0])?;
-                crate::merge::edit(
+                crate::merge::edit_guarded(
                     shared,
                     actor,
                     &ids,
                     p.get("expected_revision").and_then(Value::as_u64),
                     p.get("task").and_then(Value::as_str),
                     commands[0].get("name").and_then(Value::as_str),
+                    p["document_id"].as_str(),
                 )?
             } else {
-                shared.lock().unwrap().edit(
+                let mut e = shared.lock().unwrap();
+                crate::workspace::validate_target(&e, p)?;
+                e.edit(
                     actor,
                     commands,
                     p.get("expected_revision").and_then(Value::as_u64),
@@ -587,6 +765,14 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
         "task" => {
             let action = p.get("action").and_then(Value::as_str).unwrap_or("status");
             let mut e = shared.lock().unwrap();
+            crate::workspace::validate_target(&e, p)?;
+            if crate::workspace::mutating(method, p)
+                && p["expected_revision"]
+                    .as_u64()
+                    .is_some_and(|r| r != e.doc.revision)
+            {
+                return Err("Project revision changed; observe again".into());
+            }
             e.expire();
             if let Some(f) = p.get("feedback").and_then(Value::as_str) {
                 e.feedback.insert(actor.into(), f.into());
@@ -646,6 +832,7 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
         }
         "history" => {
             let mut e = shared.lock().unwrap();
+            crate::workspace::validate_target(&e, p)?;
             let action = p.get("action").and_then(Value::as_str).unwrap_or("list");
             let task = p.get("task").and_then(Value::as_str).unwrap_or("");
             let owner = p.get("task_actor").and_then(Value::as_str).unwrap_or(actor);
@@ -695,6 +882,7 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             let path = p.get("path").and_then(Value::as_str).map(PathBuf::from);
             let opening_source = if ["new", "open", "open_async"].contains(&action) {
                 let e = shared.lock().unwrap();
+                crate::workspace::validate_target(&e, p)?;
                 if p["expected_revision"]
                     .as_u64()
                     .is_some_and(|r| r != e.doc.revision)
@@ -770,23 +958,26 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                     }
                 }
                 "cancel_open" => {
-                    if let Some(control) = &shared.lock().unwrap().loading {
+                    let e = shared.lock().unwrap();
+                    crate::workspace::validate_target(&e, p)?;
+                    if let Some(control) = &e.loading {
                         control.cancel();
                     }
                 }
-                "compatible_copy" => compatible_copy_with_color(
+                "compatible_copy" => compatible_copy_guarded(
                     shared,
                     actor,
                     p["expected_revision"].as_u64(),
                     p["convert_to_srgb"].as_bool().unwrap_or(false),
+                    p["document_id"].as_str(),
                 )?,
                 "save" => {
                     let path = path
                         .or_else(|| shared.lock().unwrap().path.clone())
                         .ok_or("Choose a PSD path")?;
-                    save(shared, &path)?;
+                    save_guarded(shared, &path, p)?;
                 }
-                "export" => export(shared, path.as_deref().ok_or("Missing path")?)?,
+                "export" => export_guarded(shared, path.as_deref().ok_or("Missing path")?, p)?,
                 _ => return Err("Unknown document action".into()),
             }
             Ok(shared.lock().unwrap().state())
@@ -816,9 +1007,10 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("direct-mcp");
     {
-        let mut e = shared.lock().unwrap();
-        if request["method"] == "initialize" || e.mcp_clients.contains_key(client_id) {
-            e.mcp_clients.insert(client_id.into(), engine::now() + 45);
+        if let Ok(mut e) = shared.try_lock() {
+            if request["method"] == "initialize" || e.mcp_clients.contains_key(client_id) {
+                e.mcp_clients.insert(client_id.into(), engine::now() + 45);
+            }
         }
     }
     let result: Result<Value, String> = match request
@@ -835,6 +1027,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             if ![
                 "capabilities",
                 "brushes",
+                "projects",
                 "observe",
                 "edit",
                 "proposal",
@@ -849,19 +1042,20 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
                 return json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Unknown PeerBrush tool"}],"isError":true}});
             }
             {
-                let mut e = shared.lock().unwrap();
-                if e.activity.is_empty() || e.leases.is_empty() {
-                    e.activity = match method {
-                        "observe" => "Looking at the canvas",
-                        "edit" => "Updating the shared canvas",
-                        "proposal" => "Reviewing proposed canvas changes",
-                        "place_image" => "Placing image pixels",
-                        "segment" => "Selecting the subject",
-                        "document" => "Working with your document",
-                        "history" => "Reviewing recent changes",
-                        _ => "Getting ready to work together",
+                if let Ok(mut e) = shared.try_lock() {
+                    if e.activity.is_empty() || e.leases.is_empty() {
+                        e.activity = match method {
+                            "observe" => "Looking at the canvas",
+                            "edit" => "Updating the shared canvas",
+                            "proposal" => "Reviewing proposed canvas changes",
+                            "place_image" => "Placing image pixels",
+                            "segment" => "Selecting the subject",
+                            "document" => "Working with your document",
+                            "history" => "Reviewing recent changes",
+                            _ => "Getting ready to work together",
+                        }
+                        .into();
                     }
-                    .into();
                 }
             }
             match dispatch(shared, method, p.get("arguments").unwrap_or(&json!({}))) {
@@ -979,9 +1173,46 @@ fn unsupported_version(request: tiny_http::Request, q: &Value, requested: &str) 
 }
 
 fn touch_http_presence(shared: &Shared, client: &str) {
-    let mut engine = shared.lock().unwrap();
-    engine.expire();
-    engine.mcp_clients.insert(client.into(), engine::now() + 90);
+    if let Ok(mut engine) = shared.try_lock() {
+        engine.expire();
+        engine.mcp_clients.insert(client.into(), engine::now() + 90);
+    }
+}
+/// Slow edits must not serialize independent projects at the transport layer.
+fn http_work(
+    request: tiny_http::Request,
+    shared: &Shared,
+    work: impl FnOnce(&Shared) -> Value + Send + 'static,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNNING: AtomicUsize = AtomicUsize::new(0);
+    if RUNNING
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < 64).then_some(n + 1)
+        })
+        .is_err()
+    {
+        fail_http(
+            request,
+            429,
+            None,
+            -32000,
+            "Too many concurrent operations; retry after a request finishes",
+        );
+        return;
+    }
+    let shared = shared.clone();
+    thread::spawn(move || {
+        struct Permit;
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                RUNNING.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _permit = Permit;
+        let result = work(&shared);
+        respond_http(request, 200, Some(result), None);
+    });
 }
 
 fn decode_name_header(value: &str) -> Option<String> {
@@ -1076,25 +1307,27 @@ fn handle_modern_http(
     // Identity is presentation only. One bounded presence entry covers stateless clients.
     q["_client"] = json!("http-stateless");
     touch_http_presence(shared, "http-stateless");
-    let mut result = if method == "server/discover" {
-        json!({"jsonrpc":"2.0","id":q["id"],"result":{
-            "supportedVersions":MCP_HTTP_VERSIONS,"capabilities":{"tools":{}},
-            "instructions":initialization(&json!({}))["instructions"],"ttlMs":300000,"cacheScope":"private"
-        }})
-    } else {
-        mcp(shared, &q)
-    };
-    if result.get("result").is_some() {
-        result["result"]["resultType"] = json!("complete");
-        result["result"]["_meta"]["io.modelcontextprotocol/serverInfo"] =
-            json!({"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")});
-        if method == "tools/list" {
-            result["result"]["ttlMs"] = json!(300000);
-            result["result"]["cacheScope"] = json!("private");
+    http_work(request, shared, move |shared| {
+        let mut result = if method == "server/discover" {
+            json!({"jsonrpc":"2.0","id":q["id"],"result":{
+                "supportedVersions":MCP_HTTP_VERSIONS,"capabilities":{"tools":{}},
+                "instructions":initialization(&json!({}))["instructions"],"ttlMs":300000,"cacheScope":"private"
+            }})
+        } else {
+            mcp(shared, &q)
+        };
+        if result.get("result").is_some() {
+            result["result"]["resultType"] = json!("complete");
+            result["result"]["_meta"]["io.modelcontextprotocol/serverInfo"] =
+                json!({"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")});
+            if method == "tools/list" {
+                result["result"]["ttlMs"] = json!(300000);
+                result["result"]["cacheScope"] = json!("private");
+            }
         }
-    }
-    touch_http_presence(shared, "http-stateless");
-    respond_http(request, 200, Some(result), None);
+        touch_http_presence(shared, "http-stateless");
+        result
+    });
 }
 
 fn handle_http(
@@ -1143,11 +1376,9 @@ fn handle_http(
     let now = engine::now();
     sessions.retain(|id, session| {
         if session.expires <= now {
-            shared
-                .lock()
-                .unwrap()
-                .mcp_clients
-                .remove(&format!("http-{id}"));
+            if let Ok(mut e) = shared.try_lock() {
+                e.mcp_clients.remove(&format!("http-{id}"));
+            }
             false
         } else {
             true
@@ -1201,11 +1432,9 @@ fn handle_http(
                     return;
                 }
                 sessions.remove(&id);
-                shared
-                    .lock()
-                    .unwrap()
-                    .mcp_clients
-                    .remove(&format!("http-{id}"));
+                if let Ok(mut e) = shared.try_lock() {
+                    e.mcp_clients.remove(&format!("http-{id}"));
+                }
                 respond_http(request, 204, None, None);
             } else {
                 fail_http(
@@ -1321,32 +1550,29 @@ fn handle_http(
     };
     if !is_mcp {
         // The private authenticated bridge lets stdio keep its offline handshake and reconnect.
-        let result = if q["method"] == "mcp" {
-            if q["params"]["request"].is_object() {
-                if q["params"]["request"].get("id").is_none() {
-                    Ok(Value::Null)
+        http_work(request, shared, move |shared| {
+            let result = if q["method"] == "mcp" {
+                if q["params"]["request"].is_object() {
+                    if q["params"]["request"].get("id").is_none() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(mcp(shared, &q["params"]["request"]))
+                    }
                 } else {
-                    Ok(mcp(shared, &q["params"]["request"]))
+                    Err("MCP bridge requires a request object".into())
                 }
             } else {
-                Err("MCP bridge requires a request object".into())
-            }
-        } else {
-            dispatch(
-                shared,
-                q.get("method").and_then(Value::as_str).unwrap_or(""),
-                q.get("params").unwrap_or(&json!({})),
-            )
-        };
-        respond_http(
-            request,
-            200,
-            Some(match result {
+                dispatch(
+                    shared,
+                    q.get("method").and_then(Value::as_str).unwrap_or(""),
+                    q.get("params").unwrap_or(&json!({})),
+                )
+            };
+            match result {
                 Ok(value) => json!({"ok":true,"result":value}),
                 Err(error) => json!({"ok":false,"error":error}),
-            }),
-            None,
-        );
+            }
+        });
         return;
     }
     let id_ok = q
@@ -1538,9 +1764,11 @@ fn handle_http(
         respond_http(request, 202, None, None);
     } else {
         q["_client"] = json!(client);
-        let result = mcp(shared, &q);
-        touch_http_presence(shared, &client);
-        respond_http(request, 200, Some(result), None);
+        http_work(request, shared, move |shared| {
+            let result = mcp(shared, &q);
+            touch_http_presence(shared, &client);
+            result
+        });
     }
 }
 
@@ -1560,6 +1788,17 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().brush_library.lock().unwrap() = library;
+    let workspace = crate::workspace::attach(&shared);
+    // Preserve the preceding session's index before the running session updates its own.
+    if let Ok(bytes) = fs::read(state_dir.join("recoveries.json")) {
+        if bytes.len() < 65536
+            && serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .is_some_and(|index| index["projects"].as_array().is_some_and(|p| !p.is_empty()))
+        {
+            atomic_write(&state_dir.join("previous-recoveries.json"), &bytes)?;
+        }
+    }
     let http = tiny_http::Server::http("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = http
         .server_addr()
@@ -1570,26 +1809,11 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
     let auth = format!("Bearer {token}");
     atomic_write(&state_dir.join("connection.json"),serde_json::to_string_pretty(&json!({"url":format!("http://127.0.0.1:{port}"),"token":token,"pid":std::process::id()})).unwrap().as_bytes())?;
     let recovery_dir = state_dir.clone();
-    let recovery = shared.clone();
     thread::spawn(move || {
-        let mut previous = None;
+        let mut previous = std::collections::HashMap::new();
         loop {
             thread::sleep(std::time::Duration::from_secs(5));
-            let doc = {
-                let e = recovery.lock().unwrap();
-                if e.doc.read_only || e.doc.revision == e.saved_revision {
-                    continue;
-                }
-                e.doc.clone()
-            };
-            if previous == Some((doc.id.clone(), doc.revision)) {
-                continue;
-            }
-            if let Ok(bytes) = psd::encode(&doc) {
-                if atomic_write(&recovery_dir.join("recovery.psd"), &bytes).is_ok() {
-                    previous = Some((doc.id, doc.revision));
-                }
-            }
+            checkpoint_projects(&workspace, &recovery_dir, &mut previous);
         }
     });
     thread::spawn(move || {
@@ -1605,6 +1829,102 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         instance_lock: Some(instance_lock),
     })
 }
+pub type RecoveryVersions = std::collections::HashMap<String, (String, u64, Value)>;
+pub fn checkpoint_projects(
+    workspace: &crate::workspace::Registry,
+    state_dir: &Path,
+    previous: &mut RecoveryVersions,
+) {
+    let entries = crate::workspace::entries_in(workspace);
+    let live: std::collections::HashSet<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
+    previous.retain(|id, _| live.contains(id));
+    for (project, _, shared) in entries {
+        let doc = if let Ok(e) = shared.try_lock() {
+            if e.closed || e.doc.read_only || e.doc.revision == e.saved_revision {
+                previous.remove(&project);
+                continue;
+            }
+            if previous
+                .get(&project)
+                .is_some_and(|(id, rev, _)| id == &e.doc.id && *rev == e.doc.revision)
+            {
+                continue;
+            }
+            e.doc.clone()
+        } else {
+            continue;
+        };
+        let Ok(bytes) = psd::encode(&doc) else {
+            continue;
+        };
+        let Ok(e) = shared.try_lock() else {
+            continue;
+        };
+        if e.closed
+            || e.doc.id != doc.id
+            || e.doc.revision != doc.revision
+            || e.saved_revision == doc.revision
+        {
+            continue;
+        }
+        let filename = format!("recovery-{project}.psd");
+        if atomic_write(&state_dir.join(&filename), &bytes).is_ok() {
+            previous.insert(project.clone(),(doc.id.clone(),doc.revision,json!({"project_id":project,"document_id":doc.id,"revision":doc.revision,"name":doc.name,"file":filename,"original_path":e.path,"bit_depth":doc.bit_depth})));
+        }
+    }
+    let entries: Vec<_> = previous
+        .values()
+        .map(|(_, _, entry)| entry.clone())
+        .collect();
+    let _ = atomic_write(
+        &state_dir.join("recoveries.json"),
+        &serde_json::to_vec(&json!({"version":1,"projects":entries})).unwrap(),
+    );
+}
+pub fn recovery_projects(state_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut results = vec![];
+    let mut seen = std::collections::HashSet::new();
+    for file in ["recoveries.json", "previous-recoveries.json"] {
+        let Ok(bytes) = fs::read(state_dir.join(file)) else {
+            continue;
+        };
+        if bytes.len() > 65536 {
+            continue;
+        }
+        let Ok(index) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        for entry in index["projects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(crate::workspace::MAX_PROJECTS)
+        {
+            let Some(project) = entry["project_id"].as_str() else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(project).is_err() || !seen.insert(project.to_owned()) {
+                continue;
+            }
+            let filename = format!("recovery-{project}.psd");
+            if entry["file"] != filename {
+                continue;
+            }
+            let path = state_dir.join(filename);
+            if path.is_file() {
+                results.push((
+                    entry["name"]
+                        .as_str()
+                        .unwrap_or("Recovered project")
+                        .to_owned(),
+                    path,
+                ));
+            }
+        }
+    }
+    results
+}
+
 use std::io::Read;
 pub fn default_state_dir() -> PathBuf {
     std::env::temp_dir().join("PeerBrush")

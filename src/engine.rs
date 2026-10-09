@@ -407,7 +407,13 @@ pub struct AiChange {
     pub scopes: Vec<Scope>,
     pub at: u64,
 }
+#[derive(Clone)]
 pub struct Engine {
+    pub project_id: String,
+    pub closed: bool,
+    pub(crate) workspace: Option<std::sync::Weak<std::sync::Mutex<crate::workspace::Workspace>>>,
+    pub(crate) workspace_owner:
+        Option<std::sync::Arc<std::sync::Mutex<crate::workspace::Workspace>>>,
     pub doc: Document,
     pub leases: Vec<Lease>,
     pub undo: Vec<History>,
@@ -487,6 +493,10 @@ impl Engine {
     }
     pub fn new() -> Self {
         Self {
+            project_id: id(),
+            closed: false,
+            workspace: None,
+            workspace_owner: None,
             doc: Document::new(1024, 768).unwrap(),
             leases: vec![],
             undo: vec![],
@@ -526,6 +536,13 @@ impl Engine {
         self.mcp_clients.retain(|_, expiry| *expiry > now());
         self.expire_proposals();
     }
+    pub fn ensure_open(&self) -> Result<(), String> {
+        if self.closed {
+            Err("This project is closed; choose an open project ID".into())
+        } else {
+            Ok(())
+        }
+    }
     pub(crate) fn mark_ai(&mut self, actor: &str, label: &str, tool: &str, scopes: Vec<Scope>) {
         if actor == "human" {
             return;
@@ -542,6 +559,8 @@ impl Engine {
     }
     pub fn state(&mut self) -> Value {
         let mut result = self.state_core();
+        result["project_id"] = json!(self.project_id);
+        result["closed"] = json!(self.closed);
         result["proposals"] = json!(self.proposals.iter().map(|p| p.state()).collect::<Vec<_>>());
         result["task_recovery"] = self.task_recovery();
         result
@@ -595,6 +614,7 @@ impl Engine {
         description: &str,
         scopes: Vec<Scope>,
     ) -> Result<Lease, String> {
+        self.ensure_open()?;
         self.expire();
         for l in &self.leases {
             if l.owner != owner
@@ -617,6 +637,7 @@ impl Engine {
         Ok(lease)
     }
     pub fn check(&mut self, actor: &str, scopes: &[Scope]) -> Result<(), String> {
+        self.ensure_open()?;
         self.expire();
         for l in &self.leases {
             if l.owner != actor
@@ -971,6 +992,7 @@ impl Engine {
         mut clipboard: Option<crate::layer_clipboard::Layers>,
         prepared_doc: Option<Document>,
     ) -> Result<Value, String> {
+        self.ensure_open()?;
         if self.doc.read_only {
             return Err("This PSD is read-only. Create a compatible copy first.".into());
         }
@@ -2290,6 +2312,7 @@ impl Engine {
         Err(format!("Unsupported operation: {op}"))
     }
     pub fn undo(&mut self, actor: &str) -> Result<(), String> {
+        self.ensure_open()?;
         let h = self.undo.last().ok_or("Nothing to undo")?.clone();
         if actor != "human" && h.actor != actor {
             return Err("Latest change belongs to another participant. Observe again or inspect selective task undo.".into());
@@ -2305,6 +2328,7 @@ impl Engine {
         Ok(())
     }
     pub fn redo(&mut self, actor: &str) -> Result<(), String> {
+        self.ensure_open()?;
         let h = self.redo.last().ok_or("Nothing to redo")?.clone();
         if actor != "human" && h.actor != actor {
             return Err("Redo belongs to another participant".into());
@@ -2324,6 +2348,7 @@ impl Engine {
         mut doc: Document,
         path: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
+        self.ensure_open()?;
         if ![8, 16].contains(&doc.bit_depth) {
             return Err("Color depth must be 8 or 16 bits".into());
         }
@@ -2349,6 +2374,8 @@ impl Engine {
                 rect: None,
             }],
         )?;
+        // Reopening the same serialized PSD is still a new runtime source.
+        doc.id = id();
         self.doc = doc;
         self.path = path;
         self.saved_revision = self.doc.revision;

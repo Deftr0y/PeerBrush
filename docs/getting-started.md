@@ -10,7 +10,9 @@ Create regular layers or folders in the layer panel. Creating a folder gathers t
 
 Click the content thumbnail to paint pixels. Click the mask thumbnail to paint grayscale. The two overlapping swatches at the bottom left set foreground and background colors. **X** swaps them; mask colors remain independent from artwork colors. Click a swatch for the large hue/saturation picker, compact RGBA controls, and editable HEX values (`RGB`, `RRGGBB`, or `RRGGBBAA`). Alt-click isolates a mask; Shift-click toggles it. The mask stack supports paint, fill, invert, levels, feathering, curves, Gaussian blur and tonal adjustments. Select a paint step to edit it; use Add effect to extend the stack.
 
-Save working documents as PSD and export PNG. Import PNG/JPEG as layers, or **drop images anywhere**. Drop one PSD to open it; unsaved work must be saved first. Ctrl/Cmd+S saves; Ctrl/Cmd+O opens; Ctrl/Cmd+Z undoes; Ctrl/Cmd+Shift+Z redoes.
+Save working documents as PSD and export PNG. Import PNG/JPEG as layers, or **drop images anywhere**. New/Open and dropping one PSD create another project tab, preserving existing work. Each tab has its own undo, selections, view, dirty marker and save destination. Ctrl/Cmd+S saves the active project; Ctrl/Cmd+O opens another; Ctrl/Cmd+Z undoes; Ctrl/Cmd+Shift+Z redoes.
+
+Copy layers or folders, switch tabs and paste to transfer their editable trees. Drag selected layer roots onto another tab to see the actual destination before dropping; hold Shift to move rather than copy. A move creates an independent undo step in each project. Native16 sources promote an 8-bit destination instead of narrowing the artwork. Protected Photoshop sources need an explicit compatible copy before editable tree transfer. See [projects and background AI work](projects.md).
 
 Click a layer row to work with whole layers. **Ctrl/Cmd+J** duplicates the selected layers or folders; **Ctrl/Cmd+C**, **X**, and **V** copy, cut and paste them with their editable masks, effects, children and transforms. Cut removes content only after the clipboard write succeeds. A failed or stale copy cannot delete your work.
 
@@ -27,7 +29,7 @@ The renderer displays cached previews through the GPU. Incremental brush coverag
 
 ## Recovery and shared control
 
-Unsaved changes generate a recovery PSD in PeerBrush's runtime folder. The AI connection settings panel offers recovery when present. Recovery is a safety copy; save explicitly to keep work permanently.
+Each dirty project generates its own native-depth recovery PSD and an index in PeerBrush's runtime folder. The AI connection settings panel offers named recovery entries from the current and preceding session. Recovering opens a new unsaved tab with no original save destination. Recovery is a safety copy; save explicitly to keep work permanently.
 
 AI can reserve specific layers or rectangular regions while you edit elsewhere. Blue outlines and layer badges identify AI reservations and recent AI edits. AI opacity and transform previews ease into place, and hierarchy rows animate into their new folder positions. These are presentation transitions; the current shared document and undo history update immediately. Take back control releases reservations. Agents using the old task ID cannot keep editing under that task.
 

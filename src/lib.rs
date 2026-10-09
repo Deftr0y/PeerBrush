@@ -39,3 +39,4 @@ pub mod thumbnails;
 pub mod transform;
 pub mod tree;
 pub mod ui;
+pub mod workspace;

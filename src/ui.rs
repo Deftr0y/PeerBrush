@@ -163,8 +163,64 @@ struct RenameEdit {
     focus: bool,
 }
 struct MergeReply {
+    project: String,
     document: String,
     result: Result<Value, String>,
+}
+struct JobReply {
+    project: String,
+    result: Result<String, String>,
+}
+#[derive(Clone, PartialEq)]
+struct TabTransfer {
+    source: String,
+    destination: String,
+    source_document: String,
+    destination_document: String,
+    source_revision: u64,
+    destination_revision: u64,
+    layers: Vec<String>,
+    target: String,
+    move_layers: bool,
+}
+impl TabTransfer {
+    fn request(&self) -> crate::workspace::Transfer<'_> {
+        crate::workspace::Transfer {
+            source: &self.source,
+            destination: &self.destination,
+            source_document: &self.source_document,
+            destination_document: &self.destination_document,
+            source_revision: self.source_revision,
+            destination_revision: self.destination_revision,
+            layers: &self.layers,
+            target: &self.target,
+            move_layers: self.move_layers,
+            actor: "human",
+            source_task: None,
+            destination_task: None,
+        }
+    }
+}
+enum TransferOutput {
+    Preview(Result<(Document, u32, u32, Vec<u8>), String>),
+    Commit(Result<Value, String>),
+}
+struct TransferReply {
+    spec: TabTransfer,
+    output: TransferOutput,
+}
+struct ProjectView {
+    selected: String,
+    selection_layers: HashSet<String>,
+    selection_anchor: String,
+    mask: bool,
+    mask_step: Option<String>,
+    effect_selected: Option<(String, bool, String)>,
+    isolate: bool,
+    collapsed: HashSet<String>,
+    zoom: f32,
+    pan: Vec2,
+    message: String,
 }
 struct LayerDrag {
     gesture: String,
@@ -192,6 +248,22 @@ struct ParameterEdit {
 }
 pub struct PeerBrush {
     shared: Shared,
+    workspace_root: Shared,
+    workspace: crate::workspace::Registry,
+    project_id: String,
+    project_views: HashMap<String, ProjectView>,
+    project_rects: HashMap<String, Rect>,
+    project_labels: HashMap<String, String>,
+    doc_snapshot: Document,
+    jobs: HashSet<String>,
+    connected: bool,
+    tab_transfer: Option<TabTransfer>,
+    tab_preview_requested: Option<TabTransfer>,
+    tab_preview_pending: bool,
+    tab_transfer_committing: bool,
+    tab_preview: Option<(Document, TextureHandle)>,
+    transfer_tx: mpsc::Sender<TransferReply>,
+    transfer_rx: mpsc::Receiver<TransferReply>,
     connection: Connection,
     selected: String,
     selection_layers: HashSet<String>,
@@ -280,8 +352,8 @@ pub struct PeerBrush {
     view_rect: Option<Rect>,
     message: String,
     last_status: String,
-    job_rx: mpsc::Receiver<Result<String, String>>,
-    job_tx: mpsc::Sender<Result<String, String>>,
+    job_rx: mpsc::Receiver<JobReply>,
+    job_tx: mpsc::Sender<JobReply>,
     busy: bool,
     load_control: Option<crate::loading::Control>,
     load_preview: Option<TextureHandle>,
@@ -449,7 +521,29 @@ impl PeerBrush {
         let (job_tx, job_rx) = mpsc::channel();
         let (connect_tx, connect_rx) = mpsc::channel();
         let (merge_tx, merge_rx) = mpsc::channel();
+        let (transfer_tx, transfer_rx) = mpsc::channel();
+        let workspace = crate::workspace::attach(&shared);
+        let (project_id, doc_snapshot) = {
+            let e = shared.lock().unwrap();
+            (e.project_id.clone(), e.doc.clone())
+        };
         Self {
+            workspace_root: shared.clone(),
+            workspace,
+            project_id,
+            project_views: HashMap::new(),
+            project_rects: HashMap::new(),
+            project_labels: HashMap::new(),
+            doc_snapshot,
+            jobs: HashSet::new(),
+            connected: false,
+            tab_transfer: None,
+            tab_preview_requested: None,
+            tab_preview_pending: false,
+            tab_transfer_committing: false,
+            tab_preview: None,
+            transfer_tx,
+            transfer_rx,
             shared,
             connection,
             selection_layers: [selected.clone()].into_iter().collect(),
@@ -958,9 +1052,15 @@ impl PeerBrush {
             return;
         }
         self.busy = true;
+        let project = self.project_id.clone();
+        self.jobs.insert(project.clone());
         let tx = self.job_tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(f());
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+                    Err("File operation could not complete; current work preserved".into())
+                });
+            let _ = tx.send(JobReply { project, result });
         });
     }
     fn connect_ai(&mut self, ctx: &egui::Context) {
@@ -1030,34 +1130,41 @@ impl PeerBrush {
             ids.push(self.selected.clone());
         }
         let document = doc.id.clone();
+        let project = self.project_id.clone();
         let revision = doc.revision;
         let shared = self.shared.clone();
         let tx = self.merge_tx.clone();
         let ctx = ctx.clone();
         self.busy = true;
+        self.jobs.insert(project.clone());
         self.message = "Merging layers…".into();
         if let Err(error) = std::thread::Builder::new()
             .name("peerbrush-merge".into())
             .spawn(move || {
-                let result = crate::merge::edit(&shared, "human", &ids, Some(revision), None, None);
-                let _ = tx.send(MergeReply { document, result });
+                let result = crate::merge::edit_guarded(
+                    &shared,
+                    "human",
+                    &ids,
+                    Some(revision),
+                    None,
+                    None,
+                    Some(&document),
+                );
+                let _ = tx.send(MergeReply {
+                    project,
+                    document,
+                    result,
+                });
                 ctx.request_repaint();
             })
         {
             self.busy = false;
+            self.jobs.remove(&self.project_id);
             self.message = format!("Could not start merging layers: {error}");
         }
     }
     fn open(&mut self) {
         if self.busy {
-            return;
-        }
-        let dirty = {
-            let e = self.shared.lock().unwrap();
-            e.doc.revision != e.saved_revision
-        };
-        if dirty {
-            self.message = "Save your work before opening another document".into();
             return;
         }
         self.open_job(None, false);
@@ -1066,7 +1173,9 @@ impl PeerBrush {
         if self.busy {
             return;
         }
-        let s = self.shared.clone();
+        let s = Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
+        let workspace = self.workspace.clone();
+        let initiating = self.project_id.clone();
         let control = crate::loading::Control::default();
         {
             let e = s.lock().unwrap();
@@ -1090,6 +1199,8 @@ impl PeerBrush {
                 e.file_version = None;
                 e.saved_revision = u64::MAX;
             }
+            let engine = s.lock().unwrap().clone();
+            crate::workspace::register_in(&workspace, engine, Some(&initiating))?;
             Ok(if recover {
                 "Recovered autosave — save to your chosen PSD"
             } else {
@@ -1100,6 +1211,7 @@ impl PeerBrush {
     }
     fn save(&mut self, save_as: bool) {
         let s = self.shared.clone();
+        let document = self.doc_snapshot.id.clone();
         let current = if save_as {
             None
         } else {
@@ -1115,12 +1227,13 @@ impl PeerBrush {
             let Some(path) = path else {
                 return Ok("Ready".into());
             };
-            server::save(&s, &path)?;
+            server::save_source(&s, &path, &document)?;
             Ok("PSD saved".into())
         });
     }
     fn export(&mut self) {
         let s = self.shared.clone();
+        let document = self.doc_snapshot.id.clone();
         self.job(move || {
             let Some(path) = rfd::FileDialog::new()
                 .add_filter("PNG", &["png"])
@@ -1129,12 +1242,14 @@ impl PeerBrush {
             else {
                 return Ok("Ready".into());
             };
-            server::export(&s, &path)?;
+            server::export_source(&s, &path, &document)?;
             Ok("PNG exported".into())
         });
     }
     fn import(&mut self) {
         let shared = self.shared.clone();
+        let document = self.doc_snapshot.id.clone();
+        let revision = self.doc_snapshot.revision;
         self.job(move || {
             let Some(paths) = rfd::FileDialog::new()
                 .add_filter("Images", &["png", "jpg", "jpeg"])
@@ -1144,12 +1259,15 @@ impl PeerBrush {
             };
             let commands: Vec<Value> = paths
                 .iter()
-                .map(|path| json!({"op":"image.import","path":path}))
+                .map(|path| json!({"op":"image.import","path":path,"document_id":document}))
                 .collect();
-            shared
-                .lock()
-                .unwrap()
-                .edit("human", &commands, None, None, "Import images")?;
+            shared.lock().unwrap().edit(
+                "human",
+                &commands,
+                Some(revision),
+                None,
+                "Import images",
+            )?;
             Ok(format!("Imported {} image layers", paths.len()))
         });
     }
@@ -1173,25 +1291,22 @@ impl PeerBrush {
         }
         let shared = self.shared.clone();
         if psds == 1 {
-            let dirty = {
-                let e = shared.lock().unwrap();
-                e.doc.revision != e.saved_revision
-            };
-            if dirty {
-                self.message = "Save your work before dropping another PSD".into();
-                return;
-            }
             self.open_job(Some(paths[0].clone()), false);
         } else if !paths.is_empty() {
+            let document = self.doc_snapshot.id.clone();
+            let revision = self.doc_snapshot.revision;
             self.job(move || {
                 let commands: Vec<Value> = paths
                     .iter()
-                    .map(|p| json!({"op":"image.import","path":p}))
+                    .map(|p| json!({"op":"image.import","path":p,"document_id":document}))
                     .collect();
-                shared
-                    .lock()
-                    .unwrap()
-                    .edit("human", &commands, None, None, "Drop images")?;
+                shared.lock().unwrap().edit(
+                    "human",
+                    &commands,
+                    Some(revision),
+                    None,
+                    "Drop images",
+                )?;
                 Ok(format!("Added {} image layers", paths.len()))
             });
         }
@@ -1395,6 +1510,9 @@ impl PeerBrush {
             }
         }
         while let Ok(p) = self.preview_rx.try_recv() {
+            if p.doc_id != doc.id {
+                continue;
+            }
             if !p.coarse {
                 self.pending = false;
             }
@@ -2799,8 +2917,477 @@ impl PeerBrush {
     }
 }
 impl PeerBrush {
+    fn switch_project(&mut self, id: &str) {
+        if id == self.project_id {
+            return;
+        }
+        let Some((_, _, shared)) = crate::workspace::entries_in(&self.workspace)
+            .into_iter()
+            .find(|(project, _, _)| project == id)
+        else {
+            return;
+        };
+        self.project_views.insert(
+            self.project_id.clone(),
+            ProjectView {
+                selected: self.selected.clone(),
+                selection_layers: self.selection_layers.clone(),
+                selection_anchor: self.selection_anchor.clone(),
+                mask: self.mask,
+                mask_step: self.mask_step.clone(),
+                effect_selected: self.effect_selected.clone(),
+                isolate: self.isolate,
+                collapsed: self.collapsed.clone(),
+                zoom: self.zoom,
+                pan: self.pan,
+                message: self.message.clone(),
+            },
+        );
+        self.select_tool(self.tool);
+        self.parameter_gesture = None;
+        self.rename_edit = None;
+        self.eye_sweep = None;
+        self.layer_drag = None;
+        self.geometry = None;
+        self.source_editor = None;
+        self.refinement = None;
+        self.retouch_source = None;
+        self.task_undo_review = None;
+        self.proposal_review = None;
+        self.proposal_rendered = None;
+        self.selection_path.clear();
+        self.selection_gesture_mode = None;
+        self.project_settings = None;
+        self.shared = shared;
+        self.project_id = id.into();
+        self.busy = self.jobs.contains(id);
+        if let Some(view) = self.project_views.remove(id) {
+            self.selected = view.selected;
+            self.selection_layers = view.selection_layers;
+            self.selection_anchor = view.selection_anchor;
+            self.mask = view.mask;
+            self.mask_step = view.mask_step;
+            self.effect_selected = view.effect_selected;
+            self.isolate = view.isolate;
+            self.collapsed = view.collapsed;
+            self.zoom = view.zoom;
+            self.pan = view.pan;
+            self.message = view.message;
+        } else {
+            self.selected = String::new();
+            self.selection_layers.clear();
+            self.selection_anchor = String::new();
+            self.mask = false;
+            self.mask_step = None;
+            self.effect_selected = None;
+            self.isolate = false;
+            self.collapsed.clear();
+            self.zoom = 1.;
+            self.pan = Vec2::ZERO;
+            self.frame_pending = true;
+            self.message = "Ready".into();
+        }
+        self.texture = None;
+        self.canvas_pixels = None;
+        self.canvas_selection = None;
+        self.last_preview = None;
+        self.pending = false;
+        self.preview_cache = Arc::new(std::sync::Mutex::new(crate::preview::Cache::default()));
+        self.thumbs.clear();
+        self.thumb_pending.clear();
+        self.thumb_document.clear();
+        self.last_status.clear();
+    }
+    fn draw_header(&mut self, ctx: &egui::Context) {
+        let (connected, activity) = {
+            if let Ok(e) = self.workspace_root.try_lock() {
+                self.connected = !e.mcp_clients.is_empty();
+            }
+            let activity = self
+                .shared
+                .try_lock()
+                .ok()
+                .map(|e| e.activity.clone())
+                .unwrap_or_else(|| self.activity_text.clone());
+            (self.connected, activity)
+        };
+        let activity = activity.split_whitespace().collect::<Vec<_>>().join(" ");
+        let activity = if activity.is_empty() {
+            if connected {
+                "Connected. Ready to create together".into()
+            } else {
+                "You and your AI. Same canvas.".into()
+            }
+        } else {
+            activity
+        };
+        if activity != self.activity_text {
+            self.activity_text = activity;
+            self.activity_changed = std::time::Instant::now();
+        }
+        egui::TopBottomPanel::top("header")
+            .exact_height(54.0)
+            .show(ctx, |ui| {
+                let bounds = ui.max_rect();
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(5.0);
+                    ui.add(egui::Image::new((self.logo.id(), Vec2::splat(42.0))));
+                    ui.add_space(9.0);
+                    let aspect=self.wordmark.size_vec2().x/self.wordmark.size_vec2().y;
+                    ui.add(egui::Image::new((self.wordmark.id(),Vec2::new(136.0,136.0/aspect))))
+                        .on_hover_text("PeerBrush · You and your AI. Same canvas.");
+                    ui.add_space(12.0);
+                    if self.shared.try_lock().is_ok() {self.task_history_menu(ui);}
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        let settings = icons::small_button(ui, Icon::Adjust, "AI connection settings");
+                        self.connection_settings_rect = Some(settings.rect);
+                        if settings.clicked() { self.show_connection = true; }
+                        let title = if self.connecting {
+                            "Connecting…"
+                        } else if self.connect_retry {
+                            "Retry AI"
+                        } else if self.connect_ready {
+                            "MCP ready"
+                        } else {
+                            "Connect AI"
+                        };
+                        let button = ui.add_enabled(!self.connecting, egui::Button::new(title).min_size(Vec2::new(110.0, 28.0)).fill(Color32::from_rgb(74, 48, 71)));
+                        self.connect_button_rect = Some(button.rect);
+                        if button.clicked() { self.connect_ai(ui.ctx()); }
+                        if self.connecting {
+                            let spinner = Rect::from_center_size(button.rect.left_center() + Vec2::new(11.0, 0.0), Vec2::splat(10.0));
+                            egui::Spinner::new().size(10.0).color(ACCENT).paint_at(ui, spinner);
+                        }
+                        button.on_hover_text(if self.connect_feedback.is_empty() {
+                            "Advertise PeerBrush and set up installed AI clients. An agent turns the MCP indicator green when it connects."
+                        } else { &self.connect_feedback });
+                        let color = if connected {
+                            Color32::from_rgb(166, 215, 157)
+                        } else {
+                            Color32::from_rgb(255, 154, 144)
+                        };
+                        ui.label(
+                            RichText::new(if connected {
+                                "MCP connected"
+                            } else {
+                                "MCP · waiting for AI"
+                            })
+                            .size(11.0)
+                            .color(color),
+                        ).on_hover_text("The server is listening. Connect AI sets up discovery and installed clients; this indicator turns green after an actual agent handshake.");
+                        let (_, r) = ui.allocate_space(Vec2::new(6.0, 6.0));
+                        ui.painter().circle_filled(r.center(), 2.5, color);
+                    });
+                });
+                let width = (bounds.width() - 610.0).clamp(200.0, 540.0);
+                let center = Rect::from_center_size(bounds.center(), Vec2::new(width, 32.0));
+                ui.painter()
+                    .rect_filled(center, 9.0, Color32::from_rgb(36, 34, 38));
+                let progress = (self.activity_changed.elapsed().as_secs_f32() / 0.3).min(1.0);
+                let alpha = 0.75 + progress * 0.25;
+                let pulse = ui.input(|i| i.time) as f32;
+                ui.painter().circle_filled(
+                    center.left_center() + Vec2::new(13.0, 0.0),
+                    if connected {
+                        3.0 + 0.7 * (pulse * 3.0).sin()
+                    } else {
+                        2.5
+                    },
+                    if connected {
+                        AI_BLUE
+                    } else {
+                        MUTED.gamma_multiply(0.5)
+                    },
+                );
+                if connected {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+                if progress < 1.0 {
+                    ctx.request_repaint();
+                }
+                let label_rect = Rect::from_min_max(
+                    center.min + Vec2::new(28.0, (1.0 - progress) * 3.0),
+                    center.max - Vec2::new(10.0, 0.0),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(label_rect).layout(
+                        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    ),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&self.activity_text)
+                                    .size(12.0)
+                                    .color(if self.animation.active(ui.input(|i| i.time)) { AI_BLUE.gamma_multiply(alpha) } else { MUTED.gamma_multiply(alpha) }),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&self.activity_text);
+                    },
+                );
+            });
+    }
+    fn project_tabs(&mut self, ctx: &egui::Context) {
+        let active = crate::workspace::active_id_in(&self.workspace);
+        self.switch_project(&active);
+        let entries = crate::workspace::entries_in(&self.workspace);
+        let live: HashSet<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
+        self.project_views.retain(|id, _| live.contains(id));
+        self.project_rects.clear();
+        let mut select = None;
+        let mut close = None;
+        let mut hovered = None;
+        egui::TopBottomPanel::top("project tabs")
+            .exact_height(32.)
+            .show(ctx, |ui| {
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.;
+                        for (id, name, shared) in entries {
+                            let mut ai = false;
+                            if let Ok(e) = shared.try_lock() {
+                                self.project_labels.insert(
+                                    id.clone(),
+                                    format!(
+                                        "{}{}",
+                                        e.doc.name,
+                                        if e.doc.revision != e.saved_revision {
+                                            " *"
+                                        } else {
+                                            ""
+                                        }
+                                    ),
+                                );
+                                ai = !e.leases.is_empty()
+                                    || e.ai_change.as_ref().is_some_and(|change| {
+                                        crate::engine::now().saturating_sub(change.at) < 3
+                                    });
+                            }
+                            let label = self.project_labels.get(&id).unwrap_or(&name);
+                            let response = ui.add(
+                                egui::Button::new(RichText::new(label).color(if ai {
+                                    AI_BLUE
+                                } else {
+                                    MUTED
+                                }))
+                                .frame(false)
+                                .selected(id == self.project_id),
+                            );
+                            self.project_rects.insert(id.clone(), response.rect);
+                            if id != self.project_id
+                                && ctx
+                                    .input(|i| i.pointer.interact_pos())
+                                    .is_some_and(|p| response.rect.contains(p))
+                            {
+                                if let Some(drag) = &self.layer_drag {
+                                    if let Ok(e) = shared.try_lock() {
+                                        let target = self
+                                            .project_views
+                                            .get(&id)
+                                            .map(|v| v.selected.clone())
+                                            .filter(|target| {
+                                                e.doc.layers.iter().any(|l| l.id == *target)
+                                            })
+                                            .unwrap_or_else(|| {
+                                                e.doc
+                                                    .layers
+                                                    .first()
+                                                    .map(|l| l.id.clone())
+                                                    .unwrap_or_default()
+                                            });
+                                        hovered = Some(TabTransfer {
+                                            source: self.project_id.clone(),
+                                            destination: id.clone(),
+                                            source_document: self.doc_snapshot.id.clone(),
+                                            destination_document: e.doc.id.clone(),
+                                            source_revision: drag.revision,
+                                            destination_revision: e.doc.revision,
+                                            layers: drag.ids.clone(),
+                                            target,
+                                            move_layers: ctx.input(|i| i.modifiers.shift),
+                                        });
+                                        ui.painter().line_segment(
+                                            [
+                                                response.rect.left_bottom(),
+                                                response.rect.right_bottom(),
+                                            ],
+                                            Stroke::new(2., ACCENT),
+                                        );
+                                    }
+                                }
+                            }
+                            if response.clicked() {
+                                select = Some(id.clone());
+                            }
+                            if ui
+                                .add(egui::Button::new("×").frame(false))
+                                .on_hover_text("Close project")
+                                .clicked()
+                            {
+                                close = Some((id.clone(), shared.clone()));
+                            }
+                        }
+                        if ui
+                            .add(egui::Button::new("+").frame(false))
+                            .on_hover_text("New project")
+                            .clicked()
+                        {
+                            self.show_new = true;
+                        }
+                    })
+                });
+            });
+        while let Ok(reply) = self.transfer_rx.try_recv() {
+            match reply.output {
+                TransferOutput::Preview(result) => {
+                    self.tab_preview_pending = false;
+                    if self.tab_transfer.as_ref() == Some(&reply.spec)
+                        && !self.tab_transfer_committing
+                    {
+                        match result {
+                            Ok((doc, w, h, bytes)) => {
+                                self.tab_preview = Some((
+                                    doc,
+                                    ctx.load_texture(
+                                        "Cross-project preview",
+                                        egui::ColorImage::from_rgba_unmultiplied(
+                                            [w as usize, h as usize],
+                                            &bytes,
+                                        ),
+                                        egui::TextureOptions::LINEAR,
+                                    ),
+                                ));
+                            }
+                            Err(error) => self.message = error,
+                        }
+                    }
+                }
+                TransferOutput::Commit(result) => {
+                    self.jobs.remove(&reply.spec.source);
+                    self.busy = self.jobs.contains(&self.project_id);
+                    self.tab_transfer_committing = false;
+                    self.tab_transfer = None;
+                    self.tab_preview = None;
+                    self.tab_preview_requested = None;
+                    match result {
+                        Ok(result) => {
+                            if crate::workspace::active_id_in(&self.workspace) == reply.spec.source
+                            {
+                                let _ = crate::workspace::select_in(
+                                    &self.workspace,
+                                    &reply.spec.destination,
+                                );
+                                self.switch_project(&reply.spec.destination);
+                                if let Some(ids) = result["created_roots"].as_array() {
+                                    let ids: Vec<_> = ids
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .map(String::from)
+                                        .collect();
+                                    if let Some(first) = ids.first() {
+                                        self.select_content(first);
+                                        self.selection_layers = ids.into_iter().collect();
+                                    }
+                                }
+                            }
+                            self.message = if reply.spec.move_layers {
+                                "Moved layers between projects"
+                            } else {
+                                "Copied layers to project"
+                            }
+                            .into();
+                        }
+                        Err(error) => self.message = error,
+                    }
+                    self.last_preview = None;
+                }
+            }
+        }
+        if !self.tab_transfer_committing {
+            if let Some(spec) = hovered {
+                if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+                    self.layer_drag = None;
+                    self.tab_transfer = Some(spec.clone());
+                    self.tab_transfer_committing = true;
+                    self.jobs.insert(spec.source.clone());
+                    self.busy = true;
+                    let workspace = self.workspace.clone();
+                    let tx = self.transfer_tx.clone();
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let result = crate::workspace::transfer_in(&workspace, &spec.request());
+                        let _ = tx.send(TransferReply {
+                            spec,
+                            output: TransferOutput::Commit(result),
+                        });
+                        ctx.request_repaint();
+                    });
+                } else {
+                    if self.tab_transfer.as_ref() != Some(&spec) {
+                        self.tab_preview = None;
+                    }
+                    self.tab_transfer = Some(spec.clone());
+                    if !self.tab_preview_pending
+                        && self.tab_preview_requested.as_ref() != Some(&spec)
+                    {
+                        self.tab_preview_requested = Some(spec.clone());
+                        self.tab_preview_pending = true;
+                        let workspace = self.workspace.clone();
+                        let tx = self.transfer_tx.clone();
+                        let ctx = ctx.clone();
+                        std::thread::spawn(move || {
+                            let result =
+                                crate::workspace::transfer_preview_in(&workspace, &spec.request())
+                                    .and_then(|doc| {
+                                        let (w, h, bytes, _) =
+                                            doc.preview(None, 1400, None, false)?;
+                                        Ok((doc, w, h, bytes))
+                                    });
+                            let _ = tx.send(TransferReply {
+                                spec,
+                                output: TransferOutput::Preview(result),
+                            });
+                            ctx.request_repaint();
+                        });
+                    }
+                }
+            } else if self.tab_transfer.take().is_some() {
+                self.tab_preview = None;
+                self.tab_preview_requested = None;
+                self.last_preview = None;
+            }
+        }
+        if let Some(id) = select {
+            if crate::workspace::select_in(&self.workspace, &id).is_ok() {
+                self.switch_project(&id);
+            }
+        }
+        if let Some((id, shared)) = close {
+            if let Ok(e) = shared.try_lock() {
+                let document = e.doc.id.clone();
+                let revision = e.doc.revision;
+                drop(e);
+                self.message = crate::workspace::close_in(
+                    &self.workspace,
+                    &id,
+                    &document,
+                    revision,
+                    false,
+                    "human",
+                )
+                .map(|_| "Project closed".into())
+                .unwrap_or_else(|error| error);
+            }
+        }
+    }
     fn draw(&mut self, ctx: &egui::Context) {
-        let panel = self.shared.lock().unwrap().capture_panel.take();
+        let panel = self
+            .workspace_root
+            .try_lock()
+            .ok()
+            .and_then(|mut e| e.capture_panel.take());
         if let Some(panel) = panel {
             self.show_brush = panel == "brush";
             if panel == "color" {
@@ -2810,10 +3397,11 @@ impl PeerBrush {
             }
         }
         {
-            let mut e = self.shared.lock().unwrap();
-            if e.focus_requested {
-                e.focus_requested = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if let Ok(mut e) = self.workspace_root.try_lock() {
+                if e.focus_requested {
+                    e.focus_requested = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
         }
         for event in ctx.input(|i| i.events.clone()) {
@@ -2836,7 +3424,12 @@ impl PeerBrush {
             }
         }
         if !self.pending {
-            if let Some(path) = self.shared.lock().unwrap().capture_ui.take() {
+            if let Some(path) = self
+                .workspace_root
+                .try_lock()
+                .ok()
+                .and_then(|mut e| e.capture_ui.take())
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(path)));
             }
         }
@@ -2844,7 +3437,17 @@ impl PeerBrush {
             self.receive_connection(result);
         }
         while let Ok(reply) = self.merge_rx.try_recv() {
-            self.busy = false;
+            self.jobs.remove(&reply.project);
+            self.busy = self.jobs.contains(&self.project_id);
+            if reply.project != self.project_id {
+                if let Some(view) = self.project_views.get_mut(&reply.project) {
+                    view.message = reply
+                        .result
+                        .map(|_| "Merged layers".into())
+                        .unwrap_or_else(|e| e);
+                }
+                continue;
+            }
             match reply.result {
                 Ok(result) => {
                     let created = result["created"]
@@ -2873,6 +3476,14 @@ impl PeerBrush {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         while let Ok(reply) = self.clipboard.replies.try_recv() {
+            if self
+                .shared
+                .try_lock()
+                .ok()
+                .is_none_or(|e| e.doc.id != reply.document)
+            {
+                continue;
+            }
             if !reply.selected_layers.is_empty() {
                 self.select_content(&reply.selected_layers[0]);
                 self.selection_layers = reply.selected_layers.into_iter().collect();
@@ -2884,15 +3495,28 @@ impl PeerBrush {
             self.message = reply.result.unwrap_or_else(|e| e);
             self.last_preview = None;
         }
-        let status = self.shared.lock().unwrap().status.clone();
+        let status = self
+            .shared
+            .try_lock()
+            .ok()
+            .map(|e| e.status.clone())
+            .unwrap_or_else(|| self.last_status.clone());
         if status != self.last_status {
             self.message = status.clone();
             self.last_status = status;
         }
-        while let Ok(result) = self.job_rx.try_recv() {
-            self.busy = false;
+        while let Ok(reply) = self.job_rx.try_recv() {
+            self.jobs.remove(&reply.project);
+            self.busy = self.jobs.contains(&self.project_id);
             self.load_control = None;
             self.load_preview = None;
+            let result = reply.result;
+            if reply.project != self.project_id {
+                if let Some(view) = self.project_views.get_mut(&reply.project) {
+                    view.message = result.unwrap_or_else(|e| e);
+                }
+                continue;
+            }
             if result
                 .as_ref()
                 .is_ok_and(|msg| msg.starts_with("Imported ") || msg.starts_with("Added "))
@@ -2908,6 +3532,15 @@ impl PeerBrush {
             self.message = result.unwrap_or_else(|e| e);
             self.last_preview = None;
         }
+        self.draw_header(ctx);
+        self.project_tabs(ctx);
+        if self.shared.try_lock().is_err() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("Working on this project… Switch tabs to continue elsewhere.");
+            });
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.finish_parameter(true);
         } else if !ctx.input(|i| i.pointer.any_down()) {
@@ -2918,6 +3551,7 @@ impl PeerBrush {
             e.expire();
             (e.doc.clone(), e.ai_change.clone())
         };
+        self.doc_snapshot = doc.clone();
         if self.rename_edit.as_ref().is_some_and(|edit| {
             edit.document != doc.id || !doc.layers.iter().any(|l| l.id == edit.layer)
         }) {
@@ -3068,6 +3702,7 @@ impl PeerBrush {
                     .clipboard
                     .request(crate::clipboard::Request::Paste {
                         shared: self.shared.clone(),
+                        document: doc.id.clone(),
                         target: self.selected.clone(),
                         revision: doc.revision,
                     })
@@ -3158,127 +3793,6 @@ impl PeerBrush {
                 }
             });
         }
-        let (connected, activity) = {
-            let e = self.shared.lock().unwrap();
-            (!e.mcp_clients.is_empty(), e.activity.clone())
-        };
-        let activity = activity.split_whitespace().collect::<Vec<_>>().join(" ");
-        let activity = if activity.is_empty() {
-            if connected {
-                "Connected. Ready to create together".into()
-            } else {
-                "You and your AI. Same canvas.".into()
-            }
-        } else {
-            activity
-        };
-        if activity != self.activity_text {
-            self.activity_text = activity;
-            self.activity_changed = std::time::Instant::now();
-        }
-        egui::TopBottomPanel::top("header")
-            .exact_height(54.0)
-            .show(ctx, |ui| {
-                let bounds = ui.max_rect();
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.add_space(5.0);
-                    ui.add(egui::Image::new((self.logo.id(), Vec2::splat(42.0))));
-                    ui.add_space(9.0);
-                    let aspect=self.wordmark.size_vec2().x/self.wordmark.size_vec2().y;
-                    ui.add(egui::Image::new((self.wordmark.id(),Vec2::new(136.0,136.0/aspect))))
-                        .on_hover_text("PeerBrush · You and your AI. Same canvas.");
-                    ui.add_space(12.0);
-                    self.task_history_menu(ui);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
-                        let settings = icons::small_button(ui, Icon::Adjust, "AI connection settings");
-                        self.connection_settings_rect = Some(settings.rect);
-                        if settings.clicked() { self.show_connection = true; }
-                        let title = if self.connecting {
-                            "Connecting…"
-                        } else if self.connect_retry {
-                            "Retry AI"
-                        } else if self.connect_ready {
-                            "MCP ready"
-                        } else {
-                            "Connect AI"
-                        };
-                        let button = ui.add_enabled(!self.connecting, egui::Button::new(title).min_size(Vec2::new(110.0, 28.0)).fill(Color32::from_rgb(74, 48, 71)));
-                        self.connect_button_rect = Some(button.rect);
-                        if button.clicked() { self.connect_ai(ui.ctx()); }
-                        if self.connecting {
-                            let spinner = Rect::from_center_size(button.rect.left_center() + Vec2::new(11.0, 0.0), Vec2::splat(10.0));
-                            egui::Spinner::new().size(10.0).color(ACCENT).paint_at(ui, spinner);
-                        }
-                        button.on_hover_text(if self.connect_feedback.is_empty() {
-                            "Advertise PeerBrush and set up installed AI clients. An agent turns the MCP indicator green when it connects."
-                        } else { &self.connect_feedback });
-                        let color = if connected {
-                            Color32::from_rgb(166, 215, 157)
-                        } else {
-                            Color32::from_rgb(255, 154, 144)
-                        };
-                        ui.label(
-                            RichText::new(if connected {
-                                "MCP connected"
-                            } else {
-                                "MCP · waiting for AI"
-                            })
-                            .size(11.0)
-                            .color(color),
-                        ).on_hover_text("The server is listening. Connect AI sets up discovery and installed clients; this indicator turns green after an actual agent handshake.");
-                        let (_, r) = ui.allocate_space(Vec2::new(6.0, 6.0));
-                        ui.painter().circle_filled(r.center(), 2.5, color);
-                    });
-                });
-                let width = (bounds.width() - 610.0).clamp(200.0, 540.0);
-                let center = Rect::from_center_size(bounds.center(), Vec2::new(width, 32.0));
-                ui.painter()
-                    .rect_filled(center, 9.0, Color32::from_rgb(36, 34, 38));
-                let progress = (self.activity_changed.elapsed().as_secs_f32() / 0.3).min(1.0);
-                let alpha = 0.75 + progress * 0.25;
-                let pulse = ui.input(|i| i.time) as f32;
-                ui.painter().circle_filled(
-                    center.left_center() + Vec2::new(13.0, 0.0),
-                    if connected {
-                        3.0 + 0.7 * (pulse * 3.0).sin()
-                    } else {
-                        2.5
-                    },
-                    if connected {
-                        AI_BLUE
-                    } else {
-                        MUTED.gamma_multiply(0.5)
-                    },
-                );
-                if connected {
-                    ctx.request_repaint_after(Duration::from_millis(50));
-                }
-                if progress < 1.0 {
-                    ctx.request_repaint();
-                }
-                let label_rect = Rect::from_min_max(
-                    center.min + Vec2::new(28.0, (1.0 - progress) * 3.0),
-                    center.max - Vec2::new(10.0, 0.0),
-                );
-                ui.scope_builder(
-                    egui::UiBuilder::new().max_rect(label_rect).layout(
-                        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                    ),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&self.activity_text)
-                                    .size(12.0)
-                                    .color(if self.animation.active(ui.input(|i| i.time)) { AI_BLUE.gamma_multiply(alpha) } else { MUTED.gamma_multiply(alpha) }),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(&self.activity_text);
-                    },
-                );
-            });
         egui::TopBottomPanel::top("context")
             .exact_height(48.0)
             .show(ctx, |ui| {
@@ -3618,11 +4132,32 @@ impl PeerBrush {
                     .inner_margin(8),
             )
             .show(ctx, |ui| {
+                if let Some((preview, texture)) = &self.tab_preview {
+                    ui.label(format!(
+                        "{} · {} layers · {} bit · {}",
+                        preview.name,
+                        preview.layers.len(),
+                        preview.bit_depth,
+                        if self.tab_transfer.as_ref().is_some_and(|s| s.move_layers) {
+                            "Move preview"
+                        } else {
+                            "Copy preview · Shift to move"
+                        }
+                    ));
+                    let size = texture.size_vec2();
+                    let scale = (ui.available_width() / size.x)
+                        .min(ui.available_height() / size.y)
+                        .min(1.);
+                    ui.add(egui::Image::new((texture.id(), size * scale)));
+                    return;
+                }
                 let display = self.review_document(&doc);
                 self.canvas(ui, display.as_ref().unwrap_or(&doc));
             });
 
-        self.request_preview(ctx, &doc);
+        if self.tab_transfer.is_none() {
+            self.request_preview(ctx, &doc);
+        }
         if self.liquify_effect.as_ref().is_some_and(|id| {
             !doc.layers
                 .iter()
@@ -3699,19 +4234,22 @@ impl PeerBrush {
                         ui.selectable_value(&mut self.new_bit_depth, 8, "8 bit");
                         ui.selectable_value(&mut self.new_bit_depth, 16, "16 bit");
                     });
-                    if {
-                        let e = self.shared.lock().unwrap();
-                        e.doc.revision != e.saved_revision
-                    } {
-                        ui.label("Creating a canvas replaces unsaved work.");
-                    }
+                    ui.label("Opens in a new project tab.");
                     if ui.button("Create canvas").clicked() {
                         let result = Document::new_depth(
                             self.new_width,
                             self.new_height,
                             self.new_bit_depth,
                         )
-                        .and_then(|d| self.shared.lock().unwrap().replace(d, None));
+                        .and_then(|d| {
+                            let mut e = crate::engine::Engine::new();
+                            e.doc = d;
+                            crate::workspace::register_in(
+                                &self.workspace,
+                                e,
+                                Some(&self.project_id),
+                            )
+                        });
                         match result {
                             Ok(_) => {
                                 self.texture = None;
@@ -3756,6 +4294,9 @@ impl PeerBrush {
                 if self.connection.state_dir.join("recovery.psd").exists() && ui.button("Recover last autosave").clicked() {
                     let path = self.connection.state_dir.join("recovery.psd");
                     self.open_job(Some(path),true);
+                }
+                for (name,path) in server::recovery_projects(&self.connection.state_dir) {
+                    if ui.button(format!("Recover {name}")).clicked() {self.open_job(Some(path),true);}
                 }
             });
             self.show_connection = open;
@@ -3817,22 +4358,177 @@ impl eframe::App for PeerBrush {
         self.draw(ctx);
     }
     fn on_exit(&mut self) {
-        let doc = {
-            let e = self.shared.lock().unwrap();
-            if e.doc.revision == e.saved_revision {
-                return;
-            }
-            e.doc.clone()
-        };
-        if let Ok(bytes) = crate::psd::encode(&doc) {
-            let _ = server::atomic_write(&self.connection.state_dir.join("recovery.psd"), &bytes);
-        }
+        server::checkpoint_projects(
+            &self.workspace,
+            &self.connection.state_dir,
+            &mut Default::default(),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tabs_keep_selection_channels_view_and_background_job_results_separate() {
+        let (mut app, ctx) = fixture();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let first = app.project_id.clone();
+        let selected = app.selected.clone();
+        app.mask = true;
+        app.mask_step = Some("step-view".into());
+        app.zoom = 1.75;
+        app.pan = Vec2::new(9., -4.);
+        app.collapsed.insert("folder-view".into());
+        let mut engine = crate::engine::Engine::new();
+        engine.doc = Document::new(24, 20).unwrap();
+        let second = crate::workspace::register_in(&app.workspace, engine, Some(&first)).unwrap();
+        let second_id = second.lock().unwrap().project_id.clone();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert_eq!(app.project_id, second_id);
+        assert!(!app.mask);
+        assert_eq!(app.zoom, 1.);
+        let second_selected = app.selected.clone();
+        app.jobs.insert(first.clone());
+        app.job_tx
+            .send(JobReply {
+                project: first.clone(),
+                result: Ok("Imported 1 image layers".into()),
+            })
+            .unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert_eq!(app.selected, second_selected);
+        assert!(!app.busy);
+        crate::workspace::select_in(&app.workspace, &first).unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert_eq!(app.selected, selected);
+        assert!(app.mask);
+        assert_eq!(app.mask_step.as_deref(), Some("step-view"));
+        assert_eq!(app.zoom, 1.75);
+        assert_eq!(app.pan, Vec2::new(9., -4.));
+        assert!(app.collapsed.contains("folder-view"));
+    }
+    #[test]
+    fn native_ui_switches_tabs_while_background_root_engine_is_locked() {
+        let (mut app, ctx) = fixture();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let mut engine = crate::engine::Engine::new();
+        engine.doc = Document::new(24, 20).unwrap();
+        let second = crate::workspace::register_in(&app.workspace, engine, None).unwrap();
+        let second_id = second.lock().unwrap().project_id.clone();
+        crate::workspace::select_in(&app.workspace, &second_id).unwrap();
+        let root = app.workspace_root.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = root.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let start = std::time::Instant::now();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let elapsed = start.elapsed();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(app.project_id, second_id);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Tab switching waited {elapsed:?} for background engine"
+        );
+        app.edit(
+            vec![json!({"op":"layer.update","layer":app.selected,"name":"Human in second"})],
+            "Rename",
+        );
+        assert_eq!(second.lock().unwrap().doc.layers[0].name, "Human in second");
+        assert!(app.workspace_root.lock().unwrap().undo.is_empty());
+    }
+    #[test]
+    fn tab_drag_displays_actual_destination_then_commits_one_copy_without_source_history() {
+        let (mut app, ctx) = fixture();
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new(32, 24).unwrap();
+            e.doc.layers[0].pixels.set(3, 4, [233, 84, 32, 255]);
+        }
+        let second = crate::workspace::register_in(
+            &app.workspace,
+            {
+                let mut e = crate::engine::Engine::new();
+                e.doc = Document::new(32, 24).unwrap();
+                e
+            },
+            None,
+        )
+        .unwrap();
+        let second_id = second.lock().unwrap().project_id.clone();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let origin = app.layer_rects[&app.selected].center();
+        let tab = app.project_rects[&second_id].center();
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(origin),
+                egui::Event::PointerButton {
+                    pos: origin,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            Default::default(),
+        );
+        app.layer_drag = Some(LayerDrag {
+            gesture: crate::engine::id(),
+            id: app.selected.clone(),
+            revision: 0,
+            offset: 0.,
+            target: 0,
+            ids: vec![app.selected.clone()],
+            commands: vec![],
+        });
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(tab)],
+            Default::default(),
+        );
+        let reply = app
+            .transfer_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        app.transfer_tx.send(reply).unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        let preview = &app.tab_preview.as_ref().unwrap().0;
+        let (_, _, bytes, _) = preview.preview(None, 32, None, false).unwrap();
+        assert_eq!(
+            &bytes[((4 * 32 + 3) * 4)..((4 * 32 + 3) * 4 + 4)],
+            &[233, 84, 32, 255]
+        );
+        assert_eq!(second.lock().unwrap().doc.revision, 0);
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: tab,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            Default::default(),
+        );
+        let reply = app
+            .transfer_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        app.transfer_tx.send(reply).unwrap();
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert_eq!(app.project_id, second_id);
+        assert_eq!(second.lock().unwrap().undo.len(), 1);
+        assert!(app.workspace_root.lock().unwrap().undo.is_empty());
+    }
     use crate::engine::Engine;
     use std::sync::{Arc, Mutex};
     #[test]

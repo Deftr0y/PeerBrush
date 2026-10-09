@@ -20,7 +20,9 @@ args = ["mcp"]
 
 Codex shares MCP configuration across desktop, CLI and IDE. Restart Codex or start a fresh session after registering to load the tools. [Official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
-Tools: `peerbrush_observe`, `peerbrush_edit`, `peerbrush_proposal`, `peerbrush_task`, `peerbrush_document`, `peerbrush_history`, `peerbrush_capabilities`, `peerbrush_place_image`, `peerbrush_segment`, and `peerbrush_brushes`.
+Tools: `peerbrush_observe`, `peerbrush_edit`, `peerbrush_proposal`, `peerbrush_task`, `peerbrush_document`, `peerbrush_history`, `peerbrush_capabilities`, `peerbrush_place_image`, `peerbrush_segment`, `peerbrush_brushes`, and `peerbrush_projects`.
+
+Use `peerbrush_projects` with `action:"list"` to discover stable project IDs. Observe the intended `project_id`, then supply that ID, its `document_id` and exact `expected_revision` for every targeted mutation. Background edits never select the visible tab. `projects:new/open` creates another independent project; only human input can request activation or select a tab. The older `document:new/open` actions remain explicit replacements with dirty/source guards. See [project actions and transfer examples](projects.md).
 
 `peerbrush_brushes` lists the same 21 original presets and custom brushes as the native Brush window. Use `action:list` for stable IDs and full settings, or `action:preview,id:"graphite"` for a real pressure-stroke PNG. Preview coordinates are explicitly `brush_preview`, separate from document coordinates. `action:save` with `name`, `category` and `settings` creates a custom brush; add its `id` to update it. Only custom brushes can be deleted. These preferences live in the instance's `brushes.json` and do not dirty a document or enter undo history.
 

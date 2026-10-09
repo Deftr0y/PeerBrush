@@ -38,6 +38,7 @@ impl Proposal {
         self.reason = reason.into();
     }
 }
+#[derive(Clone)]
 pub(crate) struct TaskRecord {
     pub id: String,
     pub actor: String,

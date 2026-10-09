@@ -48,7 +48,7 @@ fn modern_async_open_exposes_progress_cancel_and_exact_native_sources() {
     }
     let mut e = canvas.shared.lock().unwrap();
     assert!(e.loading.is_none());
-    assert_eq!(e.doc.id, doc.id);
+    assert_ne!(e.doc.id, doc.id);
     assert_eq!(
         e.doc.layers[0].pixels.get16(3, 7),
         [60001, 12347, 34569, 65535]
