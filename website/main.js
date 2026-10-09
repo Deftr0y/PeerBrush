@@ -1,4 +1,5 @@
 import { detectPlatform, completeRelease, safeDownloadUrl } from './platform.js';
+import './showcase.js';
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 const views = {
@@ -146,7 +147,7 @@ if ('IntersectionObserver' in window && !reducedMotion.matches) {
       }
     }
   }, { threshold: .08 });
-  for (const section of document.querySelectorAll('.section-heading, .section-intro, .steps, .capabilities article, .contribution-grid article, .community-links')) {
+  for (const section of document.querySelectorAll('.section-heading, .section-intro, .steps, .capabilities article, .contribution-grid article, .community-links, .showcase-frame, .video-frame, .gallery, .platform-list, .format-table, .status-capture, .mcp-call, .community-heading, .shortcuts, .development')) {
     section.classList.add('reveal');
     observer.observe(section);
   }

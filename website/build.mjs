@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 const root = dirname(fileURLToPath(import.meta.url));
 const output = join(root, 'dist');
 await mkdir(output, { recursive: true });
-for (const file of ['index.html', 'styles.css', 'main.js', 'platform.js', 'community.html']) {
+for (const file of ['index.html', 'styles.css', 'main.js', 'platform.js', 'showcase.js', 'community.html']) {
   await cp(join(root, file), join(output, file));
 }
 await cp(join(root, 'public'), output, { recursive: true });
