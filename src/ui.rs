@@ -6650,6 +6650,82 @@ mod tests {
         assert_eq!(e.doc.layers[0].pixels.get(4, 5), [0; 4]);
     }
     #[test]
+    fn native_control_clicks_and_folder_button_group_native16_sources_once() {
+        let (mut app, ctx) = small_fixture();
+        let ids = {
+            let mut e = app.shared.lock().unwrap();
+            e.doc.bit_depth = 16;
+            e.doc.ensure_depth();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.add","name":"Second"})],
+                None,
+                None,
+                "Setup",
+            )
+            .unwrap();
+            for (index, layer) in e.doc.layers.iter_mut().enumerate() {
+                layer
+                    .pixels
+                    .set16(index as i32 + 3, 5, [12347, 23459, 34571, 65535]);
+            }
+            e.undo.clear();
+            e.doc
+                .layers
+                .iter()
+                .map(|l| l.id.clone())
+                .collect::<Vec<_>>()
+        };
+        app.select_content(&ids[0]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![], Default::default());
+        }
+        let baseline = app.shared.lock().unwrap().doc.export_png().unwrap();
+        let position = app.layer_rects[&ids[1]].right_center() - Vec2::new(40., 0.);
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        // A released Ctrl can already be absent from the frame's final modifier
+        // state; the pointer event must retain the click's original chord.
+        for count in [2, 1, 2] {
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    button(position, egui::PointerButton::Primary, true, ctrl),
+                ],
+                Default::default(),
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![button(position, egui::PointerButton::Primary, false, ctrl)],
+                Default::default(),
+            );
+            assert_eq!(app.selection_layers.len(), count);
+            assert!(app.rename_edit.is_none());
+        }
+        let folder = app.new_folder_rect.unwrap().center();
+        click(&mut app, &ctx, folder);
+        let e = app.shared.lock().unwrap();
+        let group = e.doc.layers.iter().find(|l| l.id == app.selected).unwrap();
+        assert_eq!(group.kind, "group");
+        assert_eq!(group.pixels.depth, 16);
+        assert_eq!(e.undo.len(), 1);
+        assert_eq!(
+            app.selection_layers,
+            [group.id.clone()].into_iter().collect()
+        );
+        assert_eq!(e.doc.export_png().unwrap(), baseline);
+        assert!(ids.iter().all(|id| e
+            .doc
+            .layers
+            .iter()
+            .any(|l| &l.id == id && l.parent.as_deref() == Some(group.id.as_str()))));
+    }
+    #[test]
     fn new_folder_button_contains_selected_layers_and_selects_folder() {
         let (mut app, ctx) = small_fixture();
         let ids = {

@@ -30,7 +30,8 @@ pub fn create(doc: &mut Document, ids: &[String], name: &str) -> Result<String, 
         return Err("Initial version supports up to 100 layers".into());
     }
     if ids.is_empty() {
-        let folder = Layer::new(name, "group", doc.width, doc.height);
+        let mut folder = Layer::new(name, "group", doc.width, doc.height);
+        folder.pixels = crate::raster::Raster::new_depth(doc.width, doc.height, doc.bit_depth);
         let id = folder.id.clone();
         doc.layers.insert(0, folder);
         return Ok(id);
@@ -79,6 +80,7 @@ pub fn create(doc: &mut Document, ids: &[String], name: &str) -> Result<String, 
         .filter(|l| !included.contains(l.id.as_str()))
         .count();
     let mut folder = Layer::new(name, "group", doc.width, doc.height);
+    folder.pixels = crate::raster::Raster::new_depth(doc.width, doc.height, doc.bit_depth);
     folder.parent = parent;
     let group = folder.id.clone();
     let mut draft = doc.clone();

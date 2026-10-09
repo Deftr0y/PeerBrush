@@ -1,5 +1,21 @@
 use super::*;
 use crate::engine::Layer;
+fn click_modifiers(ui: &egui::Ui) -> egui::Modifiers {
+    ui.input(|i| {
+        i.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    modifiers,
+                    ..
+                } => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or(i.modifiers)
+    })
+}
 fn rows(
     doc: &Document,
     parent: Option<&str>,
@@ -127,7 +143,8 @@ impl PeerBrush {
     }
     fn select_row(&mut self, ui: &egui::Ui, doc: &Document, id: &str) {
         self.layer_clipboard = true;
-        let mods = ui.input(|i| i.modifiers);
+        let mods = click_modifiers(ui);
+        let command = mods.command || mods.ctrl;
         if mods.shift {
             let mut visible = vec![];
             rows(doc, None, 0, &self.collapsed, &mut visible);
@@ -136,7 +153,7 @@ impl PeerBrush {
                 .position(|&(i, _)| doc.layers[i].id == self.selection_anchor);
             let b = visible.iter().position(|&(i, _)| doc.layers[i].id == id);
             if let (Some(a), Some(b)) = (a, b) {
-                if !mods.command {
+                if !command {
                     self.selection_layers.clear();
                 }
                 for &(i, _) in &visible[a.min(b)..=a.max(b)] {
@@ -146,7 +163,7 @@ impl PeerBrush {
             } else {
                 self.select_content(id);
             }
-        } else if mods.command {
+        } else if command {
             if self.selection_layers.contains(id) && self.selection_layers.len() > 1 {
                 self.selection_layers.remove(id);
                 if self.selected == id {
@@ -331,7 +348,8 @@ impl PeerBrush {
                 );
                 if name.clicked() {
                     self.select_row(ui, doc, &l.id);
-                    let (time, modifiers) = ui.input(|i| (i.time, i.modifiers));
+                    let time = ui.input(|i| i.time);
+                    let modifiers = click_modifiers(ui);
                     let pointer = name.interact_pointer_pos().unwrap_or(name.rect.center());
                     let options = ui.ctx().options(|o| o.input_options.clone());
                     // egui counts rapid clicks globally, including clicks on different rows.
@@ -344,6 +362,7 @@ impl PeerBrush {
                     if name.double_clicked()
                         && same_name
                         && !modifiers.command
+                        && !modifiers.ctrl
                         && !modifiers.shift
                         && !modifiers.alt
                     {
