@@ -1160,6 +1160,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             if ![
                 "capabilities",
                 "brushes",
+                "filters",
                 "image_info",
                 "projects",
                 "observe",

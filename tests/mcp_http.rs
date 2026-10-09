@@ -64,6 +64,95 @@ struct Canvas {
 }
 
 #[test]
+fn modern_code_runs_async_returns_actual_images_and_allows_cancellation() {
+    let canvas = Canvas::new();
+    let (project, document, layer, task) = {
+        let mut e = canvas.shared.lock().unwrap();
+        e.doc = peerbrush::engine::Document::new_depth(40, 32, 16).unwrap();
+        let layer = e.doc.layers[0].id.clone();
+        let task = e
+            .reserve(
+                "http-code",
+                "Native procedural patch",
+                vec![peerbrush::engine::Scope::layer(&layer)],
+            )
+            .unwrap()
+            .id;
+        (e.project_id.clone(), e.doc.id.clone(), layer, task)
+    };
+    let call = |arguments: Value| {
+        let q = modern_request(
+            json!("code"),
+            "tools/call",
+            json!({"name":"peerbrush_code","arguments":arguments}),
+        );
+        response(canvas.modern(&q).send_json(q))
+            .into_json::<Value>()
+            .unwrap()
+    };
+    let request = json!({"action":"start","actor":"http-code","project_id":project,"document_id":document,"expected_revision":0,"task":task,"description":"Painting native gold","scopes":[{"target":layer,"rect":[1,1,8,8]}],"script":format!("let p=begin_pixels(\"{layer}\",[1,1,8,8]);write_pixel(p,3,4,[60001,12347,34569,65535]);commit_pixels(p);")});
+    let reply = call(request.clone());
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let metadata: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let mut query = json!({"action":"status","actor":"http-code","project_id":project,"document_id":document,"run":metadata["run"]});
+    let mut finished = None;
+    let mut discarded = false;
+    for _ in 0..400 {
+        let reply = call(query.clone());
+        assert_eq!(reply["result"]["isError"], false);
+        let state: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        if state["status"] != "running" {
+            finished = Some((reply, state));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (reply, state) = finished.unwrap();
+    assert_eq!(state["status"], "committed", "{state}");
+    assert_eq!(state["views"][0]["document_rect"], json!([0, 0, 40, 32]));
+    assert!(reply["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["type"] == "image"));
+    assert_eq!(
+        canvas.shared.lock().unwrap().doc.layers[0]
+            .pixels
+            .get16(3, 4),
+        [60001, 12347, 34569, 65535]
+    );
+    let mut request = request;
+    request["expected_revision"] = json!(1);
+    request["script"] = json!("loop {};");
+    let reply = call(request);
+    let metadata: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    query["run"] = metadata["run"].clone();
+    query["action"] = json!("cancel");
+    assert_eq!(call(query.clone())["result"]["isError"], false);
+    query["action"] = json!("status");
+    for _ in 0..400 {
+        let reply = call(query.clone());
+        let state: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        if state["status"] != "running" {
+            assert_eq!(state["status"], "discarded");
+            assert!(
+                state["error"].as_str().unwrap().contains("canceled"),
+                "{state}"
+            );
+            discarded = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(discarded, "Cancellation must finish without committing");
+    assert_eq!(canvas.shared.lock().unwrap().doc.revision, 1);
+}
+
+#[test]
 fn modern_brush_library_custom_persistence_and_actual_png_feedback() {
     let canvas = Canvas::new();
     let call = |args| {
@@ -547,6 +636,18 @@ fn modern_discovery_and_catalog_are_stateless_and_include_required_result_metada
         content["effect_catalog"],
         peerbrush::effects::catalog::discovery()
     );
+    let filters_call = modern_request(
+        json!("filters"),
+        "tools/call",
+        json!({"name":"peerbrush_filters","arguments":{"action":"list"}}),
+    );
+    let reply: Value = response(canvas.modern(&filters_call).send_json(filters_call))
+        .into_json()
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let filters: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(filters["presets"].as_array().unwrap().len(), 15);
     let q = modern_request(json!("discover"), "server/discover", json!({}));
     let r = response(
         canvas

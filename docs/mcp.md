@@ -1,5 +1,7 @@
 # MCP and CLI
 
+Current unreleased development supports `peerbrush_code` / CLI `code` for live procedural editing with native pixel buffers, loops and shared commands. Start with an exact project/source revision, owned AI task, description and declared scopes; poll the run for actual image content and document coordinates. Cancellation, takeover and source changes discard unfinished work. See the [code interface and limits](live-code.md).
+
 MCP starts automatically with PeerBrush. Click **Connect AI** to register the running executable and its exact workspace with detected Codex, Claude Desktop, Cursor and Gemini CLI clients. Settings are updated atomically with backups; unrelated server entries, comments and preferences are preserved. No model or remote service is started. Reload or restart the configured client and approve PeerBrush when prompted. Green means an attached MCP client; red means the editor is waiting for one. There is no separate MCP on/off switch. The stdio adapter attaches to the same live document. It can initialize and list tools while the editor is closed, and reconnects when it opens. Editing calls require the app to be running.
 
 The neighboring settings button provides manual setup and recovery. Clients that require extra approval are reported there. A successful registration means the client has configuration; it does not mean the client is connected yet.

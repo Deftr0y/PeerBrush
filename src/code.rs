@@ -71,6 +71,16 @@ impl Engine {
 fn fail(message: impl Into<String>) -> Box<EvalAltResult> {
     message.into().into()
 }
+fn script_error(error: &EvalAltResult) -> String {
+    match error {
+        EvalAltResult::ErrorTerminated(reason, _) => reason
+            .clone()
+            .try_cast::<String>()
+            .unwrap_or_else(|| "Code canceled; no edits committed".into()),
+        EvalAltResult::ErrorInFunctionCall(_, _, inner, _) => script_error(inner),
+        _ => error.to_string(),
+    }
+}
 fn descendant(doc: &Document, child: &str, ancestor: &str) -> bool {
     let mut parent = doc
         .layers
@@ -517,7 +527,7 @@ fn run(
     runtime.register_fn("edit",move |map:Map|->Result<(),Box<EvalAltResult>> {
         let command=rhai::serde::from_dynamic::<Value>(&Dynamic::from_map(map)).map_err(|e|fail(e.to_string()))?;
         let op=command["op"].as_str().unwrap_or("");
-        if !["paint","shape","gradient","fill","adjust","move","transform","layer.update","effect.add","effect.update","effect.delete","effect.reorder","mask.add","mask.delete","mask.paint","mask.update","mask.step.add","mask.step.update","mask.step.delete","mask.step.reorder","filter.add","filter.update","filter.delete","filter.reorder","source.update","selection","selection.refine"].contains(&op) {return Err(fail("Operation is not exposed to code; use native pixel buffers or documented editing commands"));}
+        if !["paint","shape","gradient","fill","adjust","move","transform","layer.update","effect.add","effect.update","effect.delete","effect.reorder","mask.add","mask.remove","mask.toggle","mask.refine","mask.from_selection","mask.from_color","mask.step.add","mask.step.update","mask.step.delete","mask.step.reorder","filter.add","filter.update","filter.delete","filter.reorder","source.update","selection","selection.refine","selection.clear","selection.reselect","selection.invert","selection.modify"].contains(&op) {return Err(fail("Operation is not exposed to code; use native pixel buffers or documented editing commands"));}
         if command.as_object().unwrap().keys().any(|k|["path","png","rgba","preset","locked","source_revision","document_id"].contains(&k.as_str())) {return Err(fail("Code cannot access files, resolve mutable presets, change locks or override source guards"));}
         c.lock().unwrap().push(command).map_err(fail)
     });
@@ -529,7 +539,7 @@ fn run(
     );
     runtime
         .run_with_scope(&mut scope, script)
-        .map_err(|e| format!("Code discarded: {e}"))?;
+        .map_err(|e| format!("Code discarded: {}", script_error(&e)))?;
     let commands = {
         let c = context.lock().unwrap();
         if !c.patches.is_empty() {

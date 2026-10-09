@@ -726,6 +726,18 @@
     {
       "op": "source.rasterize",
       "layer": "LAYER_ID"
+    },
+    {
+      "op": "pixels.replace",
+      "layer": "LAYER_ID",
+      "rect": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "bit_depth": 16,
+      "rgba": "OzCjWwGH//8="
     }
   ],
   "not_yet": [
@@ -964,5 +976,35 @@
     "processing": "Nearest evenly spaced channel levels at native 8/16-bit depth; strength interpolates before/after at native precision",
     "sources": "Layer, isolated folder and explicitly requested adjustment effects; settings, bypass, removal, preview and undo share the document engine",
     "psd": "Private source format 13 protects older readers; standard raster/mask channels and current merged composite are still written"
+  },
+  "live_code": {
+    "language": "Rhai",
+    "transport": "peerbrush_code / CLI code: start, status, cancel",
+    "target": "Explicit project_id/document_id/expected_revision, named AI actor, active owned task, description and declared scopes. One atomic shared undo entry; any newer source edit discards unfinished code.",
+    "functions": [
+      "read_pixel(layer,x,y)",
+      "begin_pixels(layer,[left,top,right,bottom])",
+      "write_pixel(handle,x,y,[r,g,b,a])",
+      "commit_pixels(handle)",
+      "edit(#{op:...,layer:...})"
+    ],
+    "metadata": "document.width, height, bit_depth, channel_max and layer metadata; reads are frozen native paint-layer samples at document coordinates.",
+    "limits": {
+      "script_bytes": 65536,
+      "operations": 2000000,
+      "evaluation_seconds": 5,
+      "preparation_seconds": 30,
+      "commands": 32,
+      "patch_pixels": 262144,
+      "open_pixel_buffers": 8,
+      "command_output_bytes": 8388608,
+      "runs_per_project": 1,
+      "runs_per_process": 2,
+      "retained_receipts_per_project": 4,
+      "feedback_max_edge": 1024
+    },
+    "coworking": "Blue scopes and description appear before execution. Scope/lock/reservation/task checks repeat before one commit. Native AI tasks Cancel, protocol cancel, expiry and human takeover discard unfinished work without reacquiring tasks.",
+    "isolation": "No files/network/OS/module/eval API, mutable presets, lock changes or direct live storage access. A native engine operation completes before cancellation/deadline rejection; no OS process sandbox is claimed.",
+    "documentation": "docs/live-code.md"
   }
 }
