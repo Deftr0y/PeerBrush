@@ -10,6 +10,7 @@ use std::{
 pub const BUDGET: usize = 256 * 1024 * 1024;
 // Caches and transient effect buffers have separate, bounded budgets.
 pub const WORKING_BUDGET: usize = 256 * 1024 * 1024;
+pub mod catalog;
 pub const KINDS: &[&str] = &[
     "levels",
     "curves",

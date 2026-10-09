@@ -374,6 +374,60 @@ pub(super) fn menu_effect(ui: &mut egui::Ui, kind: &str, label: &str) -> egui::R
     .inner
 }
 impl PeerBrush {
+    pub(super) fn effect_picker(&mut self, ui: &mut egui::Ui, mask: bool) {
+        let search_id = ui.id().with(("effect search", mask));
+        let mut search = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<String>(search_id).unwrap_or_default());
+        ui.set_min_width(230.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut search)
+                    .desired_width(195.0)
+                    .hint_text("Search effects…"),
+            );
+            if !search.is_empty() && ui.small_button("×").on_hover_text("Clear search").clicked() {
+                search.clear();
+            }
+        });
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(search_id, search.clone()));
+        let entries = effects::catalog::ENTRIES
+            .iter()
+            .filter(|entry| entry.matches(mask, &search))
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            ui.label(RichText::new("No matching effects").color(MUTED));
+        }
+        egui::ScrollArea::vertical()
+            .max_height(280.0)
+            .show(ui, |ui| {
+                for category in effects::catalog::CATEGORIES {
+                    let category_entries = entries
+                        .iter()
+                        .filter(|entry| entry.category == *category)
+                        .collect::<Vec<_>>();
+                    if category_entries.is_empty() {
+                        continue;
+                    }
+                    controls::label(ui, category);
+                    for entry in category_entries {
+                        if menu_effect(ui, entry.kind, entry.name(mask)).clicked() {
+                            self.layer_cmd(
+                                if mask { "mask.step.add" } else { "effect.add" },
+                                json!({"kind":entry.kind}),
+                                if mask {
+                                    "Add mask step"
+                                } else {
+                                    "Add color effect"
+                                },
+                            );
+                            ui.close_menu();
+                        }
+                    }
+                }
+            });
+    }
     pub(super) fn effect_is_selected(&self, layer: &str, mask: bool, effect: &str) -> bool {
         self.effect_selected
             .as_ref()
@@ -434,12 +488,7 @@ impl PeerBrush {
         ui.horizontal(|ui| {
             controls::label(ui, "COLOR EFFECTS");
             let add = ui.menu_button("+ Add effect", |ui| {
-                for kind in effects::KINDS {
-                    if menu_effect(ui, kind, effect_name(kind)).clicked() {
-                        self.layer_cmd("effect.add", json!({"kind":kind}), "Add color effect");
-                        ui.close_menu();
-                    }
-                }
+                self.effect_picker(ui, false);
             });
             self.effect_add_rect = Some(add.response.rect);
         });
@@ -550,21 +599,7 @@ impl PeerBrush {
     }
 }
 pub(super) fn effect_name(kind: &str) -> &str {
-    match kind {
-        "blur" | "gaussian" => "Gaussian blur",
-        "adjust" => "Color adjustment",
-        "color_balance" => "Color balance",
-        "hsl" => "Hue / saturation",
-        "bloom" => "Bloom",
-        "liquify" => "Liquify",
-        "grayscale" => "Grayscale",
-        "levels" => "Levels",
-        "paint" => "Paint",
-        "fill" => "Fill",
-        "curves" => "Curves",
-        "invert" => "Invert",
-        _ => kind,
-    }
+    effects::catalog::get(kind).map_or(kind, |entry| entry.name)
 }
 
 #[cfg(test)]

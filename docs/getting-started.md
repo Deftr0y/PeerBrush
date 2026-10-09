@@ -54,7 +54,7 @@ The Brush window offers 21 original brushes in **Sketch, Ink, Paint, Airbrush, T
 
 Each layer and group has a compact connected **Color / Mask** selector. Add levels, curves, Gaussian blur, color balance, hue/saturation, bloom, liquify, invert or grayscale to the color stack. Group effects process the combined child content. The top effect runs last, with earlier effects below it. Blend mode and opacity remain visible beneath the stack. Parameters remain editable after later work; effects can be disabled, reordered or removed. Hover a blend choice for a temporary canvas preview; click to commit it. Double-click a range to type a value; arrow keys also adjust it. Values sit inside the orange bar.
 
-Add effect stays above the scrollable stack so it remains reachable as the list grows. Tone adjustment belongs in Color effects; the brush toolbar contains brush controls.
+Add effect stays above the scrollable stack so it remains reachable as the list grows. Its picker has a search field and Tone, Color, Blur & light, Distortion and Mask categories. Search by name or a familiar term such as glow; color and mask stacks show only their supported effects. Tone adjustment belongs in Color effects; the brush toolbar contains brush controls.
 
 **K** selects Smart mask. Click an artwork color, adjust Tolerance, and choose a contiguous region or all similar colors. Replace, Add and Subtract build an editable mask. Refine with a mask brush, curves or feathering. Subject/object segmentation remains a follow-up.
 

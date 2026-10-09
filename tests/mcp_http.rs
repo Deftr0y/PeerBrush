@@ -527,6 +527,26 @@ fn transport_validates_json_content_and_session_headers() {
 #[test]
 fn modern_discovery_and_catalog_are_stateless_and_include_required_result_metadata() {
     let canvas = Canvas::new();
+    let catalog_call = modern_request(
+        json!("effects"),
+        "tools/call",
+        json!({"name":"peerbrush_capabilities","arguments":{}}),
+    );
+    let catalog_reply: Value =
+        response(canvas.modern(&catalog_call).send_json(catalog_call.clone()))
+            .into_json()
+            .unwrap();
+    assert_eq!(catalog_reply["result"]["isError"], false);
+    let content: Value = serde_json::from_str(
+        catalog_reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        content["effect_catalog"],
+        peerbrush::effects::catalog::discovery()
+    );
     let q = modern_request(json!("discover"), "server/discover", json!({}));
     let r = response(
         canvas

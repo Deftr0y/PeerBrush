@@ -1868,13 +1868,10 @@ impl Engine {
                         return Err("Initial mask stack supports up to 32 steps".into());
                     }
                     let kind = text(c, "kind", "invert");
-                    if ![
-                        "paint", "fill", "invert", "levels", "blur", "curves", "adjust", "gaussian",
-                    ]
-                    .contains(&kind)
+                    if !crate::effects::catalog::get(kind).is_some_and(|entry| entry.supports(true))
                     {
                         return Err(
-                            "Supported mask steps: paint, fill, invert, levels, blur".into()
+                            "Unsupported mask effect; inspect the shared effect catalog".into()
                         );
                     }
                     m.steps.push(MaskStep {

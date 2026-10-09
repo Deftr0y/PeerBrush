@@ -2077,16 +2077,7 @@ impl PeerBrush {
                             );
                         });
                         let add = ui.menu_button("+ Add effect", |ui| {
-                            for kind in ["paint", "fill", "invert", "levels", "blur", "curves", "gaussian", "adjust"] {
-                                if effects::menu_effect(ui,kind,if kind=="blur"{"Feather"}else{effects::effect_name(kind)}).clicked() {
-                                    self.layer_cmd(
-                                        "mask.step.add",
-                                        json!({"kind":kind}),
-                                        "Add mask step",
-                                    );
-                                    ui.close_menu();
-                                }
-                            }
+                            self.effect_picker(ui,true);
                         });
                         self.effect_add_rect = Some(add.response.rect);
                         egui::ScrollArea::vertical().id_salt("mask effects").max_height((ui.available_height()-8.0).max(24.0)).show(ui,|ui| {
@@ -5063,6 +5054,154 @@ mod tests {
             Default::default(),
         );
         assert!(app.tool == Tool::Move);
+    }
+    #[test]
+    fn effect_picker_filters_typed_names_and_adds_only_supported_stack_effects() {
+        for (mask, query, label, kind) in [
+            (false, "bLoOm", "Bloom", "bloom"),
+            (true, "FeAtHeR", "Feather", "blur"),
+            (true, "Bloom", "No matching effects", ""),
+        ] {
+            let (mut app, ctx) = fixture();
+            let layer = app.selected.clone();
+            if mask {
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":layer})],
+                        None,
+                        None,
+                        "Mask",
+                    )
+                    .unwrap();
+            }
+            app.mask = mask;
+            let draw = |app: &mut PeerBrush, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1100., 900.))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            };
+            draw(&mut app, vec![]);
+            let add = app.effect_add_rect.unwrap().center();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(add),
+                    button(add, egui::PointerButton::Primary, true, Default::default()),
+                ],
+            );
+            draw(
+                &mut app,
+                vec![button(
+                    add,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+            );
+            let output = draw(&mut app, vec![]);
+            let text_rect = |output: &egui::FullOutput, label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == label => {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Missing picker label {label:?}: {:?}",
+                            output
+                                .shapes
+                                .iter()
+                                .filter_map(|shape| match &shape.shape {
+                                    egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                        )
+                    })
+            };
+            let search = text_rect(&output, "Search effects…").center();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(search),
+                    button(
+                        search,
+                        egui::PointerButton::Primary,
+                        true,
+                        Default::default(),
+                    ),
+                ],
+            );
+            draw(
+                &mut app,
+                vec![button(
+                    search,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+            );
+            let output = draw(&mut app, vec![egui::Event::Text(query.into())]);
+            let choice = text_rect(&output, label).center();
+            if kind.is_empty() {
+                assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+                continue;
+            }
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text == "Levels")));
+            let before = app.shared.lock().unwrap().undo.len();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(choice),
+                    button(
+                        choice,
+                        egui::PointerButton::Primary,
+                        true,
+                        Default::default(),
+                    ),
+                ],
+            );
+            draw(
+                &mut app,
+                vec![button(
+                    choice,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+            );
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), before + 1);
+            if mask {
+                assert_eq!(
+                    engine.doc.layers[0]
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .steps
+                        .last()
+                        .unwrap()
+                        .kind,
+                    kind
+                );
+            } else {
+                assert_eq!(engine.doc.layers[0].effects.last().unwrap().kind, kind);
+            }
+            engine.undo("human").unwrap();
+            assert_eq!(engine.undo.len(), before);
+        }
     }
     #[test]
     fn long_color_and_mask_stacks_keep_add_effect_visible_in_a_small_window() {

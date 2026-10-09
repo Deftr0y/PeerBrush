@@ -375,6 +375,7 @@ pub fn capabilities() -> Value {
     });
     result["segmentation"]["configured"] = json!(crate::segmentation::configured());
     result["projects"] = json!({"tool":"peerbrush_projects","max_open":crate::workspace::MAX_PROJECTS,"targeting":"Use project_id, document_id and expected_revision for every background AI mutation. Switching tabs never changes a project's engine.","transfer":"Editable trees, masks, effects and native16 sources; copy changes destination, move is atomic with one undo step per project."});
+    result["effect_catalog"] = crate::effects::catalog::discovery();
     result
 }
 

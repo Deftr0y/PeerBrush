@@ -751,7 +751,7 @@
     "subtract",
     "divide"
   ],
-  "effect_weight": "effect.add/update and mask.step.add/update accept weight from 0 to 1, default 1. Zero bypasses the step; partial weights interpolate its input and result at native precision (premultiplied for color/alpha). Weight is independent of effect settings, observable, undoable and preserved in clipboard/PSD sources. The UI shows Weight for every row, with settings opened only for the selected row; top effects run last.",
+  "effect_weight": "effect.add/update and mask.step.add/update accept weight from 0 to 1, default 1. Zero bypasses the step; partial weights interpolate its input and result at native precision (premultiplied for color/alpha). Weight is independent of effect settings, observable, undoable and preserved in clipboard/PSD sources. The UI shows a compact strength percentage beside every effect name, with settings opened only for the selected row; top effects run last.",
   "effects": [
     "levels",
     "curves",
