@@ -6,7 +6,8 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TipKind {
     Round,
     Dry,
@@ -36,7 +37,8 @@ impl TipKind {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub radius: f32,
     pub hardness: f32,
@@ -52,6 +54,7 @@ pub struct Settings {
     pub seed: u32,
     pub pressure_size: bool,
     pub pressure_opacity: bool,
+    pub pressure_gamma: f32,
     pub taper_start: f32,
     pub taper_end: f32,
     pub taper_size: bool,
@@ -77,6 +80,7 @@ impl Default for Settings {
             seed: 0,
             pressure_size: true,
             pressure_opacity: true,
+            pressure_gamma: 1.0,
             taper_start: 0.0,
             taper_end: 0.0,
             taper_size: true,
@@ -136,6 +140,7 @@ impl Settings {
             })?,
             pressure_size: boolean("pressure_size", true)?,
             pressure_opacity: boolean("pressure_opacity", true)?,
+            pressure_gamma: parameter("pressure_gamma", 1.0, 0.1, 4.0)?,
             taper_start: parameter("taper_start", 0.0, 0.0, 10000.0)?,
             taper_end: parameter("taper_end", 0.0, 0.0, 10000.0)?,
             taper_size: boolean("taper_size", true)?,
@@ -148,7 +153,7 @@ impl Settings {
     pub fn coverage(self, dx: f32, dy: f32) -> f32 {
         Tip::new(self).coverage(dx, dy)
     }
-    fn validate(self) -> Result<(), String> {
+    pub fn validate(self) -> Result<(), String> {
         for (name, value, min, max) in [
             ("radius", self.radius, 0.5, 512.0),
             ("hardness", self.hardness, 0.0, 1.0),
@@ -160,6 +165,7 @@ impl Settings {
             ("smoothing", self.smoothing, 0.0, 1.0),
             ("density", self.density, 0.05, 1.0),
             ("grain", self.grain, 0.5, 32.0),
+            ("pressure_gamma", self.pressure_gamma, 0.1, 4.0),
             ("taper_start", self.taper_start, 0.0, 10000.0),
             ("taper_end", self.taper_end, 0.0, 10000.0),
             ("wetness", self.wetness, 0.0, 1.0),
@@ -435,6 +441,11 @@ pub(crate) fn dabs(
                 1.0
             };
             let taper = start.min(end);
+            let p = if settings.pressure_gamma == 1.0 {
+                p
+            } else {
+                p.powf(settings.pressure_gamma)
+            };
             let size_pressure = if settings.pressure_size { p } else { 1.0 };
             let opacity_pressure = if settings.pressure_opacity { p } else { 1.0 };
             let size_taper = if settings.taper_size { taper } else { 1.0 };

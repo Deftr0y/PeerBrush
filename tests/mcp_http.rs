@@ -64,6 +64,54 @@ struct Canvas {
 }
 
 #[test]
+fn modern_brush_library_custom_persistence_and_actual_png_feedback() {
+    let canvas = Canvas::new();
+    let call = |args| {
+        let q = modern_request(
+            json!("brush"),
+            "tools/call",
+            json!({"name":"peerbrush_brushes","arguments":args}),
+        );
+        response(canvas.modern(&q).send_json(q.clone()))
+            .into_json::<Value>()
+            .unwrap()
+    };
+    let saved = call(
+        json!({"action":"save","name":"HTTP brush","category":"Ink","settings":{"radius":3,"pressure_gamma":0.7}}),
+    );
+    assert_eq!(saved["result"]["isError"], false);
+    let metadata: Value =
+        serde_json::from_str(saved["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let id = metadata["preset"]["id"].as_str().unwrap();
+    assert_eq!(
+        peerbrush::brush_library::Library::load(canvas.dir.join("brushes.json"))
+            .get(id)
+            .unwrap()
+            .name,
+        "HTTP brush"
+    );
+    let preview = call(json!({"action":"preview","id":id}));
+    assert_eq!(preview["result"]["isError"], false);
+    let image = preview["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "image")
+        .unwrap();
+    let bytes = STANDARD.decode(image["data"].as_str().unwrap()).unwrap();
+    let png = image::load_from_memory(&bytes).unwrap().to_rgba8();
+    assert_eq!(png.dimensions(), (240, 48));
+    assert!(png.pixels().any(|p| p[3] > 0));
+    assert_eq!(
+        call(json!({"action":"delete","id":id}))["result"]["isError"],
+        false
+    );
+    let mut e = canvas.shared.lock().unwrap();
+    assert_eq!(e.state()["dirty"], false);
+    assert!(e.undo.is_empty());
+}
+
+#[test]
 fn modern_proposal_feedback_is_explicit_and_acceptance_is_atomic() {
     let canvas = Canvas::new();
     let (document, layer) = {

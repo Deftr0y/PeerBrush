@@ -238,6 +238,12 @@ pub struct PeerBrush {
     mask_background: u8,
     show_brush: bool,
     brush_preview: Option<(String, TextureHandle)>,
+    brush_search: String,
+    brush_category: String,
+    brush_preset: Option<String>,
+    brush_name: String,
+    brush_save_category: String,
+    brush_thumbnails: HashMap<String, (crate::brush::Settings, TextureHandle)>,
     color_editor: Option<color::Editor>,
     layer_drag: Option<LayerDrag>,
     layer_rects: HashMap<String, Rect>,
@@ -490,6 +496,12 @@ impl PeerBrush {
             mask_background: 255,
             show_brush: false,
             brush_preview: None,
+            brush_search: String::new(),
+            brush_category: "All".into(),
+            brush_preset: None,
+            brush_name: "My brush".into(),
+            brush_save_category: "Paint".into(),
+            brush_thumbnails: HashMap::new(),
             color_editor: None,
             layer_drag: None,
             layer_rects: HashMap::new(),
@@ -3796,6 +3808,58 @@ mod tests {
             },
         );
         (app, ctx)
+    }
+    #[test]
+    fn preset_selection_custom_editing_and_stroke_use_the_same_settings() {
+        let (mut app, ctx) = fixture();
+        let preset = crate::brush_library::curated()
+            .into_iter()
+            .find(|p| p.id == "brush-pen")
+            .unwrap();
+        app.select_brush_preset(&preset);
+        assert_eq!(app.brush, preset.settings);
+        assert_eq!(app.radius, preset.settings.radius);
+        app.radius = 23.;
+        app.brush.pressure_gamma = 0.6;
+        app.brush_name = "My pressure pen".into();
+        app.save_brush_preset(false);
+        let id = app.brush_preset.clone().unwrap();
+        let stored = app
+            .shared
+            .lock()
+            .unwrap()
+            .brush_library
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap();
+        assert_eq!(stored.settings.radius, 23.);
+        assert_eq!(stored.settings.pressure_gamma, 0.6);
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        app.brush_search = "pressure pen".into();
+        app.brush_category = "Custom".into();
+        app.show_brush = true;
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.brush_thumbnails.contains_key(&id));
+        let command = app.stroke_command(vec![[40., 40.], [100., 80.]], [200, 70, 20, 255]);
+        assert_eq!(
+            crate::brush::Settings::from_command(&command).unwrap(),
+            stored.settings
+        );
+        let before = app.shared.lock().unwrap().doc.clone();
+        let preview = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        app.edit(vec![command], "Custom brush stroke");
+        assert_eq!(
+            app.shared.lock().unwrap().doc.export_png().unwrap(),
+            preview.export_png().unwrap()
+        );
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        app.shared.lock().unwrap().undo("human").unwrap();
+        assert_eq!(
+            app.shared.lock().unwrap().doc.export_png().unwrap(),
+            before.export_png().unwrap()
+        );
     }
     #[test]
     fn parameter_preview_waits_for_release_and_cancels_when_source_changes() {

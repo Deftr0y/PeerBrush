@@ -293,8 +293,14 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         }
         draft.doc = e.doc.clone();
         draft.leases = e.leases.clone();
+        draft.brush_library = e.brush_library.clone();
     }
-    let result = draft.edit(actor, commands, Some(revision), task, label)?;
+    let commands = draft
+        .brush_library
+        .lock()
+        .unwrap()
+        .resolve_commands(commands)?;
+    let result = draft.edit(actor, &commands, Some(revision), task, label)?;
     if draft.doc.id != document {
         return Err("Proposals edit the current project; new/open are document actions".into());
     }

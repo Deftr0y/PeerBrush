@@ -1,6 +1,16 @@
 {
   "version": "build",
   "coordinates": "Document pixels. rect=[left,top,right,bottom], right/bottom exclusive.",
+  "brush_library": {
+    "tool": "peerbrush_brushes",
+    "actions": ["list", "preview", "save", "delete"],
+    "presets": "21 original procedural presets in Sketch, Ink, Paint, Airbrush, Texture and Blend. List returns stable IDs and complete shared settings. Paint/smudge/clone/heal accepts preset:ID; explicit settings override it before reservation scopes are checked.",
+    "custom": "Instance-local brushes.json, outside document history and PSD sources. save without id creates a custom brush; id updates only an existing custom brush. Curated brushes are immutable. Maximum 256 custom brushes/4 MiB; invalid or externally changed files are preserved and writes refused.",
+    "preview": "Actual shared-engine pressure stroke PNG, 64–512 by 24–128, coordinate_space brush_preview and rect [0,0,width,height]. This rectangle is not a document placement.",
+    "pressure_gamma": "0.1–4, default 1 (linear). response = pressure^gamma before size/opacity and taper. Below 1 responds more at light force; above 1 needs more force. Native16 and mouse taper remain unchanged.",
+    "example": {"op":"paint","layer":"ID","preset":"brush-pen","radius":12,"points":[[20,30],[100,50]],"pressures":[0.2,0.9],"color":[240,100,30,255]},
+    "limits": "Five procedural tips; no proprietary brush assets or .brush/.brushset import. Blend settings operate on existing pigment through smudge; ordinary paint uses the same tip/coverage settings."
+  },
   "ai_proposals": {
     "tool": "peerbrush_proposal",
     "actions": ["create", "list", "preview", "accept", "reject"],

@@ -151,6 +151,13 @@ fn initialized_adapter_reconnects_when_canvas_opens_and_clears_presence_at_eof()
     let state: Value =
         serde_json::from_str(observed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(state["revision"], 0);
+    let brushes=adapter.send(&json!({"id":3,"method":"tools/call","params":{"name":"peerbrush_brushes","arguments":{"action":"preview","id":"brush-pen"}}}));
+    assert_eq!(brushes["result"]["isError"], false);
+    assert!(brushes["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["type"] == "image" && c["mimeType"] == "image/png"));
     adapter.stop();
     assert!(shared.lock().unwrap().mcp_clients.is_empty());
     drop(connection);

@@ -20,7 +20,11 @@ args = ["mcp"]
 
 Codex shares MCP configuration across desktop, CLI and IDE. Restart Codex or start a fresh session after registering to load the tools. [Official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
-Tools: `peerbrush_observe`, `peerbrush_edit`, `peerbrush_proposal`, `peerbrush_task`, `peerbrush_document`, `peerbrush_history`, `peerbrush_capabilities`, `peerbrush_place_image`, and `peerbrush_segment`.
+Tools: `peerbrush_observe`, `peerbrush_edit`, `peerbrush_proposal`, `peerbrush_task`, `peerbrush_document`, `peerbrush_history`, `peerbrush_capabilities`, `peerbrush_place_image`, `peerbrush_segment`, and `peerbrush_brushes`.
+
+`peerbrush_brushes` lists the same 21 original presets and custom brushes as the native Brush window. Use `action:list` for stable IDs and full settings, or `action:preview,id:"graphite"` for a real pressure-stroke PNG. Preview coordinates are explicitly `brush_preview`, separate from document coordinates. `action:save` with `name`, `category` and `settings` creates a custom brush; add its `id` to update it. Only custom brushes can be deleted. These preferences live in the instance's `brushes.json` and do not dirty a document or enter undo history.
+
+Paint, smudge, clone and heal commands accept `preset:"brush-pen"` with optional explicit setting overrides. Settings are frozen before footprint/reservation checks and proposal creation. `pressure_gamma` (0.1–4, default 1) applies a shared response curve to supplied pressure; size/opacity toggles and taper still operate independently. Use `smudge` for Blend presets to carry existing pigment. No proprietary brush-set import is claimed.
 
 Observe before editing. Use layer IDs, document pixel coordinates, and `expected_revision`. The upper-left pixel is (0,0). Rectangles are `[left, top, right, bottom]`, with right and bottom excluded.
 

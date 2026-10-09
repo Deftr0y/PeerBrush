@@ -137,7 +137,7 @@ impl PeerBrush {
             "hardness":b.hardness,"opacity":b.opacity,"flow":b.flow,"spacing":b.spacing,
             "roundness":b.roundness,"angle":b.angle,"smoothing":b.smoothing,
             "tip":b.tip.name(),"density":b.density,"grain":b.grain,"seed":b.seed,
-            "pressure_size":b.pressure_size,"pressure_opacity":b.pressure_opacity,
+            "pressure_size":b.pressure_size,"pressure_opacity":b.pressure_opacity,"pressure_gamma":b.pressure_gamma,
             "taper_start":b.taper_start,"taper_end":b.taper_end,"taper_size":b.taper_size,"taper_opacity":b.taper_opacity,
             "wetness":b.wetness,"load":b.load,"pickup":b.pickup});
         if let Some(pressures) = pressures {
@@ -148,43 +148,60 @@ impl PeerBrush {
     }
     pub(super) fn brush_settings(&mut self, ctx: &egui::Context) {
         let mut open = true;
-        egui::Window::new(match self.tool {Tool::Smudge=>"Smudge",Tool::Clone=>"Clone",Tool::Heal=>"Heal",_=>"Brush"})
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_pos(egui::pos2(85.0, 125.0))
-            .show(ctx, |ui| {
-                self.tip_presets(ui);
-                let key = format!("{:?}", self.brush);
-                if self.brush_preview.as_ref().map(|p| p.0.as_str()) != Some(key.as_str()) {
-                    let mut r = crate::raster::Raster::new(260, 54);
-                    let mut settings = self.brush;
-                    settings.radius = 16.0;
-                    let points = (0..30)
-                        .map(|i| [20.0 + i as f32 * 7.5, 27.0 + (i as f32 * 0.25).sin() * 7.0])
-                        .collect::<Vec<_>>();
-                    if crate::brush::paint(
-                        &mut r,
-                        &points,
-                        settings,
-                        [245, 242, 240, 255],
-                        false,
-                        None,
-                    )
-                    .is_ok()
-                    {
-                        let texture = ctx.load_texture(
-                            "brush tip",
-                            egui::ColorImage::from_rgba_unmultiplied([260, 54], &r.rgba()),
-                            egui::TextureOptions::LINEAR,
-                        );
-                        self.brush_preview = Some((key, texture));
+        egui::Window::new(match self.tool {
+            Tool::Smudge => "Smudge",
+            Tool::Clone => "Clone",
+            Tool::Heal => "Heal",
+            _ => "Brush",
+        })
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .default_pos(egui::pos2(85.0, 125.0))
+        .default_width(680.0)
+        .show(ctx, |ui| {
+            ui.columns(2, |columns| {
+                self.preset_browser(&mut columns[0]);
+                self.brush_parameters(&mut columns[1]);
+            });
+        });
+        self.show_brush = open;
+    }
+    fn brush_parameters(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(&self.brush_name).color(ACCENT));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Tip").small().color(MUTED));
+            egui::ComboBox::from_id_salt("procedural tip")
+                .selected_text(self.brush.tip.name())
+                .show_ui(ui, |ui| {
+                    for tip in [
+                        crate::brush::TipKind::Round,
+                        crate::brush::TipKind::Dry,
+                        crate::brush::TipKind::Chalk,
+                        crate::brush::TipKind::Grain,
+                        crate::brush::TipKind::Bristle,
+                    ] {
+                        ui.selectable_value(&mut self.brush.tip, tip, tip.name());
                     }
-                }
-                if let Some((_, texture)) = &self.brush_preview {
-                    ui.image((texture.id(), Vec2::new(260.0, 54.0)));
-                }
-                egui::Grid::new("brush parameters")
+                });
+        });
+        let mut current = self.brush;
+        current.radius = self.radius;
+        let key = format!("{current:?}");
+        if self.brush_preview.as_ref().map(|p| p.0.as_str()) != Some(key.as_str()) {
+            if let Ok(r) = crate::brush_library::preview(current, 260, 54) {
+                let texture = ui.ctx().load_texture(
+                    "brush tip",
+                    egui::ColorImage::from_rgba_unmultiplied([260, 54], &r.rgba()),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.brush_preview = Some((key, texture));
+            }
+        }
+        if let Some((_, texture)) = &self.brush_preview {
+            ui.image((texture.id(), Vec2::new(260.0, 54.0)));
+        }
+        egui::Grid::new("brush parameters")
                     .spacing(Vec2::new(10.0, 8.0))
                     .show(ui, |ui| {
                         let mut size = self.radius * 2.0;
@@ -271,6 +288,9 @@ impl PeerBrush {
                             false,
                         );
                         ui.end_row();
+                        controls::label(ui, "Pressure curve");
+                        controls::range(ui,"pressure response",&mut self.brush.pressure_gamma,0.1..=4.0,200.0,"",2,false).on_hover_text("1 is linear. Below 1 responds more at light pressure; above 1 needs more force.");
+                        ui.end_row();
                         if self.brush.tip!=crate::brush::TipKind::Round {
                             let mut density=self.brush.density*100.0;
                             controls::label(ui,"Density");controls::range(ui,"tip density",&mut density,5.0..=100.0,200.0,"%",0,false);ui.end_row();self.brush.density=density/100.0;
@@ -285,98 +305,223 @@ impl PeerBrush {
                             }
                         }
                     });
-                ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
                     ui.label(RichText::new("Pressure").small().color(MUTED));
                     ui.checkbox(&mut self.brush.pressure_size,"Size").on_hover_text("Uses genuine device force when supplied, or explicit agent pressure. Mouse strokes use taper.");
                     ui.checkbox(&mut self.brush.pressure_opacity,"Opacity");
                 });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Taper").small().color(MUTED));
-                    ui.checkbox(&mut self.brush.taper_size,"Size");ui.checkbox(&mut self.brush.taper_opacity,"Opacity");
-                });
-            });
-        self.show_brush = open;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Taper").small().color(MUTED));
+            ui.checkbox(&mut self.brush.taper_size, "Size");
+            ui.checkbox(&mut self.brush.taper_opacity, "Opacity");
+        });
     }
-    fn tip_presets(&mut self, ui: &mut egui::Ui) {
-        use crate::brush::{Settings, TipKind};
-        ui.horizontal_wrapped(|ui| {
-            for (name, tip, hardness, roundness, density, grain) in [
-                ("Hard", TipKind::Round, 1.0, 1.0, 1.0, 2.0),
-                ("Soft", TipKind::Round, 0.0, 1.0, 1.0, 2.0),
-                ("Ink", TipKind::Round, 1.0, 0.2, 1.0, 2.0),
-                ("Dry", TipKind::Dry, 0.85, 0.65, 0.65, 2.5),
-                ("Chalk", TipKind::Chalk, 0.8, 1.0, 0.75, 3.0),
-                ("Grain", TipKind::Grain, 0.9, 1.0, 0.65, 1.0),
-                ("Bristle", TipKind::Bristle, 1.0, 0.7, 0.75, 3.0),
-            ] {
-                let id = egui::Id::new(("brush preset thumbnail", name));
-                let texture = ui
-                    .ctx()
-                    .data_mut(|data| data.get_temp::<TextureHandle>(id))
-                    .unwrap_or_else(|| {
-                        let mut raster = crate::raster::Raster::new(44, 30);
-                        let settings = Settings {
-                            radius: 10.0,
-                            tip,
-                            hardness,
-                            roundness,
-                            density,
-                            grain,
-                            angle: if name == "Ink" { -35.0 } else { 0.0 },
-                            ..Default::default()
-                        };
-                        let _ = crate::brush::paint(
-                            &mut raster,
-                            &[[12., 15.], [32., 15.]],
-                            settings,
-                            [245, 242, 240, 255],
-                            false,
-                            None,
-                        );
+    fn preset_browser(&mut self, ui: &mut egui::Ui) {
+        let library = self.shared.lock().unwrap().brush_library.clone();
+        let (presets, error) = {
+            let l = library.lock().unwrap();
+            (l.presets(), l.error.clone())
+        };
+        self.brush_thumbnails
+            .retain(|id, _| presets.iter().any(|p| &p.id == id));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.brush_search)
+                .hint_text("Search brushes")
+                .desired_width(ui.available_width()),
+        );
+        let mut categories = vec!["All".to_owned(), "Custom".to_owned()];
+        for category in crate::brush_library::CATEGORIES {
+            categories.push((*category).into());
+        }
+        for preset in &presets {
+            if !categories.contains(&preset.category) {
+                categories.push(preset.category.clone());
+            }
+        }
+        egui::ComboBox::from_id_salt("brush category")
+            .selected_text(&self.brush_category)
+            .show_ui(ui, |ui| {
+                for category in categories {
+                    ui.selectable_value(&mut self.brush_category, category.clone(), category);
+                }
+            });
+        let search = self.brush_search.to_lowercase();
+        let mut count = 0;
+        egui::ScrollArea::vertical()
+            .id_salt("brush library")
+            .max_height(350.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for preset in &presets {
+                    if self.brush_category != "All"
+                        && !(self.brush_category == "Custom" && preset.custom)
+                        && self.brush_category != preset.category
+                    {
+                        continue;
+                    }
+                    if !format!("{} {}", preset.name, preset.category)
+                        .to_lowercase()
+                        .contains(&search)
+                    {
+                        continue;
+                    }
+                    count += 1;
+                    let cached = self
+                        .brush_thumbnails
+                        .get(&preset.id)
+                        .filter(|(settings, _)| *settings == preset.settings)
+                        .map(|(_, texture)| texture.clone());
+                    let texture = cached.or_else(|| {
+                        let raster =
+                            crate::brush_library::preview(preset.settings, 240, 36).ok()?;
                         let texture = ui.ctx().load_texture(
-                            name,
-                            egui::ColorImage::from_rgba_unmultiplied([44, 30], &raster.rgba()),
+                            format!("brush {}", preset.id),
+                            egui::ColorImage::from_rgba_unmultiplied([240, 36], &raster.rgba()),
                             egui::TextureOptions::LINEAR,
                         );
-                        ui.ctx()
-                            .data_mut(|data| data.insert_temp(id, texture.clone()));
-                        texture
+                        self.brush_thumbnails
+                            .insert(preset.id.clone(), (preset.settings, texture.clone()));
+                        Some(texture)
                     });
-                let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(44.0, 48.0), egui::Sense::click());
-                let selected = self.brush.tip == tip
-                    && self.brush.hardness == hardness
-                    && self.brush.roundness == roundness;
-                let image = Rect::from_min_size(rect.min, Vec2::new(44.0, 30.0));
-                ui.painter().image(
-                    texture.id(),
-                    image,
-                    Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-                ui.painter().text(
-                    rect.center_bottom() - Vec2::new(0., 8.),
-                    egui::Align2::CENTER_CENTER,
-                    name,
-                    egui::FontId::proportional(10.0),
-                    if selected { ACCENT } else { MUTED },
-                );
-                if selected {
-                    ui.painter().line_segment(
-                        [rect.left_bottom(), rect.right_bottom()],
-                        Stroke::new(1.5_f32, ACCENT),
+                    let selected = self.brush_preset.as_deref() == Some(&preset.id);
+                    let (rect, response) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 52.0),
+                        egui::Sense::click(),
                     );
+                    if response.hovered() || selected {
+                        ui.painter().rect_filled(
+                            rect,
+                            0,
+                            Color32::from_white_alpha(if selected { 12 } else { 5 }),
+                        );
+                    }
+                    ui.painter().text(
+                        rect.left_top() + Vec2::new(5., 7.),
+                        egui::Align2::LEFT_TOP,
+                        &preset.name,
+                        egui::FontId::proportional(12.),
+                        if selected { ACCENT } else { Color32::WHITE },
+                    );
+                    if preset.custom {
+                        ui.painter().text(
+                            rect.right_top() - Vec2::new(5., -7.),
+                            egui::Align2::RIGHT_TOP,
+                            "Custom",
+                            egui::FontId::proportional(10.),
+                            MUTED,
+                        );
+                    }
+                    if let Some(texture) = texture {
+                        ui.painter().image(
+                            texture.id(),
+                            Rect::from_min_size(
+                                rect.left_bottom() - Vec2::new(-5., 33.),
+                                Vec2::new(240., 32.),
+                            ),
+                            Rect::from_min_max(Pos2::ZERO, egui::pos2(1., 1.)),
+                            Color32::WHITE,
+                        );
+                    }
+                    if response
+                        .on_hover_text(format!(
+                            "{} · {}{}",
+                            preset.name,
+                            preset.category,
+                            if preset.category == "Blend" {
+                                " · choose Smudge to blend existing paint"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .clicked()
+                    {
+                        self.select_brush_preset(preset);
+                    }
                 }
-                if response.on_hover_text(format!("{name} brush")).clicked() {
-                    self.brush.tip = tip;
-                    self.brush.hardness = hardness;
-                    self.brush.roundness = roundness;
-                    self.brush.density = density;
-                    self.brush.grain = grain;
-                    self.brush.angle = if name == "Ink" { -35.0 } else { 0.0 };
-                    self.brush.spacing = 0.15;
+                if count == 0 {
+                    ui.label(RichText::new("No matching brushes").small().color(MUTED));
+                }
+            });
+        ui.add_space(6.);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Name").small().color(MUTED));
+            ui.add(egui::TextEdit::singleline(&mut self.brush_name).desired_width(215.));
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Category").small().color(MUTED));
+            ui.add(egui::TextEdit::singleline(&mut self.brush_save_category).desired_width(195.));
+        });
+        let custom = self
+            .brush_preset
+            .as_ref()
+            .is_some_and(|id| presets.iter().any(|p| p.id == *id && p.custom));
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Save new")
+                .on_hover_text("Save the current settings as a custom brush")
+                .clicked()
+            {
+                self.save_brush_preset(false);
+            }
+            if ui
+                .add_enabled(custom, egui::Button::new("Update").small())
+                .clicked()
+            {
+                self.save_brush_preset(true);
+            }
+            if ui
+                .add_enabled(custom, egui::Button::new("Delete").small())
+                .clicked()
+            {
+                let result = library
+                    .lock()
+                    .unwrap()
+                    .delete(self.brush_preset.as_deref().unwrap());
+                match result {
+                    Ok(()) => {
+                        self.brush_preset = None;
+                        self.shared.lock().unwrap().status = "Custom brush deleted".into();
+                    }
+                    Err(e) => self.shared.lock().unwrap().status = e,
                 }
             }
         });
+        if let Some(error) = error {
+            ui.label(RichText::new(error).small().color(Color32::LIGHT_RED));
+        }
+    }
+    pub(super) fn select_brush_preset(&mut self, preset: &crate::brush_library::Preset) {
+        if preset.category == "Blend" {
+            self.tool = Tool::Smudge;
+        } else if self.tool == Tool::Smudge {
+            self.tool = Tool::Brush;
+        }
+        self.brush = preset.settings;
+        self.radius = preset.settings.radius;
+        self.brush_preset = Some(preset.id.clone());
+        self.brush_name = preset.name.clone();
+        self.brush_save_category = preset.category.clone();
+    }
+    pub(super) fn save_brush_preset(&mut self, update: bool) {
+        let library = self.shared.lock().unwrap().brush_library.clone();
+        let mut settings = self.brush;
+        settings.radius = self.radius;
+        let result = library.lock().unwrap().save(
+            if update {
+                self.brush_preset.as_deref()
+            } else {
+                None
+            },
+            &self.brush_name,
+            &self.brush_save_category,
+            settings,
+        );
+        match result {
+            Ok(preset) => {
+                self.select_brush_preset(&preset);
+                self.shared.lock().unwrap().status = "Custom brush saved".into();
+            }
+            Err(error) => self.shared.lock().unwrap().status = error,
+        }
     }
 }

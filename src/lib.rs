@@ -1,5 +1,6 @@
 pub mod adjustment;
 pub mod brush;
+pub mod brush_library;
 pub mod clipboard;
 pub mod collaboration;
 pub mod color_profile;

@@ -427,6 +427,7 @@ pub struct Engine {
     ai_serial: u64,
     pub focus_requested: bool,
     pub loading: Option<crate::loading::Control>,
+    pub brush_library: std::sync::Arc<std::sync::Mutex<crate::brush_library::Library>>,
     pub(crate) proposals: Vec<crate::collaboration::Proposal>,
     pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
 }
@@ -466,7 +467,12 @@ impl Engine {
     pub fn preview_edits(doc: Document, commands: &[Value]) -> Result<Document, String> {
         let mut engine = Self::new();
         engine.doc = doc;
-        for command in commands {
+        let resolved = engine
+            .brush_library
+            .lock()
+            .unwrap()
+            .resolve_commands(commands)?;
+        for command in &resolved {
             engine.apply(command)?;
         }
         engine.doc.ensure_depth();
@@ -500,6 +506,9 @@ impl Engine {
             ai_serial: 0,
             focus_requested: false,
             loading: None,
+            brush_library: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::brush_library::Library::default(),
+            )),
             proposals: vec![],
             recent_tasks: vec![],
         }
@@ -968,6 +977,12 @@ impl Engine {
         if commands.is_empty() || commands.len() > 100 {
             return Err("A batch must contain 1–100 commands".into());
         }
+        let resolved = self
+            .brush_library
+            .lock()
+            .unwrap()
+            .resolve_commands(commands)?;
+        let commands = resolved.as_slice();
         let before = self.doc.clone();
         let mut scopes = vec![];
         for c in commands {

@@ -289,6 +289,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply an absolute local PNG/JPEG path or base64 PNG, and exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
         {"name":"peerbrush_capabilities","description":"Get concise supported operations and runnable JSON examples before editing.","inputSchema":{"type":"object","properties":{}}}
+        ,{"name":"peerbrush_brushes","description":"Browse original brush presets, render actual stroke previews, and save/update/delete instance-local custom brushes. Presets work in paint/smudge/clone/heal commands via preset ID with explicit setting overrides. This library is outside document history; curated presets are immutable. Preview coordinates refer to brush_preview, not the document.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","preview","save","delete"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"settings":{"type":"object"},"width":{"type":"integer","minimum":64,"maximum":512},"height":{"type":"integer","minimum":24,"maximum":128}},"required":["action"],"additionalProperties":false}}
     ])
 }
 pub fn capabilities() -> Value {
@@ -357,6 +358,50 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             Ok(json!({"focused":true}))
         }
         "observe" => observation(shared, p),
+        "brushes" => {
+            let library = shared.lock().unwrap().brush_library.clone();
+            let mut library = library.lock().unwrap();
+            match p["action"].as_str().ok_or("Missing brush action")? {
+                "list" => Ok(
+                    json!({"presets":library.presets(),"categories":crate::brush_library::CATEGORIES,"error":library.error}),
+                ),
+                "save" => {
+                    let settings: crate::brush::Settings =
+                        serde_json::from_value(p["settings"].clone())
+                            .map_err(|e| format!("Invalid brush settings: {e}"))?;
+                    let id = p
+                        .get("id")
+                        .map(|v| v.as_str().ok_or("Brush ID must be text"))
+                        .transpose()?;
+                    Ok(
+                        json!({"preset":library.save(id,p["name"].as_str().ok_or("Missing brush name")?,p["category"].as_str().ok_or("Missing brush category")?,settings)?}),
+                    )
+                }
+                "delete" => {
+                    library.delete(p["id"].as_str().ok_or("Missing brush ID")?)?;
+                    Ok(json!({"deleted":true}))
+                }
+                "preview" => {
+                    let preset = library.get(p["id"].as_str().ok_or("Missing brush ID")?)?;
+                    let size = |key: &str, default: u32| -> Result<u32, String> {
+                        p.get(key).map_or(Ok(default), |v| {
+                            v.as_u64()
+                                .and_then(|n| u32::try_from(n).ok())
+                                .ok_or_else(|| format!("Invalid preview {key}"))
+                        })
+                    };
+                    let width = size("width", 240)?;
+                    let height = size("height", 48)?;
+                    drop(library);
+                    let raster = crate::brush_library::preview(preset.settings, width, height)?;
+                    let bytes = raster::png(width, height, &raster.rgba())?;
+                    Ok(
+                        json!({"preset":preset,"images":[{"mime_type":"image/png","data":STANDARD.encode(bytes),"width":width,"height":height,"coordinate_space":"brush_preview","rect":[0,0,width,height]}]}),
+                    )
+                }
+                _ => Err("Unknown brush action".into()),
+            }
+        }
         "proposal" => {
             let action = p["action"].as_str().ok_or("Missing proposal action")?;
             if action == "list" {
@@ -789,6 +834,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             let method = name.strip_prefix("peerbrush_").unwrap_or(name);
             if ![
                 "capabilities",
+                "brushes",
                 "observe",
                 "edit",
                 "proposal",
@@ -1509,6 +1555,11 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         .map_err(|e| e.to_string())?;
     instance_lock.try_lock().map_err(|_|"PeerBrush is already running for this workspace. Use that window or a different --state-dir.".to_string())?;
     crate::disk_cache::configure(&state_dir);
+    let library = crate::brush_library::Library::load(state_dir.join("brushes.json"));
+    if let Some(error) = &library.error {
+        shared.lock().unwrap().status = error.clone();
+    }
+    *shared.lock().unwrap().brush_library.lock().unwrap() = library;
     let http = tiny_http::Server::http("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = http
         .server_addr()
