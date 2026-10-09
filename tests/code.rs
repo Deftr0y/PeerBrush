@@ -59,7 +59,7 @@ fn palette(layer: &str) -> String {
     for y in 1..9 {{for x in 1..9 {{
         let p=read_pixel("{layer}",x,y);
         write_pixel(patch,x,y,[document.channel_max-x, p[1], x+y, document.channel_max]);
-    }}}
+    }}}}
     commit_pixels(patch);
     edit(#{{op:"effect.add",layer:"{layer}",kind:"posterize",settings:#{{levels:5}},weight:0.6}});
     "#
@@ -76,8 +76,8 @@ fn native_code_pixels_atomic_undo_psd_feedback_and_human_task_compensation() {
         assert_eq!(state["status"], "committed", "{state}");
         let result = &state["result"];
         assert_eq!(result["applied"], 2);
-        assert_eq!(result["images"][0]["document_rect"], json!([0, 0, 40, 32]));
-        let mut e = shared.lock().unwrap();
+        assert_eq!(state["images"][0]["document_rect"], json!([0, 0, 40, 32]));
+        let e = shared.lock().unwrap();
         assert_eq!(e.undo.len(), 1);
         assert_eq!(e.doc.bit_depth, depth);
         let pixel = e.doc.layers[0].pixels.get16(2, 3);
@@ -100,14 +100,14 @@ fn native_code_pixels_atomic_undo_psd_feedback_and_human_task_compensation() {
             Scope::layer(&layer)
         );
         let after = e.doc.export_png().unwrap();
-        e.undo("human").unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
-        e.redo("human").unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), after);
         drop(e);
         let revision = shared.lock().unwrap().doc.revision;
         server::dispatch(&shared,"task",&json!({"action":"end","actor":"code-agent","project_id":p["project_id"],"document_id":p["document_id"],"expected_revision":revision,"task":task})).unwrap();
         let mut e = shared.lock().unwrap();
+        e.undo("human").unwrap();
+        assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        e.redo("human").unwrap();
+        assert_eq!(e.doc.export_png().unwrap(), after);
         e.edit("human",&[json!({"op":"paint","layer":layer,"points":[[28,24]],"radius":2,"color":[230,80,36,255]})],None,None,"Human detail").unwrap();
         let human = e.doc.layers[0].pixels.get16(28, 24);
         e.undo_task("human", "code-agent", &task).unwrap();
