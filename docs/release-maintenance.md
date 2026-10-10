@@ -16,7 +16,7 @@ Keep this registry limited to verified, public project URLs and public content s
 | --- | --- | --- |
 | GitHub | https://github.com/Deftr0y/PeerBrush | This repository |
 | Releases | https://github.com/Deftr0y/PeerBrush/releases | GitHub releases, tag-specific checkpoint notes |
-| Website | https://peerbrush.com/ | `website/`, deployed by `.github/workflows/pages.yml` |
+| Website | https://peerbrush.com/ | Reviewed public `site-content` build output, deployed by `.github/workflows/pages.yml`; source and publication records are maintained privately |
 | Discord announcements | Not configured in this registry | Confirm official public destination before posting |
 | Social accounts | Not configured in this registry | Confirm each official public profile before posting |
 
