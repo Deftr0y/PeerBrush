@@ -1,4 +1,4 @@
-import { releaseHistory, latestRelease } from './platform.js';
+import { releaseHistory, latestRelease, safeDownloadUrl } from './platform.js';
 
 function historyDownloadLink(platform) {
   const link = document.createElement('a');
@@ -37,8 +37,14 @@ export function renderHistory(data) {
     if(missing.length) {const line=document.createElement('p');line.textContent=`No published ${missing.join(' / ')} package for this checkpoint.`;downloads.append(line);}
     const docs = document.createElement('a');
     docs.className = 'text-link';
-    docs.href = `https://github.com/Deftr0y/PeerBrush/tree/${encodeURIComponent(release.version)}/docs`;
+    const documentationRef = /^[0-9a-f]{40}$/.test(release.packagingCommit || '') ? release.packagingCommit : release.version;
+    docs.href = `https://github.com/Deftr0y/PeerBrush/tree/${encodeURIComponent(documentationRef)}/docs`;
     docs.textContent = 'Documentation for this version';
+    for (const [label,url] of [['Matching source',release.sourceUrl],['Checksums',release.checksumsUrl]]) {
+      if (!safeDownloadUrl(url)) continue;
+      const row=document.createElement('p');const link=document.createElement('a');
+      link.className='text-link';link.href=url;link.textContent=label;row.append(link);downloads.append(row);
+    }
     item.append(downloads,docs);
   }
 }
