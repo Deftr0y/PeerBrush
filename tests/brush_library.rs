@@ -13,7 +13,18 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn curated_strokes_are_distinct_deterministic_and_all_tips_are_represented() {
     let presets = curated();
-    assert_eq!(presets.len(), 21);
+    assert_eq!(presets.len(), 26);
+    assert_eq!(peerbrush::brush_library::CATEGORIES[0], "Basic");
+    assert_eq!(
+        presets[..5]
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Hard Round", "Soft Round", "Pencil", "Ink Pen", "Airbrush"]
+    );
+    assert!(presets[..5]
+        .iter()
+        .all(|p| p.category == "Basic" && !p.custom));
     let mut strokes = std::collections::BTreeSet::new();
     let mut ids = std::collections::BTreeSet::new();
     let mut tips = std::collections::HashSet::new();
@@ -308,6 +319,30 @@ fn mcp_library_returns_real_png_in_preview_coordinates_and_never_marks_document_
     };
     let list = call(json!({"action":"list"}));
     assert_eq!(list["result"]["isError"], false);
+    let listed: serde_json::Value =
+        serde_json::from_str(list["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(listed["categories"][0], "Basic");
+    assert_eq!(listed["presets"][0]["id"], "basic-hard-round");
+    for preset in curated().into_iter().take(5) {
+        let result = call(json!({"action":"preview","id":preset.id,"width":240,"height":48}));
+        assert_eq!(result["result"]["isError"], false);
+        let blocks = result["result"]["content"].as_array().unwrap();
+        let image = blocks.iter().find(|c| c["type"] == "image").unwrap();
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            image["data"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            image::load_from_memory(&bytes)
+                .unwrap()
+                .to_rgba8()
+                .into_raw(),
+            preview(preset.settings, 240, 48).unwrap().rgba()
+        );
+        let metadata = blocks[0]["text"].as_str().unwrap();
+        assert!(metadata.contains("brush_preview") && !metadata.contains("document_rect"));
+    }
     let preview = call(json!({"action":"preview","id":"graphite","width":240,"height":48}));
     assert_eq!(preview["result"]["isError"], false);
     assert!(preview["result"]["content"]

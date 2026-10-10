@@ -5066,6 +5066,92 @@ mod tests {
         );
     }
     #[test]
+    fn basic_brush_section_comes_first_and_actual_clicks_use_shared_native_strokes() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            let before = {
+                let mut e = app.shared.lock().unwrap();
+                e.doc = Document::new_depth(96, 64, depth).unwrap();
+                e.doc.clone()
+            };
+            app.select_content(&before.layers[0].id);
+            app.show_brush = true;
+            let draw = |app: &mut PeerBrush| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            };
+            let label_pos = |out: &egui::FullOutput, name: &str| {
+                out.shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.job.text == name => {
+                            Some(t.pos + t.galley.size() * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("Missing visible brush label: {name}"))
+            };
+            // egui sizes a newly opened window before painting its visible frame.
+            for _ in 0..3 {
+                let _ = draw(&mut app);
+            }
+            let out = draw(&mut app);
+            assert!(label_pos(&out, "Basic").y < label_pos(&out, "Hard Round").y);
+            let first_section = label_pos(&out, "Basic").y;
+            for category in &crate::brush_library::CATEGORIES[1..] {
+                assert!(out.shapes.iter().all(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == *category =>
+                        t.pos.y > first_section,
+                    _ => true,
+                }));
+            }
+            for preset in crate::brush_library::curated().into_iter().take(5) {
+                let out = draw(&mut app);
+                let pos = label_pos(&out, &preset.name);
+                click(&mut app, &ctx, pos);
+                assert_eq!(app.brush_preset.as_deref(), Some(preset.id.as_str()));
+                assert_eq!(app.brush, preset.settings);
+                assert_eq!(app.radius, preset.settings.radius);
+                assert_eq!(app.brush_thumbnails[&preset.id].0, preset.settings);
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(
+                    app.shared.lock().unwrap().doc.export_png().unwrap(),
+                    before.export_png().unwrap()
+                );
+                app.stroke_has_pressure = true;
+                app.stroke_pressures = vec![0.25, 0.8];
+                let command = app.stroke_command(vec![[20., 25.], [72., 38.]], [173, 61, 29, 255]);
+                let expected = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
+                app.edit(vec![command], "Basic brush stroke");
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1);
+                assert_eq!(e.doc.export_png().unwrap(), expected.export_png().unwrap());
+                assert_ne!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                let loaded = crate::psd::decode(&crate::psd::encode(&e.doc).unwrap()).unwrap();
+                assert_eq!(loaded.bit_depth, depth);
+                assert_eq!(
+                    loaded.layers[0].pixels.rgba16(),
+                    e.doc.layers[0].pixels.rgba16()
+                );
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            }
+            app.brush_category = "Basic".into();
+            app.brush_search = "pencil".into();
+            let out = draw(&mut app);
+            assert!(out
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text=="Pencil")));
+            assert!(!out.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text=="Hard Round" || t.galley.job.text=="Graphite")));
+        }
+    }
+    #[test]
     fn bottom_right_transform_modes_click_without_editing_and_keep_ai_feedback() {
         let (mut app, ctx) = fixture();
         frame(&mut app, &ctx, vec![], Default::default());

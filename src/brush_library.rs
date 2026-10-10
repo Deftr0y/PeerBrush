@@ -7,7 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CATEGORIES: &[&str] = &["Sketch", "Ink", "Paint", "Airbrush", "Texture", "Blend"];
+pub const CATEGORIES: &[&str] = &[
+    "Basic", "Sketch", "Ink", "Paint", "Airbrush", "Texture", "Blend",
+];
 const LIMIT: usize = 256;
 const FILE_LIMIT: u64 = 4 * 1024 * 1024;
 
@@ -226,6 +228,63 @@ pub fn curated() -> Vec<Preset> {
         ..Default::default()
     };
     [
+        (
+            "basic-hard-round",
+            "Hard Round",
+            "Basic",
+            Settings { ..base },
+        ),
+        (
+            "basic-soft-round",
+            "Soft Round",
+            "Basic",
+            Settings {
+                hardness: 0.2,
+                flow: 0.45,
+                spacing: 0.1,
+                ..base
+            },
+        ),
+        (
+            "basic-pencil",
+            "Pencil",
+            "Basic",
+            Settings {
+                radius: 2.,
+                tip: Grain,
+                density: 0.85,
+                grain: 0.5,
+                flow: 0.65,
+                opacity: 0.8,
+                smoothing: 0.2,
+                pressure_opacity: true,
+                ..base
+            },
+        ),
+        (
+            "basic-ink-pen",
+            "Ink Pen",
+            "Basic",
+            Settings {
+                radius: 3.,
+                smoothing: 0.35,
+                ..base
+            },
+        ),
+        (
+            "basic-airbrush",
+            "Airbrush",
+            "Basic",
+            Settings {
+                radius: 48.,
+                hardness: 0.,
+                flow: 0.08,
+                spacing: 0.1,
+                pressure_size: false,
+                pressure_opacity: true,
+                ..base
+            },
+        ),
         (
             "graphite",
             "Graphite",

@@ -4,7 +4,7 @@
   "brush_library": {
     "tool": "peerbrush_brushes",
     "actions": ["list", "preview", "save", "delete"],
-    "presets": "21 original procedural presets in Sketch, Ink, Paint, Airbrush, Texture and Blend. List returns stable IDs and complete shared settings. Paint/smudge/clone/heal accepts preset:ID; explicit settings override it before reservation scopes are checked.",
+    "presets": "26 original procedural presets, with Basic first: Hard Round, Soft Round, Pencil, Ink Pen and Airbrush; followed by Sketch, Ink, Paint, Airbrush, Texture and Blend. List returns stable IDs and complete shared settings. Paint/smudge/clone/heal accepts preset:ID; explicit settings override it before reservation scopes are checked.",
     "custom": "Instance-local brushes.json, outside document history and PSD sources. save without id creates a custom brush; id updates only an existing custom brush. Curated brushes are immutable. Maximum 256 custom brushes/4 MiB; invalid or externally changed files are preserved and writes refused.",
     "preview": "Actual shared-engine pressure stroke PNG, 64–512 by 24–128, coordinate_space brush_preview and rect [0,0,width,height]. This rectangle is not a document placement.",
     "pressure_gamma": "0.1–4, default 1 (linear). response = pressure^gamma before size/opacity and taper. Below 1 responds more at light force; above 1 needs more force. Native16 and mouse taper remain unchanged.",

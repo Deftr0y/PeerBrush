@@ -318,10 +318,16 @@ impl PeerBrush {
     }
     fn preset_browser(&mut self, ui: &mut egui::Ui) {
         let library = self.shared.lock().unwrap().brush_library.clone();
-        let (presets, error) = {
+        let (mut presets, error) = {
             let l = library.lock().unwrap();
             (l.presets(), l.error.clone())
         };
+        presets.sort_by_key(|preset| {
+            crate::brush_library::CATEGORIES
+                .iter()
+                .position(|category| *category == preset.category.as_str())
+                .unwrap_or(crate::brush_library::CATEGORIES.len())
+        });
         self.brush_thumbnails
             .retain(|id, _| presets.iter().any(|p| &p.id == id));
         ui.add(
@@ -329,10 +335,11 @@ impl PeerBrush {
                 .hint_text("Search brushes")
                 .desired_width(ui.available_width()),
         );
-        let mut categories = vec!["All".to_owned(), "Custom".to_owned()];
+        let mut categories = vec!["All".to_owned()];
         for category in crate::brush_library::CATEGORIES {
             categories.push((*category).into());
         }
+        categories.push("Custom".to_owned());
         for preset in &presets {
             if !categories.contains(&preset.category) {
                 categories.push(preset.category.clone());
@@ -352,6 +359,7 @@ impl PeerBrush {
             .max_height(350.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let mut section = None;
                 for preset in &presets {
                     if self.brush_category != "All"
                         && !(self.brush_category == "Custom" && preset.custom)
@@ -366,6 +374,13 @@ impl PeerBrush {
                         continue;
                     }
                     count += 1;
+                    if section != Some(preset.category.as_str()) {
+                        if section.is_some() {
+                            ui.add_space(6.);
+                        }
+                        ui.label(RichText::new(&preset.category).small().color(ACCENT));
+                        section = Some(preset.category.as_str());
+                    }
                     let cached = self
                         .brush_thumbnails
                         .get(&preset.id)
