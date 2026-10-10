@@ -454,5 +454,5 @@ dd kbd + kbd { margin-left: 6px; }
 .documentation-links { display: flex; flex-wrap: wrap; gap: 16px 32px; margin-top: 28px; }
 .documentation-nav { display: flex; flex-wrap: wrap; gap: 12px 28px; margin-bottom: 40px; color: var(--muted); }
 .documentation-nav [aria-current="page"] { color: var(--orange); }
-.documentation-page h1 { font-size: clamp(36px, 5vw, 64px); line-height: 1.1; letter-spacing: -.035em; }
+.documentation-page h1 { font-size: clamp(36px, 5vw, 64px); line-height: 1.1; letter-spacing: -.035em; white-space: normal; overflow-wrap: break-word; text-wrap: balance; }
 .documentation-page .page-description { margin-top: 20px; max-width: 700px; }
