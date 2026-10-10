@@ -1,9 +1,7 @@
 /target/
-/.dev-tools/
-/.runtime/
 /dist/
-*.tmp
-*.recovery
-
-
-/peerbrush.exe
+__pycache__/
+*.pyc
+.runtime/
+connection.json
+.env
