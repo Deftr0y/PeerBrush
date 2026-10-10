@@ -252,7 +252,7 @@ impl PeerBrush {
         let mut hovered = None;
         let mut started = None;
         let mut strip = Rect::NOTHING;
-        egui::TopBottomPanel::top("project tabs")
+        let panel = egui::TopBottomPanel::top("project tabs")
             .exact_height(38.)
             .frame(
                 egui::Frame::new()
@@ -430,6 +430,7 @@ impl PeerBrush {
                     );
                 });
             });
+        self.project_drop_rect = Some(panel.response.rect);
         if let Some(project) = started {
             if !escape {
                 self.tab_drag = Some(TabDrag {

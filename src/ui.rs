@@ -5,6 +5,7 @@ mod brush;
 mod brush_toolbar_tests;
 mod color;
 mod effects;
+mod file_drop;
 mod file_ownership;
 mod filters;
 mod geometry;
@@ -282,6 +283,7 @@ pub struct PeerBrush {
     project_id: String,
     project_views: HashMap<String, ProjectView>,
     project_rects: HashMap<String, Rect>,
+    project_drop_rect: Option<Rect>,
     project_labels: HashMap<String, tabs::Label>,
     tab_active: String,
     tab_drag: Option<tabs::TabDrag>,
@@ -586,6 +588,7 @@ impl PeerBrush {
             project_id,
             project_views: HashMap::new(),
             project_rects: HashMap::new(),
+            project_drop_rect: None,
             project_labels: HashMap::new(),
             tab_active: String::new(),
             tab_drag: None,
@@ -4064,28 +4067,13 @@ impl PeerBrush {
                 .collect::<Vec<_>>()
         });
         if !dropped.is_empty() && self.lifecycle.is_none() && !self.lifecycle_frame {
-            self.drop_files(dropped);
+            if self.file_drop_on_tabs(ctx) {
+                self.drop_project_file(dropped);
+            } else {
+                self.drop_files(dropped);
+            }
         }
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("file-drop"),
-            ));
-            let bounds = ctx.screen_rect().shrink(8.0);
-            painter.rect_stroke(
-                bounds,
-                8.0,
-                Stroke::new(3.0_f32, ACCENT),
-                egui::StrokeKind::Inside,
-            );
-            painter.text(
-                bounds.center(),
-                egui::Align2::CENTER_CENTER,
-                "Drop PSD/PSB to open · Drop images to add layers",
-                egui::FontId::proportional(23.0),
-                Color32::WHITE,
-            );
-        }
+        self.file_drop_feedback(ctx);
         let typing = self.lifecycle.is_some()
             || self.filter_editor.is_some()
             || self.lifecycle_frame
