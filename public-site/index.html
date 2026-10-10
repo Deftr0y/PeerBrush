@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#161417">
+  <title>PeerBrush — Image editing with connected AI agents</title>
+  <meta name="description" content="PeerBrush is a free, open-source image editor with AI agent access. Download native Windows, Linux and macOS builds, explore the workspace, and help develop the application.">
+  <meta property="og:title" content="PeerBrush">
+  <meta property="og:description" content="A free, open-source image editor where you and connected AI agents work on the same editable document.">
+  <meta property="og:image" content="assets/showcase/golden-hour-1440.webp">
+  <link rel="icon" type="image/png" href="assets/peerbrush-logo.png">
+  <link rel="preload" href="assets/fonts/UbuntuSans-SemiBold.ttf" as="font" type="font/ttf" crossorigin>
+  <link rel="preload" href="assets/showcase/golden-hour-1440.webp" as="image" type="image/webp" imagesrcset="assets/showcase/golden-hour-800.webp 800w, assets/showcase/golden-hour-1440.webp 1440w, assets/showcase/golden-hour-2400.webp 2400w" imagesizes="100vw">
+  <link rel="stylesheet" href="styles.css?layout=3">
+  <script src="main.js?release=v0.2&amp;layout=2" type="module"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <defs>
+      <symbol id="arrow" viewBox="0 0 24 24"><path d="M7 17 17 7M7 7h10v10"/></symbol>
+      <symbol id="download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/></symbol>
+      <symbol id="expand" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></symbol>
+      <symbol id="brush" viewBox="0 0 24 24"><path d="m9 14 10-11 3 3-11 10M9 14c-3-2-5 1-4 3 0 2-2 4-3 4 6 1 9-1 9-5Z"/></symbol>
+      <symbol id="layers" viewBox="0 0 24 24"><path d="m3 7 9-5 9 5-9 5Zm0 5 9 5 9-5M3 17l9 5 9-5"/></symbol>
+      <symbol id="effects" viewBox="0 0 24 24"><path d="M5 3v6m0 4v8m7-18v11m0 4v3m7-18v2m0 4v12"/><path d="M2 9h6v4H2Zm7 5h6v4H9Zm7-9h6v4h-6Z"/></symbol>
+      <symbol id="file" viewBox="0 0 24 24"><path d="M14 2H4v20h16V8Zm0 0v6h6M8 13h8m-8 4h6"/></symbol>
+      <symbol id="github" viewBox="0 0 24 24"><path d="M9 20c-4 1-4-2-6-2m12 4v-4c0-1-.3-1.8-1-2 3-.4 6-1.5 6-6 0-1.5-.6-2.7-1.5-3.7.2-.9.2-2-.3-3.3 0 0-1.4-.4-4 1a14 14 0 0 0-6 0c-2.6-1.4-4-1-4-1-.5 1.3-.5 2.4-.3 3.3C3.6 7.3 3 8.5 3 10c0 4.5 3 5.6 6 6-.7.2-1 1-1 2v4"/></symbol>
+      <symbol id="check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+      <symbol id="close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+      <symbol id="windows" viewBox="0 0 24 24"><path d="M3 5 21 2v20L3 19ZM11 4v16M3 12h18"/></symbol>
+      <symbol id="linux" viewBox="0 0 24 24"><path d="m5 7 5 5-5 5m8 0h6M3 3h18v18H3Z"/></symbol>
+      <symbol id="macos" viewBox="0 0 24 24"><path d="M12 6c1-4 4-4 4-4 0 3-2 4-4 4Zm0 1c-2-2-8-1-8 5 0 5 3 10 5 9l3-1 3 1c2 1 4-3 5-5-4-2-4-6-1-8-2-2-5-3-7-1Z"/></symbol>
+      <symbol id="discord" viewBox="0 0 24 24"><path d="m8 5-4 1c-2 3-3 6-3 10l5 3 1-2m9-12 4 1c2 3 3 6 3 10l-5 3-1-2M7 17c3 1 7 1 10 0M8 5c2-1 6-1 8 0"/><circle cx="8" cy="12" r="1.3"/><circle cx="16" cy="12" r="1.3"/></symbol>
+      <symbol id="play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5Z"/></symbol>
+      <symbol id="eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+      <symbol id="spark" viewBox="0 0 24 24"><path d="M12 3v4m0 10v4M3 12h4m10 0h4M6 6l2.5 2.5m7 7L18 18M6 18l2.5-2.5m7-7L18 6"/></symbol>
+    </defs>
+  </svg>
+
+  <div class="header-shell"><header class="header wrap">
+    <a class="brand" href="#" aria-label="PeerBrush home">
+      <img src="assets/peerbrush-logo.png" alt="" width="34" height="40">
+      <span>Peer<span class="ember">Brush</span></span>
+    </a>
+    <nav aria-label="Main navigation">
+      <a href="#layer-story">Layers</a>
+      <a href="#workspace">Workspace</a>
+      <a href="#downloads">Downloads</a>
+      <a href="releases.html">Release notes &amp; docs</a>
+      <a href="#contribute">Contribute</a>
+    </nav>
+    <a class="source-link" href="https://github.com/Deftr0y/PeerBrush" aria-label="PeerBrush source on GitHub"><svg class="icon" aria-hidden="true"><use href="#github"/></svg><span>Source</span><svg class="icon arrow-icon" aria-hidden="true"><use href="#arrow"/></svg></a>
+  </header><div class="reading-progress" aria-hidden="true"></div></div>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="title">
+      <div class="hero-media" aria-hidden="true">
+        <img class="hero-image" src="assets/showcase/golden-hour-1440.webp" srcset="assets/showcase/golden-hour-800.webp 800w, assets/showcase/golden-hour-1440.webp 1440w, assets/showcase/golden-hour-2400.webp 2400w" sizes="100vw" width="2400" height="1350" alt="" fetchpriority="high">
+     </div>
+      <div class="hero-inner wrap">
+        <div class="hero-copy">
+          <div class="release-label"><span class="status-dot"></span> Free & open source <span class="label-separator">/</span> GPL v3 <span class="label-separator">/</span> In active development</div>
+          <div class="hero-title">
+            <div class="logo-mark" aria-hidden="true">
+              <img class="logo-part logo-plum" src="assets/showcase/logo-plum.png" alt="" width="241" height="385">
+              <img class="logo-part logo-orange" src="assets/showcase/logo-orange.png" alt="" width="241" height="385">
+              <img class="logo-part logo-ivory" src="assets/showcase/logo-ivory.png" alt="" width="241" height="385">
+            </div>
+            <h1 id="title">Peer<span class="ember">Brush</span></h1>
+          </div>
+         <p class="hero-description">Image editing with layers, masks and connected AI agents.</p>
+          <div class="hero-actions">
+            <a class="button primary" id="primary-download" href="#downloads"><svg class="icon"><use href="#download"/></svg><span>Choose a download</span></a>
+            <a class="button ghost" href="#demo"><svg class="icon"><use href="#play"/></svg><span>Watch the trailer</span></a>
+          </div>
+          <p class="download-meta" id="download-meta">PeerBrush 0.2 · Prerelease · Windows, Linux & macOS</p>
+          <div class="other-downloads" id="other-downloads" aria-label="Other operating systems"></div>
+          <div class="hero-facts"><span>Free to download and use</span><a href="LICENSE.txt">GPL v3 license <svg class="icon"><use href="#arrow"/></svg></a></div>
+        </div>
+      </div>
+      <a class="scroll-cue" href="#showcase" aria-label="Scroll to the workspace"><span></span></a>
+    </section>
+
+    <section class="showcase wrap" id="showcase" aria-label="PeerBrush workspace">
+      <figure class="showcase-frame">
+        <div class="showcase-tilt">
+          <img src="assets/showcase/workspace-golden-hour.webp" width="1600" height="900" loading="lazy" alt="The real PeerBrush window editing a mountain lake at golden hour. Layers for Sunlight, Lake reflection, Atmosphere, Sun glow, Sky and Photo; the status bar shows MCP connected and the AI updating the shared canvas.">
+          <span class="showcase-glow" aria-hidden="true"></span>
+        </div>
+      </figure>
+    </section>
+
+    <section class="trailer-section section wrap" id="demo" aria-labelledby="trailer-title">
+      <div class="section-heading"><div><span class="section-label">VIDEO</span><h2 id="trailer-title">Trailer</h2></div></div>
+      <div class="video-frame">
+        <video class="trailer-video" controls playsinline preload="metadata" width="1920" height="1080" poster="assets/showcase/trailer-poster.webp" aria-labelledby="trailer-title" controlslist="nodownload">
+          <source src="assets/peerbrush-trailer-v2.1.mp4" type="video/mp4">
+          <p>Your browser does not support inline video playback.</p>
+        </video>
+        <button class="play-overlay" type="button" aria-label="Play the PeerBrush trailer"><span class="play-ring"><svg class="icon"><use href="#play"/></svg></span><span class="play-text">Play trailer <span>1:03</span></span></button>
+      </div>
+    </section>
+
+    <section class="community-section section" id="contribute" aria-labelledby="community-title">
+      <div class="community-backdrop" aria-hidden="true"><img src="assets/showcase/golden-hour-1440.webp" alt="" width="1440" height="810" loading="lazy"></div>
+      <div class="wrap">
+        <div class="community-heading"><span class="section-label">ONGOING DEVELOPMENT</span><h2 id="community-title">Artists and developers:<br>take part in PeerBrush.</h2><p>Try a workflow, share what needs improving, or contribute a focused change. The application and its source are free under GPL v3.</p></div>
+        <div class="contribution-grid">
+          <article class="spot artist-card"><svg class="feature-icon"><use href="#brush"/></svg><h3>Artists</h3><p>Test painting, masks or layer editing. Share artwork, awkward steps and the tools your workflow is missing.</p><a class="text-link" href="#community-links">Join the conversation <svg class="icon"><use href="#arrow"/></svg></a></article>
+          <article class="spot dev-card"><svg class="feature-icon"><use href="#linux"/></svg><h3>Developers</h3><p>Contribute Rust, egui, wgpu, codecs, tests or native platform fixes. Start with the development guide and a small, reviewable change.</p><a class="text-link" href="https://github.com/Deftr0y/PeerBrush/blob/main/docs/development.md">Development guide <svg class="icon"><use href="#arrow"/></svg></a></article>
+        </div>
+        <div class="community-links" id="community-links">
+          <a class="community-destination discord-destination" id="discord-link" href="https://discord.gg/TfCUvkqNv"><svg class="feature-icon"><use href="#discord"/></svg><div><strong>Discord</strong><span>Artwork, feedback and development · Invite valid through 8 Nov 2026</span></div><svg class="icon"><use href="#arrow"/></svg></a>
+          <a class="community-destination" href="https://github.com/Deftr0y/PeerBrush/issues"><svg class="feature-icon"><use href="#github"/></svg><div><strong>Issues & feature requests</strong><span>Report a reproducible problem or propose a tool</span></div><svg class="icon"><use href="#arrow"/></svg></a>
+        </div>
+      </div>
+    </section>
+
+    <section class="layers-story" id="layer-story" aria-labelledby="layers-title">
+      <div class="layers-sticky">
+        <div class="wrap layers-grid">
+          <div class="layers-copy">
+            <span class="section-label">SHARED DOCUMENT</span>
+            <h2 id="layers-title">You and an agent, editing at the same time</h2>
+            <ol class="layers-steps">
+              <li class="active"><h3>One open document, two editors</h3><p>While you paint, a connected agent edits the same document. Both changes land in one shared history, marked by who made them.</p></li>
+              <li><h3>Different parts of the canvas</h3><p>An agent can reserve a whole layer or only a region of one, so you can keep working everywhere else, even on the same layer. Its work area is outlined in blue.</p></li>
+              <li><h3>Different layers</h3><p>In the trailer edit, the agent built the sky, grade, glow, atmosphere and lake light on its own layers while the sunlight and dodge &amp; burn were painted on separate manual layers.</p></li>
+              <li><h3>Still editable</h3><p>Nothing is merged. Turn any layer off and on; masks, effects and blend modes survive the saved PSD.</p></li>
+            </ol>
+          </div>
+          <div class="layers-stage">
+            <div class="stack-viewport">
+              <div class="stack">
+                <img class="stack-flat" src="assets/showcase/golden-hour-1600.webp" width="1600" height="900" alt="" loading="lazy">
+                <div class="plane" data-layer="0-photo" data-blend="normal"><img src="assets/showcase/layer-0-photo.webp" alt="" width="1280" height="720" loading="lazy"><i class="anchor"></i></div>
+                <div class="plane" data-layer="1-sky" data-blend="normal"><img src="assets/showcase/layer-1-sky.webp" alt="" width="1280" height="720" loading="lazy"><i class="anchor"></i></div>
+                <div class="plane" data-layer="2-glow" data-blend="screen"><img src="assets/showcase/layer-2-glow.webp" alt="" width="1280" height="720" loading="lazy"><i class="anchor"></i></div>
+                <div class="plane" data-layer="3-atmosphere" data-blend="screen"><img src="assets/showcase/layer-3-atmosphere.webp" alt="" width="1280" height="720" loading="lazy"><i class="anchor"></i></div>
+                <div class="plane" data-layer="4-lake" data-blend="overlay"><img src="assets/showcase/layer-4-lake.webp" alt="" width="1280" height="720" loading="lazy"><i class="anchor"></i></div>
+                <div class="plane" data-layer="5-sunlight" data-blend="overlay"><img src="assets/showcase/layer-5-sunlight.webp" alt="" width="1280" height="720" loading="lazy"><i class="anchor"></i></div>
+                <div class="plane" data-layer="6-dodge" data-blend="overlay"><img src="assets/showcase/layer-6-dodge.webp" alt="" width="1280" height="720" loading="lazy"><i class="anchor"></i></div>
+                <div class="regions" aria-hidden="true">
+                  <div class="activity"><span class="activity-chip artist"><span class="dot"></span>You · painting sunlight</span><span class="activity-chip ai"><span class="dot"></span>AI · building the sky</span></div>
+                  <div class="region-ai"><span class="region-tag">AI · Sky region</span></div>
+                  <div class="region-you"><span class="brush-ring"></span><span class="region-tag">You · Sunlight brush</span></div>
+                </div>
+              </div>
+            </div>
+            <svg class="layer-links" aria-hidden="true"></svg>
+            <div class="layer-labels" role="group" aria-label="Layers of the example document. Select a layer to hide or show it.">
+              <button type="button" class="layer-label artist" data-layer="6-dodge" aria-pressed="true"><span class="who">You</span>Dodge &amp; burn<svg class="icon"><use href="#eye"/></svg></button>
+              <button type="button" class="layer-label artist" data-layer="5-sunlight" aria-pressed="true"><span class="who">You</span>Sunlight<svg class="icon"><use href="#eye"/></svg></button>
+              <button type="button" class="layer-label ai" data-layer="4-lake" aria-pressed="true"><span class="who">AI</span>Lake reflection<svg class="icon"><use href="#eye"/></svg></button>
+              <button type="button" class="layer-label ai" data-layer="3-atmosphere" aria-pressed="true"><span class="who">AI</span>Atmosphere<svg class="icon"><use href="#eye"/></svg></button>
+              <button type="button" class="layer-label ai" data-layer="2-glow" aria-pressed="true"><span class="who">AI</span>Sun glow<svg class="icon"><use href="#eye"/></svg></button>
+              <button type="button" class="layer-label ai" data-layer="1-sky" aria-pressed="true"><span class="who">AI</span>Sky<svg class="icon"><use href="#eye"/></svg></button>
+              <button type="button" class="layer-label ai" data-layer="0-photo" aria-pressed="true"><span class="who">AI</span>Golden-hour grade<svg class="icon"><use href="#eye"/></svg></button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="capabilities wrap" aria-label="Editing tools">
+      <article class="spot"><svg class="feature-icon"><use href="#brush"/></svg><h2>Painting</h2><p>Pressure, texture, taper and flow. Brush, erase, clone and heal.</p></article>
+      <article class="spot"><svg class="feature-icon"><use href="#layers"/></svg><h2>Layers & masks</h2><p>Folders, blend modes, selections and separate color and mask editing.</p></article>
+      <article class="spot"><svg class="feature-icon"><use href="#effects"/></svg><h2>Editable effects</h2><p>Curves, levels, color balance, bloom and liquify with live previews.</p></article>
+      <article class="spot"><svg class="feature-icon"><use href="#file"/></svg><h2>8 & 16 bit</h2><p>Native channel precision through editing, transforms and PSD / PNG saves.</p></article>
+    </section>
+
+    <section class="gallery-section section wrap" id="workspace" aria-labelledby="workspace-title">
+      <div class="section-heading"><div><span class="section-label">NATIVE SCREENSHOTS</span><h2 id="workspace-title">Inside the workspace</h2></div><p class="section-aside">Captured from the application. Select a view, or enlarge it.</p></div>
+      <div class="gallery">
+        <div class="gallery-controls" role="tablist" aria-label="Native workspace screenshots">
+          <button id="tab-workspace" role="tab" aria-selected="true" aria-controls="screenshot-panel" data-view="workspace">Workspace</button>
+          <button id="tab-brush" role="tab" aria-selected="false" aria-controls="screenshot-panel" tabindex="-1" data-view="brush">Brush</button>
+          <button id="tab-selection" role="tab" aria-selected="false" aria-controls="screenshot-panel" tabindex="-1" data-view="selection">Selection</button>
+          <button id="tab-color" role="tab" aria-selected="false" aria-controls="screenshot-panel" tabindex="-1" data-view="color">Color</button>
+          <button class="expand-button" aria-label="Enlarge workspace screenshot"><svg class="icon"><use href="#expand"/></svg></button>
+        </div>
+        <figure id="screenshot-panel" role="tabpanel" aria-labelledby="tab-workspace">
+          <button class="screenshot-button" aria-label="Enlarge workspace screenshot">
+            <img id="workspace-image" src="assets/workspace-v2.png" width="2040" height="1350" alt="A mountain lake at sunset open in the real PeerBrush workspace, with editable layers, masks and color effects." loading="lazy">
+          </button>
+        </figure>
+      </div>
+    </section>
+
+    <section class="downloads-section section wrap" id="downloads" aria-labelledby="downloads-title">
+      <div class="section-heading"><div><span class="section-label">DOWNLOADS</span><h2 id="downloads-title">Choose your platform</h2></div><span class="build-label" id="build-label">PeerBrush 0.2 · Prerelease</span></div>
+      <p class="download-intro">Free native builds from the same tested source. Includes GPL v3 source and third-party notices.</p>
+      <div class="platform-list" id="platform-list">
+        <div class="platform-row"><div class="platform-info"><svg class="icon" aria-hidden="true"><use href="#windows"/></svg><div><h3>Windows</h3><p>x64 · Extract and run peerbrush.exe · Unsigned</p></div></div><span class="package-size">26.5 MB</span><a class="platform-download" href="https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Windows-x64-repacked-20261010.zip">Download <svg class="icon" aria-hidden="true"><use href="#download"/></svg></a></div>
+        <div class="platform-row"><div class="platform-info"><svg class="icon" aria-hidden="true"><use href="#linux"/></svg><div><h3>Linux</h3><p>x64 · Built on Ubuntu 24.04 · Unsigned</p></div></div><span class="package-size">29.0 MB</span><a class="platform-download" href="https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Linux-x64-repacked-20261010.zip">Download <svg class="icon" aria-hidden="true"><use href="#download"/></svg></a></div>
+        <div class="platform-row"><div class="platform-info"><svg class="icon" aria-hidden="true"><use href="#macos"/></svg><div><h3>macOS</h3><p>Apple silicon · arm64 · Open PeerBrush.app · Unsigned</p></div></div><span class="package-size">25.5 MB</span><a class="platform-download" href="https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-macOS-arm64-repacked-20261010.zip">Download <svg class="icon" aria-hidden="true"><use href="#download"/></svg></a></div>
+      </div>
+      <p class="download-caution">Experimental 0.2 prerelease. All packages are unsigned; Windows/macOS may show publisher or security warnings. macOS requires Apple silicon. Manual macOS/Linux desktop verification remains pending.</p>
+      <div class="download-links"><a class="text-link" id="release-link" href="https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2">Release notes <svg class="icon"><use href="#arrow"/></svg></a><a class="text-link" href="releases.html">All release notes &amp; documentation <svg class="icon"><use href="#arrow"/></svg></a></div>
+      <noscript><p><a href="https://github.com/Deftr0y/PeerBrush/releases">View all download packages on GitHub Releases</a>. Enable JavaScript for operating-system suggestions.</p></noscript>
+    </section>
+
+    <section class="section wrap" id="version-history" aria-labelledby="version-history-title">
+      <div class="section-heading"><div><span class="section-label">VERSION HISTORY</span><h2 id="version-history-title">Published releases</h2></div></div>
+      <ol class="release-history" id="release-history" data-scope="latest"></ol>
+      <a class="text-link" href="releases.html">See all versions &amp; documentation <svg class="icon"><use href="#arrow"/></svg></a>
+      <noscript><p><a href="https://github.com/Deftr0y/PeerBrush/releases">Read the complete release history on GitHub</a>.</p></noscript>
+    </section>
+
+    <section class="ai-section section" id="ai" aria-labelledby="ai-title">
+      <div class="wrap ai-grid">
+        <div class="section-intro">
+          <span class="section-label ai-color"><span class="status-dot blue"></span> AI CONNECTION</span>
+          <h2 id="ai-title">Connect an agent</h2>
+          <p>Agents inspect the actual canvas and edit through the same document engine. AI changes appear in blue.</p>
+          <p class="client-list">Codex <span>·</span> Claude Desktop <span>·</span> Cursor <span>·</span> Gemini CLI</p>
+          <a class="text-link ai-link" href="https://github.com/Deftr0y/PeerBrush/blob/main/docs/mcp.md">MCP setup and tool reference <svg class="icon"><use href="#arrow"/></svg></a>
+        </div>
+        <div class="ai-instructions">
+          <figure class="status-capture"><img src="assets/showcase/mcp-status.webp" width="920" height="74" alt="The PeerBrush status bar showing MCP connected next to the Connect AI button." loading="lazy"><figcaption>The real status bar once a client is attached</figcaption></figure>
+          <ol class="steps ai-steps">
+            <li><span class="step-number">01</span><div><h3>Click Connect AI in PeerBrush</h3><p>The app registers with detected clients and preserves their existing settings.</p></div></li>
+            <li><span class="step-number">02</span><div><h3>Reload your AI client</h3><p>Approve the connection if prompted. A green MCP indicator in PeerBrush confirms a connected client.</p></div></li>
+          </ol>
+          <div class="code-block mcp-call" aria-label="Example MCP edit command from the documentation"><span class="code-title">peerbrush_edit</span><pre><code>{"commands":[{"op":"paint","layer":"LAYER_ID",
+  "points":[[60,60],[180,120]],"radius":14,
+  "color":[233,84,32,255]}],
+ "expected_revision":0,"actor":"my-agent",
+ "label":"Paint orange accent"}</code></pre></div>
+          <div class="connection-note"><svg class="icon"><use href="#check"/></svg><p>Choose your model in the AI client. PeerBrush is free; separate AI providers may charge for their services.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="formats-section section wrap" id="formats" aria-labelledby="formats-title">
+      <div class="section-heading"><div><span class="section-label">FILE SUPPORT</span><h2 id="formats-title">Supported formats</h2></div><a class="text-link" href="https://github.com/Deftr0y/PeerBrush/blob/main/docs/photoshop-fidelity.md">Compatibility details <svg class="icon"><use href="#arrow"/></svg></a></div>
+      <div class="format-table" role="region" aria-label="File compatibility" tabindex="0">
+        <table>
+          <thead><tr><th scope="col">Format</th><th scope="col">Current support</th><th scope="col">Behavior</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">PSD <span>v1 · RGB · 8 / 16 bit</span></th><td><span class="support-dot"></span>Editable, supported structures</td><td>Raster layers, groups, supported blends and raster masks. Saves include a current merged composite.</td></tr>
+            <tr><th scope="row">PNG <span>8 / 16 bit</span></th><td><span class="support-dot"></span>Import & export</td><td>Export retains the document’s native channel depth.</td></tr>
+            <tr><th scope="row">JPEG / BMP / GIF / TIFF / WebP / ICO / Netpbm / TGA / QOI</th><td><span class="support-dot"></span>Image import</td><td>Supported static images, with explicit frame, page or icon choices where needed. Supported native 16-bit samples retain their precision.</td></tr>
+            <tr><th scope="row">SVG / SVGZ</th><td><span class="support-dot"></span>Editable vector import</td><td>Supported self-contained static artwork. Outline text; unsupported visual features are rejected. Vector coverage renders at 8 bit.</td></tr>
+            <tr><th scope="row">RGB ICC profiles</th><td><span class="support-dot"></span>Bounded color management</td><td>Matrix/TRC and classic RGB LUT profiles. Supported image imports normalize to sRGB at source depth; protected PSDs require an explicit editable copy.</td></tr>
+            <tr><th scope="row">Unsupported PSD structures</th><td><span class="support-dot protected"></span>Protected preview</td><td>Read-only merged preview. An explicit flattened copy retains the original precision.</td></tr>
+            <tr><th scope="row">PSB / other color modes</th><td><span class="support-dot limited"></span>Not supported</td><td>CMYK, HDR/32-bit, PSB and newer ICC LUT structures remain unsupported.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="reference-section section wrap" aria-labelledby="reference-title">
+      <div class="shortcuts">
+        <span class="section-label">QUICK REFERENCE</span>
+        <h2 id="reference-title">Canvas shortcuts</h2>
+        <dl>
+          <div><dt>Paint</dt><dd><kbd>B</kbd></dd></div>
+          <div><dt>Move / rotate / scale</dt><dd><kbd>W</kbd><kbd>E</kbd><kbd>R</kbd></dd></div>
+          <div><dt>Frame canvas or selection</dt><dd><kbd>F</kbd></dd></div>
+          <div><dt>Pan</dt><dd>Middle drag / <kbd>Space</kbd> + drag</dd></div>
+          <div><dt>Zoom</dt><dd>Scroll / <kbd>Alt</kbd> + right drag</dd></div>
+          <div><dt>Delete selected layers</dt><dd><kbd>DEL</kbd></dd></div>
+          <div><dt>Duplicate layer selection</dt><dd><kbd>Ctrl</kbd> + <kbd>D</kbd></dd></div>
+          <div><dt>Group / merge layers</dt><dd><kbd>Ctrl</kbd> + <kbd>G</kbd> / <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></dd></div>
+          <div><dt>Undo / redo</dt><dd><kbd>Ctrl</kbd> + <kbd>Z</kbd> / <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>Z</kbd></dd></div>
+        </dl>
+      </div>
+      <div class="development">
+        <span class="section-label">SOURCE</span>
+        <h2>Develop from source</h2>
+        <p>Rust, egui and wgpu. Licensed under GPL v3.</p>
+        <div class="code-block"><pre><code>git clone https://github.com/Deftr0y/PeerBrush.git
+cd PeerBrush
+cargo run --locked</code></pre><button class="copy-button" data-copy="git clone https://github.com/Deftr0y/PeerBrush.git&#10;cd PeerBrush&#10;cargo run --locked" aria-label="Copy development commands">Copy</button></div>
+        <p class="platform-note">Native build and automated tests pass on Windows, Linux and macOS. Desktop workflow verification on Linux and macOS is pending.</p>
+        <a class="text-link" href="https://github.com/Deftr0y/PeerBrush/blob/main/docs/development.md">Development guide <svg class="icon"><use href="#arrow"/></svg></a>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer wrap">
+    <a class="brand" href="#" aria-label="Back to top"><img src="assets/peerbrush-logo.png" alt="" width="26" height="32"><span>Peer<span class="ember">Brush</span></span></a>
+    <span class="footer-license">Free & open source · GPL v3</span>
+    <div><a href="LICENSE.txt">License</a><a href="https://discord.gg/TfCUvkqNv">Discord</a><a href="https://github.com/Deftr0y/PeerBrush/issues">Report an issue <svg class="icon"><use href="#arrow"/></svg></a><a href="https://github.com/Deftr0y/PeerBrush">GitHub <svg class="icon"><use href="#arrow"/></svg></a></div>
+    <p class="footer-credits">Golden-hour example: photo by Robert Magnusson (Unsplash, CC0) and sky panorama by W.carter (CC0), edited in PeerBrush. Ember lake example: ImageGen artwork in the real PeerBrush workspace.</p>
+  </footer>
+
+  <dialog class="image-dialog" aria-labelledby="dialog-caption">
+    <div class="dialog-toolbar"><span id="dialog-caption">Native workspace</span><button class="close-dialog" aria-label="Close screenshot"><svg class="icon"><use href="#close"/></svg></button></div>
+    <img id="dialog-image" alt="" width="2040" height="1350">
+  </dialog>
+  <div class="sr-only" role="status" id="status" aria-live="polite"></div>
+</body>
+</html>

@@ -1,0 +1,191 @@
+{
+  "version": "v0.2",
+  "label": "PeerBrush 0.2 · Prerelease",
+  "commit": "2e1791ffc02584103f7a8f1824ef7668a1b19589",
+  "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2",
+  "buildUrl": "https://github.com/Deftr0y/PeerBrush/actions/runs/38013631911",
+  "platforms": [
+    {
+      "id": "windows",
+      "name": "Windows",
+      "architecture": "x64",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Windows-x64-repacked-20261010.zip",
+      "bytes": 26478146,
+      "sha256": "3db047293fa1e307ec72dd24963ce14df551feb46a66b1b7e098126a6dadfec4",
+      "nativeSigning": "unsigned",
+      "description": "x64 · Extract and run peerbrush.exe · Unsigned"
+    },
+    {
+      "id": "linux",
+      "name": "Linux",
+      "architecture": "x64",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Linux-x64-repacked-20261010.zip",
+      "bytes": 29010659,
+      "sha256": "f31dd45b5f96ce15ae10a5bd1221ff81a6fa3f9ca8d08cdc6b2744934c203156",
+      "nativeSigning": "unsigned",
+      "description": "x64 · Built on Ubuntu 24.04 · Unsigned"
+    },
+    {
+      "id": "macos",
+      "name": "macOS",
+      "architecture": "arm64",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-macOS-arm64-repacked-20261010.zip",
+      "bytes": 25473214,
+      "sha256": "35472e98dbbf5a27f3fd261f837162accf125a0c8503799f00d69a7e6002f8ef",
+      "nativeSigning": "unsigned",
+      "description": "Apple silicon · arm64 · Open PeerBrush.app · Unsigned"
+    }
+  ],
+  "schema": 2,
+  "history": [
+    {
+      "version": "v0.2",
+      "label": "PeerBrush 0.2 · Prerelease",
+      "kind": "prerelease",
+      "publishedAt": "2026-10-10T10:13:22Z",
+      "commit": "2e1791ffc02584103f7a8f1824ef7668a1b19589",
+      "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2",
+      "buildUrl": "https://github.com/Deftr0y/PeerBrush/actions/runs/38013631911",
+      "caution": "Experimental 0.2 prerelease. All packages are unsigned; Windows/macOS may show publisher or security warnings. macOS requires Apple silicon. Manual macOS/Linux desktop verification remains pending.",
+      "notes": [
+        "Project tabs, guarded cross-project transfers, retained transforms, clone/heal, crop/resize, text and editable vectors.",
+        "Independent selections; DEL deletes layers, Ctrl+D duplicates the current layer selection, Ctrl+G groups and Ctrl+Shift+G merges. Folder guides, full-row menus and the connected Add mask selector.",
+        "Common raster and supported static SVG/SVGZ imports, Windows image-file paste, searchable categorized effects and presets, compact effect weights and typed slider values.",
+        "Broader native-depth GPU previews, RGB matrix/TRC and classic LUT ICC support, standard PSD full layer/folder locks and protected unsupported originals.",
+        "Guarded live AI code editing through the shared engine, with blue feedback, reservations, takeover and task undo that preserves human work.",
+        "Windows x64, Linux x64 and macOS arm64 packages passed exact-source CI and archive/source/checksum verification. All are unsigned; macOS/Linux manual desktop interaction remains unverified.",
+        "2026-10-10 packaging correction: removed duplicated website-only trailer, demo PSD and showcase images. Windows 26.5 MB, Linux 29.0 MB, macOS 25.5 MB; matching source 11.7 MB. Original 0.2.0 executable bytes are unchanged; GPL source, application artwork/fonts, user guides and license notices remain included. Packages remain unsigned."
+      ],
+      "platforms": [
+        {
+          "id": "windows",
+          "name": "Windows",
+          "architecture": "x64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Windows-x64-repacked-20261010.zip",
+          "bytes": 26478146,
+          "sha256": "3db047293fa1e307ec72dd24963ce14df551feb46a66b1b7e098126a6dadfec4",
+          "nativeSigning": "unsigned",
+          "description": "x64 · Extract and run peerbrush.exe · Unsigned"
+        },
+        {
+          "id": "linux",
+          "name": "Linux",
+          "architecture": "x64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Linux-x64-repacked-20261010.zip",
+          "bytes": 29010659,
+          "sha256": "f31dd45b5f96ce15ae10a5bd1221ff81a6fa3f9ca8d08cdc6b2744934c203156",
+          "nativeSigning": "unsigned",
+          "description": "x64 · Built on Ubuntu 24.04 · Unsigned"
+        },
+        {
+          "id": "macos",
+          "name": "macOS",
+          "architecture": "arm64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-macOS-arm64-repacked-20261010.zip",
+          "bytes": 25473214,
+          "sha256": "35472e98dbbf5a27f3fd261f837162accf125a0c8503799f00d69a7e6002f8ef",
+          "nativeSigning": "unsigned",
+          "description": "Apple silicon · arm64 · Open PeerBrush.app · Unsigned"
+        }
+      ],
+      "packagingCommit": "0eb25310d37976dc6fd655bf960b89686204a569",
+      "packagingCorrectedAt": "2026-10-10",
+      "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-source-repacked-20261010.zip"
+    },
+    {
+      "version": "development-d70f64e",
+      "label": "Development build d70f64e · Windows, Linux, macOS",
+      "kind": "development",
+      "publishedAt": "2026-10-09T14:57:54Z",
+      "commit": "d70f64eca57083bf4bf43c39cd74eaad6fb8298a",
+      "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/development-d70f64e",
+      "notes": [
+        "Independent project tabs and editable cross-project transfers; retained transforms, crop/resize, clone/heal, text/vector sources and native PSD loading.",
+        "Weighted effect stacks, brush presets, selection refinement and optional learned selection providers; proposals and selective AI task undo.",
+        "DEL layer deletion, Windows image-file paste, typed slider values and connected folder guides.",
+        "Windows, Linux and macOS packages passed the same CI run. macOS/Linux manual desktop verification remains pending; the macOS package is unsigned."
+      ],
+      "platforms": [
+        {
+          "id": "windows",
+          "name": "Windows",
+          "architecture": "x64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/development-d70f64e/PeerBrush-Windows.zip",
+          "bytes": 24323001,
+          "sha256": "b4400eb21f018aec922cfb6a241a4a7085bff8b951e829935d36602dd9c27224",
+          "nativeSigning": "unverified"
+        },
+        {
+          "id": "linux",
+          "name": "Linux",
+          "architecture": "x64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/development-d70f64e/PeerBrush-Linux.zip",
+          "bytes": 26859482,
+          "sha256": "80eb5ee0851589f8906e3ec6dcfeac832b220af4ae2a51c989e35fb2222080e0",
+          "nativeSigning": "unverified"
+        },
+        {
+          "id": "macos",
+          "name": "macOS",
+          "architecture": "arm64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/development-d70f64e/PeerBrush-macOS.zip",
+          "bytes": 23718559,
+          "sha256": "239696546c95c32811567fefbeb8e2e45737efb889d45046a9bbd1f537267499",
+          "nativeSigning": "unsigned"
+        }
+      ]
+    },
+    {
+      "version": "v0.1.4",
+      "label": "PeerBrush v0.1.4 — Native 16-bit painting checkpoint",
+      "kind": "prerelease",
+      "publishedAt": "2026-10-08T09:21:58Z",
+      "commit": "8adadb8f6471214dc96a1c79d2c834b07f8f7ebc",
+      "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.1.4",
+      "notes": [
+        "Native 16-bit painting, textured/tapered brushes, smudge/wet blending, editable Liquify, HSL/color balance/bloom, expanded blends and clipped adjustments.",
+        "Marquees, lassos, Wand, Quick Selection, deterministic Object region, feather/morphology/reselect and coverage-aware edits.",
+        "Windows regression, native painting and independent PNG16/PSD16 undo/save/reopen checks passed. Unsupported Photoshop structures remain protected."
+      ],
+      "platforms": [
+        {
+          "id": "windows",
+          "name": "Windows",
+          "architecture": "x64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.4/PeerBrush-Windows.zip",
+          "bytes": 23397230,
+          "sha256": "6677ba92cc645f58a9cbddc63bd7c524c6b967431d0f4973a4b86bdc962e4297",
+          "nativeSigning": "unverified"
+        }
+      ]
+    },
+    {
+      "version": "v0.1.2",
+      "label": "PeerBrush v0.1.2 — Shared canvas checkpoint",
+      "kind": "prerelease",
+      "publishedAt": "2026-10-06T22:01:00Z",
+      "commit": "f1c3476b0ec098a5d772f62a35042f21c2fc8dd8",
+      "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.1.2",
+      "notes": [
+        "Connected Color/Mask controls, inline layer names, grouping/merging and whole-layer clipboard operations.",
+        "Foreground fill, selection-aware rotation/move/scale and exact-shape painting/copying.",
+        "Detected-client registration, local MCP discovery and authenticated HTTP; Windows workflow/save/undo checks. Editable PSD support at this checkpoint is limited to supported 8-bit RGB."
+      ],
+      "platforms": [
+        {
+          "id": "windows",
+          "name": "Windows",
+          "architecture": "x64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.2/PeerBrush-Windows.zip",
+          "bytes": 14037529,
+          "sha256": "4c32ca0e36eaabf871a2681fed213dd0aa85cc7c5f6171925195e2065e1b274b",
+          "nativeSigning": "unverified"
+        }
+      ]
+    }
+  ],
+  "caution": "Experimental 0.2 prerelease. All packages are unsigned; Windows/macOS may show publisher or security warnings. macOS requires Apple silicon. Manual macOS/Linux desktop verification remains pending.",
+  "packagingCommit": "0eb25310d37976dc6fd655bf960b89686204a569",
+  "packagingCorrectedAt": "2026-10-10",
+  "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-source-repacked-20261010.zip"
+}
