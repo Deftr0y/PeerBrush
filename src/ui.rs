@@ -2334,6 +2334,10 @@ impl PeerBrush {
                 if icons::button(ui, Icon::AddLayer, "New paint layer").clicked(){self.edit(vec![json!({"op":"layer.add","kind":"paint","name":format!("Paint {}",doc.layers.len()+1)})],"New paint layer");}
             });
         });
+        if let Some(caption) = self.solo_caption(doc) {
+            ui.add(egui::Label::new(RichText::new(&caption).size(11.).color(ACCENT)).truncate())
+                .on_hover_text(caption);
+        }
         ui.add_space(12.0);
         let selected = doc.layers.iter().find(|l| l.id == self.selected).cloned();
         ui.add_space(8.0);
@@ -2376,8 +2380,8 @@ impl PeerBrush {
                         self.channel_tabs(ui, doc, l.mask.is_some());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .selectable_label(self.isolate, "Solo")
-                                .on_hover_text("Isolate content or mask")
+                                .selectable_label(self.isolate, if self.isolate {"Exit solo"} else {"Solo"})
+                                .on_hover_text(if self.isolate {"Return to the full document"} else {"View only the selected Color or Mask target"})
                                 .clicked()
                             {
                                 self.isolate = !self.isolate;
@@ -2828,6 +2832,22 @@ impl PeerBrush {
             Stroke::new(1.0_f32, Color32::from_rgb(90, 84, 93)),
             egui::StrokeKind::Outside,
         );
+        if let Some(caption) = self.solo_caption(doc) {
+            let painter = painter.with_clip_rect(visible);
+            let point = visible.left_top() + Vec2::new(8., 8.);
+            for (offset, color) in [
+                (Vec2::splat(1.), Color32::BLACK),
+                (Vec2::ZERO, Color32::WHITE),
+            ] {
+                painter.text(
+                    point + offset,
+                    egui::Align2::LEFT_TOP,
+                    &caption,
+                    egui::FontId::proportional(12.),
+                    color,
+                );
+            }
+        }
         if self.lifecycle.is_some() || self.lifecycle_frame {
             return;
         }
@@ -3597,6 +3617,22 @@ impl PeerBrush {
             .and_then(|mut e| e.capture_panel.take());
         if let Some(panel) = panel {
             self.show_brush = panel == "brush";
+            if panel == "solo_color" || panel == "solo_mask" {
+                self.mask = panel == "solo_mask";
+                self.isolate = !self.mask
+                    || self
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .doc
+                        .layers
+                        .iter()
+                        .any(|l| l.id == self.selected && l.mask.is_some());
+                if !self.isolate {
+                    self.message = "Selected layer has no mask for solo viewing".into();
+                }
+                self.last_preview = None;
+            }
             if panel == "selection" {
                 self.tool = Tool::MagicWand;
                 self.selection_kind = "wand".into();
@@ -9522,6 +9558,126 @@ mod tests {
                 crate::selection::current(&e.doc).unwrap().mask.rgba(),
                 current.mask.rgba()
             );
+        }
+    }
+    #[test]
+    fn solo_view_names_its_channel_dims_other_rows_and_renders_actual_pixels_without_edits() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            let before = {
+                let mut e = app.shared.lock().unwrap();
+                e.doc = Document::new_depth(32, 24, depth).unwrap();
+                e.doc.layers[0].name = "Solo target".into();
+                for y in 3..18 {
+                    for x in 4..22 {
+                        e.doc.layers[0]
+                            .pixels
+                            .set16(x, y, [12347, 33559, 51237, 65535]);
+                    }
+                }
+                let mut other = crate::engine::Layer::new("Other layer", "fill", 32, 24);
+                other.color = [233, 84, 32, 255];
+                e.doc.layers.push(other);
+                let target = e.doc.layers[0].id.clone();
+                e.edit(
+                    "human",
+                    &[json!({"op":"mask.add","layer":target,"value":128})],
+                    None,
+                    None,
+                    "Fixture mask",
+                )
+                .unwrap();
+                e.undo.clear();
+                e.doc.clone()
+            };
+            app.select_content(&before.layers[0].id);
+            let saved = crate::psd::encode(&before).unwrap();
+            let draw = |app: &mut PeerBrush| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            };
+            let label_pos = |out: &egui::FullOutput, name: &str| {
+                out.shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.job.text == name => {
+                            Some(t.pos + t.galley.size() * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            for mask in [false, true] {
+                if mask {
+                    let p = app.mask_tab_rect.unwrap().center();
+                    click(&mut app, &ctx, p);
+                }
+                let out = draw(&mut app);
+                let toggle = label_pos(&out, "Solo");
+                click(&mut app, &ctx, toggle);
+                assert!(app.isolate);
+                assert_eq!(app.mask, mask);
+                let out = draw(&mut app);
+                let caption = format!("Solo {} · Solo target", if mask { "Mask" } else { "Color" });
+                assert_eq!(app.solo_caption(&before), Some(caption.clone()));
+                assert!(out.shapes.iter().any(
+                    |s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text==caption)
+                ));
+                let opacity = |name: &str| {
+                    out.shapes
+                        .iter()
+                        .find_map(|s| match &s.shape {
+                            egui::Shape::Text(t) if t.galley.job.text == name => Some(
+                                t.galley.rows[0].visuals.mesh.vertices[0].color.a() as f32 / 255.,
+                            ),
+                            _ => None,
+                        })
+                        .unwrap()
+                };
+                assert_eq!(opacity("Solo target"), 1.);
+                assert!((opacity("Other layer") - 0.55).abs() < 0.005);
+                assert!(app.eye_rects.contains_key(&before.layers[1].id));
+                let expected = before
+                    .preview(None, 1536, Some(&before.layers[0].id), mask)
+                    .unwrap()
+                    .2;
+                // Observe the actual canvas accepted from the worker, including its
+                // target checks, rather than draining replies behind the UI's back.
+                app.last_preview = None;
+                app.canvas_pixels = None;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let _ = draw(&mut app);
+                    if !app.pending
+                        && app
+                            .canvas_pixels
+                            .as_ref()
+                            .is_some_and(|(_, _, p)| p == &expected)
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Solo canvas did not match shared-engine pixels"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let exit = label_pos(&out, "Exit solo");
+                click(&mut app, &ctx, exit);
+                assert!(!app.isolate);
+                assert!(app.solo_caption(&before).is_none());
+                let out = draw(&mut app);
+                assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text=="Other layer" && t.galley.rows[0].visuals.mesh.vertices[0].color.a()==255)));
+                let e = app.shared.lock().unwrap();
+                assert!(e.undo.is_empty());
+                assert_eq!(crate::psd::encode(&e.doc).unwrap(), saved);
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            }
         }
     }
     #[test]

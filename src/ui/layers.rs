@@ -96,6 +96,25 @@ fn rows(
     }
 }
 impl PeerBrush {
+    pub(super) fn solo_caption(&self, doc: &Document) -> Option<String> {
+        self.isolate
+            .then(|| doc.layers.iter().find(|l| l.id == self.selected))
+            .flatten()
+            .map(|l| {
+                format!(
+                    "Solo {} · {}",
+                    if self.mask { "Mask" } else { "Color" },
+                    l.name
+                )
+            })
+    }
+    fn solo_row_opacity(&self, id: &str) -> f32 {
+        if self.isolate && id != self.selected {
+            0.55
+        } else {
+            1.
+        }
+    }
     pub(super) fn begin_rename(&mut self, _doc: &Document, id: &str) {
         if self.rename_edit.is_some() {
             self.finish_rename();
@@ -552,6 +571,8 @@ impl PeerBrush {
                 let offset=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,&l.id,"position")),target,duration);
                 let indent=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,&l.id,"indent")),depth as f32*TREE_INDENT,duration);
                 let arrival=self.animation.arrival(&l.id,time);
+                let solo_opacity = self.solo_row_opacity(&l.id);
+                let row_opacity = arrival * solo_opacity;
                 let rect=Rect::from_min_size(base+Vec2::new((1.0-arrival)*14.0,offset),Vec2::new(width,42.0));
                 self.layer_rects.insert(l.id.clone(),rect);
                 let held=self.layer_drag.as_ref().is_some_and(|d|d.ids.contains(&l.id));
@@ -571,20 +592,20 @@ impl PeerBrush {
                 } else {
                     let selected=self.selection_layers.contains(&l.id);
                     let hover=ui.ctx().animate_bool_with_time(response.id.with("hover"),response.hovered(),0.08);
-                    if selected {ui.painter().rect_filled(rect,5,Color32::from_rgb(74,48,71));
-                        ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,5.0),Vec2::new(2.0,32.0)),1,ACCENT);}
-                    else if hover>0.0 {ui.painter().rect_filled(rect,5,Color32::WHITE.gamma_multiply(0.035*hover));}
+                    if selected {ui.painter().rect_filled(rect,5,Color32::from_rgb(74,48,71).gamma_multiply(solo_opacity));
+                        ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,5.0),Vec2::new(2.0,32.0)),1,ACCENT.gamma_multiply(solo_opacity));}
+                    else if hover>0.0 {ui.painter().rect_filled(rect,5,Color32::WHITE.gamma_multiply(0.035*hover*solo_opacity));}
                     if ai {
                         let pulse=0.065+0.02*(time as f32*4.0).sin();
-                        ui.painter().rect_filled(rect,5,AI_BLUE.gamma_multiply(pulse));
-                        ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,4.0),Vec2::new(2.0,34.0)),1,AI_BLUE);
+                        ui.painter().rect_filled(rect,5,AI_BLUE.gamma_multiply(pulse*solo_opacity));
+                        ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,4.0),Vec2::new(2.0,34.0)),1,AI_BLUE.gamma_multiply(solo_opacity));
                     }
                     if drop_folder.as_deref()==Some(&l.id){ui.painter().rect_stroke(rect,4,Stroke::new(1.0_f32,ACCENT),egui::StrokeKind::Inside);}
                     let disclosure=ui.scope_builder(egui::UiBuilder::new().id_salt(&l.id).max_rect(rect.shrink2(Vec2::new(4.0,4.0))),|ui| {
-                        ui.set_opacity(arrival);
+                        ui.set_opacity(row_opacity);
                         self.layer_contents(ui,doc,l,indent,thumb.as_ref(),mask_thumb.as_ref())
                     }).inner;
-                    anchors.insert(l.id.clone(),TreeAnchor {disclosure,ai,opacity:arrival});
+                    anchors.insert(l.id.clone(),TreeAnchor {disclosure,ai,opacity:row_opacity});
                 }
                 // Child controls own their primary interactions. Test the clipped row
                 // directly for secondary clicks, including over those controls.
