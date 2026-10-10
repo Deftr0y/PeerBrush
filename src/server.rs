@@ -8,7 +8,10 @@ use std::{
     fs,
     io::{BufRead, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
 };
 
@@ -18,6 +21,18 @@ pub struct Connection {
     pub token: String,
     pub state_dir: PathBuf,
     pub instance_lock: Option<fs::File>,
+    pub(crate) availability: Arc<AtomicBool>,
+}
+impl Connection {
+    pub fn is_available(&self) -> bool {
+        self.availability.load(Ordering::Acquire)
+    }
+}
+struct ServerAvailability(Arc<AtomicBool>);
+impl Drop for ServerAvailability {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("{}.tmp", engine::id()));
@@ -2050,7 +2065,10 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
             checkpoint_projects(&workspace, &recovery_dir, &mut previous);
         }
     });
+    let availability = Arc::new(AtomicBool::new(true));
+    let listening = availability.clone();
     thread::spawn(move || {
+        let _availability = ServerAvailability(listening);
         let mut sessions = std::collections::BTreeMap::new();
         for request in http.incoming_requests() {
             handle_http(request, &shared, &auth, port, &mut sessions);
@@ -2061,6 +2079,7 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         token,
         state_dir,
         instance_lock: Some(instance_lock),
+        availability,
     })
 }
 pub type RecoveryVersions = crate::recovery::Versions;

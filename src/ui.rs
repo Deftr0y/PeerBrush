@@ -3346,7 +3346,10 @@ impl PeerBrush {
     fn draw_header(&mut self, ctx: &egui::Context) {
         let (connected, activity) = {
             if let Ok(e) = self.workspace_root.try_lock() {
-                self.connected = !e.mcp_clients.is_empty();
+                self.connected = e
+                    .mcp_clients
+                    .values()
+                    .any(|expiry| *expiry > crate::engine::now());
             }
             let activity = self
                 .shared
@@ -3356,6 +3359,8 @@ impl PeerBrush {
                 .unwrap_or_else(|| self.activity_text.clone());
             (self.connected, activity)
         };
+        let available = self.connection.is_available();
+        let connected = connected && available;
         let activity = activity.split_whitespace().collect::<Vec<_>>().join(" ");
         let activity = if activity.is_empty() {
             if connected {
@@ -3409,22 +3414,30 @@ impl PeerBrush {
                             egui::Spinner::new().size(10.0).color(ACCENT).paint_at(ui, spinner);
                         }
                         button.on_hover_text(if self.connect_feedback.is_empty() {
-                            "Advertise PeerBrush and set up installed AI clients. An agent turns the MCP indicator green when it connects."
+                            "Advertise PeerBrush and set up installed AI clients. Green MCP available means the server is ready; MCP connected confirms an active AI client."
                         } else { &self.connect_feedback });
-                        let color = if connected {
+                        let color = if available {
                             Color32::from_rgb(166, 215, 157)
                         } else {
                             Color32::from_rgb(255, 154, 144)
                         };
                         ui.label(
-                            RichText::new(if connected {
+                            RichText::new(if !available {
+                                "MCP unavailable"
+                            } else if connected {
                                 "MCP connected"
                             } else {
-                                "MCP · waiting for AI"
+                                "MCP available"
                             })
                             .size(11.0)
                             .color(color),
-                        ).on_hover_text("The server is listening. Connect AI sets up discovery and installed clients; this indicator turns green after an actual agent handshake.");
+                        ).on_hover_text(if !available {
+                            "The local MCP server is unavailable. Restart PeerBrush to restore the connection."
+                        } else if connected {
+                            "The local MCP server is available and an AI client is connected."
+                        } else {
+                            "The local MCP server is available; no AI client is connected yet. Connect AI sets up discovery and installed clients."
+                        });
                         let (_, r) = ui.allocate_space(Vec2::new(6.0, 6.0));
                         ui.painter().circle_filled(r.center(), 2.5, color);
                     });
@@ -5009,6 +5022,7 @@ mod tests {
                 token: String::new(),
                 state_dir: std::env::temp_dir(),
                 instance_lock: None,
+                availability: Default::default(),
             },
         );
         (app, ctx)
@@ -8166,6 +8180,80 @@ mod tests {
         assert!(!app.show_connection);
         assert_eq!(app.message, "Ready in Codex. Reload its MCP tools.");
         assert!(app.shared.lock().unwrap().mcp_clients.is_empty());
+    }
+    #[test]
+    fn mcp_header_separates_server_availability_from_live_or_expired_clients_without_document_edits(
+    ) {
+        let (mut app, ctx) = small_fixture();
+        let before = app.shared.lock().unwrap().doc.clone();
+        let saved = crate::psd::encode(&before).unwrap();
+        for (available, expiry, label, color) in [
+            (
+                false,
+                None,
+                "MCP unavailable",
+                Color32::from_rgb(255, 154, 144),
+            ),
+            (
+                true,
+                None,
+                "MCP available",
+                Color32::from_rgb(166, 215, 157),
+            ),
+            (
+                true,
+                Some(crate::engine::now() + 90),
+                "MCP connected",
+                Color32::from_rgb(166, 215, 157),
+            ),
+            (
+                false,
+                Some(crate::engine::now() + 90),
+                "MCP unavailable",
+                Color32::from_rgb(255, 154, 144),
+            ),
+            (
+                true,
+                Some(crate::engine::now() - 1),
+                "MCP available",
+                Color32::from_rgb(166, 215, 157),
+            ),
+        ] {
+            app.connection
+                .availability
+                .store(available, std::sync::atomic::Ordering::Release);
+            {
+                let mut e = app.workspace_root.lock().unwrap();
+                e.mcp_clients.clear();
+                if let Some(expiry) = expiry {
+                    e.mcp_clients.insert("Synthetic UI client".into(), expiry);
+                }
+            }
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            let text = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == label => Some(t),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(text.galley.rows[0].visuals.mesh.vertices[0].color, color);
+            assert!(out.shapes.iter().any(
+                |s| matches!(&s.shape,egui::Shape::Circle(c) if c.radius==2.5 && c.fill==color)
+            ));
+            assert!(!out.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text.starts_with("MCP ") && t.galley.job.text!=label && matches!(t.galley.job.text.as_str(),"MCP connected"|"MCP available"|"MCP unavailable"))));
+            let e = app.shared.lock().unwrap();
+            assert!(e.undo.is_empty());
+            assert_eq!(crate::psd::encode(&e.doc).unwrap(), saved);
+            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        }
     }
     #[test]
     fn secondary_connection_settings_opens_manual_configuration_without_starting_setup() {

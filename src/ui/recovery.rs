@@ -197,6 +197,7 @@ mod tests {
                 token: String::new(),
                 state_dir: dir,
                 instance_lock: None,
+                availability: Default::default(),
             },
         );
         assert!(app.recovery.open);

@@ -79,7 +79,9 @@ Version 0.2 passed exact-source CI and package verification on Windows, macOS an
 
 ## Connect an AI agent
 
-Click **Connect AI** to register PeerBrush with detected Codex, Claude Desktop, Cursor and Gemini CLI installations. Existing client settings are preserved and backed up. A local discovery manifest gives other agents the executable, workspace and authenticated HTTP endpoint. Restart or reload a configured client to load the tools; the top bar turns green when it actually connects.
+Click **Connect AI** to register PeerBrush with detected Codex, Claude Desktop, Cursor and Gemini CLI installations. Existing client settings are preserved and backed up. A local discovery manifest gives other agents the executable, workspace and authenticated HTTP endpoint. Restart or reload a configured client to load the tools.
+
+Unreleased: green **MCP available** means the local server is ready for clients; green **MCP connected** confirms a live client. Red **MCP unavailable** means the server is unavailable. Client setup and server availability are separate states.
 
 The adapter can initialize while the editor is closed, then reconnect when you open it. Advanced settings and manual setup are available beside Connect AI. See [connection details](docs/mcp.md).
 

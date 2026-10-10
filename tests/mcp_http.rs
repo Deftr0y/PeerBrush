@@ -378,6 +378,11 @@ impl Canvas {
         let dir = std::env::temp_dir().join(format!("peerbrush-http-{}", uuid::Uuid::new_v4()));
         let shared = Arc::new(Mutex::new(Engine::new()));
         let connection = server::start(shared.clone(), dir.clone()).unwrap();
+        assert!(
+            connection.is_available(),
+            "A bound MCP server is available before any client handshake"
+        );
+        assert!(shared.lock().unwrap().mcp_clients.is_empty());
         Self {
             shared,
             connection,

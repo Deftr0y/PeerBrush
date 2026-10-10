@@ -641,6 +641,7 @@ mod tests {
             token: String::new(),
             state_dir: std::path::PathBuf::new(),
             instance_lock: None,
+            availability: Default::default(),
         };
         let mut app = PeerBrush::init(&ctx, shared.clone(), connection);
         let output = ctx.run(

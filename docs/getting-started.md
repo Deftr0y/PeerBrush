@@ -73,7 +73,9 @@ Press an eye icon and drag vertically across other eyes to show or hide the swep
 
 Unreleased: **Solo** shows the selected Color or Mask through the shared renderer. The canvas and layer stack name the solo channel and layer, surrounding rows dim while their controls remain usable, and **Exit solo** restores the full document. Selecting another layer or Color/Mask channel exits solo automatically; selecting the same target keeps it. Alt-click a mask thumbnail to toggle that mask's solo view explicitly. Removing the solo layer or mask also restores the full view. Solo is a view setting and creates no document edit or undo step.
 
-MCP starts automatically with the editor. Red **MCP · waiting for AI** means no agent is attached yet. Click **Connect AI** to register with detected Codex, Claude Desktop, Cursor and Gemini CLI clients and publish the local discovery manifest. The neighboring settings control opens advanced/manual configuration. Restart or reload a configured client to load PeerBrush; green requires a real client connection. The adapter can register while the editor is closed and reconnect when you launch PeerBrush. Keep the app open during editing calls. See [MCP and CLI](mcp.md).
+MCP starts automatically with the editor. Click **Connect AI** to register with detected Codex, Claude Desktop, Cursor and Gemini CLI clients and publish the local discovery manifest. The neighboring settings control opens advanced/manual configuration. Restart or reload a configured client to load PeerBrush. The adapter can register while the editor is closed and reconnect when you launch PeerBrush. Keep the app open during editing calls. See [MCP and CLI](mcp.md).
+
+Unreleased: green **MCP available** means the server is ready before an agent connects; green **MCP connected** means a live client is attached. Red **MCP unavailable** means the server is unavailable. Hover the status for connection details. Released builds used red while waiting for an agent.
 
 
 ## Painting, adjustments and liquify

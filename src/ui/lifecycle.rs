@@ -32,6 +32,7 @@ mod tests {
                 token: String::new(),
                 state_dir,
                 instance_lock: None,
+                availability: Default::default(),
             },
         );
         (app, ctx, root, second)

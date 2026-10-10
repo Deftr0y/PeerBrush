@@ -402,6 +402,7 @@ mod tests {
                 token: String::new(),
                 state_dir: std::env::temp_dir(),
                 instance_lock: None,
+                availability: Default::default(),
             },
         );
         (app, ctx, projects)
