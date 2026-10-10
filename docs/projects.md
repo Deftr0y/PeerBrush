@@ -47,3 +47,5 @@ Transfers target the destination with the ordinary three guards and supply match
 ```
 
 Use `action:"move"` for an atomic source cut and destination paste. Undo each affected project explicitly with `peerbrush_history`, using its current guards. Human or agent edits elsewhere remain subject to the existing history/conflict rules.
+
+Unreleased PB-120: `projects.open` accepts the [supported image formats](image-import.md), including native 8/16-bit PNG and TIFF. Image sources open as independent unsaved projects with their selected content’s actual dimensions. Inspect `image_info` first and specify zero-based `frame`, `page` or `variant` when required. Existing projects retain their history and view. Save image projects to a new PSD/PSB working file; exports cannot overwrite an open original image.

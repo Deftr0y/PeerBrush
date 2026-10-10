@@ -2,7 +2,7 @@
 
 This describes unreleased development behavior.
 
-PeerBrush refuses a second open of an owned PSD or PSB. The native warning identifies the existing project; an attempt in the same workspace brings that tab forward without replacing its document. Its unsaved pixels, selection, saved view and history remain intact. Open, recent files, Photoshop document drops and MCP/CLI project opens use the same loader checks. The file is claimed before hashing and decoding, so pending opens also count.
+PeerBrush refuses a second open of an owned PSD or PSB. Unreleased PB-120 extends these claims to supported image sources, including pending frame/page/icon choices. Image projects retain the original source claim until Save As or close; exports cannot replace any open source. The native warning identifies the existing project; an attempt in the same workspace brings that tab forward without replacing its document. Its unsaved pixels, selection, saved view and history remain intact. Open, recent files, Photoshop document drops and MCP/CLI project opens use the same loader checks. The file is claimed before hashing and decoding, so pending opens also count.
 
 Ownership compares canonical paths and physical file identities, including hard links and Windows case aliases. Different files with the same display name remain independent. Locks live in per-user temporary storage rather than alongside the document, so opening a source does not require writing to its directory. Separate instances share these OS locks even when their connection state directories differ. Lock records contain only a runtime project identifier; a stale record cannot keep a file locked after the process exits. Failed or cancelled loads release their claims.
 

@@ -122,12 +122,38 @@ pub fn open_progress(
     path: &Path,
     control: &crate::loading::Control,
 ) -> Result<(), String> {
+    open_request(shared, path, control, &json!({}), None)
+}
+pub fn open_options(
+    shared: &Shared,
+    path: &Path,
+    control: &crate::loading::Control,
+    options: &Value,
+) -> Result<(), String> {
+    open_request(shared, path, control, options, None)
+}
+pub(crate) fn open_prepared_image(
+    shared: &Shared,
+    prepared: crate::image_open::Prepared,
+    control: &crate::loading::Control,
+    options: &Value,
+) -> Result<(), String> {
+    let path = prepared.path.clone();
+    open_request(shared, &path, control, options, Some(prepared))
+}
+fn open_request(
+    shared: &Shared,
+    path: &Path,
+    control: &crate::loading::Control,
+    options: &Value,
+    prepared: Option<crate::image_open::Prepared>,
+) -> Result<(), String> {
     control.begin()?;
     let _loading = LoadGuard {
         shared: shared.clone(),
         control: control.clone(),
     };
-    let result = open_progress_inner(shared, path, control);
+    let result = open_progress_inner(shared, path, control, options, prepared);
     {
         let mut e = shared.lock().unwrap();
         if e.loading.as_ref().is_none_or(|c| c.same(control)) {
@@ -140,8 +166,10 @@ pub fn open_progress(
                         .is_some_and(|e| e.eq_ignore_ascii_case("psb"))
                     {
                         "PSB opened".into()
-                    } else {
+                    } else if crate::image_open::photoshop(path) {
                         "PSD opened".into()
+                    } else {
+                        "Image opened — save as PSD or PSB".into()
                     }
                 })
                 .unwrap_or_else(|e| e.clone());
@@ -165,11 +193,11 @@ fn open_progress_inner(
     shared: &Shared,
     path: &Path,
     control: &crate::loading::Control,
+    options: &Value,
+    prepared: Option<crate::image_open::Prepared>,
 ) -> Result<(), String> {
     if path.is_dir() {
-        return Err(
-            "Choose a .psd or .psb file inside this folder, or drop one Photoshop document onto the canvas".into(),
-        );
+        return Err("Choose a supported image, PSD or PSB file inside this folder".into());
     }
     let (before, project) = {
         let mut e = shared.lock().unwrap();
@@ -186,6 +214,33 @@ fn open_progress_inner(
         e.loading = Some(control.clone());
         (before, e.project_id.clone())
     };
+    if !crate::image_open::photoshop(path) {
+        let prepared = match prepared {
+            Some(p) => p,
+            None => crate::image_open::Prepared::read(path, &project, control)?,
+        };
+        let doc = prepared.document(options, control)?;
+        let mut e = shared.lock().unwrap();
+        prepared.validate(control)?;
+        if (e.doc.id.clone(), e.doc.revision) != before {
+            return Err("Canvas changed while opening; current work preserved".into());
+        }
+        e.replace(doc, None)?;
+        e.release_file_ownership();
+        prepared.ownership.published(prepared.version.identity);
+        e.file_ownership = Some(prepared.ownership);
+        e.file_version = None;
+        e.saved_revision = u64::MAX;
+        return Ok(());
+    }
+    if ["frame", "page", "variant"]
+        .iter()
+        .any(|key| options.get(key).is_some())
+    {
+        return Err(
+            "Frame, page and variant choices apply to images, not Photoshop documents".into(),
+        );
+    }
     let ownership = crate::file_ownership::Ownership::open(path, &project)?;
     let version = crate::file_safety::version_with_check(path, || control.check())?;
     if version.bytes > 256 * 1024 * 1024 {
@@ -498,6 +553,7 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
         crate::workspace::validate_target(&e, request)?;
         if e.path
             .as_deref()
+            .or_else(|| e.file_ownership.as_ref().map(|owner| owner.path.as_path()))
             .map(|source| crate::file_safety::same_destination(source, path))
             .transpose()?
             .unwrap_or(false)
@@ -512,6 +568,9 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
         }
         e.doc.clone()
     };
+    // Protect sources owned by another project or application instance too.
+    let project = shared.lock().unwrap().project_id.clone();
+    let _ownership = crate::file_ownership::Ownership::save(path, &project)?;
     let bytes = doc.export_png()?;
     let backup = lease.preserve()?;
     let e = shared.lock().unwrap();
@@ -534,7 +593,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_proposal","description":"Create and render frozen proposed edits for explicit human review. create needs observed document_id/expected_revision and ordinary engine commands; the shared project and history stay unchanged. preview returns actual PNG pixels with document coordinates. Only actor human can accept; agents can list, preview or reject their proposals. A changed project or ended/expired/taken-over task invalidates its draft. Never silently reacquire a task. Direct edits remain available when already authorized.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","preview","accept","reject"]},"actor":{"type":"string"},"proposal":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"task":{"type":"string"},"label":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"feedback":{"type":"string","enum":["batch","request"]}},"required":["action"],"additionalProperties":false}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status","recovery"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
-        {"name":"peerbrush_document","description":"New/open/save PSD v1 or PSB v2, or export PNG. Destination extension selects the native 8/16-bit RGB save format under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","export","compatible_copy"]},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"expected_revision":{"type":"integer"}},"required":["action"]}},
+        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export PNG. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Destination extension selects the native 8/16-bit RGB save format under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","export","compatible_copy"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply a supported absolute local image path or base64 PNG. SVG/SVGZ placement creates rendered pixels; image.import retains editable vector markup. Use image_info and explicit frame/page/variant for animations, multipage TIFF and icons. Supply an exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
@@ -559,7 +618,7 @@ pub fn tools() -> Value {
         }
     }
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_image_info","description":"Inspect a supported local image without editing. Reports channel depth and explicit zero-based frame/page/variant choices for image.import and place_image. Float, CMYK and PNG16 animation require explicit supported conversion.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}));
-    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_projects","description":"List stable project IDs, create/open independent projects, select/reorder tabs or request native Save/Don't Save/Cancel close review (human only), close with exact source guards, or copy/move editable layer trees between projects. Background AI writes must supply project_id, document_id and expected_revision; never depend on the visible tab. Transfers need both source identities/revisions and preserve native precision, masks and effects. preview_transfer returns actual destination pixels without history. move creates one undo step in each document; failures change neither.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","new","open","select","reorder","request_close","close","copy","move","preview_transfer"]},"actor":{"type":"string"},"project_id":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"path":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"expected_order":{"type":"array","items":{"type":"string"}},"order":{"type":"array","items":{"type":"string"}},"activate":{"type":"boolean"},"discard":{"type":"boolean"},"source_project_id":{"type":"string"},"source_document_id":{"type":"string"},"source_revision":{"type":"integer"},"source_task":{"type":"string"},"task":{"type":"string"},"layers":{"type":"array","items":{"type":"string"}},"target":{"type":"string"},"move":{"type":"boolean"},"max_edge":{"type":"integer"}},"required":["action"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_projects","description":"List stable project IDs, create/open independent projects, select/reorder tabs or request native Save/Don't Save/Cancel close review (human only), close with exact source guards, or copy/move editable layer trees between projects. Background AI writes must supply project_id, document_id and expected_revision; never depend on the visible tab. Transfers need both source identities/revisions and preserve native precision, masks and effects. preview_transfer returns actual destination pixels without history. move creates one undo step in each document; failures change neither.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","new","open","select","reorder","request_close","close","copy","move","preview_transfer"]},"actor":{"type":"string"},"project_id":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"expected_order":{"type":"array","items":{"type":"string"}},"order":{"type":"array","items":{"type":"string"}},"activate":{"type":"boolean"},"discard":{"type":"boolean"},"source_project_id":{"type":"string"},"source_document_id":{"type":"string"},"source_revision":{"type":"integer"},"source_task":{"type":"string"},"task":{"type":"string"},"layers":{"type":"array","items":{"type":"string"}},"target":{"type":"string"},"move":{"type":"boolean"},"max_edge":{"type":"integer"}},"required":["action"],"additionalProperties":false}}));
     tools
 }
 pub fn capabilities() -> Value {
@@ -707,7 +766,9 @@ fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
             let engine = if p["action"] == "open" {
                 let shared = Arc::new(Mutex::new(Engine::new()));
                 let path = Path::new(text("path")?);
-                if let Err(error) = open(&shared, path) {
+                if let Err(error) =
+                    open_options(&shared, path, &crate::loading::Control::default(), p)
+                {
                     w::duplicate_warning(&w::attach(root), path, &error, activate);
                     return Err(error);
                 }
@@ -1333,7 +1394,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     let control = crate::loading::Control::default();
                     let (document, revision) = opening_source.unwrap();
                     control.bind(document, revision);
-                    open_progress(shared, path.as_deref().ok_or("Missing path")?, &control)?;
+                    open_options(shared, path.as_deref().ok_or("Missing path")?, &control, p)?;
                 }
                 "open_async" => {
                     let path = path.ok_or("Missing path")?;
@@ -1351,15 +1412,16 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                         }
                         control.bind(document, revision);
                         e.loading = Some(control.clone());
-                        e.status = "Opening PSD…".into();
+                        e.status = "Opening document…".into();
                     }
                     let worker = shared.clone();
                     let worker_control = control.clone();
+                    let options = p.clone();
                     if let Err(error) =
                         thread::Builder::new()
                             .name("peerbrush-open".into())
                             .spawn(move || {
-                                let _ = open_progress(&worker, &path, &worker_control);
+                                let _ = open_options(&worker, &path, &worker_control, &options);
                             })
                     {
                         drop(LoadGuard {

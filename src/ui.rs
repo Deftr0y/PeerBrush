@@ -9,6 +9,7 @@ mod file_ownership;
 mod filters;
 mod geometry;
 mod history;
+mod image_open;
 mod layers;
 mod lifecycle;
 mod liquify;
@@ -393,6 +394,9 @@ pub struct PeerBrush {
     import_tx: mpsc::Sender<ImportReply>,
     import_rx: mpsc::Receiver<ImportReply>,
     pending_import: Option<PendingImport>,
+    image_open_tx: mpsc::Sender<image_open::Pending>,
+    image_open_rx: mpsc::Receiver<image_open::Pending>,
+    pending_image_open: Option<image_open::Pending>,
     job_rx: mpsc::Receiver<JobReply>,
     job_tx: mpsc::Sender<JobReply>,
     busy: bool,
@@ -564,6 +568,7 @@ impl PeerBrush {
         let (preview_tx, preview_rx) = mpsc::channel();
         let (job_tx, job_rx) = mpsc::channel();
         let (import_tx, import_rx) = mpsc::channel();
+        let (image_open_tx, image_open_rx) = mpsc::channel();
         let (connect_tx, connect_rx) = mpsc::channel();
         let (merge_tx, merge_rx) = mpsc::channel();
         let (transfer_tx, transfer_rx) = mpsc::channel();
@@ -690,6 +695,9 @@ impl PeerBrush {
             last_status: "Ready".into(),
             import_tx,
             import_rx,
+            image_open_tx,
+            image_open_rx,
+            pending_image_open: None,
             pending_import: None,
             job_rx,
             job_tx,
@@ -1346,7 +1354,7 @@ impl PeerBrush {
         self.open_named_job(path, recover, None);
     }
     fn open_named_job(&mut self, path: Option<PathBuf>, recover: bool, name: Option<String>) {
-        if self.busy {
+        if self.busy || self.pending_image_open.is_some() {
             return;
         }
         let s = Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
@@ -1359,15 +1367,48 @@ impl PeerBrush {
         }
         self.load_control = Some(control.clone());
         self.load_preview = None;
+        let image_open_tx = self.image_open_tx.clone();
         self.job(move || {
             let path = path.or_else(|| {
                 rfd::FileDialog::new()
+                    .add_filter(
+                        "Images and Photoshop documents",
+                        &std::iter::once("psd")
+                            .chain(std::iter::once("psb"))
+                            .chain(crate::image_import::EXTENSIONS.iter().copied())
+                            .collect::<Vec<_>>(),
+                    )
                     .add_filter("Photoshop documents", &["psd", "psb"])
+                    .add_filter("Images", crate::image_import::EXTENSIONS)
                     .pick_file()
             });
             let Some(path) = path else {
                 return Ok("Open canceled · current projects preserved".into());
             };
+            if !recover && !crate::image_open::photoshop(&path) {
+                let project = s.lock().unwrap().project_id.clone();
+                let prepared = match crate::image_open::Prepared::read(&path, &project, &control) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        crate::workspace::duplicate_warning(&workspace, &path, &error, true);
+                        return Err(error);
+                    }
+                };
+                let pending = image_open::Pending {
+                    shared: s,
+                    prepared,
+                    control,
+                    initiating,
+                    index: 0,
+                };
+                if pending.prepared.encoded.info.choice.is_some() {
+                    image_open_tx
+                        .send(pending)
+                        .map_err(|_| "Open workspace closed")?;
+                    return Ok("Choose image content to open".into());
+                }
+                return image_open::finish(pending, &workspace);
+            }
             if let Err(error) = server::open_progress(&s, &path, &control) {
                 crate::workspace::duplicate_warning(&workspace, &path, &error, true);
                 return Err(error);
@@ -3930,6 +3971,7 @@ impl PeerBrush {
         self.doc_snapshot = doc.clone();
         if self.lifecycle.is_none() && !self.lifecycle_frame {
             self.import_dialog(ctx);
+            self.image_open_dialog(ctx);
         }
         if self.rename_edit.as_ref().is_some_and(|edit| {
             edit.document != doc.id || !doc.layers.iter().any(|l| l.id == edit.layer)
