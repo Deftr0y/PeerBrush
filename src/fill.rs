@@ -282,3 +282,87 @@ pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
     );
     Ok(())
 }
+
+/// Erase only current coverage, without moving sources, changing masks/effects,
+/// or expanding raster bounds. The Engine owns rollback, reservations and undo.
+pub fn clear_selection(doc: &mut Document, command: &Value) -> Result<(), String> {
+    let coverage = crate::selection::current(doc).ok_or("Select pixels before clearing")?;
+    if coverage.bounds[0] >= coverage.bounds[2] || coverage.bounds[1] >= coverage.bounds[3] {
+        return Ok(());
+    }
+    let target = command["layer"].as_str().ok_or("Choose a layer to clear")?;
+    let layer = doc
+        .layers
+        .iter()
+        .find(|l| l.id == target)
+        .ok_or("Layer no longer exists")?;
+    let mask = command["mask"] == true;
+    let ids = if layer.kind == "group" && !mask {
+        crate::transform::tree_ids(doc, &[target.into()])
+    } else {
+        vec![target.into()]
+    };
+    let mut count = 0;
+    for layer in &mut doc.layers {
+        if !ids.contains(&layer.id) {
+            continue;
+        }
+        if layer.locked {
+            return Err("A selected layer or folder child is locked".into());
+        }
+        if layer.kind == "group" && !mask {
+            continue;
+        }
+        if !mask && (!matches!(layer.kind.as_str(), "paint" | "fill") || layer.source.is_some()) {
+            return Err("Rasterize editable text/vector or adjustment layers before clearing selected color pixels".into());
+        }
+        if !mask && layer.kind == "fill" {
+            let area = [0, 0, layer.pixels.width as i32, layer.pixels.height as i32];
+            fill_tiles(&mut layer.pixels, area, layer.color, [0, 0], None);
+            layer.kind = "paint".into();
+        }
+        let (ox, oy) = (layer.x, layer.y);
+        let raster = crate::engine::edit_raster(layer, command)?;
+        let bounds = coverage.bounds;
+        for y in bounds[1].max(0).max(oy)
+            ..bounds[3]
+                .min(doc.height as i32)
+                .min(oy + raster.height as i32)
+        {
+            for x in bounds[0].max(0).max(ox)
+                ..bounds[2]
+                    .min(doc.width as i32)
+                    .min(ox + raster.width as i32)
+            {
+                let remaining = 1. - coverage.value(x, y) as f64;
+                if remaining >= 1. {
+                    continue;
+                }
+                let (x, y) = (x - ox, y - oy);
+                if raster.depth == 16 {
+                    let mut pixel = raster.get16(x, y);
+                    pixel[3] = (pixel[3] as f64 * remaining).round() as u16;
+                    if pixel[3] == 0 {
+                        pixel = [0; 4];
+                    }
+                    raster.set16(x, y, pixel);
+                } else {
+                    let mut pixel = raster.get(x, y);
+                    pixel[3] = (pixel[3] as f64 * remaining).round() as u8;
+                    if pixel[3] == 0 {
+                        pixel = [0; 4];
+                    }
+                    raster.set(x, y, pixel);
+                }
+            }
+        }
+        if mask {
+            layer.mask.as_mut().unwrap().cache_key = crate::engine::id();
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return Err("Folder has no raster pixels to clear".into());
+    }
+    Ok(())
+}

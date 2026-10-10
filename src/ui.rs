@@ -877,7 +877,13 @@ impl PeerBrush {
                 }
             })
         } else if cut {
-            None
+            doc.selection.map(|_| crate::clipboard::Request::Cut {
+                shared: self.shared.clone(),
+                doc: doc.clone(),
+                target: self.selected.clone(),
+                mask: self.mask,
+                step: self.mask_step.clone(),
+            })
         } else {
             Some(crate::clipboard::Request::Copy {
                 doc: doc.clone(),
@@ -3928,7 +3934,11 @@ impl PeerBrush {
                         .request(request)
                         .map(|_| {
                             if cut {
-                                "Cutting layers…".into()
+                                if doc.selection.is_some() {
+                                    "Cutting selected pixels…".into()
+                                } else {
+                                    "Cutting layers…".into()
+                                }
                             } else if self.layer_clipboard && doc.selection.is_none() && !merged {
                                 "Copying layers…".into()
                             } else {
@@ -3986,7 +3996,13 @@ impl PeerBrush {
                     && self.selection_path.is_empty()
                     && !key_modifiers(i,egui::Key::Delete).any()
                 {
-                    self.layer_cmd("layer.delete",json!({}),"Delete selected layers");
+                    if doc.selection.is_some() {
+                        let roots = crate::tree::roots(&doc, &self.selection_layers);
+                        let commands = roots.iter().map(|id| json!({"op":"paint.clear_selection","layer":id,"mask":self.mask,"step":self.mask_step,"document_id":doc.id,"source_revision":doc.revision})).collect();
+                        self.edit(commands,"Clear selected pixels");
+                    } else {
+                        self.layer_cmd("layer.delete",json!({}),"Delete selected layers");
+                    }
                 }
                 if command_key(i,egui::Key::D) {
                     if key_modifiers(i,egui::Key::D).shift {
@@ -8602,6 +8618,64 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn delete_after_wand_and_layer_row_click_erases_only_selected_native_pixels() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            let before = {
+                let mut e = app.shared.lock().unwrap();
+                e.doc = Document::new_depth(8, 8, depth).unwrap();
+                for y in 0..8 {
+                    for x in 0..8 {
+                        e.doc.layers[0].pixels.set16(
+                            x,
+                            y,
+                            if x < 4 {
+                                [12347, 33559, 51237, 65535]
+                            } else {
+                                [51239, 12349, 33561, 65535]
+                            },
+                        );
+                    }
+                }
+                e.doc.clone()
+            };
+            app.select_content(&before.layers[0].id);
+            app.selection_tolerance = 0.;
+            app.selection_merged = false;
+            frame(&mut app, &ctx, vec![], Default::default());
+            modified_key(&mut app, &ctx, egui::Key::K, Default::default());
+            let canvas = app.view_rect.unwrap();
+            click(
+                &mut app,
+                &ctx,
+                canvas.min + Vec2::new(1.5, 2.5) * (canvas.width() / 8.),
+            );
+            let row = app.layer_rects[&app.selected];
+            click(&mut app, &ctx, row.right_center() - Vec2::new(30., 0.));
+            assert!(app.layer_clipboard);
+            let history = app.shared.lock().unwrap().undo.len();
+            modified_key(&mut app, &ctx, egui::Key::Delete, Default::default());
+            let mut e = app.shared.lock().unwrap();
+            assert_eq!(e.doc.selection, Some([0, 0, 4, 8]));
+            assert_eq!(e.doc.layers.len(), 1);
+            assert_eq!(e.undo.len(), history + 1);
+            for y in 0..8 {
+                for x in 0..8 {
+                    assert_eq!(
+                        e.doc.layers[0].pixels.get16(x, y),
+                        if x < 4 {
+                            [0; 4]
+                        } else {
+                            before.layers[0].pixels.get16(x, y)
+                        }
+                    );
+                }
+            }
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        }
+    }
     fn modified_key(
         app: &mut PeerBrush,
         ctx: &egui::Context,
@@ -8707,8 +8781,9 @@ mod tests {
             );
             assert_eq!(image.samples16.is_some(), depth == 16);
             assert!(
-                app.copy_request(&doc, true, false).is_none(),
-                "Unsupported selected cut must never delete the whole layer"
+                matches!(app.copy_request(&doc, true, false),
+                Some(crate::clipboard::Request::Cut { target, .. }) if target == app.selected),
+                "Selected cut must erase pixels rather than delete the layer"
             );
             let baseline = doc.export_png().unwrap();
             let mut engine = app.shared.lock().unwrap();

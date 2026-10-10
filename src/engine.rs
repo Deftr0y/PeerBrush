@@ -733,8 +733,9 @@ impl Engine {
     pub fn scopes(&self, c: &Value) -> Vec<Scope> {
         let mut scopes = self.command_scopes(c);
         if self.doc.selection.is_some()
-            && matches!(c["op"].as_str(), Some("move" | "transform"))
-            && c["selection_only"] != false
+            && (c["op"] == "paint.clear_selection"
+                || (matches!(c["op"].as_str(), Some("move" | "transform"))
+                    && c["selection_only"] != false))
         {
             scopes.push(Scope::layer("@selection"));
         }
@@ -848,18 +849,19 @@ impl Engine {
                 })
                 .collect();
         }
-        if op == "paint.fill" {
+        if matches!(op, "paint.fill" | "paint.clear_selection") {
             let layer = target
                 .as_deref()
                 .and_then(|id| self.doc.layers.iter().find(|l| l.id == id));
             if layer.is_some_and(|l| l.kind == "group") && c["mask"] != true {
                 return vec![Scope { target, rect: None }];
             }
-            let mut area = c
-                .get("rect")
-                .and_then(rect)
-                .or(self.doc.selection)
-                .unwrap_or([0, 0, self.doc.width as i32, self.doc.height as i32]);
+            let mut area = if op == "paint.clear_selection" {
+                self.doc.selection
+            } else {
+                c.get("rect").and_then(rect).or(self.doc.selection)
+            }
+            .unwrap_or([0, 0, self.doc.width as i32, self.doc.height as i32]);
             if let Some(selection) = self.doc.selection {
                 area = [
                     area[0].max(selection[0]),
@@ -1367,6 +1369,7 @@ impl Engine {
         let command = &commands[commands.len() - 1];
         let tool = match text(command, "op", "") {
             "paint" if command["erase"] == true => "eraser",
+            "paint.clear_selection" => "eraser",
             "paint" => "brush",
             "smudge" => "smudge",
             "clone" => "clone",
@@ -1687,6 +1690,7 @@ impl Engine {
                         | "heal"
                         | "fill"
                         | "paint.fill"
+                        | "paint.clear_selection"
                         | "shape"
                         | "gradient"
                         | "adjust"
@@ -2156,6 +2160,9 @@ impl Engine {
         }
         if op == "paint.fill" {
             return crate::fill::apply(&mut self.doc, c);
+        }
+        if op == "paint.clear_selection" {
+            return crate::fill::clear_selection(&mut self.doc, c);
         }
         let selection_coverage = self
             .doc

@@ -328,6 +328,13 @@ pub enum Request {
         doc: Document,
         ids: Vec<String>,
     },
+    Cut {
+        shared: Shared,
+        doc: Document,
+        target: String,
+        mask: bool,
+        step: Option<String>,
+    },
     CutLayers {
         shared: Shared,
         doc: Document,
@@ -544,6 +551,32 @@ impl Session {
                 Ok("Selection copied".into())
             }
             Request::CopyLayers { doc, ids } => self.copy_layers(clipboard, doc, ids, None),
+            Request::Cut {
+                shared,
+                doc,
+                target,
+                mask,
+                step,
+            } => {
+                let command = json!({"op":"paint.clear_selection","layer":target,"mask":mask,"step":step,"document_id":doc.id,"source_revision":doc.revision});
+                crate::engine::Engine::preview_edits(doc.clone(), &[command.clone()])?;
+                let image = Image::copy(&doc, &target, mask, false)?;
+                // Establish the clipboard copy before clearing any source pixels.
+                clipboard.write_image(&image)?;
+                self.image_sequence = clipboard.sequence();
+                self.image = Some(image);
+                self.layers = None;
+                let mut engine = shared.lock().unwrap();
+                crate::workspace::guard(&engine, &doc.id, doc.revision).map_err(|_| "Canvas changed before cut. Selection was copied; original pixels remain unchanged")?;
+                engine.edit(
+                    "human",
+                    &[command],
+                    Some(doc.revision),
+                    None,
+                    "Cut selected pixels",
+                )?;
+                Ok("Selected pixels cut; paste to place them again".into())
+            }
             Request::CutLayers { shared, doc, ids } => {
                 self.copy_layers(clipboard, doc, ids, Some(shared))
             }
@@ -670,9 +703,10 @@ impl Session {
 impl Request {
     fn document(&self) -> &str {
         match self {
-            Self::Copy { doc, .. } | Self::CopyLayers { doc, .. } | Self::CutLayers { doc, .. } => {
-                &doc.id
-            }
+            Self::Copy { doc, .. }
+            | Self::Cut { doc, .. }
+            | Self::CopyLayers { doc, .. }
+            | Self::CutLayers { doc, .. } => &doc.id,
             Self::Paste { document, .. } => document,
         }
     }
@@ -691,6 +725,7 @@ mod tests {
         files: Vec<PathBuf>,
         sequence: Option<u64>,
         change_on_read: bool,
+        edit_on_write: Option<(Shared, Value)>,
     }
     impl Provider for Fake {
         fn write_image(&mut self, image: &Image) -> Result<(), String> {
@@ -701,6 +736,12 @@ mod tests {
             self.text = None;
             self.files.clear();
             self.sequence = self.sequence.map(|n| n + 1);
+            if let Some((shared, command)) = self.edit_on_write.take() {
+                shared
+                    .lock()
+                    .unwrap()
+                    .edit("human", &[command], None, None, "Concurrent work")?;
+            }
             Ok(())
         }
         fn read_image(&mut self) -> Result<Image, String> {
@@ -735,6 +776,131 @@ mod tests {
         let doc = e.doc.clone();
         let id = doc.layers[0].id.clone();
         (Arc::new(Mutex::new(e)), doc, id)
+    }
+    #[test]
+    fn selected_cut_paste_retains_coordinates_native_depth_and_separate_undo_steps() {
+        for depth in [8, 16] {
+            let (shared, _, id) = fixture();
+            let doc = {
+                let mut e = shared.lock().unwrap();
+                e.doc = Document::new_depth(8, 8, depth).unwrap();
+                e.doc.layers[0].id = id.clone();
+                for y in 0..8 {
+                    for x in 0..8 {
+                        e.doc.layers[0]
+                            .pixels
+                            .set16(x, y, [12347, 33559, 51237, 65535]);
+                    }
+                }
+                e.doc.selection = Some([2, 3, 5, 7]);
+                e.doc.clone()
+            };
+            let mut session = Session::default();
+            let mut fake = Fake::default();
+            session
+                .process(
+                    &mut fake,
+                    Request::Cut {
+                        shared: shared.clone(),
+                        doc: doc.clone(),
+                        target: id.clone(),
+                        mask: false,
+                        step: None,
+                    },
+                )
+                .result
+                .unwrap();
+            {
+                let e = shared.lock().unwrap();
+                assert_eq!(e.doc.layers.len(), 1);
+                assert_eq!(e.doc.layers[0].pixels.get16(2, 3), [0; 4]);
+                assert_eq!(
+                    e.doc.layers[0].pixels.get16(1, 3),
+                    doc.layers[0].pixels.get16(1, 3)
+                );
+                assert_eq!(e.undo.len(), 1);
+            }
+            assert_eq!(fake.image.as_ref().unwrap().origin, Some([2, 3]));
+            let revision = shared.lock().unwrap().doc.revision;
+            session
+                .process(
+                    &mut fake,
+                    Request::Paste {
+                        shared: shared.clone(),
+                        document: doc.id.clone(),
+                        target: id,
+                        revision,
+                    },
+                )
+                .result
+                .unwrap();
+            let mut e = shared.lock().unwrap();
+            let pasted = e
+                .doc
+                .layers
+                .iter()
+                .find(|l| l.name == "Pasted image")
+                .unwrap();
+            assert_eq!(
+                (
+                    pasted.x,
+                    pasted.y,
+                    pasted.pixels.width,
+                    pasted.pixels.height
+                ),
+                (2, 3, 3, 4)
+            );
+            assert_eq!(pasted.pixels.get16(0, 0), doc.layers[0].pixels.get16(2, 3));
+            assert_eq!(e.doc.bit_depth, depth);
+            assert_eq!(e.undo.len(), 2);
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.layers.len(), 1);
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), doc.export_png().unwrap());
+        }
+    }
+    #[test]
+    fn selected_cut_failed_clipboard_or_concurrent_edit_never_erases_source_work() {
+        for concurrent in [false, true] {
+            let (shared, mut doc, id) = fixture();
+            doc.selection = Some([2, 3, 5, 7]);
+            doc.layers[0].pixels.set(2, 3, [21, 43, 65, 255]);
+            shared.lock().unwrap().doc = doc.clone();
+            let mut session = Session::default();
+            let mut fake = Fake::default();
+            if concurrent {
+                fake.edit_on_write = Some((
+                    shared.clone(),
+                    json!({"op":"layer.update","layer":id,"name":"New human work"}),
+                ));
+            } else {
+                fake.fail_write = true;
+            }
+            let result = session
+                .process(
+                    &mut fake,
+                    Request::Cut {
+                        shared: shared.clone(),
+                        doc: doc.clone(),
+                        target: id,
+                        mask: false,
+                        step: None,
+                    },
+                )
+                .result;
+            assert!(result.is_err());
+            let e = shared.lock().unwrap();
+            assert_eq!(
+                e.doc.layers[0].pixels.rgba16(),
+                doc.layers[0].pixels.rgba16()
+            );
+            assert_eq!(e.doc.layers.len(), 1);
+            assert_eq!(e.undo.len(), usize::from(concurrent));
+            if concurrent {
+                assert_eq!(e.doc.layers[0].name, "New human work");
+                assert!(session.image.is_some());
+            }
+        }
     }
     #[test]
     fn failed_os_marker_write_never_cuts_or_replaces_previous_internal_copy() {
