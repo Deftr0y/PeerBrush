@@ -485,6 +485,48 @@ pub fn rect(v: &Value) -> Option<[i32; 4]> {
     (out[2] >= out[0] && out[3] >= out[1]).then_some(out)
 }
 
+#[derive(Default)]
+struct SelectionGesture {
+    source: Option<(
+        Value,
+        Option<[i32; 4]>,
+        Option<Vec<[f32; 2]>>,
+        Vec<String>,
+        Option<crate::selection::Coverage>,
+    )>,
+}
+impl SelectionGesture {
+    fn prepare(&mut self, doc: &mut Document, command: &Value) {
+        if !matches!(command["op"].as_str(), Some("move" | "transform"))
+            || command["selection_only"] == false
+        {
+            self.source = None;
+            return;
+        }
+        let mut signature = command.clone();
+        if let Some(object) = signature.as_object_mut() {
+            object.remove("layer");
+        }
+        let target = command["layer"].as_str().unwrap_or("").to_owned();
+        if let Some((previous, bounds, polygon, targets, coverage)) = &mut self.source {
+            if *previous == signature && !targets.contains(&target) {
+                doc.selection = *bounds;
+                doc.selection_polygon = polygon.clone();
+                doc.selection_coverage = coverage.clone();
+                targets.push(target);
+                return;
+            }
+        }
+        self.source = Some((
+            signature,
+            doc.selection,
+            doc.selection_polygon.clone(),
+            vec![target],
+            doc.selection_coverage.clone(),
+        ));
+    }
+}
+
 impl Engine {
     /// Transient visual feedback uses the same commands as a committed edit, without touching history or shared state.
     pub fn preview_edits(doc: Document, commands: &[Value]) -> Result<Document, String> {
@@ -501,7 +543,9 @@ impl Engine {
             .unwrap()
             .resolve_commands(&commands)?;
         let mut imported_bytes = 0;
+        let mut selection_gesture = SelectionGesture::default();
         for command in &resolved {
+            selection_gesture.prepare(&mut engine.doc, command);
             if command["op"] == "image.import" {
                 engine.validate_source(command)?;
                 engine.apply_import(command, None, &mut imported_bytes)?;
@@ -687,6 +731,16 @@ impl Engine {
         Ok(())
     }
     pub fn scopes(&self, c: &Value) -> Vec<Scope> {
+        let mut scopes = self.command_scopes(c);
+        if self.doc.selection.is_some()
+            && matches!(c["op"].as_str(), Some("move" | "transform"))
+            && c["selection_only"] != false
+        {
+            scopes.push(Scope::layer("@selection"));
+        }
+        scopes
+    }
+    fn command_scopes(&self, c: &Value) -> Vec<Scope> {
         let op = text(c, "op", "");
         if op.starts_with("filter.") {
             return vec![Scope {
@@ -1174,13 +1228,7 @@ impl Engine {
         }
         let mut pasted_roots = None;
         let mut imported_bytes = 0usize;
-        let mut selection_gesture: Option<(
-            Value,
-            Option<[i32; 4]>,
-            Option<Vec<[f32; 2]>>,
-            Vec<String>,
-            Option<crate::selection::Coverage>,
-        )> = None;
+        let mut selection_gesture = SelectionGesture::default();
         if let Some(mut doc) = prepared_doc {
             if doc.id != before.id || doc.revision != before.revision + 1 {
                 return Err("Proposal source changed; request a fresh proposal".into());
@@ -1189,43 +1237,7 @@ impl Engine {
             self.doc = doc;
         } else {
             for c in commands {
-                if matches!(c["op"].as_str(), Some("move" | "transform"))
-                    && c["selection_only"] != false
-                {
-                    let mut signature = c.clone();
-                    if let Some(object) = signature.as_object_mut() {
-                        object.remove("layer");
-                    }
-                    let target = c["layer"].as_str().unwrap_or("").to_owned();
-                    if let Some((previous, bounds, polygon, targets, coverage)) =
-                        &mut selection_gesture
-                    {
-                        if *previous == signature && !targets.contains(&target) {
-                            self.doc.selection = *bounds;
-                            self.doc.selection_polygon = polygon.clone();
-                            self.doc.selection_coverage = coverage.clone();
-                            targets.push(target);
-                        } else {
-                            selection_gesture = Some((
-                                signature,
-                                self.doc.selection,
-                                self.doc.selection_polygon.clone(),
-                                vec![target],
-                                self.doc.selection_coverage.clone(),
-                            ));
-                        }
-                    } else {
-                        selection_gesture = Some((
-                            signature,
-                            self.doc.selection,
-                            self.doc.selection_polygon.clone(),
-                            vec![target],
-                            self.doc.selection_coverage.clone(),
-                        ));
-                    }
-                } else {
-                    selection_gesture = None;
-                }
+                selection_gesture.prepare(&mut self.doc, c);
                 if let Err(error) = self.validate_source(c) {
                     self.doc = before;
                     return Err(error);

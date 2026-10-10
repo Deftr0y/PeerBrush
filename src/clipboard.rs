@@ -6,7 +6,9 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use std::{borrow::Cow, path::PathBuf, sync::mpsc};
+#[cfg(not(windows))]
+use std::borrow::Cow;
+use std::{path::PathBuf, sync::mpsc};
 #[cfg(windows)]
 mod windows;
 
@@ -361,7 +363,20 @@ impl Worker {
             // Retain ownership for Linux clipboard providers while the application is open.
             let mut clipboard = arboard::Clipboard::new().ok();
             let mut session = Session::default();
-            while let Ok(request) = rx.recv() {
+            loop {
+                #[cfg(windows)]
+                windows::pump();
+                #[cfg(windows)]
+                let request = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(request) => request,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                #[cfg(not(windows))]
+                let request = match rx.recv() {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
                 let document = request.document().to_owned();
                 if clipboard.is_none() {
                     clipboard = arboard::Clipboard::new().ok();
@@ -401,6 +416,9 @@ trait Provider {
 }
 impl Provider for arboard::Clipboard {
     fn write_image(&mut self, image: &Image) -> Result<(), String> {
+        #[cfg(windows)]
+        return windows::write_image(image);
+        #[cfg(not(windows))]
         self.set_image(arboard::ImageData {
             width: image.width as usize,
             height: image.height as usize,
@@ -435,6 +453,9 @@ impl Provider for arboard::Clipboard {
         })
     }
     fn write_text(&mut self, text: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        return windows::write_text(text);
+        #[cfg(not(windows))]
         self.set_text(text).map_err(|e| e.to_string())
     }
     fn read_text(&mut self) -> Result<String, String> {
