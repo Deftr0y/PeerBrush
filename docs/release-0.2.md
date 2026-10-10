@@ -2,6 +2,21 @@
 
 Version 0.2 uses internal version 0.2.0. The [published experimental prerelease](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2) was released on 2026-10-10 from `2e1791ffc02584103f7a8f1824ef7668a1b19589`. Windows x64, Linux x64 and macOS arm64 packages contain identical corresponding source; their archive checksums are recorded in the release.
 
+## Packaging correction — 2026-10-10
+
+Corrected archives remove duplicated website-only trailers, demo artwork and showcase images. The released 0.2.0 executables and release tag are unchanged. All application/build inputs in the corrected corresponding source match the original build byte-for-byte. Required GPL source, application artwork/fonts, user guides and third-party notices remain included. All packages remain unsigned.
+
+Archive/source policy commit: [`0eb25310d37976dc6fd655bf960b89686204a569`](https://github.com/Deftr0y/PeerBrush/commit/0eb25310d37976dc6fd655bf960b89686204a569). `release.json` distinguishes this packaging/source revision from the original `binary_source_commit`. The same source ZIP is embedded in all three packages.
+
+| Download | Bytes | SHA-256 |
+| --- | ---: | --- |
+| [PeerBrush-0.2.0-Linux-x64-repacked-20261010.zip](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Linux-x64-repacked-20261010.zip) | 29010659 | `f31dd45b5f96ce15ae10a5bd1221ff81a6fa3f9ca8d08cdc6b2744934c203156` |
+| [PeerBrush-0.2.0-macOS-arm64-repacked-20261010.zip](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-macOS-arm64-repacked-20261010.zip) | 25473214 | `35472e98dbbf5a27f3fd261f837162accf125a0c8503799f00d69a7e6002f8ef` |
+| [PeerBrush-0.2.0-Windows-x64-repacked-20261010.zip](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Windows-x64-repacked-20261010.zip) | 26478146 | `3db047293fa1e307ec72dd24963ce14df551feb46a66b1b7e098126a6dadfec4` |
+| [PeerBrush-0.2.0-source-repacked-20261010.zip](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-source-repacked-20261010.zip) | 11728683 | `52a914ec993ca0deacd15dedf65805577201d5dfc240c32cb07c7a21e7266aa0` |
+
+[Correction checksums](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/SHA256SUMS-repacked-20261010) and [release inventory](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/release-inventory-repacked-20261010.json) describe the actual public downloads. Superseded oversized uploads were removed after public download and website-link verification. Older releases are unchanged and require a separate audit.
+
 ## Changes since 0.1.4
 
 - Independent project tabs, guarded cross-project layer transfers and unsaved-work review for closing projects or exiting.
