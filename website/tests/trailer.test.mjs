@@ -9,13 +9,13 @@ test('trailer uses accessible, user-controlled inline playback', async () => {
   const html = await readFile(new URL('index.html', root), 'utf8');
   const video = html.match(/<video\b[^>]*>/)?.[0];
   assert.ok(video);
-  for (const attribute of ['controls', 'playsinline', 'preload="metadata"', 'aria-labelledby="trailer-title"', 'aria-describedby="trailer-description"']) {
+  for (const attribute of ['controls', 'playsinline', 'preload="metadata"', 'aria-labelledby="trailer-title"']) {
     assert.ok(video.includes(attribute), attribute);
   }
   assert.doesNotMatch(video, /\b(?:autoplay|loop)\b/);
   assert.match(html, /<source src="assets\/peerbrush-trailer-v2\.1\.mp4" type="video\/mp4">/);
   assert.match(html, /id="trailer-title"/);
-  assert.match(html, /id="trailer-description"/);
+  assert.ok(video.includes('controlslist="nodownload"'));
 });
 test('build includes the exact canonical trailer bytes', async () => {
   execFileSync(process.execPath, ['build.mjs'], { cwd: root });
