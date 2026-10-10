@@ -2,11 +2,11 @@
 
 Prepare public source and release packages for Windows signing, macOS signing and notarization, and verified Linux distribution. Preserve GPL v3, complete corresponding source, bundled artwork and fonts, and the Ember palette. Follow [release maintenance](release-maintenance.md) for publication and privacy checks.
 
-Status: archive hardening is implemented locally and its regression tests pass. A release still requires rebuilt binaries with private paths remapped and successful native verification. The broader privacy audit, private storage separation, signing enrollment and publication remain open. Lock down archive contents first, then complete the repository privacy review and storage separation. Provider applications can run alongside trusted release automation after that review. Account enrollment and publication are separate from preparing local changes.
+Status: the latest v0.2 packaging correction is published, with original executable bytes retained and complete matching application/build inputs verified. Website source and operational records are maintained separately; reviewed browser-served output is deployed to Pages. Archive regression tests and the native CI matrix pass. Historical releases/history and the wider privacy audit remain separate work. Native signing enrollment and notarization remain pending. See [v0.2 correction facts](release-0.2.md).
 
 ## 1 Make packaging include only approved content
 
-`scripts/package.py` uses the explicit file list in `scripts/package-files.json`, fresh temporary staging and committed-source export for clean release inputs. See [release archive contents](packaging.md). Existing published archives require separate review.
+`scripts/package.py` uses the explicit file list in `scripts/package-files.json`, fresh temporary staging and committed-source export for clean release inputs. See [release archive contents](packaging.md). The latest v0.2 correction is inspected and published; older published archives require separate review.
 
 - [x] Replace broad working-tree copying with reviewed manifests for application packages and corresponding source. Derive release inputs from the exact selected Git commit and reject unexpected inputs.
 - [x] Build each package in a fresh staging directory. Reject paths or symbolic links that escape the permitted source tree.
@@ -15,9 +15,9 @@ Status: archive hardening is implemented locally and its regression tests pass. 
 - [x] Inspect local QA archive entry lists and extracted contents, including the nested source ZIP.
 - [x] Reject recognized credentials and personal build paths in executable inputs; configure Rust path remapping in CI.
 - [ ] Rebuild production binaries, rerun engine/codec/protocol tests and inspect the final archives before release.
-- [ ] Apply privacy checks to website output and existing published archives separately.
+- [x] Inspect the latest v0.2 correction archives and reviewed website output. Older releases and historical disclosure still require their own audit.
 
-Completion requires production builds from the final reviewed commit: packages contain the intended source and assets, exclude synthetic private material and stale files, and pass inspection of the actual archives.
+New-release completion requires production builds from the final reviewed commit; an explicit packaging-only correction can retain original executable bytes after verifying identical application/build inputs: packages contain the intended source and assets, exclude synthetic private material and stale files, and pass inspection of the actual archives.
 
 ## 2 Inventory public and private material
 
