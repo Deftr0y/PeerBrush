@@ -103,7 +103,7 @@ pub(super) fn buffer_bytes(layer: &Layer) -> u64 {
             u64::from(layer.pixels.width) * u64::from(layer.pixels.height) * 2
         })
 }
-pub(super) fn prepare(layer: &Layer) -> Result<Option<Arc<Gray16>>, String> {
+pub(crate) fn prepare(layer: &Layer) -> Result<Option<Arc<Gray16>>, String> {
     let Some(mask) = layer.mask.as_ref().filter(|m| m.needs_cache()) else {
         return Ok(None);
     };

@@ -382,8 +382,8 @@ pub fn capabilities() -> Value {
         "brush": "incremental tiled CPU coverage",
         "compositing": "compiled CPU layer tree with regional gesture updates",
         "tile_compositor": {
-            "mode": "downsampled 8-bit normal layers and isolated folders",
-            "fallback": "native16, masks, clipping, adjustments, other blends and full-resolution saves use CPU",
+            "mode": "downsampled native 8/16-bit layers; all blend modes, masks, clipping, prepared adjustments, isolated and pass-through folders",
+            "fallback": "budget limits, busy/failed GPU, isolated targets, whole-image filter preparation and full-resolution saves use CPU; rounding-boundary samples are repaired by the shared engine",
             "status": crate::gpu::composite::status()
         },
         "liquify": "CPU displacement grid"

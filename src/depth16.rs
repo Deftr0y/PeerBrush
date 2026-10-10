@@ -289,6 +289,16 @@ pub fn preview16(
     target: Option<&str>,
     mask: bool,
 ) -> Result<(u32, u32, Vec<u16>, [i32; 4]), String> {
+    preview_impl(doc, rect, edge, target, mask, false)
+}
+fn preview_impl(
+    doc: &Document,
+    rect: Option<[i32; 4]>,
+    edge: u32,
+    target: Option<&str>,
+    mask: bool,
+    gpu: bool,
+) -> Result<(u32, u32, Vec<u16>, [i32; 4]), String> {
     validate_budget(doc)?;
     let mut rect = rect.unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
     rect[0] = rect[0].clamp(0, doc.width as i32 - 1);
@@ -318,7 +328,20 @@ pub fn preview16(
         });
         return Ok((width, height, words, rect));
     }
-    let plan = Plan16::new(doc)?;
+    let masks = prepare_masks(doc)?;
+    let colors = prepare_with_masks(doc, &masks)?;
+    if gpu && index.is_none() && !mask && scale < 1.0 {
+        let xs: Vec<_> = (0..width)
+            .map(|x| rect[0] + (x as f64 / scale) as i32)
+            .collect();
+        let ys: Vec<_> = (0..height)
+            .map(|y| rect[1] + (y as f64 / scale) as i32)
+            .collect();
+        if let Some(words) = crate::gpu::composite::try_render16(doc, &colors, &xs, &ys) {
+            return Ok((width, height, words, rect));
+        }
+    }
+    let plan = Plan16::with_prepared(doc, &masks, &colors);
     check_size(width, height)?;
     let words = crate::render::rgba16(width, height, |x, y| {
         let sx = rect[0] + (x as f64 / scale) as i32;
@@ -344,7 +367,7 @@ pub fn preview(
     target: Option<&str>,
     mask: bool,
 ) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
-    let (width, height, mut words, rect) = preview16(doc, rect, edge, target, mask)?;
+    let (width, height, mut words, rect) = preview_impl(doc, rect, edge, target, mask, true)?;
     if !mask {
         if let Some(profile) = doc.icc_profile.as_deref() {
             if crate::color_profile::supported(profile).is_ok() {
