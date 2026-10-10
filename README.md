@@ -13,7 +13,7 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/AI_interface-MCP-5aaaff.svg)](docs/mcp.md)
 
-[Downloads](https://github.com/Deftr0y/PeerBrush/releases) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development](docs/development.md) · [Roadmap](FOLLOWUPS.MD)
+[Download 0.2](https://peerbrush.com/#downloads) · [Release notes](docs/release-0.2.md) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development](docs/development.md) · [Roadmap](FOLLOWUPS.MD)
 
 </div>
 
@@ -47,7 +47,7 @@ You stay in control while AI works directly alongside you inside the same editin
 - **Visual, compact controls.** White tool glyphs, Ubuntu Sans, uncluttered range values and live canvas feedback.
 - **Compact transform modes.** Q/W/E/R sit at the bottom right, with the same shortcuts, live rendered gizmos and blue AI feedback.
 - **A browsable brush library.** Twenty-one original procedural presets, six categories, search and readable stroke previews. Edit pressure response, texture, taper and flow, then save custom brushes; the UI and agents use the same native-depth painting engine.
-- **Live procedural AI editing (unreleased development).** Run bounded code with native pixel buffers and shared commands in one guarded transaction. Declared blue scopes, task ownership, locks, cancellation and source checks preserve collaborative work. See [live code](docs/live-code.md).
+- **Live procedural AI editing.** Run bounded code with native pixel buffers and shared commands in one guarded transaction. Declared blue scopes, task ownership, locks, cancellation and source checks preserve collaborative work. See [live code](docs/live-code.md).
 - **A useful hierarchy.** Distinct folders, multi-layer editing, drag into or out of folders, animated reorder previews, visibility sweep gestures, inline renaming, grouping and merging.
 - **Editable effects.** Compact color and mask stacks have recognizable icons and an inline strength percentage for every effect. Select a row to open its settings; top effects run last. Parameter drags preview through the shared engine and commit once on release. Blend and opacity sit beneath the stack.
 - **Whole-image filters.** Browse searchable categories and rendered thumbnails, compare actual project previews, and retain editable native-depth settings above the complete composite. Save, rename, import and export custom presets. See [filter controls and protocol](docs/filters.md).
@@ -62,7 +62,7 @@ You stay in control while AI works directly alongside you inside the same editin
 
 ## Run PeerBrush
 
-[Download the Windows x64 portable build](https://github.com/Deftr0y/PeerBrush/releases/download/v0.1.4/PeerBrush-Windows.zip), extract it, and run `PeerBrush-Windows/peerbrush.exe`. **No Rust installation is needed to use it.** Open/import/drop an image, work in layers, save PSD, and export PNG.
+[Download PeerBrush 0.2 for Windows x64, Linux x64 or macOS Apple silicon](https://peerbrush.com/#downloads). Extract the archive, then run `peerbrush.exe` on Windows, `peerbrush` on Linux, or `PeerBrush.app` on macOS. **No Rust installation is needed to use it.** All 0.2 packages are unsigned; Windows/macOS may show publisher or security warnings. Open/import/drop an image, work in layers, save PSD, and export PNG.
 
 To develop from source:
 
@@ -75,7 +75,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Windows, macOS and Linux builds are configured in CI. This checkpoint has been tested on Windows; other platforms still require successful CI and native desktop verification. See [getting started](docs/getting-started.md) and [platform development notes](docs/development.md).
+Version 0.2 passed exact-source CI and package verification on Windows, macOS and Linux. Windows native editing/save/reopen workflows were visually verified; macOS/Linux manual desktop interaction remains unverified. See [getting started](docs/getting-started.md) and [platform development notes](docs/development.md).
 
 ## Connect an AI agent
 
@@ -125,21 +125,18 @@ The long-term goal is an MCP-native creative application where compatible AI age
 - Local and remote model support through connected agents
 - Extensible tool and plugin architecture
 
-Development now includes retained regional previews, tiled GPU previews, folder transforms, selective agent-task undo, richer edge refinement, optional local learned subject/object selection, native clone/heal, crop/canvas/image resizing, editable text/vector sources, transforms that retain original pixels, progressive loading, optional AI proposals, stronger raster PSD fidelity and compact weighted effects stacks. The next slices cover the brush library, transform controls and project lifecycle. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status; [learned-selection setup](docs/segmentation.md) keeps model choice outside the editor, and [AI collaboration](docs/collaboration.md) describes optional review.
+Version 0.2 includes retained regional and broader GPU previews, folder transforms, selective agent-task undo, refined selections, optional external learned selection, native clone/heal, crop/canvas/image resizing, editable text/vector sources, retained transform originals, progressive loading, AI proposals and live code editing, stronger RGB PSD/color-profile support, brush and preset libraries, compact weighted effects and independent project tabs. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status; [learned-selection setup](docs/segmentation.md) keeps model choice outside the editor, and [AI collaboration](docs/collaboration.md) describes optional review.
 
 ## Status
 
-🚧 **Early development — [v0.1.4 checkpoint](docs/checkpoint-0.1.4.md)**
+🚧 **Experimental prerelease — [PeerBrush 0.2](docs/release-0.2.md)**
 
 PeerBrush is currently experimental and under active development. Features, APIs, and project structure are expected to change.
 
 Editable PSD support currently targets **PSD v1, 8-bit and 16-bit RGB**, basic raster layers, isolated and pass-through groups, supported blend modes, raster masks and default grouped raster clipping stacks. Supported clipping and raster-only pass-through folders stay layered in standard PSD data. PeerBrush preserves editable effect sources in private metadata and writes current standard raster/mask data and a merged composite. Supported embedded RGB matrix/TRC and classic LUT ICC profiles display through sRGB and support an explicit editable sRGB copy at the original depth. Protected-original PNG export keeps native samples and its ICC tag; converted PSD/PNG copies carry an sRGB tag. Unsupported Photoshop features and profiles open as a read-only merged preview at the original depth. Full Photoshop compatibility, PSB and full color management remain future work. See [supported Photoshop behavior](docs/photoshop-fidelity.md).
 
-The shell uses Rust, egui/eframe and wgpu. Sparse copy-on-write tiles share unchanged image data with history. Incremental strokes reuse coverage and composite affected regions, then upload only changed preview pixels. Larger previews use bounded parallel CPU rendering. Common expensive 8-bit effects use optional GPU compute with a measured CPU fallback; native 16-bit sources retain their precision through the renderer. Full tiled GPU compositing remains on the roadmap.
+The shell uses Rust, egui/eframe and wgpu. Sparse copy-on-write tiles share unchanged image data with history. Incremental strokes reuse coverage and composite affected regions, then upload only changed preview pixels. Larger previews use bounded parallel CPU rendering. GPU previews cover 8/16-bit blends, masks, clipping, folders and prepared adjustment stacks, with bounded caches and shared CPU fallback. History and PSD/PNG sources retain native precision. Larger workloads may remain faster on CPU.
 
 ## License
 
 GNU General Public License v3. See [LICENSE](LICENSE). Bundled fonts and dependencies retain their own licenses; portable packages include source and third-party notices.
-
-
-The local Windows 0.1.4 build adds the selection toolbar and Select menu (Ctrl+D deselects, Ctrl+Shift+D reselects, Ctrl+J duplicates layers), on-canvas editable Liquify, visual Levels and smooth Curves controls, one Add Mask action, connected Color/Mask buttons, generated tool artwork and wordmark, precise AI reservations with blue AI tags, and right-click canvas dimensions/depth settings. The download link above remains the separately published release. See [getting started](docs/getting-started.md) for behavior and selection limits.

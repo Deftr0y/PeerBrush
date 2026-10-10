@@ -1,6 +1,6 @@
 # Photoshop fidelity
 
-The development build implements the documented RGB subset: standard raster clipping, pass-through folders, full layer locks, supported RGB ICC previews and explicit native-depth sRGB copies. Unsupported Photoshop settings remain protected. These changes are in the 0.2 source. The v0.1.4 checkpoint predates them; consult GitHub Releases for currently published packages.
+PeerBrush 0.2 implements the documented RGB subset: standard raster clipping, pass-through folders, full layer locks, supported RGB ICC previews and explicit native-depth sRGB copies. Unsupported Photoshop settings remain protected. The v0.1.4 checkpoint predates these changes; [v0.2 packages](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2) contain the documented support.
 
 ## Supported clipping
 

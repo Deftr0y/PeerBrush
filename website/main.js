@@ -105,6 +105,7 @@ function renderDownloads(build) {
     }
   }
   document.querySelector('#build-label').textContent = build.label || build.version;
+  if (typeof build.caution === 'string') document.querySelector('.download-caution').textContent = build.caution;
   try {
     const url = new URL(build.releaseUrl);
     if (url.hostname === 'github.com' && url.protocol === 'https:' && url.pathname.startsWith('/Deftr0y/PeerBrush/releases/tag/')) document.querySelector('#release-link').href = url.href;
@@ -139,7 +140,7 @@ async function loadDownloads() {
     const response = await fetch('downloads.json');
     if (response.ok) {const data=await response.json();renderHistory(data);const build=latestRelease(data);if(build)loaded=renderDownloads(build);}
   } catch { /* Keep the verified static download links when the feed is unavailable. */ }
-  if (!loaded) document.querySelector('#build-label').textContent = 'Development · d70f64e';
+  if (!loaded) document.querySelector('#build-label').textContent = 'PeerBrush 0.2 · Prerelease';
 }
 loadDownloads();
 

@@ -1,6 +1,6 @@
 # Image import
 
-Development builds support the following raster and vector imports. Use File → Import, drag files into the workspace, or issue `image.import` through the shared document engine. A batch is one undo step. Import never replaces an existing project.
+PeerBrush 0.2 supports the following raster and vector imports. Use File → Import, drag files into the workspace, or issue `image.import` through the shared document engine. A batch is one undo step. Import never replaces an existing project.
 
 | Format | Import behavior |
 | --- | --- |

@@ -1,6 +1,6 @@
 # Release packages
 
-PeerBrush 0.2 source uses version **0.2.0**. A release is downloadable only after its assets appear on [GitHub Releases](https://github.com/Deftr0y/PeerBrush/releases). Release candidates in Actions are not published downloads.
+The [published PeerBrush 0.2 prerelease](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2) uses application version **0.2.0**. Its Windows x64, Linux x64 and macOS arm64 packages are unsigned; native publisher signing, notarization and archive signatures are deferred. Public archive checksums are included in the release. Release candidates in Actions are not published downloads.
 
 Packages target Windows x64, Linux x64 and macOS Apple silicon (arm64). Each archive includes `release.json` with the source commit, version, architecture and executable/source checksums, the matching GPL source archive, bundled artwork/fonts, documentation and license notices. macOS has a `PeerBrush.app` bundle; Windows includes `Start PeerBrush.cmd`. Linux binaries are built on Ubuntu 24.04 and require compatible system graphics/windowing libraries. Other Linux distributions and Intel Macs are not separately verified targets.
 
