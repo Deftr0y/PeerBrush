@@ -8,3 +8,24 @@ __pycache__/
 
 
 /peerbrush.exe
+
+# Local credentials and private operational records
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+/secrets/
+/credentials/
+/private/
+/docs/development-handoff.md
+/docs/outreach-plan.md
+/website/.openai/
+
+# Website source and editorial media are maintained separately
+/website/
+/assets/examples/
+/docs/videos/
+/docs/images/website/

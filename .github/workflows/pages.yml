@@ -1,14 +1,12 @@
 name: PeerBrush website
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'website/**'
-      - '.github/workflows/pages.yml'
-  release:
-    types: [published]
   workflow_dispatch:
+    inputs:
+      expected_site_commit:
+        description: Full reviewed public site-content commit SHA
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -23,23 +21,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: main
+          ref: site-content
           persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Test website
-        working-directory: website
-        run: npm test
-      - name: Build static website
-        working-directory: website
-        run: npm run build
+      - name: Check reviewed public output
+        shell: bash
+        env:
+          EXPECTED_SITE_COMMIT: ${{ inputs.expected_site_commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SITE_COMMIT"
+          test -f public-site/index.html
+          test -f public-site/downloads.json
       - name: Configure Pages
         uses: actions/configure-pages@v5
-      - name: Upload website only
+      - name: Upload reviewed website output
         uses: actions/upload-pages-artifact@v4
         with:
-          path: website/dist
+          path: public-site
 
   deploy:
     needs: build
