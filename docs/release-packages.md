@@ -14,6 +14,6 @@ Sigstore signs through the GitHub Actions identity without a long-lived signing 
 
 ## Preparing candidates
 
-Commit all tracked changes before packaging. Run `cargo build --release --locked`, then `python scripts/package.py`. The packager checks the executable's `--version` output and reads source/documentation/artwork from committed Git blobs. It cannot include untracked connection files, recovery work or development outputs. Candidate filenames include version, platform and architecture.
+Commit all tracked changes before packaging. Run `python scripts/build_release.py`, then `python scripts/package.py`. The release build remaps checkout and dependency paths so personal local directories are not embedded in the executable. The packager checks the executable's `--version` output and reads source/documentation/artwork from committed Git blobs. It cannot include untracked connection files, recovery work or development outputs. Candidate filenames include version, platform and architecture.
 
 The manual **PeerBrush release candidates** workflow requires the full commit SHA matching the selected workflow ref. It prepares and inspects all platforms. The optional Sigstore step signs and verifies candidates; it does not create a release, upload public assets or update the website. Publish only after inspecting the actual candidates and completing the [release-maintenance gates](release-maintenance.md). Never replace an existing published tag or package in place.

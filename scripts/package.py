@@ -136,6 +136,10 @@ def package(root, binary, output, registry, platform, verify_binary=True):
     epoch = int(git(root, 'show', '-s', '--format=%ct', 'HEAD'))
     architecture = binary_architecture(binary, platform)
     if verify_binary:
+        content = binary.read_bytes()
+        for home in {str(pathlib.Path.home()), pathlib.Path.home().as_posix()}:
+            if any(home.encode(encoding) in content for encoding in ['utf-8', 'utf-16le']):
+                raise ValueError('Executable contains local home paths; rebuild with scripts/build_release.py')
         actual = subprocess.check_output([str(binary.resolve()), '--version'], text=True, timeout=30).strip()
         if actual != f'PeerBrush {version}':
             raise ValueError('Executable version does not match the committed source')

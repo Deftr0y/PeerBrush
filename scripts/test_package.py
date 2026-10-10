@@ -14,6 +14,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import verify_release
+from build_release import release_environment
 
 spec = importlib.util.spec_from_file_location('packaging', pathlib.Path(__file__).with_name('package.py'))
 packaging = importlib.util.module_from_spec(spec)
@@ -21,6 +22,16 @@ spec.loader.exec_module(packaging)
 
 
 class Packages(unittest.TestCase):
+    def test_release_flags_remap_paths_and_preserve_encoded_options(self):
+        environment = release_environment(pathlib.Path('synthetic checkout'), {'CARGO_ENCODED_RUSTFLAGS': '-C\x1ftarget-feature=+sse2'})
+        flags = environment['CARGO_ENCODED_RUSTFLAGS'].split('\x1f')
+        self.assertEqual(flags[:2], ['-C', 'target-feature=+sse2'])
+        self.assertTrue(any(f.startswith('--remap-path-prefix=') and f.endswith('=peerbrush') for f in flags))
+        self.assertTrue(any(f.endswith('=cargo') for f in flags))
+        self.assertTrue(any(f.endswith('=build-home') for f in flags))
+        with self.assertRaisesRegex(ValueError, 'CARGO_ENCODED_RUSTFLAGS'):
+            release_environment(pathlib.Path('.'), {'RUSTFLAGS': '-C target-cpu=native'})
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='peerbrush-package-test-')
         self.addCleanup(self.temporary.cleanup)

@@ -18,7 +18,7 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked
       - run: python scripts/test_package.py
-      - run: cargo build --release --locked
+      - run: python scripts/build_release.py
       - run: python scripts/package.py
       - uses: actions/upload-artifact@v4
         with:
