@@ -203,6 +203,37 @@ pub fn select_in(workspace: &Registry, id: &str) -> Result<(), String> {
     workspace.active = id.into();
     Ok(())
 }
+/// Navigation only: preserve engine handles, source state and active project identity.
+pub fn reorder_in(
+    workspace: &Registry,
+    expected_order: &[String],
+    order: &[String],
+) -> Result<(), String> {
+    let mut workspace = workspace.lock().unwrap();
+    if workspace.exiting {
+        return Err("Workspace is exiting".into());
+    }
+    if !workspace
+        .entries
+        .iter()
+        .map(|p| &p.id)
+        .eq(expected_order.iter())
+    {
+        return Err("Open project order changed; start the tab drag again".into());
+    }
+    let expected: std::collections::HashSet<_> = expected_order.iter().collect();
+    let requested: std::collections::HashSet<_> = order.iter().collect();
+    if order.len() != expected_order.len()
+        || requested.len() != order.len()
+        || requested != expected
+    {
+        return Err("Tab order must contain every open project exactly once".into());
+    }
+    workspace
+        .entries
+        .sort_by_key(|p| order.iter().position(|id| id == &p.id).unwrap());
+    Ok(())
+}
 pub fn state(root: &Shared) -> Value {
     let active = active_id(root);
     let projects=handles(root).into_iter().filter_map(|shared| {

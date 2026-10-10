@@ -7,6 +7,12 @@ pub(super) struct Label {
     ai: bool,
 }
 
+pub(super) struct TabDrag {
+    project: String,
+    source_order: Vec<String>,
+    order: Vec<String>,
+}
+
 struct TabResponse {
     body: egui::Response,
     close: egui::Response,
@@ -23,7 +29,7 @@ fn tab(ui: &mut egui::Ui, id: &str, label: &Label, active: bool, width: f32) -> 
     let body = ui.interact(
         body_rect,
         ui.id().with(("project", id)),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
     body.widget_info(|| {
         egui::WidgetInfo::selected(
@@ -194,7 +200,24 @@ impl PeerBrush {
     ) {
         let active = crate::workspace::active_id_in(&self.workspace);
         self.switch_project(&active);
-        let entries = crate::workspace::entries_in(&self.workspace);
+        let mut entries = crate::workspace::entries_in(&self.workspace);
+        let source_order: Vec<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
+        let escape = self.tab_drag.is_some()
+            && ctx.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Escape));
+        if escape
+            || self.lifecycle.is_some()
+            || self.lifecycle_frame
+            || self.layer_drag.is_some()
+            || self
+                .tab_drag
+                .as_ref()
+                .is_some_and(|d| d.source_order != source_order)
+        {
+            self.tab_drag = None;
+        }
+        if let Some(drag) = &self.tab_drag {
+            entries.sort_by_key(|(id, _, _)| drag.order.iter().position(|p| p == id).unwrap());
+        }
         let live: HashSet<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
         self.project_views.retain(|id, _| live.contains(id));
         self.project_labels.retain(|id, _| live.contains(id));
@@ -227,6 +250,8 @@ impl PeerBrush {
         let mut select = None;
         let mut close = None;
         let mut hovered = None;
+        let mut started = None;
+        let mut strip = Rect::NOTHING;
         egui::TopBottomPanel::top("project tabs")
             .exact_height(38.)
             .frame(
@@ -244,8 +269,9 @@ impl PeerBrush {
                     let width = ((available - 4. * entries.len().saturating_sub(1) as f32)
                         / entries.len().max(1) as f32)
                         .clamp(132., 216.);
-                    egui::ScrollArea::horizontal()
+                    let scroll = egui::ScrollArea::horizontal()
                         .id_salt("project tab scroll")
+                        .drag_to_scroll(false)
                         .auto_shrink([false, false])
                         .max_width(available)
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -261,6 +287,15 @@ impl PeerBrush {
                                         width,
                                     );
                                     self.project_rects.insert(id.clone(), response.rect);
+                                    if response.body.drag_started() && self.layer_drag.is_none() {
+                                        started = Some(id.clone());
+                                    }
+                                    if self.tab_drag.as_ref().is_some_and(|d| d.project == *id) {
+                                        ui.painter().line_segment(
+                                            [response.rect.left_top(), response.rect.left_bottom()],
+                                            Stroke::new(2., ACCENT),
+                                        );
+                                    }
                                     if changed && id == &self.project_id {
                                         ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
                                     }
@@ -308,15 +343,40 @@ impl PeerBrush {
                                             }
                                         }
                                     }
-                                    if response.body.clicked() {
+                                    if self.tab_drag.is_none() && response.body.clicked() {
                                         select = Some(id.clone());
                                     }
-                                    if response.close.clicked() {
+                                    if self.tab_drag.is_none() && response.close.clicked() {
                                         close = Some((id.clone(), shared.clone()));
                                     }
                                 }
                             });
+                            if self.tab_drag.is_some() {
+                                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                                    let viewport = ui.clip_rect();
+                                    if viewport.contains(pos) {
+                                        let speed = if pos.x < viewport.left() + 24. {
+                                            180.
+                                        } else if pos.x > viewport.right() - 24. {
+                                            -180.
+                                        } else {
+                                            0.
+                                        };
+                                        if speed != 0. {
+                                            ui.scroll_with_delta_animation(
+                                                Vec2::new(
+                                                    speed * ctx.input(|i| i.stable_dt).min(0.05),
+                                                    0.,
+                                                ),
+                                                egui::style::ScrollAnimation::none(),
+                                            );
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                            }
                         });
+                    strip = scroll.inner_rect;
                     let new = ui
                         .add_sized([28., 28.], egui::Button::new("+").frame(false))
                         .on_hover_text("New project");
@@ -370,6 +430,54 @@ impl PeerBrush {
                     );
                 });
             });
+        if let Some(project) = started {
+            if !escape {
+                self.tab_drag = Some(TabDrag {
+                    project,
+                    source_order: source_order.clone(),
+                    order: source_order,
+                });
+            }
+        }
+        if let Some(drag) = &mut self.tab_drag {
+            let pointer = ctx.input(|i| i.pointer.interact_pos());
+            let inside = pointer.is_some_and(|pos| strip.contains(pos));
+            if inside {
+                // Fixed positions in the strip determine the slot, independent of the moving IDs.
+                let mut slots: Vec<_> = self.project_rects.values().collect();
+                slots.sort_by(|a, b| a.center().x.total_cmp(&b.center().x));
+                let x = pointer.unwrap().x;
+                let index = slots
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (a.center().x - x)
+                            .abs()
+                            .total_cmp(&(b.center().x - x).abs())
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                drag.order = drag.source_order.clone();
+                drag.order.retain(|id| id != &drag.project);
+                drag.order.insert(index, drag.project.clone());
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                ctx.request_repaint();
+            }
+            if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary)) {
+                let drag = self.tab_drag.take().unwrap();
+                if inside {
+                    if let Err(error) = crate::workspace::reorder_in(
+                        &self.workspace,
+                        &drag.source_order,
+                        &drag.order,
+                    ) {
+                        self.message = error;
+                    }
+                }
+            } else if !ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) {
+                self.tab_drag = None;
+            }
+        }
         (select, close, hovered)
     }
 }
@@ -439,6 +547,238 @@ mod tests {
                 ],
             );
         }
+    }
+    fn ids(app: &PeerBrush) -> Vec<String> {
+        crate::workspace::entries_in(&app.workspace)
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect()
+    }
+    fn press(app: &mut PeerBrush, ctx: &egui::Context, width: f32, pos: Pos2, pressed: bool) {
+        frame(
+            app,
+            ctx,
+            width,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+    }
+    fn begin_drag(app: &mut PeerBrush, ctx: &egui::Context, width: f32, source: &str, to: Pos2) {
+        let from = app.project_rects[source].center() - Vec2::new(20., 0.);
+        press(app, ctx, width, from, true);
+        frame(
+            app,
+            ctx,
+            width,
+            vec![egui::Event::PointerMoved(from + Vec2::new(12., 0.))],
+        );
+        assert!(
+            app.tab_drag.is_some(),
+            "Tab body must start a reorder gesture"
+        );
+        frame(app, ctx, width, vec![egui::Event::PointerMoved(to)]);
+        frame(app, ctx, width, vec![]);
+    }
+    #[test]
+    fn tab_drags_show_live_order_then_commit_without_switching_or_touching_native_work() {
+        for depth in [8, 16] {
+            let (mut app, ctx, projects) = fixture(depth, 4);
+            let original = ids(&app);
+            crate::workspace::select_in(&app.workspace, &original[0]).unwrap();
+            for (i, project) in projects.iter().enumerate() {
+                let mut e = project.lock().unwrap();
+                let layer = e.doc.layers[0].id.clone();
+                e.doc.layers[0]
+                    .pixels
+                    .set16(2, 3, [10001 + i as u16, 20003, 40007, 65535]);
+                e.edit(
+                    "human",
+                    &[
+                        json!({"op":"selection","kind":"ellipse","rect":[1,2,19,20],"feather":2}),
+                        json!({"op":"mask.add","layer":layer}),
+                    ],
+                    None,
+                    None,
+                    "Human mask",
+                )
+                .unwrap();
+                e.path = Some(std::path::PathBuf::from(format!("artwork-{i}.psd")));
+            }
+            for _ in 0..3 {
+                frame(&mut app, &ctx, 980., vec![]);
+            }
+            app.zoom = 2.5;
+            app.pan = Vec2::new(7., -9.);
+            let selected = app.selected.clone();
+            let before: Vec<_> = projects
+                .iter()
+                .map(|p| {
+                    let e = p.lock().unwrap();
+                    (
+                        crate::psd::encode(&e.doc).unwrap(),
+                        e.undo.len(),
+                        e.redo.len(),
+                        e.path.clone(),
+                        e.saved_revision,
+                    )
+                })
+                .collect();
+            let end = app.project_rects[&original[3]].center();
+            begin_drag(&mut app, &ctx, 980., &original[1], end);
+            assert_eq!(ids(&app), original, "Only presentation changes while held");
+            assert_eq!(
+                app.tab_drag.as_ref().unwrap().order,
+                vec![
+                    original[0].clone(),
+                    original[2].clone(),
+                    original[3].clone(),
+                    original[1].clone()
+                ]
+            );
+            assert!(
+                app.project_rects[&original[1]].left() > app.project_rects[&original[3]].left()
+            );
+            let output = frame(&mut app, &ctx, 980., vec![]);
+            assert!(output.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::LineSegment{points,stroke} if stroke.width==2. && stroke.color==ACCENT && points[0].x==app.project_rects[&original[1]].left())));
+            assert_eq!(app.project_id, original[0]);
+            press(&mut app, &ctx, 980., end, false);
+            assert_eq!(
+                ids(&app),
+                vec![
+                    original[0].clone(),
+                    original[2].clone(),
+                    original[3].clone(),
+                    original[1].clone()
+                ]
+            );
+            let first = app.project_rects[&original[0]].center();
+            begin_drag(&mut app, &ctx, 980., &original[1], first);
+            press(&mut app, &ctx, 980., first, false);
+            assert_eq!(
+                ids(&app),
+                vec![
+                    original[1].clone(),
+                    original[0].clone(),
+                    original[2].clone(),
+                    original[3].clone()
+                ]
+            );
+            assert_eq!(app.project_id, original[0]);
+            assert_eq!(crate::workspace::active_id_in(&app.workspace), original[0]);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.zoom, 2.5);
+            assert_eq!(app.pan, Vec2::new(7., -9.));
+            for (project, before) in projects.iter().zip(before) {
+                let e = project.lock().unwrap();
+                assert_eq!(
+                    (
+                        crate::psd::encode(&e.doc).unwrap(),
+                        e.undo.len(),
+                        e.redo.len(),
+                        e.path.clone(),
+                        e.saved_revision
+                    ),
+                    before
+                );
+                assert_eq!(e.doc.bit_depth, depth);
+            }
+        }
+    }
+    #[test]
+    fn tab_drags_cancel_on_escape_outside_drop_and_concurrent_project_membership_or_order() {
+        let (mut app, ctx, projects) = fixture(16, 3);
+        let original = ids(&app);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, 980., vec![]);
+        }
+        for scenario in 0..4 {
+            let expected = ids(&app);
+            let end = app.project_rects[expected.last().unwrap()].center();
+            begin_drag(&mut app, &ctx, 980., &original[0], end);
+            match scenario {
+                0 => {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        980.,
+                        vec![egui::Event::Key {
+                            key: egui::Key::Escape,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                    press(&mut app, &ctx, 980., end, false);
+                }
+                1 => press(&mut app, &ctx, 980., Pos2::new(end.x, 100.), false),
+                2 => {
+                    crate::workspace::new_project(&app.workspace_root, 32, 24, 16, None).unwrap();
+                    frame(&mut app, &ctx, 980., vec![]);
+                    press(&mut app, &ctx, 980., end, false);
+                }
+                _ => {
+                    let mut order = expected.clone();
+                    order.reverse();
+                    crate::workspace::reorder_in(&app.workspace, &expected, &order).unwrap();
+                    frame(&mut app, &ctx, 980., vec![]);
+                    press(&mut app, &ctx, 980., end, false);
+                    assert_eq!(ids(&app), order);
+                }
+            }
+            assert!(app.tab_drag.is_none());
+            if scenario < 2 {
+                assert_eq!(ids(&app), expected);
+            }
+            if scenario == 2 {
+                assert_eq!(&ids(&app)[..expected.len()], expected);
+            }
+            frame(&mut app, &ctx, 980., vec![]);
+        }
+        // A closed target must not be restored by a pending gesture.
+        let order = ids(&app);
+        let end = app.project_rects[order.last().unwrap()].center();
+        begin_drag(&mut app, &ctx, 980., &original[0], end);
+        let e = projects[1].lock().unwrap();
+        let doc = e.doc.id.clone();
+        drop(e);
+        crate::workspace::close_in(&app.workspace, &original[1], &doc, 0, false, "human").unwrap();
+        frame(&mut app, &ctx, 980., vec![]);
+        press(&mut app, &ctx, 980., end, false);
+        assert!(app.tab_drag.is_none());
+        assert!(!ids(&app).contains(&original[1]));
+        assert!(projects[0].lock().unwrap().undo.is_empty());
+    }
+    #[test]
+    fn tab_drag_edge_scroll_reaches_hidden_projects_without_changing_active_identity() {
+        let (mut app, ctx, _) = fixture(16, 16);
+        let original = ids(&app);
+        crate::workspace::select_in(&app.workspace, &original[0]).unwrap();
+        for _ in 0..20 {
+            frame(&mut app, &ctx, 980., vec![]);
+        }
+        let edge = Pos2::new(900., 19.);
+        begin_drag(&mut app, &ctx, 980., &original[0], edge);
+        let initial = app.project_rects[&original[15]].left();
+        for _ in 0..420 {
+            frame(&mut app, &ctx, 980., vec![]);
+        }
+        assert!(app.project_rects[&original[15]].left() < initial - 500.);
+        assert_eq!(
+            app.tab_drag.as_ref().unwrap().order.last(),
+            Some(&original[0])
+        );
+        press(&mut app, &ctx, 980., edge, false);
+        assert_eq!(ids(&app).last(), Some(&original[0]));
+        assert_eq!(app.project_id, original[0]);
+        assert_eq!(crate::workspace::active_id_in(&app.workspace), original[0]);
     }
     #[test]
     fn project_bodies_and_close_targets_preserve_native_sources_and_review_the_right_tab() {

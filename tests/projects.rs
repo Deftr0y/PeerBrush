@@ -395,3 +395,106 @@ fn protected_sources_require_explicit_compatible_copy_before_tree_transfer() {
     assert!(second.lock().unwrap().undo.is_empty());
     assert!(root.lock().unwrap().doc.read_only);
 }
+
+#[test]
+fn human_tab_reordering_is_atomic_guarded_and_keeps_native_engines_and_history() {
+    for depth in [8, 16] {
+        let mut e = Engine::new();
+        e.doc = Document::new_depth(12, 10, depth).unwrap();
+        e.doc.layers[0]
+            .pixels
+            .set16(3, 4, [10001, 20003, 40007, 65535]);
+        let root = Arc::new(Mutex::new(e));
+        w::attach(&root);
+        let second = w::new_project(&root, 12, 10, depth, None).unwrap();
+        let third = w::new_project(&root, 12, 10, depth, None).unwrap();
+        edit(&root, &second, "Preserve human work");
+        let state = w::state(&root);
+        let order: Vec<_> = state["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["project_id"].as_str().unwrap().to_owned())
+            .collect();
+        let before: Vec<_> = [&root, &second, &third]
+            .iter()
+            .map(|p| {
+                let e = p.lock().unwrap();
+                (
+                    peerbrush::psd::encode(&e.doc).unwrap(),
+                    e.undo.len(),
+                    e.redo.len(),
+                    e.saved_revision,
+                    e.path.clone(),
+                )
+            })
+            .collect();
+        let mut reversed = order.clone();
+        reversed.reverse();
+        for malformed in [
+            vec![],
+            vec![order[0].clone(); 3],
+            vec![order[0].clone(), order[1].clone(), "missing".into()],
+        ] {
+            assert!(server::dispatch(&root,"projects",&json!({"action":"reorder","actor":"human","expected_order":order,"order":malformed})).is_err());
+            assert_eq!(w::state(&root), state);
+        }
+        assert!(server::dispatch(
+            &root,
+            "projects",
+            &json!({"action":"reorder","actor":"agent","expected_order":order,"order":reversed})
+        )
+        .is_err());
+        assert!(server::dispatch(
+            &root,
+            "projects",
+            &json!({"action":"reorder","actor":"human","order":reversed})
+        )
+        .is_err());
+        let result = server::dispatch(
+            &root,
+            "projects",
+            &json!({"action":"reorder","actor":"human","expected_order":order,"order":reversed}),
+        )
+        .unwrap();
+        assert_eq!(result["active_project_id"], state["active_project_id"]);
+        assert_eq!(
+            result["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["project_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            reversed.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(server::dispatch(
+            &root,
+            "projects",
+            &json!({"action":"reorder","actor":"human","expected_order":order,"order":order})
+        )
+        .unwrap_err()
+        .contains("changed"));
+        for (i, p) in [&root, &second, &third].iter().enumerate() {
+            assert!(Arc::ptr_eq(&w::get(&root, &order[i]).unwrap(), p));
+            let e = p.lock().unwrap();
+            assert_eq!(
+                (
+                    peerbrush::psd::encode(&e.doc).unwrap(),
+                    e.undo.len(),
+                    e.redo.len(),
+                    e.saved_revision,
+                    e.path.clone()
+                ),
+                before[i]
+            );
+        }
+        // Transfers still route by identity after reordering, independent of the active tab.
+        transfer(&root, &second, &third, false).unwrap();
+        assert_eq!(second.lock().unwrap().undo.len(), 1);
+        assert_eq!(third.lock().unwrap().undo.len(), 1);
+        assert_eq!(
+            w::active_id(&root),
+            state["active_project_id"].as_str().unwrap()
+        );
+    }
+}
