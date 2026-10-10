@@ -38,6 +38,10 @@ pub struct Workspace {
     pub(crate) exiting: bool,
     pub brush_library: Arc<Mutex<crate::brush_library::Library>>,
     pub filter_library: Arc<Mutex<crate::filter_library::Library>>,
+    pub recovery_dir: Option<std::path::PathBuf>,
+    pub recovery_error: Option<String>,
+    pub(crate) recovery_failures: std::collections::BTreeMap<String, String>,
+    pub(crate) recovery_retired: Vec<String>,
 }
 pub type Registry = Arc<Mutex<Workspace>>;
 pub const MAX_PROJECTS: usize = 16;
@@ -70,6 +74,10 @@ pub fn attach(root: &Shared) -> Registry {
         exiting: false,
         brush_library: e.brush_library.clone(),
         filter_library: e.filter_library.clone(),
+        recovery_dir: None,
+        recovery_error: None,
+        recovery_failures: Default::default(),
+        recovery_retired: vec![],
     }));
     e.workspace = Some(Arc::downgrade(&workspace));
     e.workspace_owner = Some(workspace.clone());
@@ -202,7 +210,8 @@ pub fn state(root: &Shared) -> Value {
         if e.closed {return None;}
         Some(json!({"project_id":e.project_id,"document_id":e.doc.id,"name":e.doc.name,"revision":e.doc.revision,"dirty":e.doc.revision!=e.saved_revision,"path":e.path,"bit_depth":e.doc.bit_depth,"read_only":e.doc.read_only,"loading":e.loading.as_ref().map(|c|c.status().stage),"ai_change":e.ai_change}))
     }).collect::<Vec<_>>();
-    json!({"active_project_id":active,"projects":projects,"max_projects":MAX_PROJECTS})
+    let error = attach(root).lock().unwrap().recovery_error.clone();
+    json!({"active_project_id":active,"projects":projects,"max_projects":MAX_PROJECTS,"autosave_error":error})
 }
 /// Register only a successfully prepared project. Activation is conditional on the initiating tab.
 pub fn register(
@@ -327,6 +336,7 @@ pub fn close_in(
     e.file_version = None;
     e.ai_change = None;
     workspace_guard.entries.retain(|p| p.id != id);
+    workspace_guard.recovery_retired.push(id.to_owned());
     if workspace_guard.entries.is_empty() {
         let mut blank = Engine::new();
         blank.brush_library = e.brush_library.clone();

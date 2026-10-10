@@ -354,7 +354,8 @@ fn recovery_indexes_every_dirty_project_and_restore_paths_stay_local() {
         br#"{"projects":[{"project_id":"../../escape","file":"outside.psd"}]}"#,
     )
     .unwrap();
-    assert!(server::recovery_projects(&dir).is_empty());
+    // Damaging the mutable legacy index cannot hide complete versioned recoveries.
+    assert_eq!(server::recovery_projects(&dir).len(), 2);
 }
 
 #[test]
