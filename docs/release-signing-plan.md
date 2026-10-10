@@ -2,11 +2,11 @@
 
 Prepare public source and release packages for Windows signing, macOS signing and notarization, and verified Linux distribution. Preserve GPL v3, complete corresponding source, bundled artwork and fonts, and the Ember palette. Follow [release maintenance](release-maintenance.md) for publication and privacy checks.
 
-Status: the latest v0.2 packaging correction is published, with original executable bytes retained and complete matching application/build inputs verified. Website source and operational records are maintained separately; reviewed browser-served output is deployed to Pages. Archive regression tests and the native CI matrix pass. Historical releases/history and the wider privacy audit remain separate work. Native signing enrollment and notarization remain pending. See [v0.2 correction facts](release-0.2.md).
+Status: corrected v0.2 archives retain original executable bytes. Dated historical rebuilds for development-d70f64e, v0.1.2 and v0.1.4 are published with unchanged application inputs, new executable hashes, matching GPL source and verified website history links. Website source and operational records are maintained separately. The scoped historical audit and targeted artifact correction are complete; original Git history/tags and their automatic source archives are unchanged. Native signing enrollment and notarization remain pending. See [v0.2 correction facts](release-0.2.md) and [historical correction facts](release-packaging-corrections.md).
 
 ## 1 Make packaging include only approved content
 
-`scripts/package.py` uses the explicit file list in `scripts/package-files.json`, fresh temporary staging and committed-source export for clean release inputs. See [release archive contents](packaging.md). The latest v0.2 correction is inspected and published; older published archives require separate review.
+`scripts/package.py` uses the explicit file list in `scripts/package-files.json`, fresh temporary staging and committed-source export for clean release inputs. See [release archive contents](packaging.md). The v0.2 correction and dated historical corrections are inspected and published. Original tag history is unchanged.
 
 - [x] Replace broad working-tree copying with reviewed manifests for application packages and corresponding source. Derive release inputs from the exact selected Git commit and reject unexpected inputs.
 - [x] Build each package in a fresh staging directory. Reject paths or symbolic links that escape the permitted source tree.
@@ -14,17 +14,17 @@ Status: the latest v0.2 packaging correction is published, with original executa
 - [x] Add meaningful packaging checks using synthetic private files and stale output files: they must never enter source archives or binary packages. Verify expected source assets remain included.
 - [x] Inspect local QA archive entry lists and extracted contents, including the nested source ZIP.
 - [x] Reject recognized credentials and personal build paths in executable inputs; configure Rust path remapping in CI.
-- [ ] Rebuild production binaries, rerun engine/codec/protocol tests and inspect the final archives before release.
-- [x] Inspect the latest v0.2 correction archives and reviewed website output. Older releases and historical disclosure still require their own audit.
+- [x] Rebuild historical correction binaries, rerun engine/codec/protocol tests and inspect the final archives before publication. A new signed release still requires its own candidate validation.
+- [x] Inspect corrected v0.2 and historical downloads and verify the deployed website output. Historical Git/tag source remains separately scoped.
 
 New-release completion requires production builds from the final reviewed commit; an explicit packaging-only correction can retain original executable bytes after verifying identical application/build inputs: packages contain the intended source and assets, exclude synthetic private material and stale files, and pass inspection of the actual archives.
 
 ## 2 Inventory public and private material
 
-- [ ] Inventory tracked, ignored and untracked files, reachable Git history, release assets, Actions artifacts and logs, and website output. Record which remote refs and historical artifacts were actually reviewed.
-- [ ] Classify material by purpose: application source and public contributor documentation; private operations and account records; credentials and signing keys; disposable build, QA and recovery files.
-- [ ] Scan for credentials and private information without printing values. Review examples, screenshots and videos for connection tokens, personal paths and account information as well as text files.
-- [ ] Review deployment metadata, outreach material and operational notes individually. A filename or project identifier alone does not establish that a file contains a secret.
+- [x] Inventory tracked, ignored and untracked files, reachable Git history, release assets, Actions artifacts and logs, and website output. Record which remote refs and historical artifacts were actually reviewed.
+- [x] Classify material by purpose: application source and public contributor documentation; private operations and account records; credentials and signing keys; disposable build, QA and recovery files.
+- [x] Scan for credentials and private information without printing values. Review examples, screenshots and videos for connection tokens, personal paths and account information as well as text files.
+- [x] Review deployment metadata, outreach material and operational notes individually. A filename or project identifier alone does not establish that a file contains a secret.
 - [ ] If credentials have been exposed, revoke or rotate them first. Prepare a separate history and artifact remediation proposal that accounts for forks, clones, caches and existing downloads. Do not rewrite shared history as routine cleanup.
 
 Completion: a private inventory of findings and reviewed surfaces, with a concrete list of files to keep public, relocate, redact or exclude. Do not publish raw audit reports.
@@ -41,10 +41,10 @@ Keep the application in one public repository. Store private operations outside 
 | Credentials required by release jobs | Protected GitHub environment secrets; short-lived OIDC authentication where supported |
 | Build output, generated QA captures, caches and application runtime connection data | Dedicated local or temporary directories excluded from source and packaging |
 
-- [ ] Choose the private storage location and access policy before relocating material. Preserve originals until the copy is verified.
-- [ ] Move or redact classified private files, then review the staged diff. Ignore rules do not remove already tracked files or historic copies.
-- [ ] Expand ignore rules for local secrets, private configuration, signing keys, QA and recovery material. Keep sanitized examples and required source assets available to contributors.
-- [ ] Keep private infrastructure details out of public instructions. Public documentation should describe required configuration using placeholders.
+- [x] Choose the private storage location and access policy before relocating material. Preserve originals until the copy is verified.
+- [x] Move or redact classified private files, then review the staged diff. Ignore rules do not remove already tracked files or historic copies.
+- [x] Expand ignore rules for local secrets, private configuration, signing keys, QA and recovery material. Keep sanitized examples and required source assets available to contributors.
+- [x] Keep private infrastructure details out of public instructions. Public documentation should describe required configuration using placeholders.
 
 Completion: a public checkout containing contributor-facing material, separate private storage, and an explicit history of any remaining exposure to remediate. Credentials need not be in a private repository either.
 

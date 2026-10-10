@@ -15,7 +15,7 @@ Archive/source policy commit: [`0eb25310d37976dc6fd655bf960b89686204a569`](https
 | [PeerBrush-0.2.0-Windows-x64-repacked-20261010.zip](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-Windows-x64-repacked-20261010.zip) | 26478146 | `3db047293fa1e307ec72dd24963ce14df551feb46a66b1b7e098126a6dadfec4` |
 | [PeerBrush-0.2.0-source-repacked-20261010.zip](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/PeerBrush-0.2.0-source-repacked-20261010.zip) | 11728683 | `52a914ec993ca0deacd15dedf65805577201d5dfc240c32cb07c7a21e7266aa0` |
 
-[Correction checksums](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/SHA256SUMS-repacked-20261010) and [release inventory](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/release-inventory-repacked-20261010.json) describe the actual public downloads. Superseded oversized uploads were removed after public download and website-link verification. Older releases are unchanged and require a separate audit.
+[Correction checksums](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/SHA256SUMS-repacked-20261010) and [release inventory](https://github.com/Deftr0y/PeerBrush/releases/download/v0.2/release-inventory-repacked-20261010.json) describe the actual public downloads. Superseded oversized uploads were removed after public download and website-link verification. Older releases now have separately dated rebuilds; see [historical correction facts](release-packaging-corrections.md).
 
 ## Changes since 0.1.4
 
