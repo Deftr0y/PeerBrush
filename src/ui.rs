@@ -4012,6 +4012,9 @@ impl PeerBrush {
                     }
                 }
                 if command_key(i,egui::Key::A) {self.edit(vec![json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})],"Select all");}
+                if command_key(i,egui::Key::I) && key_modifiers(i,egui::Key::I).shift && !key_modifiers(i,egui::Key::I).alt {
+                    self.edit(vec![json!({"op":"selection.invert"})],"Invert selection");
+                }
                 if command_key(i,egui::Key::J) && self.layer_clipboard {self.duplicate_layers(&doc);}
                 for (key, tool) in [
                     (egui::Key::B, Tool::Brush),
@@ -4131,7 +4134,9 @@ impl PeerBrush {
                         if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Mask from selection")).clicked(){self.layer_cmd("mask.from_selection",json!({}),"Mask from selection");ui.close_menu();}
                         if ui.add_enabled(doc.layers.iter().any(|l|l.id==self.selected&&l.mask.is_some())&&!doc.read_only,egui::Button::new("Refine layer mask…")).clicked(){self.open_refinement(&doc,Some(self.selected.clone()));ui.close_menu();}
                         for (label,op) in [("All · Ctrl+A","all"),("Deselect","selection.clear"),("Reselect · Ctrl+Shift+D","selection.reselect"),("Inverse","selection.invert")] {
-                            if ui.button(label).clicked(){self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);ui.close_menu();}
+                            let button=egui::Button::new(label);
+                            let button=if op=="selection.invert" {button.shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ I"} else {"Ctrl+Shift+I"})} else {button};
+                            if ui.add(button).clicked(){self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);ui.close_menu();}
                         }
                         for (label,mode) in [("Expand by 1 px","expand"),("Contract by 1 px","contract")] {if ui.button(label).clicked(){self.edit(vec![json!({"op":"selection.modify","mode":mode,"radius":1})],label);ui.close_menu();}}
                     });
@@ -8674,6 +8679,83 @@ mod tests {
             }
             e.undo("human").unwrap();
             assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        }
+    }
+    #[test]
+    fn command_shift_i_inverts_feathered_coverage_once_and_preserves_text_entry() {
+        for depth in [8, 16] {
+            for modifiers in [
+                egui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                egui::Modifiers {
+                    command: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            ] {
+                let (mut app, ctx) = small_fixture();
+                let before = {
+                    let mut e = app.shared.lock().unwrap();
+                    e.doc = Document::new_depth(32, 32, depth).unwrap();
+                    e.doc.layers[0]
+                        .pixels
+                        .set16(4, 4, [12347, 33559, 51237, 65535]);
+                    let layer = e.doc.layers[0].id.clone();
+                    e.edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":layer})],
+                        None,
+                        None,
+                        "Mask",
+                    )
+                    .unwrap();
+                    e.edit("human",&[json!({"op":"selection","kind":"ellipse","rect":[4,5,20,22],"feather":2})],None,None,"Select").unwrap();
+                    e.undo.clear();
+                    e.doc.clone()
+                };
+                app.select_content(&before.layers[0].id);
+                app.mask = true;
+                frame(&mut app, &ctx, vec![], Default::default());
+                let original = crate::selection::current(&before).unwrap();
+                modified_key(&mut app, &ctx, egui::Key::I, modifiers);
+                {
+                    let mut e = app.shared.lock().unwrap();
+                    let inverse = crate::selection::current(&e.doc).unwrap();
+                    for y in 0..32 {
+                        for x in 0..32 {
+                            assert!((original.value(x, y) + inverse.value(x, y) - 1.).abs() < 1e-6);
+                        }
+                    }
+                    assert_eq!(e.undo.len(), 1);
+                    assert_eq!(e.doc.bit_depth, depth);
+                    assert_eq!(
+                        e.doc.layers[0].pixels.rgba16(),
+                        before.layers[0].pixels.rgba16()
+                    );
+                    assert!(app.tool == Tool::Brush);
+                    assert!(app.mask);
+                    e.undo("human").unwrap();
+                    assert_eq!(
+                        crate::selection::current(&e.doc).unwrap().mask.rgba(),
+                        original.mask.rgba()
+                    );
+                    e.redo("human").unwrap();
+                }
+                let current = app.shared.lock().unwrap().doc.clone();
+                app.begin_rename(&current, &app.selected.clone());
+                frame(&mut app, &ctx, vec![], Default::default());
+                let history = app.shared.lock().unwrap().undo.len();
+                modified_key(&mut app, &ctx, egui::Key::I, modifiers);
+                let e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), history);
+                assert_eq!(
+                    crate::selection::current(&e.doc).unwrap().mask.rgba(),
+                    crate::selection::current(&current).unwrap().mask.rgba()
+                );
+            }
         }
     }
     fn modified_key(
