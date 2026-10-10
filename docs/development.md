@@ -37,7 +37,7 @@ Roadmap: GPU tile compositor and incremental preview updates; text/vector source
 Dependency and embedded-font licenses must accompany packaged builds. The application is GPL v3; dependencies retain their original licenses. CI builds and tests on Windows, macOS, and Linux. Cross-platform support is not considered validated until those jobs run successfully.
 
 
-To package a release with source and third-party notices, run `python scripts/package.py` after `cargo build --release`. On this isolated checkout, supply `--registry .dev-tools/cargo-home/registry/src`.
+To package a release with matching source and third-party notices, run `python scripts/build_release.py`, then `python scripts/package.py` from a clean reviewed commit. Use `--registry` to select the Cargo registry used for the build. The explicit file list and archive regression checks are described in [release archive contents](packaging.md).
 
 Only one editor owns a given runtime workspace. Opening PeerBrush again focuses that window; `--state-dir` creates an independent workspace. This prevents an agent from silently switching to a second document. Unsaved content is also flushed to recovery at normal shutdown.
 

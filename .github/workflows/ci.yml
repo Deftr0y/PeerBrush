@@ -1,5 +1,7 @@
 name: PeerBrush
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   native:
     strategy:
@@ -24,3 +26,27 @@ jobs:
         with:
           name: PeerBrush-${{ runner.os }}
           path: dist/*.zip
+
+  inspect:
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PeerBrush-*
+          path: candidates
+      - name: Inspect matching platform archives and source
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-packages
+          path: dist/*
+          if-no-files-found: error

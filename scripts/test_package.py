@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import plistlib
 import struct
@@ -40,9 +41,27 @@ class Packages(unittest.TestCase):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         for name, content in {'Cargo.toml': '[package]\nname="peerbrush"\nversion="0.2.0"\n', 'Cargo.lock': 'version=4\n[[package]]\nname="peerbrush"\nversion="0.2.0"\n', 'LICENSE': 'GNU GENERAL PUBLIC LICENSE\nGPL-3.0-only\n', 'README.md': 'Synthetic package fixture\n', 'FOLLOWUPS.MD': 'Synthetic backlog\n', 'assets/fonts/LICENCE.txt': 'Synthetic font license\n', 'assets/peerbrush-logo.png': 'Synthetic artwork\n', 'src/lib.rs': '// synthetic\n', 'scripts/start-windows.cmd': '@echo off\n', 'docs/usage.md': 'Synthetic instructions\n'}.items():
             (self.root / name).write_text(content, encoding='utf-8')
+        (self.root / 'scripts/package-readme.md').write_text('Synthetic focused package README: {{SOURCE_ARCHIVE}}\n', encoding='utf-8')
+        (self.root / '.gitignore').write_text('/output/\n/verified/\n/rejected/\n/registry/\n/synthetic-binary\n', encoding='utf-8')
+        (self.root / 'integrations').mkdir()
+        (self.root / 'integrations/segmentation_rembg.py').write_text('# Synthetic provider\n', encoding='utf-8')
+        self.policy = {
+            'version': 1,
+            'source': sorted([p.relative_to(self.root).as_posix() for p in self.root.rglob('*') if p.is_file() and p.name not in ['README.md', 'FOLLOWUPS.MD', '.gitignore']] + [packaging.MANIFEST]),
+            'portable': ['LICENSE', 'assets/fonts/LICENCE.txt', 'assets/peerbrush-logo.png', 'docs/usage.md', 'integrations/segmentation_rembg.py'],
+            'readme': 'scripts/package-readme.md', 'vendored': [], 'rust_notices': ['COPYRIGHT.html', 'COPYRIGHT-library.html'],
+        }
+        self.save_policy()
         for args in [('init', '-q'), ('add', '.'), ('-c', 'user.name=Package Tests', '-c', 'user.email=package-tests@example.invalid', 'commit', '-qm', 'Synthetic fixture')]:
             subprocess.run(['git', '-C', str(self.root), *args], check=True, capture_output=True)
         self.output = self.root / 'output'
+
+    def save_policy(self):
+        (self.root / packaging.MANIFEST).write_text(json.dumps(self.policy), encoding='utf-8')
+
+    def commit(self):
+        subprocess.run(['git', '-C', str(self.root), 'add', '-A'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Package Tests', '-c', 'user.email=package-tests@example.invalid', 'commit', '-qm', 'Synthetic update'], check=True, capture_output=True)
 
     def build(self, platform):
         header = bytearray(128)
@@ -129,6 +148,178 @@ class Packages(unittest.TestCase):
         packaging.write_zip(mac, tampered, 1700000000)
         with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
             verify_release.verify(self.output, commit, '0.2.0', self.root / 'rejected', self.root)
+
+
+    def test_tracked_private_files_are_excluded_by_the_reviewed_policy(self):
+        canary = b'SYNTHETIC_PRIVATE_CANARY_NOT_A_SECRET'
+        for name in ['docs/connection.json', 'docs/outreach-plan.md', 'assets/.env', 'scripts/signing-key.pfx', 'AGENTS.md', 'website/.openai/hosting.json', 'docs/videos/marketing.mp4', 'assets/examples/website-demo.psd']:
+            p = self.root / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(canary)
+        self.commit()
+        archive = self.build('Windows')
+        with zipfile.ZipFile(archive) as bundle:
+            prefix = archive.stem + '/'
+            manifest = json.loads(bundle.read(prefix + 'release.json'))
+            self.assertNotIn(prefix + 'FOLLOWUPS.MD', bundle.namelist())
+            self.assertTrue(all(canary not in bundle.read(n) for n in bundle.namelist()))
+            with zipfile.ZipFile(io.BytesIO(bundle.read(prefix + manifest['source']))) as sources:
+                self.assertEqual(set(sources.namelist()), set(self.policy['source']) | {'README.md'})
+                self.assertTrue(all(canary not in sources.read(n) for n in sources.namelist()))
+                self.assertIn('integrations/segmentation_rembg.py', sources.namelist())
+                self.assertIn(b'Synthetic focused', sources.read('README.md'))
+                self.assertIn(manifest['source'].encode(), sources.read('README.md'))
+
+    def test_unlisted_compiler_inputs_fail_and_preserve_existing_outputs(self):
+        initial = self.build('Windows')
+        original = initial.read_bytes()
+        (self.root / 'src/new.rs').write_text('// synthetic new module')
+        self.commit()
+        with self.assertRaisesRegex(ValueError, 'Compiler input inventory'):
+            self.build('Windows')
+        self.assertEqual(initial.read_bytes(), original)
+        self.assertFalse(list(self.output.glob('.peerbrush-package-*')))
+
+    def test_committed_missing_inputs_and_invalid_manifest_paths_are_rejected(self):
+        tree = {name: None for name in self.policy['source']}
+        for name in ['../escape', '/absolute', 'docs/../escape', 'docs\\escape', 'docs/CON.txt', 'docs/name.', 'docs/name ', 'docs/name:alternate', 'README.md', 'licenses/private.txt', 'PeerBrush.app/private.txt']:
+            with self.subTest(name=name):
+                policy = dict(self.policy, source=self.policy['source'] + [name])
+                with self.assertRaises(ValueError):
+                    packaging.validate_policy(policy, tree | {name: None})
+        duplicate = dict(self.policy, source=self.policy['source'] + ['LICENSE'])
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            packaging.validate_policy(duplicate, tree)
+        (self.root / 'docs/usage.md').unlink()
+        self.commit()
+        with self.assertRaisesRegex(ValueError, 'Missing committed package input'):
+            self.build('Windows')
+
+    def test_source_snapshot_is_pinned_when_head_changes(self):
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        original = dict((n, d) for n, d, _ in packaging.source_files(self.root, commit))
+        (self.root / 'src/lib.rs').write_text('// newer concurrent commit')
+        self.commit()
+        selected = dict((n, d) for n, d, _ in packaging.source_files(self.root, commit))
+        self.assertEqual(selected, original)
+        self.assertNotEqual(dict((n, d) for n, d, _ in packaging.source_files(self.root)), original)
+
+    def test_binary_privacy_gate_is_not_skipped_by_synthetic_execution_override(self):
+        canaries = [b'C:\\Users\\synthetic person\\build\\file.rs', b'/home/synthetic-person/build/file.rs', b'/Users/synthetic-person/build/file.rs', b'-----BEGIN PRIVATE KEY-----', b'ghp_' + b'x' * 36]
+        for value in canaries:
+            with self.subTest(value_type='synthetic marker'):
+                for data in [value, value.decode().encode('utf-16le'), value.decode().encode('utf-16be')]:
+                    with self.assertRaisesRegex(ValueError, 'credential marker or personal build path'):
+                        packaging.validate_binary(data)
+        self.build('Windows')
+        binary = self.root / 'synthetic-binary'
+        binary.write_bytes(binary.read_bytes() + canaries[0])
+        with self.assertRaisesRegex(ValueError, 'credential marker or personal build path'):
+            packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False)
+
+    def test_dependency_notice_selection_rejects_traversal_and_ignores_private_files(self):
+        lock = 'version=4\n[[package]]\nname="dep"\nversion="1.0.0"\nsource="registry+https://example.invalid"\n'
+        (self.root / 'Cargo.lock').write_text(lock)
+        self.commit()
+        crate = self.root / 'registry/test/dep-1.0.0'
+        for name, data in {'Cargo.toml': '[package]\nname="dep"\nversion="1.0.0"\nlicense="MIT"\nlicense-file="legal/custom.txt"\n', 'LICENSE-MIT': 'Synthetic license', 'LICENSE-private-notes.txt': 'PRIVATE_CANARY', 'legal/custom.txt': 'Synthetic declared license', 'fonts/NOTICE.txt': 'Synthetic font notice', 'fonts/connection.txt': 'PRIVATE_CANARY', 'fonts/LICENSE-private.txt': 'PRIVATE_CANARY', '.cargo-checksum.json': json.dumps({'files': {'fonts/NOTICE.txt': 'synthetic'}})}.items():
+            p = crate / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(data)
+        archive = self.build('Windows')
+        with zipfile.ZipFile(archive) as bundle:
+            prefix = archive.stem + '/'
+            notices = json.loads(bundle.read(prefix + 'release.json'))['notice_files']
+            self.assertEqual(set(notices), {'licenses/dep-1.0.0/LICENSE-MIT', 'licenses/dep-1.0.0/legal/custom.txt', 'licenses/dep-1.0.0/fonts/NOTICE.txt', 'licenses/ubuntu-sans/LICENCE.txt'})
+            self.assertTrue(all(b'PRIVATE_CANARY' not in bundle.read(n) for n in bundle.namelist()))
+        original = archive.read_bytes()
+        source = self.output / 'PeerBrush-0.2.0-source.zip'
+        source_original = source.read_bytes()
+        (crate / 'Cargo.toml').write_text('[package]\nname="dep"\nversion="1.0.0"\nlicense-file="../outside.txt"\n')
+        with self.assertRaises(ValueError):
+            self.build('Windows')
+        self.assertEqual(archive.read_bytes(), original)
+        self.assertEqual(source.read_bytes(), source_original)
+        self.assertFalse(list(self.output.glob('.peerbrush-package-*')))
+
+    def test_windows_junction_notice_inputs_are_rejected(self):
+        if os.name != 'nt':
+            self.skipTest('Windows junction behavior')
+        outside = self.root / 'outside-notices'
+        outside.mkdir()
+        (outside / 'LICENSE').write_text('Synthetic private fixture')
+        junction = self.root / 'junction'
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(junction), str(outside)], check=True, capture_output=True)
+        try:
+            with self.assertRaisesRegex(ValueError, 'links or reparse'):
+                packaging.regular_file(self.root, 'junction/LICENSE')
+        finally:
+            junction.rmdir()
+
+    def test_inspector_rejects_extra_entries_and_changed_notices(self):
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        for platform in ['Windows', 'Linux', 'macOS']:
+            self.build(platform)
+        archive_path = self.output / 'PeerBrush-0.2.0-Windows-x64.zip'
+        original = archive_path.read_bytes()
+        with zipfile.ZipFile(archive_path, 'a') as archive:
+            archive.writestr(archive_path.stem + '/private-notes.txt', b'Synthetic private canary')
+        with self.assertRaisesRegex(ValueError, 'Unexpected or missing release entries'):
+            verify_release.verify(self.output, commit, '0.2.0', self.root / 'rejected', self.root)
+        archive_path.write_bytes(original)
+        with zipfile.ZipFile(archive_path) as archive:
+            files = [(i.filename, archive.read(i.filename), i.external_attr >> 16 & 0o777) for i in archive.infolist()]
+        tampered = [(name, data + b'changed' if '/licenses/' in name else data, mode) for name, data, mode in files]
+        packaging.write_zip(archive_path, tampered, 1700000000)
+        with self.assertRaisesRegex(ValueError, 'License notice checksum mismatch'):
+            verify_release.verify(self.output, commit, '0.2.0', self.root / 'rejected', self.root)
+
+
+    def test_repack_provenance_requires_identical_application_build_inputs(self):
+        original_commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        (self.root / 'docs/usage.md').write_text('Updated public guide')
+        self.commit()
+        sources = packaging.source_files(self.root)
+        packaging.equivalent_build_inputs(self.root, sources, original_commit)
+        self.build('Windows')
+        binary = self.root / 'synthetic-binary'
+        with contextlib.redirect_stdout(io.StringIO()):
+            archive_path = packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, binary_source_commit=original_commit)
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
+            self.assertEqual(manifest['binary_source_commit'], original_commit)
+            self.assertEqual(manifest['commit'], packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip())
+            self.assertNotEqual(manifest['commit'], manifest['binary_source_commit'])
+        (self.root / 'src/lib.rs').write_text('// changed application source')
+        self.commit()
+        with self.assertRaisesRegex(ValueError, 'source inputs differ'):
+            packaging.equivalent_build_inputs(self.root, packaging.source_files(self.root), original_commit)
+
+    def test_embedded_font_notice_inventory_preserves_real_upstream_names(self):
+        (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\nname="epaint_default_fonts"\nversion="0.31.1"\nsource="registry+https://example.invalid"\n')
+        self.commit()
+        crate = self.root / 'registry/test/epaint_default_fonts-0.31.1'
+        crate.mkdir(parents=True)
+        (crate / 'Cargo.toml').write_text('[package]\nname="epaint_default_fonts"\nversion="0.31.1"\nlicense="MIT"\n')
+        names = packaging.EMBEDDED_FONT_NOTICES['epaint_default_fonts']
+        for name in names:
+            path = crate / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('Synthetic font license')
+        (crate / 'fonts/private.txt').write_text('SYNTHETIC_PRIVATE_CANARY')
+        (crate / '.cargo-checksum.json').write_text(json.dumps({'files':{name:'synthetic' for name in names}}))
+        archive_path = self.build('Windows')
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
+            self.assertTrue({'licenses/epaint_default_fonts-0.31.1/' + name for name in names} <= set(manifest['notice_files']))
+            self.assertFalse(any(name.endswith('/private.txt') for name in archive.namelist()))
+
+    def test_archive_paths_reject_case_aliases_and_control_characters(self):
+        with self.assertRaisesRegex(ValueError, 'duplicate archive paths'):
+            packaging.write_zip(self.root / 'bad.zip', [('a.txt',b'one',0o644),('A.txt',b'two',0o644)], 1700000000)
+        for name in ['docs/tab\t.txt', 'docs/newline\n.txt']:
+            with self.assertRaises(ValueError):
+                packaging.relative_path(name)
 
 
 if __name__ == '__main__':
