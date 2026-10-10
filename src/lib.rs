@@ -31,6 +31,7 @@ pub mod placement;
 pub mod preview;
 pub mod psd;
 pub mod raster;
+pub mod recovery;
 pub(crate) mod render;
 pub mod retained;
 pub mod retouch;

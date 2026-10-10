@@ -9,6 +9,7 @@ mod history;
 mod layers;
 mod lifecycle;
 mod liquify;
+mod recovery;
 mod refinement;
 mod retouch;
 mod selection;
@@ -281,6 +282,7 @@ pub struct PeerBrush {
     doc_snapshot: Document,
     jobs: HashSet<String>,
     lifecycle: Option<lifecycle::Review>,
+    recovery: recovery::Browser,
     lifecycle_frame: bool,
     exit_approved: bool,
     connected: bool,
@@ -560,6 +562,7 @@ impl PeerBrush {
             (e.project_id.clone(), e.doc.clone())
         };
         Self {
+            recovery: recovery::Browser::new(&connection.state_dir),
             workspace_root: shared.clone(),
             workspace,
             project_id,
@@ -4064,6 +4067,11 @@ impl PeerBrush {
                             self.open();
                             ui.close_menu();
                         }
+                        if ui.button("Recover autosaved work…").clicked() {
+                            self.recovery = recovery::Browser::new(&self.connection.state_dir);
+                            self.recovery.open = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Save PSD").clicked() {
                             self.save(false);
                             ui.close_menu();
@@ -4185,6 +4193,7 @@ impl PeerBrush {
                     self.selection_toolbar(ui);
                 });
         }
+        self.recovery_failure(ctx);
         egui::TopBottomPanel::bottom("status")
             .exact_height(28.0)
             .show(ctx, |ui| {
@@ -4547,16 +4556,10 @@ impl PeerBrush {
                 ui.add(egui::TextEdit::multiline(&mut display).font(egui::TextStyle::Monospace).desired_rows(if self.connection_codex { 4 } else { 8 }).desired_width(f32::INFINITY));
                 if ui.button("Copy configuration").clicked() { ui.ctx().copy_text(config); }
                 ui.label(RichText::new(format!("Local endpoint · 127.0.0.1:{}", self.connection.port)).size(11.0).color(MUTED));
-                if self.connection.state_dir.join("recovery.psd").exists() && ui.button("Recover last autosave").clicked() {
-                    let path = self.connection.state_dir.join("recovery.psd");
-                    self.open_job(Some(path),true);
-                }
-                for (name,path) in server::recovery_projects(&self.connection.state_dir) {
-                    if ui.button(format!("Recover {name}")).clicked() {self.open_job(Some(path),true);}
-                }
             });
             self.show_connection = open;
         }
+        self.recovery_window(ctx);
         let loading = self
             .load_control
             .clone()

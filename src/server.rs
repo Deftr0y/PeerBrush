@@ -30,13 +30,48 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
-        fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+        replace_file(&tmp, path)?;
+        sync_parent(path)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
+    fs::rename(from, to).map_err(|e| e.to_string())
+}
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+    let from: Vec<_> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<_> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Same-directory replacement, with Windows write-through durability.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+pub(crate) fn sync_parent(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 fn file_version(path: &Path) -> Result<(u64, u128), String> {
     let m = fs::metadata(path).map_err(|e| e.to_string())?;
@@ -349,6 +384,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_capabilities","description":"Get concise supported operations and runnable JSON examples before editing.","inputSchema":{"type":"object","properties":{}}}
         ,{"name":"peerbrush_brushes","description":"Browse original brush presets, render actual stroke previews, and save/update/delete instance-local custom brushes. Presets work in paint/smudge/clone/heal commands via preset ID with explicit setting overrides. This library is outside document history; curated presets are immutable. Preview coordinates refer to brush_preview, not the document.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","preview","save","delete"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"settings":{"type":"object"},"width":{"type":"integer","minimum":64,"maximum":512},"height":{"type":"integer","minimum":24,"maximum":128}},"required":["action"],"additionalProperties":false}}
     ]);
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_recovery","description":"List complete instance-local autosave versions and failures. Restore an explicit snapshot into a new independent unsaved project, retaining original files and recovery versions. Returns actual image content with coordinates. Only human input may discard an explicit version; never discard to hide an autosave failure.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","restore","discard"]},"snapshot":{"type":"string"},"actor":{"type":"string"}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_filters","description":"Browse whole-image filter presets; thumbnail renders a standard reference image, preview renders the explicitly targeted current project without history and returns frozen commands. Apply with peerbrush_edit filter.add/update; edit settings, strength, bypass, delete and reorder non-destructively. Top filters run last after the composite. Save/rename/delete/import/export validated instance-local custom presets outside history. Curated presets are immutable. Preview requires current project_id/document_id/expected_revision; original 8/16-bit sources stay editable.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","thumbnail","preview","save","rename","delete","import","export"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"kind":{"type":"string"},"settings":{"type":"object"},"weight":{"type":"number","minimum":0,"maximum":1},"data":{"type":"object"},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_code","description":"Run bounded Rhai code against a frozen native 8/16-bit project, then commit shared commands atomically. start requires explicit project/document/revision, a named AI actor, active owned task, description and declared scopes. Code cannot bypass locks/reservations or read files/network. Returns run ID immediately; status returns completion and actual PNG with document coordinates. cancel or human takeover discards unfinished work. read_pixel, begin_pixels, write_pixel, commit_pixels and edit are documented in capabilities. One undo step; source changes reject the whole run.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","cancel"]},"actor":{"type":"string"},"task":{"type":"string"},"run":{"type":"string"},"description":{"type":"string","maxLength":240},"scopes":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}},"additionalProperties":false}},"script":{"type":"string","maxLength":65536},"max_edge":{"type":"integer","minimum":32,"maximum":1024}},"required":["action","project_id","document_id"],"additionalProperties":false}}));
     for tool in tools.as_array_mut().unwrap() {
@@ -433,6 +469,51 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
+    if method == "recovery" {
+        let workspace = crate::workspace::attach(shared);
+        let (dir, error) = {
+            let state = workspace.lock().unwrap();
+            (
+                state
+                    .recovery_dir
+                    .clone()
+                    .ok_or("Recovery storage is not initialized")?,
+                state.recovery_error.clone(),
+            )
+        };
+        return match p["action"].as_str().unwrap_or("list") {
+            "list" => Ok(
+                json!({"versions":crate::recovery::catalog(&dir),"autosave_error":error,"versions_per_project":crate::recovery::VERSIONS_PER_PROJECT,"max_bytes":crate::recovery::MAX_BYTES}),
+            ),
+            "restore" => {
+                let snapshot = p["snapshot"]
+                    .as_str()
+                    .ok_or("Choose an explicit recovery snapshot")?;
+                let restored = crate::recovery::restore(
+                    &workspace,
+                    &dir,
+                    snapshot,
+                    &crate::loading::Control::default(),
+                    None,
+                )?;
+                let mut result = observation(&restored, &json!({}))?;
+                result["project_id"] = json!(restored.lock().unwrap().project_id);
+                result["recovery_retained"] = json!(true);
+                Ok(result)
+            }
+            "discard" if p["actor"] == "human" => {
+                crate::recovery::discard(
+                    &dir,
+                    p["snapshot"]
+                        .as_str()
+                        .ok_or("Choose an explicit recovery snapshot")?,
+                )?;
+                Ok(json!({"discarded":p["snapshot"]}))
+            }
+            "discard" => Err("Only human input may discard recovery versions".into()),
+            _ => Err("Unknown recovery action".into()),
+        };
+    }
     if method == "projects" {
         return projects(shared, p);
     }
@@ -1163,6 +1244,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
                 "filters",
                 "image_info",
                 "projects",
+                "recovery",
                 "observe",
                 "edit",
                 "code",
@@ -1930,6 +2012,7 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
     }
     *shared.lock().unwrap().filter_library.lock().unwrap() = library;
     let workspace = crate::workspace::attach(&shared);
+    workspace.lock().unwrap().recovery_dir = Some(state_dir.clone());
     // Preserve the preceding session's index before the running session updates its own.
     if let Ok(bytes) = fs::read(state_dir.join("recoveries.json")) {
         if bytes.len() < 65536
@@ -1970,102 +2053,24 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         instance_lock: Some(instance_lock),
     })
 }
-pub type RecoveryVersions = std::collections::HashMap<String, (String, u64, Value)>;
+pub type RecoveryVersions = crate::recovery::Versions;
 pub fn checkpoint_projects(
     workspace: &crate::workspace::Registry,
     state_dir: &Path,
     previous: &mut RecoveryVersions,
 ) {
-    let entries = crate::workspace::entries_in(workspace);
-    let live: std::collections::HashSet<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
-    previous.retain(|id, _| live.contains(id));
-    for (project, _, shared) in entries {
-        let doc = if let Ok(e) = shared.try_lock() {
-            if e.closed || e.doc.read_only || e.doc.revision == e.saved_revision {
-                previous.remove(&project);
-                continue;
-            }
-            if previous
-                .get(&project)
-                .is_some_and(|(id, rev, _)| id == &e.doc.id && *rev == e.doc.revision)
-            {
-                continue;
-            }
-            e.doc.clone()
-        } else {
-            continue;
-        };
-        let Ok(bytes) = psd::encode(&doc) else {
-            continue;
-        };
-        let Ok(e) = shared.try_lock() else {
-            continue;
-        };
-        if e.closed
-            || e.doc.id != doc.id
-            || e.doc.revision != doc.revision
-            || e.saved_revision == doc.revision
-        {
-            continue;
-        }
-        let filename = format!("recovery-{project}.psd");
-        if atomic_write(&state_dir.join(&filename), &bytes).is_ok() {
-            previous.insert(project.clone(),(doc.id.clone(),doc.revision,json!({"project_id":project,"document_id":doc.id,"revision":doc.revision,"name":doc.name,"file":filename,"original_path":e.path,"bit_depth":doc.bit_depth})));
-        }
-    }
-    let entries: Vec<_> = previous
-        .values()
-        .map(|(_, _, entry)| entry.clone())
-        .collect();
-    let _ = atomic_write(
-        &state_dir.join("recoveries.json"),
-        &serde_json::to_vec(&json!({"version":1,"projects":entries})).unwrap(),
-    );
+    crate::recovery::checkpoint(workspace, state_dir, previous);
 }
 pub fn recovery_projects(state_dir: &Path) -> Vec<(String, PathBuf)> {
-    let mut results = vec![];
     let mut seen = std::collections::HashSet::new();
-    for file in ["recoveries.json", "previous-recoveries.json"] {
-        let Ok(bytes) = fs::read(state_dir.join(file)) else {
-            continue;
-        };
-        if bytes.len() > 65536 {
-            continue;
-        }
-        let Ok(index) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        for entry in index["projects"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(crate::workspace::MAX_PROJECTS)
-        {
-            let Some(project) = entry["project_id"].as_str() else {
-                continue;
-            };
-            if uuid::Uuid::parse_str(project).is_err() || !seen.insert(project.to_owned()) {
-                continue;
-            }
-            let filename = format!("recovery-{project}.psd");
-            if entry["file"] != filename {
-                continue;
-            }
-            let path = state_dir.join(filename);
-            if path.is_file() {
-                results.push((
-                    entry["name"]
-                        .as_str()
-                        .unwrap_or("Recovered project")
-                        .to_owned(),
-                    path,
-                ));
-            }
-        }
-    }
+    let mut results: Vec<_> = crate::recovery::catalog(state_dir)
+        .into_iter()
+        .filter(|e| seen.insert(e.project_id.clone()))
+        .map(|e| (e.name, state_dir.join(e.file)))
+        .collect();
+    results.extend(crate::recovery::legacy(state_dir));
     results
 }
-
 use std::io::Read;
 pub fn default_state_dir() -> PathBuf {
     std::env::temp_dir().join("PeerBrush")
