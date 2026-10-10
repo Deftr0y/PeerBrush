@@ -96,6 +96,35 @@ fn rows(
     }
 }
 impl PeerBrush {
+    pub(super) fn set_solo(&mut self, active: bool) {
+        self.isolate = active;
+        self.solo_target = active.then(|| (self.selected.clone(), self.mask));
+        self.last_preview = None;
+    }
+    pub(super) fn sync_solo(&mut self, doc: &Document) {
+        if !self.isolate {
+            self.solo_target = None;
+            return;
+        }
+        let target = (self.selected.clone(), self.mask);
+        let valid = doc
+            .layers
+            .iter()
+            .any(|l| l.id == target.0 && (!target.1 || l.mask.is_some()));
+        if !valid || self.solo_target.as_ref().is_some_and(|old| old != &target) {
+            self.set_solo(false);
+        } else {
+            self.solo_target = Some(target);
+        }
+    }
+    pub(super) fn select_channel(&mut self, mask: bool) {
+        if self.mask != mask {
+            self.set_solo(false);
+            self.mask_step = None;
+            self.last_preview = None;
+        }
+        self.mask = mask;
+    }
     pub(super) fn solo_caption(&self, doc: &Document) -> Option<String> {
         self.isolate
             .then(|| doc.layers.iter().find(|l| l.id == self.selected))
@@ -209,15 +238,22 @@ impl PeerBrush {
         }
     }
     pub(super) fn select_content(&mut self, id: &str) {
+        self.select_target(id, false);
+    }
+    fn select_target(&mut self, id: &str, mask: bool) {
+        if self.selected != id || self.mask != mask {
+            self.set_solo(false);
+        }
         self.liquify_effect = None;
         self.selected = id.into();
         self.selection_layers = [id.to_string()].into_iter().collect();
         self.selection_anchor = id.into();
-        self.mask = false;
+        self.mask = mask;
         self.mask_step = None;
         self.last_preview = None;
     }
     fn select_row(&mut self, ui: &egui::Ui, doc: &Document, id: &str) {
+        let previous = (self.selected.clone(), self.mask);
         self.layer_clipboard = true;
         let mods = click_modifiers(ui);
         let command = mods.command || mods.ctrl;
@@ -258,6 +294,9 @@ impl PeerBrush {
             self.selection_anchor = id.into();
         } else {
             self.select_content(id);
+        }
+        if previous != (self.selected.clone(), false) {
+            self.set_solo(false);
         }
         self.mask = false;
         self.mask_step = None;
@@ -460,15 +499,16 @@ impl PeerBrush {
                     )
                     .clicked()
                 {
-                    self.select_content(&l.id);
+                    let was_solo_mask = self.isolate && self.selected == l.id && self.mask;
                     self.layer_clipboard = false;
                     self.mask_step = None;
                     if ui.input(|i| i.modifiers.shift) {
+                        self.select_content(&l.id);
                         self.layer_cmd("mask.toggle", json!({}), "Toggle mask");
                     } else {
-                        self.mask = true;
+                        self.select_target(&l.id, true);
                         if ui.input(|i| i.modifiers.alt) {
-                            self.isolate = !self.isolate;
+                            self.set_solo(!was_solo_mask);
                         }
                         self.last_preview = None;
                     }

@@ -300,6 +300,7 @@ pub struct PeerBrush {
     eye_sweep: Option<EyeSweep>,
     mask: bool,
     isolate: bool,
+    solo_target: Option<(String, bool)>,
     tool: Tool,
     selection_kind: String,
     selection_mode: String,
@@ -593,6 +594,7 @@ impl PeerBrush {
             selected,
             mask: false,
             isolate: false,
+            solo_target: None,
             tool: Tool::Brush,
             selection_kind: "rectangle".into(),
             selection_mode: "replace".into(),
@@ -1753,6 +1755,7 @@ impl PeerBrush {
             self.cancel_refinement();
         }
         let doc = &current;
+        self.sync_solo(doc);
         let proposal_doc = self.review_document(&current);
         let preview_mask = self.mask && self.isolate && self.proposal_review.is_none();
         let time = ctx.input(|i| i.time);
@@ -2256,7 +2259,7 @@ impl PeerBrush {
         };
         match result {
             Ok(_) => {
-                self.mask = true;
+                self.select_channel(true);
                 self.mask_step = None;
                 self.last_preview = None;
                 self.message = "Added masks".into();
@@ -2280,8 +2283,7 @@ impl PeerBrush {
         self.color_tab_rect = Some(color.rect);
         if color.clicked() {
             self.finish_parameter(true);
-            self.mask = false;
-            self.last_preview = None;
+            self.select_channel(false);
         }
         let mask = ui.add_enabled(
             has_mask || !doc.read_only,
@@ -2299,8 +2301,7 @@ impl PeerBrush {
         if mask.clicked() {
             self.finish_parameter(true);
             if has_mask {
-                self.mask = true;
-                self.last_preview = None;
+                self.select_channel(true);
             } else {
                 self.add_selected_masks(doc);
             }
@@ -2353,7 +2354,7 @@ impl PeerBrush {
         self.effect_area_rect = None;
         if let Some(l) = selected {
             if l.mask.is_none() {
-                self.mask = false;
+                self.select_channel(false);
                 self.mask_step = None;
             }
             let remaining = ui.available_rect_before_wrap();
@@ -2384,8 +2385,7 @@ impl PeerBrush {
                                 .on_hover_text(if self.isolate {"Return to the full document"} else {"View only the selected Color or Mask target"})
                                 .clicked()
                             {
-                                self.isolate = !self.isolate;
-                                self.last_preview = None;
+                                self.set_solo(!self.isolate);
                             }
                         });
                     });
@@ -3313,7 +3313,7 @@ impl PeerBrush {
             self.mask = view.mask;
             self.mask_step = view.mask_step;
             self.effect_selected = view.effect_selected;
-            self.isolate = view.isolate;
+            self.set_solo(view.isolate);
             self.collapsed = view.collapsed;
             self.zoom = view.zoom;
             self.pan = view.pan;
@@ -3325,7 +3325,7 @@ impl PeerBrush {
             self.mask = false;
             self.mask_step = None;
             self.effect_selected = None;
-            self.isolate = false;
+            self.set_solo(false);
             self.collapsed.clear();
             self.zoom = 1.;
             self.pan = Vec2::ZERO;
@@ -3619,7 +3619,7 @@ impl PeerBrush {
             self.show_brush = panel == "brush";
             if panel == "solo_color" || panel == "solo_mask" {
                 self.mask = panel == "solo_mask";
-                self.isolate = !self.mask
+                let active = !self.mask
                     || self
                         .shared
                         .lock()
@@ -3628,6 +3628,7 @@ impl PeerBrush {
                         .layers
                         .iter()
                         .any(|l| l.id == self.selected && l.mask.is_some());
+                self.set_solo(active);
                 if !self.isolate {
                     self.message = "Selected layer has no mask for solo viewing".into();
                 }
@@ -3933,6 +3934,7 @@ impl PeerBrush {
             self.selection_layers.insert(self.selected.clone());
         }
         if !doc.layers.iter().any(|l| l.id == self.selected) {
+            self.set_solo(false);
             self.selected = doc.layers.first().map(|l| l.id.clone()).unwrap_or_default();
             self.mask = false;
             self.selection_layers = [self.selected.clone()].into_iter().collect();
@@ -4450,6 +4452,7 @@ impl PeerBrush {
                 ui.add_space((ui.available_height() - 64.0).max(0.0));
                 self.palette(ui);
             });
+        self.sync_solo(&doc);
         egui::SidePanel::right("layer_panel")
             .default_width(320.0)
             .min_width(300.0)
@@ -4471,6 +4474,7 @@ impl PeerBrush {
                 }
                 self.layers(ui, &display);
             });
+        self.sync_solo(&doc);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -4794,6 +4798,7 @@ mod tests {
             .unwrap();
         app.mask = true;
         app.mask_step = Some("step-view".into());
+        app.set_solo(true);
         app.zoom = 1.75;
         app.pan = Vec2::new(9., -4.);
         app.collapsed.insert("folder-view".into());
@@ -4821,6 +4826,8 @@ mod tests {
         assert_eq!(app.selected, selected);
         assert!(app.mask);
         assert_eq!(app.mask_step.as_deref(), Some("step-view"));
+        assert!(app.isolate);
+        assert_eq!(app.solo_target, Some((selected.clone(), true)));
         assert_eq!(app.zoom, 1.75);
         assert_eq!(app.pan, Vec2::new(9., -4.));
         assert!(app.collapsed.contains("folder-view"));
@@ -9678,6 +9685,246 @@ mod tests {
                 assert_eq!(crate::psd::encode(&e.doc).unwrap(), saved);
                 assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
             }
+        }
+    }
+    #[test]
+    fn solo_exits_on_layer_and_channel_clicks_and_restores_actual_composite() {
+        for depth in [8, 16] {
+            let (mut app, ctx, before) = solo_fixture(depth);
+            let target = &before.layers[0].id;
+            let other = &before.layers[1].id;
+            let saved = crate::psd::encode(&before).unwrap();
+            for modifiers in [
+                Default::default(),
+                egui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ] {
+                app.select_content(target);
+                app.set_solo(true);
+                frame(&mut app, &ctx, vec![], Default::default());
+                let row = app.layer_rects[target];
+                click(&mut app, &ctx, egui::pos2(row.right() - 6., row.top() + 2.));
+                assert!(app.isolate, "Selecting the same Color target keeps solo");
+                let row = app.layer_rects[other];
+                solo_click(
+                    &mut app,
+                    &ctx,
+                    egui::pos2(row.right() - 6., row.top() + 2.),
+                    modifiers,
+                );
+                assert_eq!(&app.selected, other);
+                assert!(!app.isolate);
+                assert!(app.solo_target.is_none());
+                wait_solo_pixels(&mut app, &ctx, &before, None, false);
+            }
+            for mask in [false, true] {
+                app.select_content(target);
+                app.select_channel(mask);
+                app.set_solo(true);
+                frame(&mut app, &ctx, vec![], Default::default());
+                let same = if mask {
+                    app.mask_tab_rect
+                } else {
+                    app.color_tab_rect
+                }
+                .unwrap()
+                .center();
+                click(&mut app, &ctx, same);
+                assert!(app.isolate, "Selecting the same channel keeps solo");
+                let other = if mask {
+                    app.color_tab_rect
+                } else {
+                    app.mask_tab_rect
+                }
+                .unwrap()
+                .center();
+                click(&mut app, &ctx, other);
+                assert!(!app.isolate);
+                assert_eq!(app.mask, !mask);
+                wait_solo_pixels(&mut app, &ctx, &before, None, false);
+                assert!(app.solo_caption(&before).is_none());
+            }
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            for name in ["Solo target", "Other layer"] {
+                assert!(out.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text==name && t.galley.rows[0].visuals.mesh.vertices[0].color.a()==255)));
+            }
+            let e = app.shared.lock().unwrap();
+            assert!(e.undo.is_empty());
+            assert_eq!(crate::psd::encode(&e.doc).unwrap(), saved);
+        }
+    }
+    #[test]
+    fn solo_mask_thumbnails_preserve_the_same_target_and_alt_explicitly_toggles_new_targets() {
+        let (mut app, ctx, before) = solo_fixture(16);
+        let target = &before.layers[0].id;
+        let other = &before.layers[1].id;
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        frame(&mut app, &ctx, vec![], Default::default());
+        let mask_pos = |app: &mut PeerBrush, id: &str| {
+            // The caption adds/removes a line above the stack; use current layout.
+            frame(app, &ctx, vec![], Default::default());
+            app.layer_rects[id].right_center() - Vec2::new(19., 0.)
+        };
+        let p = mask_pos(&mut app, target);
+        solo_click(&mut app, &ctx, p, alt);
+        assert!(app.isolate && app.mask);
+        assert_eq!(&app.selected, target);
+        let p = mask_pos(&mut app, target);
+        click(&mut app, &ctx, p);
+        assert!(app.isolate && app.mask);
+        let p = mask_pos(&mut app, other);
+        click(&mut app, &ctx, p);
+        assert!(!app.isolate && app.mask);
+        assert_eq!(&app.selected, other);
+        let p = mask_pos(&mut app, other);
+        solo_click(&mut app, &ctx, p, alt);
+        assert!(app.isolate && app.mask);
+        let p = mask_pos(&mut app, target);
+        solo_click(&mut app, &ctx, p, alt);
+        assert!(app.isolate && app.mask);
+        assert_eq!(&app.selected, target);
+        let p = mask_pos(&mut app, target);
+        solo_click(&mut app, &ctx, p, alt);
+        assert!(!app.isolate && app.mask);
+        let e = app.shared.lock().unwrap();
+        assert!(e.undo.is_empty());
+        assert_eq!(
+            crate::psd::encode(&e.doc).unwrap(),
+            crate::psd::encode(&before).unwrap()
+        );
+    }
+    #[test]
+    fn solo_exits_when_shared_edits_remove_its_mask_or_layer_and_undo_does_not_reenable_it() {
+        for depth in [8, 16] {
+            let (mut app, ctx, before) = solo_fixture(depth);
+            let target = &before.layers[0].id;
+            let other = &before.layers[1].id;
+            for op in ["mask.remove", "layer.delete"] {
+                app.select_content(target);
+                app.select_channel(op == "mask.remove");
+                app.set_solo(true);
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .edit(
+                        "human",
+                        &[json!({"op":op,"layer":target})],
+                        None,
+                        None,
+                        "Remove solo target",
+                    )
+                    .unwrap();
+                frame(&mut app, &ctx, vec![], Default::default());
+                assert!(!app.isolate && !app.mask);
+                let current = app.shared.lock().unwrap().doc.clone();
+                wait_solo_pixels(&mut app, &ctx, &current, None, false);
+                app.shared.lock().unwrap().undo("human").unwrap();
+                frame(&mut app, &ctx, vec![], Default::default());
+                assert!(!app.isolate);
+                assert_eq!(
+                    app.shared.lock().unwrap().doc.export_png().unwrap(),
+                    before.export_png().unwrap()
+                );
+            }
+            app.select_content(target);
+            app.set_solo(true);
+            // Covers asynchronous selections that bypass row controls.
+            app.selected = other.clone();
+            frame(&mut app, &ctx, vec![], Default::default());
+            assert!(!app.isolate);
+        }
+    }
+    fn solo_fixture(depth: u16) -> (PeerBrush, egui::Context, Document) {
+        let (mut app, ctx) = small_fixture();
+        let before = {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new_depth(32, 24, depth).unwrap();
+            e.doc.layers[0].name = "Solo target".into();
+            for y in 3..18 {
+                for x in 4..22 {
+                    e.doc.layers[0]
+                        .pixels
+                        .set16(x, y, [12347, 33559, 51237, 65535]);
+                }
+            }
+            let mut other = crate::engine::Layer::new("Other layer", "fill", 32, 24);
+            other.color = [233, 84, 32, 255];
+            let other_id = other.id.clone();
+            e.doc.layers.push(other);
+            let target = e.doc.layers[0].id.clone();
+            e.edit(
+                "human",
+                &[
+                    json!({"op":"mask.add","layer":target,"value":128}),
+                    json!({"op":"mask.add","layer":other_id,"value":255}),
+                ],
+                None,
+                None,
+                "Fixture masks",
+            )
+            .unwrap();
+            e.undo.clear();
+            e.doc.clone()
+        };
+        app.select_content(&before.layers[0].id);
+        (app, ctx, before)
+    }
+    fn solo_click(app: &mut PeerBrush, ctx: &egui::Context, pos: Pos2, mods: egui::Modifiers) {
+        frame(
+            app,
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                button(pos, egui::PointerButton::Primary, true, mods),
+            ],
+            mods,
+        );
+        frame(
+            app,
+            ctx,
+            vec![button(pos, egui::PointerButton::Primary, false, mods)],
+            mods,
+        );
+    }
+    fn wait_solo_pixels(
+        app: &mut PeerBrush,
+        ctx: &egui::Context,
+        doc: &Document,
+        layer: Option<&str>,
+        mask: bool,
+    ) {
+        let expected = doc.preview(None, 1536, layer, mask).unwrap().2;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            frame(app, ctx, vec![], Default::default());
+            if !app.pending
+                && app
+                    .canvas_pixels
+                    .as_ref()
+                    .is_some_and(|(_, _, p)| p == &expected)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Solo target change did not restore rendered pixels"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
     #[test]
