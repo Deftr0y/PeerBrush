@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-2025, macos-26, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     env:
       EXPECTED_COMMIT: ${{ inputs.expected_commit }}
@@ -53,7 +53,7 @@ jobs:
 
   inspect:
     needs: native
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       EXPECTED_COMMIT: ${{ inputs.expected_commit }}
     steps:
@@ -80,7 +80,7 @@ jobs:
   sign:
     if: inputs.sign_sigstore
     needs: inspect
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
