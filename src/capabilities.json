@@ -159,6 +159,11 @@
       "mask": false
     },
     {
+      "op": "paint.clear_selection",
+      "layer": "ID",
+      "mask": false
+    },
+    {
       "op": "paint.fill",
       "layer": "ID",
       "color": [
@@ -761,6 +766,7 @@
     "blend": "Multiple selected roots must be contiguous normal-blend siblings. Flattening a single folder preserves its external blend. Unsupported backdrop-dependent merges are rejected."
   },
   "foreground_fill": "paint.fill blends foreground RGBA into the current selection, or the visible canvas when unselected. Expands a raster layer to cover that area while preserving surrounding pixels, masks and effects. mask:true fills the requested/latest paint mask step in grayscale. Layer and folder locks, reservations and undo apply. A folder color target creates one ordinary child paint layer. Legacy fill source layers remain readable for PSD compatibility.",
+  "selected_clear": "paint.clear_selection requires an active selection and erases only its coverage at native depth, without changing selection geometry or deleting layers. Unselected RGB/alpha, hierarchy, effects and other mask steps remain intact. Folder Color targets clear raster descendants including hidden children; locked or editable text/vector/adjustment children reject the entire transaction. mask:true erases the requested/latest paint-mask step to reveal earlier mask steps. Delete uses this operation while selected; Ctrl+X writes the selected image to the clipboard before one guarded erase. Failed clipboard writes or changed sources never erase work.",
   "selection_geometry": "selection.rect stays the axis-aligned bounding rectangle. After W/E/R selection transforms, document.selection_polygon retains the exact transformed shape. Brush, fill, shapes, gradients and copied image pixels clip to pixel centers inside this polygon. selection commands with rect reset the polygon; polygon points can also be supplied explicitly. Repeated layer transforms in one gesture use the same original selection.",
   "blend_modes": [
     "normal",

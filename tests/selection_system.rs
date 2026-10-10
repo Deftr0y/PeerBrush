@@ -9,6 +9,201 @@ fn edit(e: &mut Engine, c: Value) {
     e.edit("human", &[c], None, None, "Selection regression")
         .unwrap();
 }
+
+#[test]
+fn selected_clear_preserves_native_samples_holes_preview_psd_and_one_step_undo() {
+    for depth in [8, 16] {
+        let (mut e, id) = fixture(depth);
+        e.doc.layers[0].x = -2;
+        edit(
+            &mut e,
+            json!({"op":"selection","kind":"ellipse","rect":[2,2,22,22],"feather":2}),
+        );
+        edit(
+            &mut e,
+            json!({"op":"selection","kind":"rectangle","mode":"subtract","rect":[9,9,15,15]}),
+        );
+        let before = e.doc.clone();
+        let coverage = selection::current(&before).unwrap();
+        let command = json!({"op":"paint.clear_selection","layer":id});
+        let lease = e
+            .reserve(
+                "other",
+                "Keep selected pixels",
+                vec![Scope {
+                    target: Some(id.clone()),
+                    rect: Some([3, 3, 6, 6]),
+                }],
+            )
+            .unwrap();
+        // A caller-supplied rectangle cannot understate the actual clearing scope.
+        assert!(e
+            .edit(
+                "human",
+                &[json!({"op":"paint.clear_selection","layer":id,"rect":[0,0,1,1]})],
+                None,
+                None,
+                "Clear"
+            )
+            .is_err());
+        e.leases.retain(|l| l.id != lease.id);
+        let preview = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
+        let history = e.undo.len();
+        edit(&mut e, command);
+        assert_eq!(e.undo.len(), history + 1);
+        assert_eq!(e.doc.selection, before.selection);
+        assert_eq!(e.doc.layers.len(), before.layers.len());
+        assert_eq!(
+            e.doc.layers[0].pixels.rgba16(),
+            preview.layers[0].pixels.rgba16()
+        );
+        let mut soft = 0;
+        for y in 0..24 {
+            for x in 0..32 {
+                let old = before.layers[0].pixels.get16(x, y);
+                let factor = coverage.value(x - 2, y);
+                let mut expected = old;
+                if depth == 16 {
+                    expected[3] = (old[3] as f64 * (1. - factor as f64)).round() as u16;
+                } else {
+                    expected[3] =
+                        ((old[3] / 257) as f64 * (1. - factor as f64)).round() as u16 * 257;
+                }
+                if expected[3] == 0 {
+                    expected = [0; 4];
+                }
+                assert_eq!(
+                    e.doc.layers[0].pixels.get16(x, y),
+                    expected,
+                    "depth {depth}, {x},{y}"
+                );
+                soft += usize::from(factor > 0. && factor < 1.);
+            }
+        }
+        assert!(soft > 0);
+        let saved = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+        assert_eq!(saved.bit_depth, depth);
+        assert_eq!(saved.export_png().unwrap(), e.doc.export_png().unwrap());
+        e.undo("human").unwrap();
+        assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        e.redo("human").unwrap();
+        assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+    }
+}
+
+#[test]
+fn selected_clear_folder_and_mask_enforce_locks_reservations_and_protocol_guards() {
+    for depth in [8, 16] {
+        let (mut e, id) = fixture(depth);
+        let mut folder = Layer::new("Folder", "group", 32, 24);
+        let root = folder.id.clone();
+        folder.visible = false;
+        e.doc.layers[0].parent = Some(root.clone());
+        e.doc.layers.insert(0, folder);
+        edit(
+            &mut e,
+            json!({"op":"selection","kind":"rectangle","rect":[2,3,5,7]}),
+        );
+        let before = e.doc.clone();
+        let command = json!({"op":"paint.clear_selection","layer":root});
+        e.doc.layers[1].locked = true;
+        assert!(e
+            .edit("human", &[command.clone()], None, None, "Clear")
+            .is_err());
+        assert_eq!(
+            e.doc.layers[1].pixels.rgba16(),
+            before.layers[1].pixels.rgba16()
+        );
+        e.doc.layers[1].locked = false;
+        let lease = e
+            .reserve(
+                "other",
+                "Preserve child",
+                vec![Scope {
+                    target: Some(id.clone()),
+                    rect: Some([2, 3, 5, 7]),
+                }],
+            )
+            .unwrap();
+        assert!(e
+            .edit("human", &[command.clone()], None, None, "Clear")
+            .is_err());
+        e.leases.retain(|l| l.id != lease.id);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(e));
+        let doc = shared.lock().unwrap().doc.clone();
+        let result=peerbrush::server::dispatch(&shared,"edit",&json!({"actor":"test-agent","document_id":doc.id,"expected_revision":doc.revision,"commands":[command],"feedback":"always"})).unwrap();
+        assert!(result["images"]
+            .as_array()
+            .is_some_and(|images| !images.is_empty()));
+        assert_eq!(
+            shared.lock().unwrap().doc.layers[1].pixels.get16(2, 3),
+            [0; 4]
+        );
+        assert_eq!(
+            shared.lock().unwrap().doc.layers[1].pixels.get16(9, 9),
+            before.layers[1].pixels.get16(9, 9)
+        );
+        let mut e = shared.lock().unwrap();
+        e.undo("test-agent").unwrap();
+        edit(&mut e, json!({"op":"mask.add","layer":id}));
+        let mask = e.doc.layers[1].mask.as_mut().unwrap();
+        mask.steps.push(peerbrush::engine::MaskStep {
+            id: peerbrush::engine::id(),
+            kind: "paint".into(),
+            enabled: true,
+            value: 255.,
+            weight: 1.,
+            pixels: peerbrush::raster::Raster::new_depth(32, 24, depth),
+            settings: json!({}),
+        });
+        let pixels = &mut mask.steps.last_mut().unwrap().pixels;
+        pixels.set16(2, 3, [10001, 10001, 10001, 65535]);
+        pixels.set16(9, 9, [20003, 20003, 20003, 65535]);
+        let before = e.doc.clone();
+        edit(
+            &mut e,
+            json!({"op":"paint.clear_selection","layer":id,"mask":true}),
+        );
+        assert_eq!(
+            e.doc.layers[1].pixels.rgba16(),
+            before.layers[1].pixels.rgba16()
+        );
+        let pixels = &e.doc.layers[1]
+            .mask
+            .as_ref()
+            .unwrap()
+            .steps
+            .last()
+            .unwrap()
+            .pixels;
+        assert_eq!(pixels.get16(2, 3), [0; 4]);
+        assert_eq!(
+            pixels.get16(9, 9),
+            before.layers[1]
+                .mask
+                .as_ref()
+                .unwrap()
+                .steps
+                .last()
+                .unwrap()
+                .pixels
+                .get16(9, 9)
+        );
+        e.undo("human").unwrap();
+        assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        e.doc.selection = None;
+        e.doc.selection_coverage = None;
+        assert!(e
+            .edit(
+                "human",
+                &[json!({"op":"paint.clear_selection","layer":id})],
+                None,
+                None,
+                "No selection"
+            )
+            .is_err());
+    }
+}
 fn fixture(depth: u16) -> (Engine, String) {
     let mut e = Engine::new();
     e.doc = Document::new_depth(32, 24, depth).unwrap();
