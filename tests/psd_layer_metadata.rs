@@ -85,6 +85,106 @@ fn payload_range(bytes: &[u8], key: &[u8; 4]) -> std::ops::Range<usize> {
 }
 
 #[test]
+fn standard_full_layer_locks_survive_without_private_sources_and_use_shared_edit_guards() {
+    for depth in [8, 16] {
+        let mut original = fixture(depth);
+        original.layers[0].locked = true;
+        let source = original.layers[0].pixels.rgba16();
+        let standard = ordinary(&psd::encode(&original).unwrap());
+        assert_eq!(
+            &standard[payload_range(&standard, b"lspf")],
+            &7u32.to_be_bytes()
+        );
+        let loaded = psd::decode(&standard).unwrap();
+        assert!(!loaded.read_only, "{:?}", loaded.warnings);
+        assert!(loaded.layers[0].locked);
+        assert_eq!(loaded.layers[0].pixels.rgba16(), source);
+        let mut engine = Engine::new();
+        engine.doc = loaded;
+        let layer = engine.doc.layers[0].id.clone();
+        for actor in ["human", "agent"] {
+            assert!(engine
+                .edit(
+                    actor,
+                    &[json!({"op":"layer.delete","layer":layer})],
+                    None,
+                    None,
+                    "Protected source"
+                )
+                .is_err());
+            assert!(engine
+                .edit(
+                    actor,
+                    &[json!({"op":"layer.update","layer":layer,"opacity":0.5})],
+                    None,
+                    None,
+                    "Protected source"
+                )
+                .is_err());
+        }
+        assert_eq!(engine.doc.revision, 0);
+        engine
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":layer,"locked":false})],
+                None,
+                None,
+                "Unlock standard layer",
+            )
+            .unwrap();
+        assert!(!engine.doc.layers[0].locked);
+        let unlocked = psd::decode(&ordinary(&psd::encode(&engine.doc).unwrap())).unwrap();
+        assert!(!unlocked.layers[0].locked);
+        engine.undo("human").unwrap();
+        assert!(engine.doc.layers[0].locked);
+        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+        let restored = psd::decode(&ordinary(&psd::encode(&engine.doc).unwrap())).unwrap();
+        assert!(restored.layers[0].locked);
+    }
+}
+
+#[test]
+fn standard_locked_folders_protect_children_and_partial_or_unknown_flags_remain_read_only() {
+    for depth in [8, 16] {
+        let mut original = fixture(depth);
+        let mut folder = Layer::new("Locked folder", "group", 2, 1);
+        folder.pixels = Raster::new_depth(2, 1, depth);
+        folder.locked = true;
+        original.layers[0].parent = Some(folder.id.clone());
+        original.layers.insert(0, folder);
+        let standard = ordinary(&psd::encode(&original).unwrap());
+        let loaded = psd::decode(&standard).unwrap();
+        assert!(!loaded.read_only, "{:?}", loaded.warnings);
+        assert!(loaded.layers[0].locked);
+        assert!(!loaded.layers[1].locked);
+        assert_eq!(loaded.layers[1].parent.as_ref(), Some(&loaded.layers[0].id));
+        let mut engine = Engine::new();
+        engine.doc = loaded;
+        assert!(engine
+            .edit(
+                "human",
+                &[json!({"op":"layer.delete","layer":engine.doc.layers[1].id})],
+                None,
+                None,
+                "Locked ancestor"
+            )
+            .is_err());
+        let range = payload_range(&standard, b"lspf");
+        for flag in [0u32, 1, 2, 4, 8, 0x80000000] {
+            let mut partial = standard.clone();
+            partial[range.clone()].copy_from_slice(&flag.to_be_bytes());
+            let protected = psd::decode(&partial).unwrap();
+            assert!(protected.read_only, "flag {flag}: {:?}", protected.warnings);
+            assert_eq!(protected.bit_depth, depth);
+            assert_eq!(
+                protected.export_png().unwrap(),
+                original.export_png().unwrap()
+            );
+        }
+    }
+}
+
+#[test]
 fn benign_standard_metadata_keeps_raster_layers_editable_at_both_depths_and_survives_edits() {
     for depth in [8, 16] {
         let original = fixture(depth);

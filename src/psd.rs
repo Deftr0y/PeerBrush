@@ -137,7 +137,7 @@ fn standard_flag(key: &[u8], bytes: &[u8]) -> Result<(), &'static str> {
             Ok(())
         }
         b"iOpa" => Err("Photoshop fill opacity (iOpa)"),
-        b"lspf" if bytes == [0; 4] => Ok(()),
+        b"lspf" if bytes == [0; 4] || bytes == [0, 0, 0, 7] => Ok(()),
         b"lspf" => Err("Photoshop layer protection flags (lspf)"),
         // Interior effects and vector sources are separately protected. These
         // validated flags do not alter ordinary integer-positioned raster layers.
@@ -513,7 +513,7 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         });
         records.push((l.opacity * 255.0).round() as u8);
         records.push(u8::from(l.clip_to.is_some()));
-        records.push(if l.visible { 0 } else { 2 });
+        records.push(if l.visible { 0 } else { 2 } | u8::from(l.locked && *section != 3));
         records.push(0);
         let mut extra = vec![];
         if has_mask {
@@ -555,6 +555,9 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
             u16b(&mut unicode, c);
         }
         tag(&mut extra, b"luni", &unicode);
+        if l.locked && *section != 3 {
+            tag(&mut extra, b"lspf", &7u32.to_be_bytes());
+        }
         if *section != 3
             && doc
                 .layers
@@ -1432,7 +1435,7 @@ fn decode_parts(
                     warnings.push(format!("Invalid Photoshop clipping flag: {clipping}"));
                 }
                 let flags = lr.u8()?;
-                if flags & 1 != 0 || flags & !0x1f != 0 {
+                if flags & !0x1f != 0 {
                     warnings.push("Unsupported Photoshop layer protection or flags".into());
                 }
                 if lr.u8()? != 0 {
@@ -1476,6 +1479,7 @@ fn decode_parts(
                 let padded = (np + 1 + 3) & !3;
                 ex.bytes(padded - np - 1)?;
                 let mut section = 0;
+                let mut locked = false;
                 let mut psd_metadata = vec![];
                 let mut seen_tags = std::collections::HashSet::new();
                 while ex.pos + 12 <= extra.len() {
@@ -1567,6 +1571,8 @@ fn decode_parts(
                                     "Unsupported Photoshop setting {}: {reason}; using the saved composite",
                                     String::from_utf8_lossy(key)
                                 ));
+                            } else if key == b"lspf" {
+                                locked = payload == [0, 0, 0, 7];
                             }
                         }
                         _ => warnings.push(format!(
@@ -1579,6 +1585,10 @@ fn decode_parts(
                     warnings.push(
                         "Unrecognized Photoshop layer data; using the saved composite".into(),
                     );
+                }
+                if flags & 1 != 0 && !locked {
+                    warnings
+                        .push("Partial Photoshop transparency protection is not supported".into());
                 }
                 if section == 0 && flags & 0x18 == 0x18 {
                     warnings.push("Photoshop layer pixels do not represent its appearance".into());
@@ -1600,6 +1610,7 @@ fn decode_parts(
                 layer.x = bounds[1];
                 layer.y = bounds[0];
                 layer.visible = flags & 2 == 0;
+                layer.locked = locked;
                 layer.opacity = opacity;
                 layer.blend = blend.into();
                 layer.psd_metadata = psd_metadata;

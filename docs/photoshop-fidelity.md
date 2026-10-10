@@ -1,6 +1,6 @@
 # Photoshop fidelity
 
-The PB-070 development checkpoint implements the documented RGB subset. Current slices add standard raster clipping, pass-through folders and checks for Photoshop blending settings the renderer cannot yet reproduce. Supported RGB ICC previews and explicit native-depth sRGB copies are also implemented. Broader Photoshop structures and full color management remain planned. These changes apply to the current development build; the published v0.1.4 download predates them.
+The development build implements the documented RGB subset: standard raster clipping, pass-through folders, full layer locks, supported RGB ICC previews and explicit native-depth sRGB copies. Unsupported Photoshop settings remain protected. These changes are unreleased; the published v0.1.4 download predates them.
 
 ## Supported clipping
 
@@ -20,15 +20,19 @@ Standard PSD folder keys and section-divider overrides (`lsct`/`lsdk`) recognize
 
 ## RGB ICC previews and copies
 
-Profiled PSDs retain the saved composite and exact original ICC resource at 8 or 16 bits. Supported ICC v2/v4 RGB matrix/TRC profiles with XYZ connection space display through an sRGB conversion, including loading feedback, isolated previews, thumbnails and agent observations. Common sRGB, Adobe RGB, Display P3 and ProPhoto RGB matrix profiles are covered. Display conversion uses relative colorimetric intent with no black-point compensation; out-of-gamut channels clip to the sRGB range. The screen is treated as sRGB; monitor calibration and HDR display mapping are still pending.
+Profiled PSDs retain the saved composite and exact original ICC resource at 8 or 16 bits. Supported ICC v2/v4 RGB matrix/TRC profiles with XYZ connection space, classic `lut16` RGB-to-XYZ/Lab tables and `lut8` RGB-to-Lab tables display through an sRGB conversion, including loading feedback, isolated previews, thumbnails and agent observations. Common sRGB, Adobe RGB, Display P3 and ProPhoto RGB matrix profiles are covered. Conversion uses the relative colorimetric `A2B1` table when available, otherwise the perceptual `A2B0` table, without black-point compensation. Matrix profiles use relative colorimetric intent. Out-of-gamut channels clip to the sRGB range. LUT conversion interpolates at native input/output depth; it does not promise a lossless color-space round trip. The screen is treated as sRGB; monitor calibration and HDR display mapping are pending.
 
 Profiled Photoshop documents remain **READ ONLY**. **Convert to sRGB copy** explicitly flattens their saved appearance into an editable project at the original bit depth. Native16 conversion operates on all 65,536 channel values before display projection; alpha and the source file stay intact. Save requires a new filename. Converted PSD and PNG copies carry a standard sRGB ICC tag; standard PSD raster channels and the merged composite contain the converted result. PeerBrush recognizes its exact built-in working profile on reopen without converting twice. Other imported profiles continue through the protected path.
 
 Agents call `document` with `action:"compatible_copy", convert_to_srgb:true` and the observed revision. Omitting explicit conversion is refused for a profiled source. `document.color_profile` reports source/preview spaces and conversion availability without returning raw profile bytes. The ordinary protected-document copy remains available for unprofiled sources. Reservations and source revision/identity checks are rechecked before replacing the workspace.
 
-Exporting a protected original to PNG retains its original native samples and ICC bytes, rather than baking its display conversion into the source channels. Invalid, LUT, non-RGB, non-XYZ, device-link, abstract, named-color and HDR/CICP-transfer profiles remain protected with explicit unmanaged-preview reasons; their editable conversion is unavailable. Duplicate PSD profiles and profiles above 4 MiB are rejected. Matrix parsing checks tag bounds, duplicate/required tags and singular colorants, with bounded curve tables. Four disposable profile/transform cache entries stay outside history and recovery.
+Exporting a protected original to PNG retains its original native samples and ICC bytes. Invalid, `mAB`/`mBA`, multi-process, non-RGB, device-link, abstract, named-color and HDR/CICP-transfer profiles remain protected with explicit unmanaged-preview reasons; their editable conversion is unavailable. `lut8` XYZ is protected because ICC does not define its PCS encoding. Duplicate PSD profiles and profiles above 4 MiB are rejected. Parsing checks tag bounds, duplicate/required tags, singular matrix colorants and table dimensions before allocating LUTs. Classic LUTs require three input/output channels, 2–33 grid points per axis and 2–4096 input/output curve entries. Lab normalization follows the table's encoding, including legacy `lut16` Lab in ICC v4. Four disposable transform caches stay outside history and recovery. Encodings follow the [ICC specification](https://www.color.org/specification/ICC.1-2022-05.pdf).
 
-This slice concerns embedded PSD profiles. Profile assignment, editable profiled layer stacks, imported PNG/JPEG profile normalization, soft proofing, CMYK, monitor profiles and HDR remain follow-up work.
+Raster image import normalizes these supported RGB profiles to sRGB at the original channel depth, preserving alpha. Profile assignment, editable profiled layer stacks, newer LUT structures, soft proofing, CMYK, monitor profiles and HDR remain future work.
+
+## Standard layer locks
+
+Photoshop's full protection tag (`lspf=7`, transparency/composite/position locked) imports as PeerBrush's layer lock at either depth, including folder locks that protect descendants. Unlock the layer explicitly before editing. Human, UI, MCP and CLI commands use the same engine guard and undo restores the lock. Saves emit the standard protection tag and transparency-protection flag; reopening without supplementary PeerBrush resources retains the lock and native raster channels. Partial and unknown protection combinations remain read-only because their more selective behavior is not implemented.
 
 ## Protected settings
 
@@ -38,7 +42,7 @@ The codec now checks:
 
 - Disabled **Blend Clipped Layers As Group** (`clbl`), knockout (`knko`) and non-default fill opacity (`iOpa`).
 - Non-default **Blend If** source/destination ranges. Empty or unsplit default black/white ranges are accepted.
-- Photoshop protection flags (`lspf` and transparency protection), invalid clipping/flag payloads, duplicate tags and malformed folder boundaries.
+- Partial/unknown Photoshop protection flags (`lspf` and standalone transparency protection), invalid clipping/flag payloads, duplicate tags and malformed folder boundaries.
 - Section-divider blend overrides (`lsct`/`lsdk`), including supported pass-through folders when the ordinary layer-record blend says Normal. Unknown divider modes and animation scene groups remain protected; `pass` on a raster layer is invalid.
 - Advanced mask payloads and flags, and layers whose raster pixels are explicitly irrelevant to their appearance.
 

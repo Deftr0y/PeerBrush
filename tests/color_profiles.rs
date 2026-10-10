@@ -56,6 +56,213 @@ fn linear_profile() -> Vec<u8> {
     bytes[..4].copy_from_slice(&len.to_be_bytes());
     bytes
 }
+
+// Classic LUT fixtures assembled directly from the ICC encoding, independently
+// of the CMS encoder. XYZ nodes are a linear D50-adapted sRGB matrix. Lab nodes
+// are a constant neutral L*=50, testing both legacy lut16 and lut8 encodings.
+fn lut_profile(lab: bool, words: bool, relative: bool, version: u8) -> Vec<u8> {
+    let mut lut = if words {
+        b"mft2".to_vec()
+    } else {
+        b"mft1".to_vec()
+    };
+    lut.extend([0, 0, 0, 0, 3, 3, 2, 0]);
+    for row in 0..3 {
+        for col in 0..3 {
+            lut.extend(fixed(f64::from(row == col)));
+        }
+    }
+    if words {
+        lut.extend(2u16.to_be_bytes());
+        lut.extend(2u16.to_be_bytes());
+        for _ in 0..3 {
+            lut.extend([0, 0, 255, 255]);
+        }
+    } else {
+        for _ in 0..3 {
+            lut.extend(0..=255);
+        }
+    }
+    for r in 0..2 {
+        for g in 0..2 {
+            for b in 0..2 {
+                if lab {
+                    if words {
+                        lut.extend([0x7f, 0x80, 0x80, 0, 0x80, 0]);
+                    } else {
+                        lut.extend([128, 128, 128]);
+                    }
+                } else {
+                    for value in [
+                        0.4360747 * r as f64 + 0.3850649 * g as f64 + 0.1430804 * b as f64,
+                        0.2225045 * r as f64 + 0.7168786 * g as f64 + 0.0606169 * b as f64,
+                        0.0139322 * r as f64 + 0.0971045 * g as f64 + 0.7141733 * b as f64,
+                    ] {
+                        lut.extend(((value * 32768.).round() as u16).to_be_bytes());
+                    }
+                }
+            }
+        }
+    }
+    if words {
+        for _ in 0..3 {
+            lut.extend([0, 0, 255, 255]);
+        }
+    } else {
+        for _ in 0..3 {
+            lut.extend(0..=255);
+        }
+    }
+    let mut white = b"XYZ \0\0\0\0".to_vec();
+    for v in [0.9642, 1., 0.8249] {
+        white.extend(fixed(v));
+    }
+    let entries = [
+        (if relative { *b"A2B1" } else { *b"A2B0" }, lut),
+        (*b"wtpt", white),
+    ];
+    let mut profile = linear_profile()[..128].to_vec();
+    profile[8] = version;
+    profile[9..12].fill(0);
+    profile[20..24].copy_from_slice(if lab { b"Lab " } else { b"XYZ " });
+    profile.extend((entries.len() as u32).to_be_bytes());
+    profile.resize(132 + entries.len() * 12, 0);
+    for (i, (key, data)) in entries.iter().enumerate() {
+        let at = 132 + i * 12;
+        profile[at..at + 4].copy_from_slice(key);
+        let offset = profile.len() as u32;
+        profile[at + 4..at + 8].copy_from_slice(&offset.to_be_bytes());
+        profile[at + 8..at + 12].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        profile.extend(data);
+        profile.resize((profile.len() + 3) & !3, 0);
+    }
+    let size = profile.len() as u32;
+    profile[..4].copy_from_slice(&size.to_be_bytes());
+    profile
+}
+
+#[test]
+fn classic_lut_xyz_conversion_and_explicit_psd_copy_preserve_native_depth_and_alpha() {
+    for version in [2, 4] {
+        for relative in [false, true] {
+            let profile = lut_profile(false, true, relative, version);
+            color_profile::supported(&profile).unwrap();
+            let input = [12345, 23456, 34567, 45679, 12346, 23457, 34568, 1];
+            let mut output = input;
+            color_profile::convert16(&profile, &mut output).unwrap();
+            for (source, target) in input.chunks_exact(4).zip(output.chunks_exact(4)) {
+                assert_eq!(source[3], target[3]);
+                for c in 0..3 {
+                    assert!(
+                        // The CMS interpolates a 33-point output cube. Compare
+                        // its color accuracy (under 0.2%) separately from the
+                        // exact alpha/original-word preservation checks.
+                        target[c].abs_diff(srgb(source[c])) <= 128,
+                        "{source:?} -> {target:?}, expected {} for channel {c}",
+                        srgb(source[c])
+                    );
+                }
+            }
+            assert!(output[..3].iter().any(|v| v % 257 != 0));
+            for depth in [8, 16] {
+                let source = psd::decode(&fixture(&profile, depth)).unwrap();
+                assert!(source.read_only);
+                if depth == 16 {
+                    assert_eq!(source.layers[0].pixels.rgba16(), PIXELS.concat());
+                }
+                let original = source.export_png().unwrap();
+                let display = source.preview(None, 4, None, false).unwrap().2;
+                let shared = shared(source.clone());
+                server::compatible_copy_with_color(&shared, "qa", Some(0), true).unwrap();
+                let e = shared.lock().unwrap();
+                assert!(!e.doc.read_only);
+                assert_eq!(e.doc.bit_depth, depth);
+                assert_eq!(e.doc.preview(None, 4, None, false).unwrap().2, display);
+                assert_eq!(source.export_png().unwrap(), original);
+                let saved = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+                assert_eq!(saved.export_png().unwrap(), e.doc.export_png().unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn classic_lab_luts_follow_their_table_encoding_at_both_icc_versions() {
+    for version in [2, 4] {
+        for words in [false, true] {
+            let profile = lut_profile(true, words, true, version);
+            let input = [12345, 23456, 34567, 45679];
+            let mut output = input;
+            color_profile::convert16(&profile, &mut output).unwrap();
+            let lightness: f64 = if words { 50. } else { 128. * 100. / 255. };
+            let expected = srgb((((lightness + 16.) / 116.).powi(3) * 65535.).round() as u16);
+            for c in 0..3 {
+                assert!(
+                    output[c].abs_diff(expected) <= 30,
+                    "{output:?}, expected {expected}"
+                );
+            }
+            assert_eq!(output[3], input[3]);
+            let mut bytes = [0, 99, 200, 73];
+            color_profile::convert8(&profile, &mut bytes).unwrap();
+            assert_eq!(bytes[3], 73);
+            for c in 0..3 {
+                assert!(bytes[c].abs_diff(peerbrush::raster::project16(expected)) <= 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_unsupported_or_unbounded_luts_cannot_modify_pixels_or_unlock_psd_sources() {
+    let valid = lut_profile(false, true, true, 4);
+    let offset = u32::from_be_bytes(valid[136..140].try_into().unwrap()) as usize;
+    for (at, value) in [(8, 4), (9, 4), (10, 34), (48, 255), (49, 255), (4, 1)] {
+        let mut invalid = valid.clone();
+        invalid[offset + at] = value;
+        let original = [12345, 23456, 34567, 45679];
+        let mut pixels = original;
+        assert!(color_profile::convert16(&invalid, &mut pixels).is_err());
+        assert_eq!(pixels, original);
+        let doc = psd::decode(&fixture(&invalid, 16)).unwrap();
+        assert!(doc.read_only);
+        assert_eq!(doc.layers[0].pixels.rgba16(), PIXELS.concat());
+        assert!(server::compatible_copy_with_color(&shared(doc), "qa", Some(0), true).is_err());
+    }
+    for key in [b"D2B0", b"A2B2"] {
+        let mut invalid = valid.clone();
+        invalid[132..136].copy_from_slice(key);
+        assert!(color_profile::supported(&invalid).is_err());
+    }
+    let mut newer = valid;
+    newer[offset..offset + 4].copy_from_slice(b"mAB ");
+    assert!(color_profile::supported(&newer).is_err());
+}
+
+#[test]
+fn lut_png_import_normalizes_at_original_depth_and_keeps_exact_alpha() {
+    let profile = lut_profile(false, true, true, 4);
+    let input = [12345, 23456, 34567, 45679, 12346, 23457, 34568, 1];
+    let mut expected = input;
+    color_profile::convert16(&profile, &mut expected).unwrap();
+    let png = peerbrush::raster::png16_with_profile(2, 1, &input, Some(&profile)).unwrap();
+    let imported = peerbrush::image_import::Encoded::png(png)
+        .unwrap()
+        .decode(&json!({}), peerbrush::image_import::BUDGET)
+        .unwrap();
+    assert_eq!(imported.depth, 16);
+    assert_eq!(imported.rgba16(), expected);
+    assert!(imported.rgba16().iter().any(|v| v % 257 != 0));
+    let mut bytes = [48, 91, 135, 173, 3, 7, 240, 0];
+    let png = peerbrush::raster::png_with_profile(2, 1, &bytes, Some(&profile)).unwrap();
+    color_profile::convert8(&profile, &mut bytes).unwrap();
+    let imported = peerbrush::image_import::Encoded::png(png)
+        .unwrap()
+        .decode(&json!({}), peerbrush::image_import::BUDGET)
+        .unwrap();
+    assert_eq!(imported.depth, 8);
+    assert_eq!(imported.rgba(), bytes);
+}
 fn srgb(v: u16) -> u16 {
     let v = v as f64 / 65535.;
     let encoded = if v <= 0.0031308 {
