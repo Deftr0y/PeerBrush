@@ -22,6 +22,7 @@ def verify(directory, commit, version, output, source_root=None):
     source_bytes = None
     records = []
     binary_commit = None
+    correction = None
     source_root = source_root or pathlib.Path(__file__).resolve().parents[1]
     if git(source_root, 'rev-parse', 'HEAD').decode().strip() != commit:
         raise ValueError('Inspection checkout differs from the selected commit')
@@ -29,14 +30,21 @@ def verify(directory, commit, version, output, source_root=None):
     expected_source = {name: data for name, data, _ in selected_sources}
     expected_portable = {name: data for name, data, _ in portable_files(selected_sources)}
     for path in sorted(directory.rglob(f'PeerBrush-{version}-*.zip')):
-        if path.name.endswith('-source.zip'):
+        if re.fullmatch(r'PeerBrush-' + re.escape(version) + r'-source(?:-repacked-[0-9]{8})?\.zip', path.name):
             continue
+        parsed = re.fullmatch(r'PeerBrush-' + re.escape(version) + r'-(Windows|Linux|macOS)-(x64|arm64)(-repacked-[0-9]{8})?\.zip', path.name)
+        if not parsed:
+            raise ValueError('Unexpected release archive filename')
+        suffix = parsed.group(3) or ''
+        if correction is not None and correction != suffix:
+            raise ValueError('Platforms must share a packaging correction label')
+        correction = suffix
         with zipfile.ZipFile(path) as archive:
             if sum(i.file_size for i in archive.infolist()) > 512 * 1024 * 1024:
                 raise ValueError('Release archive exceeds the inspection budget')
             if archive.testzip() is not None:
                 raise ValueError('Release archive CRC failure')
-            prefix = path.stem + '/'
+            prefix = f'PeerBrush-{version}-{parsed.group(1)}-{parsed.group(2)}/'
             if len(set(archive.namelist())) != len(archive.namelist()):
                 raise ValueError('Ambiguous duplicate release entries')
             for item in archive.infolist():
@@ -82,7 +90,7 @@ def verify(directory, commit, version, output, source_root=None):
                 raise ValueError('Duplicate or unsupported release platform')
             if manifest['commit'] != commit or manifest['version'] != version or manifest['architecture'] != expected_arch[platform]:
                 raise ValueError('Version, source commit or architecture mismatch')
-            if path.name != f'PeerBrush-{version}-{platform}-{expected_arch[platform]}.zip':
+            if path.name != f'PeerBrush-{version}-{platform}-{expected_arch[platform]}{correction}.zip':
                 raise ValueError('Package filename differs from its platform manifest')
             if archive.getinfo(prefix + manifest['executable']).external_attr >> 16 & 0o111 != 0o111:
                 raise ValueError('Missing executable permissions')
@@ -122,11 +130,11 @@ def verify(directory, commit, version, output, source_root=None):
     output.mkdir(parents=True, exist_ok=True)
     for path in packages.values():
         shutil.copyfile(path, output / path.name)
-    source_name = f'PeerBrush-{version}-source.zip'
+    source_name = f'PeerBrush-{version}-source{correction}.zip'
     (output / source_name).write_bytes(source_bytes)
     records.append({'file': source_name, 'bytes': len(source_bytes), 'sha256': sha(source_bytes)})
-    (output / 'SHA256SUMS').write_text(''.join(f"{r['sha256']}  {r['file']}\n" for r in records), encoding='utf-8')
-    (output / 'release-inventory.json').write_text(json.dumps({'schema': 1, 'version': version, 'commit': commit, 'binary_source_commit': binary_commit, 'assets': records}, indent=2) + '\n', encoding='utf-8')
+    (output / ('SHA256SUMS' + correction)).write_text(''.join(f"{r['sha256']}  {r['file']}\n" for r in records), encoding='utf-8')
+    (output / ('release-inventory' + correction + '.json')).write_text(json.dumps({'schema': 1, 'version': version, 'commit': commit, 'binary_source_commit': binary_commit, 'packaging_correction': correction or None, 'assets': records}, indent=2) + '\n', encoding='utf-8')
     print(f'Verified three matching PeerBrush {version} archives and source from {commit}')
 
 

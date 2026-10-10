@@ -314,6 +314,22 @@ class Packages(unittest.TestCase):
             self.assertTrue({'licenses/epaint_default_fonts-0.31.1/' + name for name in names} <= set(manifest['notice_files']))
             self.assertFalse(any(name.endswith('/private.txt') for name in archive.namelist()))
 
+    def test_dated_repack_names_preserve_internal_layout_and_require_matching_labels(self):
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        for platform in ['Windows', 'Linux', 'macOS']:
+            path = self.build(platform)
+            path.rename(path.with_name(path.stem + '-repacked-20261010.zip'))
+        with contextlib.redirect_stdout(io.StringIO()):
+            verify_release.verify(self.output, commit, '0.2.0', self.root / 'verified', self.root)
+        inventory = json.loads((self.root / 'verified/release-inventory-repacked-20261010.json').read_text())
+        self.assertEqual(inventory['packaging_correction'], '-repacked-20261010')
+        self.assertTrue(all('-repacked-20261010.zip' in r['file'] for r in inventory['assets']))
+        self.assertTrue((self.root / 'verified/SHA256SUMS-repacked-20261010').exists())
+        mac = self.output / 'PeerBrush-0.2.0-macOS-arm64-repacked-20261010.zip'
+        mac.rename(mac.with_name(mac.name.replace('20261010','20261011')))
+        with self.assertRaisesRegex(ValueError, 'packaging correction label'):
+            verify_release.verify(self.output, commit, '0.2.0', self.root / 'rejected', self.root)
+
     def test_archive_paths_reject_case_aliases_and_control_characters(self):
         with self.assertRaisesRegex(ValueError, 'duplicate archive paths'):
             packaging.write_zip(self.root / 'bad.zip', [('a.txt',b'one',0o644),('A.txt',b'two',0o644)], 1700000000)
