@@ -77,6 +77,136 @@ fn edit(e: &mut Engine, c: Value) {
         .unwrap();
 }
 #[test]
+fn selected_folder_transforms_match_selected_children_at_native_depth_and_round_trip() {
+    for depth in [8, 16] {
+        for parameters in [
+            json!({"op":"move","dx":15,"dy":2}),
+            json!({"op":"transform","angle":90}),
+            json!({"op":"transform","scale_x":1.5,"scale_y":0.75}),
+        ] {
+            let (mut e, root) = fixture(depth, true);
+            // Include disjoint selected pieces, a hole, a soft edge, and hidden content.
+            let mut mask = Raster::new(40, 32);
+            for y in 8..15 {
+                for x in 5..17 {
+                    if (x, y) != (7, 9) {
+                        mask.set(x, y, [if x == 5 { 128 } else { 255 }; 4]);
+                    }
+                }
+            }
+            let coverage = peerbrush::selection::from_mask(mask).unwrap();
+            e.doc.selection = Some(coverage.bounds);
+            e.doc.selection_coverage = Some(coverage.clone());
+            let before = e.doc.clone();
+            let mut command = parameters;
+            command["layer"] = json!(root);
+            command["pivot"] = json!([11., 11.5]);
+            let children = before
+                .layers
+                .iter()
+                .filter(|l| l.kind == "paint")
+                .map(|l| {
+                    let mut c = command.clone();
+                    c["layer"] = json!(l.id);
+                    c
+                })
+                .collect::<Vec<_>>();
+            let expected = Engine::preview_edits(before.clone(), &children).unwrap();
+            let preview = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
+            assert_eq!(
+                preview.export_png().unwrap(),
+                expected.export_png().unwrap()
+            );
+            assert!(e.undo.is_empty(), "Preview must leave history alone");
+            edit(&mut e, command);
+            assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+            assert_eq!(e.doc.selection, expected.selection);
+            assert_eq!(
+                peerbrush::selection::current(&e.doc).unwrap().mask.rgba(),
+                peerbrush::selection::current(&expected)
+                    .unwrap()
+                    .mask
+                    .rgba()
+            );
+            for (actual, expected) in e.doc.layers.iter().zip(&expected.layers) {
+                assert_eq!(actual.pixels.rgba16(), expected.pixels.rgba16());
+                // Hidden RGB at an unselected transparent pixel is preserved exactly.
+                assert_eq!(
+                    actual.pixels.get16(30 - actual.x, 30 - actual.y),
+                    before
+                        .layers
+                        .iter()
+                        .find(|l| l.id == actual.id)
+                        .unwrap()
+                        .pixels
+                        .get16(30, 30)
+                );
+                assert_eq!(actual.parent, expected.parent);
+            }
+            assert_eq!(
+                serde_json::to_value(&e.doc.layers[0].mask).unwrap(),
+                serde_json::to_value(&before.layers[0].mask).unwrap()
+            );
+            assert_eq!(e.undo.len(), 1);
+            let after = e.doc.export_png().unwrap();
+            let bytes = psd::encode(&e.doc).unwrap();
+            let reopened = psd::decode(&bytes).unwrap();
+            assert_eq!(reopened.bit_depth, depth);
+            assert_eq!(reopened.export_png().unwrap(), after);
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            assert_eq!(e.doc.selection_coverage, before.selection_coverage);
+            e.redo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), after);
+        }
+    }
+}
+#[test]
+fn protocol_selected_folder_move_honors_selection_reservations_and_returns_actual_pixels() {
+    let (mut e, root) = fixture(16, false);
+    let child = e.doc.layers[2].id.clone();
+    edit(
+        &mut e,
+        json!({"op":"selection","kind":"wand","layer":child,"point":[6,10],"tolerance":0,"sample_merged":false}),
+    );
+    let before = e.doc.clone();
+    let revision = before.revision;
+    e.reserve("other", "Selection work", vec![Scope::layer("@selection")])
+        .unwrap();
+    let shared = Arc::new(Mutex::new(e));
+    let params = json!({"actor":"artist","document_id":before.id,"expected_revision":revision,"commands":[{"op":"move","layer":root,"dx":15,"dy":2}],"feedback":"always","max_edge":40});
+    assert!(server::dispatch(&shared, "edit", &params).is_err());
+    assert_eq!(
+        shared.lock().unwrap().doc.export_png().unwrap(),
+        before.export_png().unwrap()
+    );
+    shared.lock().unwrap().leases.clear();
+    let result = server::dispatch(&shared, "edit", &params).unwrap();
+    assert!(result["images"].as_array().is_some_and(|i| !i.is_empty()));
+    let after = shared.lock().unwrap().doc.clone();
+    assert_eq!(after.selection, Some([20, 10, 25, 14]));
+    assert_eq!(after.layers[2].pixels.get16(6, 10)[3], 0);
+    assert_eq!(
+        after.layers[2].pixels.get16(21, 12),
+        before.layers[2].pixels.get16(6, 10)
+    );
+    assert!(
+        server::dispatch(&shared, "edit", &params).is_err(),
+        "Stale commits must fail"
+    );
+    server::dispatch(
+        &shared,
+        "history",
+        &json!({"actor":"artist","action":"undo","document_id":after.id,"expected_revision":after.revision}),
+    )
+    .unwrap();
+    assert_eq!(
+        shared.lock().unwrap().doc.export_png().unwrap(),
+        before.export_png().unwrap()
+    );
+    assert_eq!(shared.lock().unwrap().doc.selection, before.selection);
+}
+#[test]
 fn folder_rotation_keeps_native_pixels_hidden_children_masks_sources_and_one_undo() {
     for depth in [8, 16] {
         let (mut e, root) = fixture(depth, false);
@@ -201,10 +331,10 @@ fn folder_edits_are_atomic_for_locks_reservations_late_failures_and_selection_sc
     assert!(e
         .edit(
             "human",
-            &[json!({"op":"move","layer":root,"dx":1})],
+            &[json!({"op":"move","layer":root,"dx":1,"mask":true})],
             None,
             None,
-            "Ambiguous selection"
+            "Unsupported folder mask transform"
         )
         .is_err());
     let original = serde_json::to_vec(&e.doc).unwrap();

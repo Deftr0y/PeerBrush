@@ -858,7 +858,8 @@ impl PeerBrush {
         cut: bool,
         merged: bool,
     ) -> Option<crate::clipboard::Request> {
-        if self.layer_clipboard && (cut || !merged) {
+        // An active pixel selection takes precedence over the last layer-row click.
+        if self.layer_clipboard && doc.selection.is_none() && (cut || !merged) {
             let ids = self.selected_layer_ids(doc);
             Some(if cut {
                 crate::clipboard::Request::CutLayers {
@@ -2481,8 +2482,7 @@ impl PeerBrush {
             self.gizmo_bounds = Some((key, doc.revision, b));
         }
         let b = self.gizmo_bounds.as_ref().unwrap().2;
-        let folders = targets.iter().any(|l| l.kind == "group");
-        let selection_only = doc.selection.is_some() && !folders;
+        let selection_only = doc.selection.is_some();
         let b = if selection_only {
             doc.selection.unwrap()
         } else {
@@ -3926,7 +3926,7 @@ impl PeerBrush {
                         .map(|_| {
                             if cut {
                                 "Cutting layers…".into()
-                            } else if self.layer_clipboard && !merged {
+                            } else if self.layer_clipboard && doc.selection.is_none() && !merged {
                                 "Copying layers…".into()
                             } else {
                                 "Copying selection…".into()
@@ -8651,6 +8651,97 @@ mod tests {
         assert!(app.shared.lock().unwrap().undo.is_empty());
     }
     #[test]
+    fn wand_selection_overrides_layer_row_copy_intent_at_both_depths() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            {
+                let mut e = app.shared.lock().unwrap();
+                e.doc = Document::new_depth(32, 32, depth).unwrap();
+                for y in 0..32 {
+                    for x in 0..32 {
+                        e.doc.layers[0].pixels.set16(
+                            x,
+                            y,
+                            if (4..12).contains(&x) && (5..13).contains(&y) {
+                                [12347, 23459, 34571, 65535]
+                            } else {
+                                [51239, 12349, 33561, 65535]
+                            },
+                        );
+                    }
+                }
+                app.selected = e.doc.layers[0].id.clone();
+            }
+            app.select_content(&app.selected.clone());
+            app.selection_tolerance = 0.;
+            app.selection_merged = false;
+            frame(&mut app, &ctx, vec![], Default::default());
+            modified_key(&mut app, &ctx, egui::Key::K, Default::default());
+            let canvas = app.view_rect.unwrap();
+            click(
+                &mut app,
+                &ctx,
+                canvas.min + Vec2::new(6.5, 7.5) * (canvas.width() / 32.),
+            );
+            let row = app.layer_rects[&app.selected];
+            click(&mut app, &ctx, row.right_center() - Vec2::new(30., 0.));
+            let doc = app.shared.lock().unwrap().doc.clone();
+            assert_eq!(doc.selection, Some([4, 5, 12, 13]));
+            assert!(app.layer_clipboard);
+            let Some(crate::clipboard::Request::Copy {
+                doc: snapshot,
+                target,
+                mask,
+                merged,
+            }) = app.copy_request(&doc, false, false)
+            else {
+                panic!("A layer-row click must not copy the whole layer while pixels are selected");
+            };
+            let image = crate::clipboard::Image::copy(&snapshot, &target, mask, merged).unwrap();
+            assert_eq!(
+                (image.width, image.height, image.origin),
+                (8, 8, Some([4, 5]))
+            );
+            assert_eq!(image.samples16.is_some(), depth == 16);
+            assert!(
+                app.copy_request(&doc, true, false).is_none(),
+                "Unsupported selected cut must never delete the whole layer"
+            );
+            let baseline = doc.export_png().unwrap();
+            let mut engine = app.shared.lock().unwrap();
+            let history = engine.undo.len();
+            engine
+                .edit(
+                    "human",
+                    &[image.command(&target).unwrap()],
+                    Some(doc.revision),
+                    None,
+                    "Paste selected pixels",
+                )
+                .unwrap();
+            let pasted = engine
+                .doc
+                .layers
+                .iter()
+                .find(|l| l.name == "Pasted image")
+                .unwrap();
+            assert_eq!(
+                (
+                    pasted.x,
+                    pasted.y,
+                    pasted.pixels.width,
+                    pasted.pixels.height
+                ),
+                (4, 5, 8, 8)
+            );
+            assert_eq!(pasted.pixels.get16(0, 0), doc.layers[0].pixels.get16(4, 5));
+            assert_eq!(engine.undo.len(), history + 1);
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), baseline);
+            assert_eq!(engine.doc.selection, doc.selection);
+        }
+    }
+    #[test]
     fn command_j_duplicates_all_selected_roots_in_one_undo_and_selects_copies() {
         let (mut app, ctx) = small_fixture();
         let original = {
@@ -9334,6 +9425,95 @@ mod tests {
             app.shared.lock().unwrap().undo.is_empty(),
             "Live rotation preview must not commit history"
         );
+    }
+    #[test]
+    fn folder_gizmo_wer_previews_and_commits_only_the_wand_selection() {
+        for depth in [8, 16] {
+            for tool in [Tool::Move, Tool::Rotate, Tool::Scale] {
+                let (mut app, ctx) = small_fixture();
+                let (root, child) = {
+                    let mut e = app.shared.lock().unwrap();
+                    e.doc = Document::new_depth(32, 32, depth).unwrap();
+                    let mut folder = crate::engine::Layer::new("Folder", "group", 32, 32);
+                    folder.pixels = crate::raster::Raster::new_depth(32, 32, depth);
+                    let root = folder.id.clone();
+                    let child = e.doc.layers[0].id.clone();
+                    e.doc.layers[0].parent = Some(root.clone());
+                    for y in 5..11 {
+                        for x in 4..12 {
+                            e.doc.layers[0]
+                                .pixels
+                                .set16(x, y, [12347, 23459, 34571, 65535]);
+                        }
+                    }
+                    e.doc.layers[0]
+                        .pixels
+                        .set16(25, 25, [51239, 12349, 33561, 65535]);
+                    e.doc.layers.push(folder);
+                    e.edit("human", &[json!({"op":"selection","kind":"wand","layer":child,"point":[6,7],"sample_merged":false,"tolerance":0})], None, None, "Select").unwrap();
+                    e.undo.clear();
+                    (root, child)
+                };
+                app.select_content(&root);
+                app.select_tool(tool);
+                frame(&mut app, &ctx, vec![], Default::default());
+                let rect = app.view_rect.unwrap();
+                let center = rect.min + Vec2::new(8., 8.) * (rect.width() / 32.);
+                let (start, end) = if tool == Tool::Rotate {
+                    (center + Vec2::new(58., 0.), center + Vec2::new(0., 58.))
+                } else {
+                    (center, center + Vec2::new(35., 0.))
+                };
+                let before = app.shared.lock().unwrap().doc.clone();
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(start),
+                        button(
+                            start,
+                            egui::PointerButton::Primary,
+                            true,
+                            Default::default(),
+                        ),
+                    ],
+                    Default::default(),
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(end)],
+                    Default::default(),
+                );
+                assert_eq!(app.transient.len(), 1);
+                assert_eq!(app.transient[0]["selection_only"], true);
+                let preview = Engine::preview_edits(before.clone(), &app.transient).unwrap();
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![button(
+                        end,
+                        egui::PointerButton::Primary,
+                        false,
+                        Default::default(),
+                    )],
+                    Default::default(),
+                );
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1, "{}: {}", tool.label(), app.message);
+                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+                let layer = e.doc.layers.iter().find(|l| l.id == child).unwrap();
+                assert_eq!(
+                    layer.pixels.get16(25 - layer.x, 25 - layer.y),
+                    before.layers[0].pixels.get16(25, 25)
+                );
+                assert_ne!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                assert_eq!(e.doc.selection, before.selection);
+            }
+        }
     }
     #[test]
     fn folder_gizmo_transforms_selected_root_once_and_previews_actual_children() {

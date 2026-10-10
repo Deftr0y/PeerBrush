@@ -597,14 +597,35 @@ pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), St
     if c["mask"] == true {
         return Err("Select Color to transform the folder and its children".into());
     }
-    if doc.selection.is_some() && c["selection_only"] != false {
-        return Err(
-            "Use selection_only:false for a whole-folder transform, or select a child layer".into(),
-        );
-    }
     let ids = tree_ids(doc, &[root.into()]);
     if doc.layers.iter().any(|l| ids.contains(&l.id) && l.locked) {
         return Err("A layer inside the folder is locked".into());
+    }
+    if doc.selection.is_some() && c["selection_only"] != false {
+        let coverage = crate::selection::current(doc).ok_or("Selection no longer exists")?;
+        let mut command = c.clone();
+        if command["pivot"].is_null() {
+            command["pivot"] = serde_json::json!([
+                (coverage.bounds[0] as f64 + coverage.bounds[2] as f64) / 2.,
+                (coverage.bounds[1] as f64 + coverage.bounds[3] as f64) / 2.
+            ]);
+        }
+        // Every descendant uses the same document-space selection, including hidden
+        // children. Container masks and hierarchy remain attached to their sources.
+        let mut transformed = None;
+        for node in &mut doc.layers {
+            if ids.contains(&node.id) && node.kind != "group" {
+                if !matches!(node.kind.as_str(), "paint" | "fill") || node.source.is_some() {
+                    return Err("Rasterize editable text/vector or adjustment children before transforming selected folder pixels".into());
+                }
+                transformed = Some(selection_with_coverage(node, &coverage, &command)?);
+            }
+        }
+        let transformed = transformed.ok_or("Folder has no raster content to transform")?;
+        doc.selection = Some(transformed.bounds);
+        doc.selection_polygon = None;
+        doc.selection_coverage = Some(transformed);
+        return Ok(());
     }
     let bounds =
         tree_bounds(doc, &[root.into()]).unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
