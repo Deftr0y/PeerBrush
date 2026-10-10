@@ -1342,7 +1342,7 @@ impl PeerBrush {
         self.job(move || {
             let path = path.or_else(|| {
                 rfd::FileDialog::new()
-                    .add_filter("Photoshop document", &["psd"])
+                    .add_filter("Photoshop documents", &["psd", "psb"])
                     .pick_file()
             });
             let Some(path) = path else {
@@ -1360,7 +1360,7 @@ impl PeerBrush {
             Ok(if recover {
                 "Recovered autosave — save to your chosen PSD"
             } else {
-                "PSD opened"
+                "Photoshop document opened"
             }
             .into())
         });
@@ -1376,7 +1376,8 @@ impl PeerBrush {
         self.job(move || {
             let path = current.or_else(|| {
                 rfd::FileDialog::new()
-                    .add_filter("Photoshop document", &["psd"])
+                    .add_filter("PSD document", &["psd"])
+                    .add_filter("PSB document", &["psb"])
                     .set_file_name("Untitled.psd")
                     .save_file()
             });
@@ -1384,7 +1385,7 @@ impl PeerBrush {
                 return Ok("Save canceled · project remains open".into());
             };
             server::save_source(&s, &path, &document)?;
-            Ok("PSD saved".into())
+            Ok("Photoshop document saved".into())
         });
     }
     fn export(&mut self) {
@@ -1561,11 +1562,11 @@ impl PeerBrush {
             .filter(|p| {
                 p.extension()
                     .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("psd"))
+                    .is_some_and(|e| e.eq_ignore_ascii_case("psd") || e.eq_ignore_ascii_case("psb"))
             })
             .count();
         if psds > 0 && paths.len() != 1 {
-            self.message = "Drop one PSD to open it, or image files to add layers".into();
+            self.message = "Drop one PSD/PSB to open it, or image files to add layers".into();
         } else if psds == 1 {
             self.open_job(Some(paths[0].clone()), false);
         } else if !paths.is_empty() {
@@ -3981,7 +3982,7 @@ impl PeerBrush {
             painter.text(
                 bounds.center(),
                 egui::Align2::CENTER_CENTER,
-                "Drop PSD to open · Drop images to add layers",
+                "Drop PSD/PSB to open · Drop images to add layers",
                 egui::FontId::proportional(23.0),
                 Color32::WHITE,
             );
@@ -4160,7 +4161,7 @@ impl PeerBrush {
                             self.show_new = true;
                             ui.close_menu();
                         }
-                        if ui.button("Open PSD").clicked() {
+                        if ui.button("Open PSD/PSB").clicked() {
                             self.open();
                             ui.close_menu();
                         }
@@ -4169,7 +4170,7 @@ impl PeerBrush {
                             self.recovery.open = true;
                             ui.close_menu();
                         }
-                        if ui.button("Save PSD").clicked() {
+                        if ui.button("Save PSD/PSB").clicked() {
                             self.save(false);
                             ui.close_menu();
                         }
@@ -4220,10 +4221,10 @@ impl PeerBrush {
                     });
                     if ui
                         .add_enabled_ui(!self.busy, |ui| {
-                            icons::button(ui, Icon::Save, "Save PSD · Ctrl/Cmd+S")
+                            icons::button(ui, Icon::Save, "Save PSD/PSB · Ctrl/Cmd+S")
                         })
                         .inner
-                        .on_hover_text("Save PSD · Ctrl/Cmd+S")
+                        .on_hover_text("Save PSD/PSB · Ctrl/Cmd+S")
                         .clicked()
                     {
                         self.save(false);
@@ -4677,13 +4678,13 @@ impl PeerBrush {
                 ));
             }
             let status = control.status();
-            egui::Window::new("Opening PSD")
+            egui::Window::new("Opening Photoshop document")
                 .collapsible(false)
                 .resizable(false)
                 .default_width(350.)
                 .show(ctx, |ui| {
                     ui.label(if status.stage.is_empty() {
-                        "Choose a PSD file"
+                        "Choose a PSD or PSB file"
                     } else {
                         &status.stage
                     });
@@ -8182,6 +8183,73 @@ mod tests {
         assert!(!app.show_connection);
         assert_eq!(app.message, "Ready in Codex. Reload its MCP tools.");
         assert!(app.shared.lock().unwrap().mcp_clients.is_empty());
+    }
+    #[test]
+    fn dropped_psb_opens_a_native_project_without_replacing_existing_work() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            let original = app.project_id.clone();
+            let root = app.shared.clone();
+            let before = crate::psd::encode(&root.lock().unwrap().doc).unwrap();
+            let mut doc = Document::new_depth(8, 6, depth).unwrap();
+            doc.layers[0]
+                .pixels
+                .set16(2, 3, [10001, 20003, 40007, 65535]);
+            let expected = doc.export_png().unwrap();
+            let directory =
+                std::env::temp_dir().join(format!("peerbrush-psb-ui-{}", crate::engine::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("Native artwork.PSB");
+            std::fs::write(&path, crate::psd::encode_psb(&doc).unwrap()).unwrap();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                    dropped_files: vec![egui::DroppedFile {
+                        path: Some(path.clone()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                );
+                if crate::workspace::entries_in(&app.workspace).len() == 2 && !app.busy {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(
+                crate::workspace::entries_in(&app.workspace).len(),
+                2,
+                "{}",
+                app.message
+            );
+            assert_ne!(app.project_id, original);
+            let e = app.shared.lock().unwrap();
+            assert_eq!(e.doc.bit_depth, depth);
+            assert!(!e.doc.read_only);
+            assert_eq!(e.path.as_ref(), Some(&path));
+            assert_eq!(e.doc.export_png().unwrap(), expected);
+            assert!(e.undo.is_empty());
+            drop(e);
+            assert_eq!(
+                crate::psd::encode(&root.lock().unwrap().doc).unwrap(),
+                before
+            );
+            assert!(root.lock().unwrap().undo.is_empty());
+            app.drop_files(vec![path.clone(), directory.join("Image.png")]);
+            assert!(app.message.contains("Drop one PSD/PSB"));
+            assert_eq!(crate::workspace::entries_in(&app.workspace).len(), 2);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
     #[test]
     fn mcp_header_separates_server_availability_from_live_or_expired_clients_without_document_edits(

@@ -1,4 +1,4 @@
-//! A bounded PSD v1 codec. Unsupported Photoshop features are never silently rewritten.
+//! Bounded PSD v1 / PSB v2 codecs. Unsupported Photoshop features are never silently rewritten.
 use crate::{
     engine::{id, Document, Layer, Mask, MaskStep},
     raster::{check_size, Raster},
@@ -6,6 +6,89 @@ use crate::{
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, io::Read};
+
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    Psd,
+    Psb,
+}
+impl Layout {
+    fn large(self) -> bool {
+        self == Self::Psb
+    }
+    fn block<'a>(self, cursor: &mut Cursor<'a>) -> Result<&'a [u8], String> {
+        let n = cursor.length(self.large())?;
+        cursor.bytes(n)
+    }
+    fn length(self, out: &mut Vec<u8>, n: usize) {
+        if self.large() {
+            out.extend_from_slice(&(n as u64).to_be_bytes());
+        } else {
+            u32b(out, n as u32);
+        }
+    }
+    fn write_block(self, out: &mut Vec<u8>, data: &[u8]) {
+        self.length(out, data.len());
+        out.extend_from_slice(data);
+    }
+    fn tag_large(self, key: &[u8]) -> bool {
+        self.large()
+            && matches!(
+                key,
+                b"LMsk"
+                    | b"Lr16"
+                    | b"Lr32"
+                    | b"Layr"
+                    | b"Mt16"
+                    | b"Mt32"
+                    | b"Mtrn"
+                    | b"Alph"
+                    | b"FMsk"
+                    | b"lnk2"
+                    | b"FEid"
+                    | b"FXid"
+                    | b"PxSD"
+                    | b"lnk3"
+                    | b"lnkE"
+                    | b"FELS"
+                    | b"pths"
+                    | b"extd"
+                    | b"extn"
+                    | b"cinf"
+                    | b"artd"
+            )
+    }
+    fn tag_block<'a>(self, cursor: &mut Cursor<'a>, key: &[u8]) -> Result<&'a [u8], String> {
+        let n = cursor.length(self.tag_large(key))?;
+        cursor.bytes(n)
+    }
+}
+
+fn row_lengths<R: Read>(
+    input: &mut R,
+    count: usize,
+    row_bytes: usize,
+    layout: Layout,
+) -> Result<Vec<usize>, String> {
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut bytes = [0; 4];
+        let n = if layout.large() {
+            input.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+            u32::from_be_bytes(bytes) as usize
+        } else {
+            input
+                .read_exact(&mut bytes[..2])
+                .map_err(|e| e.to_string())?;
+            u16::from_be_bytes(bytes[..2].try_into().unwrap()) as usize
+        };
+        if layout.large() && n > row_bytes.saturating_mul(2).saturating_add(1024) {
+            return Err("PSB RLE row exceeds the bounded decode budget".into());
+        }
+        result.push(n);
+    }
+    Ok(result)
+}
 
 struct Cursor<'a> {
     data: &'a [u8],
@@ -39,6 +122,14 @@ impl<'a> Cursor<'a> {
     fn block(&mut self) -> Result<&'a [u8], String> {
         let n = self.u32()? as usize;
         self.bytes(n)
+    }
+    fn length(&mut self, large: bool) -> Result<usize, String> {
+        let n = if large {
+            u64::from_be_bytes(self.bytes(8)?.try_into().unwrap())
+        } else {
+            u64::from(self.u32()?)
+        };
+        usize::try_from(n).map_err(|_| "Photoshop section length overflow".into())
     }
 }
 fn u16b(out: &mut Vec<u8>, v: u16) {
@@ -286,6 +377,12 @@ impl<W: std::io::Write> std::io::Write for BoundedWriter<W> {
 }
 
 pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
+    encode_layout(doc, Layout::Psd)
+}
+pub fn encode_psb(doc: &Document) -> Result<Vec<u8>, String> {
+    encode_layout(doc, Layout::Psb)
+}
+fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     if doc.read_only {
         return Err(
             "Cannot save an unsupported PSD without explicitly creating a compatible copy".into(),
@@ -488,7 +585,7 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
                 }
             }
             u16b(&mut records, ch as u16);
-            u32b(&mut records, data.len() as u32);
+            layout.length(&mut records, data.len());
             channels.extend(data);
         }
         records.extend_from_slice(b"8BIM");
@@ -596,15 +693,15 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
     }
     let mut layer_section = vec![];
     if high {
-        u32b(&mut layer_section, 0); // Primary8-bit layer information is empty.
+        layout.length(&mut layer_section, 0); // Primary8-bit layer information is empty.
         u32b(&mut layer_section, 0); // Global layer mask.
         layer_section.extend(b"8BIMLr16");
-        block(&mut layer_section, &info);
+        layout.write_block(&mut layer_section, &info);
         layer_section.resize(layer_section.len() + (4 - info.len() % 4) % 4, 0);
         layer_section.extend(b"8BIMMt16");
-        u32b(&mut layer_section, 0);
+        layout.length(&mut layer_section, 0);
     } else {
-        block(&mut layer_section, &info);
+        layout.write_block(&mut layer_section, &info);
         u32b(&mut layer_section, 0);
     }
     let (w, h) = (doc.width, doc.height);
@@ -751,7 +848,7 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         resources.push(0);
     }
     let mut out = b"8BPS".to_vec();
-    u16b(&mut out, 1);
+    u16b(&mut out, if layout.large() { 2 } else { 1 });
     out.extend_from_slice(&[0; 6]);
     u16b(&mut out, 4);
     u32b(&mut out, h);
@@ -770,15 +867,15 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
         }
     }
     block(&mut out, &resources);
-    block(&mut out, &layer_section);
+    layout.write_block(&mut out, &layer_section);
     out.extend(composite);
     if out.len() > 256 * 1024 * 1024 {
-        return Err("PSD output exceeds the initial 256 MiB file limit".into());
+        return Err("Photoshop output exceeds the initial 256 MiB file limit".into());
     }
     Ok(out)
 }
 
-fn decode_channel(data: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
+fn decode_channel(data: &[u8], w: u32, h: u32, layout: Layout) -> Result<Vec<u8>, String> {
     let count = (w as usize)
         .checked_mul(h as usize)
         .ok_or("Channel overflow")?;
@@ -790,10 +887,13 @@ fn decode_channel(data: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     match kind {
         0 => Ok(r.bytes(count)?.to_vec()),
         1 => {
-            let mut lengths = vec![];
-            for _ in 0..h {
-                lengths.push(r.u16()? as usize);
-            }
+            let lengths = row_lengths(
+                &mut std::io::Cursor::new(&data[r.pos..]),
+                h as usize,
+                w as usize,
+                layout,
+            )?;
+            r.bytes(h as usize * if layout.large() { 4 } else { 2 })?;
             let mut out = Vec::with_capacity(count);
             for n in lengths {
                 let row = r.bytes(n)?;
@@ -918,6 +1018,7 @@ fn stream_composite<R: Read>(
     depth: u16,
     count: usize,
     transparency: bool,
+    layout: Layout,
     control: &crate::loading::Control,
 ) -> Result<Raster, String> {
     let mut kind = [0; 2];
@@ -927,13 +1028,12 @@ fn stream_composite<R: Read>(
         return Err("Unsupported PSD composite compression".into());
     }
     let lengths = if kind == 1 {
-        let mut lengths = Vec::with_capacity(h as usize * count);
-        for _ in 0..h as usize * count {
-            let mut n = [0; 2];
-            input.read_exact(&mut n).map_err(|e| e.to_string())?;
-            lengths.push(u16::from_be_bytes(n) as usize);
-        }
-        lengths
+        row_lengths(
+            input,
+            h as usize * count,
+            w as usize * if depth == 16 { 2 } else { 1 },
+            layout,
+        )?
     } else {
         vec![]
     };
@@ -1123,6 +1223,7 @@ fn stream_layer_channel(
     raster: &mut Raster,
     channel: usize,
     initialize: bool,
+    layout: Layout,
     control: &crate::loading::Control,
 ) -> Result<(), String> {
     if raster.width == 0 || raster.height == 0 {
@@ -1137,11 +1238,12 @@ fn stream_layer_channel(
     }
     let mut lengths = vec![];
     if kind == 1 {
-        for _ in 0..raster.height {
-            let mut n = [0; 2];
-            cursor.read_exact(&mut n).map_err(|e| e.to_string())?;
-            lengths.push(u16::from_be_bytes(n) as usize);
-        }
+        lengths = row_lengths(
+            &mut cursor,
+            raster.height as usize,
+            raster.width as usize * if raster.depth == 16 { 2 } else { 1 },
+            layout,
+        )?;
     }
     if kind >= 2 {
         let mut zip = ZlibDecoder::new(cursor);
@@ -1185,16 +1287,21 @@ pub fn decode_reader<R: Read + std::io::Seek>(
     use std::io::SeekFrom;
     let length = reader.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
     if length > 256 * 1024 * 1024 {
-        return Err("Initial PSD file limit is 256 MiB".into());
+        return Err("Photoshop file limit is 256 MiB".into());
     }
     reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     control.progress("Reading PSD header", 0, 1)?;
     let mut header = [0; 26];
     reader.read_exact(&mut header).map_err(|e| e.to_string())?;
     let mut r = Cursor::new(&header);
-    if r.bytes(4)? != b"8BPS" || r.u16()? != 1 {
-        return Err("Only PSD v1 is supported; PSB is not supported yet".into());
+    if r.bytes(4)? != b"8BPS" {
+        return Err("Invalid Photoshop document signature".into());
     }
+    let layout = match r.u16()? {
+        1 => Layout::Psd,
+        2 => Layout::Psb,
+        _ => return Err("Only PSD v1 and PSB v2 are supported".into()),
+    };
     r.bytes(6)?;
     let channel_count = r.u16()? as usize;
     let h = r.u32()?;
@@ -1203,12 +1310,24 @@ pub fn decode_reader<R: Read + std::io::Seek>(
     let depth = r.u16()?;
     let mode = r.u16()?;
     if ![8, 16].contains(&depth) || mode != 3 || !(3..=4).contains(&channel_count) {
-        return Err("PeerBrush opens 8-bit and 16-bit RGB PSDs (3 or 4 channels); unsupported Photoshop source features remain protected".into());
+        return Err("PeerBrush opens 8-bit and 16-bit RGB PSD/PSB documents (3 or 4 channels); unsupported Photoshop source features remain protected".into());
     }
-    read_section(reader, length, control, "Reading color data")?;
-    let resources = read_section(reader, length, control, "Reading PSD resources")?;
-    let layer_section = read_section(reader, length, control, "Reading layer sources")?;
-    let transparency = merged_transparency(&layer_section, depth)?;
+    read_section(reader, length, false, control, "Reading color data")?;
+    let resources = read_section(
+        reader,
+        length,
+        false,
+        control,
+        "Reading Photoshop resources",
+    )?;
+    let layer_section = read_section(
+        reader,
+        length,
+        layout.large(),
+        control,
+        "Reading layer sources",
+    )?;
+    let transparency = merged_transparency(&layer_section, depth, layout)?;
     let mut input = HashedReader {
         reader,
         hash: 0xcbf29ce484222325,
@@ -1220,6 +1339,7 @@ pub fn decode_reader<R: Read + std::io::Seek>(
         depth,
         channel_count,
         transparency,
+        layout,
         control,
     )?;
     let mut remaining = [0; 65536];
@@ -1237,18 +1357,28 @@ pub fn decode_reader<R: Read + std::io::Seek>(
         depth,
         merged,
         input.hash,
+        layout,
         control,
     )
 }
 fn read_section<R: Read + std::io::Seek>(
     reader: &mut R,
     length: u64,
+    large: bool,
     control: &crate::loading::Control,
     stage: &str,
 ) -> Result<Vec<u8>, String> {
-    let mut n = [0; 4];
-    reader.read_exact(&mut n).map_err(|e| e.to_string())?;
-    let n = u32::from_be_bytes(n) as usize;
+    let mut bytes = [0; 8];
+    let size = if large { 8 } else { 4 };
+    reader
+        .read_exact(&mut bytes[..size])
+        .map_err(|e| e.to_string())?;
+    let n = if large {
+        u64::from_be_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes[..4].try_into().unwrap()) as u64
+    };
+    let n = usize::try_from(n).map_err(|_| "Photoshop section length overflow")?;
     let position = reader.stream_position().map_err(|e| e.to_string())?;
     if n as u64 > length.saturating_sub(position) {
         return Err("Truncated PSD section".into());
@@ -1276,11 +1406,12 @@ fn decode_parts(
     depth: u16,
     merged: Raster,
     composite_hash: u64,
+    layout: Layout,
     control: &crate::loading::Control,
 ) -> Result<Document, String> {
     let mut rr = Cursor::new(resources);
     let mut embedded = None;
-    let mut warnings = vec![];
+    let mut warnings = global_warnings(layer_section, depth, layout)?;
     let mut has_merged_composite = true;
     let mut icc_profile = None;
     let mut seen_profile = false;
@@ -1384,7 +1515,7 @@ fn decode_parts(
     }
     let mut records = vec![];
     if !layer_section.is_empty() {
-        let info = layer_info(layer_section, depth)?;
+        let info = layer_info(layer_section, depth, layout)?;
         if info.len() >= 2 {
             let mut lr = Cursor::new(info);
             let signed_count = lr.i16()?;
@@ -1419,7 +1550,7 @@ fn decode_parts(
                 let mut channels = vec![];
                 for _ in 0..nc {
                     let channel = lr.i16()?;
-                    channels.push((channel, lr.u32()? as usize));
+                    channels.push((channel, lr.length(layout.large())?));
                     if !(-2..=2).contains(&channel) {
                         warnings.push(format!("Unsupported Photoshop layer channel: {channel}"));
                     }
@@ -1489,7 +1620,7 @@ fn decode_parts(
                         break;
                     }
                     let key = ex.bytes(4)?;
-                    let payload = ex.block()?;
+                    let payload = layout.tag_block(&mut ex, key)?;
                     if payload.len() % 2 != 0 {
                         ex.bytes(1)?;
                     }
@@ -1645,9 +1776,9 @@ fn decode_parts(
                                     return Err("Invalid mask bounds".into());
                                 }
                                 let values = if high {
-                                    decode_channel_16(bytes, mw as u32, mh as u32)?
+                                    decode_channel_16(bytes, mw as u32, mh as u32, layout)?
                                 } else {
-                                    decode_channel(bytes, mw as u32, mh as u32)?
+                                    decode_channel(bytes, mw as u32, mh as u32, layout)?
                                         .into_iter()
                                         .map(|v| v as u16 * 257)
                                         .collect()
@@ -1698,7 +1829,14 @@ fn decode_parts(
                             }
                         } else if (-1..=2).contains(&ch) {
                             let c = if ch == -1 { 3 } else { ch as usize };
-                            stream_layer_channel(bytes, &mut pixels, c, !initialized, control)?;
+                            stream_layer_channel(
+                                bytes,
+                                &mut pixels,
+                                c,
+                                !initialized,
+                                layout,
+                                control,
+                            )?;
                             initialized = true;
                         } else {
                             warnings.push(format!("Unsupported Photoshop layer channel: {ch}"));
@@ -1783,62 +1921,84 @@ fn decode_parts(
     control.progress("Ready", 1, 1)?;
     Ok(doc)
 }
-///16-bit Photoshop layer records live in Lr16 instead of the primary8-bit block.
-fn layer_info(section: &[u8], depth: u16) -> Result<&[u8], String> {
-    let mut r = Cursor::new(section);
-    let primary = r.block()?;
-    if depth == 8 || r.pos == section.len() {
-        return Ok(primary);
+/// Shared bounded global block parsing: PSB widens specific tagged lengths, not every block.
+type GlobalBlocks<'a> = (&'a [u8], &'a [u8], Vec<(&'a [u8], &'a [u8])>);
+fn global_blocks(section: &[u8], layout: Layout) -> Result<GlobalBlocks<'_>, String> {
+    if section.is_empty() {
+        return Ok((&[], &[], vec![]));
     }
-    r.block()?;
-    let mut info = primary;
+    let mut r = Cursor::new(section);
+    let primary = layout.block(&mut r)?;
+    if r.pos == section.len() {
+        return Ok((primary, &[], vec![]));
+    }
+    let mask = r.block()?; // Global mask length stays 32-bit in PSB.
+    let mut tags = Vec::new();
     while r.pos < section.len() {
         if section.len() - r.pos < 12 {
             if section[r.pos..].iter().all(|v| *v == 0) {
                 break;
             }
-            return Err("Truncated global layer information".into());
+            return Err("Truncated global Photoshop layer information".into());
         }
         let signature = r.bytes(4)?;
         if !matches!(signature, b"8BIM" | b"8B64") {
-            return Err("Invalid global layer signature".into());
+            return Err("Invalid global Photoshop layer signature".into());
         }
         let key = r.bytes(4)?;
-        let payload = r.block()?;
-        if key == b"Lr16" {
+        let payload = layout.tag_block(&mut r, key)?;
+        r.bytes((4 - payload.len() % 4) % 4)?;
+        if tags.len() >= 4096 {
+            return Err("Too many global Photoshop layer blocks".into());
+        }
+        tags.push((key, payload));
+    }
+    Ok((primary, mask, tags))
+}
+fn global_warnings(section: &[u8], depth: u16, layout: Layout) -> Result<Vec<String>, String> {
+    let (primary, mask, tags) = global_blocks(section, layout)?;
+    let mut warnings = vec![];
+    if !mask.is_empty() {
+        warnings
+            .push("Photoshop global layer masks are protected; using the saved composite".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (key, data) in tags {
+        if !seen.insert(key) {
+            warnings.push(format!(
+                "Duplicate global Photoshop layer tag: {}",
+                String::from_utf8_lossy(key)
+            ));
+        }
+        let supported = (depth == 8 && key == b"Layr")
+            || (depth == 16 && key == b"Lr16")
+            || (data.is_empty()
+                && ((depth == 8 && key == b"Mtrn") || (depth == 16 && key == b"Mt16")));
+        if !supported {
+            warnings.push(format!(
+                "Unsupported global Photoshop feature: {}",
+                String::from_utf8_lossy(key)
+            ));
+        }
+        if depth == 8 && key == b"Layr" && !primary.is_empty() {
+            warnings.push("Conflicting primary and global Photoshop layer records".into());
+        }
+    }
+    Ok(warnings)
+}
+fn layer_info(section: &[u8], depth: u16, layout: Layout) -> Result<&[u8], String> {
+    let (mut info, _, tags) = global_blocks(section, layout)?;
+    for (key, payload) in tags {
+        if (depth == 16 && key == b"Lr16") || (depth == 8 && key == b"Layr") {
             info = payload;
         }
-        r.bytes((4 - payload.len() % 4) % 4)?;
     }
     Ok(info)
 }
-
-/// Photoshop can store deeper layer-info and merged transparency as global tagged blocks.
-/// Read only their bounded headers; unsupported source objects are never deserialized for a preview.
-fn merged_transparency(section: &[u8], depth: u16) -> Result<bool, String> {
-    if section.is_empty() {
-        return Ok(false);
-    }
-    let mut r = Cursor::new(section);
-    let info = r.block()?;
+fn merged_transparency(section: &[u8], depth: u16, layout: Layout) -> Result<bool, String> {
+    let (info, _, tags) = global_blocks(section, layout)?;
     let mut alpha = info.len() >= 2 && i16::from_be_bytes(info[..2].try_into().unwrap()) < 0;
-    if r.pos == section.len() {
-        return Ok(alpha);
-    }
-    r.block()?; // Global layer mask.
-    while r.pos < section.len() {
-        if section.len() - r.pos < 12 {
-            if section[r.pos..].iter().all(|b| *b == 0) {
-                break;
-            }
-            return Err("Truncated global PSD layer information".into());
-        }
-        let signature = r.bytes(4)?;
-        if signature != b"8BIM" && signature != b"8B64" {
-            return Err("Invalid global PSD layer information signature".into());
-        }
-        let key = r.bytes(4)?;
-        let payload = r.block()?;
+    for (key, payload) in tags {
         if (depth == 8 && key == b"Mtrn") || (depth == 16 && key == b"Mt16") {
             alpha = true;
         }
@@ -1846,15 +2006,18 @@ fn merged_transparency(section: &[u8], depth: u16) -> Result<bool, String> {
         {
             alpha |= i16::from_be_bytes(payload[..2].try_into().unwrap()) < 0;
         }
-        // Global tagged blocks are aligned to four bytes; per-layer tags use two.
-        let padding = (4 - payload.len() % 4) % 4;
-        r.bytes(padding)?;
     }
     Ok(alpha)
 }
 
 /// Bounded display decode: no 16-bit sources are replaced or marked editable.
-fn decode_planes_16(data: &[u8], w: u32, h: u32, count: usize) -> Result<Vec<u16>, String> {
+fn decode_planes_16(
+    data: &[u8],
+    w: u32,
+    h: u32,
+    count: usize,
+    layout: Layout,
+) -> Result<Vec<u16>, String> {
     let mut r = Cursor::new(data);
     let kind = r.u16()?;
     let pixels = (w as usize)
@@ -1874,9 +2037,13 @@ fn decode_planes_16(data: &[u8], w: u32, h: u32, count: usize) -> Result<Vec<u16
             let rows = (h as usize)
                 .checked_mul(count)
                 .ok_or("PSD row table overflow")?;
-            let lengths = (0..rows)
-                .map(|_| r.u16().map(|n| n as usize))
-                .collect::<Result<Vec<_>, _>>()?;
+            let lengths = row_lengths(
+                &mut std::io::Cursor::new(&data[r.pos..]),
+                rows,
+                row_bytes,
+                layout,
+            )?;
+            r.bytes(rows * if layout.large() { 4 } else { 2 })?;
             let mut out = Vec::with_capacity(total);
             for length in lengths {
                 let row = r.bytes(length)?;
@@ -1942,8 +2109,8 @@ fn decode_planes_16(data: &[u8], w: u32, h: u32, count: usize) -> Result<Vec<u16
         .collect())
 }
 
-fn decode_channel_16(data: &[u8], w: u32, h: u32) -> Result<Vec<u16>, String> {
-    decode_planes_16(data, w, h, 1)
+fn decode_channel_16(data: &[u8], w: u32, h: u32, layout: Layout) -> Result<Vec<u16>, String> {
+    decode_planes_16(data, w, h, 1, layout)
 }
 pub fn validate(doc: &Document) -> Result<(), String> {
     if let Some(profile) = &doc.icc_profile {

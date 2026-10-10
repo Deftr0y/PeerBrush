@@ -523,7 +523,8 @@ impl PeerBrush {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let path = if save_as { None } else { row.path }.or_else(|| {
                         rfd::FileDialog::new()
-                            .add_filter("Photoshop document", &["psd"])
+                            .add_filter("PSD document", &["psd"])
+                            .add_filter("PSB document", &["psb"])
                             .set_file_name(&row.name)
                             .save_file()
                     });

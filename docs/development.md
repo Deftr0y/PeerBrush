@@ -28,9 +28,9 @@ On this Windows checkout, `scripts/dev.ps1` uses an isolated official GNU Rust d
 .\scripts\dev.ps1 build
 ```
 
-Sparse raster tiles are copy-on-write, so snapshots share unchanged content. Atomic command batches validate reservations and conflicting revisions before mutation; failures restore the pre-batch document. History is bounded to 40 batches. Tile sources use compact base64 encoding streamed into compressed metadata, avoiding large temporary arrays. Metadata sources are compressed in PSD resource 4000, identified by `PeerBrush.v1` and `PBR1`; hashes guard against stale definitions after external edits.
+Sparse raster tiles are copy-on-write, so snapshots share unchanged content. Atomic command batches validate reservations and conflicting revisions before mutation; failures restore the pre-batch document. History is bounded to 40 batches. Tile sources use compact base64 encoding streamed into compressed metadata, avoiding large temporary arrays. Metadata sources are compressed in PSD/PSB resource 4000, identified by `PeerBrush.v1` and `PBR1`; hashes guard against stale definitions after external edits.
 
-Initial limits: 8192 pixels per edge, 32 megapixels, 100 editable layers, 512 MiB allocated raster tiles, 256 MiB PSD input, and 128 MiB decoded application metadata. These limits are deliberately explicit while streaming and stronger cache budgets are developed.
+Initial limits: 8192 pixels per edge, 32 megapixels, 100 editable layers, 512 MiB allocated raster tiles, 256 MiB PSD/PSB input and output, and 128 MiB decoded application metadata. These limits are deliberately explicit while streaming and stronger cache budgets are developed.
 
 Roadmap: GPU tile compositor and incremental preview updates; text/vector source layers; non-destructive transforms; additional selection tools and subject segmentation; liquify distortion maps; selective task undo; isolated/pass-through group fidelity; remote connection and plugin support.
 

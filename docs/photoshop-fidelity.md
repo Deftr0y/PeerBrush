@@ -2,6 +2,14 @@
 
 PeerBrush 0.2 implements the documented RGB subset: standard raster clipping, pass-through folders, full layer locks, supported RGB ICC previews and explicit native-depth sRGB copies. Unsupported Photoshop settings remain protected. The v0.1.4 checkpoint predates these changes; [v0.2 packages](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2) contain the documented support.
 
+## PSB support — unreleased PB-104
+
+Open or drop `.psb` files into independent project tabs; Save/Save As selects PSD v1 or PSB v2 from the destination extension. UI, MCP and CLI share the codec, current source/file guards and protected-copy behavior. PSB keeps native 8/16-bit RGB source, mask and merged channels. Standard layers/groups, clipping, baked effects, ICC handling and supplementary editable sources follow the PSD behavior below; PSB does not make unsupported Photoshop objects editable. Nonempty global masks, unknown global features and conflicting global layer blocks remain protected in both formats.
+
+PSB structural layer-section, layer-info and channel lengths are 64-bit; its RLE row counts are 32-bit. Only the specified wide tagged blocks use 64-bit payload lengths. Resources, layer extra data and global-mask lengths remain 32-bit. Parsing rejects truncated/overflowing lengths and bounds RLE row scratch before allocating it. The writer always includes current standard raster/mask data and a merged composite. The implementation follows [Adobe’s file format specification](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/) and recognizes additional wide keys used by [psd-tools](https://github.com/psd-tools/psd-tools/blob/main/src/psd_tools/psd/tagged_blocks.py), while protecting their unsupported contents.
+
+The existing **8192 pixels per edge, 32 MP canvas, 100 editable layers, 200 standard layer records, 512 MiB source tiles and 256 MiB encoded file limits still apply**. PSB files beyond those limits, non-RGB modes and unsupported channel depths report errors. Larger-resolution/out-of-core work remains PB-105. Independent raw/RLE/ZIP/prediction fixtures exercise both depths, masks and protected sources; no broader Photoshop or receiving-application compatibility is claimed.
+
 ## Supported clipping
 
 PSD v1 RGB documents at 8 or 16 bits can contain consecutive clipped raster layers directly above a raster base. Stacks can live at the document root or inside an isolated or pass-through folder. The importer resolves each follower to the nearest non-clipped sibling below it, including hidden bases, and never uses a base outside its folder. Raster alpha, opacity, supported blend modes and raster masks use the shared document compositor. The base's blend applies to the complete clipping unit; hiding the base hides its followers.
