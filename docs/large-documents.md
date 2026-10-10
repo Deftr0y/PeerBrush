@@ -10,7 +10,7 @@ The existing RAM budgets remain explicit: 256 MiB color effects at 8 bits, separ
 
 Disk entries live under the workspace state directory's `derived-cache`, in an isolated instance directory. They are disposable, excluded from history and PSD sources, and abandoned recognized entries are cleared under the workspace instance lock. They are never substituted for original tiles, masks, retained transform sources, standard PSD channels or the merged composite.
 
-Limits remain **PSD v1 / 256 MiB encoded files, 8192 pixels per edge, 32 megapixels and 512 MiB document raster sources**, including retained originals. This work does not enable PSB, unlimited document sizes, arbitrary Photoshop features or out-of-core editable sources. Mask-channel buffers and private JSON restoration remain bounded in-memory paths; cancellation is checked between chunks/rows/sources rather than inside an individual JSON parse.
+Limits remain **256 MiB encoded files, 8192 pixels per edge, 32×1024² canvas pixels and 512 MiB document raster sources**, including retained originals. Unreleased [PB-104](photoshop-fidelity.md) adds PSB v2 alongside PSD v1 under the same limits. The [PB-105 investigation](large-document-investigation.md) records practical save boundaries and a phased streaming/out-of-core proposal; larger limits are not implemented. Mask-channel buffers and private JSON restoration remain bounded in-memory paths; cancellation is checked between chunks/rows/sources rather than inside an individual JSON parse.
 
 ## MCP / CLI
 
