@@ -1,16 +1,16 @@
-import { detectPlatform, safeDownloadUrl, releaseHistory, latestRelease } from './platform.js';
+import { detectPlatform, safeDownloadUrl, latestRelease } from './platform.js';
 import './showcase.js';
+import { renderHistory } from './releases.js';
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 const views = {
-  workspace: { caption: 'Real workspace · Ember lake example · ImageGen artwork', alt: 'A mountain lake at sunset open in PeerBrush, with editable layers, masks and color effects.' },
-  brush: { caption: 'Native workspace · Brush settings and stroke previews', alt: 'PeerBrush brush controls showing pressure, texture, taper and stroke settings.' },
-  selection: { caption: 'Native workspace · Rectangular selection on the canvas', alt: 'A mountain lake in PeerBrush with a rectangular selection around the sun and distant mountains.' },
-  color: { caption: 'Native workspace · Color picker and compact channel controls', alt: 'PeerBrush color picker with hue and saturation, channel controls and editable color values.' },
+  workspace: { caption: 'Workspace', alt: 'A mountain lake at sunset open in PeerBrush, with editable layers, masks and color effects.' },
+  brush: { caption: 'Brush settings', alt: 'PeerBrush brush controls showing pressure, texture, taper and stroke settings.' },
+  selection: { caption: 'Selection', alt: 'A mountain lake in PeerBrush with a rectangular selection around the sun and distant mountains.' },
+  color: { caption: 'Color picker', alt: 'PeerBrush color picker with hue and saturation, channel controls and editable color values.' },
 };
 const tabs = [...document.querySelectorAll('[role="tab"]')];
 const image = document.querySelector('#workspace-image');
-const caption = document.querySelector('#screenshot-caption');
 const panel = document.querySelector('#screenshot-panel');
 const dialog = document.querySelector('.image-dialog');
 const dialogImage = document.querySelector('#dialog-image');
@@ -29,9 +29,7 @@ function selectView(tab) {
     image.animate([{ opacity: .35, transform: 'scale(1.015)' }, { opacity: 1, transform: 'scale(1)' }], { duration: 380, easing: 'ease-out' });
   }
   image.alt = view.alt;
-  caption.textContent = view.caption;
   panel.setAttribute('aria-labelledby', tab.id);
-  document.querySelector('.image-count').textContent = `${String(tabs.indexOf(tab) + 1).padStart(2, '0')} / 04`;
   for (const button of document.querySelectorAll('.screenshot-button, .expand-button')) {
     button.setAttribute('aria-label', `Enlarge ${activeView} screenshot`);
   }
@@ -111,28 +109,6 @@ function renderDownloads(build) {
     if (url.hostname === 'github.com' && url.protocol === 'https:' && url.pathname.startsWith('/Deftr0y/PeerBrush/releases/tag/')) document.querySelector('#release-link').href = url.href;
   } catch { /* Keep the canonical release-list link. */ }
   return true;
-}
-function renderHistory(data) {
-  const list=document.querySelector('#release-history');
-  list.replaceChildren();
-  for(const release of releaseHistory(data)) {
-    const item=document.createElement('li');
-    const heading=document.createElement('h3');
-    const link=document.createElement('a');link.href=release.releaseUrl;link.textContent=release.label || release.version;heading.append(link);
-    const date=document.createElement('p');date.className='history-date';date.textContent=`${release.publishedAt.slice(0,10)} · ${release.kind} · ${release.commit.slice(0,7)}`;
-    const notes=document.createElement('ul');
-    for(const note of release.notes) {const line=document.createElement('li');line.textContent=note;notes.append(line);}
-    const downloads=document.createElement('div');downloads.className='history-downloads';
-    for(const platform of release.platforms) {
-      const row=document.createElement('p');row.append(downloadLink(platform),document.createTextNode(` · ${platform.architecture}`));
-      if(platform.sha256) {const code=document.createElement('code');code.textContent=platform.sha256;row.append(document.createTextNode(' · SHA-256 '),code);}
-      else row.append(document.createTextNode(' · Checksum not recorded'));
-      downloads.append(row);
-    }
-    const missing=['Windows','Linux','macOS'].filter(name=>!release.platforms.some(p=>p.name===name));
-    if(missing.length) {const line=document.createElement('p');line.textContent=`No published ${missing.join(' / ')} package for this checkpoint.`;downloads.append(line);}
-    item.append(heading,date,notes,downloads);list.append(item);
-  }
 }
 async function loadDownloads() {
   let loaded = false;
