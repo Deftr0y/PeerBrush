@@ -442,6 +442,7 @@ pub struct Engine {
     pub path: Option<std::path::PathBuf>,
     pub status: String,
     pub file_version: Option<crate::file_safety::Version>,
+    pub(crate) file_ownership: Option<std::sync::Arc<crate::file_ownership::Ownership>>,
     pub capture_ui: Option<std::path::PathBuf>,
     /// A human-requested native close review; never serialized into documents.
     pub native_close_review: Option<(String, u64)>,
@@ -585,6 +586,7 @@ impl Engine {
             path: None,
             status: "Ready".into(),
             file_version: None,
+            file_ownership: None,
             capture_ui: None,
             native_close_review: None,
             capture_panel: None,
@@ -2508,6 +2510,11 @@ impl Engine {
         self.mark_ai(actor, "Redo AI edit", "history", h.scopes.clone());
         self.undo.push(h);
         Ok(())
+    }
+    pub(crate) fn release_file_ownership(&mut self) {
+        if let Some(owner) = self.file_ownership.take() {
+            owner.release();
+        }
     }
     pub fn replace(
         &mut self,

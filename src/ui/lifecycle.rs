@@ -104,10 +104,10 @@ mod tests {
             let path = app.connection.state_dir.join("conflicting.psd");
             server::save(&root, &path).unwrap();
             let before = root.lock().unwrap().doc.export_png().unwrap();
-            let newer = Arc::new(Mutex::new(Engine::new()));
-            server::open(&newer, &path).unwrap();
-            dirty(&newer, "Newer saved source");
-            server::save(&newer, &path).unwrap();
+            // Simulate another editor replacing the source: duplicate PeerBrush opens are blocked.
+            let mut newer = root.lock().unwrap().doc.clone();
+            newer.layers[0].name = "Newer saved source".into();
+            server::atomic_write(&path, &crate::psd::encode(&newer).unwrap()).unwrap();
             let saved = std::fs::read(&path).unwrap();
             frame(&mut app, &ctx, vec![]);
             let project = root.lock().unwrap().project_id.clone();

@@ -340,7 +340,9 @@ fn canceled_stale_failed_and_invalid_opens_preserve_document_and_history() {
     assert!(shared.lock().unwrap().undo.is_empty());
     server::open(&shared, &path).unwrap();
     let reused = Control::default();
-    server::open_progress(&shared, &path, &reused).unwrap();
+    assert!(server::open_progress(&shared, &path, &reused)
+        .unwrap_err()
+        .starts_with("File already open"));
     assert!(server::open_progress(&shared, &path, &reused)
         .unwrap_err()
         .contains("already started"));

@@ -18,13 +18,13 @@ pub struct Version {
 }
 
 #[cfg(unix)]
-fn identity(file: &fs::File) -> Result<(u64, u64), String> {
+pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
     use std::os::unix::fs::MetadataExt;
     let m = file.metadata().map_err(|e| e.to_string())?;
     Ok((m.dev(), m.ino()))
 }
 #[cfg(windows)]
-fn identity(file: &fs::File) -> Result<(u64, u64), String> {
+pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
     use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     #[derive(Default)]
@@ -161,7 +161,7 @@ pub fn same_destination(a: &Path, b: &Path) -> Result<bool, String> {
 fn regular(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
-fn destination_key(path: &Path) -> [u64; 2] {
+pub(crate) fn destination_key(path: &Path) -> [u64; 2] {
     let mut key = [0xcbf29ce484222325, 0x84222325cbf29ce4];
     #[cfg(windows)]
     hash(

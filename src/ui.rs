@@ -3,6 +3,7 @@ mod animation;
 mod brush;
 mod color;
 mod effects;
+mod file_ownership;
 mod filters;
 mod geometry;
 mod history;
@@ -287,6 +288,7 @@ pub struct PeerBrush {
     lifecycle: Option<lifecycle::Review>,
     recovery: recovery::Browser,
     saved_versions: Option<saved_versions::Browser>,
+    open_file_warning: Option<String>,
     lifecycle_frame: bool,
     exit_approved: bool,
     connected: bool,
@@ -571,6 +573,7 @@ impl PeerBrush {
         Self {
             recovery: recovery::Browser::new(&connection.state_dir),
             saved_versions: None,
+            open_file_warning: None,
             workspace_root: shared.clone(),
             workspace,
             project_id,
@@ -1363,11 +1366,15 @@ impl PeerBrush {
             let Some(path) = path else {
                 return Ok("Open canceled · current projects preserved".into());
             };
-            server::open_progress(&s, &path, &control)?;
+            if let Err(error) = server::open_progress(&s, &path, &control) {
+                crate::workspace::duplicate_warning(&workspace, &path, &error, true);
+                return Err(error);
+            }
             if recover {
                 let mut e = s.lock().unwrap();
                 e.path = None;
                 e.file_version = None;
+                e.release_file_ownership();
                 e.saved_revision = u64::MAX;
                 if let Some(name) = name {
                     e.doc.name = format!("Recovered — {name}");
@@ -3331,6 +3338,8 @@ impl PeerBrush {
         self.project_id = id.into();
         self.busy = self.jobs.contains(id);
         if let Some(view) = self.project_views.remove(id) {
+            // A fit requested for a new tab must not replace this tab's saved view.
+            self.frame_pending = false;
             self.selected = view.selected;
             self.selection_layers = view.selection_layers;
             self.selection_anchor = view.selection_anchor;
@@ -3647,6 +3656,23 @@ impl PeerBrush {
     }
     fn draw(&mut self, ctx: &egui::Context) {
         self.lifecycle_frame = false;
+        if let Some(warning) = self.workspace.lock().unwrap().open_warning.take() {
+            self.open_file_warning = Some(warning);
+        }
+        if let Some(warning) = self.open_file_warning.clone() {
+            egui::Window::new("File already open")
+                .id(egui::Id::new("duplicate_file_warning"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.);
+                    ui.label(warning);
+                    if ui.button("OK").clicked() {
+                        self.open_file_warning = None;
+                    }
+                });
+        }
         let panel = self
             .workspace_root
             .try_lock()

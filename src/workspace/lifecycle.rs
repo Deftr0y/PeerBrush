@@ -88,6 +88,7 @@ pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), St
             control.cancel();
         }
         e.closed = true;
+        e.release_file_ownership();
     }
     Ok(())
 }

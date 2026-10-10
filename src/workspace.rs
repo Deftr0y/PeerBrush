@@ -33,6 +33,7 @@ struct Entry {
     handle: Handle,
 }
 pub struct Workspace {
+    pub(crate) open_warning: Option<String>,
     entries: Vec<Entry>,
     active: String,
     pub(crate) exiting: bool,
@@ -45,6 +46,35 @@ pub struct Workspace {
 }
 pub type Registry = Arc<Mutex<Workspace>>;
 pub const MAX_PROJECTS: usize = 16;
+
+/// Queue native feedback without changing any document or presentation state.
+pub(crate) fn duplicate_warning(
+    workspace: &Registry,
+    path: &std::path::Path,
+    error: &str,
+    focus: bool,
+) {
+    if !error.starts_with("File already open") {
+        return;
+    }
+    let owner = crate::file_ownership::local_project(path);
+    let mut w = workspace.lock().unwrap();
+    let existing = owner.and_then(|id| {
+        w.entries
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.id.clone(), p.name.clone()))
+    });
+    let detail = if let Some((id, name)) = existing {
+        if focus {
+            w.active = id;
+        }
+        format!("{} is already open in project {name}. Its unsaved work, selection, view and history are preserved.", path.file_name().unwrap_or_default().to_string_lossy())
+    } else {
+        error.to_string()
+    };
+    w.open_warning = Some(detail);
+}
 
 pub fn attach(root: &Shared) -> Registry {
     let key = Arc::as_ptr(root) as usize;
@@ -78,6 +108,7 @@ pub fn attach(root: &Shared) -> Registry {
         recovery_error: None,
         recovery_failures: Default::default(),
         recovery_retired: vec![],
+        open_warning: None,
     }));
     e.workspace = Some(Arc::downgrade(&workspace));
     e.workspace_owner = Some(workspace.clone());
@@ -358,6 +389,7 @@ pub fn close_in(
         control.cancel();
     }
     e.closed = true;
+    e.release_file_ownership();
     e.doc = Document::new(1, 1).unwrap();
     e.saved_revision = 0;
     e.undo.clear();

@@ -280,24 +280,31 @@ fn transfer_preview_and_paste_preserve_native_tree_masks_effects_and_standard_ps
     assert_eq!(reopened.bit_depth, 16);
 }
 #[test]
-fn duplicate_opens_have_distinct_runtime_sources_and_keep_independent_save_conflict_guards() {
+fn duplicate_opens_preserve_work_focus_existing_and_keep_independent_save_conflict_guards() {
     let (root, _) = fixture();
     let dir = std::env::temp_dir().join(format!("pb-projects-{}", peerbrush::engine::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("shared.psd");
     server::save(&root, &path).unwrap();
-    let a = server::dispatch(&root, "projects", &json!({"action":"open","path":path})).unwrap();
-    let b = server::dispatch(&root, "projects", &json!({"action":"open","path":path})).unwrap();
-    assert_ne!(a["project_id"], b["project_id"]);
-    assert_ne!(a["document"]["id"], b["document"]["id"]);
-    let a = w::get(&root, a["project_id"].as_str().unwrap()).unwrap();
-    let b = w::get(&root, b["project_id"].as_str().unwrap()).unwrap();
-    edit(&root, &a, "Saved first");
-    server::save(&a, &path).unwrap();
-    edit(&root, &b, "Other edits");
-    assert!(server::save(&b, &path).unwrap_err().contains("outside"));
-    assert_eq!(b.lock().unwrap().saved_revision, 0);
-    assert_eq!(b.lock().unwrap().doc.layers[0].name, "Other edits");
+    edit(&root, &root, "Unsaved original");
+    let before = root.lock().unwrap().state();
+    let count = w::handles(&root).len();
+    assert!(server::dispatch(
+        &root,
+        "projects",
+        &json!({"action":"open","path":path,"actor":"human"})
+    )
+    .unwrap_err()
+    .starts_with("File already open"));
+    assert_eq!(w::handles(&root).len(), count);
+    assert_eq!(w::active_id(&root), root.lock().unwrap().project_id);
+    assert_eq!(root.lock().unwrap().state(), before);
+    // Another editor remains outside the cooperative open-file locks.
+    let mut external = root.lock().unwrap().doc.clone();
+    external.layers[0].name = "External saved work".into();
+    server::atomic_write(&path, &peerbrush::psd::encode(&external).unwrap()).unwrap();
+    assert!(server::save(&root, &path).unwrap_err().contains("outside"));
+    assert_eq!(root.lock().unwrap().doc.layers[0].name, "Unsaved original");
     let closed = w::new_project(&root, 12, 10, 8, None).unwrap();
     let p = target(&closed);
     w::close(
@@ -367,6 +374,8 @@ fn reopening_same_psd_rejects_old_project_source_even_at_identical_saved_revisio
     server::save(&second, &path).unwrap();
     let mut old = target(&second);
     old["commands"] = json!([{"op":"layer.add","name":"Stale"}]);
+    assert!(server::open(&second, &path).is_err());
+    server::dispatch(&root, "document", &json!({"action":"new","actor":"human","project_id":old["project_id"],"document_id":old["document_id"],"expected_revision":old["expected_revision"],"width":12,"height":10})).unwrap();
     server::open(&second, &path).unwrap();
     assert_eq!(second.lock().unwrap().doc.revision, 0);
     assert!(server::dispatch(&root, "edit", &old).is_err());

@@ -86,7 +86,7 @@ fn flushed_temp_failure_preserves_original_and_cleans_incomplete_file() {
     fs::create_dir(&dir).unwrap();
     let path = dir.join("document.psd");
     fs::write(&path, b"prior complete file").unwrap();
-    let result = atomic_write_checked(&path, b"new prepared file", || {
+    let result = atomic_write_checked(&path, b"new prepared file", |_| {
         Err("Injected publication failure".into())
     });
     assert!(result.is_err());

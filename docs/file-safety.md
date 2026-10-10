@@ -1,5 +1,7 @@
 # File safety (unreleased)
 
+[Open-file ownership](file-ownership.md) prevents duplicate PSD/PSB opens across tabs, pending loads and PeerBrush processes. Content-based conflict checks remain independent: tests construct legacy document states without ownership and still verify that stale saves cannot replace newer artwork.
+
 Save and PNG export capture the document identity and revision, the destination's file identity, timestamp, length and a streamed content fingerprint. The final replacement checks the captured source and destination again after flushing a same-directory temporary file. A changed source or destination rejects the operation, preserves current work and leaves the project open. Fingerprints detect accidental changes; they are not authentication hashes.
 
 An instance that opened an older version cannot overwrite a newer save, including through equivalent paths. Use **Save As** with a new destination to retain both versions. Existing Save As and export destinations require explicit replacement consent: the native save dialog supplies it; MCP/CLI requests use `overwrite:true`. This consent never bypasses a loaded source conflict. Cooperative OS file locks serialize saves to the same destination across PeerBrush processes, independently of their instance-state directories.

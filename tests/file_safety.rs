@@ -47,6 +47,14 @@ fn paint(s: &server::Shared, value: u16) {
 fn png(s: &server::Shared) -> Vec<u8> {
     s.lock().unwrap().doc.export_png().unwrap()
 }
+// Legacy instances and other editors can bypass modern open-file ownership.
+// Keep content-based publication protection independently exercised.
+fn legacy_open(s: &server::Shared, path: &std::path::Path) {
+    let doc = peerbrush::psd::decode(&fs::read(path).unwrap()).unwrap();
+    let mut e = s.lock().unwrap();
+    e.replace(doc, Some(path.into())).unwrap();
+    e.file_version = Some(file_safety::version(path).unwrap());
+}
 fn versions(dir: &Directory) -> Vec<PathBuf> {
     fs::read_dir(dir.0.join(".peerbrush-versions"))
         .unwrap()
@@ -126,10 +134,11 @@ fn stale_two_instance_saves_close_orders_and_recovery_preserve_manual_artwork() 
             let initial = fixture(depth);
             server::save(&initial, &path).unwrap();
             let initial_file = fs::read(&path).unwrap();
+            drop(initial);
             let stale = fixture(depth);
             let newer = fixture(depth);
-            server::open(&stale, &path).unwrap();
-            server::open(&newer, &path).unwrap();
+            legacy_open(&stale, &path);
+            legacy_open(&newer, &path);
             let stale_registry = workspace::attach(&stale);
             let newer_registry = workspace::attach(&newer);
             paint(&newer, 54321);
@@ -217,6 +226,7 @@ fn save_as_and_exports_require_consent_and_keep_exact_previous_versions() {
         let old = fixture(depth);
         server::save(&old, &target).unwrap();
         let old_file = fs::read(&target).unwrap();
+        drop(old);
         let s = fixture(depth);
         paint(&s, 54321);
         let before = png(&s);
@@ -336,6 +346,7 @@ fn protocol_overwrite_is_explicit_and_does_not_override_stale_source() {
     let target = dir.0.join("existing.psd");
     let old = fixture(8);
     server::save(&old, &target).unwrap();
+    drop(old);
     let s = fixture(16);
     assert!(server::dispatch(&s, "document", &json!({"action":"save","path":target})).is_err());
     server::dispatch(

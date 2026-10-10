@@ -38,12 +38,12 @@ impl Drop for ServerAvailability {
     }
 }
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    atomic_write_checked(path, bytes, || Ok(()))
+    atomic_write_checked(path, bytes, |_| Ok(()))
 }
 fn atomic_write_checked(
     path: &Path,
     bytes: &[u8],
-    validate: impl FnOnce() -> Result<(), String>,
+    validate: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let tmp = path.with_extension(format!("{}.tmp", engine::id()));
     let result = (|| {
@@ -58,7 +58,7 @@ fn atomic_write_checked(
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
-        validate()?;
+        validate(&tmp)?;
         replace_file(&tmp, path)?;
         sync_parent(path)?;
         Ok(())
@@ -148,6 +148,17 @@ pub fn open_progress(
             e.loading = None;
         }
     }
+    if let Err(error) = &result {
+        let workspace = shared
+            .lock()
+            .unwrap()
+            .workspace
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(workspace) = workspace {
+            crate::workspace::duplicate_warning(&workspace, path, error, false);
+        }
+    }
     result
 }
 fn open_progress_inner(
@@ -160,7 +171,7 @@ fn open_progress_inner(
             "Choose a .psd or .psb file inside this folder, or drop one Photoshop document onto the canvas".into(),
         );
     }
-    let before = {
+    let (before, project) = {
         let mut e = shared.lock().unwrap();
         e.ensure_open()?;
         if e.loading.as_ref().is_some_and(|c| !c.same(control)) {
@@ -173,8 +184,9 @@ fn open_progress_inner(
             return Err("Canvas changed before opening; current work preserved".into());
         }
         e.loading = Some(control.clone());
-        before
+        (before, e.project_id.clone())
     };
+    let ownership = crate::file_ownership::Ownership::open(path, &project)?;
     let version = crate::file_safety::version_with_check(path, || control.check())?;
     if version.bytes > 256 * 1024 * 1024 {
         return Err("Photoshop document exceeds the initial 256 MiB file limit".into());
@@ -191,6 +203,7 @@ fn open_progress_inner(
         .into();
     let mut e = shared.lock().unwrap();
     control.check()?;
+    ownership.prepare(path)?;
     if crate::file_safety::version_with_check(path, || control.check())? != version {
         return Err("Photoshop file changed during decoding; current work preserved".into());
     }
@@ -198,6 +211,9 @@ fn open_progress_inner(
         return Err("Canvas changed while opening. Save the current work and try again.".into());
     }
     e.replace(doc, Some(path.into()))?;
+    ownership.published(version.identity);
+    e.release_file_ownership();
+    e.file_ownership = Some(ownership);
     e.file_version = Some(version);
     Ok(())
 }
@@ -292,6 +308,7 @@ fn compatible_copy_guarded(
         }],
     )?;
     e.replace(doc, None)?;
+    e.release_file_ownership();
     e.saved_revision = 0;
     e.file_version = None;
     Ok(())
@@ -354,7 +371,7 @@ fn save_prepared(
     {
         return Err("Save alias must resolve to a .psd or .psb destination".into());
     }
-    let (doc, source_path, source_version, saved_revision) = {
+    let (doc, source_path, source_version, saved_revision, project) = {
         let e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, request)?;
         if request["expected_revision"]
@@ -368,6 +385,7 @@ fn save_prepared(
             e.path.clone(),
             e.file_version,
             e.saved_revision,
+            e.project_id.clone(),
         )
     };
     let saving_source = source_path
@@ -387,6 +405,7 @@ fn save_prepared(
             "Destination exists. Confirm overwrite=true or choose a new Save As path.".into(),
         );
     }
+    let ownership = crate::file_ownership::Ownership::save(path, &project)?;
     let bytes = if path
         .extension()
         .and_then(|e| e.to_str())
@@ -410,8 +429,12 @@ fn save_prepared(
         return Err("Project source changed while saving; current work preserved".into());
     }
     lease.validate()?;
-    atomic_write_checked(path, &bytes, || lease.validate())?;
+    atomic_write_checked(path, &bytes, |temporary| {
+        ownership.prepare(temporary)?;
+        lease.validate()
+    })?;
     let version = crate::file_safety::published_version(path, &bytes)?;
+    ownership.published(version.identity);
     if e.doc.id == doc.id {
         e.path = Some(path.into());
         e.file_version = Some(version);
@@ -421,6 +444,8 @@ fn save_prepared(
             .to_string_lossy()
             .into();
         e.saved_revision = doc.revision;
+        e.release_file_ownership();
+        e.file_ownership = Some(ownership);
     }
     if let Some(backup) = backup {
         lease.prune(&backup);
@@ -495,7 +520,7 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
         return Err("Project source changed before exporting".into());
     }
     lease.validate()?;
-    atomic_write_checked(path, &bytes, || lease.validate())?;
+    atomic_write_checked(path, &bytes, |_| lease.validate())?;
     crate::file_safety::published_version(path, &bytes)?;
     if let Some(backup) = backup {
         lease.prune(&backup);
@@ -681,7 +706,11 @@ fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
             let activate = actor == "human" && p["activate"] != false;
             let engine = if p["action"] == "open" {
                 let shared = Arc::new(Mutex::new(Engine::new()));
-                open(&shared, Path::new(text("path")?))?;
+                let path = Path::new(text("path")?);
+                if let Err(error) = open(&shared, path) {
+                    w::duplicate_warning(&w::attach(root), path, &error, activate);
+                    return Err(error);
+                }
                 let result = shared.lock().unwrap().clone();
                 result
             } else {
@@ -1297,6 +1326,8 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                         return Err("Canvas changed before opening; current work preserved".into());
                     }
                     e.replace(doc, None)?;
+                    e.release_file_ownership();
+                    e.file_version = None;
                 }
                 "open" => {
                     let control = crate::loading::Control::default();

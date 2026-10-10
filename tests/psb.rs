@@ -420,6 +420,14 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     )
     .unwrap();
     assert_eq!(&std::fs::read(&path).unwrap()[4..6], &2u16.to_be_bytes());
+    assert!(server::dispatch(
+        &shared,
+        "projects",
+        &json!({"action":"open","path":path,"actor":"human"})
+    )
+    .is_err());
+    // Save As releases the original before the protocol opens it as an independent project.
+    server::save(&shared, &temp.join("Working.psb")).unwrap();
     let opened = server::dispatch(
         &shared,
         "projects",
