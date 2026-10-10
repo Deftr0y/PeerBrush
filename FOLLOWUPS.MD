@@ -91,6 +91,12 @@ See [development notes](docs/development.md) for the engine and validation workf
 
 ## Next development slices
 
+PSD opening/editability (PB-122) is the highest-priority reported bug. Unsupported source features remain protected while support is developed.
+
+| Priority | ID | Work | Status | Acceptance |
+| --- | --- | --- | --- | --- |
+| Highest | PB-122 | Fix PSDs opening as flattened, non-editable projects | Reproduced — default-range fix verified; styled-source support pending | Corrected false protection for default transparency/mask Blend If pairs within bounded channel counts. Added a source-bound, view-only Why read only? report with actual codec reasons and original precision. All 568 regression checks passed (eight opt-in GPU/performance checks ignored; one Windows clipboard station check excluded). Native16 standard-only hierarchy/masks/clipping, painting, exact undo, editable save/reopen and independent standard raster/mask/current-composite parity passed. The supplied layered PSD genuinely contains unsupported layer-style/global sources and an embedded profile; it remains read-only with its original intact. Broader support remains pending, including PB-136; no full Photoshop compatibility or recovery of editable styled layers is claimed. |
+
 Selection correctness (PB-110) was prioritized before the remaining queued work.
 
 | Priority | ID | Work | Status | Acceptance |

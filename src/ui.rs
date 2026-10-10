@@ -9,6 +9,7 @@ mod history;
 mod layers;
 mod lifecycle;
 mod liquify;
+mod protection;
 mod recovery;
 mod refinement;
 mod retouch;
@@ -392,6 +393,7 @@ pub struct PeerBrush {
     load_control: Option<crate::loading::Control>,
     load_preview: Option<TextureHandle>,
     show_new: bool,
+    read_only_info: Option<String>,
     new_width: u32,
     new_bit_depth: u16,
     new_height: u32,
@@ -687,6 +689,7 @@ impl PeerBrush {
             load_control: None,
             load_preview: None,
             show_new: false,
+            read_only_info: None,
             new_width: 1024,
             new_bit_depth: 8,
             new_height: 768,
@@ -3632,6 +3635,11 @@ impl PeerBrush {
             .ok()
             .and_then(|mut e| e.capture_panel.take());
         if let Some(panel) = panel {
+            self.read_only_info = if panel == "document_info" {
+                Some(self.shared.lock().unwrap().doc.id.clone())
+            } else {
+                None
+            };
             self.show_brush = panel == "brush";
             if panel == "solo_color" || panel == "solo_mask" {
                 self.mask = panel == "solo_mask";
@@ -4330,6 +4338,9 @@ impl PeerBrush {
                     if doc.read_only {
                         ui.label(RichText::new("READ ONLY").size(10.0).color(ACCENT))
                             .on_hover_text(doc.warnings.join("\n"));
+                        if ui.small_button("Why read only?").clicked() {
+                            self.read_only_info = Some(doc.id.clone());
+                        }
                         let profiled = doc.icc_profile.is_some();
                         let convertible = !profiled || doc.icc_profile.as_deref().is_some_and(|p| crate::color_profile::supported(p).is_ok());
                         let label = if profiled { "Convert to sRGB copy".into() } else { format!("Edit {}-bit copy", doc.bit_depth) };
@@ -4586,6 +4597,7 @@ impl PeerBrush {
         self.geometry_window(ctx, &doc);
         self.source_window(ctx, &doc);
         self.filters_window(ctx, &doc);
+        self.protection_window(ctx, &doc);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")
@@ -8183,6 +8195,84 @@ mod tests {
         assert!(!app.show_connection);
         assert_eq!(app.message, "Ready in Codex. Reload its MCP tools.");
         assert!(app.shared.lock().unwrap().mcp_clients.is_empty());
+    }
+    #[test]
+    fn protected_photoshop_report_is_view_only_and_bound_to_the_current_source() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            let draw = |app: &mut PeerBrush| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            };
+            {
+                let mut e = app.shared.lock().unwrap();
+                e.doc = Document::new_depth(8, 8, depth).unwrap();
+                e.doc.layers[0]
+                    .pixels
+                    .set16(1, 2, [10001, 20003, 40007, 65535]);
+                e.doc.read_only = true;
+                e.doc.warnings = vec![
+                    "Unsupported Photoshop feature: lmfx".into(),
+                    "Unsupported global Photoshop feature: unknown".into(),
+                ];
+                app.selected = e.doc.layers[0].id.clone();
+            }
+            let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+            let original = app.shared.lock().unwrap().doc.export_png().unwrap();
+            draw(&mut app);
+            let output = draw(&mut app);
+            let point = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == "Why read only?" => {
+                        Some(t.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            click(&mut app, &ctx, point);
+            let mut output = draw(&mut app);
+            for _ in 0..3 {
+                output = draw(&mut app);
+            }
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Showing the saved appearance"));
+            assert!(text.contains("layer styles"));
+            assert!(text.contains("Unsupported global Photoshop feature: unknown"));
+            assert!(app.protection_visible(&app.shared.lock().unwrap().doc));
+            assert_eq!(
+                serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+                before
+            );
+            assert_eq!(
+                app.shared.lock().unwrap().doc.export_png().unwrap(),
+                original
+            );
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            app.shared.lock().unwrap().doc.id = crate::engine::id();
+            frame(&mut app, &ctx, vec![], Default::default());
+            assert!(app.read_only_info.is_none());
+            app.workspace_root.lock().unwrap().capture_panel = Some("document_info".into());
+            frame(&mut app, &ctx, vec![], Default::default());
+            assert!(app.protection_visible(&app.shared.lock().unwrap().doc));
+            app.shared.lock().unwrap().doc.read_only = false;
+            frame(&mut app, &ctx, vec![], Default::default());
+            assert!(app.read_only_info.is_none());
+        }
     }
     #[test]
     fn dropped_psb_opens_a_native_project_without_replacing_existing_work() {

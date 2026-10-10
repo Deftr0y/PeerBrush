@@ -206,9 +206,11 @@ fn standard_clipping(doc: &Document) -> bool {
     })
 }
 
-fn default_blending_ranges(bytes: &[u8]) -> bool {
+fn default_blending_ranges(bytes: &[u8], channels: u16) -> bool {
     bytes.is_empty()
-        || (bytes.len() <= 32
+        // Photoshop may include transparency/mask channel pairs in addition to
+        // RGB and the composite gray pair. Every pair must remain a no-op.
+        || (bytes.len() <= (usize::from(channels) + 1) * 8
             && bytes.len() % 8 == 0
             && bytes.chunks_exact(4).all(|range| range == [0, 0, 255, 255]))
 }
@@ -1599,7 +1601,7 @@ fn decode_parts(
                         warnings.push("Advanced PSD mask flags are not supported yet".into());
                     }
                 }
-                if !default_blending_ranges(ex.block()?) {
+                if !default_blending_ranges(ex.block()?, nc) {
                     warnings.push(
                         "Photoshop Blend If ranges are not supported; using the saved composite"
                             .into(),

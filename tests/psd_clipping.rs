@@ -165,6 +165,145 @@ fn ordinary(bytes: &[u8]) -> Vec<u8> {
     out.extend(&bytes[34 + n..]);
     out
 }
+
+#[test]
+fn default_photoshop_blending_ranges_include_transparency_and_mask_pairs() {
+    for depth in [8, 16] {
+        for masked in [false, true] {
+            let mut top = Spec::paint("Default ranges", SAVED);
+            if masked {
+                top.mask = Some([12345, 65535]);
+            }
+            top.ranges = [0, 0, 255, 255].repeat(if masked { 12 } else { 10 });
+            let bottom = Spec::paint("Base", [[21001, 31003, 41007, 65535]; 2]);
+            let mut reference = top.clone();
+            reference.ranges.clear();
+            let expected = psd::decode(&fixture(&[reference, bottom.clone()], depth)).unwrap();
+            let doc = psd::decode(&fixture(&[top.clone(), bottom.clone()], depth)).unwrap();
+            assert!(!doc.read_only, "{:?}", doc.warnings);
+            assert_eq!(doc.layers.len(), 2);
+            assert_eq!(rendered(&doc), rendered(&expected));
+            for (a, b) in doc.layers.iter().zip(&expected.layers) {
+                assert_eq!(a.pixels, b.pixels);
+                assert_eq!(a.mask_value_raw(0, 0), b.mask_value_raw(0, 0));
+            }
+            for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                let reopened = psd::decode(&bytes).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.bit_depth, depth);
+                assert_eq!(rendered(&reopened), rendered(&doc));
+                assert_eq!(reopened.layers[0].pixels, doc.layers[0].pixels);
+            }
+            // A real range change, excessive channel count or incomplete pair
+            // must retain protection rather than being accepted as a no-op.
+            for ranges in [
+                {
+                    let mut r = top.ranges.clone();
+                    r[3] = 254;
+                    r
+                },
+                [0, 0, 255, 255].repeat(if masked { 14 } else { 12 }),
+                {
+                    let mut r = top.ranges.clone();
+                    r.pop();
+                    r
+                },
+            ] {
+                let mut unsupported = top.clone();
+                unsupported.ranges = ranges;
+                let protected =
+                    psd::decode(&fixture(&[unsupported, bottom.clone()], depth)).unwrap();
+                assert!(protected.read_only);
+                assert!(protected.warnings.iter().any(|w| w.contains("Blend If")));
+                assert!(psd::encode(&protected).is_err());
+                assert_eq!(
+                    rendered(&protected),
+                    SAVED
+                        .concat()
+                        .into_iter()
+                        .map(|v| native(v, depth))
+                        .collect::<Vec<_>>()
+                );
+            }
+            top.tags.push((*b"lmfx", vec![0; 16]));
+            let protected = psd::decode(&fixture(&[top, bottom], depth)).unwrap();
+            assert!(protected.read_only, "Layer styles must still be protected");
+            assert!(!protected.warnings.iter().any(|w| w.contains("Blend If")));
+            assert!(protected.warnings.iter().any(|w| w.contains("lmfx")));
+        }
+    }
+}
+
+#[test]
+fn protocol_default_range_psd_opens_editable_and_protected_report_keeps_source_intact() {
+    use peerbrush::server;
+    use std::sync::{Arc, Mutex};
+    let dir = std::env::temp_dir().join(format!(
+        "peerbrush-default-ranges-{}",
+        peerbrush::engine::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for depth in [8, 16] {
+        let mut spec = Spec::paint("Standard raster", SAVED);
+        spec.ranges = [0, 0, 255, 255].repeat(10);
+        let source = fixture(&[spec.clone()], depth);
+        let path = dir.join(format!("Source-{depth}.psd"));
+        std::fs::write(&path, &source).unwrap();
+        let shared = Arc::new(Mutex::new(Engine::new()));
+        peerbrush::workspace::attach(&shared);
+        server::dispatch(
+            &shared,
+            "document",
+            &json!({"action":"open","path":path,"actor":"human"}),
+        )
+        .unwrap();
+        let before = shared.lock().unwrap().doc.export_png().unwrap();
+        let document = shared.lock().unwrap().doc.id.clone();
+        let layer = shared.lock().unwrap().doc.layers[0].id.clone();
+        assert!(!shared.lock().unwrap().doc.read_only);
+        server::dispatch(&shared, "edit", &json!({"actor":"human","document_id":document,"expected_revision":0,"commands":[{"op":"paint.fill","layer":layer,"rect":[0,0,1,1],"color":[233,84,32,255]}]})).unwrap();
+        assert_ne!(shared.lock().unwrap().doc.export_png().unwrap(), before);
+        server::dispatch(
+            &shared,
+            "history",
+            &json!({"action":"undo","actor":"human"}),
+        )
+        .unwrap();
+        assert_eq!(shared.lock().unwrap().doc.export_png().unwrap(), before);
+        let saved = dir.join(format!("Edited-{depth}.psd"));
+        server::dispatch(&shared, "document", &json!({"action":"save","path":saved,"actor":"human","document_id":document,"expected_revision":2})).unwrap();
+        let reopened = psd::decode(&std::fs::read(saved).unwrap()).unwrap();
+        assert!(!reopened.read_only);
+        assert_eq!(reopened.bit_depth, depth);
+        assert_eq!(reopened.export_png().unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+
+        spec.tags.push((*b"lmfx", vec![0; 16]));
+        let protected_source = fixture(&[spec], depth);
+        let protected_path = dir.join(format!("Protected-{depth}.psd"));
+        std::fs::write(&protected_path, &protected_source).unwrap();
+        server::dispatch(
+            &shared,
+            "document",
+            &json!({"action":"open","path":protected_path,"actor":"human"}),
+        )
+        .unwrap();
+        let state = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+        server::dispatch(
+            &shared,
+            "capture_ui",
+            &json!({"path":dir.join("report.png"),"panel":"document_info"}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            state
+        );
+        assert!(server::save(&shared, &protected_path).is_err());
+        assert_eq!(std::fs::read(&protected_path).unwrap(), protected_source);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
 fn saved_composite(bytes: &[u8], depth: u16) -> Vec<u16> {
     let bytes = ordinary(bytes);
     let n = u32::from_be_bytes(bytes[34..38].try_into().unwrap()) as usize;

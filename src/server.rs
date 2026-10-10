@@ -943,6 +943,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "selection",
                     "solo_color",
                     "solo_mask",
+                    "document_info",
                 ]
                 .contains(&name)
             }) {

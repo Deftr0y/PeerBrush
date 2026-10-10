@@ -10,6 +10,12 @@ PSB structural layer-section, layer-info and channel lengths are 64-bit; its RLE
 
 The existing **8192 pixels per edge, 32 MP canvas, 100 editable layers, 200 standard layer records, 512 MiB source tiles and 256 MiB encoded file limits still apply**. PSB files beyond those limits, non-RGB modes and unsupported channel depths report errors. The [PB-105 investigation](large-document-investigation.md) explains why valid canvases can exceed save limits and proposes streaming/out-of-core work before raising them. Independent raw/RLE/ZIP/prediction fixtures exercise both depths, masks and protected sources; no broader Photoshop or receiving-application compatibility is claimed.
 
+## Protection diagnostics — unreleased PB-122
+
+Unreleased PB-122 corrects false read-only fallback for default blending ranges that include transparency or mask channel pairs. Every pair must be the default source/destination range and fit the layer's bounded channel count; actual Blend If changes remain protected. The native **Why read only?** action explains why a protected file is displaying its saved appearance, with the codec's specific reasons and original bit depth. Opening does not flatten or overwrite the original Photoshop file. The existing copy action explicitly flattens that appearance; it does not recover Photoshop layers. Layer styles and other unsupported sources still require further implementation.
+
+The bounded channel-pair layout follows [Adobe's layer blending ranges specification](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/). Default transparency pairs must not be mistaken for a non-default Blend If setting. Color profiles, layer-style sources and unknown Photoshop features retain their existing protection independently.
+
 ## Supported clipping
 
 PSD v1 RGB documents at 8 or 16 bits can contain consecutive clipped raster layers directly above a raster base. Stacks can live at the document root or inside an isolated or pass-through folder. The importer resolves each follower to the nearest non-clipped sibling below it, including hidden bases, and never uses a base outside its folder. Raster alpha, opacity, supported blend modes and raster masks use the shared document compositor. The base's blend applies to the complete clipping unit; hiding the base hides its followers.
