@@ -12,7 +12,25 @@ const TOOLS: &[(&str, &str, usize)] = &[
     ("object", "Object region", 23),
 ];
 impl PeerBrush {
-    pub(super) fn selection_toolbar(&mut self, ui: &mut egui::Ui) {
+    fn wand_update_command(&self, doc: &Document) -> Value {
+        json!({"op":"selection.wand_update", "document_id":doc.id,
+            "source_revision":doc.revision, "tolerance":self.selection_tolerance,
+            "feather":self.selection_feather, "contiguous":self.selection_contiguous,
+            "sample_merged":self.selection_merged})
+    }
+    pub(super) fn selection_toolbar(&mut self, ui: &mut egui::Ui, doc: &Document) -> [Rect; 3] {
+        let mut controls = [Rect::NOTHING; 3];
+        let source = crate::selection::wand_source(doc);
+        if self.selection_live_wand && self.parameter_gesture.is_none() {
+            let display = self.animation.document(doc, ui.input(|i| i.time), false);
+            if let Some(s) = crate::selection::wand_source(&display) {
+                self.selection_tolerance = s.command["tolerance"].as_f64().unwrap_or(24.) as f32;
+                self.selection_feather = s.command["feather"].as_f64().unwrap_or(0.) as f32;
+                self.selection_contiguous = s.command["contiguous"].as_bool().unwrap_or(true);
+                self.selection_merged = s.command["sample_merged"].as_bool().unwrap_or(false);
+            }
+        }
+        let live = self.selection_kind == "wand" && self.selection_live_wand && source.is_some();
         ui.horizontal_centered(|ui| {
             if self.tool == Tool::MagicWand {
                 ui.label("Magic Wand");
@@ -52,7 +70,7 @@ impl PeerBrush {
                     }
                 });
             controls::label(ui, "Feather");
-            controls::range(
+            let feather = controls::range(
                 ui,
                 "selection feather",
                 &mut self.selection_feather,
@@ -62,9 +80,13 @@ impl PeerBrush {
                 1,
                 false,
             );
+            controls[0] = feather.rect;
+            if live && (feather.changed() || feather.double_clicked()) {
+                self.layer_parameter(self.wand_update_command(doc), "Wand feather", &feather);
+            }
             if ["wand", "quick", "object"].contains(&self.selection_kind.as_str()) {
                 controls::label(ui, "Tolerance");
-                controls::range(
+                let tolerance = controls::range(
                     ui,
                     "selection tolerance",
                     &mut self.selection_tolerance,
@@ -74,13 +96,29 @@ impl PeerBrush {
                     0,
                     false,
                 );
-                if self.selection_kind == "wand" {
-                    ui.checkbox(&mut self.selection_contiguous, "Contiguous");
+                controls[1] = tolerance.rect;
+                if live && (tolerance.changed() || tolerance.double_clicked()) {
+                    self.layer_parameter(self.wand_update_command(doc), "Wand tolerance", &tolerance);
                 }
-                ui.checkbox(&mut self.selection_merged, "Merged")
+                let mut sampling_changed = false;
+                if self.selection_kind == "wand" {
+                    sampling_changed |= ui.checkbox(&mut self.selection_contiguous, "Contiguous").changed();
+                }
+                sampling_changed |= ui.checkbox(&mut self.selection_merged, "Merged")
                     .on_hover_text(
                         "Sample the rendered composite; disable to sample the active layer",
-                    );
+                    ).changed();
+                if self.selection_kind == "wand" {
+                    let toggle = ui.checkbox(&mut self.selection_live_wand, "Live updates")
+                        .on_hover_text("Update from the last wand click. After artwork or selection changes, click again. Drag previews selected pixels; release commits once.");
+                    controls[2] = toggle.rect;
+                    if toggle.changed() && !self.selection_live_wand {
+                        self.finish_parameter(true);
+                    }
+                    if source.is_some() && self.selection_live_wand && (sampling_changed || toggle.changed()) {
+                        self.edit(vec![self.wand_update_command(doc)], "Wand selection");
+                    }
+                }
             }
             if ["quick", "magnetic"].contains(&self.selection_kind.as_str()) {
                 controls::label(
@@ -110,6 +148,7 @@ impl PeerBrush {
                 );
             }
         });
+        controls
     }
     fn selection_mode_for(&self, ui: &egui::Ui) -> String {
         ui.input(|i| match (i.modifiers.shift, i.modifiers.alt) {

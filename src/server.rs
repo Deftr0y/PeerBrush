@@ -877,8 +877,9 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 .and_then(Value::as_str)
                 .ok_or("Missing PNG path")?;
             let panel = p.get("panel").and_then(Value::as_str);
-            if panel.is_some_and(|name| !["workspace", "brush", "color", "filters"].contains(&name))
-            {
+            if panel.is_some_and(|name| {
+                !["workspace", "brush", "color", "filters", "selection"].contains(&name)
+            }) {
                 return Err("Unknown capture panel".into());
             }
             let mut engine = shared.lock().unwrap();

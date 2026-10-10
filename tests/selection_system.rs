@@ -11,6 +11,176 @@ fn edit(e: &mut Engine, c: Value) {
 }
 
 #[test]
+fn live_wand_replays_original_combination_and_keeps_native_artwork_and_psd() {
+    for depth in [8, 16] {
+        for mode in ["replace", "add", "subtract", "intersect"] {
+            let (mut e, id) = fixture(depth);
+            for y in 0..24 {
+                for x in 0..32 {
+                    e.doc.layers[0].pixels.set16(
+                        x,
+                        y,
+                        if x < 10 {
+                            [10001, 20003, 30007, 65535]
+                        } else {
+                            [16001, 26003, 36007, 65535]
+                        },
+                    );
+                }
+            }
+            edit(
+                &mut e,
+                json!({"op":"selection","kind":"ellipse","rect":[4,4,24,20],"feather":2}),
+            );
+            let baseline = e.doc.clone();
+            let mut seed = json!({"op":"selection","kind":"wand","layer":id,"point":[5,5],"mode":mode,"tolerance":0,"feather":0});
+            edit(&mut e, seed.clone());
+            let narrow = selection::current(&e.doc).unwrap().mask.rgba();
+            let source_id = selection::wand_source(&e.doc).unwrap().id.clone();
+            let history = e.undo.len();
+            let command = json!({"op":"selection.wand_update","tolerance":255,"feather":3});
+            let preview = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
+            assert_eq!(e.undo.len(), history);
+            edit(&mut e, command);
+            seed["tolerance"] = json!(255);
+            seed["feather"] = json!(3);
+            let fresh = Engine::preview_edits(baseline.clone(), &[seed]).unwrap();
+            assert_eq!(
+                selection::current(&e.doc).unwrap().mask.rgba(),
+                selection::current(&fresh).unwrap().mask.rgba()
+            );
+            assert_eq!(
+                selection::current(&e.doc).unwrap().mask.rgba(),
+                selection::current(&preview).unwrap().mask.rgba()
+            );
+            assert_eq!(selection::wand_source(&e.doc).unwrap().id, source_id);
+            assert_eq!(e.doc.export_png().unwrap(), baseline.export_png().unwrap());
+            assert_eq!(e.undo.len(), history + 1);
+            let saved = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+            assert!(!saved.read_only);
+            assert_eq!(saved.bit_depth, depth);
+            assert_eq!(saved.export_png().unwrap(), baseline.export_png().unwrap());
+            assert_eq!(
+                selection::current(&saved).unwrap().mask.rgba(),
+                selection::current(&e.doc).unwrap().mask.rgba()
+            );
+            assert!(saved.wand_source.is_none());
+            assert!(serde_json::to_value(&e.doc)
+                .unwrap()
+                .get("wand_source")
+                .is_none());
+            e.undo("human").unwrap();
+            assert_eq!(selection::current(&e.doc).unwrap().mask.rgba(), narrow);
+            assert!(selection::wand_source(&e.doc).is_some());
+            e.redo("human").unwrap();
+            assert!(selection::wand_source(&e.doc).is_some());
+            edit(
+                &mut e,
+                json!({"op":"selection.wand_update","tolerance":0,"feather":0}),
+            );
+            assert_eq!(
+                selection::current(&e.doc).unwrap().mask.rgba(),
+                narrow,
+                "{depth} {mode}"
+            );
+        }
+    }
+}
+
+#[test]
+fn live_wand_rejects_invalid_stale_and_reserved_updates_atomically() {
+    let (mut e, id) = fixture(16);
+    let seed = json!({"op":"selection","kind":"wand","layer":id,"point":[0,0],"tolerance":0});
+    edit(&mut e, seed.clone());
+    let before = e.doc.clone();
+    for command in [
+        json!({"op":"selection.wand_update","tolerance":256}),
+        json!({"op":"selection.wand_update","feather":-1}),
+        json!({"op":"selection.wand_update","contiguous":"true"}),
+        json!({"op":"selection.wand_update","document_id":"different"}),
+        json!({"op":"selection.wand_update","source_revision":0}),
+    ] {
+        assert!(e.edit("human", &[command], None, None, "Invalid").is_err());
+        assert_eq!(e.doc.revision, before.revision);
+        assert_eq!(
+            selection::current(&e.doc).unwrap().mask.rgba(),
+            selection::current(&before).unwrap().mask.rgba()
+        );
+        assert!(selection::wand_source(&e.doc).is_some());
+    }
+    let lease = e
+        .reserve(
+            "other",
+            "Selection",
+            vec![Scope {
+                target: Some("@selection".into()),
+                rect: None,
+            }],
+        )
+        .unwrap();
+    assert!(e
+        .edit(
+            "human",
+            &[json!({"op":"selection.wand_update","feather":2})],
+            None,
+            None,
+            "Reserved"
+        )
+        .is_err());
+    e.leases.retain(|l| l.id != lease.id);
+    edit(
+        &mut e,
+        json!({"op":"layer.update","layer":id,"name":"Changed"}),
+    );
+    assert!(selection::wand_source(&e.doc).is_none());
+    assert!(e
+        .edit(
+            "human",
+            &[json!({"op":"selection.wand_update","feather":2})],
+            None,
+            None,
+            "Stale"
+        )
+        .is_err());
+    e.undo("human").unwrap();
+    assert!(selection::wand_source(&e.doc).is_some());
+    edit(&mut e, json!({"op":"selection.wand_update","feather":2}));
+    edit(&mut e, json!({"op":"selection.invert"}));
+    assert!(selection::wand_source(&e.doc).is_none());
+    // A later edit in the same transaction must also retire the new seed.
+    e.edit(
+        "human",
+        &[
+            seed.clone(),
+            json!({"op":"layer.update","layer":id,"opacity":0.5}),
+        ],
+        None,
+        None,
+        "Batch",
+    )
+    .unwrap();
+    assert!(selection::wand_source(&e.doc).is_none());
+    let path = std::env::temp_dir().join(format!("wand-import-{}.png", uuid::Uuid::new_v4()));
+    std::fs::write(&path, e.doc.export_png().unwrap()).unwrap();
+    let imported = Engine::preview_edits(
+        e.doc.clone(),
+        &[seed.clone(), json!({"op":"image.import","path":path})],
+    )
+    .unwrap();
+    assert!(selection::wand_source(&imported).is_none());
+    e.edit(
+        "human",
+        &[seed, json!({"op":"image.import","path":path})],
+        None,
+        None,
+        "Prepared import",
+    )
+    .unwrap();
+    assert!(selection::wand_source(&e.doc).is_none());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn selected_clear_preserves_native_samples_holes_preview_psd_and_one_step_undo() {
     for depth in [8, 16] {
         let (mut e, id) = fixture(depth);

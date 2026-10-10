@@ -198,6 +198,19 @@ impl Animation {
         };
         let mut display = doc.clone();
         if !canvas {
+            if let (Some(old), Some(source)) = (
+                crate::selection::wand_source(&transition.before),
+                display.wand_source.as_mut(),
+            ) {
+                if old.id == source.id && source.revision == doc.revision {
+                    let source = Arc::make_mut(source);
+                    for (key, default) in [("tolerance", 24.), ("feather", 0.)] {
+                        let a = old.command[key].as_f64().unwrap_or(default) as f32;
+                        let b = source.command[key].as_f64().unwrap_or(default) as f32;
+                        source.command[key] = json!(lerp(a, b, t));
+                    }
+                }
+            }
             for filter in &mut display.filters {
                 if let Some(old) = transition
                     .before
@@ -466,6 +479,55 @@ mod tests {
         assert_eq!(
             crossfade(&[255, 0, 0, 255], &[0, 0, 0, 0], 1.0),
             [0, 0, 0, 0]
+        );
+    }
+    #[test]
+    fn ai_wand_parameters_animate_only_runtime_presentation_and_interrupt_cleanly() {
+        let mut e = crate::engine::Engine::new();
+        e.doc = Document::new_depth(16, 12, 16).unwrap();
+        e.edit(
+            "human",
+            &[json!({"op":"selection","kind":"wand","point":[3,3],"tolerance":0})],
+            None,
+            None,
+            "Seed",
+        )
+        .unwrap();
+        let mut animation = Animation::default();
+        animation.observe(&e.doc, None, 0.);
+        e.edit(
+            "agent",
+            &[json!({"op":"selection.wand_update","tolerance":200,"feather":8})],
+            None,
+            None,
+            "Wand parameters",
+        )
+        .unwrap();
+        let history = e.undo.len();
+        let saved = crate::psd::encode(&e.doc).unwrap();
+        animation.observe(&e.doc, e.ai_change.clone(), 1.);
+        let display = animation.document(&e.doc, 1.18, false);
+        let source = crate::selection::wand_source(&display).unwrap();
+        assert!((source.command["tolerance"].as_f64().unwrap() - 100.).abs() < 0.01);
+        assert!((source.command["feather"].as_f64().unwrap() - 4.).abs() < 0.01);
+        assert!(animation.layer("@selection", 1.18));
+        assert_eq!(
+            crate::selection::wand_source(&e.doc).unwrap().command["tolerance"],
+            200.
+        );
+        assert_eq!(
+            animation.document(&e.doc, 1.18, true).selection,
+            e.doc.selection
+        );
+        assert_eq!(crate::psd::encode(&e.doc).unwrap(), saved);
+        assert_eq!(e.undo.len(), history);
+        animation.cancel();
+        assert!(!animation.active(1.18));
+        assert_eq!(
+            crate::selection::wand_source(&animation.document(&e.doc, 1.18, false))
+                .unwrap()
+                .command["tolerance"],
+            200.
         );
     }
     #[test]

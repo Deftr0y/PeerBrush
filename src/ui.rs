@@ -307,6 +307,7 @@ pub struct PeerBrush {
     selection_tolerance: f32,
     selection_contiguous: bool,
     selection_merged: bool,
+    selection_live_wand: bool,
     selection_width: f32,
     selection_path: Vec<[f32; 2]>,
     selection_gesture_mode: Option<String>,
@@ -599,6 +600,7 @@ impl PeerBrush {
             selection_tolerance: 24.,
             selection_contiguous: true,
             selection_merged: true,
+            selection_live_wand: true,
             selection_width: 12.,
             selection_path: vec![],
             selection_gesture_mode: None,
@@ -1086,17 +1088,19 @@ impl PeerBrush {
     fn layer_parameter(&mut self, extra: Value, label: &str, response: &egui::Response) {
         let down = response.is_pointer_button_down_on() || response.dragged();
         let mut command = extra;
-        command["op"] = json!(if command.get("filter").is_some() {
-            "filter.update"
-        } else if command.get("effect").is_some() {
-            "effect.update"
-        } else if command.get("step").is_some() {
-            "mask.step.update"
-        } else {
-            "layer.update"
-        });
-        if command["op"] != "filter.update" {
-            command["layer"] = json!(self.selected);
+        if command["op"] != "selection.wand_update" {
+            command["op"] = json!(if command.get("filter").is_some() {
+                "filter.update"
+            } else if command.get("effect").is_some() {
+                "effect.update"
+            } else if command.get("step").is_some() {
+                "mask.step.update"
+            } else {
+                "layer.update"
+            });
+            if command["op"] != "filter.update" {
+                command["layer"] = json!(self.selected);
+            }
         }
         let mut commands = if command["op"] == "layer.update" {
             self.selection_layers
@@ -1893,7 +1897,17 @@ impl PeerBrush {
             let refinement = self
                 .refinement
                 .as_ref()
-                .map(|r| (r.target.clone(), r.preview.clone()));
+                .map(|r| (r.target.clone(), r.preview.clone()))
+                .or_else(|| {
+                    self.parameter_gesture
+                        .as_ref()
+                        .filter(|e| {
+                            e.commands
+                                .iter()
+                                .any(|c| c["op"] == "selection.wand_update")
+                        })
+                        .map(|_| (None, "cutout".into()))
+                });
             std::thread::spawn(move || {
                 let id = doc.id.clone();
                 let revision = doc.revision;
@@ -3576,6 +3590,10 @@ impl PeerBrush {
             .and_then(|mut e| e.capture_panel.take());
         if let Some(panel) = panel {
             self.show_brush = panel == "brush";
+            if panel == "selection" {
+                self.tool = Tool::MagicWand;
+                self.selection_kind = "wand".into();
+            }
             if panel == "color" {
                 self.open_color(color::Target::Foreground, self.color);
             } else {
@@ -4211,7 +4229,10 @@ impl PeerBrush {
                     if self.lifecycle.is_some() || self.lifecycle_frame {
                         ui.disable();
                     }
-                    self.selection_toolbar(ui);
+                    if self.animation.layer("@selection", ui.input(|i| i.time)) {
+                        ui.style_mut().visuals.selection.stroke.color = AI_BLUE;
+                    }
+                    self.selection_toolbar(ui, &doc);
                 });
         }
         self.recovery_failure(ctx);
@@ -5977,6 +5998,232 @@ mod tests {
         );
         assert_eq!(app.shared.lock().unwrap().doc.layers[0].opacity, 1.);
         assert!(app.message.contains("cancelled"));
+    }
+    #[test]
+    fn wand_toolbar_live_drag_previews_pixels_and_toggle_preserves_selection() {
+        let (mut app, ctx) = small_fixture();
+        app.tool = Tool::MagicWand;
+        app.selection_kind = "wand".into();
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new_depth(32, 24, 16).unwrap();
+            app.selected = e.doc.layers[0].id.clone();
+            for y in 0..24 {
+                for x in 0..32 {
+                    e.doc.layers[0].pixels.set16(
+                        x,
+                        y,
+                        if x < 10 {
+                            [10001, 20003, 30007, 65535]
+                        } else {
+                            [16001, 26003, 36007, 65535]
+                        },
+                    );
+                }
+            }
+            e.edit("human", &[json!({"op":"selection","kind":"wand","layer":app.selected,"point":[5,5],"tolerance":0,"feather":2})], None, None, "Wand").unwrap();
+            e.undo.clear();
+        }
+        let before = app.shared.lock().unwrap().doc.clone();
+        let mut time = 0.;
+        let mut draw = |app: &mut PeerBrush, events: Vec<egui::Event>| {
+            time += 0.15;
+            let doc = app.shared.lock().unwrap().doc.clone();
+            let mut rects = [Rect::NOTHING; 3];
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200., 100.))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        rects = app.selection_toolbar(ui, &doc);
+                    });
+                },
+            );
+            rects
+        };
+        let rects = draw(&mut app, vec![]);
+        assert!(app.selection_live_wand);
+        let p = rects[1].center();
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(p),
+                button(p, egui::PointerButton::Primary, true, Default::default()),
+            ],
+        );
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(p + Vec2::new(25., 0.))],
+        );
+        let commands = app.parameter_gesture.as_ref().unwrap().commands.clone();
+        assert_eq!(commands[0]["op"], "selection.wand_update");
+        assert_eq!(commands[0]["document_id"], before.id);
+        let draft = Engine::preview_edits(before.clone(), &commands).unwrap();
+        assert!(draft.selection.unwrap()[2] > before.selection.unwrap()[2]);
+        assert_eq!(draft.export_png().unwrap(), before.export_png().unwrap());
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        // Inspect the actual asynchronous canvas worker, rather than only an outline.
+        app.request_preview(&ctx, &before);
+        let rendered = app
+            .preview_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(rendered.error.is_none());
+        let mut expected = draft.preview(None, 1536, None, false).unwrap().2;
+        crate::selection::display::apply(&draft, rendered.w, rendered.h, &mut expected, "cutout");
+        assert_eq!(rendered.bytes, expected);
+        draw(
+            &mut app,
+            vec![button(
+                p + Vec2::new(25., 0.),
+                egui::PointerButton::Primary,
+                false,
+                Default::default(),
+            )],
+        );
+        app.finish_parameter(false);
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        assert_eq!(
+            crate::selection::current(&app.shared.lock().unwrap().doc)
+                .unwrap()
+                .mask
+                .rgba(),
+            crate::selection::current(&draft).unwrap().mask.rgba()
+        );
+        let rects = draw(&mut app, vec![]);
+        let toggle = rects[2].center();
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(toggle),
+                button(
+                    toggle,
+                    egui::PointerButton::Primary,
+                    true,
+                    Default::default(),
+                ),
+            ],
+        );
+        draw(
+            &mut app,
+            vec![button(
+                toggle,
+                egui::PointerButton::Primary,
+                false,
+                Default::default(),
+            )],
+        );
+        assert!(!app.selection_live_wand);
+        let feather = rects[0].center();
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(feather),
+                button(
+                    feather,
+                    egui::PointerButton::Primary,
+                    true,
+                    Default::default(),
+                ),
+            ],
+        );
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(feather + Vec2::new(15., 0.))],
+        );
+        draw(
+            &mut app,
+            vec![button(
+                feather + Vec2::new(15., 0.),
+                egui::PointerButton::Primary,
+                false,
+                Default::default(),
+            )],
+        );
+        assert!(app.selection_feather > 0.);
+        assert!(app.parameter_gesture.is_none());
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        assert_eq!(
+            crate::selection::current(&app.shared.lock().unwrap().doc)
+                .unwrap()
+                .mask
+                .rgba(),
+            crate::selection::current(&draft).unwrap().mask.rgba()
+        );
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(toggle),
+                button(
+                    toggle,
+                    egui::PointerButton::Primary,
+                    true,
+                    Default::default(),
+                ),
+            ],
+        );
+        draw(
+            &mut app,
+            vec![button(
+                toggle,
+                egui::PointerButton::Primary,
+                false,
+                Default::default(),
+            )],
+        );
+        assert!(app.selection_live_wand);
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 2);
+        assert_ne!(
+            crate::selection::current(&app.shared.lock().unwrap().doc)
+                .unwrap()
+                .mask
+                .rgba(),
+            crate::selection::current(&draft).unwrap().mask.rgba()
+        );
+        let committed = app.shared.lock().unwrap().doc.clone();
+        draw(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(feather),
+                button(
+                    feather,
+                    egui::PointerButton::Primary,
+                    true,
+                    Default::default(),
+                ),
+            ],
+        );
+        draw(
+            &mut app,
+            vec![egui::Event::PointerMoved(feather - Vec2::new(10., 0.))],
+        );
+        assert!(app.parameter_gesture.is_some());
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":app.selected,"name":"Human rename"})],
+                None,
+                None,
+                "Rename",
+            )
+            .unwrap();
+        app.finish_parameter(false);
+        let e = app.shared.lock().unwrap();
+        assert!(app.parameter_gesture.is_none());
+        assert!(app.message.contains("cancelled"));
+        assert_eq!(e.undo.len(), 3);
+        assert_eq!(e.doc.layers[0].name, "Human rename");
+        assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        assert_eq!(
+            crate::selection::current(&e.doc).unwrap().mask.rgba(),
+            crate::selection::current(&committed).unwrap().mask.rgba()
+        );
     }
     fn key(app: &mut PeerBrush, ctx: &egui::Context, key: egui::Key) {
         frame(

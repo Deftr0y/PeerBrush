@@ -610,6 +610,14 @@
       "op": "selection.invert"
     },
     {
+      "op": "selection.wand_update",
+      "tolerance": 24,
+      "feather": 0,
+      "contiguous": true,
+      "sample_merged": true,
+      "notes": "Rebuild from the last wand seed and original combination baseline. Requires unchanged artwork/selection; runtime seed is restored by undo/redo, not saved in PSD. Optional document_id/source_revision guards. Numeric drag previews commit once on release."
+    },
+    {
       "op": "selection.modify",
       "mode": "expand",
       "radius": 2

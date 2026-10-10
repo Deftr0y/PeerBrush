@@ -13,6 +13,60 @@ use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
+/// Runtime replay source, scoped to unchanged artwork and its original combination baseline.
+#[derive(Clone, Debug)]
+pub struct WandSource {
+    pub id: String,
+    pub revision: u64,
+    pub command: Value,
+    before: Option<Coverage>,
+    previous: Option<Coverage>,
+}
+pub fn wand_source(doc: &Document) -> Option<&WandSource> {
+    doc.wand_source
+        .as_deref()
+        .filter(|s| s.revision == doc.revision)
+}
+pub(crate) fn restore_wand_revision(doc: &mut Document, revision: u64) {
+    if let Some(source) = &mut doc.wand_source {
+        if source.revision == doc.revision {
+            Arc::make_mut(source).revision = revision;
+        }
+    }
+    doc.revision = revision;
+}
+fn update_wand(doc: &mut Document, c: &Value) -> Result<(), String> {
+    let source = doc
+        .wand_source
+        .clone()
+        .filter(|s| s.revision == doc.revision || s.revision == doc.revision.saturating_add(1))
+        .ok_or("Click with the Magic Wand again after changing the artwork or selection")?;
+    let mut command = source.command.clone();
+    for (key, limit) in [("tolerance", 255.), ("feather", 64.)] {
+        if let Some(value) = c.get(key) {
+            let n = value
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0. && *n <= limit)
+                .ok_or_else(|| format!("Wand {key} must be between 0 and {limit}"))?;
+            command[key] = serde_json::json!(n);
+        }
+    }
+    for key in ["contiguous", "sample_merged"] {
+        if let Some(value) = c.get(key) {
+            command[key] = serde_json::json!(value
+                .as_bool()
+                .ok_or("Wand sampling options must be boolean")?);
+        }
+    }
+    doc.selection = source.before.as_ref().map(|s| s.bounds);
+    doc.selection_polygon = None;
+    doc.selection_coverage = source.before.clone();
+    doc.selection_previous = source.previous.clone();
+    apply(doc, &command)?;
+    let updated = Arc::make_mut(doc.wand_source.as_mut().ok_or("Wand source unavailable")?);
+    updated.id = source.id.clone();
+    Ok(())
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Coverage {
     pub mask: Raster,
@@ -192,6 +246,9 @@ fn difference(a: &[u8], b: &[u8]) -> f32 {
     rgb.max((a[3] as f32 - b[3] as f32).abs())
 }
 pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
+    if c["op"] == "selection.wand_update" {
+        return update_wand(doc, c);
+    }
     if c["op"] == "selection.import" {
         return super::import::apply(doc, c);
     }
@@ -536,7 +593,40 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
             }
         }
     }
-    put(doc, mask)
+    let source = if kind == "wand" && op == "selection" {
+        let mut command = serde_json::json!({"op":"selection","kind":"wand"});
+        for key in [
+            "point",
+            "points",
+            "rect",
+            "mode",
+            "tolerance",
+            "feather",
+            "contiguous",
+            "sample_merged",
+            "layer",
+        ] {
+            if let Some(value) = c.get(key) {
+                command[key] = value.clone();
+            }
+        }
+        command["tolerance"] = serde_json::json!(num(c, "tolerance", 24.).clamp(0., 255.));
+        command["feather"] = serde_json::json!(num(c, "feather", 0.).clamp(0., 64.));
+        command["contiguous"] = serde_json::json!(c["contiguous"] != false);
+        command["sample_merged"] = serde_json::json!(c["sample_merged"] == true);
+        Some(Arc::new(WandSource {
+            id: crate::engine::id(),
+            revision: doc.revision + 1,
+            command,
+            before: prior,
+            previous: doc.selection_previous.clone(),
+        }))
+    } else {
+        None
+    };
+    put(doc, mask)?;
+    doc.wand_source = source;
+    Ok(())
 }
 pub fn restrict_raster(after: &mut Raster, before: &Raster, coverage: &Coverage, origin: [i32; 2]) {
     let keys: BTreeSet<_> = if after.depth == 16 {

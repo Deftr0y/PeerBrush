@@ -64,6 +64,80 @@ struct Canvas {
 }
 
 #[test]
+fn modern_live_wand_updates_return_actual_selection_content_and_enforce_sources() {
+    let canvas = Canvas::new();
+    let (project, document, layer, pixels) = {
+        let mut e = canvas.shared.lock().unwrap();
+        e.doc = peerbrush::engine::Document::new_depth(32, 24, 16).unwrap();
+        for y in 0..24 {
+            for x in 0..32 {
+                e.doc.layers[0].pixels.set16(
+                    x,
+                    y,
+                    if x < 10 {
+                        [10001, 20003, 30007, 65535]
+                    } else {
+                        [16001, 26003, 36007, 65535]
+                    },
+                );
+            }
+        }
+        (
+            e.project_id.clone(),
+            e.doc.id.clone(),
+            e.doc.layers[0].id.clone(),
+            e.doc.export_png().unwrap(),
+        )
+    };
+    let call = |name: &str, arguments: Value| {
+        let q = modern_request(
+            json!("wand"),
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        );
+        response(canvas.modern(&q).send_json(q))
+            .into_json::<Value>()
+            .unwrap()
+    };
+    let seed = call(
+        "peerbrush_edit",
+        json!({"actor":"wand-agent","project_id":project,"document_id":document,"expected_revision":0,"commands":[{"op":"selection","kind":"wand","point":[4,4],"layer":layer,"tolerance":0}]}),
+    );
+    assert_eq!(seed["result"]["isError"], false);
+    let update = call(
+        "peerbrush_edit",
+        json!({"actor":"wand-agent","project_id":project,"document_id":document,"expected_revision":1,"commands":[{"op":"selection.wand_update","feather":2}],"max_edge":32}),
+    );
+    assert_eq!(update["result"]["isError"], false);
+    let observed = call(
+        "peerbrush_observe",
+        json!({"selection_view":"mask","max_edge":32}),
+    );
+    assert_eq!(observed["result"]["isError"], false);
+    let content = observed["result"]["content"].as_array().unwrap();
+    let metadata: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["views"][0]["document_rect"], json!([0, 0, 32, 24]));
+    let feedback = content.iter().find(|c| c["type"] == "image").unwrap();
+    let mask =
+        image::load_from_memory(&STANDARD.decode(feedback["data"].as_str().unwrap()).unwrap())
+            .unwrap()
+            .to_rgba8();
+    assert!(mask.get_pixel(9, 12)[0] > 0 && mask.get_pixel(9, 12)[0] < 255);
+    assert_eq!(mask.get_pixel(20, 12)[0], 0);
+    assert_eq!(
+        canvas.shared.lock().unwrap().doc.export_png().unwrap(),
+        pixels
+    );
+    let stale = call(
+        "peerbrush_edit",
+        json!({"actor":"wand-agent","expected_revision":1,"commands":[{"op":"selection.wand_update","tolerance":255}]}),
+    );
+    assert_eq!(stale["result"]["isError"], true);
+    assert_eq!(canvas.shared.lock().unwrap().doc.revision, 2);
+    assert_eq!(canvas.shared.lock().unwrap().undo.len(), 2);
+}
+
+#[test]
 fn modern_code_runs_async_returns_actual_images_and_allows_cancellation() {
     let canvas = Canvas::new();
     let (project, document, layer, task) = {

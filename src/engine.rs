@@ -167,6 +167,9 @@ pub struct Document {
     pub selection_coverage: Option<crate::selection::Coverage>,
     #[serde(default)]
     pub selection_previous: Option<crate::selection::Coverage>,
+    /// Runtime wand seed; saved documents retain coverage, never replay metadata.
+    #[serde(skip)]
+    pub wand_source: Option<std::sync::Arc<crate::selection::WandSource>>,
     pub read_only: bool,
     pub warnings: Vec<String>,
 }
@@ -188,6 +191,7 @@ impl Document {
             selection_polygon: None,
             selection_coverage: None,
             selection_previous: None,
+            wand_source: None,
             read_only: false,
             warnings: vec![],
         })
@@ -548,6 +552,7 @@ impl Engine {
             selection_gesture.prepare(&mut engine.doc, command);
             if command["op"] == "image.import" {
                 engine.validate_source(command)?;
+                engine.doc.wand_source = None;
                 engine.apply_import(command, None, &mut imported_bytes)?;
             } else {
                 engine.apply(command)?;
@@ -1244,6 +1249,11 @@ impl Engine {
                     self.doc = before;
                     return Err(error);
                 }
+                if c["op"] != "selection.wand_update"
+                    && !(c["op"] == "selection" && c["kind"] == "wand")
+                {
+                    self.doc.wand_source = None;
+                }
                 let applied = if c["op"] == "image.import" {
                     let pixels = imports
                         .as_mut()
@@ -1435,6 +1445,9 @@ impl Engine {
         )
     }
     fn apply(&mut self, c: &Value) -> Result<(), String> {
+        if c["op"] != "selection.wand_update" && !(c["op"] == "selection" && c["kind"] == "wand") {
+            self.doc.wand_source = None;
+        }
         // Reframe before taking native-original and soft-selection baselines. The
         // outer transaction still owns the complete pre-gesture undo snapshot.
         self.doc.ensure_depth();
@@ -2462,7 +2475,7 @@ impl Engine {
         self.check(actor, &h.scopes)?;
         let revision = self.doc.revision + 1;
         self.doc = h.before.clone();
-        self.doc.revision = revision;
+        crate::selection::restore_wand_revision(&mut self.doc, revision);
         self.undo.pop();
         self.changes.push((revision, h.scopes.clone()));
         self.mark_ai(actor, "Undo AI edit", "history", h.scopes.clone());
@@ -2478,7 +2491,7 @@ impl Engine {
         self.check(actor, &h.scopes)?;
         let revision = self.doc.revision + 1;
         self.doc = h.after.clone();
-        self.doc.revision = revision;
+        crate::selection::restore_wand_revision(&mut self.doc, revision);
         self.redo.pop();
         self.changes.push((revision, h.scopes.clone()));
         self.mark_ai(actor, "Redo AI edit", "history", h.scopes.clone());
