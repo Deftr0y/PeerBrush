@@ -1,14 +1,24 @@
-name: PeerBrush
-on: [push, pull_request]
+name: Historical PeerBrush packaging correction
+on:
+  push:
+    branches: ['codex/historical-*']
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   native:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-2025, macos-26, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -17,9 +27,33 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked
-      - run: cargo build --release --locked
-      - run: python scripts/package.py
+      - run: python scripts/test_package.py
+      - run: python scripts/build_release.py
+      - run: python scripts/package_checkpoint.py
       - uses: actions/upload-artifact@v4
         with:
-          name: PeerBrush-${{ runner.os }}
-          path: dist/*.zip
+          name: historical-${{ runner.os }}
+          path: dist/*-rebuilt-*.*
+          if-no-files-found: error
+
+  inspect:
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: historical-*
+          path: candidates
+      - name: Verify all original platforms and corresponding source
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version 0.1.4 --output verified
+      - uses: actions/upload-artifact@v4
+        with:
+          name: historical-verified
+          path: verified/*
+          if-no-files-found: error
