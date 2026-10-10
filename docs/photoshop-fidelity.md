@@ -1,6 +1,6 @@
 # Photoshop fidelity
 
-The development build implements the documented RGB subset: standard raster clipping, pass-through folders, full layer locks, supported RGB ICC previews and explicit native-depth sRGB copies. Unsupported Photoshop settings remain protected. These changes are unreleased; the published v0.1.4 download predates them.
+The development build implements the documented RGB subset: standard raster clipping, pass-through folders, full layer locks, supported RGB ICC previews and explicit native-depth sRGB copies. Unsupported Photoshop settings remain protected. These changes are in the 0.2 source. The v0.1.4 checkpoint predates them; consult GitHub Releases for currently published packages.
 
 ## Supported clipping
 

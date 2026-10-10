@@ -452,3 +452,4 @@ dd kbd + kbd { margin-left: 6px; }
   .layers-sticky { position: static; height: auto; }
   .layers-steps li { opacity: 1; }
 }
+.release-history{list-style:none;padding:0;display:grid;gap:2.5rem}.release-history>li{padding-bottom:2rem;border-bottom:1px solid var(--line)}.release-history h3{margin-bottom:.35rem}.history-date,.download-checksum{color:var(--muted);font-size:.8rem}.history-downloads p{margin:.55rem 0}.history-downloads code,.download-checksum code{font-size:.7rem;overflow-wrap:anywhere}.download-checksum{margin:0 0 1rem;padding:0 1rem}

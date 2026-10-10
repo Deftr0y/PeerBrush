@@ -1,0 +1,104 @@
+name: PeerBrush release candidates
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full commit SHA matching the selected workflow ref
+        required: true
+        type: string
+      sign_sigstore:
+        description: Sign and verify the candidates with Sigstore
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_commit }}
+          persist-credentials: false
+      - name: Check exact release source
+        shell: bash
+        run: python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked
+      - run: python scripts/test_package.py
+      - run: cargo build --release --locked
+      - run: python scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ runner.os }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  inspect:
+    needs: native
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          path: candidates
+      - name: Inspect matching archives and checksums
+        shell: bash
+        run: |
+          python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release-candidate
+          path: dist/*
+          if-no-files-found: error
+
+  sign:
+    if: inputs.sign_sigstore
+    needs: inspect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-release-candidate
+          path: dist
+      - name: Sign and verify packages, source and checksums
+        uses: sigstore/gh-action-sigstore-python@a5caf349bc536fbef3668a10ed7f5cd309a4b53d # v3.2.0
+        with:
+          inputs: dist/*.zip dist/SHA256SUMS dist/release-inventory.json
+          verify: true
+          verify-cert-identity: https://github.com/${{ github.workflow_ref }}
+          verify-oidc-issuer: https://token.actions.githubusercontent.com
+          release-signing-artifacts: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-candidate
+          path: dist/*
+          if-no-files-found: error

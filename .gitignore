@@ -2,6 +2,7 @@
 /.dev-tools/
 /.runtime/
 /dist/
+__pycache__/
 *.tmp
 *.recovery
 

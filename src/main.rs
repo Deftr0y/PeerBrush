@@ -23,6 +23,10 @@ fn run() -> Result<(), String> {
         args.remove(i);
     }
     match args.first().map(String::as_str) {
+        Some("--version" | "-V") => {
+            println!("PeerBrush {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Some("mcp") => return server::stdio(&state_dir),
         Some("discover") => {
             let manifest = peerbrush::discovery::discover()?;

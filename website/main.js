@@ -1,4 +1,4 @@
-import { detectPlatform, completeRelease, safeDownloadUrl } from './platform.js';
+import { detectPlatform, safeDownloadUrl, releaseHistory, latestRelease } from './platform.js';
 import './showcase.js';
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -67,7 +67,7 @@ function renderDownloads(build) {
     primaryDownload.href = suggested.url;
     primaryDownload.querySelector('span').textContent = `Download for ${suggested.name}`;
     primaryDownload.setAttribute('aria-label', `Download PeerBrush for ${suggested.name}, ${suggested.architecture}`);
-    document.querySelector('#download-meta').textContent = `${suggested.architecture === 'arm64' ? 'Apple silicon · ' : 'x64 · '}${(suggested.bytes/1e6).toFixed(1)} MB · Development build`;
+    document.querySelector('#download-meta').textContent = `${suggested.architecture === 'arm64' ? 'Apple silicon · ' : 'x64 · '}${(suggested.bytes/1e6).toFixed(1)} MB · ${build.label || build.version}`;
   }
   otherDownloads.replaceChildren();
   for (const platform of platforms.filter(p => p.id !== detected)) otherDownloads.append(downloadLink(platform));
@@ -88,7 +88,7 @@ function renderDownloads(build) {
       heading.append(hint);
     }
     const detail = document.createElement('p');
-    detail.textContent = platformDescriptions[platform.id];
+    detail.textContent = platform.description || platformDescriptions[platform.id];
     copy.append(heading, detail);
     info.append(copy);
     const size = document.createElement('span');
@@ -98,6 +98,11 @@ function renderDownloads(build) {
     link.replaceChildren(document.createTextNode('Download'), makeIcon('download'));
     row.append(info, size, link);
     platformList.append(row);
+    if(platform.sha256) {
+      const checksum=document.createElement('p');checksum.className='download-checksum';
+      checksum.append(document.createTextNode(`${platform.name} SHA-256: `));
+      const code=document.createElement('code');code.textContent=platform.sha256;checksum.append(code);platformList.append(checksum);
+    }
   }
   document.querySelector('#build-label').textContent = build.label || build.version;
   try {
@@ -106,21 +111,34 @@ function renderDownloads(build) {
   } catch { /* Keep the canonical release-list link. */ }
   return true;
 }
+function renderHistory(data) {
+  const list=document.querySelector('#release-history');
+  list.replaceChildren();
+  for(const release of releaseHistory(data)) {
+    const item=document.createElement('li');
+    const heading=document.createElement('h3');
+    const link=document.createElement('a');link.href=release.releaseUrl;link.textContent=release.label || release.version;heading.append(link);
+    const date=document.createElement('p');date.className='history-date';date.textContent=`${release.publishedAt.slice(0,10)} · ${release.kind} · ${release.commit.slice(0,7)}`;
+    const notes=document.createElement('ul');
+    for(const note of release.notes) {const line=document.createElement('li');line.textContent=note;notes.append(line);}
+    const downloads=document.createElement('div');downloads.className='history-downloads';
+    for(const platform of release.platforms) {
+      const row=document.createElement('p');row.append(downloadLink(platform),document.createTextNode(` · ${platform.architecture}`));
+      if(platform.sha256) {const code=document.createElement('code');code.textContent=platform.sha256;row.append(document.createTextNode(' · SHA-256 '),code);}
+      else row.append(document.createTextNode(' · Checksum not recorded'));
+      downloads.append(row);
+    }
+    const missing=['Windows','Linux','macOS'].filter(name=>!release.platforms.some(p=>p.name===name));
+    if(missing.length) {const line=document.createElement('p');line.textContent=`No published ${missing.join(' / ')} package for this checkpoint.`;downloads.append(line);}
+    item.append(heading,date,notes,downloads);list.append(item);
+  }
+}
 async function loadDownloads() {
-  // The bundled manifest remains usable if GitHub is unavailable or rate-limited.
   let loaded = false;
   try {
     const response = await fetch('downloads.json');
-    if (response.ok) loaded = renderDownloads(await response.json());
-  } catch { /* Try the public release feed below. */ }
-  try {
-    const response = await fetch('https://api.github.com/repos/Deftr0y/PeerBrush/releases?per_page=10', { signal: AbortSignal.timeout(5000), headers: { Accept: 'application/vnd.github+json' } });
-    if (response.ok) {
-      const releases = await response.json();
-      const build = Array.isArray(releases) ? releases.map(completeRelease).find(Boolean) : null;
-      if (build) loaded = renderDownloads(build);
-    }
-  } catch { /* The verified bundled release already supplies all three builds. */ }
+    if (response.ok) {const data=await response.json();renderHistory(data);const build=latestRelease(data);if(build)loaded=renderDownloads(build);}
+  } catch { /* Keep the verified static download links when the feed is unavailable. */ }
   if (!loaded) document.querySelector('#build-label').textContent = 'Development · d70f64e';
 }
 loadDownloads();

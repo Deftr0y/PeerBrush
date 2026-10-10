@@ -2,7 +2,7 @@
 
 Run the portable `peerbrush` executable. Open the File menu for new/open/import/export and Save As. Keyboard undo/redo works on shared edits. Rust is only needed to develop PeerBrush, not to run a packaged build.
 
-For the Windows 0.1.4 folder, double-click **Start PeerBrush.cmd**. It uses a separate 0.1.4 workspace under Local AppData, so an older running build can keep its current document open.
+For the Windows 0.2 folder, double-click **Start PeerBrush.cmd**. It uses a separate `PeerBrush-0.2.0` workspace under Local AppData. Existing project files remain at their original locations; earlier workspaces and recovery files are not moved automatically. The macOS package contains **PeerBrush.app**; the Linux package contains an executable `peerbrush`. See [package verification](release-packages.md) for checksums, signing status and platform requirements.
 
 The first canvas is transparent. Use the brush, eraser, fill, gradient, rectangle, ellipse, move, rectangle selection, eyedropper, and pan tools. Scroll or **Alt + right-mouse drag** to zoom around the cursor; **middle-mouse drag** or Space-drag to pan. **F** frames an active selection with a small margin, or centers and fits the full canvas when nothing is selected. The frame icon does the same.
 

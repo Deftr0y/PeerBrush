@@ -1,2 +1,2 @@
 @echo off
-start "" "%~dp0peerbrush.exe" --state-dir "%LOCALAPPDATA%\PeerBrush-0.1.4"
+start "" "%~dp0peerbrush.exe" --state-dir "%LOCALAPPDATA%\PeerBrush-0.2.0"
