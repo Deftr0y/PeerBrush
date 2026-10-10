@@ -36,41 +36,58 @@ impl Default for Settings {
         }
     }
 }
-pub(super) fn toolbar(ui: &mut egui::Ui, radius: &mut f32, settings: &mut Settings) {
+pub(super) fn toolbar(
+    ui: &mut egui::Ui,
+    radius: &mut f32,
+    settings: &mut Settings,
+    display_radius: f32,
+    display_strength: f32,
+    ai: bool,
+) {
     egui::ComboBox::from_id_salt("liquify mode")
         .selected_text(settings.mode.name())
-        .width(76.0)
+        .width(76.)
         .show_ui(ui, |ui| {
             for mode in [Mode::Push, Mode::Expand, Mode::Pinch, Mode::Restore] {
                 ui.selectable_value(&mut settings.mode, mode, mode.name());
             }
         });
     controls::label(ui, "Size");
-    let mut diameter = *radius * 2.0;
-    controls::range(
+    let mut diameter = *radius * 2.;
+    if tool_settings::number(
         ui,
         "liquify radius",
         &mut diameter,
-        1.0..=1024.0,
-        112.0,
+        display_radius * 2.,
+        1.0..=1024.,
+        112.,
         " px",
         0,
         true,
-    );
-    *radius = diameter * 0.5;
+        ai,
+    )
+    .changed()
+    {
+        *radius = diameter * 0.5;
+    }
     controls::label(ui, "Strength");
-    let mut percent = settings.strength * 100.0;
-    controls::range(
+    let mut percent = settings.strength * 100.;
+    if tool_settings::number(
         ui,
         "liquify strength",
         &mut percent,
-        0.0..=100.0,
-        112.0,
+        display_strength * 100.,
+        0.0..=100.,
+        112.,
         "%",
         0,
         false,
-    );
-    settings.strength = percent / 100.0;
+        ai,
+    )
+    .changed()
+    {
+        settings.strength = percent / 100.;
+    }
 }
 pub(super) fn command(layer: &str, points: &[[f32; 2]], radius: f32, settings: &Settings) -> Value {
     json!({"op":"liquify.stroke","layer":layer,"mode":settings.mode.key(),"points":points,"radius":radius,"strength":settings.strength})

@@ -454,6 +454,7 @@ pub struct Engine {
     pub focus_requested: bool,
     pub loading: Option<crate::loading::Control>,
     pub brush_library: std::sync::Arc<std::sync::Mutex<crate::brush_library::Library>>,
+    pub tool_settings: std::sync::Arc<std::sync::Mutex<crate::tool_settings::Store>>,
     pub filter_library: std::sync::Arc<std::sync::Mutex<crate::filter_library::Library>>,
     pub(crate) proposals: Vec<crate::collaboration::Proposal>,
     pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
@@ -599,6 +600,7 @@ impl Engine {
             brush_library: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::brush_library::Library::default(),
             )),
+            tool_settings: Default::default(),
             filter_library: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::filter_library::Library::default(),
             )),

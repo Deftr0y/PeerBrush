@@ -22,6 +22,9 @@ mod saved_versions;
 mod selection;
 mod source;
 mod tabs;
+mod tool_settings;
+#[cfg(test)]
+mod tool_settings_tests;
 use crate::{controls, thumbnails};
 use crate::{
     engine::Document,
@@ -344,6 +347,9 @@ pub struct PeerBrush {
     size_drag: Option<(Pos2, f32)>,
     live_gesture: Option<String>,
     brush: crate::brush::Settings,
+    tool_settings_store: Arc<std::sync::Mutex<crate::tool_settings::Store>>,
+    tool_profile: tool_settings::Cache,
+    tool_feedback: Option<tool_settings::Feedback>,
     liquify: liquify::Settings,
     liquify_effect: Option<String>,
     stroke_pressures: Vec<f32>,
@@ -567,6 +573,9 @@ impl PeerBrush {
             .first()
             .map(|l| l.id.clone())
             .unwrap_or_default();
+        let tool_settings_store = shared.lock().unwrap().tool_settings.clone();
+        let tool_profile = tool_settings::initial(&tool_settings_store);
+        let initial_tool_profile = tool_profile.snapshot.profile.clone();
         let (preview_tx, preview_rx) = mpsc::channel();
         let (job_tx, job_rx) = mpsc::channel();
         let (import_tx, import_rx) = mpsc::channel();
@@ -643,10 +652,13 @@ impl PeerBrush {
             retouch_pick: false,
             color: [233, 84, 32, 255],
             mask_value: 0,
-            radius: 18.0,
+            radius: initial_tool_profile.settings.radius,
             size_drag: None,
             live_gesture: None,
-            brush: crate::brush::Settings::default(),
+            brush: tool_profile.snapshot.profile.settings,
+            tool_profile,
+            tool_settings_store,
+            tool_feedback: None,
             liquify: liquify::Settings::default(),
             liquify_effect: None,
             stroke_pressures: vec![],
@@ -658,7 +670,7 @@ impl PeerBrush {
             brush_preview: None,
             brush_search: String::new(),
             brush_category: "All".into(),
-            brush_preset: None,
+            brush_preset: initial_tool_profile.preset.clone(),
             brush_name: "My brush".into(),
             brush_save_category: "Paint".into(),
             brush_thumbnails: HashMap::new(),
@@ -777,7 +789,15 @@ impl PeerBrush {
         }
     }
     fn select_tool(&mut self, tool: Tool) {
+        self.store_current_tool_profile();
+        self.restore_tool_profile(tool);
         self.tool = tool;
+        if !matches!(
+            tool,
+            Tool::Brush | Tool::Eraser | Tool::Smudge | Tool::Clone | Tool::Heal
+        ) {
+            self.show_brush = false;
+        }
         if tool == Tool::MagicWand {
             self.selection_kind = "wand".into();
         }
@@ -1656,7 +1676,7 @@ impl PeerBrush {
         command
     }
     fn activate_liquify(&mut self, effect: Option<String>) {
-        self.tool = Tool::Liquify;
+        self.select_tool(Tool::Liquify);
         self.mask = false;
         self.liquify_effect = effect;
         self.message =
@@ -3701,6 +3721,7 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.sync_tool_profile(ctx);
         self.lifecycle_frame = false;
         if let Some(warning) = self.workspace.lock().unwrap().open_warning.take() {
             self.open_file_warning = Some(warning);
@@ -3752,7 +3773,7 @@ impl PeerBrush {
                 self.last_preview = None;
             }
             if panel == "selection" {
-                self.tool = Tool::MagicWand;
+                self.select_tool(Tool::MagicWand);
                 self.selection_kind = "wand".into();
             }
             if panel == "color" {
@@ -4330,25 +4351,21 @@ impl PeerBrush {
                     }
                     if [Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Clone, Tool::Heal].contains(&self.tool) {
                         controls::label(ui, "Size");
-                        let mut size = self.radius * 2.0;
-                        controls::range(
-                            ui,
-                            "brush size",
-                            &mut size,
-                            1.0..=1024.0,
-                            130.0,
-                            " px",
-                            0,
-                            true,
-                        );
-                        self.radius = size / 2.0;
+                        let time=ui.input(|i|i.time);
+                        let mut size=self.radius*2.;
+                        let display=self.tool_display_number("radius",self.radius,time)*2.;
+                        if tool_settings::number(ui,"brush size",&mut size,display,1.0..=1024.,130.," px",0,true,self.tool_preferences_ai(time)).changed() {self.radius=size/2.;}
                         self.toolbar_brush_opacity(ui);
                         if icons::button(ui, Icon::Adjust, "Brush settings").clicked() {
                             self.show_brush = !self.show_brush;
                         }
                     }
                     if self.tool == Tool::Liquify {
-                        liquify::toolbar(ui, &mut self.radius, &mut self.liquify);
+                        let time=ui.input(|i|i.time);
+                        let radius=self.tool_display_number("radius",self.radius,time);
+                        let strength=self.tool_display_number("opacity",self.liquify.strength,time);
+                        let ai=self.tool_preferences_ai(time);
+                        liquify::toolbar(ui, &mut self.radius, &mut self.liquify,radius,strength,ai);
                     }
                     self.retouch_toolbar(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4805,6 +4822,10 @@ impl PeerBrush {
                 });
         } else {
             self.load_preview = None;
+        }
+        self.sync_tool_profile(ctx);
+        if self.tool_preferences_ai(ctx.input(|i| i.time)) {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
         if self.pending || self.busy || !self.points.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));

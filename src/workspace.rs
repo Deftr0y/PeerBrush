@@ -38,6 +38,7 @@ pub struct Workspace {
     active: String,
     pub(crate) exiting: bool,
     pub brush_library: Arc<Mutex<crate::brush_library::Library>>,
+    pub tool_settings: Arc<Mutex<crate::tool_settings::Store>>,
     pub filter_library: Arc<Mutex<crate::filter_library::Library>>,
     pub recovery_dir: Option<std::path::PathBuf>,
     pub recovery_error: Option<String>,
@@ -103,6 +104,7 @@ pub fn attach(root: &Shared) -> Registry {
         active: e.project_id.clone(),
         exiting: false,
         brush_library: e.brush_library.clone(),
+        tool_settings: e.tool_settings.clone(),
         filter_library: e.filter_library.clone(),
         recovery_dir: None,
         recovery_error: None,
@@ -291,6 +293,7 @@ pub fn register_in(
 ) -> Result<Shared, String> {
     engine.ensure_open()?;
     engine.brush_library = workspace.lock().unwrap().brush_library.clone();
+    engine.tool_settings = workspace.lock().unwrap().tool_settings.clone();
     engine.filter_library = workspace.lock().unwrap().filter_library.clone();
     engine.workspace = Some(Arc::downgrade(workspace));
     engine.workspace_owner = None;
@@ -406,6 +409,7 @@ pub fn close_in(
     if workspace_guard.entries.is_empty() {
         let mut blank = Engine::new();
         blank.brush_library = e.brush_library.clone();
+        blank.tool_settings = e.tool_settings.clone();
         blank.filter_library = e.filter_library.clone();
         blank.workspace = Some(Arc::downgrade(workspace));
         let id = blank.project_id.clone();

@@ -618,6 +618,7 @@ pub fn tools() -> Value {
         }
     }
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_image_info","description":"Inspect a supported local image without editing. Reports channel depth and explicit zero-based frame/page/variant choices for image.import and place_image. Float, CMYK and PNG16 animation require explicit supported conversion.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_tool_settings","description":"Inspect/update independent instance-local Brush, Eraser, Smudge, Clone and Heal preferences, plus Liquify radius/strength/mode. Settings and preset choice stay outside document history and PSD sources; set never selects the visible tool or paints. Supply expected_tool_revision from get when changing preferences as an agent. Settings partially override the current snapshot; choosing a preset first copies its settings. Use returned profile.settings as explicit parameters in shared edit commands. preview returns actual brush-preview PNG pixels with explicit coordinates.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["get","set","preview"]},"tool":{"type":"string","enum":["brush","eraser","smudge","clone","heal","liquify"]},"actor":{"type":"string"},"expected_tool_revision":{"type":"integer","minimum":0},"preset":{"type":["string","null"]},"settings":{"type":"object"}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_projects","description":"List stable project IDs, create/open independent projects, select/reorder tabs or request native Save/Don't Save/Cancel close review (human only), close with exact source guards, or copy/move editable layer trees between projects. Background AI writes must supply project_id, document_id and expected_revision; never depend on the visible tab. Transfers need both source identities/revisions and preserve native precision, masks and effects. preview_transfer returns actual destination pixels without history. move creates one undo step in each document; failures change neither.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","new","open","select","reorder","request_close","close","copy","move","preview_transfer"]},"actor":{"type":"string"},"project_id":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"expected_order":{"type":"array","items":{"type":"string"}},"order":{"type":"array","items":{"type":"string"}},"activate":{"type":"boolean"},"discard":{"type":"boolean"},"source_project_id":{"type":"string"},"source_document_id":{"type":"string"},"source_revision":{"type":"integer"},"source_task":{"type":"string"},"task":{"type":"string"},"layers":{"type":"array","items":{"type":"string"}},"target":{"type":"string"},"move":{"type":"boolean"},"max_edge":{"type":"integer"}},"required":["action"],"additionalProperties":false}}));
     tools
 }
@@ -742,7 +743,13 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
     }
     if matches!(
         method,
-        "capabilities" | "brushes" | "image_info" | "focus" | "client_state" | "capture_ui"
+        "capabilities"
+            | "brushes"
+            | "tool_settings"
+            | "image_info"
+            | "focus"
+            | "client_state"
+            | "capture_ui"
     ) {
         return dispatch_project(shared, method, p);
     }
@@ -989,6 +996,97 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
         "observe" => observation(shared, p),
         "code" => crate::code::dispatch(shared, actor, p),
         "filters" => filter_library(shared, p),
+        "tool_settings" => {
+            let (store, library) = {
+                let e = shared.lock().unwrap();
+                (e.tool_settings.clone(), e.brush_library.clone())
+            };
+            let action = p["action"]
+                .as_str()
+                .ok_or("Missing tool preference action")?;
+            if action == "get" && p.get("tool").is_none() {
+                return Ok(store.lock().unwrap().state());
+            }
+            let tool = p["tool"].as_str().ok_or("Choose a brush-based tool")?;
+            let snapshot =
+                match action {
+                    "get" | "preview" => store.lock().unwrap().get(tool)?,
+                    "set" => {
+                        let mut store = store.lock().unwrap();
+                        let mut profile = store.get(tool)?.profile;
+                        if tool == "liquify" && p.get("preset").is_some_and(|v| !v.is_null()) {
+                            return Err("Liquify does not use brush presets".into());
+                        }
+                        if let Some(preset) = p.get("preset") {
+                            if preset.is_null() {
+                                profile.preset = None;
+                            } else {
+                                let preset = library
+                                    .lock()
+                                    .unwrap()
+                                    .get(preset.as_str().ok_or("Preset must be an ID or null")?)?;
+                                profile.settings = preset.settings;
+                                profile.preset = Some(preset.id);
+                            }
+                        }
+                        if let Some(settings) = p.get("settings") {
+                            let mut value = serde_json::to_value(profile.settings)
+                                .map_err(|e| e.to_string())?;
+                            for (key, setting) in settings
+                                .as_object()
+                                .ok_or("Tool settings must be an object")?
+                            {
+                                if tool == "liquify" {
+                                    match key.as_str() {
+                                        "radius" => value["radius"] = setting.clone(),
+                                        "strength" => value["opacity"] = setting.clone(),
+                                        "mode" => {
+                                            profile.liquify_mode = Some(
+                                                setting
+                                                    .as_str()
+                                                    .ok_or("Liquify mode must be text")?
+                                                    .into(),
+                                            )
+                                        }
+                                        _ => return Err(
+                                            "Liquify preferences support radius, strength and mode"
+                                                .into(),
+                                        ),
+                                    }
+                                } else {
+                                    value[key] = setting.clone();
+                                }
+                            }
+                            profile.settings = serde_json::from_value(value)
+                                .map_err(|e| format!("Invalid tool settings: {e}"))?;
+                        }
+                        store.set(
+                            tool,
+                            profile,
+                            actor,
+                            p.get("expected_tool_revision")
+                                .map(|v| {
+                                    v.as_u64()
+                                        .ok_or("Tool revision must be an unsigned integer")
+                                })
+                                .transpose()?,
+                        )?
+                    }
+                    _ => return Err("Choose get, set or preview tool preferences".into()),
+                };
+            let mut result = snapshot.state(tool);
+            if action == "preview" {
+                if tool == "liquify" {
+                    return Err(
+                        "Preview Liquify with liquify.stroke on an explicit document source".into(),
+                    );
+                }
+                let raster = crate::brush_library::preview(snapshot.profile.settings, 240, 48)?;
+                let png = raster::png(240, 48, &raster.rgba())?;
+                result["images"] = json!([{"mime_type":"image/png","data":STANDARD.encode(png),"width":240,"height":48,"coordinate_space":"brush_preview","rect":[0,0,240,48]}]);
+            }
+            Ok(result)
+        }
         "brushes" => {
             let library = shared.lock().unwrap().brush_library.clone();
             let mut library = library.lock().unwrap();
@@ -1501,6 +1599,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             if ![
                 "capabilities",
                 "brushes",
+                "tool_settings",
                 "filters",
                 "image_info",
                 "projects",

@@ -17,7 +17,9 @@ impl PeerBrush {
                 | (Some("clone"), Tool::Clone)
                 | (Some("heal"), Tool::Heal)
         );
-        let mut percent = self.brush.opacity * 100.;
+        let ai = ai || self.tool_preferences_ai(ui.input(|i| i.time));
+        let mut percent =
+            self.tool_display_number("opacity", self.brush.opacity, ui.input(|i| i.time)) * 100.;
         let response = controls::range_with_color(
             ui,
             "toolbar brush opacity",
@@ -210,9 +212,13 @@ impl PeerBrush {
         self.show_brush = open;
     }
     fn brush_parameters(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new(&self.brush_name).color(ACCENT));
+        let time = ui.input(|i| i.time);
+        let ai = self.tool_preferences_ai(time);
+        let display = self.tool_display_values(time);
+        let shown = |key: &str| display[key].as_f64().unwrap_or(0.) as f32;
+        ui.label(RichText::new(&self.brush_name).color(if ai { AI_BLUE } else { ACCENT }));
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Tip").small().color(MUTED));
+            controls::label(ui, "Tip");
             egui::ComboBox::from_id_salt("procedural tip")
                 .selected_text(self.brush.tip.name())
                 .show_ui(ui, |ui| {
@@ -241,117 +247,190 @@ impl PeerBrush {
             }
         }
         if let Some((_, texture)) = &self.brush_preview {
-            ui.image((texture.id(), Vec2::new(260.0, 54.0)));
+            ui.image((texture.id(), Vec2::new(260., 54.)));
         }
         egui::Grid::new("brush parameters")
-                    .spacing(Vec2::new(10.0, 8.0))
-                    .show(ui, |ui| {
-                        let mut size = self.radius * 2.0;
-                        controls::label(ui, "Size");
-                        controls::range(
+            .spacing(Vec2::new(10., 8.))
+            .show(ui, |ui| {
+                let mut size = self.radius * 2.;
+                controls::label(ui, "Size");
+                let response = tool_settings::number(
+                    ui,
+                    "tip size",
+                    &mut size,
+                    shown("radius") * 2.,
+                    1.0..=1024.,
+                    200.,
+                    " px",
+                    0,
+                    true,
+                    ai,
+                );
+                if response.changed() {
+                    self.radius = size / 2.;
+                }
+                ui.end_row();
+                for (id, label, value, min, max) in [
+                    ("hardness", "Hardness", &mut self.brush.hardness, 0., 100.),
+                    (
+                        "opacity",
+                        if self.tool == Tool::Smudge {
+                            "Strength"
+                        } else {
+                            "Opacity"
+                        },
+                        &mut self.brush.opacity,
+                        0.,
+                        100.,
+                    ),
+                    ("flow", "Flow", &mut self.brush.flow, 0., 100.),
+                    ("spacing", "Spacing", &mut self.brush.spacing, 1., 200.),
+                    (
+                        "roundness",
+                        "Roundness",
+                        &mut self.brush.roundness,
+                        5.,
+                        100.,
+                    ),
+                    (
+                        "smoothing",
+                        "Smoothing",
+                        &mut self.brush.smoothing,
+                        0.,
+                        100.,
+                    ),
+                ] {
+                    let mut percent = *value * 100.;
+                    controls::label(ui, label);
+                    if tool_settings::number(
+                        ui,
+                        id,
+                        &mut percent,
+                        shown(id) * 100.,
+                        min..=max,
+                        200.,
+                        "%",
+                        0,
+                        false,
+                        ai,
+                    )
+                    .changed()
+                    {
+                        *value = percent / 100.;
+                    }
+                    ui.end_row();
+                }
+                for (id, label, value, min, max, suffix, decimals) in [
+                    ("angle", "Angle", &mut self.brush.angle, -180., 180., "°", 0),
+                    (
+                        "pressure_gamma",
+                        "Pressure curve",
+                        &mut self.brush.pressure_gamma,
+                        0.1,
+                        4.,
+                        "",
+                        2,
+                    ),
+                ] {
+                    controls::label(ui, label);
+                    tool_settings::number(
+                        ui,
+                        id,
+                        value,
+                        shown(id),
+                        min..=max,
+                        200.,
+                        suffix,
+                        decimals,
+                        false,
+                        ai,
+                    );
+                    ui.end_row();
+                }
+                if self.brush.tip != crate::brush::TipKind::Round {
+                    let mut density = self.brush.density * 100.;
+                    controls::label(ui, "Density");
+                    if tool_settings::number(
+                        ui,
+                        "tip density",
+                        &mut density,
+                        shown("density") * 100.,
+                        5.0..=100.,
+                        200.,
+                        "%",
+                        0,
+                        false,
+                        ai,
+                    )
+                    .changed()
+                    {
+                        self.brush.density = density / 100.;
+                    }
+                    ui.end_row();
+                    controls::label(ui, "Grain");
+                    tool_settings::number(
+                        ui,
+                        "tip grain",
+                        &mut self.brush.grain,
+                        shown("grain"),
+                        0.5..=32.,
+                        200.,
+                        " px",
+                        1,
+                        false,
+                        ai,
+                    );
+                    ui.end_row();
+                }
+                for (id, label, value) in [
+                    ("taper_start", "Start", &mut self.brush.taper_start),
+                    ("taper_end", "End", &mut self.brush.taper_end),
+                ] {
+                    controls::label(ui, label);
+                    tool_settings::number(
+                        ui,
+                        id,
+                        value,
+                        shown(id),
+                        0.0..=512.,
+                        200.,
+                        " px",
+                        0,
+                        false,
+                        ai,
+                    )
+                    .on_hover_text("Taper length along the stroke");
+                    ui.end_row();
+                }
+                if self.tool == Tool::Smudge {
+                    for (id, label, value) in [
+                        ("wetness", "Wet", &mut self.brush.wetness),
+                        ("load", "Load", &mut self.brush.load),
+                        ("pickup", "Pickup", &mut self.brush.pickup),
+                    ] {
+                        let mut percent = *value * 100.;
+                        controls::label(ui, label);
+                        if tool_settings::number(
                             ui,
-                            "tip size",
-                            &mut size,
-                            1.0..=1024.0,
-                            200.0,
-                            " px",
-                            0,
-                            true,
-                        );
-                        ui.end_row();
-                        self.radius = size / 2.0;
-                        for (id, label, value, min, max, suffix) in [
-                            (
-                                "hardness",
-                                "Hardness",
-                                &mut self.brush.hardness,
-                                0.0,
-                                100.0,
-                                "%",
-                            ),
-                            (
-                                "opacity",
-                                if self.tool==Tool::Smudge {"Strength"}else{"Opacity"},
-                                &mut self.brush.opacity,
-                                0.0,
-                                100.0,
-                                "%",
-                            ),
-                            ("flow", "Flow", &mut self.brush.flow, 0.0, 100.0, "%"),
-                            (
-                                "spacing",
-                                "Spacing",
-                                &mut self.brush.spacing,
-                                1.0,
-                                200.0,
-                                "%",
-                            ),
-                            (
-                                "roundness",
-                                "Roundness",
-                                &mut self.brush.roundness,
-                                5.0,
-                                100.0,
-                                "%",
-                            ),
-                            (
-                                "smoothing",
-                                "Smoothing",
-                                &mut self.brush.smoothing,
-                                0.0,
-                                100.0,
-                                "%",
-                            ),
-                        ] {
-                            let mut percent = *value * 100.0;
-                            controls::label(ui, label);
-                            controls::range(
-                                ui,
-                                id,
-                                &mut percent,
-                                min..=max,
-                                200.0,
-                                suffix,
-                                0,
-                                false,
-                            );
-                            *value = percent / 100.0;
-                            ui.end_row();
-                        }
-                        controls::label(ui, "Angle");
-                        controls::range(
-                            ui,
-                            "tip angle",
-                            &mut self.brush.angle,
-                            -180.0..=180.0,
-                            200.0,
-                            "°",
+                            id,
+                            &mut percent,
+                            shown(id) * 100.,
+                            0.0..=100.,
+                            200.,
+                            "%",
                             0,
                             false,
-                        );
+                            ai,
+                        )
+                        .changed()
+                        {
+                            *value = percent / 100.;
+                        }
                         ui.end_row();
-                        controls::label(ui, "Pressure curve");
-                        controls::range(ui,"pressure response",&mut self.brush.pressure_gamma,0.1..=4.0,200.0,"",2,false).on_hover_text("1 is linear. Below 1 responds more at light pressure; above 1 needs more force.");
-                        ui.end_row();
-                        if self.brush.tip!=crate::brush::TipKind::Round {
-                            let mut density=self.brush.density*100.0;
-                            controls::label(ui,"Density");controls::range(ui,"tip density",&mut density,5.0..=100.0,200.0,"%",0,false);ui.end_row();self.brush.density=density/100.0;
-                            controls::label(ui,"Grain");controls::range(ui,"tip grain",&mut self.brush.grain,0.5..=32.0,200.0," px",1,false);ui.end_row();
-                        }
-                        for (id,label,value) in [("taper start","Start",&mut self.brush.taper_start),("taper end","End",&mut self.brush.taper_end)] {
-                            controls::label(ui,label);controls::range(ui,id,value,0.0..=512.0,200.0," px",0,false).on_hover_text("Taper length along the stroke");ui.end_row();
-                        }
-                        if self.tool==Tool::Smudge {
-                            for (id,label,value) in [("wetness","Wet",&mut self.brush.wetness),("paint load","Load",&mut self.brush.load),("paint pickup","Pickup",&mut self.brush.pickup)] {
-                                let mut percent=*value*100.0;controls::label(ui,label);controls::range(ui,id,&mut percent,0.0..=100.0,200.0,"%",0,false);ui.end_row();*value=percent/100.0;
-                            }
-                        }
-                    });
-        ui.horizontal(|ui| {
-                    ui.label(RichText::new("Pressure").small().color(MUTED));
-                    ui.checkbox(&mut self.brush.pressure_size,"Size").on_hover_text("Uses genuine device force when supplied, or explicit agent pressure. Mouse strokes use taper.");
-                    ui.checkbox(&mut self.brush.pressure_opacity,"Opacity");
-                });
+                    }
+                }
+            });
+        ui.horizontal(|ui| {ui.label(RichText::new("Pressure").small().color(MUTED));ui.checkbox(&mut self.brush.pressure_size,"Size").on_hover_text("Uses genuine device force when supplied, or explicit agent pressure. Mouse strokes use taper.");ui.checkbox(&mut self.brush.pressure_opacity,"Opacity");});
         ui.horizontal(|ui| {
             ui.label(RichText::new("Taper").small().color(MUTED));
             ui.checkbox(&mut self.brush.taper_size, "Size");
@@ -549,15 +628,16 @@ impl PeerBrush {
     }
     pub(super) fn select_brush_preset(&mut self, preset: &crate::brush_library::Preset) {
         if preset.category == "Blend" {
-            self.tool = Tool::Smudge;
+            self.select_tool(Tool::Smudge);
         } else if self.tool == Tool::Smudge {
-            self.tool = Tool::Brush;
+            self.select_tool(Tool::Brush);
         }
         self.brush = preset.settings;
         self.radius = preset.settings.radius;
         self.brush_preset = Some(preset.id.clone());
         self.brush_name = preset.name.clone();
         self.brush_save_category = preset.category.clone();
+        self.store_current_tool_profile();
     }
     pub(super) fn save_brush_preset(&mut self, update: bool) {
         let library = self.shared.lock().unwrap().brush_library.clone();

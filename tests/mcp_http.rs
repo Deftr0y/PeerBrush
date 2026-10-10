@@ -8,6 +8,54 @@ use std::{
 };
 
 #[test]
+fn modern_tool_settings_are_guarded_independent_and_return_real_preview_pixels() {
+    let canvas = Canvas::new();
+    let call = |args| {
+        let q = modern_request(
+            json!("tool-prefs"),
+            "tools/call",
+            json!({"name":"peerbrush_tool_settings","arguments":args}),
+        );
+        response(canvas.modern(&q).send_json(q.clone()))
+            .into_json::<Value>()
+            .unwrap()
+    };
+    let before = peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap();
+    let updated = call(
+        json!({"action":"set","tool":"brush","actor":"preference-artist","expected_tool_revision":0,"settings":{"radius":12.5,"opacity":0.4}}),
+    );
+    assert_eq!(updated["result"]["isError"], false, "{updated}");
+    let metadata: Value =
+        serde_json::from_str(updated["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["profile"]["settings"]["radius"], 12.5);
+    let stale = call(
+        json!({"action":"set","tool":"brush","actor":"preference-artist","expected_tool_revision":0,"settings":{"radius":50}}),
+    );
+    assert_eq!(stale["result"]["isError"], true);
+    let eraser = call(json!({"action":"get","tool":"eraser"}));
+    let metadata: Value =
+        serde_json::from_str(eraser["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["profile"]["settings"]["radius"], 18.0);
+    let preview = call(json!({"action":"preview","tool":"brush"}));
+    assert_eq!(preview["result"]["isError"], false);
+    let content = preview["result"]["content"].as_array().unwrap();
+    let image = content.iter().find(|c| c["type"] == "image").unwrap();
+    let pixels =
+        image::load_from_memory(&STANDARD.decode(image["data"].as_str().unwrap()).unwrap())
+            .unwrap()
+            .to_rgba8();
+    assert_eq!(pixels.dimensions(), (240, 48));
+    assert!(pixels.pixels().any(|p| p[3] > 0));
+    let metadata: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["views"][0]["coordinate_space"], "brush_preview");
+    assert_eq!(
+        peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap(),
+        before
+    );
+    assert!(canvas.shared.lock().unwrap().undo.is_empty());
+}
+
+#[test]
 fn modern_async_open_exposes_progress_cancel_and_exact_native_sources() {
     let canvas = Canvas::new();
     let control = peerbrush::loading::Control::default();

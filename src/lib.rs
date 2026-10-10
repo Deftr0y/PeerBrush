@@ -46,6 +46,7 @@ pub mod smudge;
 pub mod source;
 pub mod svg;
 pub mod thumbnails;
+pub mod tool_settings;
 pub mod transform;
 pub mod tree;
 pub mod ui;
