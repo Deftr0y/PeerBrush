@@ -1,5 +1,47 @@
 use super::*;
 impl PeerBrush {
+    pub(super) fn toolbar_brush_opacity(&mut self, ui: &mut egui::Ui) {
+        controls::label(
+            ui,
+            if self.tool == Tool::Smudge {
+                "Strength"
+            } else {
+                "Opacity"
+            },
+        );
+        let ai = matches!(
+            (self.animation.tool(ui.input(|i| i.time)), self.tool),
+            (Some("brush"), Tool::Brush)
+                | (Some("eraser"), Tool::Eraser)
+                | (Some("smudge"), Tool::Smudge)
+                | (Some("clone"), Tool::Clone)
+                | (Some("heal"), Tool::Heal)
+        );
+        let mut percent = self.brush.opacity * 100.;
+        let response = controls::range_with_color(
+            ui,
+            "toolbar brush opacity",
+            &mut percent,
+            0.0..=100.0,
+            104.,
+            "%",
+            0,
+            false,
+            if ai {
+                AI_BLUE
+            } else {
+                Color32::from_rgb(190, 70, 29)
+            },
+        );
+        if response.changed() {
+            self.brush.opacity = percent / 100.;
+        }
+        response.on_hover_text(if self.tool == Tool::Smudge {
+            "Smudge strength"
+        } else {
+            "Brush opacity · double-click to enter a value"
+        });
+    }
     pub(super) fn pointer_pressure(ui: &egui::Ui) -> Option<f32> {
         ui.input(|input| {
             input.events.iter().rev().find_map(|event| {

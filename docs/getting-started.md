@@ -52,6 +52,8 @@ The top bar shows green **MCP connected** when a live client is attached, red ot
 
 ## Brush and effects
 
+Unreleased: **Opacity** is directly adjustable beside Size in the top toolbar for Brush, Eraser, Clone and Heal; Smudge shows **Strength**. Drag the compact percentage bar or double-click to enter a value. It uses the same setting as the Brush window and the shared stroke commands. Changing this preference creates no artwork history; painting still commits one undo step per completed stroke. The bar turns blue during AI work with that tool, and human input interrupts the presentation feedback.
+
 The Brush window offers 21 original brushes in **Sketch, Ink, Paint, Airbrush, Texture and Blend**. Search or choose a category, then click a readable stroke preview to load all settings. Blend presets select Smudge. Edit any tip, texture, pressure curve, taper, flow or smoothing control, then use **Save new** with a name/category. **Update** and **Delete** apply only to your custom brushes. Custom presets persist in the running instance's state folder independently of artwork and undo. The pressure curve is linear at 1; lower values respond more to light force and higher values need more force.
 
 Unreleased: the new **Basic** section comes first, adding **Hard Round**, **Soft Round**, **Pencil**, **Ink Pen** and **Airbrush** to the existing 21 presets. Use Hard Round for opaque painting, Soft Round for gentle edges, Pencil for fine textured drawing, Ink Pen for smooth lines, and Airbrush for gradual shading. Each preview uses the same brush engine and settings as UI, MCP and CLI strokes; preset selection alone does not edit the artwork.

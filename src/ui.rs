@@ -1,6 +1,8 @@
 use crate::icons::{self, Icon};
 mod animation;
 mod brush;
+#[cfg(test)]
+mod brush_toolbar_tests;
 mod color;
 mod effects;
 mod file_ownership;
@@ -4310,6 +4312,7 @@ impl PeerBrush {
                             true,
                         );
                         self.radius = size / 2.0;
+                        self.toolbar_brush_opacity(ui);
                         if icons::button(ui, Icon::Adjust, "Brush settings").clicked() {
                             self.show_brush = !self.show_brush;
                         }
