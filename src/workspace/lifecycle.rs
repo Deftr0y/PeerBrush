@@ -56,7 +56,10 @@ pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), St
         .collect::<Result<_, _>>()?;
     for (e, r) in engines.iter_mut().zip(&reviewed) {
         guard(e, &r.document, r.revision)?;
-        if !r.discard && e.doc.revision != e.saved_revision {
+        if !r.discard
+            && (e.doc.revision != e.saved_revision
+                || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version))
+        {
             return Err(format!(
                 "{} still has unsaved changes. Save, Don't Save or Cancel before exiting.",
                 e.doc.name

@@ -13,6 +13,7 @@ pub mod disk_cache;
 mod edit_bounds;
 pub mod effects;
 pub mod engine;
+pub mod file_safety;
 pub mod fill;
 pub mod filter_library;
 pub mod filters;

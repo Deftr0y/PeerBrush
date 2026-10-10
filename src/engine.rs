@@ -441,7 +441,7 @@ pub struct Engine {
     pub feedback: BTreeMap<String, String>,
     pub path: Option<std::path::PathBuf>,
     pub status: String,
-    pub file_version: Option<(u64, u128)>,
+    pub file_version: Option<crate::file_safety::Version>,
     pub capture_ui: Option<std::path::PathBuf>,
     /// A human-requested native close review; never serialized into documents.
     pub native_close_review: Option<(String, u64)>,

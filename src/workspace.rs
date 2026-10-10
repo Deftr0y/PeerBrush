@@ -334,7 +334,10 @@ pub fn close_in(
         .try_lock()
         .map_err(|_| "The project is still working. Try closing again when it finishes.")?;
     guard(&e, document, revision)?;
-    if e.doc.revision != e.saved_revision && !discard {
+    if (e.doc.revision != e.saved_revision
+        || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version))
+        && !discard
+    {
         return Err("Unsaved project: save first, cancel, or explicitly choose Don't Save".into());
     }
     e.check(

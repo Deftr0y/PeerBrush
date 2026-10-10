@@ -97,6 +97,54 @@ mod tests {
         }
         panic!("Save reply did not arrive");
     }
+    #[test]
+    fn clean_conflicting_project_reviews_native_cancel_failed_save_and_discard() {
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            let path = app.connection.state_dir.join("conflicting.psd");
+            server::save(&root, &path).unwrap();
+            let before = root.lock().unwrap().doc.export_png().unwrap();
+            let newer = Arc::new(Mutex::new(Engine::new()));
+            server::open(&newer, &path).unwrap();
+            dirty(&newer, "Newer saved source");
+            server::save(&newer, &path).unwrap();
+            let saved = std::fs::read(&path).unwrap();
+            frame(&mut app, &ctx, vec![]);
+            let project = root.lock().unwrap().project_id.clone();
+            app.request_close(Intent::Close(project.clone()));
+            frame(&mut app, &ctx, vec![]);
+            assert!(
+                app.lifecycle
+                    .as_ref()
+                    .unwrap()
+                    .current()
+                    .unwrap()
+                    .conflicted
+            );
+            click(&mut app, &ctx, 2);
+            assert!(app.lifecycle.is_none());
+            assert!(!root.lock().unwrap().closed);
+            app.request_close(Intent::Close(project));
+            click(&mut app, &ctx, 0);
+            waiting(&mut app, &ctx);
+            assert!(app
+                .lifecycle
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("changed"));
+            assert!(!root.lock().unwrap().closed);
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert_eq!(root.lock().unwrap().doc.export_png().unwrap(), before);
+            click(&mut app, &ctx, 1);
+            frame(&mut app, &ctx, vec![]);
+            assert!(root.lock().unwrap().closed);
+            assert!(!second.lock().unwrap().closed);
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        }
+    }
 
     #[test]
     fn cancel_after_an_exit_discard_decision_keeps_every_native_project_and_history() {
@@ -365,6 +413,7 @@ struct Entry {
     name: String,
     path: Option<PathBuf>,
     dirty: bool,
+    conflicted: bool,
     decided: bool,
 }
 pub(super) struct Review {
@@ -389,7 +438,8 @@ fn entries(workspace: &crate::workspace::Registry, intent: &Intent) -> Result<Ve
             .try_lock()
             .map_err(|_| "A project is still working. Try again when it finishes.")?;
         e.ensure_open()?;
-        let dirty = e.doc.revision != e.saved_revision;
+        let conflicted = crate::file_safety::source_conflict(e.path.as_deref(), e.file_version);
+        let dirty = e.doc.revision != e.saved_revision || conflicted;
         rows.push(Entry {
             source: Reviewed {
                 project,
@@ -400,6 +450,7 @@ fn entries(workspace: &crate::workspace::Registry, intent: &Intent) -> Result<Ve
             name: e.doc.name.clone(),
             path: e.path.clone(),
             dirty,
+            conflicted,
             decided: !dirty,
         });
     }
@@ -422,6 +473,9 @@ impl Review {
                     && old.source.revision == row.source.revision
             }) {
                 row.decided |= old.decided && (old.dirty || !row.dirty);
+                if old.conflicted != row.conflicted {
+                    row.decided = false;
+                }
                 row.source.discard = old.source.discard;
             }
         }
@@ -521,6 +575,7 @@ impl PeerBrush {
             .name("peerbrush-close-save".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let overwrite = save_as || row.path.is_none();
                     let path = if save_as { None } else { row.path }.or_else(|| {
                         rfd::FileDialog::new()
                             .add_filter("PSD document", &["psd"])
@@ -531,11 +586,12 @@ impl PeerBrush {
                     let Some(path) = path else {
                         return Ok(false);
                     };
-                    server::save_reviewed_source(
+                    server::save_confirmed_source(
                         &shared,
                         &path,
                         &source.document,
                         source.revision,
+                        overwrite,
                     )?;
                     Ok(true)
                 }))
@@ -691,6 +747,7 @@ impl PeerBrush {
             ui.heading(title);
             if let Some(row) = &current {
                 ui.label(RichText::new(&row.name).strong());
+                if row.conflicted { ui.label(RichText::new("The saved file changed outside this project. Save As preserves both versions. Don't Save closes only this project's in-memory copy.").color(ACCENT)); }
                 ui.label(
                     row.path
                         .as_ref()

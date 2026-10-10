@@ -16,6 +16,9 @@ use std::{
 };
 
 pub type Shared = Arc<Mutex<Engine>>;
+#[cfg(test)]
+#[path = "save_safety_tests.rs"]
+mod save_safety_tests;
 pub struct Connection {
     pub port: u16,
     pub token: String,
@@ -35,6 +38,13 @@ impl Drop for ServerAvailability {
     }
 }
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_checked(path, bytes, || Ok(()))
+}
+fn atomic_write_checked(
+    path: &Path,
+    bytes: &[u8],
+    validate: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let tmp = path.with_extension(format!("{}.tmp", engine::id()));
     let result = (|| {
         let mut file = fs::OpenOptions::new()
@@ -42,9 +52,13 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .write(true)
             .open(&tmp)
             .map_err(|e| e.to_string())?;
+        if path.exists() {
+            crate::file_safety::preserve_permissions(path, &tmp)?;
+        }
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
+        validate()?;
         replace_file(&tmp, path)?;
         sync_parent(path)?;
         Ok(())
@@ -87,17 +101,6 @@ pub(crate) fn sync_parent(path: &Path) -> Result<(), String> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
-}
-fn file_version(path: &Path) -> Result<(u64, u128), String> {
-    let m = fs::metadata(path).map_err(|e| e.to_string())?;
-    Ok((
-        m.len(),
-        m.modified()
-            .map_err(|e| e.to_string())?
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-    ))
 }
 pub fn open(shared: &Shared, path: &Path) -> Result<(), String> {
     open_progress(shared, path, &crate::loading::Control::default())
@@ -172,12 +175,12 @@ fn open_progress_inner(
         e.loading = Some(control.clone());
         before
     };
-    let version = file_version(path)?;
-    if version.0 > 256 * 1024 * 1024 {
+    let version = crate::file_safety::version_with_check(path, || control.check())?;
+    if version.bytes > 256 * 1024 * 1024 {
         return Err("Photoshop document exceeds the initial 256 MiB file limit".into());
     }
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    if file_version(path)? != version {
+    if crate::file_safety::version_with_check(path, || control.check())? != version {
         return Err("File changed while opening; try again".into());
     }
     let mut doc = psd::decode_reader(&mut file, control)?;
@@ -188,7 +191,7 @@ fn open_progress_inner(
         .into();
     let mut e = shared.lock().unwrap();
     control.check()?;
-    if file_version(path)? != version {
+    if crate::file_safety::version_with_check(path, || control.check())? != version {
         return Err("Photoshop file changed during decoding; current work preserved".into());
     }
     if (e.doc.id.clone(), e.doc.revision) != before {
@@ -299,6 +302,20 @@ pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
 pub fn save_source(shared: &Shared, path: &Path, document: &str) -> Result<(), String> {
     save_guarded(shared, path, &json!({"document_id":document}))
 }
+/// Native Save As dialog has already obtained explicit replacement consent.
+pub fn save_confirmed_source(
+    shared: &Shared,
+    path: &Path,
+    document: &str,
+    revision: u64,
+    overwrite: bool,
+) -> Result<(), String> {
+    save_guarded(
+        shared,
+        path,
+        &json!({"document_id":document,"expected_revision":revision,"overwrite":overwrite}),
+    )
+}
 pub fn save_reviewed_source(
     shared: &Shared,
     path: &Path,
@@ -312,6 +329,14 @@ pub fn save_reviewed_source(
     )
 }
 fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
+    save_prepared(shared, path, request, || {})
+}
+fn save_prepared(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    before_commit: impl FnOnce(),
+) -> Result<(), String> {
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -320,7 +345,16 @@ fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), Str
     {
         return Err("Working documents must use .psd or .psb".into());
     }
-    let (doc, expected) = {
+    let lease = crate::file_safety::Lease::acquire(path)?;
+    let path = lease.path.as_path();
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("psd") || e.eq_ignore_ascii_case("psb"))
+    {
+        return Err("Save alias must resolve to a .psd or .psb destination".into());
+    }
+    let (doc, source_path, source_version, saved_revision) = {
         let e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, request)?;
         if request["expected_revision"]
@@ -331,20 +365,27 @@ fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), Str
         }
         (
             e.doc.clone(),
-            if e.path.as_deref() == Some(path) {
-                e.file_version
-            } else {
-                None
-            },
+            e.path.clone(),
+            e.file_version,
+            e.saved_revision,
         )
     };
-    if let Some(expected) = expected {
-        if file_version(path)? != expected {
+    let saving_source = source_path
+        .as_deref()
+        .map(|p| crate::file_safety::same_destination(p, path))
+        .transpose()?
+        .unwrap_or(false);
+    if saving_source {
+        if lease.expected != source_version {
             return Err(
                 "Photoshop file changed outside PeerBrush. Use Save As to preserve both versions."
                     .into(),
             );
         }
+    } else if lease.expected.is_some() && request["overwrite"] != true {
+        return Err(
+            "Destination exists. Confirm overwrite=true or choose a new Save As path.".into(),
+        );
     }
     let bytes = if path
         .extension()
@@ -355,18 +396,22 @@ fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), Str
     } else {
         psd::encode(&doc)?
     };
+    // Preserve the previous exact file before touching its replacement.
+    let backup = lease.preserve()?;
+    before_commit();
     let mut e = shared.lock().unwrap();
     e.ensure_open()?;
-    if e.doc.id != doc.id {
+    if e.doc.id != doc.id
+        || e.doc.revision != doc.revision
+        || e.path != source_path
+        || e.file_version != source_version
+        || e.saved_revision != saved_revision
+    {
         return Err("Project source changed while saving; current work preserved".into());
     }
-    if let Some(expected) = expected {
-        if file_version(path)? != expected {
-            return Err("Photoshop file changed while preparing the save. Use Save As.".into());
-        }
-    }
-    atomic_write(path, &bytes)?;
-    let version = file_version(path)?;
+    lease.validate()?;
+    atomic_write_checked(path, &bytes, || lease.validate())?;
+    let version = crate::file_safety::published_version(path, &bytes)?;
     if e.doc.id == doc.id {
         e.path = Some(path.into());
         e.file_version = Some(version);
@@ -377,6 +422,9 @@ fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), Str
             .into();
         e.saved_revision = doc.revision;
     }
+    if let Some(backup) = backup {
+        lease.prune(&backup);
+    }
     Ok(())
 }
 pub fn export(shared: &Shared, path: &Path) -> Result<(), String> {
@@ -384,6 +432,18 @@ pub fn export(shared: &Shared, path: &Path) -> Result<(), String> {
 }
 pub fn export_source(shared: &Shared, path: &Path, document: &str) -> Result<(), String> {
     export_guarded(shared, path, &json!({"document_id":document}))
+}
+pub fn export_confirmed_source(
+    shared: &Shared,
+    path: &Path,
+    document: &str,
+    revision: u64,
+) -> Result<(), String> {
+    export_guarded(
+        shared,
+        path,
+        &json!({"document_id":document,"expected_revision":revision,"overwrite":true}),
+    )
 }
 fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     if path
@@ -394,18 +454,53 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
     {
         return Err("PNG is the only export format".into());
     }
+    let lease = crate::file_safety::Lease::acquire(path)?;
+    let path = lease.path.as_path();
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+    {
+        return Err("Export alias must resolve to a .png destination".into());
+    }
+    if lease.expected.is_some() && request["overwrite"] != true {
+        return Err(
+            "Export destination exists. Confirm overwrite=true or choose a new path.".into(),
+        );
+    }
     let doc = {
         let e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, request)?;
+        if e.path
+            .as_deref()
+            .map(|source| crate::file_safety::same_destination(source, path))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err("PNG export cannot replace this project's working source. Choose a different destination.".into());
+        }
+        if request["expected_revision"]
+            .as_u64()
+            .is_some_and(|r| r != e.doc.revision)
+        {
+            return Err("Project changed before exporting".into());
+        }
         e.doc.clone()
     };
     let bytes = doc.export_png()?;
+    let backup = lease.preserve()?;
     let e = shared.lock().unwrap();
     e.ensure_open()?;
-    if e.doc.id != doc.id {
+    if e.doc.id != doc.id || e.doc.revision != doc.revision {
         return Err("Project source changed before exporting".into());
     }
-    atomic_write(path, &bytes)
+    lease.validate()?;
+    atomic_write_checked(path, &bytes, || lease.validate())?;
+    crate::file_safety::published_version(path, &bytes)?;
+    if let Some(backup) = backup {
+        lease.prune(&backup);
+    }
+    Ok(())
 }
 
 pub fn tools() -> Value {
@@ -433,6 +528,9 @@ pub fn tools() -> Value {
             properties["project_id"] = json!({"type":"string"});
             properties["document_id"] = json!({"type":"string"});
             properties["expected_revision"] = json!({"type":"integer"});
+            if tool["name"] == "peerbrush_document" {
+                tool["inputSchema"]["properties"]["overwrite"] = json!({"type":"boolean","description":"Explicit replacement consent for an existing Save As/export destination; never bypasses a loaded source conflict."});
+            }
         }
     }
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_image_info","description":"Inspect a supported local image without editing. Reports channel depth and explicit zero-based frame/page/variant choices for image.import and place_image. Float, CMYK and PNG16 animation require explicit supported conversion.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}));
@@ -944,6 +1042,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "solo_color",
                     "solo_mask",
                     "document_info",
+                    "saved_versions",
                 ]
                 .contains(&name)
             }) {

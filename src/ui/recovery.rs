@@ -23,7 +23,7 @@ impl Browser {
         }
     }
 }
-fn timestamp(ms: u64) -> String {
+pub(super) fn timestamp(ms: u64) -> String {
     // Gregorian civil date from Unix days; no locale-dependent ambiguity.
     let seconds = ms / 1000;
     let z = (seconds / 86400) as i64 + 719468;

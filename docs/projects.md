@@ -1,5 +1,7 @@
 # Independent projects
 
+Unreleased save-safety hardening adds content/identity guards, independent Save As/export conflict checks, cooperative cross-process locks and byte-exact previous saves. Dirty and externally conflicting projects both require close review. See [file safety and its limits](file-safety.md). Autosave cannot guarantee recovery after the last complete checkpoint or when the document exceeds the encoded save budget; it never writes the original destination.
+
 PeerBrush keeps up to sixteen open project engines. Each owns its document, selections, undo/redo, reservations, proposals, dirty state, path and external-file version. Switching tabs preserves the layer selection, Color/Mask channel, effect selection, collapsed folders, pan and zoom. Unfinished gesture previews are canceled on switching; committed edits remain intact. Brush preferences and the internal clipboard belong to the workspace.
 
 Unreleased tab reordering (PB-111): drag a tab body left or right. Tabs move live with an orange placement line; releasing in the strip commits the order without switching the active project or changing any document/history. Escape or releasing outside cancels. Drag near a strip edge to reveal hidden tabs. A project opening, closing or another order change cancels the pending drag instead of overwriting that navigation. Close controls and cross-project layer drops remain separate.

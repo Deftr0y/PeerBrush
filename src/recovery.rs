@@ -325,10 +325,12 @@ pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Ve
         };
         let result = psd::encode(&doc).and_then(|bytes| {
             // Replacement/closing during encoding must not create a new recovery.
-            if shared
-                .try_lock()
-                .is_ok_and(|e| e.closed || e.doc.id != doc.id || e.saved_revision == e.doc.revision)
-            {
+            if shared.try_lock().is_ok_and(|e| {
+                e.closed
+                    || e.doc.id != doc.id
+                    || e.doc.revision != doc.revision
+                    || e.saved_revision == e.doc.revision
+            }) {
                 return Ok(None);
             }
             persist(dir, &project, &doc, path, &bytes).map(Some)

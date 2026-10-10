@@ -13,6 +13,7 @@ mod protection;
 mod recovery;
 mod refinement;
 mod retouch;
+mod saved_versions;
 mod selection;
 mod source;
 mod tabs;
@@ -285,6 +286,7 @@ pub struct PeerBrush {
     jobs: HashSet<String>,
     lifecycle: Option<lifecycle::Review>,
     recovery: recovery::Browser,
+    saved_versions: Option<saved_versions::Browser>,
     lifecycle_frame: bool,
     exit_approved: bool,
     connected: bool,
@@ -568,6 +570,7 @@ impl PeerBrush {
         };
         Self {
             recovery: recovery::Browser::new(&connection.state_dir),
+            saved_versions: None,
             workspace_root: shared.clone(),
             workspace,
             project_id,
@@ -1328,7 +1331,16 @@ impl PeerBrush {
         }
         self.open_job(None, false);
     }
+    fn recover_previous_save(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.show_previous_saves();
+    }
     fn open_job(&mut self, path: Option<PathBuf>, recover: bool) {
+        self.open_named_job(path, recover, None);
+    }
+    fn open_named_job(&mut self, path: Option<PathBuf>, recover: bool, name: Option<String>) {
         if self.busy {
             return;
         }
@@ -1357,11 +1369,14 @@ impl PeerBrush {
                 e.path = None;
                 e.file_version = None;
                 e.saved_revision = u64::MAX;
+                if let Some(name) = name {
+                    e.doc.name = format!("Recovered — {name}");
+                }
             }
             let engine = s.lock().unwrap().clone();
             crate::workspace::register_in(&workspace, engine, Some(&initiating))?;
             Ok(if recover {
-                "Recovered autosave — save to your chosen PSD"
+                "Recovered version — save to your chosen PSD or PSB"
             } else {
                 "Photoshop document opened"
             }
@@ -1371,12 +1386,14 @@ impl PeerBrush {
     fn save(&mut self, save_as: bool) {
         let s = self.shared.clone();
         let document = self.doc_snapshot.id.clone();
+        let revision = self.doc_snapshot.revision;
         let current = if save_as {
             None
         } else {
             s.lock().unwrap().path.clone()
         };
         self.job(move || {
+            let overwrite = current.is_none();
             let path = current.or_else(|| {
                 rfd::FileDialog::new()
                     .add_filter("PSD document", &["psd"])
@@ -1387,13 +1404,14 @@ impl PeerBrush {
             let Some(path) = path else {
                 return Ok("Save canceled · project remains open".into());
             };
-            server::save_source(&s, &path, &document)?;
+            server::save_confirmed_source(&s, &path, &document, revision, overwrite)?;
             Ok("Photoshop document saved".into())
         });
     }
     fn export(&mut self) {
         let s = self.shared.clone();
         let document = self.doc_snapshot.id.clone();
+        let revision = self.doc_snapshot.revision;
         self.job(move || {
             let Some(path) = rfd::FileDialog::new()
                 .add_filter("PNG", &["png"])
@@ -1402,7 +1420,7 @@ impl PeerBrush {
             else {
                 return Ok("Ready".into());
             };
-            server::export_source(&s, &path, &document)?;
+            server::export_confirmed_source(&s, &path, &document, revision)?;
             Ok("PNG exported".into())
         });
     }
@@ -3635,6 +3653,9 @@ impl PeerBrush {
             .ok()
             .and_then(|mut e| e.capture_panel.take());
         if let Some(panel) = panel {
+            if panel == "saved_versions" {
+                self.recover_previous_save();
+            }
             self.read_only_info = if panel == "document_info" {
                 Some(self.shared.lock().unwrap().doc.id.clone())
             } else {
@@ -4182,6 +4203,10 @@ impl PeerBrush {
                             self.save(false);
                             ui.close_menu();
                         }
+                        if ui.add_enabled(self.shared.lock().unwrap().path.is_some() && !self.busy, egui::Button::new("Recover previous save…")).clicked() {
+                            self.recover_previous_save();
+                            ui.close_menu();
+                        }
                         if ui.button("Save As...").clicked() {
                             self.save(true);
                             ui.close_menu();
@@ -4677,6 +4702,7 @@ impl PeerBrush {
             self.show_connection = open;
         }
         self.recovery_window(ctx);
+        self.saved_versions_window(ctx);
         let loading = self
             .load_control
             .clone()
@@ -5027,7 +5053,7 @@ mod tests {
         };
         let _ = ctx.run(raw, |ctx| app.draw(ctx));
     }
-    fn fixture() -> (PeerBrush, egui::Context) {
+    pub(super) fn fixture() -> (PeerBrush, egui::Context) {
         let ctx = egui::Context::default();
         let app = PeerBrush::init(
             &ctx,
