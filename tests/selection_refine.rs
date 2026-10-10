@@ -28,6 +28,150 @@ fn fixture(depth: u16) -> (Engine, String) {
     }
     (e, layer)
 }
+
+#[test]
+fn new_masks_use_exact_document_selection_and_preserve_native_sources_history_psd() {
+    for depth in [8, 16] {
+        let mut e = Engine::new();
+        e.doc = Document::new_depth(32, 24, depth).unwrap();
+        let id = e.doc.layers[0].id.clone();
+        e.doc.layers[0].x = -4;
+        e.doc.layers[0].y = 3;
+        for y in 0..24 {
+            for x in 0..32 {
+                e.doc.layers[0]
+                    .pixels
+                    .set16(x, y, [12347, 33559, 51237, 65535]);
+            }
+        }
+        edit(
+            &mut e,
+            json!({"op":"selection","kind":"ellipse","rect":[2,4,22,20],"feather":2}),
+        );
+        edit(
+            &mut e,
+            json!({"op":"selection","kind":"rectangle","mode":"subtract","rect":[9,9,14,14]}),
+        );
+        let before = e.doc.clone();
+        let selected = selection::current(&before).unwrap();
+        let command = json!({"op":"mask.add","layer":id,"value":255,"document_id":before.id,"source_revision":before.revision});
+        let draft = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
+        let count = e.undo.len();
+        edit(&mut e, command);
+        assert_eq!(e.undo.len(), count + 1);
+        let layer = &e.doc.layers[0];
+        let mask = layer.mask.as_ref().unwrap();
+        assert_eq!(mask.steps.len(), 1);
+        assert_eq!(mask.steps[0].kind, "paint");
+        assert_eq!(mask.steps[0].pixels.depth, depth);
+        let mut soft = 0;
+        for y in 0..24 {
+            for x in 0..32 {
+                let v = (selected.value(x - 4, y + 3) * 65535.).round() as u16;
+                let v = if depth == 8 {
+                    ((u32::from(v) + 128) / 257) as u16 * 257
+                } else {
+                    v
+                };
+                assert_eq!(mask.steps[0].pixels.get16(x, y), [v, v, v, 65535]);
+                soft += usize::from(v > 0 && v < 65535);
+            }
+        }
+        assert!(soft > 0);
+        assert_eq!(mask.steps[0].pixels.get16(14, 7), [0, 0, 0, 65535]);
+        assert_eq!(layer.pixels.rgba16(), before.layers[0].pixels.rgba16());
+        assert_eq!((layer.x, layer.y), (-4, 3));
+        assert_eq!(
+            selection::current(&e.doc).unwrap().mask.rgba(),
+            selected.mask.rgba()
+        );
+        assert_eq!(e.doc.export_png().unwrap(), draft.export_png().unwrap());
+        let reopened = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+        assert!(!reopened.read_only);
+        assert_eq!(reopened.bit_depth, depth);
+        assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+        assert_eq!(
+            reopened.layers[0].mask.as_ref().unwrap().steps[0]
+                .pixels
+                .rgba16(),
+            mask.steps[0].pixels.rgba16()
+        );
+        assert_eq!(
+            reopened.layers[0].pixels.rgba16(),
+            before.layers[0].pixels.rgba16()
+        );
+        e.undo("human").unwrap();
+        assert!(e.doc.layers[0].mask.is_none());
+        assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        e.redo("human").unwrap();
+        assert_eq!(e.doc.export_png().unwrap(), draft.export_png().unwrap());
+    }
+}
+
+#[test]
+fn mask_creation_preserves_existing_masks_empty_selections_and_atomic_guards() {
+    let mut e = Engine::new();
+    e.doc = Document::new_depth(24, 16, 16).unwrap();
+    let id = e.doc.layers[0].id.clone();
+    edit(&mut e, json!({"op":"mask.add","layer":id,"value":123}));
+    assert_eq!(e.doc.layers[0].mask.as_ref().unwrap().steps.len(), 2);
+    let original = serde_json::to_value(&e.doc).unwrap();
+    assert!(e
+        .edit(
+            "human",
+            &[json!({"op":"mask.add","layer":id})],
+            None,
+            None,
+            "Existing"
+        )
+        .is_err());
+    assert_eq!(serde_json::to_value(&e.doc).unwrap(), original);
+    edit(&mut e, json!({"op":"mask.remove","layer":id}));
+    edit(
+        &mut e,
+        json!({"op":"selection","kind":"rectangle","rect":[1,1,5,5]}),
+    );
+    edit(
+        &mut e,
+        json!({"op":"selection","kind":"rectangle","mode":"intersect","rect":[10,10,14,14]}),
+    );
+    let before = serde_json::to_value(&e.doc).unwrap();
+    let count = e.undo.len();
+    let command = json!({"op":"mask.add","layer":id});
+    for target in ["@selection", id.as_str()] {
+        let lease = e
+            .reserve("other", "Keep work", vec![Scope::layer(target)])
+            .unwrap();
+        assert!(e
+            .edit("human", &[command.clone()], None, None, "Reserved")
+            .is_err());
+        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+        assert_eq!(e.undo.len(), count);
+        e.leases.retain(|l| l.id != lease.id);
+    }
+    e.doc.layers[0].locked = true;
+    assert!(e
+        .edit("human", &[command.clone()], None, None, "Locked")
+        .is_err());
+    e.doc.layers[0].locked = false;
+    assert!(e
+        .edit(
+            "human",
+            &[json!({"op":"mask.add","layer":id,"source_revision":0})],
+            None,
+            None,
+            "Stale"
+        )
+        .is_err());
+    edit(&mut e, command);
+    for p in e.doc.layers[0].mask.as_ref().unwrap().steps[0]
+        .pixels
+        .rgba16()
+        .chunks_exact(4)
+    {
+        assert_eq!(p, [0, 0, 0, 65535]);
+    }
+}
 #[test]
 fn native_masks_keep_sub_byte_samples_original_steps_and_exact_undo_psd_sources() {
     let (mut e, layer) = fixture(16);

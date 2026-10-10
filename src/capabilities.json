@@ -236,7 +236,8 @@
     {
       "op": "mask.add",
       "layer": "ID",
-      "value": 255
+      "value": 255,
+      "notes": "With an active selection, initialize a new native-depth mask from exact document coverage, including feathering and empty selections; selected pixels reveal, others hide. Existing masks are protected. Without a selection, value initializes the usual fill/paint mask. Selection-dependent creation also requires @selection access; document_id/source_revision guards are recommended."
     },
     {
       "op": "mask.step.add",

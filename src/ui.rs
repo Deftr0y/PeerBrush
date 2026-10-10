@@ -2114,6 +2114,11 @@ impl PeerBrush {
                 if op == "rename" {
                     self.begin_rename(doc, &l.id);
                 } else {
+                    let extra = if op == "mask.add" {
+                        json!({"value":255,"document_id":doc.id,"source_revision":doc.revision})
+                    } else {
+                        extra
+                    };
                     self.layer_cmd(op, extra, title);
                 }
                 ui.close_menu();
@@ -2239,11 +2244,11 @@ impl PeerBrush {
             .layers
             .iter()
             .filter(|layer| ids.contains(&layer.id) && layer.mask.is_none())
-            .map(|layer| json!({"op":"mask.add","layer":layer.id,"value":255}))
+            .map(|layer| json!({"op":"mask.add","layer":layer.id,"value":255,"document_id":doc.id,"source_revision":doc.revision}))
             .collect();
         let result = {
             let mut engine = self.shared.lock().unwrap();
-            if engine.doc.id != doc.id {
+            if engine.doc.id != doc.id || engine.doc.revision != doc.revision {
                 Err("The document changed before adding masks".into())
             } else {
                 engine.edit("human", &commands, Some(doc.revision), None, "Add masks")
@@ -2302,6 +2307,8 @@ impl PeerBrush {
         }
         mask.on_hover_text(if has_mask {
             "Edit mask"
+        } else if doc.selection.is_some() {
+            "Create masks from the selection for selected layers that do not have one"
         } else {
             "Create white masks for selected layers that do not have one"
         });
@@ -9455,6 +9462,66 @@ mod tests {
                 assert_eq!(engine.doc.layers[0].name, "New human name");
             }
             assert!(!app.message.is_empty());
+        }
+    }
+    #[test]
+    fn connected_add_mask_uses_selection_coverage_and_preserves_existing_selected_masks() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            let (before, existing) = {
+                let mut e = app.shared.lock().unwrap();
+                e.doc = Document::new_depth(32, 24, depth).unwrap();
+                let kept = crate::engine::Layer::new("Existing mask", "paint", 32, 24);
+                let existing = kept.id.clone();
+                e.doc.layers.push(kept);
+                e.edit(
+                    "human",
+                    &[json!({"op":"mask.add","layer":existing,"value":123})],
+                    None,
+                    None,
+                    "Existing",
+                )
+                .unwrap();
+                e.edit(
+                    "human",
+                    &[json!({"op":"selection","kind":"ellipse","rect":[3,3,26,21],"feather":3})],
+                    None,
+                    None,
+                    "Selection",
+                )
+                .unwrap();
+                e.undo.clear();
+                (e.doc.clone(), existing)
+            };
+            app.select_content(&before.layers[0].id);
+            app.selection_layers = before.layers.iter().map(|l| l.id.clone()).collect();
+            frame(&mut app, &ctx, vec![], Default::default());
+            let add = app.mask_tab_rect.unwrap().center();
+            click(&mut app, &ctx, add);
+            assert!(app.mask);
+            let mut e = app.shared.lock().unwrap();
+            assert_eq!(e.undo.len(), 1);
+            let current = crate::selection::current(&e.doc).unwrap();
+            let mask = e.doc.layers[0].mask.as_ref().unwrap();
+            assert_eq!(mask.steps.len(), 1);
+            for y in 0..24 {
+                for x in 0..32 {
+                    let expected = (current.value(x, y) * 65535.).round() as u16;
+                    assert_eq!(mask.steps[0].pixels.get16(x, y)[0], expected);
+                    assert_eq!(mask.steps[0].pixels.get16(x, y)[3], 65535);
+                }
+            }
+            let kept = e.doc.layers.iter().find(|l| l.id == existing).unwrap();
+            assert_eq!(
+                serde_json::to_value(&kept.mask).unwrap(),
+                serde_json::to_value(&before.layers[1].mask).unwrap()
+            );
+            e.undo("human").unwrap();
+            assert!(e.doc.layers[0].mask.is_none());
+            assert_eq!(
+                crate::selection::current(&e.doc).unwrap().mask.rgba(),
+                current.mask.rgba()
+            );
         }
     }
     #[test]

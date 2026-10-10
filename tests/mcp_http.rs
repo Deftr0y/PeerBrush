@@ -135,6 +135,28 @@ fn modern_live_wand_updates_return_actual_selection_content_and_enforce_sources(
     assert_eq!(stale["result"]["isError"], true);
     assert_eq!(canvas.shared.lock().unwrap().doc.revision, 2);
     assert_eq!(canvas.shared.lock().unwrap().undo.len(), 2);
+    let created = call(
+        "peerbrush_edit",
+        json!({"actor":"wand-agent","project_id":project,"document_id":document,"expected_revision":2,"commands":[{"op":"mask.add","layer":layer}]}),
+    );
+    assert_eq!(created["result"]["isError"], false);
+    let observed = call(
+        "peerbrush_observe",
+        json!({"layer":layer,"mask":true,"max_edge":32}),
+    );
+    let content = observed["result"]["content"].as_array().unwrap();
+    let feedback = content.iter().find(|c| c["type"] == "image").unwrap();
+    let actual =
+        image::load_from_memory(&STANDARD.decode(feedback["data"].as_str().unwrap()).unwrap())
+            .unwrap()
+            .to_rgba8();
+    assert_eq!(actual, mask);
+    let e = canvas.shared.lock().unwrap();
+    assert_eq!(e.undo.len(), 3);
+    assert_eq!(
+        e.doc.layers[0].mask.as_ref().unwrap().steps[0].pixels.depth,
+        16
+    );
 }
 
 #[test]

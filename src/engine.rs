@@ -744,6 +744,11 @@ impl Engine {
         {
             scopes.push(Scope::layer("@selection"));
         }
+        if c["op"] == "mask.from_selection"
+            || (c["op"] == "mask.add" && self.doc.selection.is_some())
+        {
+            scopes.push(Scope::layer("@selection"));
+        }
         scopes
     }
     fn command_scopes(&self, c: &Value) -> Vec<Scope> {
@@ -1820,10 +1825,16 @@ impl Engine {
             return Ok(());
         }
         if op == "mask.add" {
-            let layer = &mut self.doc.layers[i];
-            if layer.mask.is_some() {
+            if self.doc.layers[i].mask.is_some() {
                 return Err("Layer already has a mask".into());
             }
+            if self.doc.selection.is_some() {
+                let mut command = c.clone();
+                command["op"] = json!("mask.from_selection");
+                command["mode"] = json!("replace");
+                return crate::selection::masks::apply(&mut self.doc, i, &command);
+            }
+            let layer = &mut self.doc.layers[i];
             layer.mask = Some(Mask {
                 enabled: true,
                 cache_key: id(),
