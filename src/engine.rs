@@ -2300,7 +2300,8 @@ impl Engine {
                 let v = brush[0];
                 brush = [v, v, v, brush[3]];
             }
-            let settings = crate::brush::Settings::from_command(c)?;
+            let mut settings = crate::brush::Settings::from_command(c)?;
+            settings.texture_origin = [x, y];
             for point in &mut points {
                 point[0] -= x as f32;
                 point[1] -= y as f32;

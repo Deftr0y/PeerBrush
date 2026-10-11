@@ -99,7 +99,7 @@ impl Cache {
             return Engine::preview_edits(base, commands);
         }
         let command = &commands[0];
-        let settings = crate::brush::Settings::from_command(command)?;
+        let mut settings = crate::brush::Settings::from_command(command)?;
         let (mut points, pressures) = crate::brush::points_from_command(command)?;
         let mut metadata = command.clone();
         metadata
@@ -131,6 +131,7 @@ impl Cache {
                 .position(|layer| Some(layer.id.as_str()) == command["layer"].as_str())
                 .ok_or("Paint target no longer exists")?;
             let selected = &prepared.layers[layer];
+            settings.texture_origin = [selected.x, selected.y];
             let mask = command["mask"].as_bool().unwrap_or(false);
             let step = if mask {
                 let steps = &selected.mask.as_ref().ok_or("Layer has no mask")?.steps;

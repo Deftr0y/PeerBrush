@@ -1,4 +1,126 @@
 use super::*;
+#[test]
+fn textured_strokes_keep_native_pixels_across_pan_and_zoom_and_preview_the_shared_result() {
+    for depth in [8, 16] {
+        for tip in [
+            crate::brush::TipKind::Grain,
+            crate::brush::TipKind::Chalk,
+            crate::brush::TipKind::Dry,
+            crate::brush::TipKind::Bristle,
+        ] {
+            let mut reference = None;
+            for (zoom, pan) in [
+                (0.5, Vec2::ZERO),
+                (1., Vec2::new(21., -17.)),
+                (2., Vec2::new(-25., 13.)),
+            ] {
+                let (mut app, ctx) = super::tests::fixture();
+                app.recovery.open = false;
+                {
+                    let mut e = app.shared.lock().unwrap();
+                    e.doc = Document::new_depth(64, 64, depth).unwrap();
+                    let l = &mut e.doc.layers[0];
+                    l.x = -13;
+                    l.y = -11;
+                    l.pixels = crate::raster::Raster::new_depth(77, 75, depth);
+                    for y in 0..64 {
+                        for x in 0..64 {
+                            l.pixels.set16(
+                                x + 13,
+                                y + 11,
+                                [10001 + x as u16 * 137, 20003 + y as u16 * 157, 30007, 65535],
+                            );
+                        }
+                    }
+                    e.undo.clear();
+                }
+                frame(&mut app, &ctx, 0., vec![]);
+                app.select_tool(Tool::Brush);
+                app.brush.tip = tip;
+                app.brush.seed = 71;
+                app.brush.grain = 2.75;
+                app.brush.density = 0.42;
+                app.brush.spacing = 0.2;
+                app.brush.hardness = 0.6;
+                app.radius = 7.;
+                app.brush.opacity = 0.7;
+                app.brush.flow = 0.8;
+                app.zoom = zoom;
+                app.pan = pan;
+                frame(&mut app, &ctx, 0.1, vec![]);
+                frame(&mut app, &ctx, 0.2, vec![]);
+                let before = app.shared.lock().unwrap().doc.clone();
+                let rect = app.view_rect.unwrap();
+                let scale = rect.width() / 64.;
+                let start = rect.min + Vec2::new(16., 32.) * scale;
+                let end = rect.min + Vec2::new(48., 32.) * scale;
+                let button = |pos, pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                frame(
+                    &mut app,
+                    &ctx,
+                    0.3,
+                    vec![egui::Event::PointerMoved(start), button(start, true)],
+                );
+                frame(&mut app, &ctx, 0.4, vec![egui::Event::PointerMoved(end)]);
+                assert!(app.points.len() >= 2);
+                let commands = vec![app.stroke_command(app.points.clone(), app.color)];
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0]["tip"], tip.name());
+                for (actual, expected) in commands[0]["points"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip([[16., 32.], [48., 32.]])
+                {
+                    for axis in 0..2 {
+                        assert!((actual[axis].as_f64().unwrap() - expected[axis]).abs() < 0.0001);
+                    }
+                }
+                let preview =
+                    crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut time = 0.5;
+                loop {
+                    frame(&mut app, &ctx, time, vec![]);
+                    time += 0.05;
+                    if app.canvas_pixels.as_ref().is_some_and(|(w, h, p)| {
+                        preview.preview(None, (*w).max(*h), None, false).unwrap().2 == *p
+                    }) {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Textured preview missing"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                frame(&mut app, &ctx, time, vec![button(end, false)]);
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1, "{}", app.message);
+                assert_eq!(e.doc.bit_depth, depth);
+                let actual = e.doc.export_png().unwrap();
+                assert_eq!(actual, preview.export_png().unwrap());
+                if let Some(expected) = &reference {
+                    assert_eq!(&actual, expected, "{depth}, {}, zoom {zoom}", tip.name());
+                } else {
+                    reference = Some(actual);
+                }
+                assert_eq!(
+                    e.doc.layers[0].pixels.get16(17, 15),
+                    before.layers[0].pixels.get16(17, 15)
+                );
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            }
+        }
+    }
+}
 fn frame(
     app: &mut PeerBrush,
     ctx: &egui::Context,

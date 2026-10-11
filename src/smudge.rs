@@ -58,7 +58,7 @@ pub fn paint(
                 if !selected(x, y) {
                     continue;
                 }
-                let amount = tip.at(dab.point, x, y);
+                let amount = tip.at(dab.document_point, x, y);
                 if amount == 0.0 {
                     continue;
                 }
@@ -102,7 +102,7 @@ pub fn paint(
                         if !selected(x, y) {
                             continue;
                         }
-                        let amount = tip.at(dab.point, x, y)
+                        let amount = tip.at(dab.document_point, x, y)
                             * settings.flow
                             * settings.opacity
                             * settings.wetness
@@ -199,7 +199,7 @@ fn paint16(
                 if !selected(x, y) {
                     continue;
                 }
-                let amount = tip.at(dab.point, x, y) as f64;
+                let amount = tip.at(dab.document_point, x, y) as f64;
                 if amount == 0.0 {
                     continue;
                 }
@@ -243,7 +243,7 @@ fn paint16(
                         if !selected(x, y) {
                             continue;
                         }
-                        let amount = (tip.at(dab.point, x, y)
+                        let amount = (tip.at(dab.document_point, x, y)
                             * settings.flow
                             * settings.opacity
                             * settings.wetness

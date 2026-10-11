@@ -62,6 +62,9 @@ pub struct Settings {
     pub wetness: f32,
     pub load: f32,
     pub pickup: f32,
+    /// Derived storage-to-document offset; never a preset or saved preference.
+    #[serde(skip)]
+    pub texture_origin: [i32; 2],
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -88,6 +91,7 @@ impl Default for Settings {
             wetness: 0.8,
             load: 0.0,
             pickup: 0.25,
+            texture_origin: [0; 2],
         }
     }
 }
@@ -148,6 +152,7 @@ impl Settings {
             wetness: parameter("wetness", 0.8, 0.0, 1.0)?,
             load: parameter("load", 0.0, 0.0, 1.0)?,
             pickup: parameter("pickup", 0.25, 0.0, 1.0)?,
+            texture_origin: [0; 2],
         })
     }
     pub fn coverage(self, dx: f32, dy: f32) -> f32 {
@@ -217,8 +222,10 @@ impl Tip {
         self
     }
     pub(crate) fn at(self, point: [f32; 2], x: i32, y: i32) -> f32 {
-        let dx = x as f32 + 0.5 - point[0];
-        let dy = y as f32 + 0.5 - point[1];
+        let document_x = x as f32 + self.settings.texture_origin[0] as f32 + 0.5;
+        let document_y = y as f32 + self.settings.texture_origin[1] as f32 + 0.5;
+        let dx = document_x - point[0];
+        let dy = document_y - point[1];
         let coverage = self.coverage(dx, dy);
         if coverage == 0.0 || self.settings.tip == TipKind::Round {
             return coverage;
@@ -227,7 +234,7 @@ impl Tip {
         let u = dx * self.cos + dy * self.sin;
         let v = -dx * self.sin + dy * self.cos;
         let grain = s.grain;
-        let noise = noise2((x as f32 + 0.5) / grain, (y as f32 + 0.5) / grain, s.seed);
+        let noise = noise2(document_x / grain, document_y / grain, s.seed);
         let lane = noise2(0.0, (v / grain).floor(), s.seed.wrapping_add(83));
         let fiber = ((v / grain).rem_euclid(1.0) - 0.5).abs();
         let texture = match s.tip {
@@ -240,7 +247,7 @@ impl Tip {
                 }
             }
             TipKind::Chalk => ((s.density
-                - smooth_noise((x as f32 + 0.5) / grain, (y as f32 + 0.5) / grain, s.seed))
+                - smooth_noise(document_x / grain, document_y / grain, s.seed))
                 / s.density
                 * 2.5)
                 .clamp(0.0, 1.0),
@@ -360,6 +367,7 @@ fn pressure(value: &Value) -> Result<f32, String> {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Dab {
     pub point: [f32; 2],
+    pub document_point: [f32; 2],
     pub radius: f32,
     pub opacity: f32,
 }
@@ -384,6 +392,24 @@ pub(crate) fn dabs(
     }) {
         return Err("Pressures must match points and stay between 0 and 1".into());
     }
+    // Interpolate in the common document frame, then index storage locally.
+    // Otherwise shifting storage can change f32 interpolation/coverage rounding.
+    let document_points = if settings.texture_origin == [0, 0] {
+        std::borrow::Cow::Borrowed(points)
+    } else {
+        std::borrow::Cow::Owned(
+            points
+                .iter()
+                .map(|p| {
+                    [
+                        p[0] + settings.texture_origin[0] as f32,
+                        p[1] + settings.texture_origin[1] as f32,
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let points = document_points.as_ref();
     let step = (settings.radius * 2.0 * settings.spacing).max(0.5);
     let at_pressure = |index: usize| pressures.map_or(1.0, |p| p[index]);
     let mut raw = vec![(points[0], 0.0, at_pressure(0))];
@@ -451,7 +477,11 @@ pub(crate) fn dabs(
             let size_taper = if settings.taper_size { taper } else { 1.0 };
             let opacity_taper = if settings.taper_opacity { taper } else { 1.0 };
             Dab {
-                point,
+                point: [
+                    point[0] - settings.texture_origin[0] as f32,
+                    point[1] - settings.texture_origin[1] as f32,
+                ],
+                document_point: point,
                 radius: settings.radius * size_pressure * size_taper,
                 opacity: opacity_pressure * opacity_taper,
             }
@@ -686,7 +716,7 @@ fn accumulate(
                         }) {
                             continue;
                         }
-                        let alpha = tip.at(dab.point, x, y) * settings.flow;
+                        let alpha = tip.at(dab.document_point, x, y) * settings.flow;
                         if alpha <= 0.0 {
                             continue;
                         }
@@ -772,7 +802,7 @@ fn accumulate16(
                         }) {
                             continue;
                         }
-                        let alpha = tip.at(dab.point, x, y) as f64 * settings.flow as f64;
+                        let alpha = tip.at(dab.document_point, x, y) as f64 * settings.flow as f64;
                         if alpha <= 0.0 {
                             continue;
                         }

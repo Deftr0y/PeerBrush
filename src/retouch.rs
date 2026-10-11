@@ -160,7 +160,7 @@ pub fn apply(doc: &mut Document, index: usize, c: &Value) -> Result<(), String> 
     };
     let anchor = [coordinate(&anchor[0])?, coordinate(&anchor[1])?];
     let (mut points, pressures) = brush::points_from_command(c)?;
-    let settings = Settings::from_command(c)?;
+    let mut settings = Settings::from_command(c)?;
     let heal = c["op"] == "heal";
     let radius = match c.get("heal_radius") {
         Some(v) => v
@@ -176,6 +176,7 @@ pub fn apply(doc: &mut Document, index: usize, c: &Value) -> Result<(), String> 
         return Err("Retouch a paint layer or a paint mask step".into());
     }
     let origin = [layer.x, layer.y];
+    settings.texture_origin = origin;
     let clip = doc.selection.map(|s| {
         [
             s[0] - origin[0],
