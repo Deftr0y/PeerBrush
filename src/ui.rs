@@ -9669,6 +9669,166 @@ mod tests {
         }
     }
     #[test]
+    fn keyboard_selected_cut_paste_preserves_feather_holes_native_samples_and_history() {
+        for depth in [8, 16] {
+            for modifiers in [
+                egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                egui::Modifiers {
+                    command: true,
+                    ..Default::default()
+                },
+            ] {
+                let (mut app, ctx) = small_fixture();
+                app.clipboard = crate::clipboard::Worker::memory(ctx.clone());
+                let before = {
+                    let mut e = app.shared.lock().unwrap();
+                    e.doc = Document::new_depth(32, 24, depth).unwrap();
+                    for y in 0..24 {
+                        for x in 0..32 {
+                            e.doc.layers[0].pixels.set16(
+                                x,
+                                y,
+                                [12347 + x as u16, 33559 + y as u16, 51237, 60001],
+                            );
+                        }
+                    }
+                    e.edit("human", &[json!({"op":"selection","kind":"ellipse","rect":[2,2,28,22],"feather":2}), json!({"op":"selection","kind":"rectangle","mode":"subtract","rect":[12,9,18,15]})], None, None, "Fixture").unwrap();
+                    e.undo.clear();
+                    e.doc.clone()
+                };
+                let id = before.layers[0].id.clone();
+                app.select_content(&id);
+                frame(&mut app, &ctx, vec![], Default::default());
+                let image = crate::clipboard::Image::copy(&before, &id, false, false).unwrap();
+                let cleared = Engine::preview_edits(
+                    before.clone(),
+                    &[json!({"op":"paint.clear_selection","layer":id})],
+                )
+                .unwrap();
+                let area = crate::selection::current(&before).unwrap();
+                assert!(area
+                    .mask
+                    .rgba()
+                    .chunks_exact(4)
+                    .any(|p| p[0] > 0 && p[0] < 255));
+                assert_eq!(area.value(15, 12), 0.);
+                modified_key(&mut app, &ctx, egui::Key::X, modifiers);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while app.shared.lock().unwrap().undo.is_empty() || app.busy {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Cut did not finish: {}",
+                        app.message
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    frame(&mut app, &ctx, vec![], Default::default());
+                }
+                {
+                    let e = app.shared.lock().unwrap();
+                    assert_eq!(e.doc.layers.len(), 1);
+                    assert_eq!(
+                        e.doc.layers[0].pixels.rgba16(),
+                        cleared.layers[0].pixels.rgba16()
+                    );
+                    assert_eq!(
+                        e.doc.layers[0].pixels.get16(15, 12),
+                        before.layers[0].pixels.get16(15, 12)
+                    );
+                    assert_eq!(e.undo.len(), 1);
+                }
+                frame(&mut app, &ctx, vec![], Default::default());
+                modified_key(&mut app, &ctx, egui::Key::V, modifiers);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while app.shared.lock().unwrap().undo.len() < 2 || app.busy {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Paste did not finish: {}",
+                        app.message
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    frame(&mut app, &ctx, vec![], Default::default());
+                }
+                let mut e = app.shared.lock().unwrap();
+                let pasted = e
+                    .doc
+                    .layers
+                    .iter()
+                    .find(|l| l.name == "Pasted image")
+                    .unwrap();
+                assert_eq!(Some([pasted.x, pasted.y]), image.origin);
+                assert_eq!(
+                    pasted.pixels.rgba16(),
+                    image.samples16.clone().unwrap_or_else(|| image
+                        .bytes
+                        .iter()
+                        .map(|v| *v as u16 * 257)
+                        .collect())
+                );
+                assert_eq!(e.doc.bit_depth, depth);
+                assert_eq!(e.doc.layers.len(), 3);
+                assert_eq!(
+                    e.doc
+                        .layers
+                        .iter()
+                        .filter(|l| l.name == "Pasted image")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    e.doc
+                        .layers
+                        .iter()
+                        .find(|l| l.id == id)
+                        .unwrap()
+                        .pixels
+                        .rgba16(),
+                    cleared.layers[0].pixels.rgba16()
+                );
+                assert_eq!(e.undo.len(), 2);
+                let saved = crate::psd::decode(&crate::psd::encode(&e.doc).unwrap()).unwrap();
+                assert_eq!(saved.export_png().unwrap(), e.doc.export_png().unwrap());
+                if modifiers.ctrl {
+                    if let Some(directory) = std::env::var_os("PEERBRUSH_TEST_CAPTURE_DIR") {
+                        let root = std::path::PathBuf::from(directory);
+                        std::fs::create_dir_all(&root).unwrap();
+                        for (name, doc) in
+                            [("Before", &before), ("Cut", &cleared), ("Paste", &e.doc)]
+                        {
+                            std::fs::write(
+                                root.join(format!("{name}{depth}.psd")),
+                                crate::psd::encode(doc).unwrap(),
+                            )
+                            .unwrap();
+                            std::fs::write(
+                                root.join(format!("{name}{depth}.png")),
+                                doc.export_png().unwrap(),
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+                let result = e.doc.export_png().unwrap();
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), cleared.export_png().unwrap());
+                e.undo("human").unwrap();
+                assert_eq!(
+                    e.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert_eq!(
+                    crate::selection::current(&e.doc).unwrap().mask.rgba(),
+                    area.mask.rgba()
+                );
+                e.redo("human").unwrap();
+                e.redo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), result);
+            }
+        }
+    }
+    #[test]
     fn command_shift_i_inverts_feathered_coverage_once_and_preserves_text_entry() {
         for depth in [8, 16] {
             for modifiers in [

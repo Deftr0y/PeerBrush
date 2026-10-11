@@ -365,6 +365,25 @@ impl Default for Worker {
     }
 }
 impl Worker {
+    #[cfg(test)]
+    pub(crate) fn memory(ctx: eframe::egui::Context) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Request>(1);
+        let (reply_tx, replies) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut clipboard = tests::Fake::default();
+            let mut session = Session::default();
+            while let Ok(request) = rx.recv() {
+                if reply_tx
+                    .send(session.process(&mut clipboard, request))
+                    .is_err()
+                {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
+        Self { tx, replies }
+    }
     pub fn new(ctx: eframe::egui::Context) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Request>(1);
         let (reply_tx, replies) = mpsc::channel();
@@ -720,7 +739,7 @@ mod tests {
     use crate::engine::Engine;
     use std::sync::{Arc, Mutex};
     #[derive(Default)]
-    struct Fake {
+    pub(super) struct Fake {
         text: Option<String>,
         image: Option<Image>,
         fail_write: bool,
@@ -863,10 +882,17 @@ mod tests {
     }
     #[test]
     fn selected_cut_failed_clipboard_or_concurrent_edit_never_erases_source_work() {
-        for concurrent in [false, true] {
-            let (shared, mut doc, id) = fixture();
+        for (depth, concurrent) in [8, 16]
+            .into_iter()
+            .flat_map(|depth| [false, true].map(move |concurrent| (depth, concurrent)))
+        {
+            let (shared, _, id) = fixture();
+            let mut doc = Document::new_depth(8, 8, depth).unwrap();
+            doc.layers[0].id = id.clone();
             doc.selection = Some([2, 3, 5, 7]);
-            doc.layers[0].pixels.set(2, 3, [21, 43, 65, 255]);
+            doc.layers[0]
+                .pixels
+                .set16(2, 3, [12347, 33559, 51237, 60001]);
             shared.lock().unwrap().doc = doc.clone();
             let mut session = Session::default();
             let mut fake = Fake::default();
@@ -901,6 +927,60 @@ mod tests {
             if concurrent {
                 assert_eq!(e.doc.layers[0].name, "New human work");
                 assert!(session.image.is_some());
+            }
+        }
+    }
+    #[test]
+    fn selected_cut_locks_and_reservations_keep_native_source_and_recoverable_copy() {
+        for depth in [8, 16] {
+            for locked in [false, true] {
+                let (shared, _, _) = fixture();
+                let doc = {
+                    let mut e = shared.lock().unwrap();
+                    e.doc = Document::new_depth(8, 8, depth).unwrap();
+                    e.doc.selection = Some([2, 3, 5, 7]);
+                    e.doc.layers[0]
+                        .pixels
+                        .set16(2, 3, [12347, 33559, 51237, 60001]);
+                    if locked {
+                        e.doc.layers[0].locked = true;
+                    } else {
+                        let id = e.doc.layers[0].id.clone();
+                        e.reserve(
+                            "agent",
+                            "Native source",
+                            vec![crate::engine::Scope::layer(&id)],
+                        )
+                        .unwrap();
+                    }
+                    e.doc.clone()
+                };
+                let mut session = Session::default();
+                let mut fake = Fake::default();
+                let reply = session.process(
+                    &mut fake,
+                    Request::Cut {
+                        shared: shared.clone(),
+                        target: doc.layers[0].id.clone(),
+                        mask: false,
+                        step: None,
+                        doc: doc.clone(),
+                    },
+                );
+                assert!(reply.result.is_err());
+                let e = shared.lock().unwrap();
+                assert_eq!(
+                    e.doc.layers[0].pixels.rgba16(),
+                    doc.layers[0].pixels.rgba16()
+                );
+                assert_eq!(e.doc.selection, doc.selection);
+                assert!(e.undo.is_empty());
+                if !locked {
+                    let copy = Image::copy(&doc, &doc.layers[0].id, false, false).unwrap();
+                    assert_eq!(session.image.as_ref().unwrap().bytes, copy.bytes);
+                    assert_eq!(session.image.as_ref().unwrap().samples16, copy.samples16);
+                    assert_eq!(fake.image.as_ref().unwrap().origin, copy.origin);
+                }
             }
         }
     }
