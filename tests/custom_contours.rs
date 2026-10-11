@@ -71,6 +71,41 @@ fn replace_embedded(bytes: &[u8], value: &Value) -> Vec<u8> {
     ]
     .concat()
 }
+fn standard_composite(bytes: &[u8], depth: u16, width: u32, height: u32) -> Vec<u16> {
+    let count = (width * height) as usize;
+    let byte_count = count * 4 * usize::from(depth / 8);
+    let at = bytes.len() - byte_count;
+    assert_eq!(&bytes[at - 2..at], &[0, 0]);
+    let words = if depth == 16 {
+        bytes[at..]
+            .chunks_exact(2)
+            .map(|b| u16::from_be_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>()
+    } else {
+        bytes[at..].iter().map(|b| u16::from(*b)).collect()
+    };
+    let max = if depth == 16 { 65535i64 } else { 255 };
+    (0..count)
+        .flat_map(|i| {
+            let alpha = i64::from(words[count * 3 + i]);
+            let mut pixel = [0u16; 4];
+            pixel[3] = alpha as u16;
+            for c in 0..3 {
+                pixel[c] = if alpha == 0 {
+                    0
+                } else {
+                    ((i64::from(words[count * c + i]) + alpha - max) * max + alpha / 2)
+                        .div_euclid(alpha)
+                        .clamp(0, max) as u16
+                };
+            }
+            if depth == 8 {
+                pixel = pixel.map(|n| n * 257);
+            }
+            pixel
+        })
+        .collect()
+}
 #[test]
 fn contour_mapping_retains_native_piecewise_endpoints_and_nonmonotone_values() {
     let curve = effects::contours::Curve::decode(&points()).unwrap();
@@ -109,7 +144,7 @@ fn contour_mapping_retains_native_piecewise_endpoints_and_nonmonotone_values() {
         } else {
             engine
                 .doc
-                .preview_native8(None, 4, None, false)
+                .preview(None, 4, None, false)
                 .unwrap()
                 .2
                 .into_iter()
@@ -265,7 +300,6 @@ fn future_and_malformed_contour_sources_preserve_native_composites_and_disabled_
         let effect = engine.doc.layers[0].effects[0].id.clone();
         for disabled in [false, true] {
             engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!disabled})],None,None,"Contour bypass").unwrap();
-            let current = engine.doc.export_png().unwrap();
             for bytes in [
                 psd::encode(&engine.doc).unwrap(),
                 psd::encode_psb(&engine.doc).unwrap(),
@@ -290,7 +324,10 @@ fn future_and_malformed_contour_sources_preserve_native_composites_and_disabled_
                     let protected = psd::decode(&replace_embedded(&bytes, &source)).unwrap();
                     assert!(protected.read_only);
                     assert_eq!(protected.bit_depth, depth);
-                    assert_eq!(protected.export_png().unwrap(), current);
+                    assert_eq!(
+                        protected.layers[0].pixels.rgba16(),
+                        standard_composite(&bytes, depth, 32, 24)
+                    );
                 }
             }
         }

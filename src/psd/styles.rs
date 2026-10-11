@@ -358,7 +358,7 @@ fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
         || items.get("Scl ").is_some_and(|v| percent(v) != Ok(1.))
     {
         return Err(
-            "Only a single unscaled hard shadow without other styles can be imported".into(),
+            "Unsupported Photoshop style stack: only a single unscaled hard shadow without other styles can be imported".into(),
         );
     }
     let master = boolean(field(items, "masterFXSwitch")).ok_or("Missing style master switch")?;

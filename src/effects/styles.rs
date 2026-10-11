@@ -377,7 +377,14 @@ pub fn apply(
     let size = number(v, "size");
     let distance = number(v, "distance");
     let angle = number(v, "angle").to_radians();
-    let (dx, dy) = (angle.cos() * distance, -angle.sin() * distance);
+    let direction = match number(v, "angle") {
+        -180. | 180. => (-1., 0.),
+        -90. => (0., -1.),
+        0. => (1., 0.),
+        90. => (0., 1.),
+        _ => (angle.cos(), angle.sin()),
+    };
+    let (dx, dy) = (direction.0 * distance, -direction.1 * distance);
     if matches!(
         kind,
         "inner_glow" | "outer_glow" | "inner_shadow" | "drop_shadow" | "satin" | "bevel_emboss"
@@ -430,7 +437,7 @@ pub fn apply(
                     let scale = number(v, "scale");
                     let px = (x as f64 + 0.5) / w as f64 - 0.5;
                     let py = (y as f64 + 0.5) / h as f64 - 0.5;
-                    let position = px * angle.cos() - py * angle.sin();
+                    let position = px * direction.0 - py * direction.1;
                     let mut t = match v["style"].as_str().unwrap_or("linear") {
                         "radial" => px.hypot(py) * 2. / scale,
                         "angle" => {

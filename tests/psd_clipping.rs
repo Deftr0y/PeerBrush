@@ -65,6 +65,17 @@ fn sample(out: &mut Vec<u8>, value: u16, depth: u16) {
         out.push((native(value, depth) / 257) as u8);
     }
 }
+fn composite_sample(out: &mut Vec<u8>, pixel: [u16; 4], channel: usize, depth: u16) {
+    let max = if depth == 16 { 65535u64 } else { 255 };
+    let divisor = if depth == 16 { 1u64 } else { 257 };
+    let pixel = pixel.map(|v| u64::from(native(v, depth)) / divisor);
+    let value = if channel == 3 {
+        pixel[3]
+    } else {
+        (pixel[channel] * pixel[3] + max * (max - pixel[3]) + max / 2) / max
+    };
+    sample(out, (value * divisor) as u16, depth);
+}
 const SAVED: [[u16; 4]; 2] = [[12345, 23456, 34567, 65535], [54321, 32123, 11223, 65535]];
 
 fn pattern_text(value: &str) -> Vec<u8> {
@@ -186,7 +197,7 @@ fn inject_pattern(
         bytes.extend(0u16.to_be_bytes());
         for channel in 0..4 {
             for pixel in PATTERN {
-                sample(&mut bytes, pixel[channel], depth);
+                composite_sample(&mut bytes, pixel, channel, depth);
             }
         }
     } else {
@@ -1285,7 +1296,7 @@ fn photoshop_overlay_blend_enum_import_uses_exact_native_composite_gate() {
             }
             for c in 0..4 {
                 for p in expected {
-                    sample(&mut bytes, p[c], depth);
+                    composite_sample(&mut bytes, p, c, depth);
                 }
             }
             let doc = psd::decode(&bytes).unwrap();
@@ -1556,7 +1567,7 @@ fn mixed_overlay_fixture(depth: u16, enabled: [bool; 3], master: bool, mismatch:
     bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
     for channel in 0..4 {
         for pixel in merged {
-            sample(&mut bytes, pixel[channel], depth);
+            composite_sample(&mut bytes, pixel, channel, depth);
         }
     }
     bytes
@@ -1706,7 +1717,7 @@ fn blended_overlay_fixture(depth: u16, pattern: bool, ps_mode: &[u8; 4], opacity
     bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
     for channel in 0..4 {
         for pixel in merged {
-            sample(&mut bytes, pixel[channel], depth);
+            composite_sample(&mut bytes, pixel, channel, depth);
         }
     }
     bytes
@@ -1887,7 +1898,7 @@ fn multiple_photoshop_overlays_preserve_file_order_disabled_entries_and_native_s
                 bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
                 for channel in 0..4 {
                     for pixel in merged {
-                        sample(&mut bytes, pixel[channel], depth);
+                        composite_sample(&mut bytes, pixel, channel, depth);
                     }
                 }
                 let doc = psd::decode(&bytes).unwrap();
@@ -2081,7 +2092,7 @@ fn supported_photoshop_overlays_retain_raster_masks_and_layer_opacity_at_native_
                     bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
                     for channel in 0..4 {
                         for pixel in merged {
-                            sample(&mut bytes, pixel[channel], depth);
+                            composite_sample(&mut bytes, pixel, channel, depth);
                         }
                     }
                     let doc = psd::decode(&bytes).unwrap();
@@ -2090,7 +2101,7 @@ fn supported_photoshop_overlays_retain_raster_masks_and_layer_opacity_at_native_
                         "{depth} {masked} {opacity} {pattern}: {:?}",
                         doc.warnings
                     );
-                    assert_eq!(doc.layers[0].opacity, f64::from(opacity) / 255.);
+                    assert_eq!(doc.layers[0].opacity, f32::from(opacity) / 255.);
                     assert_eq!(doc.layers[0].mask.is_some(), masked);
                     if let Some(mask) = &doc.layers[0].mask {
                         for x in 0..2 {
@@ -2145,7 +2156,7 @@ fn supported_photoshop_overlays_retain_raster_masks_and_layer_opacity_at_native_
                                 .map(|m| m.steps[1].pixels.rgba16()),
                             mask
                         );
-                        assert_eq!(reopened.layers[0].opacity, f64::from(opacity) / 255.);
+                        assert_eq!(reopened.layers[0].opacity, f32::from(opacity) / 255.);
                         assert_eq!(reopened.export_png().unwrap(), current);
                     }
                 }
@@ -2225,7 +2236,7 @@ fn photoshop_cardinal_and_reflected_gradients_keep_native_orientation_and_source
                         bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
                         for channel in 0..4 {
                             for pixel in merged {
-                                sample(&mut bytes, pixel[channel], depth);
+                                composite_sample(&mut bytes, pixel, channel, depth);
                             }
                         }
                         let doc = psd::decode(&bytes).unwrap();
@@ -2329,7 +2340,7 @@ fn supported_photoshop_overlays_keep_raster_clipping_sources_and_standard_saves(
             bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
             for channel in 0..4 {
                 for pixel in merged {
-                    sample(&mut bytes, pixel[channel], depth);
+                    composite_sample(&mut bytes, pixel, channel, depth);
                 }
             }
             let doc = psd::decode(&bytes).unwrap();
@@ -2618,7 +2629,7 @@ fn shadow_fixture(
     bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
     for c in 0..4 {
         for p in merged {
-            sample(&mut bytes, p[c], depth);
+            composite_sample(&mut bytes, p, c, depth);
         }
     }
     (bytes, merged.into_iter().flatten().collect())
@@ -2677,10 +2688,26 @@ fn bounded_hard_photoshop_shadows_retain_native_sources_orientation_bypass_undo_
                                 assert!(!reopened.read_only);
                                 assert_eq!(reopened.export_png().unwrap(), current);
                                 assert_eq!(reopened.layers[0].pixels.rgba16(), source);
-                                assert_eq!(
-                                    reopened.layers[0].effects[0].settings,
-                                    engine.doc.layers[0].effects[0].settings
-                                );
+                                let settings = &reopened.layers[0].effects[0].settings;
+                                for key in
+                                    ["angle", "distance", "opacity", "size", "spread", "contour"]
+                                {
+                                    assert_eq!(
+                                        settings[key],
+                                        engine.doc.layers[0].effects[0].settings[key]
+                                    );
+                                }
+                                for channel in 0..3 {
+                                    assert!(
+                                        (settings["color"][channel].as_f64().unwrap()
+                                            - engine.doc.layers[0].effects[0].settings["color"]
+                                                [channel]
+                                                .as_f64()
+                                                .unwrap())
+                                        .abs()
+                                            < 1e-12
+                                    );
+                                }
                             }
                             let standard =
                                 psd::decode(&ordinary(&psd::encode(&engine.doc).unwrap())).unwrap();

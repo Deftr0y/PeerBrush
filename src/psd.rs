@@ -1141,7 +1141,7 @@ fn stream_composite<R: Read>(
     transparency: bool,
     layout: Layout,
     control: &crate::loading::Control,
-) -> Result<Raster, String> {
+) -> Result<(Raster, bool), String> {
     let mut kind = [0; 2];
     input.read_exact(&mut kind).map_err(|e| e.to_string())?;
     let kind = u16::from_be_bytes(kind);
@@ -1196,6 +1196,7 @@ fn stream_composite<R: Read>(
     let max = if depth == 16 { 65535i64 } else { 255 };
     let restore = |pixel: &mut [u16]| {
         let a = pixel[3] as i64;
+        let valid = pixel[..3].iter().all(|v| i64::from(*v) >= max - a);
         for v in &mut pixel[..3] {
             *v = if a == 0 {
                 0
@@ -1203,22 +1204,40 @@ fn stream_composite<R: Read>(
                 (((*v as i64 + a - max) * max + a / 2) / a).clamp(0, max) as u16
             };
         }
+        valid
     };
-    for tile in raster.samples16.values_mut() {
+    let mut white_valid = true;
+    for (&(tx, ty), tile) in &mut raster.samples16 {
         control.check()?;
-        for pixel in std::sync::Arc::make_mut(tile).chunks_exact_mut(4) {
-            restore(pixel);
+        for (index, pixel) in std::sync::Arc::make_mut(tile)
+            .chunks_exact_mut(4)
+            .enumerate()
+        {
+            let valid = restore(pixel);
+            if tx * crate::raster::TILE + index as u32 % crate::raster::TILE < w
+                && ty * crate::raster::TILE + index as u32 / crate::raster::TILE < h
+            {
+                white_valid &= valid;
+            }
         }
     }
-    for tile in raster.tiles.values_mut() {
+    for (&(tx, ty), tile) in &mut raster.tiles {
         control.check()?;
-        for pixel in std::sync::Arc::make_mut(tile).chunks_exact_mut(4) {
+        for (index, pixel) in std::sync::Arc::make_mut(tile)
+            .chunks_exact_mut(4)
+            .enumerate()
+        {
             let mut p = pixel.try_into().map(|p: [u8; 4]| p.map(u16::from)).unwrap();
-            restore(&mut p);
+            let valid = restore(&mut p);
+            if tx * crate::raster::TILE + index as u32 % crate::raster::TILE < w
+                && ty * crate::raster::TILE + index as u32 / crate::raster::TILE < h
+            {
+                white_valid &= valid;
+            }
             pixel.copy_from_slice(&p.map(|v| v as u8));
         }
     }
-    Ok(raster)
+    Ok((raster, white_valid))
 }
 fn composite_rows<R: Read>(
     input: &mut R,
@@ -1453,7 +1472,7 @@ pub fn decode_reader<R: Read + std::io::Seek>(
         reader,
         hash: 0xcbf29ce484222325,
     };
-    let merged = stream_composite(
+    let (merged, merged_white_valid) = stream_composite(
         &mut input,
         w,
         h,
@@ -1477,6 +1496,7 @@ pub fn decode_reader<R: Read + std::io::Seek>(
         h,
         depth,
         merged,
+        merged_white_valid,
         input.hash,
         layout,
         control,
@@ -1526,6 +1546,7 @@ fn decode_parts(
     h: u32,
     depth: u16,
     merged: Raster,
+    merged_white_valid: bool,
     composite_hash: u64,
     layout: Layout,
     control: &crate::loading::Control,
@@ -2186,14 +2207,20 @@ fn decode_parts(
         ));
     }
     // New style import never authorizes editing on approximate visual equivalence.
-    // Compare native samples, including alpha, through the same engine used by UI/MCP.
+    // Compare exact standard white-matte RGB and alpha samples. Straight-alpha
+    // restoration can shift RGB by a word; it must not reject matching encoded
+    // samples or introduce an approximate tolerance. Out-of-range matte samples
+    // cannot be recovered after clamping and therefore never authorize editing.
     if warnings.is_empty() && doc.layers.iter().any(|l| !l.effects.is_empty()) {
         control.check()?;
         let matches = if depth == 16 {
-            crate::depth16::render(&doc).map(|image| image.words == merged.rgba16())
+            crate::depth16::render(&doc)
+                .map(|image| merged_white_valid && same_standard_composite(&image.words, &merged))
         } else {
             doc.preview_native8(None, w.max(h), None, false)
-                .map(|(_, _, pixels, _)| pixels == merged.rgba())
+                .map(|(_, _, pixels, _)| {
+                    merged_white_valid && same_standard_composite(&pixels, &merged)
+                })
         };
         match matches {
             Ok(true) => {},
@@ -2220,6 +2247,26 @@ fn decode_parts(
     }
     control.progress("Ready", 1, 1)?;
     Ok(doc)
+}
+fn same_standard_composite<T: Copy + Into<u32>>(actual: &[T], saved: &Raster) -> bool {
+    if actual.len() != saved.width as usize * saved.height as usize * 4 {
+        return false;
+    }
+    let max = if saved.is16() { 65535u64 } else { 255 };
+    let divisor = if saved.is16() { 1 } else { 257 };
+    let matte = |color: u64, alpha: u64| (color * alpha + max * (max - alpha) + max / 2) / max;
+    actual.chunks_exact(4).enumerate().all(|(index, pixel)| {
+        let source = saved
+            .get16(
+                (index % saved.width as usize) as i32,
+                (index / saved.width as usize) as i32,
+            )
+            .map(|v| u64::from(v) / divisor);
+        let alpha = u64::from(pixel[3].into());
+        alpha == source[3]
+            && (0..3)
+                .all(|c| matte(u64::from(pixel[c].into()), alpha) == matte(source[c], source[3]))
+    })
 }
 /// Shared bounded global block parsing: PSB widens specific tagged lengths, not every block.
 type GlobalBlocks<'a> = (&'a [u8], &'a [u8], Vec<(&'a [u8], &'a [u8])>);
@@ -2567,6 +2614,53 @@ pub fn validate(doc: &Document) -> Result<(), String> {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    #[test]
+    fn style_gate_compares_exact_standard_matte_and_alpha_without_straight_rgb_tolerance() {
+        let mut saved = Raster::new_depth(1, 1, 8);
+        for alpha in 0u32..=255 {
+            for color in 0u32..=255 {
+                let white = (color * alpha + 255 * (255 - alpha) + 127) / 255;
+                let recovered = if alpha == 0 {
+                    0
+                } else {
+                    ((white + alpha - 255) * 255 + alpha / 2) / alpha
+                };
+                saved.set16(
+                    0,
+                    0,
+                    [
+                        (recovered * 257) as u16,
+                        (recovered * 257) as u16,
+                        (recovered * 257) as u16,
+                        (alpha * 257) as u16,
+                    ],
+                );
+                assert!(same_standard_composite(
+                    &[color as u8, color as u8, color as u8, alpha as u8],
+                    &saved
+                ));
+                let wrong_alpha = if alpha == 255 { 254 } else { alpha + 1 };
+                assert!(!same_standard_composite(
+                    &[color as u8, color as u8, color as u8, wrong_alpha as u8],
+                    &saved
+                ));
+            }
+        }
+        let mut saved = Raster::new_depth(1, 1, 16);
+        saved.set16(0, 0, [12347, 23459, 34571, 65535]);
+        assert!(same_standard_composite(
+            &[12347u16, 23459, 34571, 65535],
+            &saved
+        ));
+        assert!(!same_standard_composite(
+            &[12348u16, 23459, 34571, 65535],
+            &saved
+        ));
+        assert!(!same_standard_composite(
+            &[12347u16, 23459, 34571, 65534],
+            &saved
+        ));
+    }
     fn record() -> Record {
         Record {
             source: SourceLayerInfo {
