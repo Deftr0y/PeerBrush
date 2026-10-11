@@ -22,6 +22,13 @@ pub struct Source {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Content {
+    Bezier {
+        nodes: Vec<crate::path::Anchor>,
+        closed: bool,
+        fill: [u16; 4],
+        stroke: [u16; 4],
+        stroke_width: f32,
+    },
     Text {
         text: String,
         font: String,
@@ -68,6 +75,41 @@ impl Source {
             return Err("Invalid editable-source transform".into());
         }
         match &self.content {
+            Content::Bezier {
+                nodes,
+                closed,
+                stroke_width,
+                ..
+            } => {
+                let points = crate::path::flatten(nodes, *closed)?;
+                if !stroke_width.is_finite() || !(0. ..=256.).contains(stroke_width) {
+                    return Err("Invalid path stroke width".into());
+                }
+                if !points.is_empty() {
+                    let pad = stroke_width * 0.5 + 1.;
+                    let w = (points
+                        .iter()
+                        .map(|p| p[0])
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        + pad)
+                        .min(self.width as f32)
+                        .max(0.)
+                        - (points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min) - pad).max(0.);
+                    let h = (points
+                        .iter()
+                        .map(|p| p[1])
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        + pad)
+                        .min(self.height as f32)
+                        .max(0.)
+                        - (points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min) - pad).max(0.);
+                    if w.max(0.).ceil() as u64 * h.max(0.).ceil() as u64 * points.len() as u64
+                        > 32_000_000
+                    {
+                        return Err("Path exceeds the bounded rendering budget; use a smaller frame or simpler curves".into());
+                    }
+                }
+            }
             Content::Svg { svg } => {
                 if crate::svg::dimensions(svg)? != (self.width, self.height) {
                     return Err("SVG viewport must match its editable source frame".into());
@@ -137,6 +179,7 @@ impl Source {
     }
     pub fn label(&self) -> &'static str {
         match self.content {
+            Content::Bezier { .. } => "Pen path",
             Content::Text { .. } => "Text",
             Content::Shape { .. } => "Vector shape",
             Content::Svg { .. } => "SVG",
@@ -144,6 +187,9 @@ impl Source {
     }
     pub fn render(&self, w: u32, h: u32, depth: u16) -> Result<Raster, String> {
         self.validate()?;
+        self.render_validated(w, h, depth)
+    }
+    fn render_validated(&self, w: u32, h: u32, depth: u16) -> Result<Raster, String> {
         check_size(w, h)?;
         if ![8, 16].contains(&depth) {
             return Err("Editable projections require 8 or 16 bit channels".into());
@@ -151,8 +197,39 @@ impl Source {
         if let Content::Svg { svg } = &self.content {
             return crate::svg::render(svg, [self.width, self.height], self.matrix, w, h, depth);
         }
+        if let Content::Bezier {
+            nodes,
+            closed,
+            fill,
+            stroke,
+            stroke_width,
+        } = &self.content
+        {
+            let points = crate::path::flatten(nodes, *closed)?;
+            if points.is_empty() {
+                return Ok(Raster::new_depth(w, h, depth));
+            }
+            let projected = Source {
+                width: self.width,
+                height: self.height,
+                matrix: self.matrix,
+                content: Content::Shape {
+                    shape: "path".into(),
+                    bounds: [0., 0., self.width as f32, self.height as f32],
+                    points,
+                    closed: *closed,
+                    fill: *fill,
+                    stroke: *stroke,
+                    stroke_width: *stroke_width,
+                },
+            };
+            return projected.render_validated(w, h, depth);
+        }
         let mut base = Raster::new_depth(self.width, self.height, depth);
         match &self.content {
+            Content::Bezier { .. } => {
+                unreachable!("Cubic paths project through validated native geometry")
+            }
             Content::Svg { .. } => unreachable!("SVG projects directly from its vector definition"),
             Content::Text {
                 text,

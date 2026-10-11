@@ -31,6 +31,7 @@ pub mod liquify;
 pub mod loading;
 pub mod mask;
 pub mod merge;
+pub mod path;
 pub mod placement;
 pub mod preview;
 pub mod psd;

@@ -654,7 +654,7 @@ impl Engine {
     }
     fn state_core(&mut self) -> Value {
         self.expire();
-        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -765,6 +765,15 @@ impl Engine {
             }];
         }
         let target = c.get("layer").and_then(Value::as_str).map(String::from);
+        if matches!(op, "path.to_selection" | "path.to_mask") {
+            let mut scopes = vec![Scope::layer(c["path"].as_str().unwrap_or("@invalid_path"))];
+            if op == "path.to_selection" {
+                scopes.push(Scope::layer("@selection"));
+            } else {
+                scopes.push(Scope { target, rect: None });
+            }
+            return scopes;
+        }
         if matches!(op, "effect.bake" | "mask.step.bake") {
             return vec![Scope { target, rect: None }];
         }
@@ -801,7 +810,7 @@ impl Engine {
                     }]
                 });
         }
-        if ["layer.add", "image.import", "source.add"].contains(&op) {
+        if ["layer.add", "image.import", "source.add", "path.create"].contains(&op) {
             return c["parent"]
                 .as_str()
                 .map(|p| {
@@ -1406,6 +1415,7 @@ impl Engine {
             "liquify.stroke" => "liquify",
             "adjustment.add" => "effects",
             op if op.starts_with("source.") => "layers",
+            op if op.starts_with("path.") => "pen",
             "move" => "move",
             "transform" if num(command, "angle", 0.0) != 0.0 => "rotate",
             "transform" => "scale",
@@ -1529,6 +1539,12 @@ impl Engine {
         }
         if op == "source.add" {
             return crate::source::add(&mut self.doc, c);
+        }
+        if op == "path.create" {
+            return crate::path::create(&mut self.doc, c);
+        }
+        if op == "path.to_selection" {
+            return crate::path::to_selection(&mut self.doc, c);
         }
         if ["crop", "canvas.resize", "image.resize", "resize"].contains(&op) {
             return crate::geometry::apply(&mut self.doc, c);
@@ -1705,6 +1721,12 @@ impl Engine {
         }
         if matches!(op, "effect.bake" | "mask.step.bake") {
             return crate::bake::apply(&mut self.doc, i, c);
+        }
+        if op == "path.to_mask" {
+            return crate::path::to_mask(&mut self.doc, i, c);
+        }
+        if op.starts_with("path.") {
+            return crate::path::update(&mut self.doc.layers[i], c);
         }
         if op == "source.rasterize" {
             if self.doc.layers[i].source.take().is_none() {

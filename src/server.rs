@@ -649,6 +649,12 @@ pub fn capabilities() -> Value {
     result["projects"] = json!({"tool":"peerbrush_projects","max_open":crate::workspace::MAX_PROJECTS,"targeting":"Use project_id, document_id and expected_revision for every background AI mutation. Switching or reordering tabs never changes a project's engine. Human-only reorder requires the complete expected_order and new order.","transfer":"Editable trees, masks, effects and native16 sources; copy changes destination, move is atomic with one undo step per project."});
     result["image_import"] = json!({"extensions":crate::image_import::EXTENSIONS,"inspect_tool":"peerbrush_image_info","choices":"Explicit zero-based frame/page/variant when image_info reports choice; never silently flatten animations or multipage files.","precision":"Raster imports retain native 8/16-bit RGB and gray. Supported embedded RGB ICC is converted to sRGB at original depth. Float, CMYK and PNG16 animation are rejected. Static supported SVG/SVGZ retains editable markup; its colors and coverage project through RGBA8 and promote in native16 projects without quantizing existing raster channels. image.place and external image-file paste rasterize SVG."});
     result["effect_catalog"] = crate::effects::catalog::discovery();
+    result["paths"] = json!({"tool":"Pen · P","source_format":17,"commands":["path.create","path.update","path.node.add","path.node.move","path.handle.move","path.node.split","path.node.convert","path.node.delete","path.to_selection","path.to_mask"],"coordinates":"Command points/handles and observed path_document_nodes use document pixels. Supplementary source nodes use the source frame and matrix.","precision":"Native 8/16-bit rendering and RGBA16 source colors. 8-bit screen feedback only.","limits":"128 anchors, 4096 flattened vertices, 0.125 source-pixel subdivision tolerance, four-million-pixel source frame and bounded rendering work. Single contour, even-odd fill, round segment ends. Standard PSD/PSB rasters/masks/current composite plus PeerBrush editable paths; Photoshop native Pen import/export is unsupported."});
+    result["commands"].as_array_mut().unwrap().extend([
+        json!({"op":"path.create","nodes":[{"point":[40,40]},{"point":[180,120],"in_handle":[80,40]}],"stroke_width":2}),
+        json!({"op":"path.handle.move","layer":"PATH_ID","index":1,"handle":"out","point":[210,150]}),
+        json!({"op":"path.to_selection","path":"PATH_ID","feather":1}),
+    ]);
     result["effect_bake"] = json!({"commands":["effect.bake","mask.step.bake"],"scope":"Selected effect plus preceding stack; following effects remain editable. Folder Color flattens all children; editable Color sources rasterize. Mask keeps Color/hierarchy. Whole-target reservations, native 8/16-bit fidelity check and one undo. Inexact prefixes, backdrop-dependent adjustments and expanding styles that shift an attached mask frame are refused."});
     result["commands"].as_array_mut().unwrap().extend([
         json!({"op":"effect.bake","layer":"LAYER_ID","effect":"EFFECT_ID"}),
@@ -1232,6 +1238,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "color",
                     "filters",
                     "selection",
+                    "pen",
                     "solo_color",
                     "solo_mask",
                     "document_info",

@@ -14,6 +14,9 @@ mod image_open;
 mod layers;
 mod lifecycle;
 mod liquify;
+mod pen;
+#[cfg(test)]
+mod pen_tests;
 mod protection;
 mod recovery;
 mod refinement;
@@ -69,6 +72,7 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, _color: Color32) 
     use crate::icons::{self, Icon};
     let icon = match tool {
         Tool::None => Icon::Cursor,
+        Tool::Pen => Icon::Curves,
         Tool::Move => Icon::Move,
         Tool::Rotate => Icon::Rotate,
         Tool::Scale => Icon::Scale,
@@ -98,6 +102,7 @@ fn eye_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
 }
 #[derive(PartialEq, Clone, Copy)]
 enum Tool {
+    Pen,
     None,
     Move,
     Rotate,
@@ -120,6 +125,7 @@ enum Tool {
 impl Tool {
     fn label(self) -> &'static str {
         match self {
+            Self::Pen => "Pen · P",
             Self::None => "Select · Q",
             Self::Move => "Move · W",
             Self::Rotate => "Rotate · E",
@@ -331,6 +337,7 @@ pub struct PeerBrush {
     project_settings: Option<(u32, u32, u16)>,
     geometry: Option<geometry::Editor>,
     source_editor: Option<source::Editor>,
+    pen: pen::State,
     filter_editor: Option<filters::Editor>,
     task_undo_review: Option<Value>,
     proposal_review: Option<String>,
@@ -640,6 +647,7 @@ impl PeerBrush {
             project_settings: None,
             geometry: None,
             source_editor: None,
+            pen: pen::State::default(),
             filter_editor: None,
             task_undo_review: None,
             proposal_review: None,
@@ -804,6 +812,7 @@ impl PeerBrush {
             self.selection_kind = "wand".into();
         }
         self.selection_path.clear();
+        self.cancel_pen();
         self.selection_gesture_mode = None;
         self.drag_start = None;
         self.drag_revision = None;
@@ -3256,6 +3265,10 @@ impl PeerBrush {
             self.selection_canvas(ui, doc, &response, &painter, rect, scale);
             return;
         }
+        if self.tool == Tool::Pen {
+            self.pen_canvas(ui, doc, &response, &painter, rect, scale);
+            return;
+        }
         if [Tool::Move, Tool::Rotate, Tool::Scale].contains(&self.tool) {
             self.gizmo(ui, doc, rect, scale, available);
             return;
@@ -3831,6 +3844,10 @@ impl PeerBrush {
                 self.select_tool(Tool::MagicWand);
                 self.selection_kind = "wand".into();
             }
+            if panel == "pen" {
+                let doc = self.shared.lock().unwrap().doc.clone();
+                self.capture_pen(&doc);
+            }
             if panel == "color" {
                 self.open_color(color::Target::Foreground, self.color);
             } else {
@@ -4235,6 +4252,7 @@ impl PeerBrush {
                     }
                 }
                 if i.key_pressed(egui::Key::Delete)
+                    && self.tool != Tool::Pen
                     && self.selection_path.is_empty()
                     && !key_modifiers(i,egui::Key::Delete).any()
                 {
@@ -4260,6 +4278,7 @@ impl PeerBrush {
                 if command_key(i,egui::Key::J) && self.layer_clipboard {self.duplicate_layers(&doc);}
                 for (key, tool) in [
                     (egui::Key::B, Tool::Brush),
+                    (egui::Key::P, Tool::Pen),
                     (egui::Key::U, Tool::Smudge),
                     (egui::Key::C, Tool::Clone),
                     (egui::Key::J, Tool::Heal),
@@ -4423,6 +4442,7 @@ impl PeerBrush {
                         liquify::toolbar(ui, &mut self.radius, &mut self.liquify,radius,strength,ai);
                     }
                     self.transform_snap_toolbar(ui, &doc);
+                    self.pen_toolbar(ui,&doc);
                     self.retouch_toolbar(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::button(ui, Icon::Frame, "Frame selection or canvas · F").clicked()
@@ -4559,6 +4579,7 @@ impl PeerBrush {
                             Tool::Picker,
                             Tool::Pan,
                             Tool::MagicWand,
+                            Tool::Pen,
                         ]
                         .into_iter()
                         .enumerate()
@@ -4603,6 +4624,7 @@ impl PeerBrush {
                                     | (Some("smudge"), Tool::Smudge)
                                     | (Some("clone"), Tool::Clone)
                                     | (Some("heal"), Tool::Heal)
+                                    | (Some("pen"), Tool::Pen)
                                     | (Some("liquify"), Tool::Liquify)
                                     | (Some("eraser"), Tool::Eraser)
                                     | (Some("move"), Tool::Move)

@@ -154,6 +154,29 @@ impl PeerBrush {
                     });
                 }
                 match &mut e.source.content {
+                    Content::Bezier {
+                        nodes,
+                        closed,
+                        fill,
+                        stroke,
+                        stroke_width,
+                    } => {
+                        ui.label(format!(
+                            "{} anchors · edit points and handles with Pen",
+                            nodes.len()
+                        ));
+                        ui.add_enabled(
+                            nodes.len() >= 2,
+                            egui::Checkbox::new(closed, "Closed path"),
+                        );
+                        native_color(ui, "Fill", fill, doc.bit_depth);
+                        native_color(ui, "Stroke", stroke, doc.bit_depth);
+                        ui.horizontal(|ui| {
+                            ui.label("Stroke width");
+                            controls::numeric(ui, stroke_width, 0. ..=256.);
+                            ui.label("px");
+                        });
+                    }
                     Content::Svg { svg } => {
                         ui.label("SVG source");
                         egui::ScrollArea::vertical()
