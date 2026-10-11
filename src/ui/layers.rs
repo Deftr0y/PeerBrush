@@ -1,6 +1,65 @@
 use super::*;
 use crate::engine::Layer;
 const TREE_INDENT: f32 = 22.0;
+#[derive(Default)]
+struct FolderSummary {
+    direct: usize,
+    descendants: usize,
+    selected: usize,
+}
+
+struct TreeInfo<'a> {
+    doc: &'a Document,
+    folders: HashMap<String, FolderSummary>,
+    paths: HashMap<String, String>,
+}
+impl<'a> TreeInfo<'a> {
+    fn new(doc: &'a Document, selected: &HashSet<String>) -> Self {
+        let layers: HashMap<_, _> = doc.layers.iter().map(|l| (l.id.as_str(), l)).collect();
+        let mut folders: HashMap<String, FolderSummary> = HashMap::new();
+        let mut paths = HashMap::new();
+        for layer in &doc.layers {
+            let mut names = vec![layer.name.as_str()];
+            let mut parent = layer.parent.as_deref();
+            for depth in 0..16 {
+                let Some(ancestor) = parent.and_then(|id| layers.get(id)) else {
+                    break;
+                };
+                let summary = folders.entry(ancestor.id.clone()).or_default();
+                summary.direct += usize::from(depth == 0);
+                summary.descendants += 1;
+                summary.selected += usize::from(selected.contains(&layer.id));
+                names.push(&ancestor.name);
+                parent = ancestor.parent.as_deref();
+            }
+            names.reverse();
+            paths.insert(layer.id.clone(), names.join(" / "));
+        }
+        Self {
+            doc,
+            folders,
+            paths,
+        }
+    }
+    fn path(&self, id: &str) -> &str {
+        self.paths.get(id).map(String::as_str).unwrap_or("")
+    }
+    fn tooltip(&self, layer: &Layer) -> String {
+        let mut text = self.path(&layer.id).to_owned();
+        if layer.kind == "group" {
+            let empty = FolderSummary::default();
+            let summary = self.folders.get(&layer.id).unwrap_or(&empty);
+            text.push_str(&format!(
+                "\n{} direct children · {} total descendants",
+                summary.direct, summary.descendants
+            ));
+            if summary.selected > 0 {
+                text.push_str(&format!("\n{} selected inside", summary.selected));
+            }
+        }
+        text
+    }
+}
 struct TreeAnchor {
     disclosure: Rect,
     ai: bool,
@@ -334,12 +393,13 @@ impl PeerBrush {
     fn layer_contents(
         &mut self,
         ui: &mut egui::Ui,
-        doc: &Document,
         l: &Layer,
         indent: f32,
         thumb: Option<&TextureHandle>,
         mask_thumb: Option<&TextureHandle>,
+        tree: &TreeInfo<'_>,
     ) -> Rect {
+        let doc = tree.doc;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
             let (grip, _) = ui.allocate_exact_size(Vec2::new(6.0, 28.0), egui::Sense::hover());
@@ -384,7 +444,11 @@ impl PeerBrush {
                     } else {
                         Icon::Down
                     },
-                    "Expand / collapse group",
+                    if self.collapsed.contains(&l.id) {
+                        "Expand folder"
+                    } else {
+                        "Collapse folder"
+                    },
                 );
                 if response.clicked() {
                     if !self.collapsed.remove(&l.id) {
@@ -431,8 +495,35 @@ impl PeerBrush {
                     );
             }
             let mask_width = if l.mask.is_some() { 35.0 } else { 0.0 };
-            let name_width =
-                (ui.available_width() - mask_width - if l.locked { 21.0 } else { 0.0 }).max(25.0);
+            let summary = if l.kind == "group" {
+                let empty = FolderSummary::default();
+                let counts = tree.folders.get(&l.id).unwrap_or(&empty);
+                Some(if self.collapsed.contains(&l.id) && counts.selected > 0 {
+                    (
+                        format!("{} · {} selected", counts.descendants, counts.selected),
+                        true,
+                    )
+                } else {
+                    (counts.descendants.to_string(), false)
+                })
+            } else {
+                None
+            };
+            let summary_width = summary
+                .as_ref()
+                .map(|(text, _)| {
+                    ui.painter()
+                        .layout_no_wrap(text.clone(), egui::FontId::proportional(10.), MUTED)
+                        .size()
+                        .x
+                        + 5.
+                })
+                .unwrap_or(0.);
+            let name_width = (ui.available_width()
+                - mask_width
+                - summary_width
+                - if l.locked { 21.0 } else { 0.0 })
+            .max(25.0);
             if self
                 .rename_edit
                 .as_ref()
@@ -440,30 +531,32 @@ impl PeerBrush {
             {
                 self.inline_rename(ui, name_width);
             } else {
-                let name = ui.add_sized(
-                    [name_width, 30.0],
-                    egui::Label::new(
-                        RichText::new(&l.name)
-                            .size(12.0)
-                            .font(egui::FontId::new(
-                                12.0,
-                                if l.kind == "group" {
-                                    egui::FontFamily::Name("semibold".into())
+                let name = ui
+                    .add_sized(
+                        [name_width, 30.0],
+                        egui::Label::new(
+                            RichText::new(&l.name)
+                                .size(12.0)
+                                .font(egui::FontId::new(
+                                    12.0,
+                                    if l.kind == "group" {
+                                        egui::FontFamily::Name("semibold".into())
+                                    } else {
+                                        egui::FontFamily::Proportional
+                                    },
+                                ))
+                                .color(if reserved {
+                                    AI_BLUE
+                                } else if l.visible {
+                                    Color32::WHITE
                                 } else {
-                                    egui::FontFamily::Proportional
-                                },
-                            ))
-                            .color(if reserved {
-                                AI_BLUE
-                            } else if l.visible {
-                                Color32::WHITE
-                            } else {
-                                MUTED
-                            }),
+                                    MUTED
+                                }),
+                        )
+                        .truncate()
+                        .sense(egui::Sense::click()),
                     )
-                    .truncate()
-                    .sense(egui::Sense::click()),
-                );
+                    .on_hover_text(tree.tooltip(l));
                 if name.clicked() {
                     self.select_row(ui, doc, &l.id);
                     let time = ui.input(|i| i.time);
@@ -487,6 +580,59 @@ impl PeerBrush {
                         self.begin_rename(doc, &l.id);
                     }
                     self.name_click = Some((l.id.clone(), pointer, time));
+                }
+            }
+            if let Some((text, hidden_selection)) = summary {
+                let color = if reserved {
+                    AI_BLUE
+                } else if hidden_selection {
+                    ACCENT
+                } else {
+                    MUTED
+                };
+                let response = ui
+                    .add(
+                        egui::Label::new(RichText::new(text).size(10.).color(color)).sense(
+                            if hidden_selection {
+                                egui::Sense::click()
+                            } else {
+                                egui::Sense::hover()
+                            },
+                        ),
+                    )
+                    .on_hover_text(if hidden_selection {
+                        format!(
+                            "{}\nClick to reveal selected layers without changing selection",
+                            tree.tooltip(l)
+                        )
+                    } else {
+                        tree.tooltip(l)
+                    });
+                if response.clicked() {
+                    self.collapsed.remove(&l.id);
+                    for child in doc
+                        .layers
+                        .iter()
+                        .filter(|child| self.selection_layers.contains(&child.id))
+                    {
+                        let mut chain = vec![];
+                        let mut parent = child.parent.as_deref();
+                        for _ in 0..16 {
+                            let Some(ancestor) = parent.and_then(|id| {
+                                doc.layers.iter().find(|candidate| candidate.id == id)
+                            }) else {
+                                break;
+                            };
+                            chain.push(ancestor.id.clone());
+                            if ancestor.id == l.id {
+                                for id in chain {
+                                    self.collapsed.remove(&id);
+                                }
+                                break;
+                            }
+                            parent = ancestor.parent.as_deref();
+                        }
+                    }
                 }
             }
             if l.mask.is_some() {
@@ -578,6 +724,7 @@ impl PeerBrush {
             let base=ui.cursor().min;let width=ui.available_width();
             let pointer=ui.input(|i|i.pointer.interact_pos());
             let mut preview=doc.clone();let mut open=self.collapsed.clone();let mut drop_folder=None;
+            let mut drop_hint=None;
             if let (Some(drag),Some(pointer))=(&mut self.layer_drag,pointer) {
                 let slot=((pointer.y-base.y)/46.0).floor().max(0.0) as usize;
                 let target=original.get(slot).map(|&(i,depth)|(&doc.layers[i],depth));
@@ -595,12 +742,21 @@ impl PeerBrush {
                     }
                 } else {(None,None)};
                 match crate::tree::reparent(doc,&drag.ids,parent,before) {
-                    Ok((p,commands))=>{drag.target=p.layers.iter().position(|l|l.id==drag.id).unwrap_or(0);drag.commands=commands;preview=p;}
+                    Ok((p,commands))=>{
+                        let info=TreeInfo::new(doc,&self.selection_layers);
+                        let destination=parent.map(|id|info.path(id)).unwrap_or("Top level");
+                        drop_hint=Some(if let Some(id)=before {
+                            let name=doc.layers.iter().find(|l|l.id==id).map(|l|l.name.as_str()).unwrap_or("");
+                            format!("{} · before {}",destination,name)
+                        } else {format!("{} · at end",destination)});
+                        drag.target=p.layers.iter().position(|l|l.id==drag.id).unwrap_or(0);drag.commands=commands;preview=p;
+                    }
                     Err(e)=>{drag.commands.clear();self.message=e;}
                 }
             }
             if let Some(sweep)=&self.eye_sweep {for l in &mut preview.layers {if sweep.ids.contains(&l.id){l.visible=sweep.visible;}}}
             let mut ordered=vec![];rows(&preview,None,0,&open,&mut ordered);
+            let tree=TreeInfo::new(&preview,&self.selection_layers);
             let mut floating=None;
             let mut anchors=HashMap::new();
             for (slot,(index,depth)) in ordered.iter().copied().enumerate() {
@@ -643,7 +799,7 @@ impl PeerBrush {
                     if drop_folder.as_deref()==Some(&l.id){ui.painter().rect_stroke(rect,4,Stroke::new(1.0_f32,ACCENT),egui::StrokeKind::Inside);}
                     let disclosure=ui.scope_builder(egui::UiBuilder::new().id_salt(&l.id).max_rect(rect.shrink2(Vec2::new(4.0,4.0))),|ui| {
                         ui.set_opacity(row_opacity);
-                        self.layer_contents(ui,doc,l,indent,thumb.as_ref(),mask_thumb.as_ref())
+                        self.layer_contents(ui,l,indent,thumb.as_ref(),mask_thumb.as_ref(),&tree)
                     }).inner;
                     anchors.insert(l.id.clone(),TreeAnchor {disclosure,ai,opacity:row_opacity});
                 }
@@ -657,7 +813,7 @@ impl PeerBrush {
                     }
                 }
                 context_visible |= context_menu.as_ref().is_some_and(|root|root.id==response.id);
-                let response=response.on_hover_text("Click to select · Ctrl/Cmd or Shift for multiple · Drag into folders · Drag left to move out · Right-click anywhere for options");
+                let response=response.on_hover_text(format!("{}\nClick to select · Ctrl/Cmd or Shift for multiple · Drag into folders · Drag left to move out · Right-click anywhere for options",tree.tooltip(l)));
                 context_menu.show(&response,|ui|self.layer_menu(ui,doc,l));
             }
             paint_tree_guides(ui.painter(),&preview,&anchors);
@@ -673,6 +829,11 @@ impl PeerBrush {
                 else if let Some(t)=thumb {painter.image(t.id(),image_rect,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);}
                 let label=if drag.ids.len()>1 {format!("{}  +{}",layer.name,drag.ids.len()-1)}else{layer.name};
                 painter.text(egui::pos2(x+38.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(12.0),Color32::WHITE);
+                if let Some(hint)=drop_hint {
+                    let galley=painter.layout_no_wrap(hint,egui::FontId::proportional(11.0),ACCENT);
+                    let at=egui::pos2(rect.left()+8.,rect.bottom()+4.);
+                    painter.with_clip_rect(Rect::from_min_size(at,Vec2::new(width-16.,20.))).galley(at,galley,ACCENT);
+                }
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
             if ui.input(|i|i.pointer.button_released(egui::PointerButton::Primary)) {
@@ -693,6 +854,235 @@ impl PeerBrush {
         });
         if context_visible && context_menu.is_some() {
             self.layer_context = Some((doc.id.clone(), context_menu));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture(depth: u16) -> (PeerBrush, egui::Context, Vec<String>, Document) {
+        let ctx = egui::Context::default();
+        let mut engine = crate::engine::Engine::new();
+        engine.doc = Document::new_depth(8, 8, depth).unwrap();
+        let mut outer = Layer::new("Outer", "group", 8, 8);
+        outer.opacity = 0.6;
+        let mut inner = Layer::new("Inner", "group", 8, 8);
+        inner.parent = Some(outer.id.clone());
+        let mut leaf = Layer::new("Nested paint", "paint", 8, 8);
+        leaf.parent = Some(inner.id.clone());
+        let mut sibling = Layer::new("Sibling", "paint", 8, 8);
+        sibling.parent = Some(outer.id.clone());
+        let loose = Layer::new("Loose paint", "paint", 8, 8);
+        let unrelated = Layer::new("Other folder", "group", 8, 8);
+        let mut other = Layer::new("Other paint", "paint", 8, 8);
+        other.parent = Some(unrelated.id.clone());
+        engine.doc.layers = vec![outer, inner, leaf, sibling, loose, unrelated, other];
+        engine.doc.ensure_depth();
+        for (index, color) in [
+            (2, [12345, 23457, 34569, 65535]),
+            (4, [52345, 11357, 4569, 65535]),
+        ] {
+            for y in 0..8 {
+                for x in 0..8 {
+                    engine.doc.layers[index].pixels.set16(x, y, color);
+                }
+            }
+        }
+        let ids: Vec<_> = engine.doc.layers.iter().map(|l| l.id.clone()).collect();
+        engine
+            .edit(
+                "human",
+                &[json!({"op":"mask.add","layer":ids[2],"value":183})],
+                None,
+                None,
+                "Native mask",
+            )
+            .unwrap();
+        engine.undo.clear();
+        let before = engine.doc.clone();
+        let mut app = PeerBrush::init(
+            &ctx,
+            std::sync::Arc::new(std::sync::Mutex::new(engine)),
+            crate::server::Connection {
+                port: 0,
+                token: String::new(),
+                state_dir: Default::default(),
+                instance_lock: None,
+                availability: Default::default(),
+            },
+        );
+        app.selected = ids[2].clone();
+        app.selection_layers = [ids[2].clone()].into_iter().collect();
+        (app, ctx, ids, before)
+    }
+    fn frame(
+        app: &mut PeerBrush,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let time = ctx.input(|i| i.time) + 0.1;
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 1100.))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        )
+    }
+    fn button(at: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+    fn text(output: &egui::FullOutput, value: &str) -> Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == value => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing visible {value}"))
+    }
+    #[test]
+    fn collapsed_folder_selection_reveal_keeps_native_mask_target_and_other_folders() {
+        for depth in [8, 16] {
+            let (mut app, ctx, ids, before) = fixture(depth);
+            app.selection_layers.insert(ids[6].clone());
+            app.mask = true;
+            app.collapsed = [ids[0].clone(), ids[1].clone(), ids[5].clone()]
+                .into_iter()
+                .collect();
+            frame(&mut app, &ctx, vec![]);
+            let output = frame(&mut app, &ctx, vec![]);
+            let at = text(&output, "3 · 1 selected");
+            assert!(!app.layer_rects.contains_key(&ids[2]));
+            let selected = app.selection_layers.clone();
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(at), button(at, true)],
+            );
+            frame(&mut app, &ctx, vec![button(at, false)]);
+            frame(&mut app, &ctx, vec![]);
+            assert!(
+                app.layer_rects.contains_key(&ids[2]),
+                "at={at:?} root={:?} collapsed={:?} selected={:?}",
+                app.layer_rects.get(&ids[0]),
+                app.collapsed,
+                app.selection_layers
+            );
+            assert!(!app.layer_rects.contains_key(&ids[6]));
+            assert!(app.collapsed.contains(&ids[5]));
+            assert_eq!(app.selected, ids[2]);
+            assert_eq!(app.selection_layers, selected);
+            assert!(app.mask);
+            let e = app.shared.lock().unwrap();
+            assert!(e.undo.is_empty());
+            assert_eq!(
+                serde_json::to_value(&e.doc).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        }
+    }
+    #[test]
+    fn nested_drag_destination_matches_live_native_pixels_and_shared_reservation_guards() {
+        for depth in [8, 16] {
+            for reserved in [false, true] {
+                let (mut app, ctx, ids, before) = fixture(depth);
+                app.select_content(&ids[4]);
+                app.collapsed.insert(ids[1].clone());
+                if reserved {
+                    app.shared
+                        .lock()
+                        .unwrap()
+                        .reserve(
+                            "agent",
+                            "Paint work",
+                            vec![crate::engine::Scope::layer(&ids[4])],
+                        )
+                        .unwrap();
+                }
+                for _ in 0..3 {
+                    frame(&mut app, &ctx, vec![]);
+                }
+                let at = app.layer_rects[&ids[4]].left_top() + Vec2::new(20., 2.);
+                let destination = app.layer_rects[&ids[1]].center();
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(at), button(at, true)],
+                );
+                frame(&mut app, &ctx, vec![egui::Event::PointerMoved(destination)]);
+                let output = frame(&mut app, &ctx, vec![]);
+                text(&output, "Outer / Inner · before Nested paint");
+                assert!(
+                    app.layer_rects.contains_key(&ids[2]),
+                    "Destination opens in presentation only"
+                );
+                let commands = app.layer_drag.as_ref().unwrap().commands.clone();
+                assert!(commands
+                    .iter()
+                    .any(|c| c["op"] == "layer.parent" && c["parent"] == ids[1]));
+                let mut preview = crate::engine::Engine::new();
+                preview.doc = before.clone();
+                preview
+                    .edit("human", &commands, None, None, "Preview")
+                    .unwrap();
+                let expected = preview.doc.export_png().unwrap();
+                let rendered = preview.doc.preview(None, 1400, None, false).unwrap().2;
+                assert_ne!(expected, before.export_png().unwrap());
+                for _ in 0..50 {
+                    if app
+                        .canvas_pixels
+                        .as_ref()
+                        .is_some_and(|(_, _, pixels)| pixels == &rendered)
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    frame(&mut app, &ctx, vec![]);
+                }
+                assert_eq!(
+                    app.canvas_pixels.as_ref().map(|(_, _, pixels)| pixels),
+                    Some(&rendered),
+                    "Actual canvas receives the shared-engine hierarchy preview"
+                );
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(app.shared.lock().unwrap().doc.revision, before.revision);
+                frame(&mut app, &ctx, vec![button(destination, false)]);
+                let mut e = app.shared.lock().unwrap();
+                if reserved {
+                    assert!(e.undo.is_empty());
+                    assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                    assert_eq!(e.doc.layers[4].parent, None);
+                } else {
+                    assert_eq!(e.undo.len(), 1);
+                    assert_eq!(e.doc.export_png().unwrap(), expected);
+                    for original in &before.layers {
+                        let current = e.doc.layers.iter().find(|l| l.id == original.id).unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&current.pixels).unwrap(),
+                            serde_json::to_value(&original.pixels).unwrap()
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&current.mask).unwrap(),
+                            serde_json::to_value(&original.mask).unwrap()
+                        );
+                    }
+                    e.undo("human").unwrap();
+                    assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                }
+            }
         }
     }
 }
