@@ -82,6 +82,14 @@ fn fixture(depth: u16, compression: u8, id: &str) -> (Vec<u8>, Vec<u16>) {
                 c.push(row.len() as u8 - 1);
                 c.extend(row);
             }
+        } else if compression == 2 {
+            use std::io::Write;
+            let mut zip =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            for row in rows {
+                zip.write_all(&row).unwrap();
+            }
+            c.extend(zip.finish().unwrap());
         } else {
             for row in rows {
                 c.extend(row);
@@ -149,9 +157,9 @@ fn inject(bytes: &[u8], tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     out
 }
 #[test]
-fn raw_and_packbits_rgb_assets_preserve_every_native_sample_and_asset_coordinates() {
+fn supported_rgb_assets_preserve_every_native_sample_and_asset_coordinates() {
     for depth in [8, 16] {
-        for compression in [0, 1] {
+        for compression in [0, 1, 2] {
             for tag in ["Patt", "Pat2", "Pat3"] {
                 let (bytes, words) = fixture(depth, compression, "synthetic-pattern");
                 let sources = patterns::decode(&bytes, tag, &Control::default()).unwrap();
@@ -327,5 +335,72 @@ fn shared_pattern_inspection_returns_actual_native_pngs_with_source_guards_and_a
             }
             assert!(server::dispatch(&shared, "document", &p).is_err());
         }
+    }
+}
+
+fn replace_first_channel_payload(bytes: &[u8], payload: &[u8]) -> Vec<u8> {
+    let marker = [0, 0, 0, 16, 0, 0, 0, 5];
+    let at = bytes
+        .windows(marker.len())
+        .position(|v| v == marker)
+        .unwrap();
+    let channel_len = u32::from_be_bytes(bytes[at - 4..at].try_into().unwrap()) as usize;
+    let pattern_len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let arrays_at = at - 32;
+    let arrays_len =
+        u32::from_be_bytes(bytes[arrays_at..arrays_at + 4].try_into().unwrap()) as usize;
+    let delta = payload.len() as isize - (channel_len - 23) as isize;
+    let mut out = bytes[..4 + pattern_len].to_vec();
+    out.splice(at + 23..at + channel_len, payload.iter().copied());
+    out[at - 4..at].copy_from_slice(&((23 + payload.len()) as u32).to_be_bytes());
+    out[..4].copy_from_slice(&((pattern_len as isize + delta) as u32).to_be_bytes());
+    out[arrays_at..arrays_at + 4]
+        .copy_from_slice(&((arrays_len as isize + delta) as u32).to_be_bytes());
+    out.resize(out.len().div_ceil(4) * 4, 0);
+    out
+}
+#[test]
+fn zip_patterns_reject_truncation_trailing_streams_corrupt_checksums_and_excessive_output() {
+    use std::io::Write;
+    let zipped = |raw: &[u8]| {
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(raw).unwrap();
+        z.finish().unwrap()
+    };
+    let (bytes, _) = fixture(16, 2, "synthetic-pattern");
+    let marker = [0, 0, 0, 16, 0, 0, 0, 5];
+    let at = bytes
+        .windows(marker.len())
+        .position(|v| v == marker)
+        .unwrap();
+    let len = u32::from_be_bytes(bytes[at - 4..at].try_into().unwrap()) as usize;
+    let payload = &bytes[at + 23..at + len];
+    let mut corrupt = payload.to_vec();
+    *corrupt.last_mut().unwrap() ^= 0xff;
+    for bad in [
+        corrupt,
+        [payload, &[0]].concat(),
+        [payload, payload].concat(),
+        zipped(&[0; 11]),
+        zipped(&[0; 13]),
+        zipped(&vec![0; 1024 * 1024]),
+    ] {
+        assert!(patterns::decode(
+            &replace_first_channel_payload(&bytes, &bad),
+            "Patt",
+            &Control::default()
+        )
+        .is_err());
+    }
+    for end in 0..payload.len() {
+        assert!(
+            patterns::decode(
+                &replace_first_channel_payload(&bytes, &payload[..end]),
+                "Patt",
+                &Control::default()
+            )
+            .is_err(),
+            "truncated compressed prefix {end}"
+        );
     }
 }

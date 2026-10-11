@@ -34,6 +34,37 @@ fn rectangle(c: &mut Cursor<'_>) -> Result<[i32; 4], String> {
     }
     Ok([left, top, right, bottom])
 }
+// Validate one complete zlib stream with a fixed scratch buffer. Decoding below
+// still uses the shared native row reader; oversized output, concatenation and
+// incomplete/checksum-invalid streams never substitute pixels.
+fn validate_zip(payload: &[u8], expected: usize, control: &Control) -> Result<(), String> {
+    let mut zip = flate2::Decompress::new(true);
+    let mut scratch = [0u8; 16384];
+    loop {
+        control.check()?;
+        let before = (zip.total_in(), zip.total_out());
+        let status = zip
+            .decompress(
+                &payload[before.0 as usize..],
+                &mut scratch,
+                flate2::FlushDecompress::None,
+            )
+            .map_err(|_| "Invalid pattern ZIP stream")?;
+        if zip.total_out() > expected as u64 {
+            return Err("Pattern ZIP output exceeds its native channel dimensions".into());
+        }
+        if status == flate2::Status::StreamEnd {
+            return if zip.total_out() == expected as u64 && zip.total_in() == payload.len() as u64 {
+                Ok(())
+            } else {
+                Err("Pattern ZIP stream length does not match its native channel".into())
+            };
+        }
+        if before == (zip.total_in(), zip.total_out()) {
+            return Err("Incomplete pattern ZIP stream".into());
+        }
+    }
+}
 fn text(c: &mut Cursor<'_>) -> Result<String, String> {
     let count = c.u32()? as usize;
     if count > 1024 {
@@ -149,7 +180,7 @@ pub fn decode(data: &[u8], tag: &str, control: &Control) -> Result<Vec<Source>, 
             let payload = channel.bytes(bytes.len() - channel.pos)?;
             let row_bytes = width as usize * (d as usize / 8);
             // Observed mode 1 is PackBits with 16-bit row counts, including in PSB.
-            // Reject other modes explicitly; never guess a compression codec.
+            // ZIP framing is checked separately before using the shared row reader.
             let expected = match compression {
                 0 => row_bytes * height as usize,
                 1 => {
@@ -164,9 +195,13 @@ pub fn decode(data: &[u8], tag: &str, control: &Control) -> Result<Vec<Source>, 
                     }
                     n
                 }
+                2 => {
+                    validate_zip(payload, row_bytes * height as usize, control)?;
+                    payload.len()
+                }
                 _ => {
                     return Err(
-                        "Only raw and PackBits RGB pattern channels can be inspected".into(),
+                        "Only raw, PackBits and ZIP RGB pattern channels can be inspected".into(),
                     )
                 }
             };
