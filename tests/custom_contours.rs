@@ -319,7 +319,7 @@ fn future_and_malformed_contour_sources_preserve_native_composites_and_disabled_
                         source["document"]["layers"][0]["effects"][0]["settings"]
                             ["contour_points"][1]["position"] = json!(0.);
                     } else {
-                        source["format"] = json!(23);
+                        source["format"] = json!(24);
                     }
                     let protected = psd::decode(&replace_embedded(&bytes, &source)).unwrap();
                     assert!(protected.read_only);

@@ -1,6 +1,11 @@
 //! Bounded native RGB and independent opacity stops; no bitmap or display projection.
 use serde_json::Value;
 
+pub fn positioned(kind: &str, value: &Value) -> bool {
+    kind == "gradient_overlay"
+        && (value.get("offset_x").is_some() || value.get("offset_y").is_some())
+}
+
 pub fn extended(kind: &str, value: &Value) -> bool {
     kind == "gradient_overlay"
         && (value.get("color_stops").is_some() || value.get("alpha_stops").is_some())

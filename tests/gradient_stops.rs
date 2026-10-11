@@ -142,3 +142,151 @@ fn shared_gradient_stops_feedback_has_actual_native_pixels_and_document_coordina
     assert!(result["images"][0]["data"].as_str().unwrap().len() > 20);
     assert_eq!(shared.lock().unwrap().undo.len(), 1);
 }
+
+#[test]
+fn positioned_gradients_match_analytic_native_coordinates_and_preserve_alpha() {
+    for depth in [8, 16] {
+        for (angle, ox, oy) in [
+            (0., 0.125, 0.),
+            (180., -0.125, 0.),
+            (90., 0., 0.25),
+            (-90., 0., -0.25),
+        ] {
+            for reflected in [false, true] {
+                let mut e = Engine::new();
+                e.doc = Document::new_depth(4, 2, depth).unwrap();
+                for y in 0..2 {
+                    for x in 0..4 {
+                        e.doc.layers[0]
+                            .pixels
+                            .set16(x, y, [12347, 23459, 34571, 65535]);
+                    }
+                }
+                let source = e.doc.layers[0].pixels.rgba16();
+                let layer = e.doc.layers[0].id.clone();
+                e.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":{"opacity":1.,"color":[0.,0.,0.],"color2":[1.,1.,1.],"angle":angle,"offset_x":ox,"offset_y":oy,"style":if reflected{"reflected"}else{"linear"}}})],None,None,"Gradient placement").unwrap();
+                let actual = if depth == 16 {
+                    peerbrush::depth16::render(&e.doc).unwrap().words
+                } else {
+                    e.doc
+                        .preview(None, 8, None, false)
+                        .unwrap()
+                        .2
+                        .into_iter()
+                        .map(|v| u16::from(v) * 257)
+                        .collect()
+                };
+                for y in 0..2 {
+                    for x in 0..4 {
+                        let px = (f64::from(x) + 0.5) / 4. - 0.5 - ox;
+                        let py = (f64::from(y) + 0.5) / 2. - 0.5 - oy;
+                        let p = if angle == 0. {
+                            px
+                        } else if angle == 180. {
+                            -px
+                        } else if angle == 90. {
+                            -py
+                        } else {
+                            py
+                        };
+                        let t = if reflected { 2. * p.abs() } else { 0.5 + p };
+                        let n = (t.clamp(0., 1.) * 65535.).round() as u16;
+                        let n = if depth == 16 {
+                            n
+                        } else {
+                            u16::from(peerbrush::raster::project16(n)) * 257
+                        };
+                        assert_eq!(
+                            &actual[((y * 4 + x) * 4) as usize..][..4],
+                            &[n, n, n, 65535]
+                        );
+                    }
+                }
+                assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+            }
+        }
+    }
+}
+#[test]
+fn gradient_placement_shared_feedback_undo_save_and_disabled_sources_remain_exact() {
+    for depth in [8, 16] {
+        for disabled in [false, true] {
+            let mut e = fixture(depth);
+            let source = e.doc.layers[0].pixels.rgba16();
+            let layer = e.doc.layers[0].id.clone();
+            e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":settings()})],None,None,"Initial gradient").unwrap();
+            e.doc.layers[0].effects[0].enabled = !disabled;
+            e.undo.clear();
+            let effect = e.doc.layers[0].effects[0].id.clone();
+            let before = e.doc.export_png().unwrap();
+            let mut s = settings();
+            s["offset_x"] = json!(0.25);
+            s["offset_y"] = json!(-0.375);
+            let shared = Arc::new(Mutex::new(e));
+            let result=server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[{"op":"effect.update","layer":layer,"effect":effect,"settings":s,"enabled":!disabled}],"feedback":"always","max_edge":32})).unwrap();
+            assert_eq!(result["images"][0]["document_rect"], json!([0, 0, 16, 8]));
+            assert!(result["images"][0]["data"].as_str().unwrap().len() > 20);
+            let mut e = shared.lock().unwrap();
+            assert_eq!(e.undo.len(), 1);
+            assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+            let current = e.doc.export_png().unwrap();
+            for output in [
+                psd::encode(&e.doc).unwrap(),
+                psd::encode_psb(&e.doc).unwrap(),
+            ] {
+                let reopened = psd::decode(&output).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.export_png().unwrap(), current);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                assert_eq!(
+                    reopened.layers[0].effects[0].settings["offset_x"],
+                    json!(0.25)
+                );
+                assert_eq!(reopened.layers[0].effects[0].enabled, !disabled);
+                let marker = output.windows(4).position(|v| v == b"PBR1").unwrap();
+                use std::io::Read;
+                let mut raw = Vec::new();
+                flate2::read::ZlibDecoder::new(&output[marker + 4..])
+                    .read_to_end(&mut raw)
+                    .unwrap();
+                let raw: Value = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(raw["format"], 23);
+            }
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), before);
+            e.redo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), current);
+        }
+    }
+}
+#[test]
+fn gradient_placement_invalid_or_inapplicable_settings_roll_back_atomically() {
+    for depth in [8, 16] {
+        for (kind, s) in [
+            ("gradient_overlay", json!({"offset_x":1.01})),
+            ("gradient_overlay", json!({"offset_y":-1.01})),
+            ("gradient_overlay", json!({"offset_x":"0"})),
+            ("gradient_overlay", json!({"offset_y":null})),
+            ("color_overlay", json!({"offset_x":0.25})),
+            ("bevel_emboss", json!({"offset_y":0.25})),
+        ] {
+            let mut e = fixture(depth);
+            let before = serde_json::to_value(&e.doc).unwrap();
+            let layer = e.doc.layers[0].id.clone();
+            assert!(e
+                .edit(
+                    "human",
+                    &[
+                        json!({"op":"layer.update","layer":layer,"opacity":0.2}),
+                        json!({"op":"effect.add","layer":layer,"kind":kind,"settings":s})
+                    ],
+                    None,
+                    None,
+                    "Invalid placement"
+                )
+                .is_err());
+            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+            assert!(e.undo.is_empty());
+        }
+    }
+}

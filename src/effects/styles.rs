@@ -137,7 +137,10 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
         if defaults.get(key).is_none()
             && !(bitmap && bitmap_defaults.get(key).is_some())
             && !(kind == "gradient_overlay"
-                && matches!(key.as_str(), "color_stops" | "alpha_stops"))
+                && matches!(
+                    key.as_str(),
+                    "color_stops" | "alpha_stops" | "offset_x" | "offset_y"
+                ))
             && !(crate::effects::contours::contains(kind) && key == "contour_points")
         {
             return Err(format!("Unsupported {kind} setting: {key}"));
@@ -205,6 +208,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                     "altitude" => (0., 90.),
                     "range" => (0.01, 1.),
                     "scale" if kind == "gradient_overlay" => (0.1, 10.),
+                    "offset_x" | "offset_y" => (-1., 1.),
                     "scale" => (1., 128.),
                     "depth" => (0., 10.),
                     "bitmap_scale" => (0.01, 8.),
@@ -376,6 +380,7 @@ pub fn apply(
     let mut field = alpha.clone();
     let size = number(v, "size");
     let distance = number(v, "distance");
+    let offset = (number(v, "offset_x"), number(v, "offset_y"));
     let angle = number(v, "angle").to_radians();
     let direction = match number(v, "angle") {
         -180. | 180. => (-1., 0.),
@@ -435,8 +440,8 @@ pub fn apply(
             match kind {
                 "gradient_overlay" => {
                     let scale = number(v, "scale");
-                    let px = (x as f64 + 0.5) / w as f64 - 0.5;
-                    let py = (y as f64 + 0.5) / h as f64 - 0.5;
+                    let px = (x as f64 + 0.5) / w as f64 - 0.5 - offset.0;
+                    let py = (y as f64 + 0.5) / h as f64 - 0.5 - offset.1;
                     let position = px * direction.0 - py * direction.1;
                     let mut t = match v["style"].as_str().unwrap_or("linear") {
                         "radial" => px.hypot(py) * 2. / scale,
