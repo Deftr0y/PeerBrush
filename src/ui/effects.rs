@@ -500,7 +500,35 @@ impl PeerBrush {
             "{name} · Select to edit settings · click again to close"
         ))
     }
-    pub(super) fn color_stack(&mut self, ui: &mut egui::Ui, l: &Layer) {
+    pub(super) fn effect_bake_menu(
+        &mut self,
+        response: &egui::Response,
+        l: &Layer,
+        mask: bool,
+        effect: &str,
+        index: usize,
+        revision: u64,
+    ) {
+        response.context_menu(|ui| {
+            let scope = if mask { "mask pixels" } else if l.kind == "group" { "folder pixels (flattens children)" } else if l.source.is_some() { "pixels (rasterizes text/vector)" } else { "layer pixels" };
+            let label = format!("Bake into {scope}");
+            ui.label(format!("Includes this effect and {index} preceding {}", if index == 1 { "effect" } else { "effects" }));
+            let enabled = l.kind != "adjustment" || mask;
+            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                let command = if mask {
+                    json!({"op":"mask.step.bake","layer":l.id,"step":effect,"source_revision":revision})
+                } else {
+                    json!({"op":"effect.bake","layer":l.id,"effect":effect,"source_revision":revision})
+                };
+                self.edit(vec![command], "Bake effect and preceding effects");
+                self.effect_selected = None;
+                self.mask_step = None;
+                ui.close_menu();
+            }
+            if !enabled { ui.label("Adjustment effects depend on the backdrop. Merge affected layers explicitly."); }
+        });
+    }
+    pub(super) fn color_stack(&mut self, ui: &mut egui::Ui, l: &Layer, revision: u64) {
         ui.horizontal(|ui| {
             controls::label(ui, "COLOR EFFECTS");
             let add = ui.menu_button("+ Add effect", |ui| {
@@ -539,13 +567,13 @@ impl PeerBrush {
                                 effect_icon(&effect.kind),
                                 effect.enabled,
                             );
-                            if Self::effect_title(
+                            let title = Self::effect_title(
                                 ui,
                                 effect_name(&effect.kind),
                                 self.effect_is_selected(&l.id, false, &effect.id),
-                            )
-                            .clicked()
-                            {
+                            );
+                            self.effect_bake_menu(&title, l, false, &effect.id, index, revision);
+                            if title.clicked() {
                                 self.select_effect(&l.id, false, &effect.id);
                             }
                             self.effect_weight(ui, &effect.id, effect.weight, false);
@@ -622,6 +650,130 @@ pub(super) fn effect_name(kind: &str) -> &str {
 mod tests {
     use super::*;
     #[test]
+    fn right_click_native_color_and_mask_effects_bake_once_with_explicit_scope() {
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let ctx = egui::Context::default();
+                let mut e = crate::engine::Engine::new();
+                e.doc = Document::new_depth(32, 24, depth).unwrap();
+                e.doc.layers[0]
+                    .pixels
+                    .set16(10, 12, [12345, 23457, 34569, 65535]);
+                let id = e.doc.layers[0].id.clone();
+                if mask {
+                    e.edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":id,"value":255})],
+                        None,
+                        None,
+                        "Mask",
+                    )
+                    .unwrap();
+                }
+                let c = if mask {
+                    json!({"op":"mask.step.add","layer":id,"kind":"invert"})
+                } else {
+                    json!({"op":"effect.add","layer":id,"kind":"invert"})
+                };
+                e.edit("human", &[c], None, None, "Effect").unwrap();
+                e.undo.clear();
+                let before = e.doc.clone();
+                let shared = std::sync::Arc::new(std::sync::Mutex::new(e));
+                let connection = crate::server::Connection {
+                    port: 0,
+                    token: String::new(),
+                    state_dir: Default::default(),
+                    instance_lock: None,
+                    availability: Default::default(),
+                };
+                let mut app = PeerBrush::init(&ctx, shared.clone(), connection);
+                app.selected = id.clone();
+                app.selection_layers = [id].into_iter().collect();
+                app.mask = mask;
+                let mut time = 0.;
+                let mut draw = |app: &mut PeerBrush, events| {
+                    time += 0.05;
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1200., 900.),
+                            )),
+                            events,
+                            time: Some(time),
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                let position = |output: &egui::FullOutput, label: &str| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|s| match &s.shape {
+                            egui::Shape::Text(t) if t.galley.job.text == label => {
+                                Some(t.pos + Vec2::new(4., 4.))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("Missing {label}"))
+                };
+                let at = position(&output, "Invert");
+                let button = |pos, button, pressed| egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        button(at, egui::PointerButton::Secondary, true),
+                    ],
+                );
+                draw(
+                    &mut app,
+                    vec![button(at, egui::PointerButton::Secondary, false)],
+                );
+                let menu = draw(&mut app, vec![]);
+                assert!(menu.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text.starts_with("Includes this effect"))));
+                assert!(shared.lock().unwrap().undo.is_empty());
+                let at = position(
+                    &menu,
+                    if mask {
+                        "Bake into mask pixels"
+                    } else {
+                        "Bake into layer pixels"
+                    },
+                );
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        button(at, egui::PointerButton::Primary, true),
+                    ],
+                );
+                draw(
+                    &mut app,
+                    vec![button(at, egui::PointerButton::Primary, false)],
+                );
+                let mut e = shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1, "{}", app.message);
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                if mask {
+                    assert_eq!(e.doc.layers[0].mask.as_ref().unwrap().steps.len(), 1);
+                } else {
+                    assert!(e.doc.layers[0].effects.is_empty());
+                }
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            }
+        }
+    }
+    #[test]
     fn top_color_effect_is_last_without_reinterpreting_saved_sources() {
         let ctx = egui::Context::default();
         let mut e = crate::engine::Engine::new();
@@ -657,7 +809,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, &layer));
+                egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, &layer, 1));
             },
         );
         let y = |label: &str| {
@@ -695,7 +847,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, &layer));
+                egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, &layer, 1));
             },
         );
         assert!(selected

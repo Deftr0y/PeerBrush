@@ -171,7 +171,7 @@ pub fn value(layer: &Layer, x: i32, y: i32, prepared: Option<&Gray16>, raw: bool
     }
     value.clamp(0.0, 65535.0) / 65535.0
 }
-fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, String> {
+pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, String> {
     let count = width as usize * height as usize;
     if count as u64 * 2 > MASK_BUDGET {
         return Err("Native16 spatial mask exceeds the128 MiB mask budget".into());

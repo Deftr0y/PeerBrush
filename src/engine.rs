@@ -765,6 +765,9 @@ impl Engine {
             }];
         }
         let target = c.get("layer").and_then(Value::as_str).map(String::from);
+        if matches!(op, "effect.bake" | "mask.step.bake") {
+            return vec![Scope { target, rect: None }];
+        }
         if visibility_only(c) {
             return vec![Scope {
                 target: target.map(|t| format!("@visibility:{t}")),
@@ -1699,6 +1702,9 @@ impl Engine {
         }
         if op == "source.update" {
             return crate::source::update(&mut self.doc.layers[i], c);
+        }
+        if matches!(op, "effect.bake" | "mask.step.bake") {
+            return crate::bake::apply(&mut self.doc, i, c);
         }
         if op == "source.rasterize" {
             if self.doc.layers[i].source.take().is_none() {

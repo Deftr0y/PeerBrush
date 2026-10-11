@@ -2498,7 +2498,7 @@ impl PeerBrush {
                         });
                     }
                     if !self.mask {
-                        self.color_stack(ui,&l);
+                        self.color_stack(ui,&l,doc.revision);
                     } else if let Some(m) = &l.mask {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("MASK STACK").size(10.0).color(MUTED)).on_hover_text("Bottom runs first · Top runs last");
@@ -2531,7 +2531,9 @@ impl PeerBrush {
                                         let (rect,_) = ui.allocate_exact_size(Vec2::splat(18.0),egui::Sense::hover());
                                         icons::paint(ui.painter(),rect,effects::effect_icon(&step.kind),step.enabled);
                                         let name=if step.kind=="blur" {"Feather"} else {effects::effect_name(&step.kind)};
-                                        if Self::effect_title(ui,name,self.effect_is_selected(&l.id,true,&step.id)).clicked() {
+                                        let title=Self::effect_title(ui,name,self.effect_is_selected(&l.id,true,&step.id));
+                                        self.effect_bake_menu(&title,&l,true,&step.id,index,doc.revision);
+                                        if title.clicked() {
                                             self.select_effect(&l.id,true,&step.id);
                                             self.mask_step=if step.kind=="paint" {Some(step.id.clone())} else {None};
                                             self.last_preview=None;

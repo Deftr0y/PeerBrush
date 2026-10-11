@@ -135,7 +135,7 @@ pub fn validate_budget(layers: &[Layer]) -> Result<(), String> {
     }
 }
 
-fn evaluate(mask: &Mask, width: u32, height: u32) -> GrayMask {
+pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> GrayMask {
     let (w, h) = (width as usize, height as usize);
     let mut pixels = vec![255; w * h];
     let mut scratch = Vec::new();

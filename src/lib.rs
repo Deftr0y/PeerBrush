@@ -1,4 +1,5 @@
 pub mod adjustment;
+mod bake;
 pub mod brush;
 pub mod brush_library;
 pub mod clipboard;
