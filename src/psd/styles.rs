@@ -138,8 +138,7 @@ fn style_name(key: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
-/// Summary only: no native effect stack, editable IDs or decoded source pixels are created.
-pub(super) fn inspect(bytes: &[u8]) -> Result<Vec<String>, String> {
+fn root(bytes: &[u8]) -> Result<Value, String> {
     if bytes.len() > 1024 * 1024 {
         return Err("effects descriptor exceeds 1 MiB".into());
     }
@@ -155,6 +154,11 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<Vec<String>, String> {
     if remaining.len() > 3 || remaining.iter().any(|v| *v != 0) {
         return Err("unrecognized effects descriptor trailer".into());
     }
+    Ok(root)
+}
+/// Summary only: no native effect stack, editable IDs or decoded source pixels are created.
+pub(super) fn inspect(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let root = root(bytes)?;
     let items = root["items"].as_object().unwrap();
     let mut summaries = vec![];
     let master = items.get("masterFXSwitch").and_then(boolean);
@@ -211,6 +215,145 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<Vec<String>, String> {
         }
     }
     Ok(summaries)
+}
+
+fn plain_number(value: &Value) -> Result<f64, String> {
+    if !matches!(value["type"].as_str(), Some("doub" | "long")) {
+        return Err("Color Overlay requires plain RGB channel numbers".into());
+    }
+    value["value"]
+        .as_f64()
+        .ok_or("Invalid Color Overlay number".into())
+}
+fn percent(value: &Value) -> Result<f64, String> {
+    if value["type"] != "UntF" || value["value"][0] != "#Prc" {
+        return Err("Color Overlay requires percentage units".into());
+    }
+    let n = value["value"][1]
+        .as_f64()
+        .ok_or("Invalid Color Overlay percentage")?;
+    if !(0.0..=100.).contains(&n) {
+        return Err("Color Overlay percentage is outside 0–100".into());
+    }
+    Ok(n / 100.)
+}
+/// Small explicit import subset. The caller must verify the entire saved composite.
+pub(super) fn color_overlays(bytes: &[u8]) -> Result<Vec<crate::effects::Effect>, String> {
+    let root = root(bytes)?;
+    if !matches!(root["class"].as_str(), Some("null" | "Lefx")) {
+        return Err("Unsupported Photoshop effects class".into());
+    }
+    let items = root["items"].as_object().ok_or("Invalid effects object")?;
+    let master = items
+        .get("masterFXSwitch")
+        .and_then(boolean)
+        .ok_or("Missing style master switch")?;
+    if let Some(scale) = items.get("Scl ") {
+        if percent(scale)? != 1. {
+            return Err("Scaled Photoshop styles remain protected".into());
+        }
+    }
+    if items.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "masterFXSwitch" | "Scl " | "SoFi" | "solidFillMulti"
+        )
+    }) || items.contains_key("SoFi") && items.contains_key("solidFillMulti")
+    {
+        return Err("Only unambiguous plain Color Overlay definitions can be imported".into());
+    }
+    let source = items
+        .get("SoFi")
+        .or_else(|| items.get("solidFillMulti"))
+        .ok_or("No Color Overlay definitions")?;
+    let entries = if source["type"] == "VlLs" {
+        source["value"]
+            .as_array()
+            .ok_or("Invalid Color Overlay list")?
+            .iter()
+            .collect::<Vec<_>>()
+    } else {
+        vec![source]
+    };
+    if entries.is_empty() || entries.len() > 32 {
+        return Err("Color Overlay requires 1–32 definitions".into());
+    }
+    // Photoshop multi-effect ordering is not guessed. Preserve a single definition only.
+    if entries.len() != 1 {
+        return Err("Multiple Photoshop Color Overlay ordering remains protected".into());
+    }
+    let mut effects = vec![];
+    for entry in entries {
+        if !matches!(entry["type"].as_str(), Some("Objc" | "GlbO"))
+            || entry["value"]["class"] != "SoFi"
+        {
+            return Err("Invalid Color Overlay descriptor class".into());
+        }
+        let fields = entry["value"]["items"]
+            .as_object()
+            .ok_or("Invalid Color Overlay properties")?;
+        if fields.keys().any(|k| {
+            !matches!(
+                k.as_str(),
+                "enab" | "present" | "showInDialog" | "Md  " | "Opct" | "Clr "
+            )
+        }) {
+            return Err("Unsupported Color Overlay property".into());
+        }
+        let enabled = fields
+            .get("enab")
+            .and_then(boolean)
+            .ok_or("Missing Color Overlay enabled state")?;
+        let present = fields
+            .get("present")
+            .and_then(boolean)
+            .ok_or("Missing Color Overlay present state")?;
+        if fields
+            .get("showInDialog")
+            .is_some_and(|v| boolean(v).is_none())
+        {
+            return Err("Invalid Color Overlay dialog state".into());
+        }
+        let mode = &entry["value"]["items"]["Md  "];
+        if mode["type"] != "enum" || mode["value"] != json!(["BlnM", "Nrml"]) {
+            return Err("Only Normal Photoshop Color Overlay blend can be imported".into());
+        }
+        let opacity = percent(&entry["value"]["items"]["Opct"])?;
+        let color = &entry["value"]["items"]["Clr "];
+        if !matches!(color["type"].as_str(), Some("Objc" | "GlbO"))
+            || color["value"]["class"] != "RGBC"
+        {
+            return Err("Only RGB Photoshop Color Overlay colors can be imported".into());
+        }
+        let channels = color["value"]["items"]
+            .as_object()
+            .ok_or("Invalid RGB Color Overlay")?;
+        if channels.len() != 3
+            || channels
+                .keys()
+                .any(|k| !matches!(k.as_str(), "Rd  " | "Grn " | "Bl  "))
+        {
+            return Err("Unsupported Color Overlay RGB properties".into());
+        }
+        let mut rgb = vec![];
+        for key in ["Rd  ", "Grn ", "Bl  "] {
+            let n = plain_number(&channels[key])?;
+            if !(0.0..=255.).contains(&n) {
+                return Err("Color Overlay RGB channel is outside 0–255".into());
+            }
+            rgb.push(n / 255.);
+        }
+        let settings = json!({"opacity":opacity,"blend":"normal","color":rgb});
+        crate::effects::validate("color_overlay", &settings)?;
+        effects.push(crate::effects::Effect {
+            id: crate::engine::id(),
+            kind: "color_overlay".into(),
+            enabled: master && enabled && present,
+            weight: 1.,
+            settings,
+        });
+    }
+    Ok(effects)
 }
 
 #[cfg(test)]

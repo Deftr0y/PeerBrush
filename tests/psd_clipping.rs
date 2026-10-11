@@ -830,3 +830,165 @@ fn standard_pass_through_dividers_keep_clipping_native_masks_and_external_blendi
         protected(&specs, depth, "only for folders");
     }
 }
+
+// Queued with the sprint's combined QA: real standard records, no private definitions.
+fn overlay_id(out: &mut Vec<u8>, name: &str) {
+    out.extend(
+        (if name.len() == 4 {
+            0
+        } else {
+            name.len() as u32
+        })
+        .to_be_bytes(),
+    );
+    out.extend(name.as_bytes());
+}
+fn overlay_descriptor(class: &str, items: Vec<(&str, &[u8; 4], Vec<u8>)>) -> Vec<u8> {
+    let mut out = 0u32.to_be_bytes().to_vec();
+    overlay_id(&mut out, class);
+    out.extend((items.len() as u32).to_be_bytes());
+    for (key, kind, bytes) in items {
+        overlay_id(&mut out, key);
+        out.extend(kind);
+        out.extend(bytes);
+    }
+    out
+}
+fn overlay_payload(master: bool, enabled: bool, color: [f64; 3]) -> Vec<u8> {
+    let rgb = overlay_descriptor(
+        "RGBC",
+        vec![
+            ("Rd  ", b"doub", color[0].to_be_bytes().to_vec()),
+            ("Grn ", b"doub", color[1].to_be_bytes().to_vec()),
+            ("Bl  ", b"doub", color[2].to_be_bytes().to_vec()),
+        ],
+    );
+    let mut mode = vec![];
+    overlay_id(&mut mode, "BlnM");
+    overlay_id(&mut mode, "Nrml");
+    let percent = [b"#Prc".to_vec(), 100f64.to_be_bytes().to_vec()].concat();
+    let effect = overlay_descriptor(
+        "SoFi",
+        vec![
+            ("enab", b"bool", vec![u8::from(enabled)]),
+            ("present", b"bool", vec![1]),
+            ("showInDialog", b"bool", vec![1]),
+            ("Md  ", b"enum", mode),
+            ("Opct", b"UntF", percent.clone()),
+            ("Clr ", b"Objc", rgb),
+        ],
+    );
+    let root = overlay_descriptor(
+        "Lefx",
+        vec![
+            ("masterFXSwitch", b"bool", vec![u8::from(master)]),
+            ("Scl ", b"UntF", percent),
+            ("SoFi", b"Objc", effect),
+        ],
+    );
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        root,
+    ]
+    .concat()
+}
+fn overlay_fixture(depth: u16, master: bool, enabled: bool, replace_composite: bool) -> Vec<u8> {
+    let mut spec = Spec::paint("Synthetic styled source", SAVED);
+    spec.tags.push((
+        *b"lfx2",
+        overlay_payload(master, enabled, [111., 67., 231.]),
+    ));
+    let mut bytes = fixture(&[spec], depth);
+    if replace_composite {
+        let n = 8 * usize::from(depth / 8);
+        bytes.truncate(bytes.len() - n);
+        for channel in [111u16 * 257, 67 * 257, 231 * 257, 65535] {
+            for _ in 0..2 {
+                sample(&mut bytes, channel, depth);
+            }
+        }
+    }
+    bytes
+}
+#[test]
+fn photoshop_color_overlay_import_preserves_native_sources_editability_and_standard_saves() {
+    for depth in [8, 16] {
+        for (master, enabled) in [(true, true), (true, false), (false, true)] {
+            let mut doc =
+                psd::decode(&overlay_fixture(depth, master, enabled, master && enabled)).unwrap();
+            assert!(!doc.read_only, "{:?}", doc.warnings);
+            assert_eq!(doc.layers.len(), 1);
+            assert_eq!(doc.layers[0].effects.len(), 1);
+            assert_eq!(doc.layers[0].effects[0].enabled, master && enabled);
+            for x in 0..2 {
+                assert_eq!(
+                    doc.layers[0].pixels.get16(x, 0),
+                    SAVED[x as usize].map(|n| native(n, depth))
+                );
+            }
+            let before = doc.export_png().unwrap();
+            let source = doc.layers[0].pixels.rgba16();
+            let layer = doc.layers[0].id.clone();
+            let effect = doc.layers[0].effects[0].id.clone();
+            let mut engine = Engine::new();
+            engine.doc = doc;
+            engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":{"opacity":0.25}})],None,None,"Overlay strength").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            assert_eq!(engine.undo.len(), 1);
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), before);
+            doc = engine.doc;
+            for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                let reopened = psd::decode(&bytes).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                assert_eq!(reopened.export_png().unwrap(), before);
+            }
+        }
+    }
+}
+#[test]
+fn mismatched_or_unsupported_photoshop_color_overlays_remain_protected() {
+    for depth in [8, 16] {
+        let mismatch = psd::decode(&overlay_fixture(depth, true, true, false)).unwrap();
+        assert!(mismatch.read_only);
+        assert!(mismatch
+            .warnings
+            .iter()
+            .any(|w| w.contains("differs from the native saved composite")));
+        for variant in 0..7 {
+            let mut spec = Spec::paint("Synthetic protected style", SAVED);
+            let mut payload = overlay_payload(true, true, [111., 67., 231.]);
+            match variant {
+                0 => {
+                    let at = payload.windows(4).position(|b| b == b"Nrml").unwrap();
+                    payload[at..at + 4].copy_from_slice(b"Mltp");
+                }
+                1 => spec.mask = Some([65535, 65535]),
+                2 => spec.clipping = 1,
+                3 => spec.opacity = 128,
+                4 => {
+                    spec.tags.push((*b"lmfx", payload.clone()));
+                }
+                5 => {
+                    payload = overlay_payload(true, true, [256., 67., 231.]);
+                }
+                _ => {
+                    spec.tags.push((*b"lrFX", vec![0; 16]));
+                }
+            }
+            spec.tags.push((*b"lfx2", payload));
+            let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+            assert!(doc.read_only, "variant {variant}");
+            assert_eq!(doc.layers.len(), 1);
+            assert!(doc.layers[0].effects.is_empty());
+            for x in 0..2 {
+                assert_eq!(
+                    doc.layers[0].pixels.get16(x, 0),
+                    SAVED[x as usize].map(|n| native(n, depth))
+                );
+            }
+        }
+    }
+}

@@ -1717,6 +1717,7 @@ fn decode_parts(
                 let mut section = 0;
                 let mut locked = false;
                 let mut psd_metadata = vec![];
+                let mut imported_styles = vec![];
                 let mut seen_tags = std::collections::HashSet::new();
                 while ex.pos + 12 <= extra.len() {
                     let signature = ex.bytes(4)?;
@@ -1820,8 +1821,16 @@ fn decode_parts(
                             };
                             match detail {
                                 Ok(details) => {
-                                    warnings.push(format!("Photoshop layer styles ({tag_name}) remain protected; using the saved composite"));
-                                    warnings.extend(details);
+                                    let imported = if signature == b"8BIM" && section == 0 && maskdata.is_empty() && clipping == 0 && opacity == 1. && blend == "normal" && imported_styles.is_empty() {
+                                        styles::color_overlays(payload)
+                                    } else { Err("Photoshop styles with masks, clipping, folders, layer blending or duplicate blocks remain protected".into()) };
+                                    match imported {
+                                        Ok(effects) => imported_styles = effects,
+                                        Err(reason) => {
+                                            warnings.push(format!("Photoshop layer styles ({tag_name}) remain protected: {reason}; using the saved composite"));
+                                            warnings.extend(details);
+                                        }
+                                    }
                                 }
                                 Err(reason) => warnings.push(format!("Cannot inspect Photoshop layer styles ({tag_name}): {reason}; using the protected saved composite")),
                             }
@@ -1847,6 +1856,9 @@ fn decode_parts(
                 if section != 0 && clipping != 0 {
                     warnings.push("Photoshop clipping involving a folder is not supported".into());
                 }
+                if section != 0 && !imported_styles.is_empty() {
+                    warnings.push("Photoshop folder styles remain protected".into());
+                }
                 let mut layer = Layer::new(
                     &name,
                     if section == 1 || section == 2 {
@@ -1865,6 +1877,7 @@ fn decode_parts(
                 layer.opacity = opacity;
                 layer.blend = blend.into();
                 layer.psd_metadata = psd_metadata;
+                layer.effects = imported_styles;
                 let mut details_truncated =
                     seen_tags.len() > 64 || warnings.len() - warning_start > 64;
                 let mut tags = std::collections::BTreeSet::new();
@@ -2092,6 +2105,23 @@ fn decode_parts(
         warnings.push(format!(
             "Unsupported Photoshop composition: {error}; using the saved composite"
         ));
+    }
+    // New style import never authorizes editing on approximate visual equivalence.
+    // Compare native samples, including alpha, through the same engine used by UI/MCP.
+    if warnings.is_empty() && doc.layers.iter().any(|l| !l.effects.is_empty()) {
+        control.check()?;
+        let matches = if depth == 16 {
+            crate::depth16::render(&doc).map(|image| image.words == merged.rgba16())
+        } else {
+            doc.preview_native8(None, w.max(h), None, false)
+                .map(|(_, _, pixels, _)| pixels == merged.rgba())
+        };
+        match matches {
+            Ok(true) => {},
+            Ok(false) => warnings.push("Photoshop style rendering differs from the native saved composite; original styles remain protected".into()),
+            Err(reason) => warnings.push(format!("Cannot reproduce Photoshop style composite: {reason}; original styles remain protected")),
+        }
+        control.check()?;
     }
     warnings.sort();
     warnings.dedup();
