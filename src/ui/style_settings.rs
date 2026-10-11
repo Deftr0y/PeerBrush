@@ -1,6 +1,15 @@
 use super::*;
 pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Option<egui::Response> {
-    let defaults = crate::effects::styles::defaults(kind);
+    let bitmap = crate::effects::patterns::active(kind, value);
+    let mut defaults = crate::effects::styles::defaults(kind);
+    if bitmap {
+        for (key, value) in crate::effects::styles::bitmap_defaults()
+            .as_object()
+            .unwrap()
+        {
+            defaults[key] = value.clone();
+        }
+    }
     let mut changed = None;
     for (key, options) in [
         (
@@ -21,12 +30,26 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
         ),
         (
             "pattern",
-            vec![
-                ("checker", "Checker"),
-                ("stripes", "Stripes"),
-                ("dots", "Dots"),
-                ("noise", "Noise"),
-            ],
+            if bitmap {
+                vec![
+                    ("bitmap", "Bitmap PNG"),
+                    ("checker", "Checker"),
+                    ("stripes", "Stripes"),
+                    ("dots", "Dots"),
+                    ("noise", "Noise"),
+                ]
+            } else {
+                vec![
+                    ("checker", "Checker"),
+                    ("stripes", "Stripes"),
+                    ("dots", "Dots"),
+                    ("noise", "Noise"),
+                ]
+            },
+        ),
+        (
+            "sampling",
+            vec![("bilinear", "Bilinear"), ("nearest", "Nearest")],
         ),
         (
             "position",
@@ -74,6 +97,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                     "pattern" => "Pattern",
                     "position" => "Position",
                     "source" => "Source",
+                    "sampling" => "Sampling",
                     _ => "Style",
                 },
             );
@@ -88,6 +112,15 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                         let r = ui.selectable_value(&mut selected, id.into(), label);
                         if r.changed() {
                             value[key] = json!(selected);
+                            if key == "pattern" && selected != "bitmap" {
+                                for key in crate::effects::styles::bitmap_defaults()
+                                    .as_object()
+                                    .unwrap()
+                                    .keys()
+                                {
+                                    value.as_object_mut().unwrap().remove(key);
+                                }
+                            }
                             changed = Some(r);
                         }
                     }
@@ -117,6 +150,10 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 ),
                 ("depth", "Depth", 0., 10., "%"),
                 ("range", "Range", 0.01, 1., "%"),
+                ("bitmap_scale", "Scale", 0.01, 8., "%"),
+                ("bitmap_angle", "Angle", -180., 180., "°"),
+                ("phase_x", "Phase X", -32768., 32768., " px"),
+                ("phase_y", "Phase Y", -32768., 32768., " px"),
                 (
                     "scale",
                     "Scale",
@@ -133,7 +170,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                     },
                 ),
             ] {
-                if defaults.get(key).is_none() {
+                if defaults.get(key).is_none() || (bitmap && key == "scale") {
                     continue;
                 }
                 controls::label(ui, label);
@@ -178,7 +215,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
             },
         ),
     ] {
-        if defaults.get(key).is_none() {
+        if defaults.get(key).is_none() || bitmap {
             continue;
         }
         let mut rgb: [f32; 3] = std::array::from_fn(|i| {
@@ -206,7 +243,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
         ("invert", "Invert"),
         ("down", "Down"),
     ] {
-        if defaults.get(key).is_some() {
+        if defaults.get(key).is_some() && !bitmap {
             let mut enabled = value[key]
                 .as_bool()
                 .or_else(|| defaults[key].as_bool())
@@ -227,7 +264,7 @@ mod tests {
     #[test]
     fn style_opacity_drag_previews_native_pixels_and_commits_one_undo() {
         for depth in [8, 16] {
-            for kind in ["color_overlay", "drop_shadow"] {
+            for kind in ["color_overlay", "drop_shadow", "pattern_overlay"] {
                 let ctx = egui::Context::default();
                 let mut e = crate::engine::Engine::new();
                 e.doc = Document::new_depth(32, 32, depth).unwrap();
@@ -239,14 +276,18 @@ mod tests {
                     }
                 }
                 let layer = e.doc.layers[0].id.clone();
-                e.edit(
-                    "human",
-                    &[json!({"op":"effect.add","layer":layer,"kind":kind})],
-                    None,
-                    None,
-                    "Style",
-                )
-                .unwrap();
+                let mut command = json!({"op":"effect.add","layer":layer,"kind":kind});
+                if kind == "pattern_overlay" {
+                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    let png = if depth == 16 {
+                        crate::raster::png16(1, 1, &[57313, 16317, 29119, 65535]).unwrap()
+                    } else {
+                        crate::raster::png(1, 1, &[223, 63, 113, 255]).unwrap()
+                    };
+                    command["settings"] =
+                        json!({"pattern":"bitmap","bitmap_png":STANDARD.encode(png)});
+                }
+                e.edit("human", &[command], None, None, "Style").unwrap();
                 e.undo.clear();
                 let before = e.doc.clone();
                 let effect = e.doc.layers[0].effects[0].id.clone();

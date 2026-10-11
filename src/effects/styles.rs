@@ -18,6 +18,9 @@ pub const KINDS: &[&str] = &[
 pub fn contains(kind: &str) -> bool {
     KINDS.contains(&kind)
 }
+pub fn bitmap_defaults() -> Value {
+    json!({"bitmap_png":"", "bitmap_scale":1., "bitmap_angle":0., "phase_x":0., "phase_y":0., "sampling":"bilinear"})
+}
 pub fn defaults(kind: &str) -> Value {
     let mut v = json!({"opacity":0.75,"blend":"normal"});
     match kind {
@@ -110,11 +113,13 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
         return Err("Unsupported layer-style effect".into());
     }
     let defaults = defaults(kind);
+    let bitmap = crate::effects::patterns::active(kind, value);
+    let bitmap_defaults = bitmap_defaults();
     for (key, v) in value
         .as_object()
         .ok_or("Layer-style settings must be an object")?
     {
-        if defaults.get(key).is_none() {
+        if defaults.get(key).is_none() && !(bitmap && bitmap_defaults.get(key).is_some()) {
             return Err(format!("Unsupported {kind} setting: {key}"));
         }
         match key.as_str() {
@@ -144,7 +149,16 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                 }
             }
             "contour" => choice(v, &["linear", "cone", "ring", "smooth"], key)?,
+            "pattern" if kind == "pattern_overlay" => {
+                choice(v, &["checker", "stripes", "dots", "noise", "bitmap"], key)?
+            }
             "pattern" => choice(v, &["checker", "stripes", "dots", "noise"], key)?,
+            "bitmap_png" => {
+                crate::effects::patterns::get(
+                    v.as_str().ok_or("bitmap_png must be base64 PNG text")?,
+                )?;
+            }
+            "sampling" => choice(v, &["bilinear", "nearest"], key)?,
             "position" => choice(v, &["inside", "outside", "center"], key)?,
             "source" => choice(v, &["edge", "center"], key)?,
             "style" if kind == "bevel_emboss" => {
@@ -166,6 +180,9 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                     "scale" if kind == "gradient_overlay" => (0.1, 10.),
                     "scale" => (1., 128.),
                     "depth" => (0., 10.),
+                    "bitmap_scale" => (0.01, 8.),
+                    "bitmap_angle" => (-180., 180.),
+                    "phase_x" | "phase_y" => (-32768., 32768.),
                     _ => return Err("Unknown numeric style parameter".into()),
                 };
                 if v.as_f64()
@@ -173,6 +190,18 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                 {
                     return Err(format!("{key} must be {min}–{max}"));
                 }
+            }
+        }
+    }
+    if bitmap {
+        crate::effects::patterns::get(
+            value["bitmap_png"]
+                .as_str()
+                .ok_or("Bitmap pattern requires bitmap_png")?,
+        )?;
+        for key in ["color", "color2", "scale", "invert"] {
+            if value.get(key).is_some_and(|v| *v != defaults[key]) {
+                return Err(format!("{key} applies only to procedural patterns"));
             }
         }
     }
@@ -328,6 +357,7 @@ pub fn apply(
     let color = rgb(v, "color");
     let color2 = rgb(v, "color2");
     let opacity = number(v, "opacity");
+    let bitmap = crate::effects::patterns::from_settings(kind, v)?;
     let blend = v["blend"].as_str().unwrap_or("normal");
     let contour = v["contour"].as_str().unwrap_or("linear");
     for y in 0..h {
@@ -364,10 +394,17 @@ pub fn apply(
                     });
                 }
                 "pattern_overlay" => {
-                    let t = pattern(x as f64, y as f64, v);
-                    tint = std::array::from_fn(|c| {
-                        ((1. - t) * f64::from(color[c]) + t * f64::from(color2[c])).round() as u16
-                    });
+                    if let Some(bitmap) = &bitmap {
+                        let sample = bitmap.sample(x as f64, y as f64, v);
+                        tint = sample[..3].try_into().unwrap();
+                        coverage = f64::from(sample[3]) / 65535.;
+                    } else {
+                        let t = pattern(x as f64, y as f64, v);
+                        tint = std::array::from_fn(|c| {
+                            ((1. - t) * f64::from(color[c]) + t * f64::from(color2[c])).round()
+                                as u16
+                        });
+                    }
                 }
                 "texture" => {
                     let light = (pattern(x as f64 + angle.cos(), y as f64 - angle.sin(), v)

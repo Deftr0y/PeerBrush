@@ -18,6 +18,7 @@ mod image_open;
 mod layers;
 mod lifecycle;
 mod liquify;
+mod pattern_source;
 mod pen;
 #[cfg(test)]
 mod pen_tests;
@@ -4446,6 +4447,7 @@ impl PeerBrush {
             ctx.request_repaint_after(Duration::from_millis(16));
             return;
         }
+        pattern_source::poll(self, ctx);
         if self.lifecycle.is_some() || self.lifecycle_frame {
             // The review owns keyboard/canvas input for the entire frame.
         } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

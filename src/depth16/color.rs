@@ -154,7 +154,7 @@ fn balance(rgb: [f64; 3], settings: &Value) -> [f64; 3] {
 pub fn working_bytes(width: u32, height: u32, kind: &str, settings: &Value) -> Result<u64, String> {
     let pixels = u64::from(width) * u64::from(height);
     if effects::styles::contains(kind) {
-        return Ok(effects::styles::working_bytes(width, height));
+        return effects::working_bytes(kind, width, height, settings);
     }
     if matches!(kind, "blur" | "bloom") {
         Ok(pixels * 16 + 1040)

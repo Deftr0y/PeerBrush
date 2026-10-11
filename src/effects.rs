@@ -12,6 +12,7 @@ pub const BUDGET: usize = 256 * 1024 * 1024;
 pub const WORKING_BUDGET: usize = 256 * 1024 * 1024;
 pub mod catalog;
 pub mod channel_clamp;
+pub mod patterns;
 pub mod posterize;
 pub mod styles;
 pub const KINDS: &[&str] = &[
@@ -276,6 +277,11 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
 pub fn normalized(kind: &str, settings: &Value) -> Result<Value, String> {
     validate(kind, settings)?;
     let mut result = defaults(kind);
+    if patterns::active(kind, settings) {
+        for (key, value) in styles::bitmap_defaults().as_object().unwrap() {
+            result[key] = value.clone();
+        }
+    }
     if kind == "curves" && settings.get("interpolation").is_none() {
         result["interpolation"] = json!("linear");
     }
@@ -300,7 +306,8 @@ pub fn color_only(kind: &str) -> bool {
 pub fn working_bytes(kind: &str, width: u32, height: u32, settings: &Value) -> Result<u64, String> {
     let pixels = width as u64 * height as u64;
     if styles::contains(kind) {
-        return Ok(styles::working_bytes(width, height));
+        return Ok(styles::working_bytes(width, height)
+            + patterns::from_settings(kind, settings)?.map_or(0, |b| b.bytes() as u64));
     }
     match kind {
         "blur" | "bloom" => Ok(pixels * 8 + width.max(height) as u64 * 8),
@@ -464,6 +471,7 @@ pub fn active(l: &Layer) -> bool {
     l.kind == "adjustment" || l.effects.iter().any(|e| e.enabled && e.weight > 0.0)
 }
 pub fn validate_budget(doc: &Document) -> Result<(), String> {
+    patterns::validate_document(doc)?;
     crate::filters::validate(doc)?;
     for layer in &doc.layers {
         validate_target(layer)?;
@@ -481,11 +489,7 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
         })
         .sum();
     for layer in doc.layers.iter().filter(|l| active(l)) {
-        let (w, h) = if ["group", "adjustment"].contains(&layer.kind.as_str()) {
-            (doc.width, doc.height)
-        } else {
-            (layer.pixels.width, layer.pixels.height)
-        };
+        let (w, h) = frame(doc, layer);
         for effect in layer.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
             if weighted_working_bytes(effect, w, h)? > WORKING_BUDGET as u64 {
                 return Err("Effect working buffers exceed the 256 MiB budget; reduce the affected layer dimensions".into());

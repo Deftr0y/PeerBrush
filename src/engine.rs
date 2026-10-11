@@ -217,6 +217,12 @@ impl Document {
     pub(crate) fn ensure_depth(&mut self) {
         if self.layers.iter().any(|l| {
             l.pixels.depth == 16
+                || l.effects.iter().any(|e| {
+                    crate::effects::patterns::from_settings(&e.kind, &e.settings)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|b| b.depth == 16)
+                })
                 || l.mask
                     .as_ref()
                     .is_some_and(|m| m.steps.iter().any(|s| s.pixels.depth == 16))
@@ -232,6 +238,13 @@ impl Document {
                     }
                 }
             }
+        }
+        if self.layers.iter().any(|l| {
+            l.effects
+                .iter()
+                .any(|e| crate::effects::patterns::active(&e.kind, &e.settings))
+        }) {
+            self.srgb_tagged = true;
         }
     }
     pub fn preview(
@@ -1575,6 +1588,18 @@ impl Engine {
             let depth = c["bit_depth"].as_u64().unwrap_or(self.doc.bit_depth as u64);
             if ![8, 16].contains(&depth) {
                 return Err("Choose 8 or 16 bit channels".into());
+            }
+            if depth == 8
+                && self.doc.layers.iter().any(|l| {
+                    l.effects.iter().any(|e| {
+                        crate::effects::patterns::from_settings(&e.kind, &e.settings)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|b| b.depth == 16)
+                    })
+                })
+            {
+                return Err("Replace 16-bit bitmap patterns with explicitly converted 8-bit PNGs before lowering document precision".into());
             }
             if depth != self.doc.bit_depth as u64 {
                 for layer in &mut self.doc.layers {

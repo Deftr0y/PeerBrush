@@ -842,6 +842,9 @@ impl PeerBrush {
                             self.effect_weight(ui, &effect.id, effect.weight, false);
                         });
                         if self.effect_is_selected(&l.id, false, &effect.id) {
+                            if effect.kind == "pattern_overlay" {
+                                pattern_source::control(self, ui, l, effect, revision);
+                            }
                             if effect.kind == "liquify"
                                 && ui
                                     .button("Edit on canvas")

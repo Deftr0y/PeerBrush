@@ -58,6 +58,7 @@ pub fn display_pixel(pixel: Pixel16) -> [u8; 4] {
     bytes
 }
 pub fn validate_budget(doc: &Document) -> Result<(), String> {
+    crate::effects::patterns::validate_document(doc)?;
     check_size(doc.width, doc.height)?;
     crate::filters::validate(doc)?;
     let mut colors = 0u64;

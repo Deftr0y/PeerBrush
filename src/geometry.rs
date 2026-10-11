@@ -129,7 +129,11 @@ pub fn plan(doc: &Document, c: &Value) -> Result<Plan, String> {
                 &effect.kind,
                 &mut settings,
                 scale,
-                if world { offset } else { [0, 0] },
+                if world || crate::effects::patterns::active(&effect.kind, &effect.settings) {
+                    offset
+                } else {
+                    [0, 0]
+                },
                 proportional,
             )?;
             effects.push(settings);
@@ -255,7 +259,16 @@ pub(crate) fn map_effect(
         settings[key] =
             json!(crate::effects::number(settings, key, default) * (scale[0] * scale[1]).sqrt());
     }
-    if crate::effects::styles::contains(kind) && scale != [1., 1.] {
+    if crate::effects::patterns::active(kind, settings) {
+        settings["bitmap_scale"] =
+            json!(settings["bitmap_scale"].as_f64().unwrap_or(1.) * f64::from(scale[0]));
+        for (axis, key) in ["phase_x", "phase_y"].into_iter().enumerate() {
+            settings[key] = json!(
+                settings[key].as_f64().unwrap_or(0.) * f64::from(scale[axis])
+                    + f64::from(offset[axis])
+            );
+        }
+    } else if crate::effects::styles::contains(kind) && scale != [1., 1.] {
         let defaults = crate::effects::styles::defaults(kind);
         for key in ["size", "soften", "distance", "scale"] {
             if key == "scale" && kind == "gradient_overlay" {
