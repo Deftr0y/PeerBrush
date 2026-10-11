@@ -150,26 +150,40 @@ fn pattern_resource(depth: u16, identity: &str) -> Vec<u8> {
     pattern_resource_compression(depth, identity, 0)
 }
 fn pattern_resource_compression(depth: u16, identity: &str, compression: u8) -> Vec<u8> {
+    pattern_resource_pixels(depth, identity, compression, PATTERN, false)
+}
+fn pattern_resource_pixels(
+    depth: u16,
+    identity: &str,
+    compression: u8,
+    pixels: [[u16; 4]; 2],
+    alpha: bool,
+) -> Vec<u8> {
     let rect = [0i32, 0, 1, 2]
         .into_iter()
         .flat_map(i32::to_be_bytes)
         .collect::<Vec<_>>();
     let mut arrays = rect.clone();
     arrays.extend(3u32.to_be_bytes());
-    for channel in 0..3 {
+    for slot in 0..5 {
+        if slot == 3 || (slot == 4 && !alpha) {
+            arrays.extend(0u32.to_be_bytes());
+            continue;
+        }
+        let channel = if slot == 4 { 3 } else { slot };
         arrays.extend(1u32.to_be_bytes());
         let mut data = u32::from(depth).to_be_bytes().to_vec();
         data.extend(&rect);
         data.extend(depth.to_be_bytes());
         data.push(compression);
         let mut row = Vec::new();
-        for (i, pixel) in PATTERN.iter().enumerate() {
+        for (i, pixel) in pixels.iter().enumerate() {
             let n = native(pixel[channel], depth);
             if compression == 3 {
                 let prev = if i == 0 {
                     0
                 } else {
-                    native(PATTERN[i - 1][channel], depth)
+                    native(pixels[i - 1][channel], depth)
                 };
                 if depth == 16 {
                     row.extend(n.wrapping_sub(prev).to_be_bytes());
@@ -188,12 +202,15 @@ fn pattern_resource_compression(depth: u16, identity: &str, compression: u8) -> 
             let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
             z.write_all(&row).unwrap();
             data.extend(z.finish().unwrap());
+        } else if compression == 1 {
+            data.extend(((row.len() + 1) as u16).to_be_bytes());
+            data.push(row.len() as u8 - 1);
+            data.extend(row);
         } else {
             data.extend(row);
         }
         block(&mut arrays, &data);
     }
-    arrays.extend([0; 8]);
     let mut pattern = 1u32.to_be_bytes().to_vec();
     pattern.extend(3u32.to_be_bytes());
     pattern.extend(1i16.to_be_bytes());
@@ -290,6 +307,127 @@ fn plain_photoshop_pattern_import_retains_native_tiles_sources_and_editable_save
                     assert!(!reopened.read_only);
                     assert_eq!(reopened.export_png().unwrap(), rendered);
                     assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                }
+            }
+        }
+    }
+}
+#[test]
+fn transparent_photoshop_patterns_retain_native_sources_blends_guards_and_working_saves() {
+    for depth in [8, 16] {
+        for compression in [0, 1, 2, 3] {
+            for alpha in [[0, 41317], [65535, 1]] {
+                let mut pixels = PATTERN;
+                for x in 0..2 {
+                    pixels[x][3] = alpha[x];
+                }
+                for enabled in [true, false] {
+                    for (mode, opacity) in [(b"Nrml", 100f64), (b"Mltp", 37f64)] {
+                        let mut payload = pattern_payload(enabled, "synthetic-pattern", "", 100.);
+                        let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
+                        payload[at..at + 4].copy_from_slice(mode);
+                        let at = payload
+                            .windows(12)
+                            .position(|v| v == b"OpctUntF#Prc")
+                            .unwrap()
+                            + 12;
+                        payload[at..at + 8].copy_from_slice(&opacity.to_be_bytes());
+                        let mut spec = Spec::paint("Synthetic transparent pattern", SAVED);
+                        spec.tags.push((*b"lfx2", payload));
+                        let mut bytes = inject_pattern(
+                            fixture(&[spec], depth),
+                            depth,
+                            &pattern_resource_pixels(
+                                depth,
+                                "synthetic-pattern",
+                                compression,
+                                pixels,
+                                true,
+                            ),
+                            false,
+                        );
+                        let mut merged = SAVED.map(|p| p.map(|n| native(n, depth)));
+                        if enabled {
+                            for x in 0..2 {
+                                let coverage =
+                                    (f64::from(native(alpha[x], depth)) * opacity / 100.).round()
+                                        / 65535.;
+                                for c in 0..3 {
+                                    let base = f64::from(merged[x][c]) / 65535.;
+                                    let tile = f64::from(native(pixels[x][c], depth)) / 65535.;
+                                    let color = if mode == b"Mltp" { base * tile } else { tile };
+                                    merged[x][c] = native(
+                                        ((base * (1. - coverage) + color * coverage) * 65535.)
+                                            .round() as u16,
+                                        depth,
+                                    );
+                                }
+                            }
+                        }
+                        bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                        for c in 0..4 {
+                            for pixel in merged {
+                                composite_sample(&mut bytes, pixel, c, depth);
+                            }
+                        }
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(!doc.read_only, "{:?}", doc.warnings);
+                        assert_eq!(
+                            rendered(&doc),
+                            merged.into_iter().flatten().collect::<Vec<_>>()
+                        );
+                        let source = doc.layers[0].pixels.rgba16();
+                        let rendered = doc.export_png().unwrap();
+                        let bitmap = doc.layers[0].effects[0].settings["bitmap_png"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned();
+                        use base64::Engine as _;
+                        let png = base64::engine::general_purpose::STANDARD
+                            .decode(&bitmap)
+                            .unwrap();
+                        assert_eq!(
+                            image::load_from_memory(&png)
+                                .unwrap()
+                                .into_rgba16()
+                                .into_raw(),
+                            pixels
+                                .into_iter()
+                                .flatten()
+                                .map(|v| native(v, depth))
+                                .collect::<Vec<_>>()
+                        );
+                        let mut e = Engine::new();
+                        e.doc = doc;
+                        let id = e.doc.layers[0].id.clone();
+                        let effect = e.doc.layers[0].effects[0].id.clone();
+                        let mut settings = e.doc.layers[0].effects[0].settings.clone();
+                        settings["phase_x"] = json!(1.);
+                        e.edit("human",&[json!({"op":"effect.update","layer":id,"effect":effect,"settings":settings})],None,None,"Transparent phase").unwrap();
+                        assert_eq!(e.undo.len(), 1);
+                        assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+                        e.undo("human").unwrap();
+                        assert_eq!(e.doc.export_png().unwrap(), rendered);
+                        for large in [false, true] {
+                            let saved = if large {
+                                psd::encode_psb(&e.doc).unwrap()
+                            } else {
+                                psd::encode(&e.doc).unwrap()
+                            };
+                            let reopened = psd::decode(&saved).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.export_png().unwrap(), rendered);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(
+                                reopened.layers[0].effects[0].settings["bitmap_png"],
+                                bitmap
+                            );
+                        }
+                        // Even one encoded composite sample disagreement protects the whole source.
+                        let at = bytes.len() - 8 * usize::from(depth / 8);
+                        bytes[at] ^= 1;
+                        assert!(psd::decode(&bytes).unwrap().read_only);
+                    }
                 }
             }
         }
