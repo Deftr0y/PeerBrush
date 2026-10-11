@@ -963,7 +963,7 @@ fn mismatched_or_unsupported_photoshop_color_overlays_remain_protected() {
             match variant {
                 0 => {
                     let at = payload.windows(4).position(|b| b == b"Nrml").unwrap();
-                    payload[at..at + 4].copy_from_slice(b"Mltp");
+                    payload[at..at + 4].copy_from_slice(b"????");
                 }
                 1 => spec.mask = Some([65535, 65535]),
                 2 => spec.clipping = 1,
@@ -983,6 +983,64 @@ fn mismatched_or_unsupported_photoshop_color_overlays_remain_protected() {
             assert!(doc.read_only, "variant {variant}");
             assert_eq!(doc.layers.len(), 1);
             assert!(doc.layers[0].effects.is_empty());
+            for x in 0..2 {
+                assert_eq!(
+                    doc.layers[0].pixels.get16(x, 0),
+                    SAVED[x as usize].map(|n| native(n, depth))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn photoshop_overlay_blend_enum_import_uses_exact_native_composite_gate() {
+    for depth in [8, 16] {
+        for (ps_mode, mode) in [
+            (b"Mltp", "multiply"),
+            (b"Scrn", "screen"),
+            (b"Ovrl", "overlay"),
+            (b"Drkn", "darken"),
+            (b"Lghn", "lighten"),
+        ] {
+            let mut payload = overlay_payload(true, true, [111., 67., 231.]);
+            let at = payload.windows(4).position(|b| b == b"Nrml").unwrap();
+            payload[at..at + 4].copy_from_slice(ps_mode);
+            let mut spec = Spec::paint("Synthetic blend style", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            let mut bytes = fixture(&[spec], depth);
+            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+            let colors = [111., 67., 231.];
+            let mut expected = [[0u16; 4]; 2];
+            for x in 0..2 {
+                for c in 0..3 {
+                    let b = f64::from(native(SAVED[x][c], depth)) / 65535.;
+                    let s = colors[c] / 255.;
+                    let n = match mode {
+                        "multiply" => b * s,
+                        "screen" => b + s - b * s,
+                        "overlay" => {
+                            if b <= 0.5 {
+                                2. * b * s
+                            } else {
+                                1. - 2. * (1. - b) * (1. - s)
+                            }
+                        }
+                        "darken" => b.min(s),
+                        _ => b.max(s),
+                    };
+                    expected[x][c] = native((n * 65535.).round() as u16, depth);
+                }
+                expected[x][3] = 65535;
+            }
+            for c in 0..4 {
+                for p in expected {
+                    sample(&mut bytes, p[c], depth);
+                }
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{mode}, {depth}: {:?}", doc.warnings);
+            assert_eq!(doc.layers[0].effects[0].settings["blend"], mode);
             for x in 0..2 {
                 assert_eq!(
                     doc.layers[0].pixels.get16(x, 0),

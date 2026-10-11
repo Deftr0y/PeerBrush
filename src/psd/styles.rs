@@ -315,9 +315,18 @@ pub(super) fn color_overlays(bytes: &[u8]) -> Result<Vec<crate::effects::Effect>
             return Err("Invalid Color Overlay dialog state".into());
         }
         let mode = &entry["value"]["items"]["Md  "];
-        if mode["type"] != "enum" || mode["value"] != json!(["BlnM", "Nrml"]) {
-            return Err("Only Normal Photoshop Color Overlay blend can be imported".into());
+        if mode["type"] != "enum" || mode["value"][0] != "BlnM" {
+            return Err("Invalid Photoshop Color Overlay blend enumeration".into());
         }
+        let blend = match mode["value"][1].as_str() {
+            Some("Nrml") => "normal",
+            Some("Mltp") => "multiply",
+            Some("Scrn") => "screen",
+            Some("Ovrl") => "overlay",
+            Some("Drkn") => "darken",
+            Some("Lghn") => "lighten",
+            _ => return Err("Unsupported Photoshop Color Overlay blend remains protected".into()),
+        };
         let opacity = percent(&entry["value"]["items"]["Opct"])?;
         let color = &entry["value"]["items"]["Clr "];
         if !matches!(color["type"].as_str(), Some("Objc" | "GlbO"))
@@ -343,7 +352,7 @@ pub(super) fn color_overlays(bytes: &[u8]) -> Result<Vec<crate::effects::Effect>
             }
             rgb.push(n / 255.);
         }
-        let settings = json!({"opacity":opacity,"blend":"normal","color":rgb});
+        let settings = json!({"opacity":opacity,"blend":blend,"color":rgb});
         crate::effects::validate("color_overlay", &settings)?;
         effects.push(crate::effects::Effect {
             id: crate::engine::id(),
