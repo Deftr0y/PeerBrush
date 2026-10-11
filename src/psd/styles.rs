@@ -250,7 +250,7 @@ fn overlay_blend(value: &Value) -> Result<&'static str, String> {
         _ => Err("Unsupported Photoshop overlay blend remains protected".into()),
     }
 }
-pub(super) fn native_overlays(
+pub(super) fn native_styles(
     bytes: &[u8],
     patterns: &[super::patterns::Source],
     depth: u16,
@@ -262,6 +262,14 @@ pub(super) fn native_overlays(
     let items = parsed["items"]
         .as_object()
         .ok_or("Invalid effects object")?;
+    if items.keys().any(|key| {
+        matches!(
+            key.as_str(),
+            "DrSh" | "IrSh" | "dropShadowMulti" | "innerShadowMulti"
+        )
+    }) {
+        return Ok((vec![hard_shadow(&parsed)?], None));
+    }
     if items.keys().any(|key| {
         !matches!(
             key.as_str(),
@@ -337,6 +345,140 @@ pub(super) fn native_overlays(
         return Err("No supported Photoshop overlay definitions".into());
     }
     Ok((effects, pattern_index))
+}
+// Shadow fields follow psd-tools/api/effects.py and Krita's ASL serializer.
+// Keep this separate from overlay stacks: exterior/interior combinations need
+// independent effect-source and backdrop handling rather than sequential tinting.
+fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
+    let items = root["items"].as_object().ok_or("Invalid effects object")?;
+    if items
+        .keys()
+        .any(|key| !matches!(key.as_str(), "masterFXSwitch" | "Scl " | "DrSh" | "IrSh"))
+        || items.contains_key("DrSh") == items.contains_key("IrSh")
+        || items.get("Scl ").is_some_and(|v| percent(v) != Ok(1.))
+    {
+        return Err(
+            "Only a single unscaled hard shadow without other styles can be imported".into(),
+        );
+    }
+    let master = boolean(field(items, "masterFXSwitch")).ok_or("Missing style master switch")?;
+    let (key, kind) = if items.contains_key("DrSh") {
+        ("DrSh", "drop_shadow")
+    } else {
+        ("IrSh", "inner_shadow")
+    };
+    let fields = descriptor(field(items, key), key)?;
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "enab"
+                | "present"
+                | "showInDialog"
+                | "Md  "
+                | "Opct"
+                | "Clr "
+                | "uglg"
+                | "lagl"
+                | "Dstn"
+                | "Ckmt"
+                | "blur"
+                | "Nose"
+                | "AntA"
+                | "TrnS"
+        ) && !(kind == "drop_shadow" && key == "layerConceals")
+    }) {
+        return Err("Unsupported Photoshop hard shadow property".into());
+    }
+    let required_bool =
+        |key: &str| boolean(field(fields, key)).ok_or("Missing or invalid shadow boolean");
+    let enabled = required_bool("enab")?;
+    let present = required_bool("present")?;
+    if fields
+        .get("showInDialog")
+        .is_some_and(|v| boolean(v).is_none())
+        || required_bool("uglg")?
+        || required_bool("AntA")?
+        || kind == "drop_shadow" && !required_bool("layerConceals")?
+    {
+        return Err("Global-light, antialiased or non-knockout shadows remain protected".into());
+    }
+    let unit = |key: &str, unit: &str| -> Result<f64, String> {
+        let value = field(fields, key);
+        if value["type"] != "UntF" || value["value"][0] != unit {
+            return Err("Invalid Photoshop shadow unit".into());
+        }
+        value["value"][1]
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .ok_or("Invalid Photoshop shadow number".into())
+    };
+    let angle = unit("lagl", "#Ang")?;
+    let distance = unit("Dstn", "#Pxl")?;
+    if ![-180., -90., 0., 90., 180.].contains(&angle)
+        || !(0.0..=128.).contains(&distance)
+        || distance.fract() != 0.
+        || unit("blur", "#Pxl")? != 0.
+        || unit("Ckmt", "#Pxl")? != 0.
+        || percent(field(fields, "Nose"))? != 0.
+    {
+        return Err("Only cardinal, integer-distance shadows with zero size, choke and noise can be imported".into());
+    }
+    let contour = descriptor(field(fields, "TrnS"), "ShpC")?;
+    if contour
+        .keys()
+        .any(|key| !matches!(key.as_str(), "Nm  " | "Crv "))
+        || contour.get("Nm  ").is_some_and(|v| v["type"] != "TEXT")
+        || field(contour, "Crv ")["type"] != "VlLs"
+    {
+        return Err("Hard shadow requires an explicit linear contour".into());
+    }
+    let points = field(contour, "Crv ")["value"]
+        .as_array()
+        .filter(|v| v.len() == 2)
+        .ok_or("Hard shadow requires two contour endpoints")?;
+    for (point, expected) in points.iter().zip([0., 255.]) {
+        let point = descriptor(point, "CrPt")?;
+        if point.len() != 2
+            || plain_number(field(point, "Hrzn"))? != expected
+            || plain_number(field(point, "Vrtc"))? != expected
+        {
+            return Err("Nonlinear or malformed Photoshop shadow contour remains protected".into());
+        }
+    }
+    let rgb = descriptor(field(fields, "Clr "), "RGBC")?;
+    if rgb.len() != 3
+        || rgb
+            .keys()
+            .any(|key| !matches!(key.as_str(), "Rd  " | "Grn " | "Bl  "))
+    {
+        return Err("Only plain RGB Photoshop shadow colors can be imported".into());
+    }
+    let mut color = Vec::with_capacity(3);
+    for key in ["Rd  ", "Grn ", "Bl  "] {
+        let channel = plain_number(field(rgb, key))?;
+        if !(0.0..=255.).contains(&channel) {
+            return Err("Shadow RGB channel is outside 0–255".into());
+        }
+        color.push(channel / 255.);
+    }
+    let blend = overlay_blend(field(fields, "Md  "))?;
+    if kind == "drop_shadow" && blend != "normal" {
+        return Err("Independent Photoshop Drop Shadow backdrop blends remain protected".into());
+    }
+    // Photoshop's angle locates the light; native angle locates displacement.
+    let angle = (angle + 360.).rem_euclid(360.) - 180.;
+    let mut settings = json!({"opacity":percent(field(fields,"Opct"))?,"color":color,"angle":angle,"distance":distance,"size":0.,"spread":0.,"contour":"linear"});
+    if kind == "inner_shadow" {
+        settings["blend"] = json!(blend);
+    }
+    crate::effects::validate(kind, &settings)?;
+    Ok(crate::effects::Effect {
+        id: crate::engine::id(),
+        kind: kind.into(),
+        enabled: master && enabled && present,
+        weight: 1.,
+        settings,
+    })
 }
 fn pattern_overlay(
     root: &Value,

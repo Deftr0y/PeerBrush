@@ -2411,3 +2411,341 @@ fn styled_clipped_rasters_without_a_compatible_base_keep_native_composites_prote
         assert_eq!(doc.bit_depth, depth);
     }
 }
+
+fn hard_shadow_payload(
+    kind: &str,
+    enabled: bool,
+    master: bool,
+    angle: f64,
+    opacity: f64,
+    variant: &str,
+) -> Vec<u8> {
+    let unit = |unit: &[u8; 4], n: f64| [unit.to_vec(), n.to_be_bytes().to_vec()].concat();
+    let mut mode = vec![];
+    overlay_id(&mut mode, "BlnM");
+    overlay_id(&mut mode, if variant == "blend" { "Mltp" } else { "Nrml" });
+    let mut curve = 2u32.to_be_bytes().to_vec();
+    for endpoint in [0f64, 255.] {
+        curve.extend(b"Objc");
+        curve.extend(overlay_descriptor(
+            "CrPt",
+            vec![
+                ("Hrzn", b"doub", endpoint.to_be_bytes().to_vec()),
+                (
+                    "Vrtc",
+                    b"doub",
+                    (if variant == "contour" && endpoint == 255. {
+                        254.
+                    } else {
+                        endpoint
+                    })
+                    .to_be_bytes()
+                    .to_vec(),
+                ),
+            ],
+        ));
+    }
+    let mut properties = vec![
+        ("enab", b"bool", vec![u8::from(enabled)]),
+        ("present", b"bool", vec![1]),
+        ("showInDialog", b"bool", vec![1]),
+        ("Md  ", b"enum", mode),
+        ("Opct", b"UntF", unit(b"#Prc", opacity)),
+        (
+            "Clr ",
+            b"Objc",
+            overlay_descriptor(
+                "RGBC",
+                vec![
+                    ("Rd  ", b"doub", 111f64.to_be_bytes().to_vec()),
+                    ("Grn ", b"doub", 67f64.to_be_bytes().to_vec()),
+                    ("Bl  ", b"doub", 231f64.to_be_bytes().to_vec()),
+                ],
+            ),
+        ),
+        ("uglg", b"bool", vec![u8::from(variant == "global")]),
+        ("AntA", b"bool", vec![u8::from(variant == "antialias")]),
+        (
+            "lagl",
+            b"UntF",
+            unit(b"#Ang", if variant == "angle" { 45. } else { angle }),
+        ),
+        (
+            "Dstn",
+            b"UntF",
+            unit(
+                b"#Pxl",
+                if variant == "fractional" {
+                    0.5
+                } else if variant == "distance" {
+                    129.
+                } else {
+                    1.
+                },
+            ),
+        ),
+        (
+            "Ckmt",
+            b"UntF",
+            unit(b"#Pxl", if variant == "choke" { 1. } else { 0. }),
+        ),
+        (
+            "blur",
+            b"UntF",
+            unit(b"#Pxl", if variant == "size" { 1. } else { 0. }),
+        ),
+        (
+            "Nose",
+            b"UntF",
+            unit(b"#Prc", if variant == "noise" { 1. } else { 0. }),
+        ),
+        (
+            "TrnS",
+            b"Objc",
+            overlay_descriptor(
+                "ShpC",
+                vec![
+                    ("Nm  ", b"TEXT", pattern_text("Synthetic linear contour")),
+                    ("Crv ", b"VlLs", curve),
+                ],
+            ),
+        ),
+    ];
+    if kind == "DrSh" {
+        properties.push((
+            "layerConceals",
+            b"bool",
+            vec![u8::from(variant != "knockout")],
+        ));
+    }
+    if variant == "unknown" {
+        properties.push(("unsupportedShadowField", b"bool", vec![0]));
+    }
+    if variant == "missing" {
+        properties.retain(|(key, _, _)| *key != "TrnS");
+    }
+    let mut entries = vec![
+        ("masterFXSwitch", b"bool", vec![u8::from(master)]),
+        ("Scl ", b"UntF", unit(b"#Prc", 100.)),
+        (kind, b"Objc", overlay_descriptor(kind, properties)),
+    ];
+    if variant == "mixed" {
+        entries.push(("SoFi", b"Objc", overlay_descriptor("SoFi", vec![])));
+    }
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        overlay_descriptor("Lefx", entries),
+    ]
+    .concat()
+}
+fn shadow_fixture(
+    depth: u16,
+    kind: &str,
+    enabled: bool,
+    master: bool,
+    vertical: bool,
+    positive: bool,
+    opacity: f64,
+    variant: &str,
+) -> (Vec<u8>, Vec<u16>) {
+    let angle = if vertical {
+        if positive {
+            90.
+        } else {
+            -90.
+        }
+    } else if positive {
+        180.
+    } else {
+        0.
+    };
+    let source = if kind == "DrSh" {
+        [[12347, 23459, 34571, 65535], [54321, 32123, 11223, 0]]
+    } else {
+        SAVED
+    };
+    let mut spec = Spec::paint("Synthetic hard shadow", source);
+    if variant == "mask" {
+        spec.mask = Some([65535; 2]);
+    }
+    if variant == "opacity" {
+        spec.opacity = 128;
+    }
+    if variant == "partial" {
+        spec.pixels[0][3] = 12347;
+    }
+    if variant == "clip" {
+        spec.clipping = 1;
+    }
+    spec.tags.push((
+        *b"lfx2",
+        hard_shadow_payload(kind, enabled, master, angle, opacity, variant),
+    ));
+    let mut merged = source.map(|p| {
+        if p[3] == 0 {
+            [0; 4]
+        } else {
+            p.map(|n| native(n, depth))
+        }
+    });
+    let tint = [111 * 257, 67 * 257, 231 * 257];
+    if master && enabled {
+        let alpha = (65535. * opacity / 100.).round() as u16;
+        if kind == "DrSh" {
+            if positive {
+                merged[1] = [tint[0], tint[1], tint[2], native(alpha, depth)];
+            }
+        } else {
+            let index = if positive { 0 } else { 1 };
+            for c in 0..3 {
+                merged[index][c] = native(
+                    ((f64::from(merged[index][c]) * f64::from(65535 - alpha)
+                        + f64::from(tint[c]) * f64::from(alpha))
+                        / 65535.)
+                        .round() as u16,
+                    depth,
+                );
+            }
+        }
+    }
+    let mut bytes = fixture_size(
+        &[spec],
+        depth,
+        if vertical { 1 } else { 2 },
+        if vertical { 2 } else { 1 },
+    );
+    bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+    for c in 0..4 {
+        for p in merged {
+            sample(&mut bytes, p[c], depth);
+        }
+    }
+    (bytes, merged.into_iter().flatten().collect())
+}
+#[test]
+fn bounded_hard_photoshop_shadows_retain_native_sources_orientation_bypass_undo_and_saves() {
+    for depth in [8, 16] {
+        for kind in ["DrSh", "IrSh"] {
+            for vertical in [false, true] {
+                for positive in [false, true] {
+                    for opacity in [50., 100.] {
+                        for flags in 0u8..4 {
+                            let (bytes, expected) = shadow_fixture(
+                                depth,
+                                kind,
+                                flags & 1 != 0,
+                                flags & 2 != 0,
+                                vertical,
+                                positive,
+                                opacity,
+                                "",
+                            );
+                            let doc = psd::decode(&bytes).unwrap();
+                            assert!(
+                                !doc.read_only,
+                                "{depth} {kind} {vertical} {positive} {opacity} {flags}: {:?}",
+                                doc.warnings
+                            );
+                            assert_eq!(rendered(&doc), expected);
+                            assert_eq!(doc.layers[0].effects.len(), 1);
+                            assert_eq!(
+                                doc.layers[0].effects[0].kind,
+                                if kind == "DrSh" {
+                                    "drop_shadow"
+                                } else {
+                                    "inner_shadow"
+                                }
+                            );
+                            assert_eq!(doc.layers[0].effects[0].enabled, flags == 3);
+                            let source = doc.layers[0].pixels.rgba16();
+                            let current = doc.export_png().unwrap();
+                            let mut engine = Engine::new();
+                            engine.doc = doc;
+                            let layer = engine.doc.layers[0].id.clone();
+                            let effect = engine.doc.layers[0].effects[0].id.clone();
+                            engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":flags!=3})],None,None,"Hard shadow bypass").unwrap();
+                            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                            assert_eq!(engine.undo.len(), 1);
+                            engine.undo("human").unwrap();
+                            assert_eq!(engine.doc.export_png().unwrap(), current);
+                            for bytes in [
+                                psd::encode(&engine.doc).unwrap(),
+                                psd::encode_psb(&engine.doc).unwrap(),
+                            ] {
+                                let reopened = psd::decode(&bytes).unwrap();
+                                assert!(!reopened.read_only);
+                                assert_eq!(reopened.export_png().unwrap(), current);
+                                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                                assert_eq!(
+                                    reopened.layers[0].effects[0].settings,
+                                    engine.doc.layers[0].effects[0].settings
+                                );
+                            }
+                            let standard =
+                                psd::decode(&ordinary(&psd::encode(&engine.doc).unwrap())).unwrap();
+                            assert!(!standard.read_only);
+                            assert_eq!(standard.export_png().unwrap(), current);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
+fn unsupported_hard_shadow_definitions_stay_protected_even_when_disabled() {
+    for depth in [8, 16] {
+        for kind in ["DrSh", "IrSh"] {
+            for enabled in [false, true] {
+                for variant in [
+                    "global",
+                    "antialias",
+                    "angle",
+                    "fractional",
+                    "distance",
+                    "choke",
+                    "size",
+                    "noise",
+                    "contour",
+                    "unknown",
+                    "missing",
+                    "mixed",
+                    "mask",
+                    "opacity",
+                    "partial",
+                    "clip",
+                ] {
+                    let (bytes, expected) =
+                        shadow_fixture(depth, kind, enabled, true, false, true, 100., variant);
+                    let doc = psd::decode(&bytes).unwrap();
+                    assert!(doc.read_only, "{depth} {kind} {enabled} {variant}");
+                    assert_eq!(rendered(&doc), expected);
+                    assert_eq!(doc.bit_depth, depth);
+                }
+                if kind == "DrSh" {
+                    for variant in ["blend", "knockout"] {
+                        let (bytes, expected) =
+                            shadow_fixture(depth, kind, enabled, true, false, true, 100., variant);
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(doc.read_only, "{variant}");
+                        assert_eq!(rendered(&doc), expected);
+                    }
+                }
+                let (mut bytes, mut expected) =
+                    shadow_fixture(depth, kind, enabled, true, false, true, 100., "");
+                let index = bytes.len() - 8 * usize::from(depth / 8);
+                let next = expected[0] + if depth == 16 { 1 } else { 257 };
+                if depth == 16 {
+                    bytes[index..index + 2].copy_from_slice(&next.to_be_bytes());
+                } else {
+                    bytes[index] = (next / 257) as u8;
+                }
+                expected[0] = next;
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(doc.read_only);
+                assert_eq!(rendered(&doc), expected);
+            }
+        }
+    }
+}

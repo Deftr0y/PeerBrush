@@ -1871,8 +1871,14 @@ fn decode_parts(
                                     // ordinary raster masks, clipping and layer opacity. Mask
                                     // and clipping decoding still validate every field. The complete
                                     // native composite gate below verifies their combined appearance.
+                                    // Hard shadows have stricter source/placement limits below.
                                     let imported = if signature == b"8BIM" && section == 0 && blend == "normal" && imported_styles.is_empty() {
-                                        styles::native_overlays(payload, &source_patterns, depth)
+                                        styles::native_styles(payload, &source_patterns, depth).and_then(|(effects, pattern)| {
+                                            if effects.iter().any(|e| matches!(e.kind.as_str(), "drop_shadow" | "inner_shadow"))
+                                                && (!maskdata.is_empty() || clipping != 0 || opacity != 1.) {
+                                                Err("Hard Photoshop shadows with masks, clipping or reduced layer opacity remain protected".into())
+                                            } else { Ok((effects, pattern)) }
+                                        })
                                     } else { Err("Photoshop styles with folders, layer blending or duplicate blocks remain protected".into()) };
                                     match imported {
                                         Ok((effects, pattern)) => {
@@ -2075,6 +2081,34 @@ fn decode_parts(
                         rec.layer.pixels = pixels;
                     } else if rec.layer.kind == "group" {
                         rec.layer.pixels = Raster::new_depth(w, h, depth);
+                    }
+                    if rec
+                        .layer
+                        .effects
+                        .iter()
+                        .any(|e| matches!(e.kind.as_str(), "drop_shadow" | "inner_shadow"))
+                    {
+                        let pixels = &rec.layer.pixels;
+                        let partial = if pixels.is16() {
+                            pixels.samples16.values().any(|tile| {
+                                tile.chunks_exact(4).any(|p| p[3] != 0 && p[3] != 65535)
+                            })
+                        } else {
+                            pixels
+                                .tiles
+                                .values()
+                                .any(|tile| tile.chunks_exact(4).any(|p| p[3] != 0 && p[3] != 255))
+                        };
+                        if partial {
+                            let reason =
+                                "Hard Photoshop shadows on partial-alpha sources remain protected";
+                            warnings.push(reason.into());
+                            if rec.source.warnings.len() < 64 {
+                                rec.source.warnings.push(reason.into());
+                            } else {
+                                rec.source.details_truncated = true;
+                            }
+                        }
                     }
                 }
             }
