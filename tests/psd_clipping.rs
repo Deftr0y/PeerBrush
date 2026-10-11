@@ -1608,6 +1608,265 @@ fn overlay_payload(master: bool, enabled: bool, color: [f64; 3]) -> Vec<u8> {
     ]
     .concat()
 }
+const FLOAT_COLOR: [f64; 3] = [0.13719, 0.41937, 0.73351];
+const FLOAT_COLOR2: [f64; 3] = [0.95431, 0.61273, 0.16789];
+fn normalized_style_fixture(
+    depth: u16,
+    family: &str,
+    flags: u8,
+    opacity: f64,
+    variant: &str,
+) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
+    let mut payload = match family {
+        "color" => overlay_payload(true, true, [111., 67., 231.]),
+        "gradient" => gradient_payload(false, None, 0.),
+        "drop" => hard_shadow_payload("DrSh", true, true, 180., opacity, ""),
+        _ => hard_shadow_payload("IrSh", true, true, 180., opacity, ""),
+    };
+    // Substitute complete independently encoded descriptors, including the
+    // variable-length channel IDs; no parser or native renderer builds fixtures.
+    for (old, color) in if family == "gradient" {
+        vec![([0f64; 3], FLOAT_COLOR), ([255f64; 3], FLOAT_COLOR2)]
+    } else {
+        vec![([111f64, 67., 231.], FLOAT_COLOR)]
+    } {
+        let needle = overlay_descriptor(
+            "RGBC",
+            ["Rd  ", "Grn ", "Bl  "]
+                .into_iter()
+                .zip(old)
+                .map(|(key, n)| (key, b"doub", n.to_be_bytes().to_vec()))
+                .collect(),
+        );
+        let mut fields = ["redFloat", "greenFloat", "blueFloat"]
+            .into_iter()
+            .zip(color)
+            .map(|(key, n)| (key, b"doub", n.to_be_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        match variant {
+            "mixed" => fields[1].0 = "Grn ",
+            "incomplete" => {
+                fields.pop();
+            }
+            "both" => fields.extend(
+                ["Rd  ", "Grn ", "Bl  "]
+                    .into_iter()
+                    .zip(old)
+                    .map(|(key, n)| (key, b"doub", n.to_be_bytes().to_vec())),
+            ),
+            "unit" => {
+                fields[0].1 = b"UntF";
+                fields[0].2 = [b"#Prc".to_vec(), color[0].to_be_bytes().to_vec()].concat();
+            }
+            "boolean" => {
+                fields[0].1 = b"bool";
+                fields[0].2 = vec![0];
+            }
+            "negative" => fields[0].2 = (-0.00001f64).to_be_bytes().to_vec(),
+            "hdr" => fields[0].2 = 1.00001f64.to_be_bytes().to_vec(),
+            "nan" => fields[0].2 = f64::NAN.to_be_bytes().to_vec(),
+            "infinity" => fields[0].2 = f64::INFINITY.to_be_bytes().to_vec(),
+            "book" => fields.push(("bookID", b"long", 123i32.to_be_bytes().to_vec())),
+            _ => {}
+        }
+        let replacement =
+            overlay_descriptor(if variant == "class" { "HSBl" } else { "RGBC" }, fields);
+        let at = payload
+            .windows(needle.len())
+            .position(|v| v == needle)
+            .unwrap();
+        payload.splice(at..at + needle.len(), replacement);
+    }
+    let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+    payload[at] = u8::from(flags & 1 != 0);
+    let at = payload
+        .windows(18)
+        .position(|v| v == b"masterFXSwitchbool")
+        .unwrap()
+        + 18;
+    payload[at] = u8::from(flags & 2 != 0);
+    let at = payload
+        .windows(12)
+        .position(|v| v == b"OpctUntF#Prc")
+        .unwrap()
+        + 12;
+    payload[at..at + 8].copy_from_slice(&opacity.to_be_bytes());
+    let mut source = SAVED;
+    if family == "drop" {
+        source[1][3] = 0;
+    }
+    let mut spec = Spec::paint("Synthetic normalized Photoshop RGB", source);
+    spec.tags.push((*b"lfx2", payload));
+    let mut merged = source.map(|p| {
+        if p[3] == 0 {
+            [0; 4]
+        } else {
+            p.map(|v| native(v, depth))
+        }
+    });
+    if flags == 3 {
+        let coverage = (opacity * 65535. / 100.).round() / 65535.;
+        for x in 0..2 {
+            let tint = if family == "gradient" {
+                let t = if x == 0 { 0.25 } else { 0.75 };
+                std::array::from_fn(|c| {
+                    ((FLOAT_COLOR[c] * (1. - t) + FLOAT_COLOR2[c] * t) * 65535.).round() as u16
+                })
+            } else {
+                FLOAT_COLOR.map(|c| (c * 65535.).round() as u16)
+            };
+            if family == "drop" {
+                if x == 1 {
+                    merged[x] = [
+                        tint[0],
+                        tint[1],
+                        tint[2],
+                        (coverage * 65535.).round() as u16,
+                    ]
+                    .map(|v| native(v, depth));
+                }
+            } else if family != "inner" || x == 0 {
+                for c in 0..3 {
+                    merged[x][c] = native(
+                        (f64::from(merged[x][c]) * (1. - coverage) + f64::from(tint[c]) * coverage)
+                            .round() as u16,
+                        depth,
+                    );
+                }
+            }
+        }
+    }
+    let mut bytes = fixture(&[spec], depth);
+    bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+    for c in 0..4 {
+        for pixel in merged {
+            composite_sample(&mut bytes, pixel, c, depth);
+        }
+    }
+    (
+        bytes,
+        merged.concat(),
+        source.map(|p| p.map(|v| native(v, depth))).concat(),
+    )
+}
+
+#[test]
+fn normalized_photoshop_rgb_style_colors_retain_native_samples_definitions_history_and_saves() {
+    for depth in [8, 16] {
+        for family in ["color", "gradient", "inner", "drop"] {
+            for flags in 0..4 {
+                for opacity in [37., 100.] {
+                    let (mut bytes, expected, source) =
+                        normalized_style_fixture(depth, family, flags, opacity, "");
+                    let doc = psd::decode(&bytes).unwrap();
+                    assert!(
+                        !doc.read_only,
+                        "{depth} {family} {flags} {opacity}: {:?}",
+                        doc.warnings
+                    );
+                    assert_eq!(rendered(&doc), expected);
+                    assert_eq!(doc.bit_depth, depth);
+                    assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                    let settings = &doc.layers[0].effects[0].settings;
+                    assert_eq!(doc.layers[0].effects[0].enabled, flags == 3);
+                    for (index, color) in if family == "gradient" {
+                        vec![(0, FLOAT_COLOR), (1, FLOAT_COLOR2)]
+                    } else {
+                        vec![(0, FLOAT_COLOR)]
+                    } {
+                        for c in 0..3 {
+                            let imported = if family == "gradient" {
+                                &settings["color_stops"][index]["color"][c]
+                            } else {
+                                &settings["color"][c]
+                            };
+                            assert!((imported.as_f64().unwrap() - color[c]).abs() < 1e-12);
+                        }
+                    }
+                    let current = doc.export_png().unwrap();
+                    let mut engine = Engine::new();
+                    engine.doc = doc;
+                    let layer = engine.doc.layers[0].id.clone();
+                    let effect = engine.doc.layers[0].effects[0].id.clone();
+                    engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":flags!=3})], None, None, "Normalized RGB bypass").unwrap();
+                    assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                    assert_eq!(engine.undo.len(), 1);
+                    engine.undo("human").unwrap();
+                    assert_eq!(engine.doc.export_png().unwrap(), current);
+                    for output in [
+                        psd::encode(&engine.doc).unwrap(),
+                        psd::encode_psb(&engine.doc).unwrap(),
+                    ] {
+                        let reopened = psd::decode(&output).unwrap();
+                        assert!(!reopened.read_only);
+                        assert_eq!(reopened.bit_depth, depth);
+                        assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                        assert_eq!(reopened.export_png().unwrap(), current);
+                        let standard = psd::decode(&ordinary(&output)).unwrap();
+                        assert!(!standard.read_only);
+                        assert_eq!(standard.export_png().unwrap(), current);
+                        let matte: Vec<u16> = expected
+                            .chunks_exact(4)
+                            .flat_map(|p| {
+                                let max = if depth == 16 { 65535u64 } else { 255 };
+                                let divisor = if depth == 16 { 1u64 } else { 257 };
+                                let alpha = u64::from(p[3]) / divisor;
+                                (0..4).map(move |c| {
+                                    if c == 3 {
+                                        p[3]
+                                    } else {
+                                        (((u64::from(p[c]) / divisor * alpha
+                                            + max * (max - alpha)
+                                            + max / 2)
+                                            / max)
+                                            * divisor)
+                                            as u16
+                                    }
+                                })
+                            })
+                            .collect();
+                        assert_eq!(saved_composite(&output, depth), matte);
+                    }
+                    let at = bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth == 16);
+                    bytes[at] ^= 1;
+                    let protected = psd::decode(&bytes).unwrap();
+                    assert!(protected.read_only);
+                    assert!(protected.layers[0].effects.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_normalized_photoshop_rgb_styles_remain_protected_even_when_disabled() {
+    for depth in [8, 16] {
+        for family in ["color", "gradient", "inner", "drop"] {
+            for variant in [
+                "mixed",
+                "incomplete",
+                "both",
+                "unit",
+                "boolean",
+                "negative",
+                "hdr",
+                "nan",
+                "infinity",
+                "book",
+                "class",
+            ] {
+                let (bytes, _, _) = normalized_style_fixture(depth, family, 0, 100., variant);
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(doc.read_only, "{depth} {family} {variant}");
+                assert!(doc.layers[0].effects.is_empty());
+                assert_eq!(doc.bit_depth, depth);
+                assert!(psd::encode(&doc).is_err());
+                assert!(psd::encode_psb(&doc).is_err());
+            }
+        }
+    }
+}
+
 fn overlay_fixture(depth: u16, master: bool, enabled: bool, replace_composite: bool) -> Vec<u8> {
     let mut spec = Spec::paint("Synthetic styled source", SAVED);
     spec.tags.push((

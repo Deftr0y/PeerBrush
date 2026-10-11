@@ -262,6 +262,31 @@ fn overlay_blend(value: &Value) -> Result<&'static str, String> {
         _ => Err("Unsupported Photoshop overlay blend remains protected".into()),
     }
 }
+// RGBC has either byte-scaled channel fields or normalized float fields.
+// Accept one complete spelling only; never clamp HDR values or mix scales.
+// Reference: psd-tools/composite/paint.py::_get_color and terminology.py.
+fn rgb_color(value: &Value) -> Result<Vec<f64>, String> {
+    let channels = descriptor(value, "RGBC")?;
+    let byte_keys = ["Rd  ", "Grn ", "Bl  "];
+    let float_keys = ["redFloat", "greenFloat", "blueFloat"];
+    let (keys, scale) =
+        if channels.len() == 3 && byte_keys.iter().all(|key| channels.contains_key(*key)) {
+            (byte_keys, 255.)
+        } else if channels.len() == 3 && float_keys.iter().all(|key| channels.contains_key(*key)) {
+            (float_keys, 1.)
+        } else {
+            return Err("Photoshop RGB colors require one complete plain channel spelling".into());
+        };
+    keys.into_iter()
+        .map(|key| {
+            let channel = plain_number(field(channels, key))?;
+            if !(0.0..=scale).contains(&channel) {
+                return Err(format!("Photoshop RGB channels must be within 0–{scale}"));
+            }
+            Ok(channel / scale)
+        })
+        .collect()
+}
 pub(super) fn native_styles(
     bytes: &[u8],
     patterns: &[super::patterns::Source],
@@ -478,22 +503,7 @@ fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
             return Err("Nonlinear or malformed Photoshop shadow contour remains protected".into());
         }
     }
-    let rgb = descriptor(field(fields, "Clr "), "RGBC")?;
-    if rgb.len() != 3
-        || rgb
-            .keys()
-            .any(|key| !matches!(key.as_str(), "Rd  " | "Grn " | "Bl  "))
-    {
-        return Err("Only plain RGB Photoshop shadow colors can be imported".into());
-    }
-    let mut color = Vec::with_capacity(3);
-    for key in ["Rd  ", "Grn ", "Bl  "] {
-        let channel = plain_number(field(rgb, key))?;
-        if !(0.0..=255.).contains(&channel) {
-            return Err("Shadow RGB channel is outside 0–255".into());
-        }
-        color.push(channel / 255.);
-    }
+    let color = rgb_color(field(fields, "Clr "))?;
     let blend = overlay_blend(field(fields, "Md  "))?;
     if kind == "drop_shadow" && blend != "normal" {
         return Err("Independent Photoshop Drop Shadow backdrop blends remain protected".into());
@@ -799,23 +809,7 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
                         "Foreground/background Photoshop gradient colors remain protected".into(),
                     );
                 }
-                let rgb = descriptor(field(stop, "Clr "), "RGBC")?;
-                if rgb.len() != 3
-                    || rgb
-                        .keys()
-                        .any(|k| !matches!(k.as_str(), "Rd  " | "Grn " | "Bl  "))
-                {
-                    return Err("Only plain RGB Photoshop gradient colors can be imported".into());
-                }
-                let mut color = vec![];
-                for key in ["Rd  ", "Grn ", "Bl  "] {
-                    let n = plain_number(field(rgb, key))?;
-                    if !(0.0..=255.).contains(&n) {
-                        return Err("Gradient RGB channels must be within 0–255".into());
-                    }
-                    color.push(n / 255.);
-                }
-                result["color"] = json!(color);
+                result["color"] = json!(rgb_color(field(stop, "Clr "))?);
             }
             stops.push(result);
         }
@@ -908,30 +902,7 @@ fn color_overlay_root(root: &Value) -> Result<Vec<crate::effects::Effect>, Strin
         }
         let blend = overlay_blend(field(fields, "Md  "))?;
         let opacity = percent(&entry["value"]["items"]["Opct"])?;
-        let color = &entry["value"]["items"]["Clr "];
-        if !matches!(color["type"].as_str(), Some("Objc" | "GlbO"))
-            || color["value"]["class"] != "RGBC"
-        {
-            return Err("Only RGB Photoshop Color Overlay colors can be imported".into());
-        }
-        let channels = color["value"]["items"]
-            .as_object()
-            .ok_or("Invalid RGB Color Overlay")?;
-        if channels.len() != 3
-            || channels
-                .keys()
-                .any(|k| !matches!(k.as_str(), "Rd  " | "Grn " | "Bl  "))
-        {
-            return Err("Unsupported Color Overlay RGB properties".into());
-        }
-        let mut rgb = vec![];
-        for key in ["Rd  ", "Grn ", "Bl  "] {
-            let n = plain_number(&channels[key])?;
-            if !(0.0..=255.).contains(&n) {
-                return Err("Color Overlay RGB channel is outside 0–255".into());
-            }
-            rgb.push(n / 255.);
-        }
+        let rgb = rgb_color(field(fields, "Clr "))?;
         let settings = json!({"opacity":opacity,"blend":blend,"color":rgb});
         crate::effects::validate("color_overlay", &settings)?;
         effects.push(crate::effects::Effect {
