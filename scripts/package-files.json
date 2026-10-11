@@ -265,7 +265,8 @@
     "src/production_export/library.rs",
     "src/ui/exports.rs",
     "tests/production_export.rs",
-    "docs/production-export.md"
+    "docs/production-export.md",
+    "src/psd/styles.rs"
   ],
   "portable": [
     "LICENSE",

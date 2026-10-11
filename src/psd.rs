@@ -1,4 +1,5 @@
 //! Bounded PSD v1 / PSB v2 codecs. Unsupported Photoshop features are never silently rewritten.
+mod styles;
 use crate::{
     engine::{id, Document, Layer, Mask, MaskStep},
     raster::{check_size, Raster},
@@ -1801,6 +1802,21 @@ fn decode_parts(
                                 ));
                             } else if key == b"lspf" {
                                 locked = payload == [0, 0, 0, 7];
+                            }
+                        }
+                        b"lfx2" | b"lmfx" => {
+                            let tag_name = String::from_utf8_lossy(key);
+                            let detail = if signature != b"8BIM" {
+                                Err("invalid effects signature".into())
+                            } else {
+                                styles::inspect(payload)
+                            };
+                            match detail {
+                                Ok(details) => {
+                                    warnings.push(format!("Photoshop layer styles ({tag_name}) remain protected; using the saved composite"));
+                                    warnings.extend(details);
+                                }
+                                Err(reason) => warnings.push(format!("Cannot inspect Photoshop layer styles ({tag_name}): {reason}; using the protected saved composite")),
                             }
                         }
                         _ => warnings.push(format!(

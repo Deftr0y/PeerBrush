@@ -4,6 +4,8 @@ PeerBrush adds Bevel & Emboss, Contour, Texture, Stroke, Inner Shadow, Inner Glo
 
 These are native PeerBrush style effects with bounded settings. They do not enable Photoshop layer-style descriptor or embedded-pattern import/export. A Photoshop document containing unsupported styles, patterns, global masks or profiles stays protected and displays its saved composite. See [Photoshop fidelity](photoshop-fidelity.md).
 
+Unreleased source diagnostics now inspect bounded `lfx2`/`lmfx` descriptors and identify recognized single/multiple style definitions and enabled/disabled states. This is view-only inspection; imported Photoshop styles and embedded patterns remain protected. See [descriptor limits](photoshop-fidelity.md).
+
 | Effect | Available settings |
 | --- | --- |
 | Bevel & Emboss | Inner/Outer/Emboss/Pillow, size, soften, depth, light angle/altitude, Up/Down, highlight/shadow colors, contour, opacity and blend |
