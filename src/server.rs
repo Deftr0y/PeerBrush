@@ -400,6 +400,20 @@ pub fn save_reviewed_source(
         &json!({"document_id":document,"expected_revision":revision}),
     )
 }
+/// The caller explicitly accepted the compatibility report for this source.
+pub fn save_accepted_source(
+    shared: &Shared,
+    path: &Path,
+    document: &str,
+    revision: u64,
+    overwrite: bool,
+) -> Result<(), String> {
+    save_guarded(
+        shared,
+        path,
+        &json!({"document_id":document,"expected_revision":revision,"overwrite":overwrite,"accept_editability_loss":true}),
+    )
+}
 fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     save_prepared(shared, path, request, || {})
 }
@@ -460,6 +474,7 @@ fn save_prepared(
             "Destination exists. Confirm overwrite=true or choose a new Save As path.".into(),
         );
     }
+    crate::compatibility::authorize_save(&doc, request)?;
     let ownership = crate::file_ownership::Ownership::save(path, &project)?;
     let bytes = if path
         .extension()
@@ -593,7 +608,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_proposal","description":"Create and render frozen proposed edits for explicit human review. create needs observed document_id/expected_revision and ordinary engine commands; the shared project and history stay unchanged. preview returns actual PNG pixels with document coordinates. Only actor human can accept; agents can list, preview or reject their proposals. A changed project or ended/expired/taken-over task invalidates its draft. Never silently reacquire a task. Direct edits remain available when already authorized.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","preview","accept","reject"]},"actor":{"type":"string"},"proposal":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"task":{"type":"string"},"label":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"feedback":{"type":"string","enum":["batch","request"]}},"required":["action"],"additionalProperties":false}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status","recovery"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
-        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export PNG. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Destination extension selects the native 8/16-bit RGB save format under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_report","export","compatible_copy"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
+        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export PNG. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Destination extension selects the native 8/16-bit RGB save format under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_report","export","compatible_copy"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply a supported absolute local image path or base64 PNG. SVG/SVGZ placement creates rendered pixels; image.import retains editable vector markup. Use image_info and explicit frame/page/variant for animations, multipage TIFF and icons. Supply an exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
@@ -614,6 +629,7 @@ pub fn tools() -> Value {
             properties["expected_revision"] = json!({"type":"integer"});
             if tool["name"] == "peerbrush_document" {
                 tool["inputSchema"]["properties"]["overwrite"] = json!({"type":"boolean","description":"Explicit replacement consent for an existing Save As/export destination; never bypasses a loaded source conflict."});
+                tool["inputSchema"]["properties"]["accept_editability_loss"] = json!({"type":"boolean","description":"For PSD/PSB saves with reported losses, explicitly accept document.save_report for this exact document_id and expected_revision. Required for baking, supplementary-only definitions and standard opacity quantization; never bypasses protected originals or file conflicts."});
             }
         }
     }
@@ -2660,4 +2676,52 @@ pub fn stdio(state_dir: &Path) -> Result<(), String> {
     let _ = heartbeat.join();
     announce_presence(state_dir, &client_id, false);
     result
+}
+
+#[cfg(test)]
+mod save_loss_tests {
+    use super::*;
+    use crate::engine::Document;
+
+    #[test]
+    fn accepted_output_cannot_publish_over_later_human_work() {
+        for depth in [8, 16] {
+            let root = std::env::temp_dir().join(format!("peerbrush-save-race-{}", engine::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("Original.psd");
+            let mut engine = Engine::new();
+            engine.doc = Document::new_depth(8, 6, depth).unwrap();
+            let shared = Arc::new(Mutex::new(engine));
+            save(&shared, &path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let (document, revision, layer) = {
+                let mut engine = shared.lock().unwrap();
+                let layer = engine.doc.layers[0].id.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"effect.add","layer":layer,"kind":"invert","settings":{}})],
+                        None,
+                        None,
+                        "Editable effect",
+                    )
+                    .unwrap();
+                (engine.doc.id.clone(), engine.doc.revision, layer)
+            };
+            let error = save_prepared(&shared, &path, &json!({"document_id":document,"expected_revision":revision,"accept_editability_loss":true}), || {
+                shared.lock().unwrap().edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,2,3,4],"color":[53,97,173,255]})], None, None, "Later human pixels").unwrap();
+            }).unwrap_err();
+            assert!(error.contains("source changed"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            let engine = shared.lock().unwrap();
+            assert_eq!(engine.doc.revision, revision + 1);
+            assert_eq!(engine.saved_revision, 0);
+            assert_eq!(engine.undo.len(), 2);
+            assert_ne!(engine.doc.layers[0].pixels.get16(1, 2)[3], 0);
+            assert_eq!(engine.doc.layers[0].effects.len(), 1);
+            drop(engine);
+            drop(shared);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 }

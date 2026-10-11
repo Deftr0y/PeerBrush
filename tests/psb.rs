@@ -413,10 +413,19 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     let shared = Arc::new(Mutex::new(engine));
     peerbrush::workspace::attach(&shared);
     let before = shared.lock().unwrap().doc.export_png().unwrap();
+    let document = shared.lock().unwrap().doc.id.clone();
+    let revision = shared.lock().unwrap().doc.revision;
+    let report = server::dispatch(
+        &shared,
+        "document",
+        &json!({"action":"save_report","document_id":document,"expected_revision":revision}),
+    )
+    .unwrap();
+    assert!(report["has_editability_losses"].as_bool().unwrap());
     server::dispatch(
         &shared,
         "document",
-        &json!({"action":"save","path":path,"actor":"human"}),
+        &json!({"action":"save","path":path,"actor":"human","document_id":document,"expected_revision":revision,"accept_editability_loss":true}),
     )
     .unwrap();
     assert_eq!(&std::fs::read(&path).unwrap()[4..6], &2u16.to_be_bytes());
@@ -427,7 +436,14 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     )
     .is_err());
     // Save As releases the original before the protocol opens it as an independent project.
-    server::save(&shared, &temp.join("Working.psb")).unwrap();
+    server::save_accepted_source(
+        &shared,
+        &temp.join("Working.psb"),
+        &document,
+        revision,
+        false,
+    )
+    .unwrap();
     let opened = server::dispatch(
         &shared,
         "projects",

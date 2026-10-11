@@ -21,6 +21,136 @@ fn fixture(depth: u16) -> Document {
     }
     doc
 }
+
+#[test]
+fn lossy_saves_require_explicit_acceptance_bound_to_the_current_source() {
+    for depth in [8, 16] {
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-save-loss-{}", peerbrush::engine::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut engine = Engine::new();
+        engine.doc = fixture(depth);
+        engine.doc.layers[0].effects = vec![effect(true)];
+        let document = engine.doc.id.clone();
+        let revision = engine.doc.revision;
+        let before = serde_json::to_value(&engine.doc).unwrap();
+        let shared = Arc::new(Mutex::new(engine));
+        let path = root.join("Styled.psd");
+        assert!(server::save(&shared, &path).is_err());
+        for acceptance in [json!(null), json!(false), json!("true"), json!(1)] {
+            let request = json!({"action":"save","actor":"human","path":path,"document_id":document,"expected_revision":revision,"accept_editability_loss":acceptance});
+            assert!(server::dispatch(&shared, "document", &request).is_err());
+            assert!(!path.exists());
+        }
+        for request in [
+            json!({"action":"save","actor":"human","path":path,"accept_editability_loss":true}),
+            json!({"action":"save","actor":"human","path":path,"document_id":document,"expected_revision":revision+1,"accept_editability_loss":true}),
+            json!({"action":"save","actor":"human","path":path,"document_id":"other","expected_revision":revision,"accept_editability_loss":true}),
+        ] {
+            assert!(server::dispatch(&shared, "document", &request).is_err());
+            assert!(!path.exists());
+        }
+        assert_eq!(
+            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            before
+        );
+        assert_eq!(shared.lock().unwrap().saved_revision, 0);
+        let report = server::dispatch(
+            &shared,
+            "document",
+            &json!({"action":"save_report","document_id":document,"expected_revision":revision}),
+        )
+        .unwrap();
+        assert!(report["has_editability_losses"].as_bool().unwrap());
+        for extension in ["psd", "psb"] {
+            let output = root.join(format!("Accepted.{extension}"));
+            server::dispatch(&shared,"document",&json!({"action":"save","actor":"human","path":output,"document_id":document,"expected_revision":revision,"accept_editability_loss":true})).unwrap();
+            let restored = psd::decode(&std::fs::read(&output).unwrap()).unwrap();
+            assert!(!restored.read_only);
+            assert_eq!(restored.bit_depth, depth);
+            assert_eq!(restored.layers[0].effects.len(), 1);
+            assert_eq!(
+                restored.export_png().unwrap(),
+                shared.lock().unwrap().doc.export_png().unwrap()
+            );
+        }
+        // A completed save grants no continuing permission to later revisions.
+        {
+            let mut e = shared.lock().unwrap();
+            let layer = e.doc.layers[0].id.clone();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.update","layer":layer,"name":"Later human work"})],
+                None,
+                None,
+                "Later work",
+            )
+            .unwrap();
+        }
+        let current_path = shared.lock().unwrap().path.clone().unwrap();
+        let saved = std::fs::read(&current_path).unwrap();
+        assert!(server::dispatch(&shared,"document",&json!({"action":"save","actor":"human","document_id":document,"expected_revision":revision,"accept_editability_loss":true})).is_err());
+        assert_eq!(std::fs::read(&current_path).unwrap(), saved);
+        drop(shared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn save_acceptance_keeps_plain_saves_and_protected_and_overwrite_guards() {
+    for depth in [8, 16] {
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-save-policy-{}", peerbrush::engine::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut engine = Engine::new();
+        engine.doc = fixture(depth);
+        let shared = Arc::new(Mutex::new(engine));
+        let plain = root.join("Plain.psd");
+        server::save(&shared, &plain).unwrap();
+        let original = std::fs::read(&plain).unwrap();
+        let existing = root.join("Existing.psb");
+        std::fs::write(&existing, &original).unwrap();
+        let (document, revision) = {
+            let mut engine = shared.lock().unwrap();
+            let layer = engine.doc.layers[0].id.clone();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"effect.add","layer":layer,"kind":"invert","settings":{}})],
+                    None,
+                    None,
+                    "Effect requiring review",
+                )
+                .unwrap();
+            (engine.doc.id.clone(), engine.doc.revision)
+        };
+        let request = json!({"action":"save","path":existing,"actor":"human","document_id":document,"expected_revision":revision,"accept_editability_loss":true});
+        assert!(server::dispatch(&shared, "document", &request)
+            .unwrap_err()
+            .contains("overwrite"));
+        assert_eq!(std::fs::read(&existing).unwrap(), original);
+        {
+            let mut engine = shared.lock().unwrap();
+            engine.doc.read_only = true;
+            engine.doc.warnings = vec!["Unsupported Photoshop source".into()];
+        }
+        let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+        let mut protected_request = request;
+        protected_request["overwrite"] = json!(true);
+        assert!(server::dispatch(&shared, "document", &protected_request)
+            .unwrap_err()
+            .contains("unsupported"));
+        assert_eq!(std::fs::read(&existing).unwrap(), original);
+        assert_eq!(std::fs::read(&plain).unwrap(), original);
+        assert_eq!(
+            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            before
+        );
+        drop(shared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 fn effect(enabled: bool) -> Effect {
     Effect {
         id: peerbrush::engine::id(),

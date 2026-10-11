@@ -133,6 +133,23 @@ fn rename(shared: &server::Shared, name: &str) {
     )
     .unwrap();
 }
+fn accepted_save(shared: &server::Shared, path: &std::path::Path) -> Result<(), String> {
+    let (project, document, revision) = {
+        let engine = shared.lock().unwrap();
+        (
+            engine.project_id.clone(),
+            engine.doc.id.clone(),
+            engine.doc.revision,
+        )
+    };
+    let report = server::dispatch(
+        shared,
+        "document",
+        &json!({"action":"save_report","project_id":project,"document_id":document,"expected_revision":revision}),
+    )?;
+    assert_eq!(report["has_editability_losses"], true);
+    server::save_accepted_source(shared, path, &document, revision, false)
+}
 fn standard(bytes: &[u8]) -> Vec<u8> {
     let color = u32::from_be_bytes(bytes[26..30].try_into().unwrap()) as usize;
     let resources = 30 + color;
@@ -170,7 +187,7 @@ fn named_and_untitled_native_versions_restore_independently_with_standard_compos
             workspace::register_in(&workspace, fixture(depth).lock().unwrap().clone(), None)
                 .unwrap();
         let original = dir.join("original.psd");
-        server::save(&named, &original).unwrap();
+        accepted_save(&named, &original).unwrap();
         let original_bytes = fs::read(&original).unwrap();
         rename(&named, "Dirty named work");
         let baselines: Vec<_> = [&root, &named]
@@ -257,7 +274,7 @@ fn named_and_untitled_native_versions_restore_independently_with_standard_compos
             drop(e);
             rename(&restored, "Recovered edit");
             let output = dir.join(format!("restored-{}.psd", entry.snapshot));
-            server::save(&restored, &output).unwrap();
+            accepted_save(&restored, &output).unwrap();
             let reopened = psd::decode(&fs::read(output).unwrap()).unwrap();
             assert_eq!(
                 reopened.export_png().unwrap(),
@@ -497,7 +514,7 @@ fn interrupted_or_blocked_ordinary_save_preserves_original_and_dirty_revision() 
     let dir = dir();
     let root = fixture(16);
     let file = dir.join("original.psd");
-    server::save(&root, &file).unwrap();
+    accepted_save(&root, &file).unwrap();
     let original = fs::read(&file).unwrap();
     rename(&root, "Unsaved edit");
     let guard = fs::OpenOptions::new()
@@ -505,14 +522,14 @@ fn interrupted_or_blocked_ordinary_save_preserves_original_and_dirty_revision() 
         .share_mode(0)
         .open(&file)
         .unwrap();
-    assert!(server::save(&root, &file).is_err());
+    assert!(accepted_save(&root, &file).is_err());
     {
         let e = root.lock().unwrap();
         assert_ne!(e.doc.revision, e.saved_revision);
     }
     drop(guard);
     assert_eq!(fs::read(&file).unwrap(), original);
-    server::save(&root, &file).unwrap();
+    accepted_save(&root, &file).unwrap();
     let reopened = psd::decode(&fs::read(&file).unwrap()).unwrap();
     assert_eq!(reopened.layers[0].name, "Unsaved edit");
 }

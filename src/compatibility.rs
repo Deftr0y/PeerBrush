@@ -74,6 +74,38 @@ pub struct SaveReport {
     pub details_truncated: bool,
 }
 
+/// Acceptance applies only to the exact source whose output was reviewed.
+/// It never overrides protection, destination conflicts or final save guards.
+pub(crate) fn authorize_save(doc: &Document, request: &serde_json::Value) -> Result<(), String> {
+    let accepted = request
+        .get("accept_editability_loss")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or("accept_editability_loss must be boolean")
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let report = report(doc)?;
+    if !report.save_allowed {
+        return Err(
+            "Cannot save an unsupported PSD without explicitly creating a compatible copy".into(),
+        );
+    }
+    if accepted
+        && (request["document_id"].as_str() != Some(doc.id.as_str())
+            || request["expected_revision"].as_u64() != Some(doc.revision))
+    {
+        return Err(
+            "Save-loss acceptance requires the reviewed document_id and expected_revision".into(),
+        );
+    }
+    if report.has_editability_losses && !accepted {
+        return Err("PSD/PSB output changes editability or standard layer settings. Request document.save_report, review its losses, then confirm accept_editability_loss=true for that document_id and expected_revision. Current work remains unchanged.".into());
+    }
+    Ok(())
+}
+
 pub fn report(doc: &Document) -> Result<SaveReport, String> {
     psd::validate(doc)?;
     let mut report = SaveReport {

@@ -440,6 +440,7 @@ pub struct PeerBrush {
     show_new: bool,
     read_only_info: Option<String>,
     save_report: Option<crate::compatibility::SaveReport>,
+    save_loss_review: Option<compatibility::SaveReview>,
     new_width: u32,
     new_bit_depth: u16,
     new_height: u32,
@@ -764,6 +765,7 @@ impl PeerBrush {
             show_new: false,
             read_only_info: None,
             save_report: None,
+            save_loss_review: None,
             new_width: 1024,
             new_bit_depth: 8,
             new_height: 768,
@@ -1520,9 +1522,45 @@ impl PeerBrush {
         });
     }
     fn save(&mut self, save_as: bool) {
+        if self.busy {
+            self.message = "Finish the current file operation before saving".into();
+            return;
+        }
+        if self.save_loss_review.is_some() {
+            return;
+        }
+        let report = match crate::compatibility::report(&self.doc_snapshot) {
+            Ok(report) => report,
+            Err(error) => {
+                self.message = error;
+                return;
+            }
+        };
+        if !report.save_allowed {
+            self.open_save_report();
+            self.message =
+                "Protected source · create an explicit compatible copy before saving".into();
+            return;
+        }
+        if report.has_editability_losses {
+            self.save_loss_review = Some(compatibility::SaveReview::new(
+                self.project_id.clone(),
+                self.doc_snapshot.name.clone(),
+                report,
+                compatibility::SaveIntent::Save { save_as },
+            ));
+            self.lifecycle_frame = true;
+            return;
+        }
+        self.save_frozen(
+            save_as,
+            self.doc_snapshot.id.clone(),
+            self.doc_snapshot.revision,
+            false,
+        );
+    }
+    fn save_frozen(&mut self, save_as: bool, document: String, revision: u64, accepted: bool) {
         let s = self.shared.clone();
-        let document = self.doc_snapshot.id.clone();
-        let revision = self.doc_snapshot.revision;
         let current = if save_as {
             None
         } else {
@@ -1540,7 +1578,11 @@ impl PeerBrush {
             let Some(path) = path else {
                 return Ok("Save canceled · project remains open".into());
             };
-            server::save_confirmed_source(&s, &path, &document, revision, overwrite)?;
+            if accepted {
+                server::save_accepted_source(&s, &path, &document, revision, overwrite)?;
+            } else {
+                server::save_confirmed_source(&s, &path, &document, revision, overwrite)?;
+            }
             Ok("Photoshop document saved".into())
         });
     }
@@ -4128,7 +4170,7 @@ impl PeerBrush {
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
         self.temporary_pen_tool(ctx);
-        self.lifecycle_frame = false;
+        self.lifecycle_frame = self.save_loss_review.is_some();
         if let Some(warning) = self.workspace.lock().unwrap().open_warning.take() {
             self.open_file_warning = Some(warning);
         }
@@ -4373,7 +4415,11 @@ impl PeerBrush {
             self.message = result.unwrap_or_else(|e| e);
             self.last_preview = None;
         }
-        self.lifecycle_dialog(ctx);
+        if self.save_loss_review.is_some() {
+            self.save_loss_dialog(ctx);
+        } else {
+            self.lifecycle_dialog(ctx);
+        }
         if self.exit_approved {
             return;
         }

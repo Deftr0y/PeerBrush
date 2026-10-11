@@ -498,7 +498,7 @@ impl Review {
 
 impl PeerBrush {
     pub(super) fn request_close(&mut self, intent: Intent) {
-        if self.lifecycle.is_some() || self.exit_approved {
+        if self.lifecycle.is_some() || self.save_loss_review.is_some() || self.exit_approved {
             return;
         }
         let working = match &intent {
@@ -552,6 +552,19 @@ impl PeerBrush {
     }
 
     fn save_for_close(&mut self, ctx: &egui::Context, save_as: bool) {
+        self.save_for_close_with_acceptance(ctx, save_as, None);
+    }
+    pub(super) fn cancel_close_save_loss(&mut self) {
+        if let Some(review) = self.lifecycle.as_mut() {
+            review.error = Some("Save canceled · the project remains open".into());
+        }
+    }
+    pub(super) fn save_for_close_with_acceptance(
+        &mut self,
+        ctx: &egui::Context,
+        save_as: bool,
+        accepted: Option<(&str, u64)>,
+    ) {
         let Some(review) = self.lifecycle.as_ref() else {
             return;
         };
@@ -568,6 +581,40 @@ impl PeerBrush {
                 return;
             }
         };
+        let report = {
+            let e = shared.lock().unwrap();
+            crate::workspace::guard(&e, &row.source.document, row.source.revision)
+                .and_then(|_| crate::compatibility::report(&e.doc))
+        };
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                self.lifecycle.as_mut().unwrap().error = Some(error);
+                return;
+            }
+        };
+        if !report.save_allowed {
+            self.lifecycle.as_mut().unwrap().error =
+                Some("Protected source · create an explicit compatible copy before saving".into());
+            return;
+        }
+        if accepted
+            .is_some_and(|source| source != (row.source.document.as_str(), row.source.revision))
+        {
+            self.lifecycle.as_mut().unwrap().error =
+                Some("Work changed after save-loss review · review the current changes".into());
+            return;
+        }
+        if report.has_editability_losses && accepted.is_none() {
+            self.save_loss_review = Some(super::compatibility::SaveReview::new(
+                row.source.project.clone(),
+                row.name.clone(),
+                report,
+                super::compatibility::SaveIntent::Close { save_as },
+            ));
+            return;
+        }
+        let accepted = accepted.is_some();
         let (tx, rx) = mpsc::channel();
         let repaint = ctx.clone();
         let source = row.source.clone();
@@ -586,13 +633,23 @@ impl PeerBrush {
                     let Some(path) = path else {
                         return Ok(false);
                     };
-                    server::save_confirmed_source(
-                        &shared,
-                        &path,
-                        &source.document,
-                        source.revision,
-                        overwrite,
-                    )?;
+                    if accepted {
+                        server::save_accepted_source(
+                            &shared,
+                            &path,
+                            &source.document,
+                            source.revision,
+                            overwrite,
+                        )?;
+                    } else {
+                        server::save_confirmed_source(
+                            &shared,
+                            &path,
+                            &source.document,
+                            source.revision,
+                            overwrite,
+                        )?;
+                    }
                     Ok(true)
                 }))
                 .unwrap_or_else(|_| {
