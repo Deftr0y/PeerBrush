@@ -4127,7 +4127,12 @@ impl PeerBrush {
                 None
             };
             let release = release?;
-            if !i.focused || (owner.as_deref() != Some(doc.id.as_str()) && !pressed_canvas) {
+            if !i.focused
+                || i.events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+                || (owner.as_deref() != Some(doc.id.as_str()) && !pressed_canvas)
+            {
                 return None;
             }
             let original = i.events.clone();
@@ -4173,6 +4178,36 @@ impl PeerBrush {
         })
     }
     fn document_shortcuts(&mut self, ctx: &egui::Context, doc: &Document) {
+        if ctx.input(|i| {
+            !i.focused
+                || i.events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        }) {
+            // Events already in the frame may outlive window focus. Reject
+            // document actions and keep their keys held until an explicit
+            // release/fresh press, including repeats after focus returns.
+            ctx.input(|input| {
+                for event in &input.events {
+                    if let egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed,
+                        ..
+                    } = event
+                    {
+                        for key in std::iter::once(*key).chain(*physical_key) {
+                            if *pressed {
+                                self.selection_shortcut_keys.insert(key);
+                            } else {
+                                self.selection_shortcut_keys.remove(&key);
+                            }
+                        }
+                    }
+                }
+            });
+            return;
+        }
         let typing = self.lifecycle.is_some()
             || self.shortcuts.open
             || self.filter_editor.is_some()
@@ -11581,6 +11616,191 @@ mod tests {
                         engine.doc.export_png().unwrap(),
                         before.export_png().unwrap()
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_focus_loss_cancels_drafts_without_running_document_shortcuts() {
+        for depth in [8, 16] {
+            for kind in ["wand", "rectangle", "polygon", "magnetic"] {
+                for release in [true, false] {
+                    for action in [
+                        "none",
+                        "copy",
+                        "cut",
+                        "paste",
+                        "delete",
+                        "move",
+                        "rotate",
+                        "scale",
+                        "fill",
+                        "duplicate",
+                    ] {
+                        let tool = if kind == "wand" {
+                            Tool::MagicWand
+                        } else {
+                            Tool::Selection
+                        };
+                        let (mut app, ctx, point, _) = pressed_selection_fixture(depth, tool, kind);
+                        let path_tool = ["polygon", "magnetic"].contains(&kind);
+                        if path_tool {
+                            frame(
+                                &mut app,
+                                &ctx,
+                                vec![
+                                    primary_release(point),
+                                    egui::Event::PointerMoved(Pos2::new(1., 1.)),
+                                ],
+                                Default::default(),
+                            );
+                            app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
+                        } else if kind == "rectangle" {
+                            let end = point + Vec2::splat(app.view_rect.unwrap().width() / 4.);
+                            frame(
+                                &mut app,
+                                &ctx,
+                                vec![egui::Event::PointerMoved(end)],
+                                Default::default(),
+                            );
+                            assert!(app.drag_start.is_some());
+                        }
+                        let before = {
+                            let mut engine = app.shared.lock().unwrap();
+                            engine.edit("human", &[json!({"op":"selection","kind":"rectangle","rect":[0,0,2,2]})], None, None, "Previous selected area").unwrap();
+                            engine.undo.clear();
+                            engine.doc.clone()
+                        };
+                        let modifiers = match action {
+                            "fill" => egui::Modifiers {
+                                alt: true,
+                                ..Default::default()
+                            },
+                            "duplicate" => egui::Modifiers {
+                                ctrl: true,
+                                command: true,
+                                ..Default::default()
+                            },
+                            _ => Default::default(),
+                        };
+                        let event = match action {
+                            "copy" => Some(egui::Event::Copy),
+                            "cut" => Some(egui::Event::Cut),
+                            "paste" => Some(egui::Event::Paste(String::new())),
+                            "delete" => Some(shortcut_press(egui::Key::Delete)),
+                            "move" => Some(shortcut_press(egui::Key::W)),
+                            "rotate" => Some(shortcut_press(egui::Key::E)),
+                            "scale" => Some(shortcut_press(egui::Key::R)),
+                            "fill" | "duplicate" => Some(egui::Event::Key {
+                                key: if action == "fill" {
+                                    egui::Key::B
+                                } else {
+                                    egui::Key::D
+                                },
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers,
+                            }),
+                            _ => None,
+                        };
+                        let mut events = vec![egui::Event::WindowFocused(false)];
+                        if release {
+                            events.push(primary_release(point));
+                        }
+                        if path_tool {
+                            events.push(shortcut_press(egui::Key::Enter));
+                        }
+                        events.extend(event.clone());
+                        // Also cover loss and return in one frame: the final
+                        // focus flag alone must not revive an unfinished draft.
+                        let refocused_in_frame = depth == 16;
+                        if refocused_in_frame {
+                            events.push(egui::Event::WindowFocused(true));
+                        }
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    Vec2::new(1360., 900.),
+                                )),
+                                focused: refocused_in_frame,
+                                events,
+                                modifiers,
+                                ..Default::default()
+                            },
+                            |ctx| app.draw(ctx),
+                        );
+                        assert!(
+                            app.tool == tool,
+                            "{depth} {kind} {release} {action}: tool changed after focus loss"
+                        );
+                        assert!(
+                            app.selection_path.is_empty(),
+                            "unfinished path survived focus loss"
+                        );
+                        assert!(app.points.is_empty());
+                        assert!(app.drag_start.is_none());
+                        assert!(app.canvas_press_document.is_none());
+                        assert!(app.selection_gesture_mode.is_none());
+                        {
+                            let engine = app.shared.lock().unwrap();
+                            assert_eq!(
+                                engine.doc.selection, before.selection,
+                                "{depth} {kind} {release} {action}"
+                            );
+                            assert_eq!(engine.doc.revision, before.revision);
+                            assert!(
+                                serde_json::to_value(&engine.doc).unwrap()
+                                    == serde_json::to_value(&before).unwrap(),
+                                "document changed after selection focus loss"
+                            );
+                            assert!(engine.undo.is_empty());
+                        }
+                        assert!(
+                            matches!(
+                                app.clipboard
+                                    .replies
+                                    .recv_timeout(Duration::from_millis(20)),
+                                Err(mpsc::RecvTimeoutError::Timeout)
+                            ),
+                            "{depth} {kind} {release} {action}: clipboard command ran after focus loss"
+                        );
+                        // Refocus/release cannot complete the abandoned gesture
+                        // or replay a command rejected while focus was absent.
+                        let mut events = vec![
+                            egui::Event::WindowFocused(true),
+                            primary_release(point),
+                            egui::Event::PointerMoved(Pos2::new(1., 1.)),
+                        ];
+                        for key in [egui::Key::Enter]
+                            .into_iter()
+                            .chain(event.as_ref().and_then(|event| {
+                                if let egui::Event::Key { key, .. } = event {
+                                    Some(*key)
+                                } else {
+                                    None
+                                }
+                            }))
+                        {
+                            events.push(egui::Event::Key {
+                                key,
+                                physical_key: Some(key),
+                                pressed: false,
+                                repeat: false,
+                                modifiers: Default::default(),
+                            });
+                        }
+                        frame(&mut app, &ctx, events, Default::default());
+                        let engine = app.shared.lock().unwrap();
+                        assert!(
+                            serde_json::to_value(&engine.doc).unwrap()
+                                == serde_json::to_value(&before).unwrap(),
+                            "refocus changed the document"
+                        );
+                        assert!(engine.undo.is_empty());
+                    }
                 }
             }
         }

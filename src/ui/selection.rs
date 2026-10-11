@@ -216,6 +216,24 @@ impl PeerBrush {
         let view = self.view;
         let to_doc = |p: Pos2| view.document(p, rect, scale);
         let to_screen = |p: [f32; 2]| view.point(p, rect, scale);
+        if ui.input(|i| {
+            !i.focused
+                || i.events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        }) {
+            // Window focus loss may share a frame with a real or synthesized
+            // release. Cancel before response.clicked/drag_stopped can commit
+            // an unfinished selection over the existing shared coverage.
+            self.selection_pointer_cancelled = ui.input(|i| i.pointer.primary_down());
+            self.canvas_press_document = None;
+            self.selection_path.clear();
+            self.selection_gesture_mode = None;
+            self.points.clear();
+            self.drag_start = None;
+            self.drag_revision = None;
+            return;
+        }
         if self.selection_pointer_cancelled {
             if !ui.input(|i| i.pointer.primary_down()) {
                 self.selection_pointer_cancelled = false;

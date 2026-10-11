@@ -71,6 +71,29 @@ pub struct EventResponse {
 
 // ----------------------------------------------------------------------------
 
+#[derive(Default)]
+struct KeyboardFocus {
+    pressed: std::collections::HashSet<winit::keyboard::PhysicalKey>,
+}
+
+impl KeyboardFocus {
+    fn focus_lost(&mut self) {
+        self.pressed.clear();
+    }
+
+    fn accepts(&mut self, key: winit::keyboard::PhysicalKey, pressed: bool, repeat: bool) -> bool {
+        if !pressed {
+            self.pressed.remove(&key);
+            true
+        } else if repeat {
+            self.pressed.contains(&key)
+        } else {
+            self.pressed.insert(key);
+            true
+        }
+    }
+}
+
 /// Handles the integration between egui and a winit Window.
 ///
 /// Instantiate one of these per viewport/window.
@@ -86,6 +109,7 @@ pub struct State {
     current_cursor_icon: Option<egui::CursorIcon>,
 
     clipboard: clipboard::Clipboard,
+    keyboard_focus: KeyboardFocus,
 
     /// If `true`, mouse inputs will be treated as touches.
     /// Useful for debugging touch support in egui.
@@ -137,6 +161,7 @@ impl State {
             clipboard: clipboard::Clipboard::new(
                 display_target.display_handle().ok().map(|h| h.as_raw()),
             ),
+            keyboard_focus: KeyboardFocus::default(),
 
             simulate_touch_screen: false,
             pointer_touch_id: None,
@@ -406,6 +431,9 @@ impl State {
                 }
             }
             WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.keyboard_focus.focus_lost();
+                }
                 self.egui_input.focused = *focused;
                 self.egui_input
                     .events
@@ -739,6 +767,13 @@ impl State {
         } = event;
 
         let pressed = *state == winit::event::ElementState::Pressed;
+
+        // egui derives repeats from its own key state, which is cleared on focus loss.
+        // Do not turn an OS repeat from a previous focus session into a fresh command
+        // or text event, and do not read the clipboard for such a repeat.
+        if !self.keyboard_focus.accepts(*physical_key, pressed, *repeat) {
+            return;
+        }
 
         let physical_key = if let winit::keyboard::PhysicalKey::Code(keycode) = *physical_key {
             key_from_key_code(keycode)
@@ -1085,6 +1120,41 @@ fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
 #[cfg(test)]
 mod peerbrush_clipboard_tests {
     use super::*;
+
+    #[test]
+    fn native_key_repeats_require_a_fresh_press_in_the_current_focus_session() {
+        use winit::keyboard::{KeyCode, NativeKeyCode, PhysicalKey};
+
+        let mut focus = KeyboardFocus::default();
+        for key in [
+            PhysicalKey::Code(KeyCode::KeyV),
+            PhysicalKey::Code(KeyCode::Delete),
+            PhysicalKey::Unidentified(NativeKeyCode::Windows(37)),
+        ] {
+            assert!(!focus.accepts(key, true, true));
+            assert!(focus.accepts(key, true, false));
+            assert!(focus.accepts(key, true, true));
+            focus.focus_lost();
+            assert!(!focus.accepts(key, true, true));
+            assert!(focus.accepts(key, false, false));
+            assert!(!focus.accepts(key, true, true));
+            assert!(focus.accepts(key, true, false));
+            assert!(focus.accepts(key, true, true));
+            assert!(focus.accepts(key, false, false));
+            assert!(!focus.accepts(key, true, true));
+        }
+
+        let first = PhysicalKey::Code(KeyCode::KeyW);
+        let second = PhysicalKey::Code(KeyCode::KeyE);
+        assert!(focus.accepts(first, true, false));
+        assert!(!focus.accepts(second, true, true));
+        assert!(focus.accepts(second, true, false));
+        assert!(focus.accepts(first, false, false));
+        assert!(focus.accepts(second, true, true));
+        focus.focus_lost();
+        assert!(!focus.accepts(first, true, true));
+        assert!(!focus.accepts(second, true, true));
+    }
 
     #[test]
     fn native_clipboard_repeats_produce_no_event_and_never_read_clipboard_text() {
