@@ -4259,19 +4259,18 @@ impl PeerBrush {
                 // Anchor keys may continue repeating after Enter, cancellation
                 // or removal of the last anchor. Preserve canvas handling, but
                 // require a new press before they become document edits.
+                // Canvas anchor removal accepts modified keys too; record every
+                // available anchor press before its modifiers can change.
                 ctx.input(|input| {
                     for event in &input.events {
                         if let egui::Event::Key {
                             key,
                             physical_key,
                             pressed: true,
-                            modifiers,
                             ..
                         } = event
                         {
-                            if matches!(key, egui::Key::Delete | egui::Key::Backspace)
-                                && !modifiers.any()
-                            {
+                            if matches!(key, egui::Key::Delete | egui::Key::Backspace) {
                                 self.selection_shortcut_keys.insert(*key);
                                 if let Some(key) = physical_key {
                                     self.selection_shortcut_keys.insert(*key);
@@ -11835,6 +11834,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn modified_lasso_anchor_backspace_cannot_turn_into_foreground_fill_on_repeat() {
+        for depth in [8, 16] {
+            for kind in ["polygon", "magnetic"] {
+                let (mut app, ctx, point, original) =
+                    pressed_selection_fixture(depth, Tool::Selection, kind);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        primary_release(point),
+                        egui::Event::PointerMoved(Pos2::new(1., 1.)),
+                    ],
+                    Default::default(),
+                );
+                app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.], [3., 9.]];
+                let key = |pressed, repeat, modifiers| egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    physical_key: Some(egui::Key::Backspace),
+                    pressed,
+                    repeat,
+                    modifiers,
+                };
+                let control = egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                };
+                frame(&mut app, &ctx, vec![key(true, false, control)], control);
+                assert_eq!(
+                    app.selection_path.len(),
+                    4,
+                    "retain existing modified anchor removal"
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![shortcut_press(egui::Key::Enter)],
+                    Default::default(),
+                );
+                assert!(app.selection_path.is_empty());
+                let selected = app.shared.lock().unwrap().doc.clone();
+                assert!(selected.selection.is_some());
+                let alt = egui::Modifiers {
+                    alt: true,
+                    ..Default::default()
+                };
+                frame(&mut app, &ctx, vec![key(true, true, alt)], alt);
+                {
+                    let engine = app.shared.lock().unwrap();
+                    assert!(
+                        engine.doc.layers[0].pixels.rgba16() == original.layers[0].pixels.rgba16(),
+                        "{depth} {kind}: modified anchor repeat filled artwork"
+                    );
+                    assert_eq!(engine.doc.selection, selected.selection);
+                    assert_eq!(engine.doc.revision, selected.revision);
+                    assert_eq!(engine.undo.len(), 1);
+                }
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![key(false, false, Default::default())],
+                    Default::default(),
+                );
+                frame(&mut app, &ctx, vec![key(true, false, alt)], alt);
+                let mut engine = app.shared.lock().unwrap();
+                assert!(
+                    engine.doc.layers[0].pixels.rgba16() != original.layers[0].pixels.rgba16(),
+                    "fresh foreground fill was rejected"
+                );
+                assert_eq!(
+                    engine.doc.layers[0].pixels.get16(0, 0),
+                    original.layers[0].pixels.get16(0, 0)
+                );
+                assert_eq!(engine.undo.len(), 2);
+                engine.undo("human").unwrap();
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    original.layers[0].pixels.rgba16()
+                );
+                assert_eq!(engine.doc.selection, selected.selection);
+            }
+        }
+    }
     #[test]
     fn held_lasso_anchor_keys_cannot_become_document_edits_after_completion() {
         for depth in [8, 16] {
