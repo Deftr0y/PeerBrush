@@ -611,11 +611,12 @@ fn pattern_overlay(
     // Pattern channels carry their own precision. An 8-bit tile is exactly
     // representable in a 16-bit document; retain its PNG8 source rather than
     // projecting the document or pretending the tile contains native low bits.
-    if !(source.bit_depth == depth || source.bit_depth == 8 && depth == 16)
-        || source.bounds != [0, 0, source.width as i32, source.height as i32]
-    {
-        return Err("Pattern precision or source origin requires protected interpretation".into());
+    if !(source.bit_depth == depth || source.bit_depth == 8 && depth == 16) {
+        return Err("Pattern precision requires protected interpretation".into());
     }
+    // The asset rectangle is its storage frame, not document placement. The
+    // decoder checks matching full channel rectangles and extracts local rows.
+    // Retain those tile samples without applying the storage origin as phase.
     let png = if source.bit_depth == 16 {
         crate::raster::png16(source.width, source.height, &source.pixels.rgba16())?
     } else {

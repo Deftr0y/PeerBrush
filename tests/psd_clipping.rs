@@ -159,7 +159,17 @@ fn pattern_resource_pixels(
     pixels: [[u16; 4]; 2],
     alpha: bool,
 ) -> Vec<u8> {
-    let rect = [0i32, 0, 1, 2]
+    pattern_resource_pixels_bounds(depth, identity, compression, pixels, alpha, [0, 0, 2, 1])
+}
+fn pattern_resource_pixels_bounds(
+    depth: u16,
+    identity: &str,
+    compression: u8,
+    pixels: [[u16; 4]; 2],
+    alpha: bool,
+    bounds: [i32; 4],
+) -> Vec<u8> {
+    let rect = [bounds[1], bounds[0], bounds[3], bounds[2]]
         .into_iter()
         .flat_map(i32::to_be_bytes)
         .collect::<Vec<_>>();
@@ -708,6 +718,216 @@ fn explicit_unsupported_pattern_angles_never_default_to_zero() {
     }
 }
 
+#[test]
+fn photoshop_pattern_storage_origins_preserve_local_tiles_native_sources_and_saves() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    for (depth, asset_depth) in [(8, 8), (16, 16), (16, 8)] {
+        for origin in [[-17, 29], [38, -23], [-32768, 32767], [32766, -32768]] {
+            let bounds = [origin[0], origin[1], origin[0] + 2, origin[1] + 1];
+            for compression in [0, 3] {
+                for enabled in [false, true] {
+                    let mut pixels = PATTERN;
+                    pixels[0][3] = 0;
+                    pixels[1][3] = 41317;
+                    let tile = pixels.map(|pixel| pixel.map(|n| native(n, asset_depth)));
+                    let mut payload = pattern_payload(enabled, "synthetic-origin", "", 100.);
+                    let at = payload
+                        .windows(12)
+                        .position(|v| v == b"OpctUntF#Prc")
+                        .unwrap()
+                        + 12;
+                    payload[at..at + 8].copy_from_slice(&37f64.to_be_bytes());
+                    let mut spec = Spec::paint("Synthetic pattern storage frame", SAVED);
+                    spec.tags.push((*b"lfx2", payload));
+                    let resource = pattern_resource_pixels_bounds(
+                        asset_depth,
+                        "synthetic-origin",
+                        compression,
+                        pixels,
+                        true,
+                        bounds,
+                    );
+                    let mut bytes =
+                        inject_pattern(fixture(&[spec], depth), depth, &resource, false);
+                    // Storage coordinates are absent from the independent local
+                    // tile and source-over calculation, unlike document phase.
+                    let source = SAVED.map(|pixel| pixel.map(|n| native(n, depth)));
+                    let mut merged = source;
+                    if enabled {
+                        for x in 0..2 {
+                            let weight =
+                                (f64::from(tile[x][3]) / 65535. * 0.37 * 65535.).round() / 65535.;
+                            for c in 0..3 {
+                                merged[x][c] = native(
+                                    (((1. - weight) * (f64::from(source[x][c]) / 65535.)
+                                        + weight * (f64::from(tile[x][c]) / 65535.))
+                                        * 65535.)
+                                        .round() as u16,
+                                    depth,
+                                );
+                            }
+                        }
+                    }
+                    bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                    for c in 0..4 {
+                        for pixel in merged {
+                            composite_sample(&mut bytes, pixel, c, depth);
+                        }
+                    }
+                    let doc = psd::decode(&bytes).unwrap();
+                    assert!(
+                        !doc.read_only,
+                        "{depth}/{asset_depth} {bounds:?} {compression} {enabled}: {:?}",
+                        doc.warnings
+                    );
+                    assert_eq!(doc.bit_depth, depth);
+                    assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+                    assert_eq!(rendered(&doc), merged.concat());
+                    let effect = &doc.layers[0].effects[0];
+                    assert_eq!(effect.enabled, enabled);
+                    assert_eq!(effect.settings["phase_x"], 0.);
+                    assert_eq!(effect.settings["phase_y"], 0.);
+                    let bitmap = effect.settings["bitmap_png"].as_str().unwrap().to_owned();
+                    let png = STANDARD.decode(&bitmap).unwrap();
+                    assert_eq!(u16::from(png[24]), asset_depth);
+                    assert_eq!(
+                        image::load_from_memory(&png)
+                            .unwrap()
+                            .into_rgba16()
+                            .into_raw(),
+                        tile.concat()
+                    );
+                    let current = doc.export_png().unwrap();
+                    let mut engine = Engine::new();
+                    let layer = doc.layers[0].id.clone();
+                    let effect = effect.id.clone();
+                    engine.doc = doc;
+                    engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Pattern storage-frame bypass").unwrap();
+                    assert_eq!(engine.undo.len(), 1);
+                    engine.undo("human").unwrap();
+                    assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+                    assert_eq!(engine.doc.export_png().unwrap(), current);
+                    for output in [
+                        psd::encode(&engine.doc).unwrap(),
+                        psd::encode_psb(&engine.doc).unwrap(),
+                    ] {
+                        assert_eq!(saved_composite(&output, depth), merged.concat());
+                        let reopened = psd::decode(&output).unwrap();
+                        assert!(!reopened.read_only);
+                        assert_eq!(reopened.bit_depth, depth);
+                        assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                        assert_eq!(reopened.layers[0].effects[0].settings["bitmap_png"], bitmap);
+                        assert_eq!(reopened.export_png().unwrap(), current);
+                        assert_eq!(
+                            psd::decode(&ordinary(&output))
+                                .unwrap()
+                                .export_png()
+                                .unwrap(),
+                            current
+                        );
+                    }
+                    let at = bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+                    bytes[at] ^= 1;
+                    assert!(
+                        psd::decode(&bytes).unwrap().read_only,
+                        "storage-origin composite mismatch was accepted"
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn photoshop_pattern_storage_origins_do_not_authorize_invalid_frames_or_placement() {
+    for depth in [8, 16] {
+        for enabled in [false, true] {
+            for bounds in [
+                [-17, 29, -17, 30],
+                [-17, 29, -18, 30],
+                [-17, 29, -15, 29],
+                [32767, 29, 32769, 30],
+                [-32769, 29, -32767, 30],
+            ] {
+                let mut spec = Spec::paint("Synthetic invalid pattern frame", SAVED);
+                spec.tags.push((
+                    *b"lfx2",
+                    pattern_payload(enabled, "synthetic-origin", "", 100.),
+                ));
+                let resource = pattern_resource_pixels_bounds(
+                    depth,
+                    "synthetic-origin",
+                    0,
+                    PATTERN,
+                    true,
+                    bounds,
+                );
+                assert!(
+                    psd::decode(&inject_pattern(
+                        fixture(&[spec], depth),
+                        depth,
+                        &resource,
+                        false
+                    ))
+                    .unwrap()
+                    .read_only
+                );
+            }
+            let bounds: [i32; 4] = [-17, 29, -15, 30];
+            for variant in ["channel", "phase", "aligned"] {
+                let mut payload = pattern_payload(enabled, "synthetic-origin", "", 100.);
+                let mut resource = pattern_resource_pixels_bounds(
+                    depth,
+                    "synthetic-origin",
+                    0,
+                    PATTERN,
+                    true,
+                    bounds,
+                );
+                match variant {
+                    "channel" => {
+                        let rect = [bounds[1], bounds[0], bounds[3], bounds[2]]
+                            .into_iter()
+                            .flat_map(i32::to_be_bytes)
+                            .collect::<Vec<_>>();
+                        let matches = resource
+                            .windows(16)
+                            .enumerate()
+                            .filter_map(|(at, v)| (v == rect).then_some(at))
+                            .collect::<Vec<_>>();
+                        assert_eq!(matches.len(), 5);
+                        // Same dimensions, but one channel has a different frame.
+                        let shifted = [bounds[1] + 1, bounds[0], bounds[3] + 1, bounds[2]]
+                            .into_iter()
+                            .flat_map(i32::to_be_bytes)
+                            .collect::<Vec<_>>();
+                        let at = matches[1];
+                        resource[at..at + 16].copy_from_slice(&shifted);
+                    }
+                    "phase" => {
+                        let at = payload.windows(8).position(|v| v == b"Hrzndoub").unwrap() + 8;
+                        payload[at..at + 8].copy_from_slice(&1.25f64.to_be_bytes());
+                    }
+                    _ => {
+                        let at = payload.windows(8).position(|v| v == b"Algnbool").unwrap() + 8;
+                        payload[at] = 1;
+                    }
+                }
+                let mut spec =
+                    Spec::paint("Synthetic unsupported pattern storage/placement", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let doc = psd::decode(&inject_pattern(
+                    fixture(&[spec], depth),
+                    depth,
+                    &resource,
+                    false,
+                ))
+                .unwrap();
+                assert!(doc.read_only, "{depth} {enabled} {variant}");
+                assert!(doc.layers[0].effects.is_empty());
+            }
+        }
+    }
+}
 #[test]
 fn unsupported_missing_ambiguous_unused_and_mismatched_pattern_sources_stay_protected() {
     for depth in [8, 16] {
