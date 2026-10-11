@@ -133,22 +133,24 @@ fn tab(ui: &mut egui::Ui, id: &str, label: &Label, active: bool, width: f32) -> 
         rect.min + Vec2::new(21., 0.),
         body_rect.max - Vec2::new(3., 0.),
     );
-    let mut job = egui::text::LayoutJob::simple(
-        label.name.clone(),
-        egui::FontId::proportional(12.),
-        color,
-        text_rect.width().max(0.),
-    );
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let galley = ui.fonts(|fonts| fonts.layout_job(job));
-    ui.painter()
-        .with_clip_rect(text_rect.intersect(ui.clip_rect()))
-        .galley(
-            Pos2::new(text_rect.left(), rect.center().y - galley.size().y / 2.),
-            galley,
+    if !filename::paint(ui, &label.name, text_rect, 12., color) {
+        let mut job = egui::text::LayoutJob::simple(
+            label.name.clone(),
+            egui::FontId::proportional(12.),
             color,
+            text_rect.width().max(0.),
         );
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = ui.fonts(|fonts| fonts.layout_job(job));
+        ui.painter()
+            .with_clip_rect(text_rect.intersect(ui.clip_rect()))
+            .galley(
+                Pos2::new(text_rect.left(), rect.center().y - galley.size().y / 2.),
+                galley,
+                color,
+            );
+    }
     if active || hovered || close.has_focus() || body.has_focus() {
         if close.hovered() || close.has_focus() {
             ui.painter()
@@ -175,17 +177,19 @@ fn tab(ui: &mut egui::Ui, id: &str, label: &Label, active: bool, width: f32) -> 
             );
         }
     }
-    body.clone().on_hover_text(format!(
-        "{}{}{}",
-        label.name,
+    body.clone().on_hover_ui(|ui| {
+        filename::label(ui, &label.name, 12., color, 900.);
         if label.dirty {
-            " · Unsaved changes"
-        } else {
-            ""
-        },
-        if label.ai { " · AI activity" } else { "" }
-    ));
-    close.clone().on_hover_text(format!("Close {}", label.name));
+            ui.label("Unsaved changes");
+        }
+        if label.ai {
+            ui.label(RichText::new("AI activity").color(AI_BLUE));
+        }
+    });
+    close.clone().on_hover_ui(|ui| {
+        ui.label("Close project");
+        filename::label(ui, &label.name, 12., color, 900.);
+    });
     TabResponse { body, close, rect }
 }
 
@@ -391,20 +395,17 @@ impl PeerBrush {
                                 .show(ui, |ui| {
                                     for (id, _, _) in &entries {
                                         let label = &self.project_labels[id];
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new(format!(
-                                                        "{}{}",
-                                                        label.name,
-                                                        if label.dirty { " ·" } else { "" }
-                                                    ))
-                                                    .color(if label.ai { AI_BLUE } else { MUTED }),
-                                                )
-                                                .selected(id == &self.project_id)
-                                                .wrap(),
-                                            )
-                                            .clicked()
+                                        if filename::project_button(
+                                            ui,
+                                            &format!(
+                                                "{}{}",
+                                                label.name,
+                                                if label.dirty { " ·" } else { "" }
+                                            ),
+                                            id == &self.project_id,
+                                            if label.ai { AI_BLUE } else { MUTED },
+                                        )
+                                        .clicked()
                                         {
                                             select = Some(id.clone());
                                             ui.close_menu();
@@ -554,6 +555,49 @@ mod tests {
             .into_iter()
             .map(|(id, _, _)| id)
             .collect()
+    }
+    #[test]
+    fn unicode_project_tabs_switch_without_mutating_names_native_pixels_or_history() {
+        let names = [
+            "café Ω Ж.psd",
+            "שלום עולם.psd",
+            "مرحبا بالعالم.psd",
+            "हिन्दी.psd",
+            "漢字 あいう 한글.psd",
+        ];
+        for depth in [8, 16] {
+            let (mut app, ctx, projects) = fixture(depth, names.len());
+            for (shared, name) in projects.iter().zip(names) {
+                shared.lock().unwrap().doc.name = name.into();
+            }
+            let before: Vec<_> = projects
+                .iter()
+                .map(|s| {
+                    let e = s.lock().unwrap();
+                    (e.doc.clone(), e.undo.len(), e.path.clone())
+                })
+                .collect();
+            frame(&mut app, &ctx, 1600., Vec::new());
+            for id in ids(&app) {
+                let rect = app.project_rects[&id];
+                click(
+                    &mut app,
+                    &ctx,
+                    1600.,
+                    rect.left_center() + Vec2::new(30., 0.),
+                );
+                assert_eq!(app.project_id, id);
+            }
+            for (shared, (doc, history, path)) in projects.iter().zip(before) {
+                let e = shared.lock().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&e.doc).unwrap(),
+                    serde_json::to_value(doc).unwrap()
+                );
+                assert_eq!(e.undo.len(), history);
+                assert_eq!(e.path, path);
+            }
+        }
     }
     fn press(app: &mut PeerBrush, ctx: &egui::Context, width: f32, pos: Pos2, pressed: bool) {
         frame(

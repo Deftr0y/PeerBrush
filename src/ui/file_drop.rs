@@ -89,14 +89,16 @@ mod tests {
             app.pan = Vec2::new(13., -17.);
             let before = root.lock().unwrap().state();
             let history = root.lock().unwrap().undo.len();
-            let path =
-                std::env::temp_dir().join(format!("pb-tab-drop-{}.png", crate::engine::id()));
+            let path = std::env::temp_dir().join(format!(
+                "café שלום مرحبا हिन्दी 漢字 あいう 한글-{}.png",
+                crate::engine::id()
+            ));
             let bytes = if depth == 16 {
                 crate::raster::png16(3, 2, &[12345, 23457, 45679, 32123].repeat(6)).unwrap()
             } else {
                 crate::raster::png(3, 2, &[123, 45, 67, 89].repeat(6)).unwrap()
             };
-            std::fs::write(&path, bytes).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
             let pos = app.project_drop_rect.unwrap().center();
             let output = frame(
                 &mut app,
@@ -131,6 +133,19 @@ mod tests {
             }
             frame(&mut app, &ctx, Default::default());
             assert_eq!(app.shared.lock().unwrap().doc.bit_depth, depth);
+            assert_eq!(
+                app.shared.lock().unwrap().doc.layers[0].pixels.get16(0, 0),
+                if depth == 16 {
+                    [12345, 23457, 45679, 32123]
+                } else {
+                    [123 * 257, 45 * 257, 67 * 257, 89 * 257]
+                }
+            );
+            assert_eq!(
+                app.shared.lock().unwrap().doc.name,
+                path.file_name().unwrap().to_str().unwrap()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
             assert_eq!(root.lock().unwrap().state(), before);
             assert_eq!(root.lock().unwrap().undo.len(), history);
             crate::workspace::select(&root, &project).unwrap();

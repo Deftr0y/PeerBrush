@@ -7,6 +7,7 @@ mod color;
 mod effects;
 mod file_drop;
 mod file_ownership;
+mod filename;
 mod filters;
 mod geometry;
 mod history;
@@ -497,6 +498,7 @@ impl PeerBrush {
             egui::FontFamily::Name("semibold".into()),
             vec!["Ubuntu Sans Semibold".into()],
         );
+        filename::install_fallbacks(&mut fonts);
         ctx.set_fonts(fonts);
         let image = image::load_from_memory(include_bytes!("../assets/peerbrush-logo.png"))
             .unwrap()
@@ -4569,8 +4571,7 @@ impl PeerBrush {
                         if ui.button("Project dimensions and depth…").clicked(){self.project_settings=Some((doc.width,doc.height,doc.bit_depth));ui.close_menu();}
                     });
                     ui.separator();
-                    ui.label(
-                        RichText::new(format!(
+                    filename::label(ui, &format!(
                             "{}{}",
                             doc.name,
                             if self.shared.lock().unwrap().saved_revision != doc.revision {
@@ -4578,9 +4579,7 @@ impl PeerBrush {
                             } else {
                                 ""
                             }
-                        ))
-                        .size(11.0)
-                        .color(MUTED),
+                        ), 11., MUTED, 300.,
                     );
                     ui.separator();
                     ui.label(RichText::new(&self.message).size(11.0));
