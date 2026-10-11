@@ -52,6 +52,10 @@ Photoshop's full protection tag (`lspf=7`, transparency/composite/position locke
 
 Unsupported documents retain their saved composite at the original channel depth and cannot be edited or saved over their source. The native **READ ONLY** label exposes warnings on hover; agents receive the same reasons in `document.warnings`. **Edit 16-bit copy** / `compatible_copy` explicitly flattens unsupported structure into a new editable project at the original precision and requires a new save path.
 
+The **Why read only?** report also lists original source layer records, including folder membership, original document coordinates, visibility, mask presence, tag names and unsupported settings found on each record. MCP and CLI observations expose the same view-only records in `document.source_structure`. `source_index` is the original file record index; `parent_index` points to its source folder. Closing folder dividers are omitted. `kind` distinguishes folder (`group`) from ordinary layer records (`layer`); unsupported source object types are not inferred. These records have no editable layer IDs and do not represent recovered layer pixels. Document-level warnings still apply to records without individual warnings.
+
+Source diagnostics stay outside saved PeerBrush sources and history. Each report has at most 200 records, 64 tag names and 64 reasons per record; diagnostic text is limited to 1,024 Unicode characters, with `details_truncated` explicitly indicating shortened details. The protected composite and source file retain their precision. Creating an explicit editable flattened copy clears these diagnostics. This reporting change is unreleased and does not add Photoshop style or pattern import support.
+
 The codec now checks:
 
 - Disabled **Blend Clipped Layers As Group** (`clbl`), knockout (`knko`) and non-default fill opacity (`iOpa`).

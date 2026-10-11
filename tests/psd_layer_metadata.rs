@@ -85,6 +85,129 @@ fn payload_range(bytes: &[u8], key: &[u8; 4]) -> std::ops::Range<usize> {
 }
 
 #[test]
+fn protected_source_report_retains_original_tree_coordinates_and_layer_specific_reasons() {
+    for depth in [8, 16] {
+        let mut original = fixture(depth);
+        original.width = 4;
+        original.height = 3;
+        original.layers[0].x = 1;
+        original.layers[0].y = 1;
+        let folder = Layer::new("Source folder", "group", 4, 3);
+        original.layers[0].parent = Some(folder.id.clone());
+        original.layers.insert(0, folder);
+        original
+            .layers
+            .push(Layer::new("Unrelated source", "paint", 4, 3));
+        if depth == 16 {
+            for layer in &mut original.layers {
+                layer.pixels.promote16();
+            }
+        }
+        let standard = ordinary(&psd::encode(&original).unwrap());
+        let editable = psd::decode(&standard).unwrap();
+        assert!(!editable.read_only);
+        assert!(editable.source_structure.is_empty());
+        let before = editable.export_png().unwrap();
+        let mut unsupported = standard.clone();
+        for (old, new) in [(b"lnsr", b"lrFX"), (b"lclr", b"lyvr")] {
+            let range = payload_range(&unsupported, old);
+            unsupported[range.start - 8..range.start - 4].copy_from_slice(new);
+        }
+        let protected = psd::decode(&unsupported).unwrap();
+        assert!(protected.read_only);
+        assert_eq!(protected.bit_depth, depth);
+        assert_eq!(protected.layers.len(), 1);
+        assert_eq!(protected.export_png().unwrap(), before);
+        assert_eq!(protected.source_structure.len(), 3); // Closing divider is not a layer.
+        let report = &protected.source_structure;
+        let child = report
+            .iter()
+            .find(|layer| layer.name == "Preserved label")
+            .unwrap();
+        let parent = report
+            .iter()
+            .find(|layer| layer.name == "Source folder")
+            .unwrap();
+        assert_eq!(child.parent_index, Some(parent.source_index));
+        assert_eq!(parent.parent_index, None);
+        assert_eq!(child.bounds, [1, 1, 3, 2]);
+        assert_eq!(child.kind, "layer"); // Unsupported records do not establish their editable type.
+        assert!(child.visible);
+        assert!(!child.details_truncated);
+        assert!(child.tags.contains(&"lrFX".into()));
+        assert!(child
+            .warnings
+            .iter()
+            .any(|reason| reason.ends_with(": lrFX")));
+        assert!(child
+            .warnings
+            .iter()
+            .any(|reason| reason.ends_with(": lyvr")));
+        assert!(report
+            .iter()
+            .filter(|layer| layer.name != child.name)
+            .all(|layer| layer.warnings.is_empty()));
+        assert!(psd::encode(&protected).unwrap_err().contains("Cannot save"));
+        let serialized = serde_json::to_value(&protected).unwrap();
+        assert!(serialized.get("source_structure").is_none());
+        let mut engine = Engine::new();
+        engine.doc = protected;
+        let observed = engine.state();
+        assert_eq!(
+            observed["document"]["source_structure"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(observed["document"]["source_structure"][0]
+            .get("id")
+            .is_none());
+        assert!(engine
+            .edit(
+                "human",
+                &[json!({"op":"layer.delete","layer":engine.doc.layers[0].id})],
+                None,
+                None,
+                "Protected source"
+            )
+            .is_err());
+        assert_eq!(engine.doc.revision, 0);
+        assert_eq!(engine.doc.export_png().unwrap(), before);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(engine));
+        peerbrush::server::compatible_copy(&shared, "human", Some(0)).unwrap();
+        let copied = shared.lock().unwrap();
+        assert!(!copied.doc.read_only);
+        assert!(copied.doc.source_structure.is_empty());
+        assert_eq!(copied.doc.bit_depth, depth);
+        assert_eq!(copied.doc.export_png().unwrap(), before);
+    }
+}
+
+#[test]
+fn protected_source_report_bounds_unicode_names_without_changing_source_serialization() {
+    let mut original = fixture(16);
+    original.layers[0].name = "色".repeat(1100);
+    let mut standard = ordinary(&psd::encode(&original).unwrap());
+    let range = payload_range(&standard, b"lnsr");
+    standard[range.start - 8..range.start - 4].copy_from_slice(b"lrFX");
+    let protected = psd::decode(&standard).unwrap();
+    assert!(protected.read_only);
+    let layer = &protected.source_structure[0];
+    assert_eq!(layer.name, "色".repeat(1024));
+    assert!(layer.details_truncated);
+    assert_eq!(protected.bit_depth, 16);
+    let restored: Document =
+        serde_json::from_value(serde_json::to_value(&protected).unwrap()).unwrap();
+    assert!(restored.source_structure.is_empty());
+    assert!(restored.read_only);
+    assert_eq!(
+        protected.export_png().unwrap(),
+        restored.export_png().unwrap()
+    );
+}
+
+#[test]
 fn standard_full_layer_locks_survive_without_private_sources_and_use_shared_edit_guards() {
     for depth in [8, 16] {
         let mut original = fixture(depth);

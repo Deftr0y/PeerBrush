@@ -3918,8 +3918,15 @@ impl PeerBrush {
             if panel == "saved_versions" {
                 self.recover_previous_save();
             }
-            self.read_only_info = if panel == "document_info" {
-                Some(self.shared.lock().unwrap().doc.id.clone())
+            self.read_only_info = if panel == "document_info" || panel == "document_sources" {
+                let id = self.shared.lock().unwrap().doc.id.clone();
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new(("protected-source-scroll", id.as_str())),
+                        panel == "document_sources",
+                    )
+                });
+                Some(id)
             } else {
                 None
             };
@@ -8745,6 +8752,18 @@ mod tests {
                     "Unsupported Photoshop feature: lmfx".into(),
                     "Unsupported global Photoshop feature: unknown".into(),
                 ];
+                e.doc.source_structure = vec![crate::psd::SourceLayerInfo {
+                    source_index: 1,
+                    parent_index: None,
+                    name: "Original styled layer".into(),
+                    kind: "paint".into(),
+                    bounds: [-2, 1, 6, 9],
+                    visible: true,
+                    has_mask: true,
+                    tags: vec!["lmfx".into()],
+                    warnings: vec!["Unsupported Photoshop feature: lmfx".into()],
+                    details_truncated: false,
+                }];
                 app.selected = e.doc.layers[0].id.clone();
             }
             let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
@@ -8778,6 +8797,23 @@ mod tests {
             assert!(text.contains("Showing the saved appearance"));
             assert!(text.contains("layer styles"));
             assert!(text.contains("Unsupported global Photoshop feature: unknown"));
+            assert!(text.contains("Original source layers"));
+            assert!(text.contains("Original styled layer"));
+            app.workspace_root.lock().unwrap().capture_panel = Some("document_sources".into());
+            for _ in 0..4 {
+                output = draw(&mut app);
+            }
+            let source_text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(source_text.contains("Bounds: -2, 1"));
+            assert!(source_text.contains("Source mask present"));
             assert!(app.protection_visible(&app.shared.lock().unwrap().doc));
             assert_eq!(
                 serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),

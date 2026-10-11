@@ -289,12 +289,14 @@ fn protocol_default_range_psd_opens_editable_and_protected_report_keeps_source_i
         )
         .unwrap();
         let state = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
-        server::dispatch(
-            &shared,
-            "capture_ui",
-            &json!({"path":dir.join("report.png"),"panel":"document_info"}),
-        )
-        .unwrap();
+        for panel in ["document_info", "document_sources"] {
+            server::dispatch(
+                &shared,
+                "capture_ui",
+                &json!({"path":dir.join("report.png"),"panel":panel}),
+            )
+            .unwrap();
+        }
         assert_eq!(
             serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
             state

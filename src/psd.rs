@@ -963,7 +963,28 @@ fn decode_channel(data: &[u8], w: u32, h: u32, layout: Layout) -> Result<Vec<u8>
         _ => Err("Unknown PSD compression".into()),
     }
 }
+/// Bounded source diagnostics, not decoded editable Photoshop layers.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SourceLayerInfo {
+    pub source_index: usize,
+    pub parent_index: Option<usize>,
+    pub name: String,
+    pub kind: String,
+    /// Original document coordinates, [left, top, right, bottom].
+    pub bounds: [i32; 4],
+    pub visible: bool,
+    pub has_mask: bool,
+    pub tags: Vec<String>,
+    pub warnings: Vec<String>,
+    pub details_truncated: bool,
+}
+fn diagnostic_text(value: &str, truncated: &mut bool) -> String {
+    let text = value.chars().take(1024).collect::<String>();
+    *truncated |= text.len() != value.len();
+    text
+}
 struct Record {
+    source: SourceLayerInfo,
     layer: Layer,
     channels: Vec<(i16, usize)>,
     bounds: [i32; 4],
@@ -1539,6 +1560,7 @@ fn decode_parts(
             }
             for record_index in 0..count {
                 control.progress("Reading layer definitions", record_index, count)?;
+                let warning_start = warnings.len();
                 let bounds = [lr.i32()?, lr.i32()?, lr.i32()?, lr.i32()?];
                 if bounds.iter().any(|v| v.unsigned_abs() > 100000) {
                     return Err("PSD layer coordinates exceed initial limits".into());
@@ -1759,7 +1781,38 @@ fn decode_parts(
                 layer.opacity = opacity;
                 layer.blend = blend.into();
                 layer.psd_metadata = psd_metadata;
+                let mut details_truncated =
+                    seen_tags.len() > 64 || warnings.len() - warning_start > 64;
+                let mut tags = std::collections::BTreeSet::new();
+                for key in &seen_tags {
+                    tags.insert(String::from_utf8_lossy(key).into_owned());
+                    if tags.len() > 64 {
+                        tags.pop_last();
+                    }
+                }
+                let source = SourceLayerInfo {
+                    source_index: record_index,
+                    parent_index: None,
+                    name: diagnostic_text(&name, &mut details_truncated),
+                    kind: if layer.kind == "group" {
+                        "group"
+                    } else {
+                        "layer"
+                    }
+                    .into(),
+                    bounds: [bounds[1], bounds[0], bounds[3], bounds[2]],
+                    visible: layer.visible,
+                    has_mask: mask_bounds.is_some(),
+                    tags: tags.into_iter().collect(),
+                    warnings: warnings[warning_start..]
+                        .iter()
+                        .take(64)
+                        .map(|warning| diagnostic_text(warning, &mut details_truncated))
+                        .collect(),
+                    details_truncated,
+                };
                 records.push(Record {
+                    source,
                     layer,
                     channels,
                     bounds,
@@ -1871,6 +1924,7 @@ fn decode_parts(
     doc.srgb_tagged = srgb_tagged;
     doc.layers.clear();
     let mut parents = Vec::<String>::new();
+    let mut source_indices = std::collections::HashMap::new();
     let mut clipped = std::collections::HashSet::new();
     for mut rec in records.into_iter().rev() {
         if rec.section == 3 {
@@ -1883,6 +1937,13 @@ fn decode_parts(
             clipped.insert(rec.layer.id.clone());
         }
         rec.layer.parent = parents.last().cloned();
+        rec.source.parent_index = rec
+            .layer
+            .parent
+            .as_ref()
+            .and_then(|parent| source_indices.get(parent).copied());
+        source_indices.insert(rec.layer.id.clone(), rec.source.source_index);
+        doc.source_structure.push(rec.source);
         if rec.layer.kind == "group" {
             parents.push(rec.layer.id.clone());
         }
@@ -1932,6 +1993,9 @@ fn decode_parts(
         warnings.push("16-bit Photoshop source features are read-only and protected. The saved composite retains 16-bit samples; an explicit editable copy flattens its layers without reducing precision".into());
     }
     doc.warnings = warnings;
+    if !doc.read_only {
+        doc.source_structure.clear();
+    }
     control.progress("Ready", 1, 1)?;
     Ok(doc)
 }
@@ -2280,6 +2344,18 @@ mod storage_tests {
     use super::*;
     fn record() -> Record {
         Record {
+            source: SourceLayerInfo {
+                source_index: 0,
+                parent_index: None,
+                name: "Thin source".into(),
+                kind: "paint".into(),
+                bounds: [0, 0, 8192, 1],
+                visible: true,
+                has_mask: false,
+                tags: vec![],
+                warnings: vec![],
+                details_truncated: false,
+            },
             layer: Layer::new("Thin source", "paint", 8192, 1),
             channels: vec![(0, 2)],
             bounds: [0, 0, 1, 8192],

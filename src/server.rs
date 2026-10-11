@@ -1243,6 +1243,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "solo_color",
                     "solo_mask",
                     "document_info",
+                    "document_sources",
                     "saved_versions",
                     "calibration",
                     "view",
