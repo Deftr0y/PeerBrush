@@ -488,7 +488,7 @@ impl PeerBrush {
     }
     pub(super) fn effect_title(ui: &mut egui::Ui, name: &str, selected: bool) -> egui::Response {
         // Reserve room for the inline strength even when an effect has a long name.
-        let width = (ui.available_width() - 84.0).clamp(24.0, 125.0);
+        let width = (ui.available_width() - 120.0).clamp(24.0, 125.0);
         ui.add_sized(
             [width, 22.0],
             egui::Button::new(RichText::new(name).size(12.0))
@@ -497,7 +497,7 @@ impl PeerBrush {
                 .truncate(),
         )
         .on_hover_text(format!(
-            "{name} · Select to edit settings · click again to close"
+            "{name} · Select to edit settings · click again to close · right-click for actions"
         ))
     }
     pub(super) fn effect_bake_menu(
@@ -509,28 +509,287 @@ impl PeerBrush {
         index: usize,
         revision: u64,
     ) {
-        response.context_menu(|ui| {
-            let scope = if mask { "mask pixels" } else if l.kind == "group" { "folder pixels (flattens children)" } else if l.source.is_some() { "pixels (rasterizes text/vector)" } else { "layer pixels" };
-            let label = format!("Bake into {scope}");
-            ui.label(format!("Includes this effect and {index} preceding {}", if index == 1 { "effect" } else { "effects" }));
-            let enabled = l.kind != "adjustment" || mask;
-            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                let command = if mask {
-                    json!({"op":"mask.step.bake","layer":l.id,"step":effect,"source_revision":revision})
+        response.context_menu(|ui| self.effect_options(ui, l, mask, effect, index, revision));
+    }
+    pub(super) fn effect_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        l: &Layer,
+        mask: bool,
+        effect: &str,
+        index: usize,
+        revision: u64,
+    ) -> egui::Response {
+        let menu = egui::menu::menu_custom_button(ui, egui::Button::new("⋯").frame(false), |ui| {
+            self.effect_options(ui, l, mask, effect, index, revision);
+        })
+        .response
+        .on_hover_text("Effect actions · Top effects run last");
+        menu.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Effect actions")
+        });
+        menu
+    }
+    fn effect_present(&self, layer: &str, mask: bool, effect: &str) -> bool {
+        self.shared
+            .lock()
+            .unwrap()
+            .doc
+            .layers
+            .iter()
+            .find(|entry| entry.id == layer)
+            .is_some_and(|entry| {
+                if mask {
+                    entry
+                        .mask
+                        .as_ref()
+                        .is_some_and(|m| m.steps.iter().any(|step| step.id == effect))
                 } else {
-                    json!({"op":"effect.bake","layer":l.id,"effect":effect,"source_revision":revision})
-                };
-                self.edit(vec![command], "Bake effect and preceding effects");
-                self.effect_selected = None;
-                self.mask_step = None;
+                    entry.effects.iter().any(|entry| entry.id == effect)
+                }
+            })
+    }
+    fn effect_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        l: &Layer,
+        mask: bool,
+        effect: &str,
+        index: usize,
+        revision: u64,
+    ) {
+        let count = if mask {
+            l.mask.as_ref().map_or(0, |m| m.steps.len())
+        } else {
+            l.effects.len()
+        };
+        ui.label(RichText::new("Top effects run last").size(11.).color(MUTED));
+        for (label, available, destination) in [
+            ("Move up · run later", index + 1 < count, index + 1),
+            (
+                "Move down · run earlier",
+                index > 0,
+                index.saturating_sub(1),
+            ),
+        ] {
+            if ui
+                .add_enabled(available, egui::Button::new(label))
+                .clicked()
+            {
+                self.layer_cmd(
+                    if mask {
+                        "mask.step.reorder"
+                    } else {
+                        "effect.reorder"
+                    },
+                    if mask {
+                        json!({"step":effect,"index":destination})
+                    } else {
+                        json!({"effect":effect,"index":destination})
+                    },
+                    "Reorder effect",
+                );
                 ui.close_menu();
             }
-            if !enabled { ui.label("Adjustment effects depend on the backdrop. Merge affected layers explicitly."); }
+        }
+        if ui
+            .button(if mask {
+                "Remove mask effect"
+            } else {
+                "Remove effect"
+            })
+            .clicked()
+        {
+            self.layer_cmd(
+                if mask {
+                    "mask.step.delete"
+                } else {
+                    "effect.delete"
+                },
+                if mask {
+                    json!({"step":effect})
+                } else {
+                    json!({"effect":effect})
+                },
+                "Remove effect",
+            );
+            let removed = !self.effect_present(&l.id, mask, effect);
+            if removed {
+                if self.effect_is_selected(&l.id, mask, effect) {
+                    self.effect_selected = None;
+                }
+                if mask && self.mask_step.as_deref() == Some(effect) {
+                    self.mask_step = None;
+                }
+            }
+            ui.close_menu();
+        }
+        ui.separator();
+        let scope = if mask {
+            "mask pixels"
+        } else if l.kind == "group" {
+            "folder pixels (flattens children)"
+        } else if l.source.is_some() {
+            "pixels (rasterizes text/vector)"
+        } else {
+            "layer pixels"
+        };
+        let label = format!("Bake into {scope}");
+        ui.label(format!(
+            "Includes this effect and {index} preceding {}",
+            if index == 1 { "effect" } else { "effects" }
+        ));
+        let enabled = l.kind != "adjustment" || mask;
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            let command = if mask {
+                json!({"op":"mask.step.bake","layer":l.id,"step":effect,"source_revision":revision})
+            } else {
+                json!({"op":"effect.bake","layer":l.id,"effect":effect,"source_revision":revision})
+            };
+            self.edit(vec![command], "Bake effect and preceding effects");
+            if !self.effect_present(&l.id, mask, effect) {
+                self.effect_selected = None;
+                self.mask_step = None;
+            }
+            ui.close_menu();
+        }
+        if !enabled {
+            ui.label(
+                "Adjustment effects depend on the backdrop. Merge affected layers explicitly.",
+            );
+        }
+    }
+    pub(super) fn effect_heading(ui: &mut egui::Ui, mask: bool) {
+        ui.label(RichText::new(if mask { "MASK EFFECTS" } else { "COLOR EFFECTS" }).size(10.).color(MUTED))
+            .on_hover_text("Bottom runs first · Top runs last · Select a name for settings · Row menu for reorder, remove or bake");
+    }
+    pub(super) fn mask_stack(&mut self, ui: &mut egui::Ui, doc: &Document, l: &Layer) {
+        let Some(m) = &l.mask else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            Self::effect_heading(ui, true);
+            let add = ui.menu_button("+ Add effect", |ui| {
+                self.effect_picker(ui, true, l.kind == "adjustment")
+            });
+            self.effect_add_rect = Some(add.response.rect);
+            let mut enabled = m.enabled;
+            if ui
+                .checkbox(&mut enabled, "On")
+                .on_hover_text("Enable or bypass the whole mask")
+                .changed()
+            {
+                self.layer_cmd("mask.toggle", json!({"enabled":enabled}), "Toggle mask");
+            }
         });
+        egui::ScrollArea::vertical()
+            .id_salt("mask effects")
+            .max_height((ui.available_height() - 8.0).max(24.0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                for (index, step) in m.steps.iter().enumerate().rev() {
+                    ui.push_id(&step.id, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let mut enabled = step.enabled;
+                            if ui
+                                .checkbox(&mut enabled, "")
+                                .on_hover_text("Enable mask effect")
+                                .changed()
+                            {
+                                self.layer_cmd(
+                                    "mask.step.update",
+                                    json!({"step":step.id,"enabled":enabled}),
+                                    "Toggle mask step",
+                                );
+                            }
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
+                            icons::paint(ui.painter(), rect, effect_icon(&step.kind), step.enabled);
+                            let name = if step.kind == "blur" {
+                                "Feather"
+                            } else {
+                                effect_name(&step.kind)
+                            };
+                            let title = Self::effect_title(
+                                ui,
+                                name,
+                                self.effect_is_selected(&l.id, true, &step.id),
+                            );
+                            self.effect_bake_menu(&title, l, true, &step.id, index, doc.revision);
+                            if title.clicked() {
+                                self.select_effect(&l.id, true, &step.id);
+                                self.mask_step = if step.kind == "paint" {
+                                    Some(step.id.clone())
+                                } else {
+                                    None
+                                };
+                                self.last_preview = None;
+                            }
+                            self.effect_actions(ui, l, true, &step.id, index, doc.revision);
+                            self.effect_weight(ui, &step.id, step.weight, true);
+                        });
+                        if self.effect_is_selected(&l.id, true, &step.id) {
+                            if let Some(preview) = self.thumbnail_for(doc, &l.id, true, Some(index))
+                            {
+                                ui.add(egui::Image::new((preview.id(), Vec2::splat(40.0))))
+                                    .on_hover_text("Result through this effect");
+                            }
+                            if ["fill", "levels", "blur"].contains(&step.kind.as_str()) {
+                                let mut value = step.value;
+                                let range = match step.kind.as_str() {
+                                    "fill" => 0.0..=255.0,
+                                    "blur" => 0.0..=64.0,
+                                    _ => 0.1..=5.0,
+                                };
+                                ui.horizontal(|ui| {
+                                    controls::label(
+                                        ui,
+                                        if step.kind == "fill" {
+                                            "Value"
+                                        } else if step.kind == "blur" {
+                                            "Radius"
+                                        } else {
+                                            "Gamma"
+                                        },
+                                    );
+                                    let response = controls::range(
+                                        ui,
+                                        (&step.id, "value"),
+                                        &mut value,
+                                        range,
+                                        180.0,
+                                        if step.kind == "blur" { " px" } else { "" },
+                                        if step.kind == "levels" { 1 } else { 0 },
+                                        false,
+                                    );
+                                    if response.changed() || response.double_clicked() {
+                                        self.layer_parameter(
+                                            json!({"step":step.id,"value":value}),
+                                            "Mask parameter",
+                                            &response,
+                                        );
+                                    }
+                                });
+                            }
+                            if ["curves", "gaussian", "adjust"].contains(&step.kind.as_str()) {
+                                let mut values = step.settings.clone();
+                                if let Some(response) = settings(ui, &step.kind, &mut values) {
+                                    self.layer_parameter(
+                                        json!({"step":step.id,"settings":values}),
+                                        "Mask parameter",
+                                        &response,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+            });
     }
     pub(super) fn color_stack(&mut self, ui: &mut egui::Ui, l: &Layer, revision: u64) {
         ui.horizontal(|ui| {
-            controls::label(ui, "COLOR EFFECTS");
+            Self::effect_heading(ui, false);
             let add = ui.menu_button("+ Add effect", |ui| {
                 self.effect_picker(ui, false, l.kind == "adjustment");
             });
@@ -543,6 +802,9 @@ impl PeerBrush {
             )
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
+                if l.effects.is_empty() {
+                    ui.label(RichText::new("No color effects").size(11.).color(MUTED));
+                }
                 for (index, effect) in l.effects.iter().enumerate().rev() {
                     ui.push_id(&effect.id, |ui| {
                         ui.horizontal(|ui| {
@@ -576,50 +838,10 @@ impl PeerBrush {
                             if title.clicked() {
                                 self.select_effect(&l.id, false, &effect.id);
                             }
+                            self.effect_actions(ui, l, false, &effect.id, index, revision);
                             self.effect_weight(ui, &effect.id, effect.weight, false);
                         });
                         if self.effect_is_selected(&l.id, false, &effect.id) {
-                            ui.horizontal(|ui| {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if icons::small_button(ui, Icon::Trash, "Remove effect")
-                                            .clicked()
-                                        {
-                                            self.layer_cmd(
-                                                "effect.delete",
-                                                json!({"effect":effect.id}),
-                                                "Remove effect",
-                                            );
-                                            self.effect_selected = None;
-                                        }
-                                        if index > 0
-                                            && icons::small_button(
-                                                ui,
-                                                Icon::Down,
-                                                "Move effect down",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.layer_cmd(
-                                                "effect.reorder",
-                                                json!({"effect":effect.id,"index":index-1}),
-                                                "Reorder effects",
-                                            );
-                                        }
-                                        if index + 1 < l.effects.len()
-                                            && icons::small_button(ui, Icon::Up, "Move effect up")
-                                                .clicked()
-                                        {
-                                            self.layer_cmd(
-                                                "effect.reorder",
-                                                json!({"effect":effect.id,"index":index+1}),
-                                                "Reorder effects",
-                                            );
-                                        }
-                                    },
-                                );
-                            });
                             if effect.kind == "liquify"
                                 && ui
                                     .button("Edit on canvas")
@@ -649,6 +871,277 @@ pub(super) fn effect_name(kind: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn menu_fixture(depth: u16, mask: bool) -> (PeerBrush, egui::Context, String, Document) {
+        let ctx = egui::Context::default();
+        let mut e = crate::engine::Engine::new();
+        e.doc = Document::new_depth(32, 24, depth).unwrap();
+        e.doc.layers[0]
+            .pixels
+            .set16(10, 12, [12345, 23457, 34569, 65535]);
+        let layer = e.doc.layers[0].id.clone();
+        let commands = if mask {
+            vec![
+                json!({"op":"mask.add","layer":layer,"value":128}),
+                json!({"op":"mask.step.add","layer":layer,"kind":"invert"}),
+                json!({"op":"mask.step.add","layer":layer,"kind":"levels","value":2.}),
+            ]
+        } else {
+            vec![
+                json!({"op":"effect.add","layer":layer,"kind":"invert"}),
+                json!({"op":"effect.add","layer":layer,"kind":"adjust","settings":{"brightness":0.2}}),
+            ]
+        };
+        e.edit("human", &commands, None, None, "Fixture").unwrap();
+        e.undo.clear();
+        let effect = if mask {
+            e.doc.layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .steps
+                .iter()
+                .find(|step| step.kind == "invert")
+                .unwrap()
+                .id
+                .clone()
+        } else {
+            e.doc.layers[0].effects[0].id.clone()
+        };
+        let before = e.doc.clone();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(e));
+        let mut app = PeerBrush::init(
+            &ctx,
+            shared,
+            crate::server::Connection {
+                port: 0,
+                token: String::new(),
+                state_dir: Default::default(),
+                instance_lock: None,
+                availability: Default::default(),
+            },
+        );
+        app.selected = layer.clone();
+        app.selection_layers = [layer.clone()].into_iter().collect();
+        app.mask = mask;
+        app.effect_selected = Some((layer, mask, effect.clone()));
+        (app, ctx, effect, before)
+    }
+    fn menu_frame(
+        app: &mut PeerBrush,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let doc = app.shared.lock().unwrap().doc.clone();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(270., 800.))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if app.mask {
+                        app.mask_stack(ui, &doc, &doc.layers[0]);
+                    } else {
+                        app.color_stack(ui, &doc.layers[0], doc.revision);
+                    }
+                });
+            },
+        )
+    }
+    fn menu_label(output: &egui::FullOutput, label: &str) -> Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.pos + Vec2::new(4., 4.))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing {label}"))
+    }
+    fn menu_click(app: &mut PeerBrush, ctx: &egui::Context, at: Pos2) {
+        for pressed in [true, false] {
+            menu_frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+    }
+    fn open_invert_menu(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
+        let output = menu_frame(app, ctx, vec![]);
+        let title = menu_label(&output, "Invert");
+        let at = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "⋯" => {
+                    Some(text.pos + Vec2::new(4., 4.))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| (a.y - title.y).abs().total_cmp(&(b.y - title.y).abs()))
+            .unwrap();
+        assert!((at.y - title.y).abs() < 8., "Actions belong to their row");
+        assert!(at.x < 252., "Actions must remain inside a compact stack");
+        menu_click(app, ctx, at);
+        menu_frame(app, ctx, vec![])
+    }
+    #[test]
+    fn compact_color_and_mask_menus_reorder_real_native_results_once_and_keep_sources() {
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let (mut app, ctx, effect, before) = menu_fixture(depth, mask);
+                let menu = open_invert_menu(&mut app, &ctx);
+                menu_label(&menu, "Top effects run last");
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                let at = menu_label(&menu, "Move up · run later");
+                menu_click(&mut app, &ctx, at);
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1, "{}", app.message);
+                assert_ne!(
+                    e.doc.export_png().unwrap(),
+                    before.export_png().unwrap(),
+                    "Order must change actual noncommuting pixels"
+                );
+                assert_eq!(
+                    serde_json::to_value(&e.doc.layers[0].pixels).unwrap(),
+                    serde_json::to_value(&before.layers[0].pixels).unwrap()
+                );
+                if mask {
+                    let steps = &e.doc.layers[0].mask.as_ref().unwrap().steps;
+                    assert_eq!(steps.last().unwrap().id, effect);
+                    for original in &before.layers[0].mask.as_ref().unwrap().steps {
+                        let current = steps.iter().find(|step| step.id == original.id).unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&current.pixels).unwrap(),
+                            serde_json::to_value(&original.pixels).unwrap()
+                        );
+                    }
+                } else {
+                    assert_eq!(e.doc.layers[0].effects.last().unwrap().id, effect);
+                }
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            }
+        }
+    }
+    #[test]
+    fn guarded_effect_removal_and_bake_keep_the_active_inspector_and_native_work() {
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let (mut app, ctx, _effect, before) = menu_fixture(depth, mask);
+                let layer = app.selected.clone();
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "agent",
+                        "Effect work",
+                        vec![crate::engine::Scope::layer(&layer)],
+                    )
+                    .unwrap();
+                let paint = before.layers[0]
+                    .mask
+                    .as_ref()
+                    .and_then(|m| m.steps.iter().find(|step| step.kind == "paint"))
+                    .map(|step| step.id.clone());
+                if mask {
+                    app.mask_step = paint.clone();
+                    app.effect_selected = Some((layer.clone(), true, paint.clone().unwrap()));
+                }
+                let inspector = app.effect_selected.clone();
+                for label in [
+                    if mask {
+                        "Remove mask effect"
+                    } else {
+                        "Remove effect"
+                    },
+                    if mask {
+                        "Bake into mask pixels"
+                    } else {
+                        "Bake into layer pixels"
+                    },
+                ] {
+                    let menu = open_invert_menu(&mut app, &ctx);
+                    let at = menu_label(&menu, label);
+                    menu_click(&mut app, &ctx, at);
+                    assert_eq!(app.effect_selected, inspector);
+                    if mask {
+                        assert_eq!(app.mask_step, paint);
+                    }
+                }
+                let e = app.shared.lock().unwrap();
+                assert!(e.undo.is_empty());
+                assert_eq!(
+                    serde_json::to_value(&e.doc).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                assert_eq!(app.effect_selected, inspector);
+                if mask {
+                    assert_eq!(app.mask_step, paint);
+                }
+                assert!(
+                    app.message.to_lowercase().contains("reserved"),
+                    "{}",
+                    app.message
+                );
+            }
+        }
+    }
+    #[test]
+    fn removing_an_unselected_effect_keeps_the_other_native_inspector() {
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let (mut app, ctx, _effect, before) = menu_fixture(depth, mask);
+                let inspector = if mask {
+                    before.layers[0].mask.as_ref().unwrap().steps[1].id.clone()
+                } else {
+                    before.layers[0].effects[1].id.clone()
+                };
+                app.effect_selected = Some((app.selected.clone(), mask, inspector.clone()));
+                if mask {
+                    app.mask_step = Some(inspector.clone());
+                }
+                let selected = app.effect_selected.clone();
+                let menu = open_invert_menu(&mut app, &ctx);
+                menu_click(
+                    &mut app,
+                    &ctx,
+                    menu_label(
+                        &menu,
+                        if mask {
+                            "Remove mask effect"
+                        } else {
+                            "Remove effect"
+                        },
+                    ),
+                );
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1, "{}", app.message);
+                assert_eq!(app.effect_selected, selected);
+                if mask {
+                    assert_eq!(app.mask_step.as_deref(), Some(inspector.as_str()));
+                }
+                assert_eq!(
+                    serde_json::to_value(&e.doc.layers[0].pixels).unwrap(),
+                    serde_json::to_value(&before.layers[0].pixels).unwrap()
+                );
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            }
+        }
+    }
     #[test]
     fn right_click_native_color_and_mask_effects_bake_once_with_explicit_scope() {
         for depth in [8, 16] {

@@ -2505,8 +2505,15 @@ impl PeerBrush {
                         self.channel_tabs(ui, doc, l.mask.is_some());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .selectable_label(self.isolate, if self.isolate {"Exit solo"} else {"Solo"})
-                                .on_hover_text(if self.isolate {"Return to the full document"} else {"View only the selected Color or Mask target"})
+                                .selectable_label(
+                                    self.isolate,
+                                    if self.isolate { "Exit solo" } else { "Solo" },
+                                )
+                                .on_hover_text(if self.isolate {
+                                    "Return to the full document"
+                                } else {
+                                    "View only the selected Color or Mask target"
+                                })
                                 .clicked()
                             {
                                 self.set_solo(!self.isolate);
@@ -2516,81 +2523,24 @@ impl PeerBrush {
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(6.0);
-                    if l.kind=="fill"&&!self.mask {
-                        ui.horizontal(|ui| {controls::label(ui,"Fill color");
-                            let response=ui.add_sized([28.0,24.0],egui::Button::new("").fill(Color32::from_rgba_unmultiplied(l.color[0],l.color[1],l.color[2],l.color[3])));
-                            if response.clicked(){self.open_color(color::Target::Layer(l.id.clone()),l.color);}
+                    if l.kind == "fill" && !self.mask {
+                        ui.horizontal(|ui| {
+                            controls::label(ui, "Fill color");
+                            let response = ui.add_sized(
+                                [28.0, 24.0],
+                                egui::Button::new("").fill(Color32::from_rgba_unmultiplied(
+                                    l.color[0], l.color[1], l.color[2], l.color[3],
+                                )),
+                            );
+                            if response.clicked() {
+                                self.open_color(color::Target::Layer(l.id.clone()), l.color);
+                            }
                         });
                     }
                     if !self.mask {
-                        self.color_stack(ui,&l,doc.revision);
-                    } else if let Some(m) = &l.mask {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("MASK STACK").size(10.0).color(MUTED)).on_hover_text("Bottom runs first · Top runs last");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let mut enabled = m.enabled;
-                                    if ui.checkbox(&mut enabled, "Enabled").changed() {
-                                        self.layer_cmd(
-                                            "mask.toggle",
-                                            json!({"enabled":enabled}),
-                                            "Toggle mask",
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        let add = ui.menu_button("+ Add effect", |ui| {
-                            self.effect_picker(ui,true,l.kind=="adjustment");
-                        });
-                        self.effect_add_rect = Some(add.response.rect);
-                        egui::ScrollArea::vertical().id_salt("mask effects").max_height((ui.available_height()-8.0).max(24.0)).show(ui,|ui| {
-                            ui.spacing_mut().item_spacing.y=3.0;
-                            for (index,step) in m.steps.iter().enumerate().rev() {
-                                ui.push_id(&step.id,|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x=4.0;
-                                        let mut enabled=step.enabled;
-                                        if ui.checkbox(&mut enabled,"").on_hover_text("Enable mask effect").changed() {self.layer_cmd("mask.step.update",json!({"step":step.id,"enabled":enabled}),"Toggle mask step");}
-                                        let (rect,_) = ui.allocate_exact_size(Vec2::splat(18.0),egui::Sense::hover());
-                                        icons::paint(ui.painter(),rect,effects::effect_icon(&step.kind),step.enabled);
-                                        let name=if step.kind=="blur" {"Feather"} else {effects::effect_name(&step.kind)};
-                                        let title=Self::effect_title(ui,name,self.effect_is_selected(&l.id,true,&step.id));
-                                        self.effect_bake_menu(&title,&l,true,&step.id,index,doc.revision);
-                                        if title.clicked() {
-                                            self.select_effect(&l.id,true,&step.id);
-                                            self.mask_step=if step.kind=="paint" {Some(step.id.clone())} else {None};
-                                            self.last_preview=None;
-                                        }
-                                        self.effect_weight(ui,&step.id,step.weight,true);
-                                    });
-                                    if self.effect_is_selected(&l.id,true,&step.id) {
-                                        ui.horizontal(|ui| {
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
-                                                if icons::small_button(ui,Icon::Trash,"Remove mask effect").clicked() {self.layer_cmd("mask.step.delete",json!({"step":step.id}),"Remove mask step");self.mask_step=None;self.effect_selected=None;}
-                                                if index>0 && icons::small_button(ui,Icon::Down,"Move mask effect down").clicked() {self.layer_cmd("mask.step.reorder",json!({"step":step.id,"index":index-1}),"Reorder mask step");}
-                                                if index+1<m.steps.len() && icons::small_button(ui,Icon::Up,"Move mask effect up").clicked() {self.layer_cmd("mask.step.reorder",json!({"step":step.id,"index":index+1}),"Reorder mask step");}
-                                            });
-                                        });
-                                        if let Some(preview)=self.thumbnail_for(doc,&l.id,true,Some(index)) { ui.add(egui::Image::new((preview.id(),Vec2::splat(40.0)))).on_hover_text("Result through this effect"); }
-                                        if ["fill","levels","blur"].contains(&step.kind.as_str()) {
-                                            let mut value=step.value;
-                                            let range=match step.kind.as_str(){"fill"=>0.0..=255.0,"blur"=>0.0..=64.0,_=>0.1..=5.0};
-                                            ui.horizontal(|ui| {
-                                                controls::label(ui,if step.kind=="fill"{"Value"}else if step.kind=="blur"{"Radius"}else{"Gamma"});
-                                                let response=controls::range(ui,(&step.id,"value"),&mut value,range,180.0,if step.kind=="blur"{" px"}else{""},if step.kind=="levels"{1}else{0},false);
-                                                if response.changed() || response.double_clicked(){self.layer_parameter(json!({"step":step.id,"value":value}),"Mask parameter",&response);}
-                                            });
-                                        }
-                                        if ["curves","gaussian","adjust"].contains(&step.kind.as_str()) {
-                                            let mut values=step.settings.clone();
-                                            if let Some(response)=effects::settings(ui,&step.kind,&mut values) {self.layer_parameter(json!({"step":step.id,"settings":values}),"Mask parameter",&response);}
-                                        }
-                                    }
-                                });
-                            }
-                        });
+                        self.color_stack(ui, &l, doc.revision);
+                    } else if l.mask.is_some() {
+                        self.mask_stack(ui, doc, &l);
                     } else {
                         ui.label(
                             RichText::new("Reveal. Hide. Refine.")
