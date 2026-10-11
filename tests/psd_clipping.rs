@@ -2620,6 +2620,8 @@ fn hard_shadow_payload(
     opacity: f64,
     variant: &str,
 ) -> Vec<u8> {
+    let container_variant = variant;
+    let variant = variant.strip_prefix("list:").unwrap_or(variant);
     let unit = |unit: &[u8; 4], n: f64| [unit.to_vec(), n.to_be_bytes().to_vec()].concat();
     let mut mode = vec![];
     overlay_id(&mut mode, "BlnM");
@@ -2724,11 +2726,66 @@ fn hard_shadow_payload(
     if variant == "missing" {
         properties.retain(|(key, _, _)| *key != "TrnS");
     }
+    let definition = overlay_descriptor(
+        if variant == "wrong_list_class" {
+            if kind == "DrSh" {
+                "IrSh"
+            } else {
+                "DrSh"
+            }
+        } else {
+            kind
+        },
+        properties,
+    );
+    let multi_key = if kind == "DrSh" {
+        "dropShadowMulti"
+    } else {
+        "innerShadowMulti"
+    };
+    let list = container_variant == "list"
+        || container_variant.starts_with("list:")
+        || matches!(
+            variant,
+            "empty_list" | "multiple_list" | "boolean_list" | "wrong_list_class" | "both_aliases"
+        );
+    let list_value = || {
+        let count = match variant {
+            "empty_list" => 0u32,
+            "multiple_list" => 2,
+            _ => 1,
+        };
+        let mut value = count.to_be_bytes().to_vec();
+        for _ in 0..count {
+            if variant == "boolean_list" {
+                value.extend(b"bool\0");
+            } else {
+                value.extend(b"Objc");
+                value.extend(&definition);
+            }
+        }
+        value
+    };
     let mut entries = vec![
         ("masterFXSwitch", b"bool", vec![u8::from(master)]),
         ("Scl ", b"UntF", unit(b"#Prc", 100.)),
-        (kind, b"Objc", overlay_descriptor(kind, properties)),
+        (
+            if list || variant == "plain_multi" {
+                multi_key
+            } else {
+                kind
+            },
+            if list { b"VlLs" } else { b"Objc" },
+            if list {
+                list_value()
+            } else {
+                definition.clone()
+            },
+        ),
     ];
+    if variant == "both_aliases" {
+        entries.push((kind, b"Objc", definition));
+    }
     if variant == "mixed" {
         entries.push(("SoFi", b"Objc", overlay_descriptor("SoFi", vec![])));
     }
@@ -2909,6 +2966,137 @@ fn bounded_hard_photoshop_shadows_retain_native_sources_orientation_bypass_undo_
         }
     }
 }
+#[test]
+fn single_entry_photoshop_shadow_lists_preserve_sources_history_and_native_saves() {
+    for depth in [8, 16] {
+        for kind in ["DrSh", "IrSh"] {
+            for vertical in [false, true] {
+                for positive in [false, true] {
+                    for flags in 0u8..4 {
+                        let (bytes, expected) = shadow_fixture(
+                            depth,
+                            kind,
+                            flags & 1 != 0,
+                            flags & 2 != 0,
+                            vertical,
+                            positive,
+                            50.,
+                            "list",
+                        );
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(!doc.read_only, "{depth} {kind} {flags}: {:?}", doc.warnings);
+                        assert_eq!(rendered(&doc), expected);
+                        assert_eq!(doc.layers[0].effects.len(), 1);
+                        assert_eq!(doc.layers[0].effects[0].enabled, flags == 3);
+                        let (single, _) = shadow_fixture(
+                            depth,
+                            kind,
+                            flags & 1 != 0,
+                            flags & 2 != 0,
+                            vertical,
+                            positive,
+                            50.,
+                            "",
+                        );
+                        let single = psd::decode(&single).unwrap();
+                        assert_eq!(
+                            doc.layers[0].effects[0].kind,
+                            single.layers[0].effects[0].kind
+                        );
+                        assert_eq!(
+                            doc.layers[0].effects[0].settings,
+                            single.layers[0].effects[0].settings
+                        );
+                        let source = doc.layers[0].pixels.rgba16();
+                        let current = doc.export_png().unwrap();
+                        let mut engine = Engine::new();
+                        engine.doc = doc;
+                        let layer = engine.doc.layers[0].id.clone();
+                        let effect = engine.doc.layers[0].effects[0].id.clone();
+                        engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":flags!=3})], None, None, "Listed shadow bypass").unwrap();
+                        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(engine.undo.len(), 1);
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        for bytes in [
+                            psd::encode(&engine.doc).unwrap(),
+                            psd::encode_psb(&engine.doc).unwrap(),
+                        ] {
+                            let reopened = psd::decode(&bytes).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.bit_depth, depth);
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(
+                                reopened.layers[0].effects[0].kind,
+                                engine.doc.layers[0].effects[0].kind
+                            );
+                            assert_eq!(reopened.layers[0].effects[0].enabled, flags == 3);
+                            assert_eq!(
+                                psd::decode(&ordinary(&bytes))
+                                    .unwrap()
+                                    .export_png()
+                                    .unwrap(),
+                                current
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ambiguous_malformed_or_unsupported_shadow_lists_remain_protected() {
+    for depth in [8, 16] {
+        for kind in ["DrSh", "IrSh"] {
+            for enabled in [false, true] {
+                for variant in [
+                    "empty_list",
+                    "multiple_list",
+                    "boolean_list",
+                    "wrong_list_class",
+                    "both_aliases",
+                    "plain_multi",
+                    "list:global",
+                    "list:antialias",
+                    "list:angle",
+                    "list:fractional",
+                    "list:distance",
+                    "list:choke",
+                    "list:size",
+                    "list:noise",
+                    "list:contour",
+                    "list:unknown",
+                    "list:missing",
+                    "list:mixed",
+                ] {
+                    let (bytes, expected) =
+                        shadow_fixture(depth, kind, enabled, true, false, true, 100., variant);
+                    let doc = psd::decode(&bytes).unwrap();
+                    assert!(doc.read_only, "{depth} {kind} {enabled} {variant}");
+                    assert_eq!(rendered(&doc), expected);
+                    assert_eq!(doc.bit_depth, depth);
+                }
+                let (mut bytes, mut expected) =
+                    shadow_fixture(depth, kind, enabled, true, false, true, 100., "list");
+                let index = bytes.len() - 8 * usize::from(depth / 8);
+                let next = expected[0] + if depth == 16 { 1 } else { 257 };
+                if depth == 16 {
+                    bytes[index..index + 2].copy_from_slice(&next.to_be_bytes());
+                } else {
+                    bytes[index] = (next / 257) as u8;
+                }
+                expected[0] = next;
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(doc.read_only);
+                assert_eq!(rendered(&doc), expected);
+            }
+        }
+    }
+}
+
 #[test]
 fn unsupported_hard_shadow_definitions_stay_protected_even_when_disabled() {
     for depth in [8, 16] {

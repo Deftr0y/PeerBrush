@@ -361,10 +361,17 @@ pub(super) fn native_styles(
 // independent effect-source and backdrop handling rather than sequential tinting.
 fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
     let items = root["items"].as_object().ok_or("Invalid effects object")?;
-    if items
-        .keys()
-        .any(|key| !matches!(key.as_str(), "masterFXSwitch" | "Scl " | "DrSh" | "IrSh"))
-        || items.contains_key("DrSh") == items.contains_key("IrSh")
+    let shadow_keys = ["DrSh", "dropShadowMulti", "IrSh", "innerShadowMulti"];
+    let present = shadow_keys
+        .into_iter()
+        .filter(|key| items.contains_key(*key))
+        .collect::<Vec<_>>();
+    if items.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "masterFXSwitch" | "Scl " | "DrSh" | "dropShadowMulti" | "IrSh" | "innerShadowMulti"
+        )
+    }) || present.len() != 1
         || items.get("Scl ").is_some_and(|v| percent(v) != Ok(1.))
     {
         return Err(
@@ -372,12 +379,26 @@ fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
         );
     }
     let master = boolean(field(items, "masterFXSwitch")).ok_or("Missing style master switch")?;
-    let (key, kind) = if items.contains_key("DrSh") {
+    let source_key = present[0];
+    let (key, kind) = if matches!(source_key, "DrSh" | "dropShadowMulti") {
         ("DrSh", "drop_shadow")
     } else {
         ("IrSh", "inner_shadow")
     };
-    let fields = descriptor(field(items, key), key)?;
+    let source = field(items, source_key);
+    let source = if source_key.ends_with("Multi") {
+        if source["type"] != "VlLs" {
+            return Err("Photoshop shadow multi-effect keys require an explicit list".into());
+        }
+        let entries = source["value"]
+            .as_array()
+            .filter(|entries| entries.len() == 1)
+            .ok_or("Only a single Photoshop shadow definition can be imported")?;
+        &entries[0]
+    } else {
+        source
+    };
+    let fields = descriptor(source, key)?;
     if fields.keys().any(|key| {
         !matches!(
             key.as_str(),
