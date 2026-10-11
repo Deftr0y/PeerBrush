@@ -1834,7 +1834,7 @@ fn decode_parts(
                             match detail {
                                 Ok(details) => {
                                     let imported = if signature == b"8BIM" && section == 0 && maskdata.is_empty() && clipping == 0 && opacity == 1. && blend == "normal" && imported_styles.is_empty() {
-                                        styles::color_overlays(payload)
+                                        styles::native_overlays(payload)
                                     } else { Err("Photoshop styles with masks, clipping, folders, layer blending or duplicate blocks remain protected".into()) };
                                     match imported {
                                         Ok(effects) => imported_styles = effects,

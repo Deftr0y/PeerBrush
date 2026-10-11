@@ -1050,3 +1050,172 @@ fn photoshop_overlay_blend_enum_import_uses_exact_native_composite_gate() {
         }
     }
 }
+
+fn gradient_payload(reverse: bool, omit: Option<&str>, smoothness: f64) -> Vec<u8> {
+    let desc = |class: &str, fields: Vec<(&str, &[u8; 4], Vec<u8>)>| {
+        overlay_descriptor(
+            class,
+            fields
+                .into_iter()
+                .filter(|(key, _, _)| Some(*key) != omit)
+                .collect(),
+        )
+    };
+    let enum_bytes = |class: &str, key: &str| {
+        let mut out = vec![];
+        overlay_id(&mut out, class);
+        overlay_id(&mut out, key);
+        out
+    };
+    let unit = |unit: &str, n: f64| [unit.as_bytes().to_vec(), n.to_be_bytes().to_vec()].concat();
+    let mut colors = 2u32.to_be_bytes().to_vec();
+    let mut alphas = 2u32.to_be_bytes().to_vec();
+    for (position, value) in [(0i32, 0f64), (4096, 255.)] {
+        let rgb = desc(
+            "RGBC",
+            vec![
+                ("Rd  ", b"doub", value.to_be_bytes().to_vec()),
+                ("Grn ", b"doub", value.to_be_bytes().to_vec()),
+                ("Bl  ", b"doub", value.to_be_bytes().to_vec()),
+            ],
+        );
+        colors.extend(b"Objc");
+        colors.extend(desc(
+            "Clrt",
+            vec![
+                ("Clr ", b"Objc", rgb),
+                ("Type", b"enum", enum_bytes("Clry", "UsrS")),
+                ("Lctn", b"long", position.to_be_bytes().to_vec()),
+                ("Mdpn", b"long", 50i32.to_be_bytes().to_vec()),
+            ],
+        ));
+        alphas.extend(b"Objc");
+        alphas.extend(desc(
+            "TrnS",
+            vec![
+                ("Opct", b"UntF", unit("#Prc", 100.)),
+                ("Lctn", b"long", position.to_be_bytes().to_vec()),
+                ("Mdpn", b"long", 50i32.to_be_bytes().to_vec()),
+            ],
+        ));
+    }
+    let gradient = desc(
+        "Grdn",
+        vec![
+            ("GrdF", b"enum", enum_bytes("GrdF", "CstS")),
+            ("Intr", b"doub", smoothness.to_be_bytes().to_vec()),
+            ("Clrs", b"VlLs", colors),
+            ("Trns", b"VlLs", alphas),
+        ],
+    );
+    let effect = desc(
+        "GrFl",
+        vec![
+            ("enab", b"bool", vec![1]),
+            ("present", b"bool", vec![1]),
+            ("showInDialog", b"bool", vec![1]),
+            ("Md  ", b"enum", enum_bytes("BlnM", "Nrml")),
+            ("Opct", b"UntF", unit("#Prc", 100.)),
+            ("Grad", b"Objc", gradient),
+            ("Angl", b"UntF", unit("#Ang", 0.)),
+            ("Type", b"enum", enum_bytes("GrdT", "Lnr ")),
+            ("Rvrs", b"bool", vec![u8::from(reverse)]),
+            ("Dthr", b"bool", vec![0]),
+            ("Algn", b"bool", vec![0]),
+            ("Scl ", b"UntF", unit("#Prc", 100.)),
+        ],
+    );
+    let root = desc(
+        "Lefx",
+        vec![
+            ("masterFXSwitch", b"bool", vec![1]),
+            ("Scl ", b"UntF", unit("#Prc", 100.)),
+            ("GrFl", b"Objc", effect),
+        ],
+    );
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        root,
+    ]
+    .concat()
+}
+#[test]
+fn plain_photoshop_linear_gradient_import_retains_native_source_and_reversible_stops() {
+    for depth in [8, 16] {
+        for reverse in [false, true] {
+            let mut spec = Spec::paint("Synthetic linear gradient", SAVED);
+            spec.tags
+                .push((*b"lfx2", gradient_payload(reverse, None, 0.)));
+            let mut bytes = fixture(&[spec], depth);
+            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+            for c in 0..4 {
+                for x in 0..2 {
+                    let word = if c == 3 {
+                        65535
+                    } else if (x == 0) != reverse {
+                        16384
+                    } else {
+                        49151
+                    };
+                    sample(&mut bytes, word, depth);
+                }
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{:?}", doc.warnings);
+            assert_eq!(doc.layers[0].effects[0].kind, "gradient_overlay");
+            assert_eq!(doc.layers[0].effects[0].settings["reverse"], reverse);
+            assert_eq!(
+                doc.layers[0].effects[0].settings["color_stops"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            for x in 0..2 {
+                assert_eq!(
+                    doc.layers[0].pixels.get16(x, 0),
+                    SAVED[x as usize].map(|n| native(n, depth))
+                );
+            }
+            let current = doc.export_png().unwrap();
+            for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                assert_eq!(psd::decode(&output).unwrap().export_png().unwrap(), current);
+            }
+        }
+    }
+}
+#[test]
+fn missing_or_unsupported_photoshop_gradient_fields_protect_without_panics() {
+    for depth in [8, 16] {
+        for omit in [
+            Some("Angl"),
+            Some("Scl "),
+            Some("Grad"),
+            Some("Dthr"),
+            Some("Lctn"),
+            Some("Clr "),
+            Some("Clrs"),
+            Some("Trns"),
+            Some("Md  "),
+            Some("Intr"),
+            Some("Type"),
+            None,
+        ] {
+            let mut spec = Spec::paint("Synthetic protected gradient", SAVED);
+            spec.tags.push((
+                *b"lfx2",
+                gradient_payload(false, omit, if omit.is_none() { 4096. } else { 0. }),
+            ));
+            let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+            assert!(doc.read_only, "missing {omit:?}");
+            assert!(doc.layers[0].effects.is_empty());
+            for x in 0..2 {
+                assert_eq!(
+                    doc.layers[0].pixels.get16(x, 0),
+                    SAVED[x as usize].map(|n| native(n, depth))
+                );
+            }
+        }
+    }
+}

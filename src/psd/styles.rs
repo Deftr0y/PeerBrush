@@ -237,6 +237,208 @@ fn percent(value: &Value) -> Result<f64, String> {
     }
     Ok(n / 100.)
 }
+pub(super) fn native_overlays(bytes: &[u8]) -> Result<Vec<crate::effects::Effect>, String> {
+    let parsed = root(bytes)?;
+    if parsed["items"].get("GrFl").is_some() || parsed["items"].get("gradientFillMulti").is_some() {
+        gradient_overlay(&parsed)
+    } else {
+        color_overlays(bytes)
+    }
+}
+fn descriptor<'a>(value: &'a Value, class: &str) -> Result<&'a Map<String, Value>, String> {
+    if !matches!(value["type"].as_str(), Some("Objc" | "GlbO")) || value["value"]["class"] != class
+    {
+        return Err("Unsupported Photoshop gradient descriptor class".into());
+    }
+    value["value"]["items"]
+        .as_object()
+        .ok_or("Invalid Photoshop gradient properties".into())
+}
+fn field<'a>(fields: &'a Map<String, Value>, key: &str) -> &'a Value {
+    static NULL: Value = Value::Null;
+    fields.get(key).unwrap_or(&NULL)
+}
+fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String> {
+    if !matches!(root["class"].as_str(), Some("null" | "Lefx")) {
+        return Err("Unsupported Photoshop effects class".into());
+    }
+    let items = root["items"].as_object().ok_or("Invalid effects object")?;
+    if items.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "masterFXSwitch" | "Scl " | "GrFl" | "gradientFillMulti"
+        )
+    }) || items.contains_key("GrFl") && items.contains_key("gradientFillMulti")
+    {
+        return Err("Only a single unambiguous plain Gradient Overlay can be imported".into());
+    }
+    let master = items
+        .get("masterFXSwitch")
+        .and_then(boolean)
+        .ok_or("Missing style master switch")?;
+    if items.get("Scl ").is_some_and(|v| percent(v) != Ok(1.)) {
+        return Err("Scaled Photoshop styles remain protected".into());
+    }
+    let value = items
+        .get("GrFl")
+        .or_else(|| items.get("gradientFillMulti"))
+        .ok_or("Missing Gradient Overlay")?;
+    let value = if value["type"] == "VlLs" {
+        let list = value["value"]
+            .as_array()
+            .filter(|v| v.len() == 1)
+            .ok_or("Multiple Photoshop Gradient Overlay ordering remains protected")?;
+        &list[0]
+    } else {
+        value
+    };
+    let fields = descriptor(value, "GrFl")?;
+    if fields.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "enab"
+                | "present"
+                | "showInDialog"
+                | "Md  "
+                | "Opct"
+                | "Grad"
+                | "Angl"
+                | "Type"
+                | "Rvrs"
+                | "Dthr"
+                | "Algn"
+                | "Scl "
+                | "Ofst"
+        )
+    }) {
+        return Err("Unsupported Photoshop gradient property/interpolation method".into());
+    }
+    let required_bool = |key: &str| {
+        fields
+            .get(key)
+            .and_then(boolean)
+            .ok_or_else(|| format!("Invalid Gradient Overlay {key}"))
+    };
+    let enabled = required_bool("enab")?;
+    let present = required_bool("present")?;
+    if fields
+        .get("showInDialog")
+        .is_some_and(|v| boolean(v).is_none())
+    {
+        return Err("Invalid Gradient Overlay dialog flag".into());
+    }
+    if required_bool("Dthr")? || required_bool("Algn")? {
+        return Err("Dithered or layer-aligned Photoshop gradients remain protected".into());
+    }
+    if field(fields, "Md  ")["type"] != "enum"
+        || field(fields, "Md  ")["value"] != json!(["BlnM", "Nrml"])
+        || field(fields, "Type")["type"] != "enum"
+        || field(fields, "Type")["value"] != json!(["GrdT", "Lnr "])
+    {
+        return Err("Only Normal linear Photoshop Gradient Overlay can be imported".into());
+    }
+    let angle = field(fields, "Angl");
+    if angle["type"] != "UntF"
+        || angle["value"][0] != "#Ang"
+        || angle["value"][1].as_f64() != Some(0.)
+        || percent(field(fields, "Scl "))? != 1.
+    {
+        return Err("Rotated or scaled Photoshop gradients remain protected".into());
+    }
+    if let Some(offset) = fields.get("Ofst") {
+        let offset = descriptor(offset, "Pnt ")?;
+        if offset.len() != 2
+            || offset.get("Hrzn").is_none_or(|v| percent(v) != Ok(0.))
+            || offset.get("Vrtc").is_none_or(|v| percent(v) != Ok(0.))
+        {
+            return Err("Offset Photoshop gradients remain protected".into());
+        }
+    }
+    let gradient = descriptor(field(fields, "Grad"), "Grdn")?;
+    if gradient
+        .keys()
+        .any(|k| !matches!(k.as_str(), "Nm  " | "GrdF" | "Intr" | "Clrs" | "Trns"))
+        || gradient.get("Nm  ").is_some_and(|v| v["type"] != "TEXT")
+        || field(gradient, "GrdF")["type"] != "enum"
+        || field(gradient, "GrdF")["value"] != json!(["GrdF", "CstS"])
+        || plain_number(field(gradient, "Intr"))? != 0.
+    {
+        return Err(
+            "Noise, smooth or unsupported Photoshop gradient definitions remain protected".into(),
+        );
+    }
+    let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":"normal","angle":0.,"scale":1.,"style":"linear","reverse":required_bool("Rvrs")?});
+    for (input, output, class, alpha) in [
+        ("Clrs", "color_stops", "Clrt", false),
+        ("Trns", "alpha_stops", "TrnS", true),
+    ] {
+        let list = field(gradient, input);
+        if list["type"] != "VlLs" {
+            return Err("Gradient stops require descriptor lists".into());
+        }
+        let list = list["value"]
+            .as_array()
+            .filter(|s| (2..=16).contains(&s.len()))
+            .ok_or("Gradient requires 2–16 source stops")?;
+        let mut stops = vec![];
+        for entry in list {
+            let stop = descriptor(entry, class)?;
+            if stop.keys().any(|k| {
+                !matches!(k.as_str(), "Lctn" | "Mdpn")
+                    && if alpha {
+                        k != "Opct"
+                    } else {
+                        k != "Clr " && k != "Type"
+                    }
+            }) || field(stop, "Lctn")["type"] != "long"
+                || field(stop, "Mdpn")["type"] != "long"
+                || plain_number(field(stop, "Mdpn"))? != 50.
+            {
+                return Err("Unsupported Photoshop gradient stop fields/midpoint".into());
+            }
+            let mut result =
+                json!({"position":plain_number(field(stop, "Lctn"))?/4096.,"midpoint":0.5});
+            if alpha {
+                result["opacity"] = json!(percent(field(stop, "Opct"))?);
+            } else {
+                if field(stop, "Type")["type"] != "enum"
+                    || field(stop, "Type")["value"] != json!(["Clry", "UsrS"])
+                {
+                    return Err(
+                        "Foreground/background Photoshop gradient colors remain protected".into(),
+                    );
+                }
+                let rgb = descriptor(field(stop, "Clr "), "RGBC")?;
+                if rgb.len() != 3
+                    || rgb
+                        .keys()
+                        .any(|k| !matches!(k.as_str(), "Rd  " | "Grn " | "Bl  "))
+                {
+                    return Err("Only plain RGB Photoshop gradient colors can be imported".into());
+                }
+                let mut color = vec![];
+                for key in ["Rd  ", "Grn ", "Bl  "] {
+                    let n = plain_number(field(rgb, key))?;
+                    if !(0.0..=255.).contains(&n) {
+                        return Err("Gradient RGB channels must be within 0–255".into());
+                    }
+                    color.push(n / 255.);
+                }
+                result["color"] = json!(color);
+            }
+            stops.push(result);
+        }
+        settings[output] = json!(stops);
+    }
+    crate::effects::validate("gradient_overlay", &settings)?;
+    Ok(vec![crate::effects::Effect {
+        id: crate::engine::id(),
+        kind: "gradient_overlay".into(),
+        enabled: master && enabled && present,
+        weight: 1.,
+        settings,
+    }])
+}
 /// Small explicit import subset. The caller must verify the entire saved composite.
 pub(super) fn color_overlays(bytes: &[u8]) -> Result<Vec<crate::effects::Effect>, String> {
     let root = root(bytes)?;
