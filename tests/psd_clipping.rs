@@ -1641,3 +1641,133 @@ fn mixed_photoshop_overlays_protect_mismatches_and_unknown_even_disabled_styles(
         }
     }
 }
+
+fn blended_overlay_fixture(depth: u16, pattern: bool, ps_mode: &[u8; 4], opacity: f64) -> Vec<u8> {
+    let mut payload = if pattern {
+        pattern_payload(true, "synthetic-pattern", "", 100.)
+    } else {
+        gradient_payload(false, None, 0.)
+    };
+    let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
+    payload[at..at + 4].copy_from_slice(ps_mode);
+    let at = payload
+        .windows(12)
+        .position(|v| v == b"OpctUntF#Prc")
+        .unwrap()
+        + 12;
+    payload[at..at + 8].copy_from_slice(&opacity.to_be_bytes());
+    let mut spec = Spec::paint("Synthetic blended overlay", SAVED);
+    spec.tags.push((*b"lfx2", payload));
+    let mut bytes = fixture(&[spec], depth);
+    if pattern {
+        bytes = inject_pattern(
+            bytes,
+            depth,
+            &pattern_resource(depth, "synthetic-pattern"),
+            false,
+        );
+    }
+    let coverage = (opacity / 100. * 65535.).round() / 65535.;
+    let mut merged = SAVED.map(|p| p.map(|n| native(n, depth)));
+    for (x, pixel) in merged.iter_mut().enumerate() {
+        for c in 0..3 {
+            let b = f64::from(pixel[c]) / 65535.;
+            let s = f64::from(if pattern {
+                native(PATTERN[x][c], depth)
+            } else if x == 0 {
+                16384
+            } else {
+                49151
+            }) / 65535.;
+            let n = match ps_mode {
+                b"Mltp" => b * s,
+                b"Scrn" => 1. - (1. - b) * (1. - s),
+                b"Ovrl" => {
+                    if b < 0.5 {
+                        2. * b * s
+                    } else {
+                        1. - 2. * (1. - b) * (1. - s)
+                    }
+                }
+                b"Drkn" => b.min(s),
+                b"Lghn" => b.max(s),
+                _ => s,
+            };
+            pixel[c] = native(
+                ((n * coverage + b * (1. - coverage)) * 65535.).round() as u16,
+                depth,
+            );
+        }
+    }
+    bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+    for channel in 0..4 {
+        for pixel in merged {
+            sample(&mut bytes, pixel[channel], depth);
+        }
+    }
+    bytes
+}
+#[test]
+fn photoshop_pattern_and_gradient_blends_retain_native_sources_and_editable_saves() {
+    for depth in [8, 16] {
+        for pattern in [false, true] {
+            for (ps_mode, mode) in [
+                (b"Nrml", "normal"),
+                (b"Mltp", "multiply"),
+                (b"Scrn", "screen"),
+                (b"Ovrl", "overlay"),
+                (b"Drkn", "darken"),
+                (b"Lghn", "lighten"),
+            ] {
+                for opacity in [50., 100.] {
+                    let doc =
+                        psd::decode(&blended_overlay_fixture(depth, pattern, ps_mode, opacity))
+                            .unwrap();
+                    assert!(
+                        !doc.read_only,
+                        "{depth} {pattern} {mode} {opacity}: {:?}",
+                        doc.warnings
+                    );
+                    assert_eq!(doc.layers[0].effects[0].settings["blend"], mode);
+                    assert_eq!(doc.layers[0].effects[0].settings["opacity"], opacity / 100.);
+                    let original = doc.layers[0].pixels.rgba16();
+                    assert_eq!(
+                        original,
+                        SAVED
+                            .into_iter()
+                            .flatten()
+                            .map(|n| native(n, depth))
+                            .collect::<Vec<_>>()
+                    );
+                    let current = doc.export_png().unwrap();
+                    for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                        let reopened = psd::decode(&output).unwrap();
+                        assert!(!reopened.read_only);
+                        assert_eq!(reopened.layers[0].pixels.rgba16(), original);
+                        assert_eq!(reopened.export_png().unwrap(), current);
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
+fn unsupported_or_mismatched_pattern_and_gradient_blends_keep_sources_protected() {
+    for depth in [8, 16] {
+        for pattern in [false, true] {
+            for mode in [
+                b"Nrml", b"Mltp", b"Scrn", b"Ovrl", b"Drkn", b"Lghn", b"HrdL",
+            ] {
+                let mut bytes = blended_overlay_fixture(depth, pattern, mode, 50.);
+                // One native-word difference must never unlock a styled source.
+                let at = bytes.len() - 8 * usize::from(depth / 8);
+                if mode != b"HrdL" {
+                    bytes[at] ^= 1;
+                }
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(doc.read_only, "{depth} {pattern} {mode:?}");
+                assert_eq!(doc.bit_depth, depth);
+            }
+        }
+    }
+}

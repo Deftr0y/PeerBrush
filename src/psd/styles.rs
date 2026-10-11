@@ -236,6 +236,20 @@ fn percent(value: &Value) -> Result<f64, String> {
     }
     Ok(n / 100.)
 }
+fn overlay_blend(value: &Value) -> Result<&'static str, String> {
+    if value["type"] != "enum" || value["value"][0] != "BlnM" {
+        return Err("Invalid Photoshop overlay blend enumeration".into());
+    }
+    match value["value"][1].as_str() {
+        Some("Nrml") => Ok("normal"),
+        Some("Mltp") => Ok("multiply"),
+        Some("Scrn") => Ok("screen"),
+        Some("Ovrl") => Ok("overlay"),
+        Some("Drkn") => Ok("darken"),
+        Some("Lghn") => Ok("lighten"),
+        _ => Err("Unsupported Photoshop overlay blend remains protected".into()),
+    }
+}
 pub(super) fn native_overlays(
     bytes: &[u8],
     patterns: &[super::patterns::Source],
@@ -335,11 +349,10 @@ fn pattern_overlay(
     }
     let enabled = boolean(field(fields, "enab")).ok_or("Missing pattern enabled state")?;
     let present = boolean(field(fields, "present")).ok_or("Missing pattern present state")?;
+    let blend = overlay_blend(field(fields, "Md  "))?;
     if fields
         .get("showInDialog")
         .is_some_and(|v| boolean(v).is_none())
-        || field(fields, "Md  ")["type"] != "enum"
-        || field(fields, "Md  ")["value"] != json!(["BlnM", "Nrml"])
         || field(fields, "Angl")["type"] != "UntF"
         || field(fields, "Angl")["value"] != json!(["#Ang", 0.])
         || percent(field(fields, "Scl "))? != 1.
@@ -348,9 +361,7 @@ fn pattern_overlay(
             .get("Lnkd")
             .is_some_and(|v| boolean(v) != Some(false))
     {
-        return Err(
-            "Only Normal, unrotated, unscaled, document-aligned patterns can be imported".into(),
-        );
+        return Err("Only unrotated, unscaled, document-aligned patterns can be imported".into());
     }
     let phase = descriptor(field(fields, "phase"), "Pnt ")?;
     if phase.len() != 2
@@ -391,7 +402,7 @@ fn pattern_overlay(
     } else {
         crate::raster::png(source.width, source.height, &source.pixels.rgba())?
     };
-    let settings = json!({"opacity":percent(field(fields, "Opct"))?,"blend":"normal","pattern":"bitmap","bitmap_png":STANDARD.encode(png),"bitmap_scale":1.,"bitmap_angle":0.,"phase_x":0.,"phase_y":0.,"sampling":"nearest"});
+    let settings = json!({"opacity":percent(field(fields, "Opct"))?,"blend":blend,"pattern":"bitmap","bitmap_png":STANDARD.encode(png),"bitmap_scale":1.,"bitmap_angle":0.,"phase_x":0.,"phase_y":0.,"sampling":"nearest"});
     crate::effects::validate("pattern_overlay", &settings)?;
     Ok((
         crate::effects::Effect {
@@ -489,12 +500,11 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
     if required_bool("Dthr")? || required_bool("Algn")? {
         return Err("Dithered or layer-aligned Photoshop gradients remain protected".into());
     }
-    if field(fields, "Md  ")["type"] != "enum"
-        || field(fields, "Md  ")["value"] != json!(["BlnM", "Nrml"])
-        || field(fields, "Type")["type"] != "enum"
+    let blend = overlay_blend(field(fields, "Md  "))?;
+    if field(fields, "Type")["type"] != "enum"
         || field(fields, "Type")["value"] != json!(["GrdT", "Lnr "])
     {
-        return Err("Only Normal linear Photoshop Gradient Overlay can be imported".into());
+        return Err("Only linear Photoshop Gradient Overlay can be imported".into());
     }
     let angle = field(fields, "Angl");
     if angle["type"] != "UntF"
@@ -526,7 +536,7 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
             "Noise, smooth or unsupported Photoshop gradient definitions remain protected".into(),
         );
     }
-    let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":"normal","angle":0.,"scale":1.,"style":"linear","reverse":required_bool("Rvrs")?});
+    let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":blend,"angle":0.,"scale":1.,"style":"linear","reverse":required_bool("Rvrs")?});
     for (input, output, class, alpha) in [
         ("Clrs", "color_stops", "Clrt", false),
         ("Trns", "alpha_stops", "TrnS", true),
@@ -674,19 +684,7 @@ fn color_overlay_root(root: &Value) -> Result<Vec<crate::effects::Effect>, Strin
         {
             return Err("Invalid Color Overlay dialog state".into());
         }
-        let mode = &entry["value"]["items"]["Md  "];
-        if mode["type"] != "enum" || mode["value"][0] != "BlnM" {
-            return Err("Invalid Photoshop Color Overlay blend enumeration".into());
-        }
-        let blend = match mode["value"][1].as_str() {
-            Some("Nrml") => "normal",
-            Some("Mltp") => "multiply",
-            Some("Scrn") => "screen",
-            Some("Ovrl") => "overlay",
-            Some("Drkn") => "darken",
-            Some("Lghn") => "lighten",
-            _ => return Err("Unsupported Photoshop Color Overlay blend remains protected".into()),
-        };
+        let blend = overlay_blend(field(fields, "Md  "))?;
         let opacity = percent(&entry["value"]["items"]["Opct"])?;
         let color = &entry["value"]["items"]["Clr "];
         if !matches!(color["type"].as_str(), Some("Objc" | "GlbO"))
