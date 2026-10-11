@@ -18,6 +18,17 @@ pub const KINDS: &[&str] = &[
 pub fn contains(kind: &str) -> bool {
     KINDS.contains(&kind)
 }
+pub fn separate_bevel_channels(kind: &str, value: &Value) -> bool {
+    kind == "bevel_emboss"
+        && [
+            "highlight_opacity",
+            "shadow_opacity",
+            "highlight_blend",
+            "shadow_blend",
+        ]
+        .iter()
+        .any(|key| value.get(key).is_some())
+}
 pub fn bitmap_defaults() -> Value {
     json!({"bitmap_png":"", "bitmap_scale":1., "bitmap_angle":0., "phase_x":0., "phase_y":0., "sampling":"bilinear"})
 }
@@ -57,6 +68,10 @@ pub fn defaults(kind: &str) -> Value {
             v["color"] = json!([1., 1., 1.]);
             v["color2"] = json!([0., 0., 0.]);
             v["contour"] = json!("linear");
+            v["highlight_opacity"] = json!(1.);
+            v["shadow_opacity"] = json!(1.);
+            v["highlight_blend"] = json!("inherit");
+            v["shadow_blend"] = json!("inherit");
         }
         "contour" => {
             v["contour"] = json!("cone");
@@ -146,10 +161,11 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                     return Err("Style RGB values must be finite within 0–1".into());
                 }
             }
-            "blend" => {
+            "blend" | "highlight_blend" | "shadow_blend" => {
                 if !crate::raster::BLENDS
                     .iter()
                     .any(|(name, _)| Some(*name) == v.as_str())
+                    && !(key != "blend" && v == "inherit")
                 {
                     return Err("Unsupported style blend mode".into());
                 }
@@ -182,7 +198,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
             )?,
             _ => {
                 let (min, max) = match key.as_str() {
-                    "opacity" | "spread" => (0., 1.),
+                    "opacity" | "spread" | "highlight_opacity" | "shadow_opacity" => (0., 1.),
                     "size" | "soften" => (0., 64.),
                     "distance" => (0., 128.),
                     "angle" => (-180., 180.),
@@ -378,6 +394,14 @@ pub fn apply(
     let opacity = number(v, "opacity");
     let bitmap = crate::effects::patterns::from_settings(kind, v)?;
     let blend = v["blend"].as_str().unwrap_or("normal");
+    let channel_blend = |key: &str| {
+        v[key]
+            .as_str()
+            .filter(|mode| *mode != "inherit")
+            .unwrap_or(blend)
+    };
+    let highlight_blend = channel_blend("highlight_blend");
+    let shadow_blend = channel_blend("shadow_blend");
     let curve = if v["contour"] == "custom" {
         Some(crate::effects::contours::Curve::decode(
             &v["contour_points"],
@@ -398,6 +422,7 @@ pub fn apply(
             let a = alpha[y * w + x];
             let mut tint = color;
             let mut coverage = 1.;
+            let mut blend = blend;
             let mut behind = false;
             let mut outside = false;
             match kind {
@@ -532,6 +557,19 @@ pub fn apply(
                     }
                     coverage = contour(light.abs().min(1.));
                     tint = if light >= 0. { color } else { color2 };
+                    coverage *= number(
+                        v,
+                        if light >= 0. {
+                            "highlight_opacity"
+                        } else {
+                            "shadow_opacity"
+                        },
+                    );
+                    blend = if light >= 0. {
+                        highlight_blend
+                    } else {
+                        shadow_blend
+                    };
                     if matches!(v["style"].as_str(), Some("outer" | "emboss")) {
                         outside = true;
                         coverage *= if v["style"] == "outer" { 1. - a } else { 1. };

@@ -794,6 +794,12 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         format: if doc.layers.iter().any(|l| {
             l.effects
                 .iter()
+                .any(|e| crate::effects::styles::separate_bevel_channels(&e.kind, &e.settings))
+        }) {
+            22
+        } else if doc.layers.iter().any(|l| {
+            l.effects
+                .iter()
                 .any(|e| crate::effects::contours::extended(&e.kind, &e.settings))
         }) {
             21
@@ -1617,7 +1623,7 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=21).contains(&e.format)
+                if (1..=22).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash

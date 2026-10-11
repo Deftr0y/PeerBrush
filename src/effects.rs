@@ -178,6 +178,18 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
     if v.get("contour_points").is_some() && !contours::contains(kind) {
         return Err("Custom contour points are unsupported for this effect".into());
     }
+    if kind != "bevel_emboss"
+        && [
+            "highlight_opacity",
+            "shadow_opacity",
+            "highlight_blend",
+            "shadow_blend",
+        ]
+        .iter()
+        .any(|key| v.get(key).is_some())
+    {
+        return Err("Independent highlight/shadow settings require Bevel & Emboss".into());
+    }
     if styles::contains(kind) {
         return styles::validate(kind, v);
     }

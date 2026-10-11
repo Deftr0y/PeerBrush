@@ -422,3 +422,194 @@ fn inapplicable_style_settings_reject_instead_of_exposing_no_op_controls() {
         assert!(e.undo.is_empty());
     }
 }
+
+#[test]
+fn bevel_highlight_and_shadow_channels_have_independent_native_blends_and_coverage() {
+    for depth in [8, 16] {
+        let adapt = |n: u16| {
+            if depth == 16 {
+                n
+            } else {
+                u16::from(peerbrush::raster::project16(n)) * 257
+            }
+        };
+        let source = [
+            [12347, 23459, 34571, 0],
+            [12347, 23459, 34571, 65535],
+            [23459, 34571, 45683, 65535],
+            [54321, 32123, 11223, 0],
+        ]
+        .map(|p| p.map(adapt));
+        let mut words = source.into_iter().flatten().collect::<Vec<_>>();
+        let settings = json!({"style":"inner","size":0.,"soften":0.,"angle":0.,"altitude":0.,"depth":1.,"opacity":0.8,"color":[0.2,0.4,0.7],"color2":[0.9,0.3,0.1],"highlight_opacity":0.25,"shadow_opacity":0.75,"highlight_blend":"screen","shadow_blend":"multiply"});
+        effects::styles::apply(&mut words, 4, 1, "bevel_emboss", &settings).unwrap();
+        for (index, color, opacity, screen) in [
+            (1, [0.2, 0.4, 0.7], 0.2, true),
+            (2, [0.9, 0.3, 0.1], 0.6, false),
+        ] {
+            let alpha = (opacity * 65535f64).round() / 65535.;
+            for c in 0..3 {
+                let value = f64::from(source[index][c]) / 65535.;
+                let tint = (color[c] * 65535f64).round() / 65535.;
+                let blended = if screen {
+                    1. - (1. - value) * (1. - tint)
+                } else {
+                    value * tint
+                };
+                let expected = ((value * (1. - alpha) + blended * alpha) * 65535.).round() as u16;
+                // The byte adapter projects only after native style processing.
+                let actual = if depth == 16 {
+                    words[index * 4 + c]
+                } else {
+                    adapt(words[index * 4 + c])
+                };
+                assert_eq!(
+                    actual,
+                    adapt(expected),
+                    "depth {depth}, pixel {index}, channel {c}"
+                );
+            }
+            assert_eq!(words[index * 4 + 3], 65535);
+        }
+        assert_eq!(&words[..4], &source[0]);
+        assert_eq!(&words[12..], &source[3]);
+    }
+}
+#[test]
+fn legacy_bevel_settings_inherit_common_blend_and_opacity_without_changed_sources() {
+    for depth in [8, 16] {
+        for style in ["inner", "outer", "emboss", "pillow"] {
+            for blend in ["normal", "multiply"] {
+                let mut e = fixture(depth);
+                let layer = e.doc.layers[0].id.clone();
+                let legacy = json!({"style":style,"blend":blend,"opacity":0.35});
+                e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"bevel_emboss","settings":legacy})],None,None,"Legacy relief").unwrap();
+                let effect = e.doc.layers[0].effects[0].id.clone();
+                // Old editable sources did not contain independent channel properties.
+                for key in [
+                    "highlight_opacity",
+                    "shadow_opacity",
+                    "highlight_blend",
+                    "shadow_blend",
+                ] {
+                    e.doc.layers[0].effects[0]
+                        .settings
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(key);
+                }
+                let before = native(&e.doc);
+                let source = e.doc.layers[0].pixels.rgba16();
+                let mut explicit = legacy.clone();
+                explicit["highlight_opacity"] = json!(1.);
+                explicit["shadow_opacity"] = json!(1.);
+                explicit["highlight_blend"] = json!("inherit");
+                explicit["shadow_blend"] = json!("inherit");
+                let preview=Engine::preview_edits(e.doc.clone(),&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":explicit})]).unwrap();
+                assert_eq!(native(&preview), before);
+                assert_eq!(preview.layers[0].pixels.rgba16(), source);
+                assert!(e.doc.layers[0].effects[0]
+                    .settings
+                    .get("highlight_opacity")
+                    .is_none());
+            }
+        }
+    }
+}
+#[test]
+fn independent_bevel_settings_preview_commit_once_and_roundtrip_current_native_sources() {
+    for depth in [8, 16] {
+        for disabled in [false, true] {
+            let mut e = fixture(depth);
+            let layer = e.doc.layers[0].id.clone();
+            let source = e.doc.layers[0].pixels.rgba16();
+            let before = e.doc.export_png().unwrap();
+            let settings = json!({"highlight_opacity":0.35,"shadow_opacity":0.7,"highlight_blend":"screen","shadow_blend":"multiply"});
+            let command = json!({"op":"effect.add","layer":layer,"kind":"bevel_emboss","settings":settings,"enabled":!disabled});
+            // Add uses the normal enabled default; bypass is a separate definition property.
+            e.edit("human", &[command], None, None, "Bevel channels")
+                .unwrap();
+            let effect = e.doc.layers[0].effects[0].id.clone();
+            if disabled {
+                e.edit(
+                    "human",
+                    &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":false})],
+                    None,
+                    None,
+                    "Bevel bypass",
+                )
+                .unwrap();
+            }
+            e.undo.clear();
+            let baseline = e.doc.clone();
+            let command = json!({"op":"effect.update","layer":layer,"effect":effect,"settings":{"highlight_opacity":0.61,"shadow_opacity":0.42,"highlight_blend":"overlay","shadow_blend":"darken"}});
+            let preview =
+                Engine::preview_edits(baseline.clone(), std::slice::from_ref(&command)).unwrap();
+            e.edit("human", &[command], None, None, "Independent relief")
+                .unwrap();
+            assert_eq!(e.undo.len(), 1);
+            assert_eq!(native(&e.doc), native(&preview));
+            assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+            let current = e.doc.export_png().unwrap();
+            if !disabled {
+                assert_ne!(current, before);
+            }
+            for bytes in [
+                psd::encode(&e.doc).unwrap(),
+                psd::encode_psb(&e.doc).unwrap(),
+            ] {
+                let at = 30 + u32::from_be_bytes(bytes[26..30].try_into().unwrap()) as usize;
+                let resources = &bytes[at + 4..];
+                assert_eq!(&resources[..6], b"8BIM\x0f\xa0");
+                let count = 6 + (usize::from(resources[6]) + 1).div_ceil(2) * 2;
+                let len =
+                    u32::from_be_bytes(resources[count..count + 4].try_into().unwrap()) as usize;
+                let payload = &resources[count + 4..count + 4 + len];
+                assert_eq!(&payload[..4], b"PBR1");
+                use std::io::Read;
+                let mut decoded = Vec::new();
+                flate2::read::ZlibDecoder::new(&payload[4..])
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+                let source_json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+                assert_eq!(source_json["format"], 22);
+                let reopened = psd::decode(&bytes).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.export_png().unwrap(), current);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                assert_eq!(
+                    reopened.layers[0].effects[0].settings,
+                    e.doc.layers[0].effects[0].settings
+                );
+                assert_eq!(reopened.layers[0].effects[0].enabled, !disabled);
+                let standard = psd::decode(&strip(&bytes)).unwrap();
+                assert!(!standard.read_only);
+                assert_eq!(standard.export_png().unwrap(), current);
+            }
+            e.undo("human").unwrap();
+            assert_eq!(native(&e.doc), native(&baseline));
+            e.redo("human").unwrap();
+            assert_eq!(e.doc.export_png().unwrap(), current);
+        }
+    }
+}
+#[test]
+fn invalid_or_inapplicable_bevel_channel_settings_rollback_native_work_and_history() {
+    let mut e = fixture(16);
+    let layer = e.doc.layers[0].id.clone();
+    let before = serde_json::to_value(&e.doc).unwrap();
+    for settings in [
+        json!({"highlight_opacity":-0.1}),
+        json!({"shadow_opacity":1.1}),
+        json!({"highlight_opacity":"bad"}),
+        json!({"highlight_blend":"unsupported"}),
+        json!({"shadow_blend":17}),
+    ] {
+        assert!(e.edit("human",&[json!({"op":"paint.fill","layer":layer,"rect":[0,0,1,1],"color":[255,0,0,255]}),json!({"op":"effect.add","layer":layer,"kind":"bevel_emboss","settings":settings})],None,None,"Invalid bevel channel").is_err());
+        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+        assert!(e.undo.is_empty());
+    }
+    for kind in ["levels", "drop_shadow", "contour", "stroke"] {
+        assert!(effects::validate(kind, &json!({"highlight_opacity":0.5})).is_err());
+    }
+}

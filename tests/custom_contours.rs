@@ -224,7 +224,10 @@ fn every_custom_style_contour_retains_sources_preview_undo_and_current_psd_psb_o
                 psd::encode(&engine.doc).unwrap(),
                 psd::encode_psb(&engine.doc).unwrap(),
             ] {
-                assert_eq!(embedded(&output)["format"], 21);
+                assert_eq!(
+                    embedded(&output)["format"],
+                    if kind == "bevel_emboss" { 22 } else { 21 }
+                );
                 let reopened = psd::decode(&output).unwrap();
                 assert!(!reopened.read_only);
                 assert_eq!(reopened.layers[0].pixels.rgba16(), source);
@@ -282,7 +285,7 @@ fn future_and_malformed_contour_sources_preserve_native_composites_and_disabled_
                         source["document"]["layers"][0]["effects"][0]["settings"]
                             ["contour_points"][1]["position"] = json!(0.);
                     } else {
-                        source["format"] = json!(22);
+                        source["format"] = json!(23);
                     }
                     let protected = psd::decode(&replace_embedded(&bytes, &source)).unwrap();
                     assert!(protected.read_only);

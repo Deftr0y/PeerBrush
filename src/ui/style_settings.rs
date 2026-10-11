@@ -30,6 +30,18 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
             ],
         ),
         (
+            "highlight_blend",
+            std::iter::once(("inherit", "Inherit effect blend"))
+                .chain(crate::raster::BLENDS.iter().copied())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "shadow_blend",
+            std::iter::once(("inherit", "Inherit effect blend"))
+                .chain(crate::raster::BLENDS.iter().copied())
+                .collect::<Vec<_>>(),
+        ),
+        (
             "pattern",
             if bitmap {
                 vec![
@@ -95,6 +107,8 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 match key {
                     "blend" => "Blend",
                     "contour" => "Contour",
+                    "highlight_blend" => "Highlight blend",
+                    "shadow_blend" => "Shadow blend",
                     "pattern" => "Pattern",
                     "position" => "Position",
                     "source" => "Source",
@@ -166,6 +180,8 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 ),
                 ("depth", "Depth", 0., 10., "%"),
                 ("range", "Range", 0.01, 1., "%"),
+                ("highlight_opacity", "Highlight opacity", 0., 1., "%"),
+                ("shadow_opacity", "Shadow opacity", 0., 1., "%"),
                 ("bitmap_scale", "Scale", 0.01, 8., "%"),
                 (
                     "bitmap_angle",
@@ -441,6 +457,126 @@ mod tests {
                 );
                 e.undo("human").unwrap();
                 assert_eq!(native(&e.doc), native(&before));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bevel_tests {
+    use super::*;
+    #[test]
+    fn bevel_highlight_opacity_drags_preview_native_pixels_and_commit_once() {
+        for depth in [8, 16] {
+            for (delta, endpoint) in [(-300., 0.), (300., 1.)] {
+                let ctx = egui::Context::default();
+                let mut engine = crate::engine::Engine::new();
+                engine.doc = Document::new_depth(32, 24, depth).unwrap();
+                for y in 0..24 {
+                    for x in 0..32 {
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(x, y, [12347, 23459, 34571, 65535]);
+                    }
+                }
+                let layer = engine.doc.layers[0].id.clone();
+                engine.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"bevel_emboss","settings":{"highlight_opacity":0.37,"shadow_opacity":0.61,"size":0.,"soften":0.,"depth":1.,"angle":0.,"altitude":0.}})], None, None, "Bevel").unwrap();
+                engine.undo.clear();
+                let before = engine.doc.clone();
+                let effect = engine.doc.layers[0].effects[0].id.clone();
+                let shared = Arc::new(std::sync::Mutex::new(engine));
+                let connection = crate::server::Connection {
+                    port: 0,
+                    token: String::new(),
+                    state_dir: Default::default(),
+                    instance_lock: None,
+                    availability: Default::default(),
+                };
+                let mut app = PeerBrush::init(&ctx, shared.clone(), connection);
+                app.selected = layer.clone();
+                app.selection_layers = [layer.clone()].into_iter().collect();
+                app.effect_selected = Some((layer, false, effect));
+                let native = |doc: &Document| {
+                    if depth == 16 {
+                        crate::depth16::render(doc).unwrap().words
+                    } else {
+                        doc.preview_native8(None, 32, None, false)
+                            .unwrap()
+                            .2
+                            .into_iter()
+                            .map(u16::from)
+                            .collect()
+                    }
+                };
+                let mut time = 0.;
+                let mut draw = |app: &mut PeerBrush, events| {
+                    time += 0.05;
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1100., 1100.),
+                            )),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                let start = output
+                    .shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.job.text == "37%" => {
+                            Some(Rect::from_min_size(t.pos, t.galley.size()).center())
+                        }
+                        _ => None,
+                    })
+                    .expect("Compact highlight opacity control");
+                let end = start + Vec2::new(delta, 0.);
+                let button = |pos, pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                draw(
+                    &mut app,
+                    vec![egui::Event::PointerMoved(start), button(start, true)],
+                );
+                draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                let commands = app
+                    .parameter_gesture
+                    .as_ref()
+                    .expect("Valid highlight gesture")
+                    .commands
+                    .clone();
+                let draft =
+                    crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
+                assert_eq!(
+                    draft.layers[0].effects[0].settings["highlight_opacity"],
+                    json!(endpoint)
+                );
+                assert_ne!(native(&draft), native(&before));
+                {
+                    let engine = shared.lock().unwrap();
+                    assert!(engine.undo.is_empty());
+                    assert_eq!(engine.doc.revision, before.revision);
+                }
+                draw(&mut app, vec![button(end, false)]);
+                let mut engine = shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(native(&engine.doc), native(&draft));
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                engine.undo("human").unwrap();
+                assert_eq!(native(&engine.doc), native(&before));
             }
         }
     }
