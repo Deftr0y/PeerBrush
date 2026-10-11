@@ -4324,9 +4324,7 @@ impl PeerBrush {
                     && !key_modifiers(i,egui::Key::Delete).any()
                 {
                     if doc.selection.is_some() {
-                        let roots = crate::tree::roots(&doc, &self.selection_layers);
-                        let commands = roots.iter().map(|id| json!({"op":"paint.clear_selection","layer":id,"mask":self.mask,"step":self.mask_step,"document_id":doc.id,"source_revision":doc.revision})).collect();
-                        self.edit(commands,"Clear selected pixels");
+                        self.edit(vec![json!({"op":"paint.clear_selection","layer":self.selected,"mask":self.mask,"step":self.mask_step,"document_id":doc.id,"source_revision":doc.revision})],"Clear selected pixels");
                     } else {
                         self.layer_cmd("layer.delete",json!({}),"Delete selected layers");
                     }
@@ -9566,6 +9564,108 @@ mod tests {
             }
             e.undo("human").unwrap();
             assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        }
+    }
+    #[test]
+    fn area_delete_targets_active_color_or_mask_with_multiple_selected_roots() {
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let (mut app, ctx) = small_fixture();
+                let before = {
+                    let mut e = app.shared.lock().unwrap();
+                    e.doc = Document::new_depth(32, 24, depth).unwrap();
+                    for y in 0..24 {
+                        for x in 0..32 {
+                            e.doc.layers[0]
+                                .pixels
+                                .set16(x, y, [12347, 33559, 51237, 65535]);
+                        }
+                    }
+                    let id = e.doc.layers[0].id.clone();
+                    e.edit("human", &[json!({"op":"layer.add","name":"Untouched"}), json!({"op":"mask.add","layer":id}), json!({"op":"selection","kind":"ellipse","rect":[2,2,28,22],"feather":2}), json!({"op":"selection","kind":"rectangle","mode":"subtract","rect":[12,9,18,15]})], None, None, "Fixture").unwrap();
+                    e.doc.layers[1].visible = false;
+                    for y in 0..24 {
+                        for x in 0..32 {
+                            e.doc.layers[0]
+                                .pixels
+                                .set16(x, y, [12347, 33559, 51237, 65535]);
+                        }
+                    }
+                    let active = e.doc.layers[0].id.clone();
+                    e.edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":active})],
+                        None,
+                        None,
+                        "Active mask",
+                    )
+                    .unwrap();
+                    e.undo.clear();
+                    e.doc.clone()
+                };
+                let id = before.layers[0].id.clone();
+                let other = before.layers[1].id.clone();
+                app.select_content(&id);
+                frame(&mut app, &ctx, vec![], Default::default());
+                app.selection_layers = [id.clone(), other.clone()].into_iter().collect();
+                app.mask = mask;
+                let command = json!({"op":"paint.clear_selection","layer":id,"mask":mask});
+                let expected = Engine::preview_edits(before.clone(), &[command]).unwrap();
+                let coverage = crate::selection::current(&before).unwrap().mask.rgba();
+                // An inactive selected root's reservation must not block active-area deletion.
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "agent",
+                        "Other layer",
+                        vec![crate::engine::Scope::layer(&other)],
+                    )
+                    .unwrap();
+                modified_key(&mut app, &ctx, egui::Key::Delete, Default::default());
+                {
+                    let mut e = app.shared.lock().unwrap();
+                    assert_eq!(e.undo.len(), 1);
+                    assert_eq!(e.doc.layers.len(), 2);
+                    assert_eq!(
+                        e.doc.layers[0].pixels.rgba16(),
+                        expected.layers[0].pixels.rgba16()
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&e.doc.layers[0].mask).unwrap(),
+                        serde_json::to_value(&expected.layers[0].mask).unwrap()
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&e.doc.layers[1]).unwrap(),
+                        serde_json::to_value(&before.layers[1]).unwrap()
+                    );
+                    assert_eq!(
+                        crate::selection::current(&e.doc).unwrap().mask.rgba(),
+                        coverage
+                    );
+                    assert!(e.doc.export_png().unwrap() != before.export_png().unwrap());
+                    e.undo("human").unwrap();
+                    assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                    assert_eq!(
+                        serde_json::to_value(&e.doc.layers).unwrap(),
+                        serde_json::to_value(&before.layers).unwrap()
+                    );
+                    e.reserve(
+                        "agent",
+                        "Active layer",
+                        vec![crate::engine::Scope::layer(&id)],
+                    )
+                    .unwrap();
+                }
+                modified_key(&mut app, &ctx, egui::Key::Delete, Default::default());
+                let e = app.shared.lock().unwrap();
+                assert!(e.undo.is_empty());
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                assert_eq!(
+                    crate::selection::current(&e.doc).unwrap().mask.rgba(),
+                    coverage
+                );
+            }
         }
     }
     #[test]
