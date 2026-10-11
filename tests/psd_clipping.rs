@@ -2283,3 +2283,131 @@ fn arbitrary_gradient_rotation_and_shape_remain_protected_even_when_disabled() {
         }
     }
 }
+
+#[test]
+fn supported_photoshop_overlays_keep_raster_clipping_sources_and_standard_saves() {
+    for depth in [8, 16] {
+        for family in 0..3 {
+            let base_pixels = [[22349, 31237, 54321, 12347], [54323, 32349, 13337, 54321]];
+            let base = Spec::paint("Synthetic clipping base", base_pixels);
+            let mut clip = Spec::paint("Synthetic clipped overlay", SAVED);
+            clip.clipping = 1;
+            clip.tags.push((
+                *b"lfx2",
+                match family {
+                    0 => overlay_payload(true, true, [111., 67., 231.]),
+                    1 => pattern_payload(true, "synthetic-pattern", "", 100.),
+                    _ => gradient_payload(false, None, 0.),
+                },
+            ));
+            let mut bytes = fixture(&[clip, base], depth);
+            if family == 1 {
+                bytes = inject_pattern(
+                    bytes,
+                    depth,
+                    &pattern_resource(depth, "synthetic-pattern"),
+                    false,
+                );
+            }
+            let merged = std::array::from_fn::<_, 2, _>(|x| {
+                let color = match family {
+                    0 => [111 * 257, 67 * 257, 231 * 257],
+                    1 => [
+                        native(PATTERN[x][0], depth),
+                        native(PATTERN[x][1], depth),
+                        native(PATTERN[x][2], depth),
+                    ],
+                    _ => [native(if x == 0 { 16384 } else { 49151 }, depth); 3],
+                };
+                [
+                    color[0],
+                    color[1],
+                    color[2],
+                    native(base_pixels[x][3], depth),
+                ]
+            });
+            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+            for channel in 0..4 {
+                for pixel in merged {
+                    sample(&mut bytes, pixel[channel], depth);
+                }
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{depth} {family}: {:?}", doc.warnings);
+            assert_eq!(doc.layers[0].clip_to.as_ref(), Some(&doc.layers[1].id));
+            let source = doc.layers[0].pixels.rgba16();
+            let base = doc.layers[1].pixels.rgba16();
+            assert_eq!(
+                source,
+                SAVED
+                    .into_iter()
+                    .flatten()
+                    .map(|n| native(n, depth))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                base,
+                base_pixels
+                    .into_iter()
+                    .flatten()
+                    .map(|n| native(n, depth))
+                    .collect::<Vec<_>>()
+            );
+            let current = doc.export_png().unwrap();
+            let mut engine = Engine::new();
+            engine.doc = doc;
+            let layer = engine.doc.layers[0].id.clone();
+            let effect = engine.doc.layers[0].effects[0].id.clone();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":false})],
+                    None,
+                    None,
+                    "Bypass clipped overlay",
+                )
+                .unwrap();
+            assert_eq!(engine.undo.len(), 1);
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), current);
+            for output in [
+                psd::encode(&engine.doc).unwrap(),
+                psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = psd::decode(&output).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(
+                    reopened.layers[0].clip_to.as_ref(),
+                    Some(&reopened.layers[1].id)
+                );
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                assert_eq!(reopened.layers[1].pixels.rgba16(), base);
+                assert_eq!(reopened.export_png().unwrap(), current);
+            }
+            let standard = psd::decode(&ordinary(&psd::encode(&engine.doc).unwrap())).unwrap();
+            assert!(!standard.read_only);
+            assert!(standard.layers[0].effects.is_empty());
+            assert_eq!(
+                standard.layers[0].clip_to.as_ref(),
+                Some(&standard.layers[1].id)
+            );
+            assert_eq!(standard.export_png().unwrap(), current);
+        }
+    }
+}
+#[test]
+fn styled_clipped_rasters_without_a_compatible_base_keep_native_composites_protected() {
+    for depth in [8, 16] {
+        let mut clip = Spec::paint("Synthetic missing clipping base", SAVED);
+        clip.clipping = 1;
+        clip.tags
+            .push((*b"lfx2", overlay_payload(false, false, [111., 67., 231.])));
+        let doc = psd::decode(&fixture(&[clip], depth)).unwrap();
+        assert!(doc.read_only);
+        assert!(doc
+            .warnings
+            .iter()
+            .any(|v| v.to_ascii_lowercase().contains("clip")));
+        assert_eq!(doc.bit_depth, depth);
+    }
+}

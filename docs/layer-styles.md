@@ -72,7 +72,7 @@ Shared `effect.add/update` settings accept `color_stops` and `alpha_stops` array
 
 ## Plain Photoshop Pattern Overlay import (unreleased)
 
-A single unscaled, unrotated bitmap Pattern Overlay with a supported blend with document alignment and zero phase can import from an unambiguous embedded RGB tile at matching native depth and zero source origin. Ordinary unclipped raster layers with Normal blend are required; supported raster masks and reduced layer opacity are accepted by the extension below (QA pending). Every resource asset must be retained in a supported style, and the shared renderer must match the saved native composite exactly. Unsupported color handling, placement, unsupported style combinations, unused resources and malformed descriptors remain protected. Imported tiles use the same compact bitmap controls, shared commands and format-18 editable sources as PNG patterns. Combined regression and native effect verification passed; broader Photoshop styles remain unsupported.
+A single unscaled, unrotated bitmap Pattern Overlay with a supported blend with document alignment and zero phase can import from an unambiguous embedded RGB tile at matching native depth and zero source origin. Ordinary raster layers with Normal blend are required; supported raster masks and reduced layer opacity are accepted by the extension below (QA pending). Every resource asset must be retained in a supported style, and the shared renderer must match the saved native composite exactly. Unsupported color handling, placement, unsupported style combinations, unused resources and malformed descriptors remain protected. Imported tiles use the same compact bitmap controls, shared commands and format-18 editable sources as PNG patterns. Combined regression and native effect verification passed; broader Photoshop styles remain unsupported.
 
 ## Mixed Photoshop overlays (unreleased; QA pending)
 
@@ -82,6 +82,8 @@ Pattern and Gradient overlays additionally accept Normal/Multiply/Screen/Overlay
 
 Explicit Photoshop Color/Gradient multi-effect lists retain 1–16 supported entries per family in file order, including disabled definitions, within a 32-effect total stack limit (QA pending). Multiple Pattern instances and unsupported entries stay protected. Shared reorder, bypass, settings and undo controls operate on each retained definition.
 
-Supported Photoshop overlay imports now retain supported raster masks and layer opacity, including zero opacity (QA pending). Every mask/source validator and exact composite gate remains active; unsupported masks, clipping, folder styles and non-Normal layer blending remain protected.
+Supported Photoshop overlay imports now retain supported raster masks and layer opacity, including zero opacity (QA pending). Every mask/source validator and exact composite gate remains active; unsupported masks/clipping, folder styles and non-Normal layer blending remain protected.
 
 Plain Photoshop Gradient Overlay import additionally supports Linear/Reflected at the horizontal/vertical cardinal axes, retaining angle, reverse and all stop definitions (QA pending). Unscaled document alignment, exact native composite matching and the existing color/interpolation limits remain mandatory.
+
+Supported overlay-only styles also retain validated default raster clipping groups (QA pending). Original foreground/base samples and clipping relationships remain editable; standard saves bake the overlay appearance while retaining clipping. Missing/incompatible bases and unsupported clipping structures stay protected.
