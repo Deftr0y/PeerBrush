@@ -271,7 +271,10 @@
     "src/ui/pattern_source.rs",
     "tests/bitmap_patterns.rs",
     "src/psd/patterns.rs",
-    "tests/psd_patterns.rs"
+    "tests/psd_patterns.rs",
+    "src/effects/gradient.rs",
+    "src/ui/gradient_stops.rs",
+    "tests/gradient_stops.rs"
   ],
   "portable": [
     "LICENSE",

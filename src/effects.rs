@@ -12,6 +12,7 @@ pub const BUDGET: usize = 256 * 1024 * 1024;
 pub const WORKING_BUDGET: usize = 256 * 1024 * 1024;
 pub mod catalog;
 pub mod channel_clamp;
+pub mod gradient;
 pub mod patterns;
 pub mod posterize;
 pub mod styles;

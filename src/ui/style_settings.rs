@@ -239,7 +239,13 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
             },
         ),
     ] {
-        if defaults.get(key).is_none() || (bitmap && kind != "texture") {
+        if defaults.get(key).is_none()
+            || (bitmap && kind != "texture")
+            || (kind == "gradient_overlay"
+                && value["color_stops"]
+                    .as_array()
+                    .is_some_and(|s| s.len() >= 2))
+        {
             continue;
         }
         let mut rgb: [f32; 3] = std::array::from_fn(|i| {
@@ -261,6 +267,9 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 }
             }
         });
+    }
+    if kind == "gradient_overlay" {
+        changed = gradient_stops::controls(ui, value).or(changed);
     }
     for (key, label) in [
         ("reverse", "Reverse"),

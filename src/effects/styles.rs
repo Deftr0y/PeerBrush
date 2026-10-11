@@ -119,10 +119,17 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
         .as_object()
         .ok_or("Layer-style settings must be an object")?
     {
-        if defaults.get(key).is_none() && !(bitmap && bitmap_defaults.get(key).is_some()) {
+        if defaults.get(key).is_none()
+            && !(bitmap && bitmap_defaults.get(key).is_some())
+            && !(kind == "gradient_overlay"
+                && matches!(key.as_str(), "color_stops" | "alpha_stops"))
+        {
             return Err(format!("Unsupported {kind} setting: {key}"));
         }
         match key.as_str() {
+            "color_stops" | "alpha_stops" => {
+                crate::effects::gradient::validate(v, key == "alpha_stops")?
+            }
             "color" | "color2" => {
                 let rgb = v
                     .as_array()
@@ -392,9 +399,14 @@ pub fn apply(
                     if v["reverse"] == true {
                         t = 1. - t;
                     }
-                    tint = std::array::from_fn(|c| {
-                        ((1. - t) * f64::from(color[c]) + t * f64::from(color2[c])).round() as u16
-                    });
+                    if crate::effects::gradient::extended(kind, v) {
+                        (tint, coverage) = crate::effects::gradient::sample(v, t);
+                    } else {
+                        tint = std::array::from_fn(|c| {
+                            ((1. - t) * f64::from(color[c]) + t * f64::from(color2[c])).round()
+                                as u16
+                        });
+                    }
                 }
                 "pattern_overlay" => {
                     if let Some(bitmap) = &bitmap {

@@ -13,6 +13,7 @@ mod file_ownership;
 mod filename;
 mod filters;
 mod geometry;
+mod gradient_stops;
 mod history;
 mod image_open;
 mod layers;
