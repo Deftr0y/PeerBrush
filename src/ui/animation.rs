@@ -401,24 +401,22 @@ impl PeerBrush {
                     })
             });
             let Some(bounds) = bounds else { continue };
-            let r = Rect::from_min_max(
-                rect.min + Vec2::new(bounds[0] as f32 * scale, bounds[1] as f32 * scale),
-                rect.min + Vec2::new(bounds[2] as f32 * scale, bounds[3] as f32 * scale),
-            );
             let color = AI_BLUE.gamma_multiply(0.7 + 0.2 * (time as f32 * 4.0).sin());
-            let length = r.width().min(r.height()).min(14.0).max(2.0);
+            let length = (((bounds[2] - bounds[0]).min(bounds[3] - bounds[1])) as f32 * scale)
+                .clamp(2.0, 14.0);
             for (p, x, y) in [
-                (r.left_top(), 1.0, 1.0),
-                (r.right_top(), -1.0, 1.0),
-                (r.left_bottom(), 1.0, -1.0),
-                (r.right_bottom(), -1.0, -1.0),
+                ([bounds[0] as f32, bounds[1] as f32], 1.0, 1.0),
+                ([bounds[2] as f32, bounds[1] as f32], -1.0, 1.0),
+                ([bounds[0] as f32, bounds[3] as f32], 1.0, -1.0),
+                ([bounds[2] as f32, bounds[3] as f32], -1.0, -1.0),
             ] {
+                let p = self.view.point(p, rect, scale);
                 painter.line_segment(
-                    [p + Vec2::new(length * x, 0.0), p],
+                    [p + self.view.vector(Vec2::new(length * x, 0.0)), p],
                     Stroke::new(1.5_f32, color),
                 );
                 painter.line_segment(
-                    [p, p + Vec2::new(0.0, length * y)],
+                    [p, p + self.view.vector(Vec2::new(0.0, length * y))],
                     Stroke::new(1.5_f32, color),
                 );
             }

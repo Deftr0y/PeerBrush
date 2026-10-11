@@ -137,6 +137,7 @@
     "src/ui.rs",
     "src/ui/animation.rs",
     "src/ui/brush.rs",
+    "src/ui/calibration.rs",
     "src/ui/brush_toolbar_tests.rs",
     "src/ui/color.rs",
     "src/ui/effects.rs",
@@ -164,11 +165,13 @@
     "src/ui/tool_settings.rs",
     "src/ui/tool_settings_tests.rs",
     "src/ui/transform_snapping.rs",
+    "src/ui/view.rs",
     "src/workspace.rs",
     "src/workspace/lifecycle.rs",
     "tests/adjustments.rs",
     "tests/brush_equivalence.rs",
     "tests/brush_library.rs",
+    "tests/pressure_calibration.rs",
     "tests/brush_session.rs",
     "tests/brush_texture_coordinates.rs",
     "tests/channel_clamp.rs",
@@ -249,7 +252,9 @@
     "vendor/egui-winit/README.md",
     "vendor/egui-winit/src/clipboard.rs",
     "vendor/egui-winit/src/lib.rs",
-    "vendor/egui-winit/src/window_settings.rs"
+    "vendor/egui-winit/src/window_settings.rs",
+    "src/ui/shortcuts.rs",
+    "docs/canvas-tablet.md"
   ],
   "portable": [
     "LICENSE",

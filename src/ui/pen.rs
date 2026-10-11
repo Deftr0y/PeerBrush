@@ -20,6 +20,11 @@ struct Gesture {
     start: [f32; 2],
     anchor: [f32; 2],
 }
+impl State {
+    pub(super) fn in_gesture(&self) -> bool {
+        self.gesture.is_some()
+    }
+}
 #[derive(Clone, Copy)]
 enum Kind {
     Add,
@@ -187,8 +192,9 @@ impl PeerBrush {
                 return;
             }
         }
-        let screen = |p: [f32; 2]| rect.min + Vec2::new(p[0], p[1]) * scale;
-        let to_doc = |p: Pos2| [(p.x - rect.min.x) / scale, (p.y - rect.min.y) / scale];
+        let view = self.view;
+        let screen = |p: [f32; 2]| view.point(p, rect, scale);
+        let to_doc = |p: Pos2| view.document(p, rect, scale);
         let cursor = ui.input(|i| i.pointer.interact_pos());
         let mut hit = None;
         if let (Some(l), Some(p)) = (&target, cursor) {
@@ -209,7 +215,7 @@ impl PeerBrush {
             }
         }
         if response.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
-            if let Some(p) = cursor.filter(|p| rect.contains(*p)) {
+            if let Some(p) = cursor.filter(|p| view.contains(*p, rect, scale)) {
                 self.cancel_source();
                 let point = to_doc(p);
                 if hit.is_none() {
@@ -382,7 +388,8 @@ impl PeerBrush {
                 return;
             }
         } else if self.pen.drawing && response.hovered() {
-            if let (Some(l), Some(p)) = (&target, cursor.filter(|p| rect.contains(*p))) {
+            if let (Some(l), Some(p)) = (&target, cursor.filter(|p| view.contains(*p, rect, scale)))
+            {
                 if !nodes(l).unwrap().1 && hit.is_none() {
                     self.transient.push(json!({"op":"path.node.add","layer":l.id,"point":to_doc(p),"source_revision":doc.revision}));
                 }

@@ -40,7 +40,7 @@ impl Drop for ServerAvailability {
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     atomic_write_checked(path, bytes, |_| Ok(()))
 }
-fn atomic_write_checked(
+pub(crate) fn atomic_write_checked(
     path: &Path,
     bytes: &[u8],
     validate: impl FnOnce(&Path) -> Result<(), String>,
@@ -1244,6 +1244,9 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "solo_mask",
                     "document_info",
                     "saved_versions",
+                    "calibration",
+                    "view",
+                    "shortcuts",
                 ]
                 .contains(&name)
             }) {
@@ -2378,6 +2381,11 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().brush_library.lock().unwrap() = library;
+    let preferences = crate::tool_settings::Store::load(state_dir.join("tool-settings.json"));
+    if let Some(error) = &preferences.error {
+        shared.lock().unwrap().status = error.clone();
+    }
+    *shared.lock().unwrap().tool_settings.lock().unwrap() = preferences;
     let library = crate::filter_library::Library::load(state_dir.join("filters.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();

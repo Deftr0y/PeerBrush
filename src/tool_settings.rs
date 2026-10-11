@@ -2,7 +2,41 @@
 use crate::brush::Settings;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+const FILE_LIMIT: u64 = 128 * 1024;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Stored {
+    version: u32,
+    tools: BTreeMap<String, Profile>,
+}
+pub(crate) fn read_owned(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("Symbolic tool preference files remain protected".into());
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Tool preferences need a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(FILE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > FILE_LIMIT {
+        return Err("Tool preferences exceed 128 KiB".into());
+    }
+    Ok(Some(bytes))
+}
 
 pub const TOOLS: &[&str] = &["brush", "eraser", "smudge", "clone", "heal", "liquify"];
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
@@ -17,9 +51,16 @@ pub struct Snapshot {
     pub profile: Profile,
     pub revision: u64,
     pub actor: String,
+    #[serde(skip)]
+    pub persistent: bool,
 }
 pub struct Store {
     tools: BTreeMap<String, Snapshot>,
+    path: Option<PathBuf>,
+    original: Option<Vec<u8>>,
+    pub error: Option<String>,
+    save_error: Option<String>,
+    dirty: bool,
 }
 impl Default for Store {
     fn default() -> Self {
@@ -44,14 +85,50 @@ impl Default for Store {
                             },
                             revision: 0,
                             actor: "human".into(),
+                            persistent: false,
                         },
                     )
                 })
                 .collect(),
+            path: None,
+            original: None,
+            error: None,
+            save_error: None,
+            dirty: false,
         }
     }
 }
 impl Store {
+    pub fn load(path: PathBuf) -> Self {
+        let mut store = Self::default();
+        let result = (|| {
+            store.original = read_owned(&path)?;
+            let Some(bytes) = &store.original else {
+                return Ok(());
+            };
+            let stored: Stored = serde_json::from_slice(bytes)
+                .map_err(|e| format!("Unreadable tool preferences: {e}"))?;
+            if stored.version != 1 || stored.tools.len() > TOOLS.len() {
+                return Err("Unsupported tool preferences".into());
+            }
+            let mut validated = Self::default();
+            for (tool, profile) in stored.tools {
+                validated.set(&tool, profile, "human", None)?;
+            }
+            if read_owned(&path)? != store.original {
+                return Err("Tool preferences changed during loading".into());
+            }
+            store.tools = validated.tools;
+            Ok(())
+        })();
+        store.error = result.err();
+        store.path = Some(path);
+        for snapshot in store.tools.values_mut() {
+            snapshot.revision = 0;
+            snapshot.persistent = true;
+        }
+        store
+    }
     pub fn get(&self, tool: &str) -> Result<Snapshot, String> {
         self.tools
             .get(tool)
@@ -59,7 +136,7 @@ impl Store {
             .ok_or_else(|| "Choose brush, eraser, smudge, clone, heal or liquify".into())
     }
     pub fn state(&self) -> Value {
-        json!({"tools":self.tools.iter().map(|(tool,snapshot)|(tool.clone(),snapshot.state(tool))).collect::<BTreeMap<_,_>>(),"persistence":"current instance"})
+        json!({"tools":self.tools.iter().map(|(tool,snapshot)|(tool.clone(),snapshot.state(tool))).collect::<BTreeMap<_,_>>(),"persistence":if self.path.is_some(){"instance state directory"}else{"current instance"},"error":self.error,"save_error":self.save_error,"pending_save":self.dirty})
     }
     pub fn set(
         &mut self,
@@ -67,6 +144,16 @@ impl Store {
         profile: Profile,
         actor: &str,
         expected: Option<u64>,
+    ) -> Result<Snapshot, String> {
+        self.set_profile(tool, profile, actor, expected, true)
+    }
+    fn set_profile(
+        &mut self,
+        tool: &str,
+        profile: Profile,
+        actor: &str,
+        expected: Option<u64>,
+        persist: bool,
     ) -> Result<Snapshot, String> {
         let before = self.get(tool)?;
         if actor.trim().is_empty()
@@ -108,6 +195,9 @@ impl Store {
             return Err("Invalid tool brush preset ID".into());
         }
         if profile == before.profile {
+            if persist {
+                self.flush()?;
+            }
             return Ok(before);
         }
         let after = Snapshot {
@@ -117,9 +207,70 @@ impl Store {
                 .checked_add(1)
                 .ok_or("Tool preference revision exhausted")?,
             actor: actor.into(),
+            persistent: before.persistent,
         };
+        if persist {
+            let mut profiles = self.profiles();
+            profiles.insert(tool.into(), after.profile.clone());
+            if let Err(error) = self.persist(profiles) {
+                self.save_error = Some(error.clone());
+                return Err(error);
+            }
+        } else {
+            self.dirty = self.path.is_some();
+        }
         self.tools.insert(tool.into(), after.clone());
         Ok(after)
+    }
+    fn profiles(&self) -> BTreeMap<String, Profile> {
+        self.tools
+            .iter()
+            .map(|(key, snapshot)| (key.clone(), snapshot.profile.clone()))
+            .collect()
+    }
+    fn persist(&mut self, profiles: BTreeMap<String, Profile>) -> Result<(), String> {
+        if let Some(error) = &self.error {
+            return Err(format!(
+                "Tool preferences preserved; repair or restore their file before saving: {error}"
+            ));
+        }
+        if let Some(path) = &self.path {
+            let _lease = crate::file_safety::Lease::acquire(path)?;
+            if read_owned(path)? != self.original {
+                return Err(
+                    "Tool preferences changed on disk; restart to load them before saving".into(),
+                );
+            }
+            let bytes = serde_json::to_vec_pretty(&Stored {
+                version: 1,
+                tools: profiles,
+            })
+            .map_err(|e| e.to_string())?;
+            crate::server::atomic_write_checked(path, &bytes, |_| {
+                if read_owned(path)? == self.original {
+                    Ok(())
+                } else {
+                    Err("Tool preferences changed while saving".into())
+                }
+            })?;
+            self.original = Some(bytes);
+        }
+        self.dirty = false;
+        self.save_error = None;
+        Ok(())
+    }
+    pub fn flush(&mut self) -> Result<(), String> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if let Some(error) = &self.save_error {
+            return Err(error.clone());
+        }
+        let result = self.persist(self.profiles());
+        if let Err(error) = &result {
+            self.save_error = Some(error.clone());
+        }
+        result
     }
     /// Merge only controls changed by human input, retaining newer independent values.
     pub fn human_delta(
@@ -145,7 +296,7 @@ impl Store {
         if before.liquify_mode != after.liquify_mode {
             profile.liquify_mode = after.liquify_mode.clone();
         }
-        self.set(tool, profile, "human", None)
+        self.set_profile(tool, profile, "human", None, false)
     }
 }
 
@@ -156,6 +307,6 @@ impl Snapshot {
         } else {
             serde_json::to_value(self.profile.settings).unwrap()
         };
-        json!({"tool":tool,"profile":{"settings":settings,"preset":self.profile.preset},"revision":self.revision,"actor":self.actor,"persistence":"current instance"})
+        json!({"tool":tool,"profile":{"settings":settings,"preset":self.profile.preset},"revision":self.revision,"actor":self.actor,"persistence":if self.persistent{"instance state directory"}else{"current instance"}})
     }
 }

@@ -213,13 +213,14 @@ impl PeerBrush {
         rect: Rect,
         scale: f32,
     ) {
-        let to_doc = |p: Pos2| [(p.x - rect.min.x) / scale, (p.y - rect.min.y) / scale];
-        let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
+        let view = self.view;
+        let to_doc = |p: Pos2| view.document(p, rect, scale);
+        let to_screen = |p: [f32; 2]| view.point(p, rect, scale);
         // The response covers only the canvas workspace, excluding panels and controls.
         if response.clicked()
             && response
                 .interact_pointer_pos()
-                .is_some_and(|p| !rect.contains(p))
+                .is_some_and(|p| !view.contains(p, rect, scale))
         {
             self.deselect_area(doc, false);
             return;
@@ -239,7 +240,7 @@ impl PeerBrush {
             if response.clicked() || response.double_clicked() {
                 if let Some(pos) = response
                     .interact_pointer_pos()
-                    .filter(|p| rect.contains(*p))
+                    .filter(|p| view.contains(*p, rect, scale))
                 {
                     if self.selection_path.is_empty() {
                         self.selection_gesture_mode = Some(self.selection_mode_for(ui));
@@ -259,7 +260,7 @@ impl PeerBrush {
             {
                 if let Some(pos) = ui
                     .input(|i| i.pointer.hover_pos())
-                    .filter(|p| rect.contains(*p))
+                    .filter(|p| view.contains(*p, rect, scale))
                 {
                     let p = to_doc(pos);
                     if self
@@ -298,7 +299,7 @@ impl PeerBrush {
                     .collect::<Vec<_>>();
                 if let Some(p) = ui
                     .input(|i| i.pointer.hover_pos())
-                    .filter(|p| rect.contains(*p))
+                    .filter(|p| view.contains(*p, rect, scale))
                 {
                     points.push(p);
                 }
@@ -306,10 +307,10 @@ impl PeerBrush {
             }
             return;
         }
-        if response.drag_started() {
+        if response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(pos) = ui
                 .input(|i| i.pointer.press_origin())
-                .filter(|p| rect.contains(*p))
+                .filter(|p| view.contains(*p, rect, scale))
             {
                 let p = to_doc(pos);
                 self.drag_start = Some(p);
@@ -317,7 +318,7 @@ impl PeerBrush {
                 self.selection_gesture_mode = Some(self.selection_mode_for(ui));
             }
         }
-        if response.dragged() && self.drag_start.is_some() {
+        if response.dragged_by(egui::PointerButton::Primary) && self.drag_start.is_some() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let p = to_doc(pos);
                 let old = *self.points.last().unwrap();
@@ -347,12 +348,16 @@ impl PeerBrush {
                     .collect::<Vec<_>>();
                 polygon(ui, painter, &points);
             } else if self.selection_kind == "ellipse" {
-                let r = Rect::from_two_pos(to_screen(a), to_screen(b));
+                let r = Rect::from_two_pos(Pos2::new(a[0], a[1]), Pos2::new(b[0], b[1]));
                 let points = (0..64)
                     .map(|i| {
                         let angle = i as f32 * std::f32::consts::TAU / 64.;
-                        r.center()
-                            + Vec2::new(angle.cos() * r.width() / 2., angle.sin() * r.height() / 2.)
+                        let p = r.center()
+                            + Vec2::new(
+                                angle.cos() * r.width() / 2.,
+                                angle.sin() * r.height() / 2.,
+                            );
+                        to_screen([p.x, p.y])
                     })
                     .collect::<Vec<_>>();
                 polygon(ui, painter, &points);
@@ -363,10 +368,14 @@ impl PeerBrush {
                     Stroke::new(1.0_f32, ACCENT),
                 );
             } else {
-                outline(ui, painter, Rect::from_two_pos(to_screen(a), to_screen(b)));
+                polygon(
+                    ui,
+                    painter,
+                    &[[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]]].map(to_screen),
+                );
             }
         }
-        if response.drag_stopped() && self.drag_start.is_some() {
+        if response.drag_stopped_by(egui::PointerButton::Primary) && self.drag_start.is_some() {
             if self.points.len() > 1 {
                 let command = self.select_command(
                     doc,
@@ -382,7 +391,7 @@ impl PeerBrush {
         }
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-                if rect.contains(pos)
+                if view.contains(pos, rect, scale)
                     && ["wand", "quick", "row", "column"].contains(&self.selection_kind.as_str())
                 {
                     let command =

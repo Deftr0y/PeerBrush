@@ -55,6 +55,8 @@ pub struct Settings {
     pub pressure_size: bool,
     pub pressure_opacity: bool,
     pub pressure_gamma: f32,
+    pub pressure_min: f32,
+    pub pressure_max: f32,
     pub taper_start: f32,
     pub taper_end: f32,
     pub taper_size: bool,
@@ -84,6 +86,8 @@ impl Default for Settings {
             pressure_size: true,
             pressure_opacity: true,
             pressure_gamma: 1.0,
+            pressure_min: 0.0,
+            pressure_max: 1.0,
             taper_start: 0.0,
             taper_end: 0.0,
             taper_size: true,
@@ -113,7 +117,7 @@ impl Settings {
                     .ok_or_else(|| format!("Brush {key} must be true or false"))
             })
         };
-        Ok(Self {
+        let settings = Self {
             radius: parameter("radius", 10.0, 0.5, 512.0)?,
             hardness: parameter(
                 "hardness",
@@ -145,6 +149,8 @@ impl Settings {
             pressure_size: boolean("pressure_size", true)?,
             pressure_opacity: boolean("pressure_opacity", true)?,
             pressure_gamma: parameter("pressure_gamma", 1.0, 0.1, 4.0)?,
+            pressure_min: parameter("pressure_min", 0.0, 0.0, 1.0)?,
+            pressure_max: parameter("pressure_max", 1.0, 0.0, 1.0)?,
             taper_start: parameter("taper_start", 0.0, 0.0, 10000.0)?,
             taper_end: parameter("taper_end", 0.0, 0.0, 10000.0)?,
             taper_size: boolean("taper_size", true)?,
@@ -153,7 +159,19 @@ impl Settings {
             load: parameter("load", 0.0, 0.0, 1.0)?,
             pickup: parameter("pickup", 0.25, 0.0, 1.0)?,
             texture_origin: [0; 2],
-        })
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
+    /// Calibrate genuine or explicitly supplied force before the shared response curve.
+    pub fn pressure_response(self, force: f32) -> f32 {
+        let calibrated =
+            ((force - self.pressure_min) / (self.pressure_max - self.pressure_min)).clamp(0., 1.);
+        if self.pressure_gamma == 1. {
+            calibrated
+        } else {
+            calibrated.powf(self.pressure_gamma)
+        }
     }
     pub fn coverage(self, dx: f32, dy: f32) -> f32 {
         Tip::new(self).coverage(dx, dy)
@@ -171,6 +189,8 @@ impl Settings {
             ("density", self.density, 0.05, 1.0),
             ("grain", self.grain, 0.5, 32.0),
             ("pressure_gamma", self.pressure_gamma, 0.1, 4.0),
+            ("pressure_min", self.pressure_min, 0.0, 1.0),
+            ("pressure_max", self.pressure_max, 0.0, 1.0),
             ("taper_start", self.taper_start, 0.0, 10000.0),
             ("taper_end", self.taper_end, 0.0, 10000.0),
             ("wetness", self.wetness, 0.0, 1.0),
@@ -180,6 +200,9 @@ impl Settings {
             if !value.is_finite() || !(min..=max).contains(&value) {
                 return Err(format!("Brush {name} must be between {min} and {max}"));
             }
+        }
+        if self.pressure_max - self.pressure_min < 0.01 - f32::EPSILON {
+            return Err("Pressure maximum must exceed minimum by at least 0.01".into());
         }
         Ok(())
     }
@@ -494,11 +517,7 @@ pub(crate) fn dabs(
                 1.0
             };
             let taper = start.min(end);
-            let p = if settings.pressure_gamma == 1.0 {
-                p
-            } else {
-                p.powf(settings.pressure_gamma)
-            };
+            let p = settings.pressure_response(p);
             let size_pressure = if settings.pressure_size { p } else { 1.0 };
             let opacity_pressure = if settings.pressure_opacity { p } else { 1.0 };
             let size_taper = if settings.taper_size { taper } else { 1.0 };

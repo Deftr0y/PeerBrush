@@ -3,6 +3,7 @@ mod animation;
 mod brush;
 #[cfg(test)]
 mod brush_toolbar_tests;
+mod calibration;
 mod color;
 mod effects;
 mod file_drop;
@@ -24,6 +25,7 @@ mod refinement;
 mod retouch;
 mod saved_versions;
 mod selection;
+mod shortcuts;
 mod source;
 mod style_settings;
 mod tabs;
@@ -31,6 +33,7 @@ mod tool_settings;
 #[cfg(test)]
 mod tool_settings_tests;
 mod transform_snapping;
+mod view;
 use crate::{controls, thumbnails};
 use crate::{
     engine::Document,
@@ -260,6 +263,7 @@ struct ProjectView {
     collapsed: HashSet<String>,
     zoom: f32,
     pan: Vec2,
+    view: view::View,
     message: String,
 }
 struct LayerDrag {
@@ -356,7 +360,7 @@ pub struct PeerBrush {
     color: Pixel,
     mask_value: u8,
     radius: f32,
-    size_drag: Option<(Pos2, f32)>,
+    size_drag: Option<(Pos2, f32, f32)>,
     live_gesture: Option<String>,
     brush: crate::brush::Settings,
     tool_settings_store: Arc<std::sync::Mutex<crate::tool_settings::Store>>,
@@ -367,6 +371,10 @@ pub struct PeerBrush {
     stroke_pressures: Vec<f32>,
     stroke_has_pressure: bool,
     current_pressure: Option<f32>,
+    show_calibration: bool,
+    show_view: bool,
+    calibration: calibration::Pad,
+    shortcuts: shortcuts::Shortcuts,
     background: Pixel,
     mask_background: u8,
     show_brush: bool,
@@ -409,6 +417,7 @@ pub struct PeerBrush {
     points: Vec<[f32; 2]>,
     drag_start: Option<[f32; 2]>,
     view_rect: Option<Rect>,
+    view: view::View,
     message: String,
     last_status: String,
     import_tx: mpsc::Sender<ImportReply>,
@@ -629,6 +638,7 @@ impl PeerBrush {
             transfer_tx,
             transfer_rx,
             shared,
+            shortcuts: shortcuts::Shortcuts::load(&connection.state_dir),
             connection,
             selection_layers: [selected.clone()].into_iter().collect(),
             selection_anchor: selected.clone(),
@@ -680,6 +690,9 @@ impl PeerBrush {
             stroke_pressures: vec![],
             stroke_has_pressure: false,
             current_pressure: None,
+            show_calibration: false,
+            show_view: false,
+            calibration: calibration::Pad::default(),
             background: [245, 242, 240, 255],
             mask_background: 255,
             show_brush: false,
@@ -722,6 +735,7 @@ impl PeerBrush {
             points: vec![],
             drag_start: None,
             view_rect: None,
+            view: view::View::default(),
             message: "Ready".into(),
             last_status: "Ready".into(),
             import_tx,
@@ -844,7 +858,7 @@ impl PeerBrush {
         // Standard button minimums exceed the footer's inner height.
         let height = ui.available_height().clamp(14.0, 20.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for (index, (tool, key)) in [
+            for (index, (tool, _default_key)) in [
                 (Tool::None, "Q"),
                 (Tool::Move, "W"),
                 (Tool::Rotate, "E"),
@@ -856,7 +870,8 @@ impl PeerBrush {
             {
                 let (_, response) =
                     ui.allocate_exact_size(Vec2::new(34.0, height), egui::Sense::click());
-                let response = response.on_hover_text(tool.label());
+                let key = self.shortcuts.tool_label(tool).replace("Shift+", "⇧");
+                let response = response.on_hover_text(self.tool_caption(tool));
                 self.transform_rects[index] = Some(response.rect);
                 let active = self.tool == tool;
                 if active || response.hovered() {
@@ -1034,7 +1049,7 @@ impl PeerBrush {
         };
         points
             .iter()
-            .map(|p| rect.min + Vec2::new(p[0] * scale, p[1] * scale))
+            .map(|p| self.view.point(*p, rect, scale))
             .collect()
     }
     fn duplicate_layers(&mut self, doc: &Document) {
@@ -2599,7 +2614,8 @@ impl PeerBrush {
             b
         };
         let pivot = [(b[0] + b[2]) as f32 / 2.0, (b[1] + b[3]) as f32 / 2.0];
-        let screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
+        let view = self.view;
+        let screen = |p: [f32; 2]| view.point(p, rect, scale);
         let center = screen(pivot);
         let xend = center + Vec2::new(65.0, 0.0);
         let yend = center - Vec2::new(0.0, 65.0);
@@ -2607,6 +2623,7 @@ impl PeerBrush {
         let hit = pointer
             .filter(|p| available.contains(*p))
             .map(|p| {
+                let p = center + view.inverse(p - center);
                 if self.tool == Tool::Rotate {
                     if ((p - center).length() - 58.0).abs() < 10.0 {
                         3
@@ -2640,6 +2657,8 @@ impl PeerBrush {
                 }
             })
             .unwrap_or(0);
+        let xend = center + view.vector(xend - center);
+        let yend = center + view.vector(yend - center);
         if hit != 0 {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
@@ -2654,8 +2673,7 @@ impl PeerBrush {
             if let Some(pos) = pointer {
                 self.gizmo_handle = hit;
                 self.live_gesture = Some(crate::engine::id());
-                self.drag_start =
-                    Some([(pos.x - rect.left()) / scale, (pos.y - rect.top()) / scale]);
+                self.drag_start = Some(view.document(pos, rect, scale));
                 self.drag_revision = Some(doc.revision);
             }
         }
@@ -2666,7 +2684,7 @@ impl PeerBrush {
         let mut sy = 1.0f32;
         if let (Some(a), Some(pos)) = (self.drag_start, pointer) {
             if self.gizmo_handle != 0 {
-                let p = [(pos.x - rect.left()) / scale, (pos.y - rect.top()) / scale];
+                let p = view.document(pos, rect, scale);
                 if self.tool == Tool::Move {
                     dx = if self.gizmo_handle == 2 {
                         0.0
@@ -2683,9 +2701,8 @@ impl PeerBrush {
                         - (a[1] - pivot[1]).atan2(a[0] - pivot[0]))
                     .to_degrees();
                 } else {
-                    let amount = (((pos.x - screen(a).x) - (pos.y - screen(a).y)) * 0.012)
-                        .exp()
-                        .clamp(0.05, 20.0);
+                    let delta = view.inverse(pos - screen(a));
+                    let amount = ((delta.x - delta.y) * 0.012).exp().clamp(0.05, 20.0);
                     if self.gizmo_handle != 2 {
                         sx = amount;
                     }
@@ -2834,6 +2851,7 @@ impl PeerBrush {
             self.drag_start = None;
             self.gizmo_handle = 0;
             self.drag_revision = None;
+            self.live_gesture = None;
         }
     }
     fn pick_color(&mut self, doc: &Document, point: [f32; 2]) {
@@ -2913,8 +2931,10 @@ impl PeerBrush {
             .as_ref()
             .map(|g| g.size())
             .unwrap_or([doc.width, doc.height]);
-        let fit = ((available.width() - 60.0) / canvas_width as f32)
-            .min((available.height() - 60.0) / canvas_height as f32)
+        let view = self.view;
+        let extent = view.extent(Vec2::new(canvas_width as f32, canvas_height as f32));
+        let fit = ((available.width() - 60.0) / extent.x)
+            .min((available.height() - 60.0) / extent.y)
             .max(0.01);
         if self.frame_pending {
             let target = doc.selection.filter(|r| r[2] > r[0] && r[3] > r[1]);
@@ -2922,14 +2942,16 @@ impl PeerBrush {
                 let width = (r[2] - r[0]) as f32;
                 let height = (r[3] - r[1]) as f32;
                 // Ten percent breathing room, fitted in document coordinates.
-                let scale =
-                    (available.width() / (width * 1.12)).min(available.height() / (height * 1.12));
+                let extent = view.extent(Vec2::new(width, height));
+                let scale = (available.width() / (extent.x * 1.12))
+                    .min(available.height() / (extent.y * 1.12));
                 self.zoom = (scale / fit).clamp(0.01, 8192.0);
                 let center = Vec2::new(
                     (r[0] as f32 + r[2] as f32) * 0.5,
                     (r[1] as f32 + r[3] as f32) * 0.5,
                 );
-                self.pan = (Vec2::new(doc.width as f32, doc.height as f32) * 0.5 - center)
+                self.pan = view
+                    .vector(Vec2::new(doc.width as f32, doc.height as f32) * 0.5 - center)
                     * fit
                     * self.zoom;
             } else {
@@ -2943,42 +2965,18 @@ impl PeerBrush {
         let rect = Rect::from_center_size(available.center() + self.pan, size);
         self.view_rect = Some(rect);
         let painter = ui.painter().with_clip_rect(available);
-        let visible = rect.intersect(available);
-        let cell = 16.0;
-        let cols = (visible.width() / cell).ceil() as i32;
-        let rows = (visible.height() / cell).ceil() as i32;
-        for y in 0..rows {
-            for x in 0..cols {
-                let min = visible.min + Vec2::new(x as f32 * cell, y as f32 * cell);
-                let c = if (x + y) % 2 == 0 {
-                    Color32::from_rgb(66, 63, 68)
-                } else {
-                    Color32::from_rgb(52, 50, 55)
-                };
-                painter.rect_filled(
-                    Rect::from_min_size(min, Vec2::splat(cell)).intersect(visible),
-                    0,
-                    c,
-                );
-            }
-        }
+        let visible = view.bounds(rect, scale).intersect(available);
+        view.image(&painter, rect, scale, view::checker(ui.ctx()).id(), true);
         if let Some(texture) = self.texture.as_ref().filter(|_| {
             self.proposal_review.is_none()
                 || self.proposal_rendered.as_deref() == Some(self.live_key().as_str())
         }) {
-            painter.image(
-                texture.id(),
-                rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            view.image(&painter, rect, scale, texture.id(), false);
         }
-        painter.rect_stroke(
-            rect,
-            0.0,
+        painter.add(egui::Shape::closed_line(
+            view.corners(rect, scale).to_vec(),
             Stroke::new(1.0_f32, Color32::from_rgb(90, 84, 93)),
-            egui::StrokeKind::Outside,
-        );
+        ));
         if let Some(caption) = self.solo_caption(doc) {
             let painter = painter.with_clip_rect(visible);
             let point = visible.left_top() + Vec2::new(8., 8.);
@@ -3035,8 +3033,8 @@ impl PeerBrush {
             self.straight.cancel();
             self.drag_revision = None;
         }
-        let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
-        let to_doc = |p: Pos2| [(p.x - rect.min.x) / scale, (p.y - rect.min.y) / scale];
+        let to_screen = |p: [f32; 2]| view.point(p, rect, scale);
+        let to_doc = |p: Pos2| view.document(p, rect, scale);
         let size_mode = [
             Tool::Brush,
             Tool::Eraser,
@@ -3046,11 +3044,22 @@ impl PeerBrush {
             Tool::Liquify,
         ]
         .contains(&self.tool)
-            && ui.input(|i| i.key_down(egui::Key::S) && !i.modifiers.command);
+            && !ui.ctx().wants_keyboard_input()
+            && !self.shortcuts.open
+            && self.points.is_empty()
+            && self.drag_start.is_none()
+            && self.gizmo_handle == 0
+            && ui.input(|i| self.shortcuts.size_held(i));
         if size_mode && (response.hovered() || self.size_drag.is_some()) {
             if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
-                let (anchor, start) = *self.size_drag.get_or_insert((pointer, self.radius));
+                let (anchor, start, hardness) =
+                    *self
+                        .size_drag
+                        .get_or_insert((pointer, self.radius, self.brush.hardness));
                 self.radius = (start * ((pointer.x - anchor.x) * 0.012).exp()).clamp(0.5, 512.0);
+                if self.tool != Tool::Liquify {
+                    self.brush.hardness = (hardness - (pointer.y - anchor.y) * 0.005).clamp(0., 1.);
+                }
                 self.points.clear();
                 self.stroke_pressures.clear();
                 self.stroke_has_pressure = false;
@@ -3064,7 +3073,15 @@ impl PeerBrush {
                 painter.text(
                     pointer + Vec2::new(16.0, 20.0),
                     egui::Align2::LEFT_TOP,
-                    format!("{} px", (self.radius * 2.0).round()),
+                    if self.tool == Tool::Liquify {
+                        format!("{} px", (self.radius * 2.0).round())
+                    } else {
+                        format!(
+                            "{} px · hardness {:.0}%",
+                            (self.radius * 2.0).round(),
+                            self.brush.hardness * 100.
+                        )
+                    },
                     egui::FontId::proportional(13.0),
                     Color32::WHITE,
                 );
@@ -3101,16 +3118,17 @@ impl PeerBrush {
             for scope in &lease.scopes {
                 if lease.owner == "human" {
                     if let Some(r) = scope.rect {
-                        let r = Rect::from_min_max(
-                            to_screen([r[0] as f32, r[1] as f32]),
-                            to_screen([r[2] as f32, r[3] as f32]),
-                        );
-                        painter.rect_stroke(
-                            r,
-                            3.0,
+                        let corners = [
+                            [r[0] as f32, r[1] as f32],
+                            [r[2] as f32, r[1] as f32],
+                            [r[2] as f32, r[3] as f32],
+                            [r[0] as f32, r[3] as f32],
+                        ]
+                        .map(to_screen);
+                        painter.add(egui::Shape::closed_line(
+                            corners.to_vec(),
                             Stroke::new(2.0_f32, ACCENT),
-                            egui::StrokeKind::Inside,
-                        );
+                        ));
                     }
                 }
             }
@@ -3125,7 +3143,7 @@ impl PeerBrush {
                 }
             }
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
-                if rect.contains(p)
+                if view.contains(p, rect, scale)
                     && ([
                         Tool::Brush,
                         Tool::Eraser,
@@ -3197,7 +3215,10 @@ impl PeerBrush {
                     ui.input(|i| i.pointer.primary_pressed())
                 };
                 if response.hovered() && pick {
-                    if let Some(p) = response.hover_pos().filter(|p| rect.contains(*p)) {
+                    if let Some(p) = response
+                        .hover_pos()
+                        .filter(|p| view.contains(*p, rect, scale))
+                    {
                         self.retouch_source = Some(retouch::Anchor {
                             project: doc.id.clone(),
                             layer: self.selected.clone(),
@@ -3238,7 +3259,7 @@ impl PeerBrush {
             if response.hovered() {
                 if let Some(pointer) = ui
                     .input(|i| i.pointer.hover_pos())
-                    .filter(|p| rect.contains(*p))
+                    .filter(|p| view.contains(*p, rect, scale))
                 {
                     // White over black remains legible over both light and dark pixels.
                     for width in [3.0_f32, 1.0] {
@@ -3301,18 +3322,28 @@ impl PeerBrush {
         if response.hovered() && ui.input(|i| i.pointer.primary_pressed()) && self.brush_tool() {
             if let Some(pos) = response
                 .interact_pointer_pos()
-                .filter(|p| rect.contains(*p))
+                .filter(|p| view.contains(*p, rect, scale))
             {
                 self.straight_click(doc, to_doc(pos), ui.input(|i| i.modifiers.shift));
             }
         }
         self.straight_modifier(ui.input(|i| i.modifiers.shift));
-        if response.drag_started() {
-            if let Some(pos) = ui
-                .input(|i| i.pointer.press_origin())
-                .or(response.interact_pointer_pos())
-            {
-                if rect.contains(pos) {
+        let precise_stroke = self.brush_tool() || self.tool == Tool::Liquify;
+        let tip_started = precise_stroke
+            && response.hovered()
+            && ui.input(|i| i.pointer.primary_pressed())
+            && !self.straight.line;
+        if tip_started
+            || response.drag_started_by(egui::PointerButton::Primary)
+                && (!precise_stroke || self.straight.line)
+        {
+            if let Some(pos) = if tip_started {
+                ui.input(|i| i.pointer.interact_pos())
+            } else {
+                ui.input(|i| i.pointer.press_origin())
+                    .or(response.interact_pointer_pos())
+            } {
+                if view.contains(pos, rect, scale) {
                     let point = to_doc(pos);
                     if !self.begin_retouch(doc, point) {
                         return;
@@ -3330,8 +3361,16 @@ impl PeerBrush {
                 }
             }
         }
-        if response.dragged() && self.drag_start.is_some() {
-            if let Some(pos) = response.interact_pointer_pos() {
+        if (if precise_stroke {
+            ui.input(|i| i.pointer.primary_down())
+        } else {
+            response.dragged_by(egui::PointerButton::Primary)
+        }) && self.drag_start.is_some()
+        {
+            if let Some(pos) = ui
+                .input(|i| i.pointer.interact_pos())
+                .or(response.interact_pointer_pos())
+            {
                 let p = to_doc(pos);
                 if self
                     .points
@@ -3385,7 +3424,13 @@ impl PeerBrush {
             }
         }
         let finished_line = self.straight.line && response.clicked();
-        if response.drag_stopped() || finished_line {
+        let finished_stroke = precise_stroke
+            && self.drag_start.is_some()
+            && ui.input(|i| i.pointer.primary_released());
+        if response.drag_stopped_by(egui::PointerButton::Primary)
+            || finished_line
+            || finished_stroke
+        {
             self.transient.clear();
             if let (Some(a), Some(b)) = (self.drag_start, self.points.last().copied()) {
                 let area = [
@@ -3395,7 +3440,7 @@ impl PeerBrush {
                     a[1].max(b[1]) as i32,
                 ];
                 match self.tool{
-            Tool::Brush|Tool::Eraser|Tool::Smudge|Tool::Clone|Tool::Heal=>{let c=if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color};self.paint_command(self.points.clone(),c,"Brush stroke");},
+            Tool::Brush|Tool::Eraser|Tool::Smudge|Tool::Clone|Tool::Heal=>{let c=if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color};self.paint_command(self.points.clone(),c,if self.points.len()==1 {"Brush dot"} else {"Brush stroke"});},
             Tool::Liquify=>{let command=self.liquify_command(&self.points);self.edit(vec![command],"Liquify stroke");},
             Tool::Move=>self.layer_cmd("move",json!({"dx":(b[0]-a[0]) as i32,"dy":(b[1]-a[1]) as i32}),"Move layer"),
             Tool::Rectangle|Tool::Ellipse=>self.layer_cmd("shape",json!({"kind":if self.tool==Tool::Ellipse{"ellipse"}else{"rectangle"},"rect":area,"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}),"Draw shape"),
@@ -3410,10 +3455,11 @@ impl PeerBrush {
             self.drag_start = None;
             self.drag_revision = None;
             self.straight.cancel();
+            self.live_gesture = None;
         }
-        if response.clicked() && !finished_line {
+        if response.clicked() && !finished_line && !finished_stroke {
             if let Some(pos) = response.interact_pointer_pos() {
-                if rect.contains(pos) {
+                if view.contains(pos, rect, scale) {
                     let p = to_doc(pos);
                     if !self.begin_retouch(doc, p) {
                         return;
@@ -3469,6 +3515,7 @@ impl PeerBrush {
                 collapsed: self.collapsed.clone(),
                 zoom: self.zoom,
                 pan: self.pan,
+                view: self.view,
                 message: self.message.clone(),
             },
         );
@@ -3505,6 +3552,7 @@ impl PeerBrush {
             self.collapsed = view.collapsed;
             self.zoom = view.zoom;
             self.pan = view.pan;
+            self.view = view.view;
             self.message = view.message;
         } else {
             self.selected = String::new();
@@ -3517,6 +3565,7 @@ impl PeerBrush {
             self.collapsed.clear();
             self.zoom = 1.;
             self.pan = Vec2::ZERO;
+            self.view = view::View::default();
             self.frame_pending = true;
             self.message = "Ready".into();
         }
@@ -3811,6 +3860,7 @@ impl PeerBrush {
     }
     fn draw(&mut self, ctx: &egui::Context) {
         self.sync_tool_profile(ctx);
+        self.temporary_pen_tool(ctx);
         self.lifecycle_frame = false;
         if let Some(warning) = self.workspace.lock().unwrap().open_warning.take() {
             self.open_file_warning = Some(warning);
@@ -3844,6 +3894,9 @@ impl PeerBrush {
                 None
             };
             self.show_brush = panel == "brush";
+            self.show_calibration = panel == "calibration";
+            self.show_view = panel == "view";
+            self.shortcuts.open = panel == "shortcuts";
             if panel == "solo_color" || panel == "solo_mask" {
                 self.mask = panel == "solo_mask";
                 let active = !self.mask
@@ -4189,6 +4242,7 @@ impl PeerBrush {
         }
         self.file_drop_feedback(ctx);
         let typing = self.lifecycle.is_some()
+            || self.shortcuts.open
             || self.filter_editor.is_some()
             || self.lifecycle_frame
             || self.rename_edit.is_some()
@@ -4298,56 +4352,14 @@ impl PeerBrush {
                     self.edit(vec![json!({"op":"selection.invert"})],"Invert selection");
                 }
                 if command_key(i,egui::Key::J) && self.layer_clipboard {self.duplicate_layers(&doc);}
-                for (key, tool) in [
-                    (egui::Key::B, Tool::Brush),
-                    (egui::Key::P, Tool::Pen),
-                    (egui::Key::U, Tool::Smudge),
-                    (egui::Key::C, Tool::Clone),
-                    (egui::Key::J, Tool::Heal),
-                    (egui::Key::L, Tool::Liquify),
-                    (egui::Key::D, Tool::Eraser),
-                    (egui::Key::Q, Tool::None),
-                    (egui::Key::W, Tool::Move),
-                    (egui::Key::E, Tool::Rotate),
-                    (egui::Key::R, Tool::Scale),
-                    (egui::Key::G, Tool::Fill),
-                    (egui::Key::I, Tool::Picker),
-                    (egui::Key::H, Tool::Pan),
-                    (egui::Key::M, Tool::Selection),
-                    (egui::Key::K, Tool::MagicWand),
-                ] {
-                    if !key_modifiers(i,key).command && !key_modifiers(i,key).ctrl && !key_modifiers(i,key).alt && (i.key_pressed(key)
-                        || i.events.iter().any(|e| matches!(e, egui::Event::Key { physical_key: Some(k), pressed: true, .. } if *k == key))) {
-                        if tool == Tool::None { self.deselect_area(&doc, true); } else { self.select_tool(tool); }
-                    }
-                }
-                if !i.modifiers.command && i.key_pressed(egui::Key::F) {
-                    self.frame_pending = true;
-                }
+                self.configured_shortcuts(i,&doc);
                 if i.key_pressed(egui::Key::Escape) {
                     let cancelled=self.straight.line || !self.points.is_empty();
                     self.straight.cancel();self.straight.cancelled=cancelled;self.drag_revision=None;
                     self.points.clear();self.stroke_pressures.clear();self.stroke_has_pressure=false;self.current_pressure=None;
                     self.drag_start = None;
                     self.gizmo_handle = 0;
-                }
-                if i.key_pressed(egui::Key::X) && !i.modifiers.command {
-                    self.swap_colors();
-                }
-                if !i.modifiers.command && [Tool::Brush, Tool::Eraser, Tool::Smudge, Tool::Clone, Tool::Heal, Tool::Liquify].contains(&self.tool) {
-                    let smaller = i.key_pressed(egui::Key::OpenBracket)
-                        || i.events
-                            .iter()
-                            .any(|e| matches!(e,egui::Event::Text(t) if t=="{"));
-                    let larger = i.key_pressed(egui::Key::CloseBracket)
-                        || i.events
-                            .iter()
-                            .any(|e| matches!(e,egui::Event::Text(t) if t=="}"));
-                    if smaller || larger {
-                        self.radius =
-                            (self.radius * if larger { 1.1 } else { 1.0 / 1.1 }).clamp(0.5, 512.0);
-                        self.message = format!("Brush size {} px", (self.radius * 2.0).round());
-                    }
+                    self.live_gesture = None;
                 }
                 if i.key_pressed(egui::Key::Escape) {
                     self.layer_drag = None;
@@ -4398,6 +4410,7 @@ impl PeerBrush {
                             ui.close_menu();
                         }
                     });
+                    ui.menu_button("View",|ui| self.canvas_view_menu(ui));
                     ui.menu_button("Image",|ui| {
                         if ui.add_enabled(!doc.read_only&&!self.busy,egui::Button::new("Whole-image filters…")).clicked(){self.open_filters(&doc);ui.close_menu();}
                         if !doc.filters.is_empty(){ui.menu_button("Filter stack",|ui|self.document_filter_stack(ui,&doc));}
@@ -4442,7 +4455,7 @@ impl PeerBrush {
                     ui.separator();
                     let (_, icon) = ui.allocate_space(Vec2::splat(24.0));
                     paint_tool(ui.painter(), icon, self.tool, ACCENT);
-                    ui.label(RichText::new(self.tool.label()).size(12.0));
+                    ui.label(RichText::new(self.tool_caption(self.tool)).size(12.0));
                     ui.add_space(6.0);
                     if self.mask {
                         ui.label(RichText::new("MASK").size(10.0).color(ACCENT));
@@ -4617,7 +4630,7 @@ impl PeerBrush {
                                         .selected(self.tool == tool)
                                         .frame(false),
                                 )
-                                .on_hover_text(tool.label());
+                                .on_hover_text(self.tool_caption(tool));
                             let active = ui.ctx().animate_bool_with_time(
                                 r.id.with("selected"),
                                 self.tool == tool,
@@ -4840,6 +4853,7 @@ impl PeerBrush {
                                 self.show_new = false;
                                 self.pan = Vec2::ZERO;
                                 self.zoom = 1.0;
+                                self.view = view::View::default();
                                 self.last_preview = None;
                             }
                             Err(e) => self.message = e,
@@ -4922,6 +4936,9 @@ impl PeerBrush {
         } else {
             self.load_preview = None;
         }
+        self.pressure_calibration(ctx);
+        self.canvas_view_window(ctx);
+        self.shortcuts_window(ctx);
         self.sync_tool_profile(ctx);
         if self.tool_preferences_ai(ctx.input(|i| i.time)) {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -4939,6 +4956,10 @@ impl eframe::App for PeerBrush {
         self.draw(ctx);
     }
     fn on_exit(&mut self) {
+        self.store_current_tool_profile();
+        if let Err(error) = self.tool_settings_store.lock().unwrap().flush() {
+            eprintln!("PeerBrush: tool settings not saved: {error}");
+        }
         server::checkpoint_projects(
             &self.workspace,
             &self.connection.state_dir,

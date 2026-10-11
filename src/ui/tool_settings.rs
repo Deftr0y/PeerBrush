@@ -111,6 +111,15 @@ impl PeerBrush {
     }
     pub(super) fn sync_tool_profile(&mut self, ctx: &egui::Context) {
         self.store_current_tool_profile();
+        if !ctx.input(|i| i.pointer.any_down())
+            && self.live_gesture.is_none()
+            && self.size_drag.is_none()
+            && !ctx.wants_keyboard_input()
+        {
+            if let Err(error) = self.tool_settings_store.lock().unwrap().flush() {
+                self.message = format!("Tool settings not saved · {error}");
+            }
+        }
         let human_input = ctx.input(|i| {
             i.pointer.any_pressed()
                 || i.events

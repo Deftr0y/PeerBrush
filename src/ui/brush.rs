@@ -183,7 +183,10 @@ impl PeerBrush {
                 let a = i as f32 * std::f32::consts::TAU / 48.0;
                 let x = a.cos() * self.radius * scale;
                 let y = a.sin() * self.radius * scale * self.brush.roundness;
-                center + Vec2::new(x * cos - y * sin, x * sin + y * cos)
+                center
+                    + self
+                        .view
+                        .vector(Vec2::new(x * cos - y * sin, x * sin + y * cos))
             })
             .collect();
         painter.add(egui::Shape::line(
@@ -317,7 +320,7 @@ impl PeerBrush {
             "hardness":b.hardness,"opacity":b.opacity,"flow":b.flow,"spacing":b.spacing,
             "roundness":b.roundness,"angle":b.angle,"smoothing":b.smoothing,
             "tip":b.tip.name(),"density":b.density,"grain":b.grain,"seed":b.seed,
-            "pressure_size":b.pressure_size,"pressure_opacity":b.pressure_opacity,"pressure_gamma":b.pressure_gamma,
+            "pressure_size":b.pressure_size,"pressure_opacity":b.pressure_opacity,"pressure_gamma":b.pressure_gamma,"pressure_min":b.pressure_min,"pressure_max":b.pressure_max,
             "taper_start":b.taper_start,"taper_end":b.taper_end,"taper_size":b.taper_size,"taper_opacity":b.taper_opacity,
             "wetness":b.wetness,"load":b.load,"pickup":b.pickup});
         if let Some(pressures) = pressures {
@@ -579,6 +582,9 @@ impl PeerBrush {
                 }
             });
         ui.horizontal(|ui| {ui.label(RichText::new("Pressure").small().color(MUTED));ui.checkbox(&mut self.brush.pressure_size,"Size").on_hover_text("Uses genuine device force when supplied, or explicit agent pressure. Mouse strokes use taper.");ui.checkbox(&mut self.brush.pressure_opacity,"Opacity");});
+        if ui.small_button("Calibrate pressure…").clicked() {
+            self.show_calibration = true;
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("Taper").small().color(MUTED));
             ui.checkbox(&mut self.brush.taper_size, "Size");
