@@ -909,3 +909,118 @@ fn unknown_malformed_or_duplicate_layer_versions_never_authorize_editing() {
         }
     }
 }
+
+#[test]
+fn supplementary_metadata_must_match_each_standard_layer_even_with_hidden_filter_sources() {
+    for depth in [8, 16] {
+        for filtered in [false, true] {
+            let mut original = fixture(depth);
+            original.layers[0].psd_metadata.push(LayerMetadata {
+                key: "lyvr".into(),
+                data: 160u32.to_be_bytes().to_vec(),
+            });
+            let mut second = original.layers[0].clone();
+            second.id = peerbrush::engine::id();
+            second.name = "Distinct metadata".into();
+            second.psd_metadata[1].data[1] = 7;
+            let mut folder = Layer::new("Metadata folder", "group", 2, 1);
+            if depth == 16 {
+                folder.pixels.promote16();
+            }
+            folder.psd_metadata = vec![LayerMetadata {
+                key: "lyvr".into(),
+                data: 80u32.to_be_bytes().to_vec(),
+            }];
+            original.layers[0].parent = Some(folder.id.clone());
+            second.parent = Some(folder.id.clone());
+            original.layers.insert(0, folder);
+            original.layers.push(second);
+            if filtered {
+                let mut e = Engine::new();
+                e.doc = original;
+                e.edit(
+                    "human",
+                    &[json!({"op":"filter.add","kind":"invert"})],
+                    None,
+                    None,
+                    "Filter retained metadata",
+                )
+                .unwrap();
+                original = e.doc;
+            }
+            let before = original.export_png().unwrap();
+            for encoded in [
+                psd::encode(&original).unwrap(),
+                psd::encode_psb(&original).unwrap(),
+            ] {
+                let good = psd::decode(&encoded).unwrap();
+                assert!(!good.read_only, "{:?}", good.warnings);
+                assert_eq!(good.export_png().unwrap(), before);
+                for (a, b) in good.layers.iter().zip(&original.layers) {
+                    assert_eq!(a.psd_metadata, b.psd_metadata);
+                    assert_eq!(a.pixels.rgba16(), b.pixels.rgba16());
+                }
+                for mode in 0..5 {
+                    let changed = rewrite_private_document(&encoded, |doc| match mode {
+                        0 => {
+                            doc["layers"][1]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("psd_metadata");
+                        }
+                        1 => {
+                            doc["layers"][1]["psd_metadata"][4]["data"] = json!([0, 0, 0, 70]);
+                        }
+                        2 => {
+                            let a = doc["layers"][1]["psd_metadata"].clone();
+                            doc["layers"][1]["psd_metadata"] =
+                                doc["layers"][2]["psd_metadata"].clone();
+                            doc["layers"][2]["psd_metadata"] = a;
+                        }
+                        3 => {
+                            doc["layers"][0]["psd_metadata"] = json!([]);
+                        }
+                        _ => {
+                            doc["layers"][1]["psd_metadata"]
+                                .as_array_mut()
+                                .unwrap()
+                                .remove(2);
+                        }
+                    });
+                    let protected = psd::decode(&changed).unwrap();
+                    assert!(protected.read_only, "case {mode}, filtered {filtered}");
+                    assert_eq!(protected.bit_depth, depth);
+                    assert_eq!(protected.export_png().unwrap(), before);
+                    assert!(protected
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("definitions were changed")));
+                    assert!(psd::encode(&protected).is_err());
+                    let mut e = Engine::new();
+                    e.doc = protected;
+                    assert!(e
+                        .edit(
+                            "human",
+                            &[json!({"op":"paint.fill","layer":e.doc.layers[0].id})],
+                            None,
+                            None,
+                            "Protected metadata"
+                        )
+                        .is_err());
+                    assert!(e.undo.is_empty());
+                    assert_eq!(e.doc.revision, 0);
+                }
+                // Metadata property ordering is not an appearance change.
+                let changed = rewrite_private_document(&encoded, |doc| {
+                    doc["layers"][1]["psd_metadata"]
+                        .as_array_mut()
+                        .unwrap()
+                        .reverse()
+                });
+                let good = psd::decode(&changed).unwrap();
+                assert!(!good.read_only);
+                assert_eq!(good.export_png().unwrap(), before);
+            }
+        }
+    }
+}

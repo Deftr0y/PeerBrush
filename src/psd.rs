@@ -1673,6 +1673,8 @@ fn decode_parts(
                     && e.standard_hash == hash(layer_section) ^ composite_hash
                     && e.document.psd_global_mask == global_mask_settings
                     && validate(&e.document).is_ok()
+                    && metadata_sources_match(layer_section, layout, &e.document, control)
+                        == Ok(true)
                 {
                     control.progress("Ready", 1, 1)?;
                     e.document.srgb_tagged |= srgb_tagged;
@@ -2364,6 +2366,88 @@ fn layer_info(section: &[u8], depth: u16, layout: Layout) -> Result<&[u8], Strin
         }
     }
     Ok(info)
+}
+// Supplementary editable definitions must retain the actual standard metadata,
+// including compatibility markers. The standard checksum alone does not bind
+// the private document's per-layer metadata to those bytes.
+fn metadata_sources_match(
+    section: &[u8],
+    layout: Layout,
+    doc: &Document,
+    control: &crate::loading::Control,
+) -> Result<bool, String> {
+    let plan = standard_plan(doc);
+    let mut expected = if !plan.composite || plan.hidden_sources {
+        standard_order(doc)
+            .into_iter()
+            .map(|(layer, section)| {
+                if section == 3 {
+                    vec![]
+                } else {
+                    layer.psd_metadata.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+    if plan.composite {
+        expected.insert(0, vec![]);
+    }
+    if expected.is_empty() {
+        expected.push(vec![]);
+    }
+    expected.reverse();
+    let info = layer_info(section, doc.bit_depth, layout)?;
+    let mut records = Cursor::new(info);
+    let count = usize::from(records.i16()?.unsigned_abs());
+    if count > 200 || count != expected.len() {
+        return Ok(false);
+    }
+    for expected in expected {
+        control.check()?;
+        records.bytes(16)?;
+        let channels = records.u16()?;
+        if channels > 8 {
+            return Ok(false);
+        }
+        for _ in 0..channels {
+            records.i16()?;
+            records.length(layout.large())?;
+        }
+        records.bytes(12)?;
+        let extra = records.block()?;
+        let mut tags = Cursor::new(extra);
+        tags.block()?;
+        tags.block()?;
+        let name = usize::from(tags.u8()?);
+        tags.bytes(name)?;
+        tags.bytes((name + 1).div_ceil(4) * 4 - name - 1)?;
+        let mut actual = vec![];
+        while tags.pos + 12 <= extra.len() {
+            let signature = tags.bytes(4)?;
+            let key = tags.bytes(4)?;
+            let payload = layout.tag_block(&mut tags, key)?;
+            tags.bytes(payload.len() % 2)?;
+            if matches!(key, b"fxrp" | b"lclr" | b"lnsr" | b"shmd" | b"lyvr") {
+                if signature != b"8BIM" || payload.len() > 128 {
+                    return Ok(false);
+                }
+                actual.push(LayerMetadata {
+                    key: std::str::from_utf8(key).unwrap().into(),
+                    data: payload.to_vec(),
+                });
+            }
+        }
+        if extra[tags.pos..].iter().any(|v| *v != 0)
+            || validate_metadata(&actual).is_err()
+            || actual.len() != expected.len()
+            || actual.iter().any(|m| !expected.contains(m))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 fn merged_transparency(section: &[u8], depth: u16, layout: Layout) -> Result<bool, String> {
     let (info, _, tags) = global_blocks(section, layout)?;
