@@ -180,6 +180,27 @@ class Packages(unittest.TestCase):
         self.assertEqual(initial.read_bytes(), original)
         self.assertFalse(list(self.output.glob('.peerbrush-package-*')))
 
+    def test_source_preflight_reports_omissions_without_building(self):
+        script = self.root / 'scripts/package.py'
+        script.write_bytes(pathlib.Path(packaging.__file__).read_bytes())
+        command = [sys.executable, str(script), '--check-source']
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Package source policy valid', result.stdout)
+        (self.root / 'tests').mkdir()
+        (self.root / 'tests/psb.rs').write_text('// synthetic codec regression')
+        self.commit()
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('tests/psb.rs', result.stderr)
+        self.policy['source'].append('tests/psb.rs')
+        self.save_policy()
+        self.commit()
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / 'dist').exists())
+        self.assertFalse((self.root / 'target').exists())
+
     def test_committed_missing_inputs_and_invalid_manifest_paths_are_rejected(self):
         tree = {name: None for name in self.policy['source']}
         for name in ['../escape', '/absolute', 'docs/../escape', 'docs\\escape', 'docs/CON.txt', 'docs/name.', 'docs/name ', 'docs/name:alternate', 'README.md', 'licenses/private.txt', 'PeerBrush.app/private.txt']:

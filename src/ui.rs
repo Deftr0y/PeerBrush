@@ -72,7 +72,7 @@ fn command_key(input: &egui::InputState, key: egui::Key) -> bool {
     let mods = key_modifiers(input, key);
     (mods.command || mods.ctrl) && input.key_pressed(key)
 }
-fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, _color: Color32) {
+fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, color: Color32) {
     use crate::icons::{self, Icon};
     let icon = match tool {
         Tool::None => Icon::Cursor,
@@ -95,7 +95,7 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, _color: Color32) 
         Tool::Pan => Icon::Pan,
         Tool::MagicWand => Icon::Wand,
     };
-    icons::paint(painter, rect, icon, true);
+    icons::paint_tinted(painter, rect, icon, color);
 }
 fn eye_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
     crate::icons::button(
@@ -400,6 +400,9 @@ pub struct PeerBrush {
     wordmark: TextureHandle,
     texture: Option<TextureHandle>,
     canvas_pixels: Option<(u32, u32, Vec<u8>)>,
+    canvas_generation: u64,
+    canvas_preview: Option<(String, u64, String, bool)>,
+    capture_ready_at: f64,
     canvas_selection: Option<CanvasSelection>,
     animation: animation::Animation,
     preview_rx: mpsc::Receiver<Preview>,
@@ -718,6 +721,9 @@ impl PeerBrush {
             wordmark,
             texture: None,
             canvas_pixels: None,
+            canvas_generation: 0,
+            canvas_preview: None,
+            capture_ready_at: 0.,
             canvas_selection: None,
             animation: animation::Animation::default(),
             preview_rx,
@@ -912,7 +918,15 @@ impl PeerBrush {
                         Vec2::splat(height.min(17.)),
                     ),
                     tool,
-                    MUTED,
+                    if !ui.is_enabled() {
+                        Color32::from_gray(100)
+                    } else if ai {
+                        AI_BLUE
+                    } else if active {
+                        ACCENT
+                    } else {
+                        Color32::from_rgb(245, 242, 240)
+                    },
                 );
                 ui.painter().text(
                     response.rect.right_center() - Vec2::new(3., 0.),
@@ -1807,6 +1821,7 @@ impl PeerBrush {
         String::new()
     }
     fn set_canvas(&mut self, ctx: &egui::Context, w: u32, h: u32, bytes: Vec<u8>) {
+        self.canvas_generation = self.canvas_generation.wrapping_add(1);
         let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &bytes);
         if let Some(t) = &mut self.texture {
             t.set(image, egui::TextureOptions::LINEAR);
@@ -1846,6 +1861,7 @@ impl PeerBrush {
                         egui::TextureOptions::LINEAR,
                     );
                     self.canvas_pixels = Some((w, h, bytes));
+                    self.canvas_generation = self.canvas_generation.wrapping_add(1);
                     return;
                 }
             }
@@ -1946,6 +1962,10 @@ impl PeerBrush {
                     }
                 }
                 if !p.bytes.is_empty() {
+                    if !p.coarse {
+                        self.canvas_preview =
+                            Some((p.doc_id.clone(), p.revision, p.target.clone(), p.mask));
+                    }
                     self.canvas_selection = Some(CanvasSelection {
                         document: p.doc_id.clone(),
                         revision: p.revision,
@@ -2054,11 +2074,18 @@ impl PeerBrush {
                 let id = doc.id.clone();
                 let revision = doc.revision;
                 let output = (|| {
+                    let mut dirty = dirty;
+                    // A replay delta belongs to these retained pixels. Keep
+                    // worker replay/render together across project switches.
+                    let mut cache = cache
+                        .lock()
+                        .map_err(|_| "Preview worker cache unavailable")?;
                     if !commands.is_empty() {
-                        doc = cache
-                            .lock()
-                            .map_err(|_| "Preview worker cache unavailable")?
-                            .edit(doc, &commands, &live)?;
+                        if dirty.is_some() && commands.len() == 1 && commands[0]["op"] == "paint" {
+                            (doc, dirty) = cache.edit_with_region(doc, &commands, &live)?;
+                        } else {
+                            doc = cache.edit(doc, &commands, &live)?;
+                        }
                     }
                     // A coarse shared-engine frame reaches the canvas before detailed sampling.
                     // Derived only: no source changes, history, or 16-bit conversion.
@@ -2088,10 +2115,8 @@ impl PeerBrush {
                             ctx.request_repaint();
                         }
                     }
-                    let mut rendered = cache
-                        .lock()
-                        .map_err(|_| "Preview worker cache unavailable")?
-                        .render(&doc, &live, dirty, edge, layer.as_deref(), mask)?;
+                    let mut rendered =
+                        cache.render(&doc, &live, dirty, edge, layer.as_deref(), mask)?;
                     if let Some((target, mode)) = &refinement {
                         if target.is_none() {
                             crate::selection::display::apply(
@@ -3859,6 +3884,7 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
         self.temporary_pen_tool(ctx);
         self.lifecycle_frame = false;
@@ -3885,6 +3911,10 @@ impl PeerBrush {
             .ok()
             .and_then(|mut e| e.capture_panel.take());
         if let Some(panel) = panel {
+            // A newly opened egui window fades in during presentation. Capture
+            // its settled controls without requiring a second client request.
+            self.capture_ready_at =
+                ctx.input(|i| i.time) + f64::from(ctx.style().animation_time).max(0.25) + 0.05;
             if panel == "saved_versions" {
                 self.recover_previous_save();
             }
@@ -3957,16 +3987,6 @@ impl PeerBrush {
                         let _ = server::atomic_write(path, &png);
                     }
                 }
-            }
-        }
-        if !self.pending {
-            if let Some(path) = self
-                .workspace_root
-                .try_lock()
-                .ok()
-                .and_then(|mut e| e.capture_ui.take())
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(path)));
             }
         }
         while let Ok(result) = self.connect_rx.try_recv() {
@@ -4454,7 +4474,7 @@ impl PeerBrush {
                     }
                     ui.separator();
                     let (_, icon) = ui.allocate_space(Vec2::splat(24.0));
-                    paint_tool(ui.painter(), icon, self.tool, ACCENT);
+                    paint_tool(ui.painter(), icon, self.tool, if ui.is_enabled() { ACCENT } else { Color32::from_gray(100) });
                     ui.label(RichText::new(self.tool_caption(self.tool)).size(12.0));
                     ui.add_space(6.0);
                     if self.mask {
@@ -4682,7 +4702,15 @@ impl PeerBrush {
                                 ui.painter(),
                                 r.rect,
                                 tool,
-                                if self.tool == tool { ACCENT } else { MUTED },
+                                if !ui.is_enabled() {
+                                    Color32::from_gray(100)
+                                } else if ai_active {
+                                    AI_BLUE
+                                } else if self.tool == tool {
+                                    ACCENT
+                                } else {
+                                    Color32::from_rgb(245, 242, 240)
+                                },
                             );
                             if r.clicked() {
                                 self.select_tool(tool);
@@ -4749,6 +4777,7 @@ impl PeerBrush {
             self.request_preview(ctx, &doc);
         }
         if self.lifecycle.is_some() || self.lifecycle_frame {
+            self.finish_capture(ctx, drawn_generation);
             return;
         }
         if self.liquify_effect.as_ref().is_some_and(|id| {
@@ -4939,6 +4968,7 @@ impl PeerBrush {
         self.pressure_calibration(ctx);
         self.canvas_view_window(ctx);
         self.shortcuts_window(ctx);
+        self.finish_capture(ctx, drawn_generation);
         self.sync_tool_profile(ctx);
         if self.tool_preferences_ai(ctx.input(|i| i.time)) {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -4947,6 +4977,30 @@ impl PeerBrush {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+    fn finish_capture(&mut self, ctx: &egui::Context, drawn_generation: u64) {
+        let time = ctx.input(|i| i.time);
+        let ready = !self.pending
+            && drawn_generation == self.canvas_generation
+            && time >= self.capture_ready_at
+            && !self.animation.fading()
+            && self.animation.progress(time) >= 1.
+            && self.canvas_preview.as_ref().is_some_and(|key| {
+                let doc = &self.shared.lock().unwrap().doc;
+                key.0 == doc.id && key.1 == doc.revision && self.last_preview.as_ref() == Some(key)
+            });
+        if let Ok(mut engine) = self.workspace_root.try_lock() {
+            if engine.capture_ui.is_some() {
+                if ready {
+                    let path = engine.capture_ui.take().unwrap();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                        path,
+                    )));
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                }
+            }
         }
     }
 }
@@ -4971,6 +5025,74 @@ impl eframe::App for PeerBrush {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_waits_for_current_painted_texture_target_and_settled_presentation() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            app.shared.lock().unwrap().doc.bit_depth = depth;
+            let doc = app.shared.lock().unwrap().doc.clone();
+            let key = (
+                doc.id.clone(),
+                doc.revision,
+                "current preview".into(),
+                false,
+            );
+            app.set_canvas(&ctx, 1, 1, vec![231, 84, 32, 255]);
+            app.canvas_preview = Some(key.clone());
+            app.last_preview = Some(key.clone());
+            let path =
+                std::env::temp_dir().join(format!("peerbrush-capture-{}.png", crate::engine::id()));
+            app.workspace_root.lock().unwrap().capture_ui = Some(path.clone());
+            let run = |app: &mut PeerBrush, time: f64, drawn: u64| {
+                let out = ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        ..Default::default()
+                    },
+                    |ctx| app.finish_capture(ctx, drawn),
+                );
+                out.viewport_output
+                    .values()
+                    .flat_map(|v| &v.commands)
+                    .any(|c| matches!(c, egui::ViewportCommand::Screenshot(_)))
+            };
+            let painted = app.canvas_generation;
+            app.capture_ready_at = 0.3;
+            assert!(!run(&mut app, 0.1, painted));
+            app.pending = true;
+            assert!(!run(&mut app, 0.4, painted));
+            app.pending = false;
+            app.set_canvas(&ctx, 1, 1, vec![20, 140, 240, 255]);
+            assert!(
+                !run(&mut app, 0.5, painted),
+                "upload after painting needs another frame"
+            );
+            let painted = app.canvas_generation;
+            app.shared.lock().unwrap().doc.revision += 1;
+            assert!(
+                !run(&mut app, 0.6, painted),
+                "new header must not capture old canvas"
+            );
+            let next = (doc.id.clone(), doc.revision + 1, "new target".into(), true);
+            app.last_preview = Some(next.clone());
+            assert!(
+                !run(&mut app, 0.7, painted),
+                "new isolation/target needs its own pixels"
+            );
+            app.canvas_preview = Some(next);
+            assert!(run(&mut app, 0.8, painted));
+            assert!(app.workspace_root.lock().unwrap().capture_ui.is_none());
+            assert!(
+                !run(&mut app, 0.9, painted),
+                "one queued capture must be consumed once"
+            );
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            assert!(
+                !path.exists(),
+                "synthetic screenshot request must not write a fake capture"
+            );
+        }
+    }
     #[test]
     fn released_or_expired_reservation_errors_clear_without_hiding_other_work() {
         for action in ["end", "expire", "takeover"] {

@@ -7,6 +7,107 @@ use peerbrush::{
 use serde_json::json;
 
 #[test]
+fn dab_regions_match_full_native_renders_for_masks_effects_and_changed_settings() {
+    for depth in [8, 16] {
+        for mask in [false, true] {
+            for dynamic in [false, true] {
+                let mut base = Document::new_depth(520, 96, depth).unwrap();
+                let target = base.layers[0].id.clone();
+                base.layers[0].x = -10;
+                base.layers[0].y = -10;
+                base.layers[0].pixels = Raster::new_depth(540, 116, depth);
+                base.layers[0]
+                    .pixels
+                    .set16(60, 55, [12347, 33559, 51237, 42199]);
+                base.layers[0].effects = vec![Effect {
+                    id: id(),
+                    kind: "blur".into(),
+                    enabled: true,
+                    weight: 0.8,
+                    settings: json!({"radius":2}),
+                }];
+                base.filters = vec![Effect {
+                    id: id(),
+                    kind: "posterize".into(),
+                    enabled: true,
+                    weight: 0.7,
+                    settings: json!({"levels":7}),
+                }];
+                base.layers[0].mask = Some(Mask {
+                    enabled: true,
+                    cache_key: id(),
+                    steps: vec![
+                        MaskStep {
+                            id: id(),
+                            kind: "fill".into(),
+                            enabled: true,
+                            weight: 1.,
+                            value: 181.,
+                            pixels: Raster::new_depth(540, 116, depth),
+                            settings: json!({}),
+                        },
+                        MaskStep {
+                            id: id(),
+                            kind: "paint".into(),
+                            enabled: true,
+                            weight: 1.,
+                            value: 255.,
+                            pixels: Raster::new_depth(540, 116, depth),
+                            settings: json!({}),
+                        },
+                    ],
+                });
+                let source = serde_json::to_value(&base).unwrap();
+                for (isolate, edge) in [(false, 257), (true, 611)] {
+                    let mut cache = Cache::default();
+                    let points = [
+                        [20., 45.],
+                        [140., 45.],
+                        [270., 45.],
+                        [400., 45.],
+                        [500., 45.],
+                    ];
+                    for (count, radius) in [(1, 6), (2, 6), (3, 6), (5, 6), (2, 6), (5, 2), (3, 2)]
+                    {
+                        let command = json!({"op":"paint","layer":target,"mask":mask,"points":&points[..count],"pressures":if dynamic {vec![0.4;count]}else{vec![1.;count]},"radius":radius,"color":[241,71,20,230],"taper_end":if dynamic {25}else{0},"smoothing":if dynamic {0.4}else{0.}});
+                        let expected =
+                            Engine::preview_edits(base.clone(), std::slice::from_ref(&command))
+                                .unwrap();
+                        let (actual, dirty) = cache
+                            .edit_with_region(base.clone(), &[command], "dab-region")
+                            .unwrap();
+                        if count == 1 || radius == 2 && count == 5 {
+                            assert!(dirty.is_none(), "new baseline/settings must render fully");
+                        }
+                        let rendered = cache
+                            .render(
+                                &actual,
+                                "dab-region",
+                                dirty,
+                                edge,
+                                isolate.then_some(target.as_str()),
+                                isolate && mask,
+                            )
+                            .unwrap();
+                        assert_eq!(rendered.bytes, expected.preview(None, edge, isolate.then_some(target.as_str()), isolate && mask).unwrap().2, "depth {depth}, mask {mask}, dynamic {dynamic}, isolate {isolate}, count {count}, radius {radius}");
+                    }
+                    assert_eq!(serde_json::to_value(&base).unwrap(), source);
+                    let mut locked = base.clone();
+                    locked.layers[0].locked = true;
+                    assert!(cache
+                        .edit_with_region(
+                            locked,
+                            &[json!({"op":"paint","layer":target,"points":[[4,4]],"radius":4})],
+                            "dab-region"
+                        )
+                        .is_err());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn dirty_stroke_cache_matches_full_render_for_fractional_scales_isolation_and_taper() {
     for (width, height, edge) in [(67, 43, 29), (63, 47, 128), (1024, 513, 384)] {
         let mut source = Document::new(width, height).unwrap();

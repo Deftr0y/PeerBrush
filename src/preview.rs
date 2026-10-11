@@ -86,6 +86,19 @@ impl Cache {
         commands: &[Value],
         gesture: &str,
     ) -> Result<Document, String> {
+        self.edit_with_region(base, commands, gesture)
+            .map(|(doc, _)| doc)
+    }
+    /// Replay and return the conservative document-space change since this
+    /// cache's preceding replay. Render this result before replaying again.
+    /// `None` requires a full render: baseline/settings changes and unsupported
+    /// commands cannot safely reuse the previously displayed stroke.
+    pub fn edit_with_region(
+        &mut self,
+        base: Document,
+        commands: &[Value],
+        gesture: &str,
+    ) -> Result<(Document, Option<[i32; 4]>), String> {
         if commands.len() != 1
             || commands[0]["op"] != "paint"
             || gesture.is_empty()
@@ -96,9 +109,23 @@ impl Cache {
             )
         {
             self.stroke = None;
-            return Engine::preview_edits(base, commands);
+            return Engine::preview_edits(base, commands).map(|doc| (doc, None));
         }
         let command = &commands[0];
+        let rendered_baseline = self.stroke.is_none()
+            && self
+                .key
+                .as_ref()
+                .is_some_and(|key| key.0 == gesture && key.1 == base.id && key.2 == base.revision)
+            && if base.bit_depth == 16 {
+                self.prepared16
+                    .as_ref()
+                    .is_some_and(|p| p.matches_baseline(&base))
+            } else {
+                self.prepared8
+                    .as_ref()
+                    .is_some_and(|p| p.matches_baseline(&base))
+            };
         let mut settings = crate::brush::Settings::from_command(command)?;
         let (mut points, pressures) = crate::brush::points_from_command(command)?;
         let mut metadata = command.clone();
@@ -120,7 +147,8 @@ impl Cache {
             metadata
         ]))
         .map_err(|e| e.to_string())?;
-        if self.stroke.as_ref().is_none_or(|stroke| stroke.key != key) {
+        let reset = self.stroke.as_ref().is_none_or(|stroke| stroke.key != key);
+        if reset {
             // Preparation follows the same Engine target, mask-step, lock and input rules.
             let mut preparation = command.clone();
             preparation["opacity"] = serde_json::json!(0.0);
@@ -193,6 +221,17 @@ impl Cache {
             .session
             .update(&points, pressures.as_deref())?
             .clone();
+        let dirty = (!reset || rendered_baseline)
+            .then(|| stroke.session.last_update_bounds())
+            .flatten()
+            .map(|b| {
+                [
+                    b[0].saturating_add(selected.x),
+                    b[1].saturating_add(selected.y),
+                    b[2].saturating_add(selected.x),
+                    b[3].saturating_add(selected.y),
+                ]
+            });
         let mut doc = stroke.prepared.clone();
         let layer = &mut doc.layers[stroke.layer];
         if let Some(index) = stroke.step {
@@ -206,7 +245,7 @@ impl Cache {
             crate::depth16::validate_budget(&doc)?;
         }
         crate::effects::invalidate(&mut doc, commands);
-        Ok(doc)
+        Ok((doc, dirty))
     }
     /// `dirty` is the complete document-space bounds of the replayed paint stroke.
     /// Use a new `key` when the baseline, isolation target or non-paint preview commands change.

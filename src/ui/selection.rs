@@ -1,15 +1,15 @@
 use super::*;
-const TOOLS: &[(&str, &str, usize)] = &[
-    ("rectangle", "Rectangular marquee", 12),
-    ("ellipse", "Elliptical marquee", 11),
-    ("row", "Single row", 21),
-    ("column", "Single column", 22),
-    ("lasso", "Freehand lasso", 16),
-    ("polygon", "Polygonal lasso", 17),
-    ("magnetic", "Magnetic lasso", 18),
-    ("wand", "Magic Wand", 19),
-    ("quick", "Quick Selection", 20),
-    ("object", "Object region", 23),
+const TOOLS: &[(&str, &str, Icon)] = &[
+    ("rectangle", "Rectangular marquee", Icon::Selection),
+    ("ellipse", "Elliptical marquee", Icon::EllipticalSelection),
+    ("row", "Single row", Icon::RowSelection),
+    ("column", "Single column", Icon::ColumnSelection),
+    ("lasso", "Freehand lasso", Icon::Lasso),
+    ("polygon", "Polygonal lasso", Icon::PolygonLasso),
+    ("magnetic", "Magnetic lasso", Icon::MagneticLasso),
+    ("wand", "Magic Wand", Icon::Wand),
+    ("quick", "Quick Selection", Icon::QuickSelection),
+    ("object", "Object region", Icon::ObjectSelection),
 ];
 impl PeerBrush {
     pub(super) fn deselect_area(&mut self, doc: &Document, tool: bool) {
@@ -57,11 +57,11 @@ impl PeerBrush {
                             .map_or("Marquee", |t| t.1),
                     )
                     .show_ui(ui, |ui| {
-                        for &(kind, label, cell) in TOOLS {
+                        for &(kind, label, icon) in TOOLS {
                             ui.horizontal(|ui| {
                                 let (r, _) =
                                     ui.allocate_exact_size(Vec2::splat(22.), egui::Sense::hover());
-                                icons::paint_generated(ui.painter(), r, cell, true);
+                                icons::paint(ui.painter(), r, icon, ui.is_enabled());
                                 if ui
                                     .selectable_value(&mut self.selection_kind, kind.into(), label)
                                     .changed()

@@ -130,6 +130,42 @@ fn main() {
                 expected.push(reference.2);
             }
             let mut cache = Cache::default();
+            // Compare both regional strategies in this same warmed process,
+            // avoiding clock/profile differences between separate builds.
+            let mut cumulative = Cache::default();
+            cumulative
+                .render(&doc, "stroke", None, 1536, None, false)
+                .unwrap();
+            let mut cumulative_replay = 0.;
+            let mut cumulative_render = 0.;
+            for (sample, count) in [16, 32, 64, 96, 128].into_iter().enumerate() {
+                let start = Instant::now();
+                let image = cumulative
+                    .edit(doc.clone(), &[command(count)], "stroke")
+                    .unwrap();
+                cumulative_replay += elapsed(start);
+                let start = Instant::now();
+                let result = cumulative
+                    .render(
+                        &image,
+                        "stroke",
+                        Some([
+                            54,
+                            edge as i32 / 2 - 190,
+                            (points[count - 1][0] + 67.) as i32,
+                            edge as i32 / 2 + 190,
+                        ]),
+                        1536,
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                cumulative_render += elapsed(start);
+                assert_eq!(
+                    result.bytes, expected[sample],
+                    "cumulative update {count} must match full rendering"
+                );
+            }
             cache
                 .render(&doc, "stroke", None, 1536, None, false)
                 .unwrap();
@@ -138,16 +174,10 @@ fn main() {
             let mut partial = 0;
             for (sample, count) in [16, 32, 64, 96, 128].into_iter().enumerate() {
                 let start = Instant::now();
-                let image = cache
-                    .edit(doc.clone(), &[command(count)], "stroke")
+                let (image, dirty) = cache
+                    .edit_with_region(doc.clone(), &[command(count)], "stroke")
                     .unwrap();
                 cached_replay += elapsed(start);
-                let dirty = Some([
-                    54,
-                    edge as i32 / 2 - 190,
-                    (points[count - 1][0] + 67.) as i32,
-                    edge as i32 / 2 + 190,
-                ]);
                 let start = Instant::now();
                 let result = cache
                     .render(&image, "stroke", dirty, 1536, None, false)
@@ -159,7 +189,7 @@ fn main() {
                 );
                 partial += usize::from(result.dirty.is_some());
             }
-            println!("{edge}² {depth}-bit {}: {} {reference:.2}ms / full render {compiled:.2}ms; five replay {full_replay:.2}ms +render {full_render:.2}ms; incremental replay {cached_replay:.2}ms +dirty render {cached_render:.2}ms ({partial}/5 partial)",if global {if heavy {"whole-image levels+blur+posterize"} else {"whole-image posterize"}} else if heavy{"levels+blur"}else{"effect-free 9 layers"},if global {"cached native document stage"} else if native{"serial native compositor"}else{"legacy compositor"});
+            println!("{edge}² {depth}-bit {}: {} {reference:.2}ms / full render {compiled:.2}ms; five replay {full_replay:.2}ms +render {full_render:.2}ms; cumulative replay {cumulative_replay:.2}ms +render {cumulative_render:.2}ms; incremental replay {cached_replay:.2}ms +dirty render {cached_render:.2}ms ({partial}/5 partial)",if global {if heavy {"whole-image levels+blur+posterize"} else {"whole-image posterize"}} else if heavy{"levels+blur"}else{"effect-free 9 layers"},if global {"cached native document stage"} else if native{"serial native compositor"}else{"legacy compositor"});
         }
     }
 }

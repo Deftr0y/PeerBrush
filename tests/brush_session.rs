@@ -4,6 +4,111 @@ use peerbrush::{
 };
 
 #[test]
+fn changed_bounds_cover_native_pixels_including_shortened_and_reshaped_tails() {
+    for depth in [8, 16] {
+        for erase in [false, true] {
+            for dynamic in [false, true] {
+                let mut source = Raster::new_depth(420, 72, depth);
+                for y in 0..72 {
+                    for x in 0..420 {
+                        source.set16(x, y, [12347, 23459, 34571, 45683]);
+                    }
+                }
+                let settings = Settings {
+                    radius: 6.,
+                    flow: 0.4,
+                    opacity: 0.7,
+                    tip: TipKind::Grain,
+                    smoothing: if dynamic { 0.4 } else { 0. },
+                    taper_end: if dynamic { 50. } else { 0. },
+                    ..Default::default()
+                };
+                let mut session =
+                    Session::new(&source, settings, [231, 90, 40, 220], erase, None, None).unwrap();
+                let points = [
+                    [20., 36.],
+                    [120., 36.],
+                    [220., 40.],
+                    [320., 40.],
+                    [395., 38.],
+                ];
+                let pressures = [0.2, 0.4, 0.8, 0.6, 1.];
+                let mut previous = source.clone();
+                for count in [1, 2, 3, 5, 2, 5] {
+                    let actual = session
+                        .update(&points[..count], dynamic.then_some(&pressures[..count]))
+                        .unwrap()
+                        .clone();
+                    let mut expected = source.clone();
+                    brush::paint_with_pressure(
+                        &mut expected,
+                        &points[..count],
+                        dynamic.then_some(&pressures[..count]),
+                        settings,
+                        [231, 90, 40, 220],
+                        erase,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(actual, expected);
+                    let bounds = session.last_update_bounds();
+                    for y in 0..72 {
+                        for x in 0..420 {
+                            if actual.get16(x, y) != previous.get16(x, y) {
+                                let b = bounds.expect("changed pixel without a dirty region");
+                                assert!(x >= b[0] && y >= b[1] && x < b[2] && y < b[3]);
+                            }
+                        }
+                    }
+                    let before_invalid = bounds;
+                    assert!(session.update(&points[..count], Some(&[])).is_err());
+                    assert_eq!(session.last_update_bounds(), before_invalid);
+                    previous = actual;
+                }
+                assert_eq!(
+                    source.get16(200, 30),
+                    if depth == 16 {
+                        [12347, 23459, 34571, 45683]
+                    } else {
+                        [12347, 23459, 34571, 45683]
+                            .map(|v| peerbrush::raster::project16(v) as u16 * 257)
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn appended_stroke_bounds_leave_earlier_coverage_out_of_the_redraw() {
+    let source = Raster::new(512, 64);
+    let mut session = Session::new(
+        &source,
+        Settings {
+            radius: 4.,
+            spacing: 0.25,
+            ..Default::default()
+        },
+        [255; 4],
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+    session.update(&[[10., 32.], [300., 32.]], None).unwrap();
+    session
+        .update(&[[10., 32.], [300., 32.], [400., 32.]], None)
+        .unwrap();
+    assert!(session.last_update_bounds().unwrap()[0] > 290);
+    session.update(&[[10., 32.]], None).unwrap();
+    assert!(
+        session.last_update_bounds().unwrap()[2] >= 400,
+        "removed tail must be restored"
+    );
+}
+
+#[test]
 fn incremental_sessions_are_exact_for_texture_pressure_erase_smoothing_and_taper() {
     let mut source = Raster::new(128, 64);
     for y in 0..64 {

@@ -227,7 +227,8 @@ def validate_policy(policy, tree):
     if vendored != set(policy['vendored']):
         raise ValueError('Vendored notice inventory changed; review the package manifest')
     if not actual <= selected:
-        raise ValueError('Compiler input inventory changed; review scripts/package-files.json')
+        missing = ', '.join(sorted(actual - selected))
+        raise ValueError('Compiler input inventory changed; review scripts/package-files.json: ' + missing)
     if any(n in tree and n not in selected for n in ['build.rs', '.cargo/config', '.cargo/config.toml']):
         raise ValueError('Unlisted build configuration; review the package manifest')
 
@@ -347,6 +348,7 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--check-source', action='store_true', help='Validate the committed source archive policy without building or packaging')
     parser.add_argument('--output', type=pathlib.Path)
     parser.add_argument('--registry', type=pathlib.Path)
     parser.add_argument('--binary', type=pathlib.Path)
@@ -357,6 +359,10 @@ def main():
     exe = 'peerbrush.exe' if platform == 'Windows' else 'peerbrush'
     cargo_home = pathlib.Path(os.environ.get('CARGO_HOME', str(pathlib.Path.home() / '.cargo')))
     try:
+        if args.check_source:
+            sources = source_files(root)
+            print(f'Package source policy valid: {len(sources)} files')
+            return
         package(root, args.binary or root / 'target' / 'release' / exe, (args.output or root / 'dist').resolve(), args.registry or cargo_home / 'registry' / 'src', platform, binary_source_commit=args.binary_source_commit)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         message = str(error) if isinstance(error, ValueError) else 'Input/output validation failed; check required files and permissions'

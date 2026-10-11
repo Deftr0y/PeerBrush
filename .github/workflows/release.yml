@@ -34,6 +34,8 @@ jobs:
       - name: Check exact release source
         shell: bash
         run: python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - name: Check committed package source
+        run: python scripts/package.py --check-source
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

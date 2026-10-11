@@ -81,6 +81,25 @@ Release measurements on the Windows NVIDIA RTX 3070 Ti Laptop system, with nine 
 
 Run `cargo run --release --example preview_performance` or add `-- --effects16` for native effects. Finer dirty-tile tracking remains queued. Progressive loading is described below.
 
+## Changed-dab regional previews (PB-108, unreleased)
+
+Growing brush previews now redraw conservative bounds of newly generated dabs. Smoothing, pressure, taper and shortened paths include old coverage when the tail changes. Settings/baseline changes and unsupported commands use a full render. Paint, erasure and mask pixels still come from the same native-depth brush session; cached replay/render stay together across worker project switches. Derived coverage and pixels remain outside history and PSD sources.
+
+Paired local measurements used an Intel Core i7-14650HX (16 cores / 24 threads), with an RTX 4070 Laptop installed. The example uses the CPU shared engine, without installing a GPU backend: nine layers, a folder, optional Levels/Blur, radius 64, 128 points and five successive updates at a 1536-pixel preview. Both strategies run in the same warmed process under the development profile (`opt-level=1`, dependencies at 2). Every result is asserted byte-identical to its full shared-engine reference. Totals include incremental paint replay and regional rendering; these are local observations, without a general speed guarantee.
+
+| Canvas / depth / scene | Cumulative stroke bounds | Changed-dab bounds | Total reduction |
+| --- | ---: | ---: | ---: |
+| 2048² / 8-bit / effect-free 9 layers | 105.8 ms | 102.6 ms | 3.1% |
+| 2048² / 8-bit / levels+blur | 385.2 ms | 267.7 ms | 30.5% |
+| 4096² / 8-bit / effect-free 9 layers | 83.1 ms | 78.2 ms | 5.9% |
+| 4096² / 8-bit / levels+blur | 352.4 ms | 250.5 ms | 28.9% |
+| 2048² / 16-bit / effect-free 9 layers | 108.5 ms | 106.3 ms | 2.0% |
+| 2048² / 16-bit / levels+blur | 412.2 ms | 290.2 ms | 29.6% |
+| 4096² / 16-bit / effect-free 9 layers | 85.2 ms | 80.2 ms | 5.8% |
+| 4096² / 16-bit / levels+blur | 574.3 ms | 342.8 ms | 40.3% |
+
+Run `cargo run --example preview_performance`, adding `-- --effects16` for native 16-bit scenes. Release-profile timings are a separate measurement. Current capture requests wait for the current document/target texture to be painted and new panels to finish fading in; one request produces a settled native workspace image. Native 8/16-bit input, source/history preservation and codec/protocol checks cover the changed paths. Physical tablet pen-to-display latency, eraser-end identity, driver buttons and navigation frame stalls remain pending. Broader transform/layer-operation profiling is still open.
+
 ## Whole-image regional performance (PB-061)
 
 Retained painting previews now include the whole-image filter stack. Conservative native windows include the complete cumulative Blur/Bloom halo; pointwise filters need no additional padding. Prepared layer/mask windows feed the same native document stage as full rendering. GPU decisions retain full-document thresholds. Changed filter settings, mask strength, source layout, isolation or profiles reset or bypass the cache. Standard PSD/PNG output still uses the complete authoritative native renderer, and all existing output/scratch limits remain enforced.

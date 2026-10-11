@@ -147,6 +147,9 @@ pub(super) struct Prepared8 {
     pub colors: Vec<Option<Arc<Image>>>,
 }
 impl Prepared8 {
+    pub fn matches_baseline(&self, doc: &Document) -> bool {
+        self.compatible(doc) && self.keys == keys(doc)
+    }
     pub fn new(doc: &Document) -> Result<Self, String> {
         crate::mask::validate_budget(&doc.layers)?;
         let masks = doc
@@ -258,6 +261,9 @@ pub(super) struct Prepared16 {
     pub colors: Vec<Option<Arc<Image16>>>,
 }
 impl Prepared16 {
+    pub fn matches_baseline(&self, doc: &Document) -> bool {
+        self.compatible(doc) && self.keys == keys(doc)
+    }
     pub fn new(doc: &Document) -> Result<Self, String> {
         crate::depth16::validate_budget(doc)?;
         let masks = crate::depth16::prepare_masks(doc)?;

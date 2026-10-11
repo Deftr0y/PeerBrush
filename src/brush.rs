@@ -877,6 +877,7 @@ pub struct Session {
     coverage: BTreeMap<(u32, u32), Vec<u8>>,
     coverage16: BTreeMap<(u32, u32), Vec<u16>>,
     last_update_dabs: usize,
+    last_update_bounds: Option<[i32; 4]>,
 }
 impl Session {
     pub fn new(
@@ -907,10 +908,16 @@ impl Session {
             coverage: BTreeMap::new(),
             coverage16: BTreeMap::new(),
             last_update_dabs: 0,
+            last_update_bounds: None,
         })
     }
     pub fn last_update_dabs(&self) -> usize {
         self.last_update_dabs
+    }
+    /// Conservative local bounds changed since the previous successful update,
+    /// including removed/recomputed tails. Invalid input leaves these unchanged.
+    pub fn last_update_bounds(&self) -> Option<[i32; 4]> {
+        self.last_update_bounds
     }
     pub fn update(
         &mut self,
@@ -923,7 +930,8 @@ impl Session {
         if visible {
             work_budget(&next, self.clip)?;
         }
-        let prefix = if next.starts_with(&self.dabs) {
+        let append = next.starts_with(&self.dabs);
+        let prefix = if append {
             self.dabs.len()
         } else {
             self.coverage.clear();
@@ -932,6 +940,31 @@ impl Session {
             0
         };
         self.last_update_dabs = next.len() - prefix;
+        self.last_update_bounds = if visible {
+            next[prefix..]
+                .iter()
+                .chain(self.dabs.iter().filter(|_| !append))
+                .map(|&dab| {
+                    let b = dab_bounds(dab);
+                    [
+                        b[0].max(self.clip[0]),
+                        b[1].max(self.clip[1]),
+                        b[2].min(self.clip[2]),
+                        b[3].min(self.clip[3]),
+                    ]
+                })
+                .filter(|b| b[0] < b[2] && b[1] < b[3])
+                .reduce(|a, b| {
+                    [
+                        a[0].min(b[0]),
+                        a[1].min(b[1]),
+                        a[2].max(b[2]),
+                        a[3].max(b[3]),
+                    ]
+                })
+        } else {
+            None
+        };
         if visible && self.baseline.depth == 16 {
             let touched = accumulate16(
                 &mut self.coverage16,

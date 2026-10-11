@@ -39,6 +39,14 @@ pub enum Icon {
     Connect,
     Swap,
     Wand,
+    Lasso,
+    PolygonLasso,
+    MagneticLasso,
+    QuickSelection,
+    RowSelection,
+    ColumnSelection,
+    ObjectSelection,
+    EllipticalSelection,
     Levels,
     Curves,
     Blur,
@@ -48,28 +56,59 @@ pub enum Icon {
     Invert,
     Grayscale,
 }
-pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
-    let cell = match icon {
+fn tool_cell(icon: Icon) -> Option<usize> {
+    match icon {
         Icon::Cursor => Some(0),
         Icon::Move => Some(1),
         Icon::Rotate => Some(2),
         Icon::Scale => Some(3),
         Icon::Brush => Some(4),
         Icon::Smudge => Some(5),
-        Icon::Liquify => Some(6),
-        Icon::Eraser => Some(7),
-        Icon::Fill => Some(8),
-        Icon::Gradient => Some(9),
-        Icon::Rectangle => Some(10),
-        Icon::Ellipse => Some(11),
-        Icon::Selection => Some(12),
-        Icon::Picker => Some(13),
-        Icon::Pan => Some(14),
-        Icon::Wand => Some(15),
+        Icon::Clone => Some(6),
+        Icon::Heal => Some(7),
+        Icon::Liquify => Some(8),
+        Icon::Eraser => Some(9),
+        Icon::Fill => Some(10),
+        Icon::Gradient => Some(11),
+        Icon::Rectangle => Some(12),
+        Icon::Ellipse => Some(13),
+        Icon::Selection => Some(14),
+        Icon::Picker => Some(15),
+        Icon::Pan => Some(16),
+        Icon::Wand => Some(17),
         _ => None,
-    };
-    if let Some(cell) = cell {
-        paint_generated(painter, rect, cell, enabled);
+    }
+}
+fn selection_cell(icon: Icon) -> Option<usize> {
+    match icon {
+        Icon::Lasso => Some(0),
+        Icon::PolygonLasso => Some(1),
+        Icon::MagneticLasso => Some(2),
+        Icon::QuickSelection => Some(3),
+        Icon::RowSelection => Some(4),
+        Icon::ColumnSelection => Some(5),
+        Icon::ObjectSelection => Some(6),
+        Icon::EllipticalSelection => Some(7),
+        _ => None,
+    }
+}
+pub fn paint_tinted(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
+    if let Some(cell) = tool_cell(icon) {
+        paint_atlas(painter, rect, cell, false, color);
+    } else if let Some(cell) = selection_cell(icon) {
+        paint_atlas(painter, rect, cell, true, color);
+    } else {
+        paint(painter, rect, icon, true);
+    }
+}
+pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
+    if tool_cell(icon).is_some() || selection_cell(icon).is_some() {
+        paint_tinted(
+            painter,
+            rect,
+            icon,
+            Color32::WHITE.gamma_multiply(if enabled { 1.0 } else { 0.35 }),
+        );
         return;
     }
     let f = rect.width().min(rect.height()) / 32.0;
@@ -452,42 +491,73 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
             line(&[(-2., -6.), (-5., -9.)]);
             line(&[(10., -10.), (13., -13.)]);
         }
+        Icon::Lasso
+        | Icon::PolygonLasso
+        | Icon::MagneticLasso
+        | Icon::QuickSelection
+        | Icon::RowSelection
+        | Icon::ColumnSelection
+        | Icon::ObjectSelection
+        | Icon::EllipticalSelection => unreachable!("Selection glyphs use the bundled atlas"),
     }
 }
-pub fn paint_generated(painter: &egui::Painter, rect: Rect, cell: usize, enabled: bool) {
-    let id = egui::Id::new("generated tool atlas");
+fn atlas_image(bytes: &[u8]) -> egui::ColorImage {
+    let mut img = image::load_from_memory(bytes)
+        .expect("Bundled icon atlas")
+        .to_rgba8();
+    // ImageGen's white-on-black source is a glyph coverage map, not canvas artwork.
+    // Decode to white plus alpha once; state tinting never changes the source asset.
+    for pixel in img.pixels_mut() {
+        let coverage = pixel[0].min(pixel[1]).min(pixel[2]);
+        let alpha = ((coverage.saturating_sub(8) as u16 * 255 + 123) / 247) as u8;
+        *pixel = image::Rgba([255, 255, 255, alpha]);
+    }
+    egui::ColorImage::from_rgba_unmultiplied(
+        [img.width() as usize, img.height() as usize],
+        img.as_raw(),
+    )
+}
+fn paint_atlas(painter: &egui::Painter, rect: Rect, cell: usize, selection: bool, color: Color32) {
+    let (name, bytes, columns, rows) = if selection {
+        (
+            "PeerBrush bold selections",
+            include_bytes!("../assets/selection-icons.png").as_slice(),
+            4.0,
+            2.0,
+        )
+    } else {
+        (
+            "PeerBrush bold tools",
+            include_bytes!("../assets/tool-icons.png").as_slice(),
+            6.0,
+            3.0,
+        )
+    };
+    let id = egui::Id::new(name);
     let texture = if let Some(t) = painter
         .ctx()
         .data(|d| d.get_temp::<egui::TextureHandle>(id))
     {
         t
     } else {
-        let img = image::load_from_memory(include_bytes!("../assets/tool-icons.png"))
-            .unwrap()
-            .to_rgba8();
-        let t = painter.ctx().load_texture(
-            "PeerBrush tools",
-            egui::ColorImage::from_rgba_unmultiplied(
-                [img.width() as usize, img.height() as usize],
-                img.as_raw(),
-            ),
-            egui::TextureOptions::LINEAR,
-        );
+        let t = painter
+            .ctx()
+            .load_texture(name, atlas_image(bytes), egui::TextureOptions::LINEAR);
         painter.ctx().data_mut(|d| d.insert_temp(id, t.clone()));
         t
     };
-    let col = (cell % 6) as f32;
-    let row = (cell / 6) as f32;
-    // Discard only the generous transparent cell padding, preserving the actual generated art.
+    let col = (cell % columns as usize) as f32;
+    let row = (cell / columns as usize) as f32;
+    // Keep equal square cells and original padding: wide buttons must not stretch glyphs.
     let uv = Rect::from_min_max(
-        egui::pos2((col + 0.08) / 6.0, (row + 0.08) / 4.0),
-        egui::pos2((col + 0.92) / 6.0, (row + 0.92) / 4.0),
+        egui::pos2(col / columns, row / rows),
+        egui::pos2((col + 1.0) / columns, (row + 1.0) / rows),
     );
     painter.image(
         texture.id(),
-        rect,
+        Rect::from_center_size(rect.center(), Vec2::splat(rect.width().min(rect.height()))),
         uv,
-        Color32::WHITE.gamma_multiply(if enabled { 1.0 } else { 0.35 }),
+        color,
     );
 }
 pub fn button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
@@ -509,4 +579,91 @@ fn button_size(ui: &mut egui::Ui, icon: Icon, tip: &str, size: [f32; 2]) -> egui
     }
     paint(ui.painter(), r.rect.shrink(2.), icon, ui.is_enabled());
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atlas_coverage_has_clear_background_and_filled_glyphs_in_every_cell() {
+        for (bytes, columns, rows) in [
+            (include_bytes!("../assets/tool-icons.png").as_slice(), 6, 3),
+            (
+                include_bytes!("../assets/selection-icons.png").as_slice(),
+                4,
+                2,
+            ),
+        ] {
+            let image = atlas_image(bytes);
+            let [width, height] = image.size;
+            assert_eq!(width * rows, height * columns, "Square atlas cells");
+            for row in 0..rows {
+                for column in 0..columns {
+                    let mut filled = 0;
+                    let mut clear = 0;
+                    for y in row * height / rows..(row + 1) * height / rows {
+                        for x in column * width / columns..(column + 1) * width / columns {
+                            let alpha = image.pixels[y * width + x].a();
+                            filled += usize::from(alpha > 240);
+                            clear += usize::from(alpha == 0);
+                        }
+                    }
+                    let area = width * height / (columns * rows);
+                    assert!(
+                        filled > area / 30,
+                        "Missing or faint glyph at {column}, {row}"
+                    );
+                    assert!(
+                        clear > area / 2,
+                        "Background must disappear at {column}, {row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn state_tint_preserves_square_glyphs_and_reuses_the_neutral_texture() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(egui::pos2(10., 10.), Vec2::new(42., 39.));
+        let mut texture = None;
+        for (index, color) in [
+            Color32::WHITE,
+            Color32::from_rgb(233, 84, 32),
+            Color32::from_rgb(90, 170, 255),
+            Color32::from_gray(100),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ctx.begin_pass(Default::default());
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            paint_tinted(&painter, rect, Icon::Heal, color);
+            let output = ctx.end_pass();
+            let egui::Shape::Mesh(mesh) = &output.shapes[0].shape else {
+                panic!("Raster glyph mesh");
+            };
+            assert!(mesh.vertices.iter().all(|v| v.color == color));
+            assert_eq!(mesh.calc_bounds().size(), Vec2::splat(39.));
+            if let Some(id) = texture {
+                assert_eq!(mesh.texture_id, id);
+                assert!(
+                    output.textures_delta.set.is_empty(),
+                    "Tint must not rebuild artwork"
+                );
+            } else {
+                texture = Some(mesh.texture_id);
+                assert!(!output.textures_delta.set.is_empty());
+            }
+            assert_eq!(
+                index == 0,
+                output
+                    .textures_delta
+                    .set
+                    .iter()
+                    .any(|(id, _)| Some(*id) == texture)
+            );
+        }
+    }
 }

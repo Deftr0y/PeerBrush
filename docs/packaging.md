@@ -13,11 +13,14 @@ Manifest paths must be portable relative names with no traversal, duplicate/case
 Use Python 3.11 or newer and stable Rust. From a clean committed checkout:
 
 ```sh
+python scripts/package.py --check-source
 cargo test --locked
 python -B scripts/test_package.py
 python scripts/build_release.py
 python scripts/package.py
 ```
+
+CI and release candidates check the committed source policy before compiling. The check reports unlisted compiler inputs without creating archives or requiring a built executable. Review new application files into `scripts/package-files.json` in the same commit that adds them.
 
 `--binary`, `--registry` and `--output` select the native executable, build's Cargo registry and output directory. Packaging rejects tracked modifications. There is no dirty-source release override. Extracted source builds do not need repository metadata; packaging a new release requires committing the reviewed inputs first.
 
