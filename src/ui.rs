@@ -347,6 +347,7 @@ pub struct PeerBrush {
     selection_width: f32,
     selection_path: Vec<[f32; 2]>,
     selection_gesture_mode: Option<String>,
+    selection_shortcut_keys: HashSet<egui::Key>,
     project_settings: Option<(u32, u32, u16)>,
     geometry: Option<geometry::Editor>,
     source_editor: Option<source::Editor>,
@@ -677,6 +678,7 @@ impl PeerBrush {
             selection_width: 12.,
             selection_path: vec![],
             selection_gesture_mode: None,
+            selection_shortcut_keys: HashSet::new(),
             project_settings: None,
             geometry: None,
             source_editor: None,
@@ -3964,7 +3966,7 @@ impl PeerBrush {
     // Commands before selection completion must not act on old coverage. Require
     // an explicit retry; never retain delayed destructive/clipboard work.
     fn hold_canvas_selection_shortcuts(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         doc: &Document,
     ) -> Option<Vec<egui::Event>> {
@@ -4048,10 +4050,22 @@ impl PeerBrush {
                         && matches!(event,
                         egui::Event::Key { key: egui::Key::Delete, pressed: true, modifiers, .. }
                             if !modifiers.any());
-                    !(*index >= start
+                    let held = *index >= start
                         && *index < end
                         && !remove_anchor
-                        && self.shortcuts.selection_dependent_event(event))
+                        && self.shortcuts.selection_dependent_event(event);
+                    if held {
+                        if let egui::Event::Key {
+                            key, physical_key, ..
+                        } = event
+                        {
+                            self.selection_shortcut_keys.insert(*key);
+                            if let Some(key) = physical_key {
+                                self.selection_shortcut_keys.insert(*key);
+                            }
+                        }
+                    }
+                    !held
                 })
                 .map(|(_, event)| event.clone())
                 .collect();
@@ -4168,6 +4182,41 @@ impl PeerBrush {
                 .memory(|m| m.focused())
                 .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
         if !typing {
+            // A held key may keep producing OS repeats after selection
+            // completion. Those are not an explicit retry. Track both logical
+            // and physical identities; a release or new non-repeat press ends
+            // the hold. This presentation input state never enters history.
+            let held_repeats = if self.selection_shortcut_keys.is_empty() {
+                None
+            } else {
+                ctx.input_mut(|input| {
+                    let original = input.events.clone();
+                    input.events.retain(|event| {
+                        if let egui::Event::Key {
+                            key,
+                            physical_key,
+                            pressed,
+                            repeat,
+                            ..
+                        } = event
+                        {
+                            if !pressed || !repeat {
+                                self.selection_shortcut_keys.remove(key);
+                                if let Some(key) = physical_key {
+                                    self.selection_shortcut_keys.remove(key);
+                                }
+                                return true;
+                            }
+                            return !self.selection_shortcut_keys.contains(key)
+                                && !physical_key.is_some_and(|key| {
+                                    self.selection_shortcut_keys.contains(&key)
+                                });
+                        }
+                        true
+                    });
+                    (input.events.len() != original.len()).then_some(original)
+                })
+            };
             let (copy, cut, paste, merged) = ctx.input(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy))
@@ -4284,6 +4333,9 @@ impl PeerBrush {
                     self.eye_sweep = None;
                 }
             });
+            if let Some(original) = held_repeats {
+                ctx.input_mut(|input| input.events = original);
+            }
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
@@ -11529,6 +11581,118 @@ mod tests {
                         engine.doc.export_png().unwrap(),
                         before.export_png().unwrap()
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn held_selection_shortcut_repeats_cannot_run_after_completion_without_key_release() {
+        for depth in [8, 16] {
+            for kind in ["wand", "polygon"] {
+                for action in ["move", "fill", "duplicate"] {
+                    let (mut app, ctx, point, _) = pressed_selection_fixture(
+                        depth,
+                        if kind == "wand" {
+                            Tool::MagicWand
+                        } else {
+                            Tool::Selection
+                        },
+                        kind,
+                    );
+                    if kind == "polygon" {
+                        frame(
+                            &mut app,
+                            &ctx,
+                            vec![primary_release(point)],
+                            Default::default(),
+                        );
+                        app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
+                    }
+                    let modifiers = match action {
+                        "fill" => egui::Modifiers {
+                            alt: true,
+                            ..Default::default()
+                        },
+                        "duplicate" => egui::Modifiers {
+                            ctrl: true,
+                            command: true,
+                            ..Default::default()
+                        },
+                        _ => Default::default(),
+                    };
+                    let key = match action {
+                        "fill" => egui::Key::B,
+                        "duplicate" => egui::Key::D,
+                        // Exercise different logical/physical identities.
+                        _ => egui::Key::Z,
+                    };
+                    let event = |pressed, repeat| egui::Event::Key {
+                        key,
+                        physical_key: Some(if action == "move" { egui::Key::W } else { key }),
+                        pressed,
+                        repeat,
+                        modifiers,
+                    };
+                    let mut events = vec![event(true, false)];
+                    if kind == "polygon" {
+                        events.insert(0, egui::Event::PointerMoved(Pos2::new(1., 1.)));
+                    }
+                    frame(&mut app, &ctx, events, modifiers);
+                    assert!(app.shared.lock().unwrap().undo.is_empty());
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![if kind == "polygon" {
+                            shortcut_press(egui::Key::Enter)
+                        } else {
+                            primary_release(point)
+                        }],
+                        Default::default(),
+                    );
+                    let selected = app.shared.lock().unwrap().doc.clone();
+                    assert_eq!(selected.selection, Some([4, 5, 12, 13]));
+                    assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+                    frame(&mut app, &ctx, vec![event(true, true)], modifiers);
+                    assert!(
+                        matches!(app.tool, Tool::Selection | Tool::MagicWand),
+                        "{depth} {kind} {action}"
+                    );
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&engine.doc).unwrap(),
+                            serde_json::to_value(&selected).unwrap(),
+                            "{depth} {kind} {action}"
+                        );
+                        assert_eq!(engine.undo.len(), 1);
+                    }
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![event(false, false)],
+                        Default::default(),
+                    );
+                    frame(&mut app, &ctx, vec![event(true, false)], modifiers);
+                    if action == "move" {
+                        assert!(app.tool == Tool::Move);
+                        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+                    } else {
+                        let mut engine = app.shared.lock().unwrap();
+                        assert_eq!(engine.undo.len(), 2);
+                        if action == "duplicate" {
+                            assert_eq!(engine.doc.layers.len(), 2);
+                        }
+                        engine.undo("human").unwrap();
+                        assert_eq!(
+                            engine.doc.layers[0].pixels.rgba16(),
+                            selected.layers[0].pixels.rgba16()
+                        );
+                        assert_eq!(
+                            engine.doc.export_png().unwrap(),
+                            selected.export_png().unwrap()
+                        );
+                    }
                 }
             }
         }

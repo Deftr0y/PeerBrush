@@ -734,7 +734,7 @@ impl State {
             state,
 
             location: _, // e.g. is it on the numpad?
-            repeat: _,   // egui will figure this out for us
+            repeat,
             ..
         } = event;
 
@@ -762,18 +762,17 @@ impl State {
         // are mapped to the physical keys that normally contain C, X, V, etc.
         // See also: https://github.com/emilk/egui/issues/3653
         if let Some(active_key) = logical_key.or(physical_key) {
-            if pressed {
-                if is_cut_command(self.egui_input.modifiers, active_key) {
-                    self.egui_input.events.push(egui::Event::Cut);
-                    return;
-                } else if is_copy_command(self.egui_input.modifiers, active_key) {
-                    self.egui_input.events.push(egui::Event::Copy);
-                    return;
-                } else if is_paste_command(self.egui_input.modifiers, active_key) {
-                    // PeerBrush also pastes images. Emit a request even when there is no text.
-                    // TextEdit ignores the empty string; the canvas reads OS image pixels.
-                    let contents = self.clipboard.get().unwrap_or_default().replace("\r\n", "\n");
-                    self.egui_input.events.push(egui::Event::Paste(contents));
+            match clipboard_input(
+                self.egui_input.modifiers,
+                active_key,
+                pressed,
+                *repeat,
+                || self.clipboard.get(),
+            ) {
+                ClipboardInput::Other => {}
+                ClipboardInput::Suppressed => return,
+                ClipboardInput::Event(event) => {
+                    self.egui_input.events.push(event);
                     return;
                 }
             }
@@ -1039,10 +1038,146 @@ fn is_printable_char(chr: char) -> bool {
     !is_in_private_use_area && !chr.is_ascii_control()
 }
 
+enum ClipboardInput {
+    Other,
+    Suppressed,
+    Event(egui::Event),
+}
+
+// Clipboard events carry no key/repeat identity in egui. Suppress native
+// repeats before converting them, so a held shortcut cannot become delayed
+// work after a selection completes. Releases still reach the key tracker.
+fn clipboard_input(
+    modifiers: egui::Modifiers,
+    keycode: egui::Key,
+    pressed: bool,
+    repeat: bool,
+    mut text: impl FnMut() -> Option<String>,
+) -> ClipboardInput {
+    if !pressed {
+        return ClipboardInput::Other;
+    }
+    let cut = is_cut_command(modifiers, keycode);
+    let copy = is_copy_command(modifiers, keycode);
+    let paste = is_paste_command(modifiers, keycode);
+    if !(cut || copy || paste) {
+        return ClipboardInput::Other;
+    }
+    if repeat {
+        return ClipboardInput::Suppressed;
+    }
+    ClipboardInput::Event(if cut {
+        egui::Event::Cut
+    } else if copy {
+        egui::Event::Copy
+    } else {
+        // Keep image-only paste requests; TextEdit ignores the empty string.
+        egui::Event::Paste(text().unwrap_or_default().replace("\r\n", "\n"))
+    })
+}
+
 fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
     keycode == egui::Key::Cut
         || (modifiers.command && keycode == egui::Key::X)
         || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Delete)
+}
+
+#[cfg(test)]
+mod peerbrush_clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn native_clipboard_repeats_produce_no_event_and_never_read_clipboard_text() {
+        let command = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        let mut shortcuts = vec![
+            (command, egui::Key::C),
+            (command, egui::Key::X),
+            (command, egui::Key::V),
+            (Default::default(), egui::Key::Copy),
+            (Default::default(), egui::Key::Cut),
+            (Default::default(), egui::Key::Paste),
+        ];
+        if cfg!(target_os = "windows") {
+            shortcuts.extend([
+                (
+                    egui::Modifiers {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    egui::Key::Insert,
+                ),
+                (
+                    egui::Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                    egui::Key::Insert,
+                ),
+                (
+                    egui::Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                    egui::Key::Delete,
+                ),
+            ]);
+        }
+        for (modifiers, key) in shortcuts {
+            let mut reads = 0;
+            assert!(
+                matches!(
+                    clipboard_input(modifiers, key, true, true, || {
+                        reads += 1;
+                        Some("Synthetic text".into())
+                    }),
+                    ClipboardInput::Suppressed
+                ),
+                "{key:?}"
+            );
+            assert_eq!(reads, 0);
+            assert!(matches!(
+                clipboard_input(modifiers, key, false, false, || panic!("release read")),
+                ClipboardInput::Other
+            ));
+        }
+    }
+
+    #[test]
+    fn fresh_clipboard_presses_keep_copy_cut_text_and_image_only_paste() {
+        let command = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            clipboard_input(command, egui::Key::C, true, false, || panic!("copy read")),
+            ClipboardInput::Event(egui::Event::Copy)
+        ));
+        assert!(matches!(
+            clipboard_input(command, egui::Key::X, true, false, || panic!("cut read")),
+            ClipboardInput::Event(egui::Event::Cut)
+        ));
+        let mut reads = 0;
+        for source in [None, Some("Line one\r\nLine two".to_string())] {
+            let expected = source.as_deref().unwrap_or_default().replace("\r\n", "\n");
+            match clipboard_input(command, egui::Key::V, true, false, || {
+                reads += 1;
+                source.clone()
+            }) {
+                ClipboardInput::Event(egui::Event::Paste(text)) => assert_eq!(text, expected),
+                _ => panic!("fresh paste was lost"),
+            }
+        }
+        assert_eq!(reads, 2);
+        assert!(matches!(
+            clipboard_input(command, egui::Key::B, true, true, || panic!(
+                "ordinary key read"
+            )),
+            ClipboardInput::Other
+        ));
+    }
 }
 
 fn is_copy_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
