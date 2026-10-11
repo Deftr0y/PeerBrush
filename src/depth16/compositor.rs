@@ -193,7 +193,7 @@ impl<'a> Plan16<'a> {
             }
             let layer = &doc.layers[index];
             let bounds = if let Some(image) = &colors[index] {
-                let [x, y] = if matches!(kinds[index], Kind::Adjustment | Kind::Group(_)) {
+                let [x, y] = if crate::effects::canvas_frame(layer) {
                     [0, 0]
                 } else {
                     [layer.x, layer.y]
@@ -336,7 +336,7 @@ impl<'a> Plan16<'a> {
             return [0; 4];
         }
         if let Some(image) = &self.colors[i] {
-            return if matches!(self.kinds[i], Kind::Group(_) | Kind::Adjustment) {
+            return if crate::effects::canvas_frame(layer) {
                 image.get(x, y)
             } else {
                 image.get(lx, ly)

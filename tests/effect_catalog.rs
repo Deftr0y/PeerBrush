@@ -30,7 +30,10 @@ fn catalog_search_respects_stack_names_categories_and_keywords() {
             .collect::<Vec<_>>()
     };
     assert_eq!(matches(false, " hUe SATURATION "), ["hsl"]);
-    assert_eq!(matches(false, "glow"), ["bloom"]);
+    assert_eq!(
+        matches(false, "glow"),
+        ["inner_glow", "outer_glow", "bloom"]
+    );
     assert_eq!(matches(true, "feather"), ["blur"]);
     assert!(matches(false, "feather").is_empty());
     assert!(matches(true, "bloom").is_empty());

@@ -14,7 +14,7 @@ use std::{
 pub const LIMIT: usize = 32;
 pub const CACHE_BUDGET: usize = 128 * 1024 * 1024;
 pub fn supports(kind: &str) -> bool {
-    effects::KINDS.contains(&kind) && kind != "liquify"
+    effects::KINDS.contains(&kind) && kind != "liquify" && !effects::styles::contains(kind)
 }
 pub fn active(doc: &Document) -> bool {
     doc.filters.iter().any(|f| f.enabled && f.weight > 0.0)

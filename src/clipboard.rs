@@ -134,17 +134,19 @@ impl Image {
                 .ok_or("Layer no longer exists")?;
             let layer = &doc.layers[index];
             let prepared = if layer.mask.as_ref().is_some_and(|mask| mask.enabled) {
-                crate::depth16::mask_image(doc, index)?
+                crate::depth16::mask::prepare(layer)?
             } else {
                 None
             };
             for y in 0..height {
                 for x in 0..width {
-                    let factor = prepared.as_ref().map_or(1., |image| {
-                        image.get(area[0] + x as i32 - layer.x, area[1] + y as i32 - layer.y)[0]
-                            as f64
-                            / 65535.
-                    });
+                    let factor = crate::depth16::mask::value(
+                        layer,
+                        area[0] + x as i32 - layer.x,
+                        area[1] + y as i32 - layer.y,
+                        prepared.as_deref(),
+                        false,
+                    );
                     let alpha = &mut words[((y * width + x) * 4 + 3) as usize];
                     *alpha = (*alpha as f64 * factor * layer.opacity as f64)
                         .round()

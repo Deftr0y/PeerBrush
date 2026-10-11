@@ -241,7 +241,8 @@ pub(crate) fn map_effect(
     offset: [i32; 2],
     proportional: bool,
 ) -> Result<(), String> {
-    let spatial = matches!(kind, "blur" | "bloom" | "liquify");
+    let spatial =
+        matches!(kind, "blur" | "bloom" | "liquify") || crate::effects::styles::contains(kind);
     if spatial && !proportional {
         return Err("Spatial effects require proportional image resizing; keep aspect ratio or remove the effect first".into());
     }
@@ -253,6 +254,20 @@ pub(crate) fn map_effect(
         };
         settings[key] =
             json!(crate::effects::number(settings, key, default) * (scale[0] * scale[1]).sqrt());
+    }
+    if crate::effects::styles::contains(kind) && scale != [1., 1.] {
+        let defaults = crate::effects::styles::defaults(kind);
+        for key in ["size", "soften", "distance", "scale"] {
+            if key == "scale" && kind == "gradient_overlay" {
+                continue;
+            }
+            if let Some(default) = defaults[key].as_f64() {
+                settings[key] = json!(
+                    settings[key].as_f64().unwrap_or(default)
+                        * f64::from((scale[0] * scale[1]).sqrt())
+                );
+            }
+        }
     }
     if kind == "liquify" {
         if scale != [1., 1.] {

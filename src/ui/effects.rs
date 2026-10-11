@@ -5,6 +5,9 @@ pub(super) fn settings(
     kind: &str,
     settings: &mut Value,
 ) -> Option<egui::Response> {
+    if crate::effects::styles::contains(kind) {
+        return style_settings::settings(ui, kind, settings);
+    }
     if kind == "channel_clamp" {
         return channel_clamp_settings(ui, settings);
     }
@@ -403,7 +406,11 @@ impl PeerBrush {
         let entries = effects::catalog::ENTRIES
             .iter()
             .filter(|entry| entry.matches(mask, &search))
-            .filter(|entry| !(adjustment && entry.kind == "channel_clamp"))
+            .filter(|entry| {
+                !(adjustment
+                    && (entry.kind == "channel_clamp"
+                        || crate::effects::styles::contains(entry.kind)))
+            })
             .collect::<Vec<_>>();
         if entries.is_empty() {
             ui.label(RichText::new("No matching effects").color(MUTED));

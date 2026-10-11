@@ -13,7 +13,20 @@ pub const WORKING_BUDGET: usize = 256 * 1024 * 1024;
 pub mod catalog;
 pub mod channel_clamp;
 pub mod posterize;
+pub mod styles;
 pub const KINDS: &[&str] = &[
+    "bevel_emboss",
+    "contour",
+    "texture",
+    "stroke",
+    "inner_shadow",
+    "inner_glow",
+    "satin",
+    "color_overlay",
+    "gradient_overlay",
+    "pattern_overlay",
+    "outer_glow",
+    "drop_shadow",
     "levels",
     "curves",
     "blur",
@@ -126,6 +139,9 @@ pub(crate) fn apply_effect(
     Ok(())
 }
 pub fn defaults(kind: &str) -> Value {
+    if styles::contains(kind) {
+        return styles::defaults(kind);
+    }
     match kind {
         "channel_clamp" => json!({"channel":"r","minimum":0.0,"maximum":1.0}),
         "posterize" => json!({"levels":posterize::DEFAULT_LEVELS}),
@@ -155,6 +171,9 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
     }
     if !v.is_object() {
         return Err("Effect settings must be an object".into());
+    }
+    if styles::contains(kind) {
+        return styles::validate(kind, v);
     }
     let check = |key: &str, min: f32, max: f32| {
         if let Some(value) = v.get(key) {
@@ -267,18 +286,22 @@ pub fn normalized(kind: &str, settings: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn color_only(kind: &str) -> bool {
-    [
-        "color_balance",
-        "hsl",
-        "bloom",
-        "posterize",
-        "channel_clamp",
-    ]
-    .contains(&kind)
+    styles::contains(kind)
+        || [
+            "color_balance",
+            "hsl",
+            "bloom",
+            "posterize",
+            "channel_clamp",
+        ]
+        .contains(&kind)
 }
 /// Largest scratch buffer used by a single effect, excluding the cached output.
 pub fn working_bytes(kind: &str, width: u32, height: u32, settings: &Value) -> Result<u64, String> {
     let pixels = width as u64 * height as u64;
+    if styles::contains(kind) {
+        return Ok(styles::working_bytes(width, height));
+    }
     match kind {
         "blur" | "bloom" => Ok(pixels * 8 + width.max(height) as u64 * 8),
         // Liquify enforces its own field/stroke work limits as well.
@@ -422,6 +445,21 @@ impl Cache {
         self.items.insert(key, image);
     }
 }
+/// Styles may grow beyond cropped source pixels; derived images use document coordinates.
+pub fn canvas_frame(layer: &Layer) -> bool {
+    ["group", "adjustment"].contains(&layer.kind.as_str())
+        || layer
+            .effects
+            .iter()
+            .any(|e| e.enabled && e.weight > 0. && styles::contains(&e.kind))
+}
+pub fn frame(doc: &Document, layer: &Layer) -> (u32, u32) {
+    if canvas_frame(layer) {
+        (doc.width, doc.height)
+    } else {
+        (layer.pixels.width, layer.pixels.height)
+    }
+}
 pub fn active(l: &Layer) -> bool {
     l.kind == "adjustment" || l.effects.iter().any(|e| e.enabled && e.weight > 0.0)
 }
@@ -435,7 +473,7 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
         .iter()
         .filter(|l| active(l))
         .map(|l| {
-            if ["group", "adjustment"].contains(&l.kind.as_str()) {
+            if canvas_frame(l) {
                 doc.width as u64 * doc.height as u64 * 4
             } else {
                 l.pixels.width as u64 * l.pixels.height as u64 * 4
@@ -461,8 +499,13 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
     }
 }
 pub(crate) fn validate_target(layer: &Layer) -> Result<(), String> {
-    if layer.kind == "adjustment" && layer.effects.iter().any(|e| e.kind == "channel_clamp") {
-        return Err("RGBO Clamp needs a regular layer or isolated folder; clipped adjustments preserve base opacity".into());
+    if layer.kind == "adjustment"
+        && layer
+            .effects
+            .iter()
+            .any(|e| e.kind == "channel_clamp" || styles::contains(&e.kind))
+    {
+        return Err("RGBO Clamp and layer styles need a regular layer or isolated folder; clipped adjustments preserve base opacity".into());
     }
     Ok(())
 }
@@ -538,7 +581,7 @@ pub fn prepare(
         if !active(l) {
             continue;
         }
-        let (w, h) = if ["group", "adjustment"].contains(&l.kind.as_str()) {
+        let (w, h) = if canvas_frame(l) {
             (doc.width, doc.height)
         } else {
             (l.pixels.width, l.pixels.height)
@@ -561,7 +604,7 @@ pub fn prepare(
         }
         let bytes = match l.kind.as_str() {
             "fill" => {
-                let mut bytes = vec![0; w as usize * h as usize * 4];
+                let mut bytes = vec![0; l.pixels.width as usize * l.pixels.height as usize * 4];
                 for pixel in bytes.chunks_exact_mut(4) {
                     pixel.copy_from_slice(&l.color);
                 }
@@ -591,12 +634,30 @@ pub fn prepare(
             }
             _ => l.pixels.rgba(),
         };
+        let base_frame = ["group", "adjustment"].contains(&l.kind.as_str());
         let mut image = Image {
-            width: w,
-            height: h,
+            width: if base_frame { w } else { l.pixels.width },
+            height: if base_frame { h } else { l.pixels.height },
             bytes,
         };
+        let mut expanded = base_frame;
         for effect in l.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
+            if styles::contains(&effect.kind) && !expanded {
+                let mut bytes = vec![0; w as usize * h as usize * 4];
+                for y in 0..h {
+                    for x in 0..w {
+                        let at = ((y * w + x) * 4) as usize;
+                        bytes[at..at + 4]
+                            .copy_from_slice(&image.get(x as i32 - l.x, y as i32 - l.y));
+                    }
+                }
+                image = Image {
+                    width: w,
+                    height: h,
+                    bytes,
+                };
+                expanded = true;
+            }
             apply_effect(&mut image, effect, None)?;
         }
         let image = Arc::new(image);
@@ -647,6 +708,14 @@ pub(crate) fn apply_region(
 }
 fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<(), String> {
     let (w, h) = (image.width as usize, image.height as usize);
+    if styles::contains(kind) {
+        let mut words: Vec<u16> = image.bytes.iter().map(|b| u16::from(*b) * 257).collect();
+        styles::apply(&mut words, image.width, image.height, kind, &settings)?;
+        for (byte, word) in image.bytes.iter_mut().zip(words) {
+            *byte = crate::raster::project16(word);
+        }
+        return Ok(());
+    }
     match kind {
         "channel_clamp" => {
             let (channel, minimum, maximum) = channel_clamp::native_bounds(&settings, 255)?;

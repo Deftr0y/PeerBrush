@@ -496,9 +496,9 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     let mut records = vec![];
     let mut channels = vec![];
     for (l, section) in &ordered {
-        let baked_group = *section == 0 && l.kind == "group" && crate::effects::active(l);
+        let canvas_frame = crate::effects::canvas_frame(l);
         let (w, h) = if *section == 0 {
-            if baked_group {
+            if canvas_frame {
                 (doc.width, doc.height)
             } else {
                 (l.pixels.width, l.pixels.height)
@@ -506,7 +506,7 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         } else {
             (0, 0)
         };
-        let (x, y) = if *section == 0 && !baked_group {
+        let (x, y) = if *section == 0 && !canvas_frame {
             (l.x, l.y)
         } else {
             (0, 0)
@@ -517,7 +517,7 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         i32b(&mut records, x + w as i32);
         let mask = l.mask.as_ref();
         // Folder masks cover the standard canvas; private sources retain off-canvas frames.
-        let (mask_w, mask_h, mask_x, mask_y) = if l.kind == "group" {
+        let (mask_w, mask_h, mask_x, mask_y) = if crate::effects::canvas_frame(l) {
             (doc.width, doc.height, 0, 0)
         } else {
             (l.pixels.width, l.pixels.height, l.x, l.y)
@@ -735,7 +735,13 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if !doc.filters.is_empty() {
+        format: if doc.layers.iter().any(|l| {
+            l.effects
+                .iter()
+                .any(|e| crate::effects::styles::contains(&e.kind))
+        }) {
+            16
+        } else if !doc.filters.is_empty() {
             15
         } else if doc
             .layers
@@ -1498,7 +1504,7 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=15).contains(&e.format)
+                if (1..=16).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash

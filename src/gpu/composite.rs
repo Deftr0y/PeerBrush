@@ -759,7 +759,7 @@ impl<'a> Scene<'a> {
             let (w, h) = source.dims();
             n[1] = w;
             n[2] = h;
-            if l.kind == "group" || l.kind == "adjustment" {
+            if crate::effects::canvas_frame(l) {
                 n[4] = 0;
                 n[5] = 0;
             }

@@ -12,7 +12,7 @@ type Colors = [Option<Arc<Image>>];
 fn raw(doc: &Document, i: usize, x: i32, y: i32, masks: &Masks, colors: &Colors) -> Pixel {
     let l = &doc.layers[i];
     if let Some(image) = &colors[i] {
-        return if ["group", "adjustment"].contains(&l.kind.as_str()) {
+        return if crate::effects::canvas_frame(l) {
             image.get(x, y)
         } else {
             image.get(x - l.x, y - l.y)
@@ -378,7 +378,7 @@ impl<'a> Plan<'a> {
             }
             let layer = &doc.layers[index];
             let bounds = if let Some(image) = &colors[index] {
-                let [x, y] = if matches!(kinds[index], Kind::Adjustment | Kind::Group(_)) {
+                let [x, y] = if crate::effects::canvas_frame(layer) {
                     [0, 0]
                 } else {
                     [layer.x, layer.y]
@@ -517,7 +517,7 @@ impl<'a> Plan<'a> {
             return [0; 4];
         }
         if let Some(image) = &self.colors[i] {
-            return if matches!(self.kinds[i], Kind::Group(_) | Kind::Adjustment) {
+            return if crate::effects::canvas_frame(layer) {
                 image.get(x, y)
             } else {
                 image.get(lx, ly)

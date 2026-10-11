@@ -167,7 +167,13 @@ pub fn prepare(doc: &Document, ids: &[String], name: Option<&str>) -> Result<Pre
     }
     let mut bounds: Option<[i64; 4]> = None;
     for l in &isolated.layers {
-        let area = if l.kind == "group" {
+        let area = if l
+            .effects
+            .iter()
+            .any(|e| e.enabled && e.weight > 0. && crate::effects::styles::contains(&e.kind))
+        {
+            Some([-l.x, -l.y, doc.width as i32 - l.x, doc.height as i32 - l.y])
+        } else if l.kind == "group" {
             l.effects.iter().any(|e| e.enabled).then_some([
                 0,
                 0,

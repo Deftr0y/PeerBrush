@@ -68,7 +68,7 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
             .checked_add(mask::buffer_bytes(layer))
             .ok_or("16-bit mask budget overflow")?;
         if crate::effects::active(layer) {
-            let (width, height) = if ["group", "adjustment"].contains(&layer.kind.as_str()) {
+            let (width, height) = if crate::effects::canvas_frame(layer) {
                 (doc.width, doc.height)
             } else {
                 (layer.pixels.width, layer.pixels.height)
@@ -131,7 +131,7 @@ pub(crate) fn prepare_with_masks(
         if !crate::effects::active(layer) {
             continue;
         }
-        let (width, height) = if ["group", "adjustment"].contains(&layer.kind.as_str()) {
+        let (width, height) = if crate::effects::canvas_frame(layer) {
             (doc.width, doc.height)
         } else {
             (layer.pixels.width, layer.pixels.height)
@@ -166,9 +166,15 @@ pub(crate) fn prepare_with_masks(
             out[index] = Some(image);
             continue;
         }
+        let base_frame = ["group", "adjustment"].contains(&layer.kind.as_str());
+        let (base_width, base_height) = if base_frame {
+            (width, height)
+        } else {
+            (layer.pixels.width, layer.pixels.height)
+        };
         let mut image = match layer.kind.as_str() {
             "fill" => {
-                let mut image = Image16::new(width, height)?;
+                let mut image = Image16::new(base_width, base_height)?;
                 for pixel in image.words.chunks_exact_mut(4) {
                     pixel.copy_from_slice(&layer.color.map(|v| u16::from(v) * 257));
                 }
@@ -191,12 +197,24 @@ pub(crate) fn prepare_with_masks(
                 }
             }
             _ => Image16 {
-                width,
-                height,
+                width: base_width,
+                height: base_height,
                 words: layer.pixels.rgba16(),
             },
         };
+        let mut expanded = base_frame;
         for effect in layer.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
+            if crate::effects::styles::contains(&effect.kind) && !expanded {
+                let words = crate::render::rgba16(width, height, |x, y| {
+                    image.get(x as i32 - layer.x, y as i32 - layer.y)
+                });
+                image = Image16 {
+                    width,
+                    height,
+                    words,
+                };
+                expanded = true;
+            }
             color::apply_effect(&mut image, effect, None)?;
         }
         let image = Arc::new(image);

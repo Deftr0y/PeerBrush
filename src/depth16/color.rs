@@ -153,6 +153,9 @@ fn balance(rgb: [f64; 3], settings: &Value) -> [f64; 3] {
 }
 pub fn working_bytes(width: u32, height: u32, kind: &str, settings: &Value) -> Result<u64, String> {
     let pixels = u64::from(width) * u64::from(height);
+    if effects::styles::contains(kind) {
+        return Ok(effects::styles::working_bytes(width, height));
+    }
     if matches!(kind, "blur" | "bloom") {
         Ok(pixels * 16 + 1040)
     } else if kind == "liquify" {
@@ -193,6 +196,15 @@ pub(crate) fn apply_region(
     apply_cpu_prepared(image, kind, settings)
 }
 fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Result<(), String> {
+    if effects::styles::contains(kind) {
+        return effects::styles::apply(
+            &mut image.words,
+            image.width,
+            image.height,
+            kind,
+            &settings,
+        );
+    }
     match kind {
         "channel_clamp" => {
             let (channel, minimum, maximum) =

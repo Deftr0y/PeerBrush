@@ -21,6 +21,7 @@ mod retouch;
 mod saved_versions;
 mod selection;
 mod source;
+mod style_settings;
 mod tabs;
 mod tool_settings;
 #[cfg(test)]

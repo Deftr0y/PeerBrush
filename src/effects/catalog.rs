@@ -1,7 +1,17 @@
 //! Shared effect discovery for the engine, native picker and protocol clients.
 use serde_json::{json, Value};
 
-pub const CATEGORIES: &[&str] = &["Tone", "Color", "Blur & light", "Distortion", "Mask"];
+pub const CATEGORIES: &[&str] = &[
+    "Tone",
+    "Color",
+    "Blur & light",
+    "Distortion",
+    "Relief",
+    "Outlines",
+    "Shadows",
+    "Overlays",
+    "Mask",
+];
 
 pub struct Entry {
     pub kind: &'static str,
@@ -44,6 +54,102 @@ impl Entry {
     }
 }
 pub const ENTRIES: &[Entry] = &[
+    Entry {
+        kind: "bevel_emboss",
+        name: "Bevel & Emboss",
+        category: "Relief",
+        color: true,
+        mask_name: None,
+        keywords: "raised edge pillow lighting highlight shadow",
+    },
+    Entry {
+        kind: "contour",
+        name: "Contour",
+        category: "Relief",
+        color: true,
+        mask_name: None,
+        keywords: "profile cone ring curve relief",
+    },
+    Entry {
+        kind: "texture",
+        name: "Texture",
+        category: "Relief",
+        color: true,
+        mask_name: None,
+        keywords: "pattern depth surface",
+    },
+    Entry {
+        kind: "stroke",
+        name: "Stroke",
+        category: "Outlines",
+        color: true,
+        mask_name: None,
+        keywords: "outline border inside outside center",
+    },
+    Entry {
+        kind: "inner_shadow",
+        name: "Inner Shadow",
+        category: "Shadows",
+        color: true,
+        mask_name: None,
+        keywords: "inset angle distance choke",
+    },
+    Entry {
+        kind: "inner_glow",
+        name: "Inner Glow",
+        category: "Shadows",
+        color: true,
+        mask_name: None,
+        keywords: "inside light source edge center",
+    },
+    Entry {
+        kind: "satin",
+        name: "Satin",
+        category: "Relief",
+        color: true,
+        mask_name: None,
+        keywords: "silk interference contour",
+    },
+    Entry {
+        kind: "color_overlay",
+        name: "Color Overlay",
+        category: "Overlays",
+        color: true,
+        mask_name: None,
+        keywords: "solid fill color",
+    },
+    Entry {
+        kind: "gradient_overlay",
+        name: "Gradient Overlay",
+        category: "Overlays",
+        color: true,
+        mask_name: None,
+        keywords: "linear radial reflected diamond",
+    },
+    Entry {
+        kind: "pattern_overlay",
+        name: "Pattern Overlay",
+        category: "Overlays",
+        color: true,
+        mask_name: None,
+        keywords: "checker stripes dots noise pattern",
+    },
+    Entry {
+        kind: "outer_glow",
+        name: "Outer Glow",
+        category: "Shadows",
+        color: true,
+        mask_name: None,
+        keywords: "outside light spread",
+    },
+    Entry {
+        kind: "drop_shadow",
+        name: "Drop Shadow",
+        category: "Shadows",
+        color: true,
+        mask_name: None,
+        keywords: "outside angle distance spread",
+    },
     Entry {
         kind: "channel_clamp",
         name: "RGBO Clamp",

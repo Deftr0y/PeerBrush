@@ -66,6 +66,8 @@ Each layer and group has a compact connected **Color / Mask** selector. Add leve
 
 Add effect stays above the scrollable stack so it remains reachable as the list grows. Its picker has a search field and Tone, Color, Blur & light, Distortion and Mask categories. Search by name or a familiar term such as glow; color and mask stacks show only their supported effects. Tone adjustment belongs in Color effects; the brush toolbar contains brush controls.
 
+Unreleased: the Color effect picker now includes twelve [layer-style effects](layer-styles.md), including Bevel & Emboss, outlines, overlays, inner/exterior glows and shadows. They use the regular editable stack and native-depth rendering. Photoshop style descriptors and embedded patterns remain protected; the new effects have explicit bounded settings and fidelity limits.
+
 **RGBO Clamp** in Color selects Red, Green, Blue or Opacity and clamps that channel between editable Minimum and Maximum percentages. Values already within the bounds and the other channels remain unchanged at full strength. Add separate instances for independent channel limits. Opacity minima also affect transparent pixels within the layer's stored rectangle or the folder's canvas frame. Original pixels remain editable; dragging previews the result and releasing commits one undo step.
 
 **K** selects Magic Wand. Click an artwork color to select a contiguous region or all matching colors. Tolerance, merged/active-layer sampling, feathering and Replace/Add/Subtract/Intersect use the same selection system as the Select toolbar. The wand preserves artwork, existing masks and the active Color/Mask channel. **Select → Mask from selection** explicitly converts the selection into a mask when wanted.

@@ -324,7 +324,7 @@ impl Document {
                     ) * 255.0) as u8;
                     [m, m, m, 255]
                 } else if let Some(image) = target_index.and_then(|i| colors[i].as_ref()) {
-                    if ["group", "adjustment"].contains(&l.kind.as_str()) {
+                    if crate::effects::canvas_frame(l) {
                         image.get(sx, sy)
                     } else {
                         image.get(sx - l.x, sy - l.y)
@@ -1933,7 +1933,7 @@ impl Engine {
                     bytes,
                 })
             };
-            let source = if ["group", "adjustment"].contains(&l.kind.as_str()) {
+            let source = if crate::effects::canvas_frame(l) {
                 Arc::new(crate::effects::Image {
                     width: l.pixels.width,
                     height: l.pixels.height,
