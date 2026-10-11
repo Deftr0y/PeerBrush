@@ -441,6 +441,7 @@ pub struct PeerBrush {
     load_preview: Option<TextureHandle>,
     show_new: bool,
     read_only_info: Option<String>,
+    read_only_patterns: Option<String>,
     save_report: Option<crate::compatibility::SaveReport>,
     save_loss_review: Option<compatibility::SaveReview>,
     export_editor: Option<exports::Editor>,
@@ -767,6 +768,7 @@ impl PeerBrush {
             load_preview: None,
             show_new: false,
             read_only_info: None,
+            read_only_patterns: None,
             save_report: None,
             save_loss_review: None,
             export_editor: None,
@@ -4227,6 +4229,8 @@ impl PeerBrush {
                 None
             };
             self.show_brush = panel == "brush";
+            self.read_only_patterns =
+                (panel == "document_patterns").then(|| self.shared.lock().unwrap().doc.id.clone());
             self.show_calibration = panel == "calibration";
             self.show_view = panel == "view";
             self.shortcuts.open = panel == "shortcuts";
@@ -5056,6 +5060,7 @@ impl PeerBrush {
         self.filters_window(ctx, &doc);
         self.exports_window(ctx, &doc);
         self.protection_window(ctx, &doc);
+        self.patterns_window(ctx, &doc);
         self.compatibility_window(ctx, &doc);
         if self.show_new {
             let mut open = true;

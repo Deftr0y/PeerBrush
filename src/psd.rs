@@ -1,4 +1,5 @@
 //! Bounded PSD v1 / PSB v2 codecs. Unsupported Photoshop features are never silently rewritten.
+pub mod patterns;
 mod styles;
 use crate::{
     engine::{id, Document, Layer, Mask, MaskStep},
@@ -2002,6 +2003,33 @@ fn decode_parts(
         }
     }
     let mut doc = Document::new(w, h)?;
+    for (key, payload) in global_blocks(layer_section, layout)?.2 {
+        if matches!(key, b"Patt" | b"Pat2" | b"Pat3") {
+            let tag = std::str::from_utf8(key).unwrap();
+            match patterns::decode(payload, tag, control) {
+                Ok(mut assets) => {
+                    let bytes: usize = doc
+                        .source_patterns
+                        .iter()
+                        .map(|p| p.pixels.bytes())
+                        .sum::<usize>()
+                        + assets.iter().map(|p| p.pixels.bytes()).sum::<usize>();
+                    if doc.source_patterns.len() + assets.len() > 16 || bytes > 16 * 1024 * 1024 {
+                        warnings.push("Embedded Photoshop patterns exceed the bounded inspection budget; additional assets remain protected".into());
+                    } else {
+                        for asset in &mut assets {
+                            asset.source_index += doc.source_patterns.len();
+                        }
+                        doc.source_patterns.extend(assets);
+                    }
+                }
+                Err(reason) => {
+                    control.check()?;
+                    warnings.push(format!("Cannot inspect Photoshop pattern assets ({tag}): {reason}; using the protected saved composite"));
+                }
+            }
+        }
+    }
     doc.bit_depth = depth;
     doc.icc_profile = icc_profile;
     doc.srgb_tagged = srgb_tagged;
@@ -2079,6 +2107,7 @@ fn decode_parts(
     doc.warnings = warnings;
     if !doc.read_only {
         doc.source_structure.clear();
+        doc.source_patterns.clear();
     }
     control.progress("Ready", 1, 1)?;
     Ok(doc)

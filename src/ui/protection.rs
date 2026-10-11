@@ -16,6 +16,78 @@ fn explanation(warning: &str) -> Option<&'static str> {
 }
 
 impl PeerBrush {
+    pub(super) fn patterns_window(&mut self, ctx: &egui::Context, doc: &Document) {
+        if !doc.read_only || self.read_only_patterns.as_deref() != Some(doc.id.as_str()) {
+            self.read_only_patterns = None;
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Embedded Photoshop patterns")
+            .id(egui::Id::new("protected-pattern-assets"))
+            .open(&mut open)
+            .default_width(350.)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label("Raw RGB tiles · color handling and style placement remain protected.");
+                ui.label("This preview does not recover editable Photoshop styles.");
+                if doc.source_patterns.is_empty() {
+                    ui.label("No supported raw RGB pattern assets were decoded.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(520.)
+                    .show(ui, |ui| {
+                        for pattern in &doc.source_patterns {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {} × {} · {} bit",
+                                    pattern.name, pattern.width, pattern.height, pattern.bit_depth
+                                ))
+                                .strong(),
+                            );
+                            let id = egui::Id::new((
+                                "raw-pattern-image",
+                                doc.id.as_str(),
+                                pattern.source_index,
+                            ));
+                            let texture = ctx
+                                .data(|d| d.get_temp::<egui::TextureHandle>(id))
+                                .unwrap_or_else(|| {
+                                    let texture = ctx.load_texture(
+                                        "Raw Photoshop pattern",
+                                        egui::ColorImage::from_rgba_unmultiplied(
+                                            [pattern.width as usize, pattern.height as usize],
+                                            &pattern.pixels.rgba(),
+                                        ),
+                                        egui::TextureOptions::NEAREST,
+                                    );
+                                    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+                                    texture
+                                });
+                            let scale =
+                                (ui.available_width().min(320.) / pattern.width as f32).min(1.);
+                            ui.image((
+                                texture.id(),
+                                Vec2::new(
+                                    pattern.width as f32 * scale,
+                                    pattern.height as f32 * scale,
+                                ),
+                            ));
+                            let [left, top, right, bottom] = pattern.bounds;
+                            ui.label(format!("Asset bounds: {left}, {top} → {right}, {bottom}"));
+                            ui.label(format!(
+                                "Source block: {} · pattern {}",
+                                pattern.tag,
+                                pattern.source_index + 1
+                            ));
+                            ui.add_space(10.);
+                        }
+                    });
+                ui.label("Original document and source samples are unchanged.");
+            });
+        if !open {
+            self.read_only_patterns = None;
+        }
+    }
     pub(super) fn protection_window(&mut self, ctx: &egui::Context, doc: &Document) {
         if !doc.read_only || self.read_only_info.as_deref() != Some(doc.id.as_str()) {
             self.read_only_info = None;
@@ -35,6 +107,9 @@ impl PeerBrush {
                 ui.label("The original Photoshop file still contains its layers. PeerBrush is showing its saved composite because these features cannot yet be preserved through editing:");
                 if !doc.source_structure.is_empty() {
                     source_requested |= ui.button(format!("Source layers ({})", doc.source_structure.len())).clicked();
+                }
+                if !doc.source_patterns.is_empty() && ui.button(format!("Pattern tiles ({})",doc.source_patterns.len())).clicked() {
+                    self.read_only_patterns=Some(doc.id.clone());
                 }
                 ui.add_space(8.);
                 egui::ScrollArea::vertical().max_height(340.).show(ui, |ui| {

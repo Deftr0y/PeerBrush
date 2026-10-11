@@ -269,7 +269,9 @@
     "src/psd/styles.rs",
     "src/effects/patterns.rs",
     "src/ui/pattern_source.rs",
-    "tests/bitmap_patterns.rs"
+    "tests/bitmap_patterns.rs",
+    "src/psd/patterns.rs",
+    "tests/psd_patterns.rs"
   ],
   "portable": [
     "LICENSE",
