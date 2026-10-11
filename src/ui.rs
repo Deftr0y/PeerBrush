@@ -126,7 +126,7 @@ impl Tool {
     fn label(self) -> &'static str {
         match self {
             Self::Pen => "Pen · P",
-            Self::None => "Select · Q",
+            Self::None => "Deselect · Q",
             Self::Move => "Move · W",
             Self::Rotate => "Rotate · E",
             Self::Scale => "Scale · R",
@@ -902,7 +902,12 @@ impl PeerBrush {
                     },
                 );
                 if response.clicked() {
-                    self.select_tool(tool);
+                    if tool == Tool::None {
+                        let doc = self.shared.lock().unwrap().doc.clone();
+                        self.deselect_area(&doc, true);
+                    } else {
+                        self.select_tool(tool);
+                    }
                 }
             }
         });
@@ -4265,9 +4270,12 @@ impl PeerBrush {
                     }
                 }
                 if command_key(i,egui::Key::D) {
-                    if key_modifiers(i,egui::Key::D).shift {
+                    let mods = key_modifiers(i,egui::Key::D);
+                    if mods.alt && !mods.shift {
                         self.edit(vec![json!({"op":"selection.reselect"})],"Reselect");
-                    } else {
+                    } else if mods.shift && !mods.alt {
+                        self.deselect_area(&doc, false);
+                    } else if !mods.alt && !mods.shift {
                         self.duplicate_selection(&doc);
                     }
                 }
@@ -4296,7 +4304,7 @@ impl PeerBrush {
                 ] {
                     if !key_modifiers(i,key).command && !key_modifiers(i,key).ctrl && !key_modifiers(i,key).alt && (i.key_pressed(key)
                         || i.events.iter().any(|e| matches!(e, egui::Event::Key { physical_key: Some(k), pressed: true, .. } if *k == key))) {
-                        self.select_tool(tool);
+                        if tool == Tool::None { self.deselect_area(&doc, true); } else { self.select_tool(tool); }
                     }
                 }
                 if !i.modifiers.command && i.key_pressed(egui::Key::F) {
@@ -4398,10 +4406,10 @@ impl PeerBrush {
                         if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Refine selection…")).clicked(){self.open_refinement(&doc,None);ui.close_menu();}
                         if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Mask from selection")).clicked(){self.layer_cmd("mask.from_selection",json!({}),"Mask from selection");ui.close_menu();}
                         if ui.add_enabled(doc.layers.iter().any(|l|l.id==self.selected&&l.mask.is_some())&&!doc.read_only,egui::Button::new("Refine layer mask…")).clicked(){self.open_refinement(&doc,Some(self.selected.clone()));ui.close_menu();}
-                        for (label,op) in [("All · Ctrl+A","all"),("Deselect","selection.clear"),("Reselect · Ctrl+Shift+D","selection.reselect"),("Inverse","selection.invert")] {
+                        for (label,op) in [("All · Ctrl+A","all"),("Deselect · Ctrl+Shift+D","selection.clear"),("Reselect · Ctrl+Alt+D","selection.reselect"),("Inverse","selection.invert")] {
                             let button=egui::Button::new(label);
                             let button=if op=="selection.invert" {button.shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ I"} else {"Ctrl+Shift+I"})} else {button};
-                            if ui.add(button).clicked(){self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);ui.close_menu();}
+                            if ui.add(button).clicked(){if op=="selection.clear" {self.deselect_area(&doc,false);}else{self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);}ui.close_menu();}
                         }
                         for (label,mode) in [("Expand by 1 px","expand"),("Contract by 1 px","contract")] {if ui.button(label).clicked(){self.edit(vec![json!({"op":"selection.modify","mode":mode,"radius":1})],label);ui.close_menu();}}
                     });
@@ -11276,6 +11284,214 @@ mod tests {
             modified_key(&mut app, &ctx, egui::Key::D, mods);
             assert_eq!(app.shared.lock().unwrap().doc.layers.len(), 2);
             assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        }
+    }
+    fn deselection_fixture(depth: u16) -> (PeerBrush, egui::Context, Document) {
+        let (mut app, ctx) = fixture();
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new_depth(32, 24, depth).unwrap();
+            for y in 0..24 {
+                for x in 0..32 {
+                    e.doc.layers[0]
+                        .pixels
+                        .set16(x, y, [12347, 33559, 51237, 45679]);
+                }
+            }
+            app.selected = e.doc.layers[0].id.clone();
+            app.selection_layers = [app.selected.clone()].into_iter().collect();
+            e.edit(
+                "human",
+                &[json!({"op":"selection","kind":"ellipse","rect":[4,4,24,20],"feather":1})],
+                None,
+                None,
+                "Area",
+            )
+            .unwrap();
+            e.undo.clear();
+        }
+        app.zoom = 0.55;
+        frame(&mut app, &ctx, vec![], Default::default());
+        let before = app.shared.lock().unwrap().doc.clone();
+        (app, ctx, before)
+    }
+    #[test]
+    fn deselection_keys_reselect_native_coverage_and_cancel_gestures() {
+        for depth in [8, 16] {
+            for ctrl in [false, true] {
+                let (mut app, ctx, before) = deselection_fixture(depth);
+                app.select_tool(Tool::Move);
+                app.drag_start = Some([4., 4.]);
+                app.points = vec![[4., 4.], [8., 8.]];
+                app.transient = vec![json!({"op":"move","layer":app.selected,"dx":4,"dy":4})];
+                let mods = egui::Modifiers {
+                    command: true,
+                    ctrl,
+                    shift: true,
+                    ..Default::default()
+                };
+                modified_key(&mut app, &ctx, egui::Key::D, mods);
+                assert!(app.tool == Tool::Move);
+                assert!(
+                    app.points.is_empty() && app.transient.is_empty() && app.drag_start.is_none()
+                );
+                {
+                    let mut e = app.shared.lock().unwrap();
+                    assert!(e.doc.selection.is_none());
+                    assert_eq!(e.undo.len(), 1);
+                    assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
+                    e.undo("human").unwrap();
+                    assert_eq!(e.doc.selection, before.selection);
+                    assert_eq!(e.doc.selection_coverage, before.selection_coverage);
+                    e.redo("human").unwrap();
+                }
+                modified_key(
+                    &mut app,
+                    &ctx,
+                    egui::Key::D,
+                    egui::Modifiers {
+                        command: true,
+                        ctrl,
+                        alt: true,
+                        ..Default::default()
+                    },
+                );
+                {
+                    let e = app.shared.lock().unwrap();
+                    assert_eq!(e.doc.selection_coverage, before.selection_coverage);
+                    assert_eq!(e.doc.layers.len(), 1);
+                    assert_eq!(e.undo.len(), 2);
+                }
+                key(&mut app, &ctx, egui::Key::Q);
+                assert!(app.tool == Tool::None);
+                assert!(app.shared.lock().unwrap().doc.selection.is_none());
+                assert_eq!(app.shared.lock().unwrap().undo.len(), 3);
+                key(&mut app, &ctx, egui::Key::Q);
+                assert_eq!(app.shared.lock().unwrap().undo.len(), 3);
+            }
+        }
+    }
+    #[test]
+    fn deselection_canvas_clicks_clear_all_modes_and_workspace_only() {
+        for depth in [8, 16] {
+            for kind in ["rectangle", "ellipse", "lasso", "object"] {
+                let (mut app, ctx, before) = deselection_fixture(depth);
+                for mode in ["replace", "add", "subtract", "intersect"] {
+                    app.select_tool(Tool::Selection);
+                    app.selection_kind = kind.into();
+                    app.selection_mode = mode.into();
+                    frame(&mut app, &ctx, vec![], Default::default());
+                    let pos = app.view_rect.unwrap().center();
+                    click(&mut app, &ctx, pos);
+                    let mut e = app.shared.lock().unwrap();
+                    assert!(e.doc.selection.is_none(), "{kind} {mode}");
+                    assert_eq!(e.undo.len(), 1);
+                    assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
+                    e.undo("human").unwrap();
+                    assert_eq!(e.doc.selection_coverage, before.selection_coverage);
+                }
+            }
+            for kind in [
+                "rectangle",
+                "ellipse",
+                "row",
+                "column",
+                "lasso",
+                "polygon",
+                "magnetic",
+                "wand",
+                "quick",
+                "object",
+            ] {
+                let (mut app, ctx, before) = deselection_fixture(depth);
+                app.select_tool(if kind == "wand" {
+                    Tool::MagicWand
+                } else {
+                    Tool::Selection
+                });
+                app.selection_kind = kind.into();
+                frame(&mut app, &ctx, vec![], Default::default());
+                let row = app.layer_rects[&app.selected].center();
+                click(&mut app, &ctx, row);
+                assert_eq!(
+                    app.shared.lock().unwrap().doc.selection_coverage,
+                    before.selection_coverage,
+                    "Layer control {kind}"
+                );
+                app.selection_path = vec![[3., 3.], [8., 4.]];
+                let outside = app.view_rect.unwrap().left_center() - Vec2::new(12., 0.);
+                click(&mut app, &ctx, outside);
+                let e = app.shared.lock().unwrap();
+                assert!(e.doc.selection.is_none(), "Workspace {kind}");
+                assert_eq!(e.undo.len(), 1);
+                assert!(app.selection_path.is_empty());
+                assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
+            }
+            // Polygon clicks still construct a path; wand/row/column clicks still select.
+            for kind in ["polygon", "wand", "row", "column", "quick"] {
+                let (mut app, ctx, _) = deselection_fixture(depth);
+                app.select_tool(Tool::Selection);
+                app.selection_kind = kind.into();
+                frame(&mut app, &ctx, vec![], Default::default());
+                let pos = app.view_rect.unwrap().center();
+                click(&mut app, &ctx, pos);
+                assert!(app.shared.lock().unwrap().doc.selection.is_some());
+                if kind == "polygon" {
+                    assert_eq!(app.selection_path.len(), 1);
+                    assert!(app.shared.lock().unwrap().undo.is_empty());
+                }
+            }
+        }
+    }
+    #[test]
+    fn deselection_reservations_and_text_focus_preserve_artwork() {
+        for depth in [8, 16] {
+            let (mut app, ctx, before) = deselection_fixture(depth);
+            app.select_tool(Tool::Brush);
+            app.shared
+                .lock()
+                .unwrap()
+                .reserve(
+                    "other",
+                    "Area",
+                    vec![crate::engine::Scope::layer("@selection")],
+                )
+                .unwrap();
+            key(&mut app, &ctx, egui::Key::Q);
+            assert!(app.tool == Tool::None);
+            {
+                let e = app.shared.lock().unwrap();
+                assert_eq!(e.doc.selection_coverage, before.selection_coverage);
+                assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
+                assert!(e.undo.is_empty());
+            }
+            assert!(app.message.contains("Reserved by other"));
+            app.select_tool(Tool::Brush);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut String::new())
+                            .id(egui::Id::new("deselection typing")),
+                    )
+                    .request_focus();
+                });
+            });
+            modified_key(
+                &mut app,
+                &ctx,
+                egui::Key::D,
+                egui::Modifiers {
+                    command: true,
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            );
+            assert!(app.tool == Tool::Brush);
+            assert_eq!(
+                app.shared.lock().unwrap().doc.selection_coverage,
+                before.selection_coverage
+            );
         }
     }
     #[test]

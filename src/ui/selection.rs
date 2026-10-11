@@ -12,6 +12,17 @@ const TOOLS: &[(&str, &str, usize)] = &[
     ("object", "Object region", 23),
 ];
 impl PeerBrush {
+    pub(super) fn deselect_area(&mut self, doc: &Document, tool: bool) {
+        self.finish_parameter(true);
+        self.cancel_geometry();
+        self.cancel_source();
+        self.cancel_filters();
+        self.cancel_refinement();
+        self.select_tool(if tool { Tool::None } else { self.tool });
+        if doc.selection.is_some() {
+            self.edit(vec![json!({"op":"selection.clear","document_id":doc.id,"source_revision":doc.revision})], "Deselect");
+        }
+    }
     fn wand_update_command(&self, doc: &Document) -> Value {
         json!({"op":"selection.wand_update", "document_id":doc.id,
             "source_revision":doc.revision, "tolerance":self.selection_tolerance,
@@ -200,6 +211,15 @@ impl PeerBrush {
     ) {
         let to_doc = |p: Pos2| [(p.x - rect.min.x) / scale, (p.y - rect.min.y) / scale];
         let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
+        // The response covers only the canvas workspace, excluding panels and controls.
+        if response.clicked()
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|p| !rect.contains(p))
+        {
+            self.deselect_area(doc, false);
+            return;
+        }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.selection_path.clear();
             self.points.clear();
@@ -364,8 +384,8 @@ impl PeerBrush {
                     let command =
                         self.select_command(doc, &[to_doc(pos)], &self.selection_mode_for(ui));
                     self.edit(vec![command], "Select region");
-                } else if self.selection_mode_for(ui) == "replace" {
-                    self.edit(vec![json!({"op":"selection.clear"})], "Deselect");
+                } else {
+                    self.deselect_area(doc, false);
                 }
             }
         }
