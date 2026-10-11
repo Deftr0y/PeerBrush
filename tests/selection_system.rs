@@ -11,6 +11,165 @@ fn edit(e: &mut Engine, c: Value) {
 }
 
 #[test]
+fn color_similarity_is_opt_in_and_distinguishes_native_colors_in_each_sampler() {
+    for depth in [8, 16] {
+        let (mut e, id) = fixture(depth);
+        for y in 0..24 {
+            for x in 0..32 {
+                let rgb = if x < 10 {
+                    [100, 100, 100]
+                } else if x < 20 {
+                    [160, 100, 100]
+                } else {
+                    [0, 200, 100]
+                };
+                e.doc.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [rgb[0] * 257 + 1, rgb[1] * 257 + 3, rgb[2] * 257 + 5, 65535],
+                );
+            }
+        }
+        let before = e.doc.clone();
+        for kind in ["wand", "quick", "object"] {
+            for contiguous in [false, true] {
+                let command = json!({"op":"selection","kind":kind,"layer":id,"point":[4,8],"rect":[0,0,32,24],"radius":64,"tolerance":40,"contiguous":contiguous,"sample_merged":false});
+                let default = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
+                let mut off = command.clone();
+                off["color_similarity"] = json!(false);
+                let unchanged = Engine::preview_edits(before.clone(), &[off]).unwrap();
+                assert_eq!(
+                    selection::current(&default).unwrap().mask.rgba(),
+                    selection::current(&unchanged).unwrap().mask.rgba()
+                );
+                let mut on = command;
+                on["color_similarity"] = json!(true);
+                let strict = Engine::preview_edits(before.clone(), &[on]).unwrap();
+                let selected = selection::current(&strict).unwrap();
+                assert_eq!(
+                    selected.value(15, 12),
+                    if kind == "object" { 1. } else { 0. }
+                );
+                assert_eq!(
+                    selection::current(&default).unwrap().value(15, 12),
+                    if kind == "object" { 0. } else { 1. }
+                );
+                // These colors have the same mean brightness as the seed, but different RGB.
+                assert_eq!(selected.value(25, 12), 0.);
+                assert_eq!(
+                    strict.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert_eq!(strict.bit_depth, depth);
+            }
+        }
+        for bad in [json!(null), json!("true"), json!(1)] {
+            assert!(e.edit("human",&[json!({"op":"selection","kind":"wand","layer":id,"point":[4,8],"color_similarity":bad})],None,None,"Invalid flag").is_err());
+            assert!(e.undo.is_empty());
+            assert_eq!(
+                e.doc.layers[0].pixels.rgba16(),
+                before.layers[0].pixels.rgba16()
+            );
+        }
+        for bad in [json!(-1), json!(256), json!("40"), json!(null)] {
+            assert!(e.edit("human",&[json!({"op":"selection","kind":"wand","layer":id,"point":[4,8],"color_similarity":true,"tolerance":bad})],None,None,"Invalid tolerance").is_err());
+            assert!(e.undo.is_empty());
+        }
+    }
+}
+
+#[test]
+fn color_similarity_live_replay_keeps_combination_baseline_guards_undo_and_psd() {
+    for depth in [8, 16] {
+        for mode in ["replace", "add", "subtract", "intersect"] {
+            let (mut e, id) = fixture(depth);
+            for y in 0..24 {
+                for x in 0..32 {
+                    e.doc.layers[0].pixels.set16(
+                        x,
+                        y,
+                        [if x < 10 { 25701 } else { 41121 }, 25703, 25705, 65535],
+                    );
+                }
+            }
+            edit(
+                &mut e,
+                json!({"op":"selection","kind":"ellipse","rect":[4,4,24,20],"feather":2}),
+            );
+            let before = e.doc.clone();
+            let command = json!({"op":"selection","kind":"wand","layer":id,"point":[4,8],"tolerance":40,"feather":1,"contiguous":false,"mode":mode,"sample_merged":false});
+            edit(&mut e, command.clone());
+            let old = selection::current(&e.doc).unwrap();
+            assert_eq!(
+                selection::wand_source(&e.doc).unwrap().command["color_similarity"],
+                false
+            );
+            let update = json!({"op":"selection.wand_update","color_similarity":true});
+            let lease = e
+                .reserve(
+                    "agent",
+                    "Selection geometry",
+                    vec![Scope::layer("@selection")],
+                )
+                .unwrap();
+            let history = e.undo.len();
+            assert!(e
+                .edit("human", &[update.clone()], None, None, "Reserved toggle")
+                .is_err());
+            assert_eq!(e.undo.len(), history);
+            assert_eq!(
+                selection::current(&e.doc).unwrap().mask.rgba(),
+                old.mask.rgba()
+            );
+            e.leases.retain(|l| l.id != lease.id);
+            let mut explicit = command;
+            explicit["color_similarity"] = json!(true);
+            let expected = Engine::preview_edits(before.clone(), &[explicit]).unwrap();
+            edit(&mut e, update);
+            assert_eq!(
+                selection::current(&e.doc).unwrap().mask.rgba(),
+                selection::current(&expected).unwrap().mask.rgba()
+            );
+            assert_eq!(e.undo.len(), history + 1);
+            assert_eq!(
+                e.doc.layers[0].pixels.rgba16(),
+                before.layers[0].pixels.rgba16()
+            );
+            let saved = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+            assert_eq!(saved.bit_depth, depth);
+            assert_eq!(
+                saved.layers[0].pixels.rgba16(),
+                before.layers[0].pixels.rgba16()
+            );
+            assert_eq!(
+                selection::current(&saved).unwrap().mask.rgba(),
+                selection::current(&e.doc).unwrap().mask.rgba()
+            );
+            e.undo("human").unwrap();
+            assert_eq!(
+                selection::current(&e.doc).unwrap().mask.rgba(),
+                old.mask.rgba()
+            );
+            e.redo("human").unwrap();
+            assert_eq!(
+                selection::wand_source(&e.doc).unwrap().command["color_similarity"],
+                true
+            );
+            let doc = e.doc.clone();
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(e));
+            let stale = peerbrush::server::dispatch(
+                &shared,
+                "edit",
+                &json!({"actor":"human","document_id":doc.id,"expected_revision":doc.revision,"commands":[{"op":"selection.wand_update","document_id":doc.id,"source_revision":doc.revision-1,"color_similarity":false}]}),
+            );
+            assert!(stale.is_err());
+            let result=peerbrush::server::dispatch(&shared,"edit",&json!({"actor":"human","document_id":doc.id,"expected_revision":doc.revision,"commands":[{"op":"selection.wand_update","color_similarity":false}],"feedback":"always"})).unwrap();
+            assert!(!result["images"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
 fn live_wand_replays_original_combination_and_keeps_native_artwork_and_psd() {
     for depth in [8, 16] {
         for mode in ["replace", "add", "subtract", "intersect"] {

@@ -27,7 +27,7 @@ impl PeerBrush {
         json!({"op":"selection.wand_update", "document_id":doc.id,
             "source_revision":doc.revision, "tolerance":self.selection_tolerance,
             "feather":self.selection_feather, "contiguous":self.selection_contiguous,
-            "sample_merged":self.selection_merged})
+            "sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity})
     }
     pub(super) fn selection_toolbar(&mut self, ui: &mut egui::Ui, doc: &Document) -> [Rect; 3] {
         let mut controls = [Rect::NOTHING; 3];
@@ -39,6 +39,8 @@ impl PeerBrush {
                 self.selection_feather = s.command["feather"].as_f64().unwrap_or(0.) as f32;
                 self.selection_contiguous = s.command["contiguous"].as_bool().unwrap_or(true);
                 self.selection_merged = s.command["sample_merged"].as_bool().unwrap_or(false);
+                self.selection_color_similarity =
+                    s.command["color_similarity"].as_bool().unwrap_or(false);
             }
         }
         let live = self.selection_kind == "wand" && self.selection_live_wand && source.is_some();
@@ -96,7 +98,7 @@ impl PeerBrush {
                 self.layer_parameter(self.wand_update_command(doc), "Wand feather", &feather);
             }
             if ["wand", "quick", "object"].contains(&self.selection_kind.as_str()) {
-                controls::label(ui, "Tolerance");
+                controls::label(ui, if self.selection_color_similarity { "Similarity" } else { "Tolerance" });
                 let tolerance = controls::range(
                     ui,
                     "selection tolerance",
@@ -112,6 +114,8 @@ impl PeerBrush {
                     self.layer_parameter(self.wand_update_command(doc), "Wand tolerance", &tolerance);
                 }
                 let mut sampling_changed = false;
+                sampling_changed |= ui.checkbox(&mut self.selection_color_similarity, "Color similarity")
+                    .on_hover_text("Maximum allowed difference in any RGB channel or alpha, from 0 to 255. Off keeps the existing averaged RGB-distance selection.").changed();
                 if self.selection_kind == "wand" {
                     sampling_changed |= ui.checkbox(&mut self.selection_contiguous, "Contiguous").changed();
                 }
@@ -198,7 +202,7 @@ impl PeerBrush {
         let polygon = ["lasso", "polygon", "magnetic"]
             .contains(&self.selection_kind.as_str())
             .then_some(points);
-        json!({"op":"selection","kind":self.selection_kind,"mode":mode,"rect":area,"polygon":polygon,"point":a,"points":points,"radius":self.selection_width,"feather":self.selection_feather,"tolerance":self.selection_tolerance,"contiguous":self.selection_contiguous,"sample_merged":self.selection_merged,"layer":self.selected})
+        json!({"op":"selection","kind":self.selection_kind,"mode":mode,"rect":area,"polygon":polygon,"point":a,"points":points,"radius":self.selection_width,"feather":self.selection_feather,"tolerance":self.selection_tolerance,"contiguous":self.selection_contiguous,"sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity,"layer":self.selected})
     }
     pub(super) fn selection_canvas(
         &mut self,

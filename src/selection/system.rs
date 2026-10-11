@@ -51,7 +51,7 @@ fn update_wand(doc: &mut Document, c: &Value) -> Result<(), String> {
             command[key] = serde_json::json!(n);
         }
     }
-    for key in ["contiguous", "sample_merged"] {
+    for key in ["contiguous", "sample_merged", "color_similarity"] {
         if let Some(value) = c.get(key) {
             command[key] = serde_json::json!(value
                 .as_bool()
@@ -237,7 +237,12 @@ pub(super) fn snapshot(doc: &Document, c: &Value) -> Result<(u32, u32, Vec<u8>),
     let (w, h, p, _) = doc.preview(None, doc.width.max(doc.height), target, false)?;
     Ok((w, h, p))
 }
-fn difference(a: &[u8], b: &[u8]) -> f32 {
+fn difference(a: &[u8], b: &[u8], color_similarity: bool) -> f32 {
+    if color_similarity {
+        return (0..4)
+            .map(|i| (a[i] as f32 - b[i] as f32).abs())
+            .fold(0., f32::max);
+    }
     let rgb = (0..3)
         .map(|i| (a[i] as f32 - b[i] as f32).powi(2))
         .sum::<f32>()
@@ -373,6 +378,19 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
             }
         }
     } else if ["wand", "quick", "object"].contains(&kind) {
+        let color_similarity = c
+            .get("color_similarity")
+            .map(|value| value.as_bool().ok_or("Color similarity must be boolean"))
+            .transpose()?
+            .unwrap_or(false);
+        if color_similarity {
+            if let Some(value) = c.get("tolerance") {
+                value
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0. && *v <= 255.)
+                    .ok_or("Similarity tolerance must be between 0 and 255")?;
+            }
+        }
         let (_, _, pixels) = snapshot(doc, c)?;
         let point = c["point"].as_array().filter(|p| p.len() == 2);
         let at = point
@@ -413,7 +431,8 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                     if pixels[i + 3] > 0
                         && corners.iter().all(|p| {
                             let j = ((p[1] as u32 * w + p[0] as u32) * 4) as usize;
-                            difference(&pixels[i..i + 4], &pixels[j..j + 4]) > tolerance
+                            difference(&pixels[i..i + 4], &pixels[j..j + 4], color_similarity)
+                                > tolerance
                         })
                     {
                         mask.set(x, y, [255; 4]);
@@ -426,7 +445,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                 for y in 0..h as i32 {
                     for x in 0..w as i32 {
                         let i = ((y as u32 * w + x as u32) * 4) as usize;
-                        if difference(&pixels[i..i + 4], reference) <= tolerance {
+                        if difference(&pixels[i..i + 4], reference, color_similarity) <= tolerance {
                             mask.set(x, y, [255; 4]);
                         }
                     }
@@ -463,7 +482,9 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                                 "Selection brush work limit exceeded; use a shorter gesture".into(),
                             );
                         }
-                        if difference(&pixels[i * 4..i * 4 + 4], seed_color) > tolerance {
+                        if difference(&pixels[i * 4..i * 4 + 4], seed_color, color_similarity)
+                            > tolerance
+                        {
                             continue;
                         }
                         // Quick Selection grows only around the painted region; Wand floods its component.
@@ -604,6 +625,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
             "feather",
             "contiguous",
             "sample_merged",
+            "color_similarity",
             "layer",
         ] {
             if let Some(value) = c.get(key) {
@@ -614,6 +636,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
         command["feather"] = serde_json::json!(num(c, "feather", 0.).clamp(0., 64.));
         command["contiguous"] = serde_json::json!(c["contiguous"] != false);
         command["sample_merged"] = serde_json::json!(c["sample_merged"] == true);
+        command["color_similarity"] = serde_json::json!(c["color_similarity"] == true);
         Some(Arc::new(WandSource {
             id: crate::engine::id(),
             revision: doc.revision + 1,

@@ -328,6 +328,7 @@ pub struct PeerBrush {
     selection_mode: String,
     selection_feather: f32,
     selection_tolerance: f32,
+    selection_color_similarity: bool,
     selection_contiguous: bool,
     selection_merged: bool,
     selection_live_wand: bool,
@@ -639,6 +640,7 @@ impl PeerBrush {
             selection_mode: "replace".into(),
             selection_feather: 0.,
             selection_tolerance: 24.,
+            selection_color_similarity: false,
             selection_contiguous: true,
             selection_merged: true,
             selection_live_wand: true,
@@ -6417,6 +6419,79 @@ mod tests {
         );
         assert_eq!(app.shared.lock().unwrap().doc.layers[0].opacity, 1.);
         assert!(app.message.contains("cancelled"));
+    }
+    #[test]
+    fn color_similarity_checkbox_replays_wand_once_and_respects_live_toggle() {
+        let (mut app, ctx) = small_fixture();
+        assert!(!app.selection_color_similarity);
+        let before = {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new_depth(32, 24, 16).unwrap();
+            for y in 0..24 {
+                for x in 0..32 {
+                    e.doc.layers[0].pixels.set16(
+                        x,
+                        y,
+                        [if x < 10 { 25701 } else { 41121 }, 25703, 25705, 65535],
+                    );
+                }
+            }
+            let id = e.doc.layers[0].id.clone();
+            e.edit("human",&[json!({"op":"selection","kind":"wand","layer":id,"point":[4,8],"sample_merged":false,"tolerance":40})],None,None,"Seed").unwrap();
+            e.undo.clear();
+            e.doc.clone()
+        };
+        app.select_content(&before.layers[0].id);
+        app.select_tool(Tool::MagicWand);
+        app.selection_kind = "wand".into();
+        fn checkbox(app: &mut PeerBrush, ctx: &egui::Context, name: &str) -> Pos2 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == name => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Checkbox absent: {name}"))
+        }
+        let at = checkbox(&mut app, &ctx, "Color similarity");
+        click(&mut app, &ctx, at);
+        {
+            let e = app.shared.lock().unwrap();
+            assert_eq!(e.undo.len(), 1);
+            assert_eq!(crate::selection::current(&e.doc).unwrap().value(15, 12), 0.);
+            assert_eq!(
+                e.doc.layers[0].pixels.rgba16(),
+                before.layers[0].pixels.rgba16()
+            );
+            assert_eq!(
+                crate::selection::wand_source(&e.doc).unwrap().command["color_similarity"],
+                true
+            );
+        }
+        let at = checkbox(&mut app, &ctx, "Live updates");
+        click(&mut app, &ctx, at);
+        assert!(!app.selection_live_wand);
+        let at = checkbox(&mut app, &ctx, "Color similarity");
+        click(&mut app, &ctx, at);
+        assert!(!app.selection_color_similarity);
+        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+        let at = checkbox(&mut app, &ctx, "Live updates");
+        click(&mut app, &ctx, at);
+        let mut e = app.shared.lock().unwrap();
+        assert_eq!(e.undo.len(), 2);
+        assert_eq!(crate::selection::current(&e.doc).unwrap().value(15, 12), 1.);
+        e.undo("human").unwrap();
+        assert_eq!(crate::selection::current(&e.doc).unwrap().value(15, 12), 0.);
     }
     #[test]
     fn wand_toolbar_live_drag_previews_pixels_and_toggle_preserves_selection() {
