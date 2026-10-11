@@ -2015,3 +2015,137 @@ fn multiple_overlay_limits_aliases_and_unsupported_disabled_entries_protect_atom
         }
     }
 }
+
+#[test]
+fn supported_photoshop_overlays_retain_raster_masks_and_layer_opacity_at_native_depth() {
+    for depth in [8, 16] {
+        for masked in [false, true] {
+            for opacity in [0u8, 64, 128, 255] {
+                for family in 0..3 {
+                    let pattern = family == 1;
+                    let gradient = family == 2;
+                    let mut spec = Spec::paint("Synthetic masked overlay", SAVED);
+                    spec.opacity = opacity;
+                    let mask_values = [12347u16, 54321];
+                    if masked {
+                        spec.mask = Some(mask_values);
+                    }
+                    spec.tags.push((
+                        *b"lfx2",
+                        if pattern {
+                            pattern_payload(true, "synthetic-pattern", "", 100.)
+                        } else if gradient {
+                            gradient_payload(false, None, 0.)
+                        } else {
+                            overlay_payload(true, true, [111., 67., 231.])
+                        },
+                    ));
+                    let mut bytes = fixture(&[spec], depth);
+                    if pattern {
+                        bytes = inject_pattern(
+                            bytes,
+                            depth,
+                            &pattern_resource(depth, "synthetic-pattern"),
+                            false,
+                        );
+                    }
+                    let mut merged = [[0u16; 4]; 2];
+                    for (x, pixel) in merged.iter_mut().enumerate() {
+                        let mask = if masked {
+                            native(mask_values[x], depth)
+                        } else {
+                            65535
+                        };
+                        pixel[3] = native(
+                            (f64::from(mask) * f64::from(opacity) / 255.).round() as u16,
+                            depth,
+                        );
+                        if pixel[3] != 0 {
+                            pixel[..3].copy_from_slice(&if pattern {
+                                [
+                                    native(PATTERN[x][0], depth),
+                                    native(PATTERN[x][1], depth),
+                                    native(PATTERN[x][2], depth),
+                                ]
+                            } else if gradient {
+                                [native(if x == 0 { 16384 } else { 49151 }, depth); 3]
+                            } else {
+                                [111 * 257, 67 * 257, 231 * 257]
+                            });
+                        }
+                    }
+                    bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                    for channel in 0..4 {
+                        for pixel in merged {
+                            sample(&mut bytes, pixel[channel], depth);
+                        }
+                    }
+                    let doc = psd::decode(&bytes).unwrap();
+                    assert!(
+                        !doc.read_only,
+                        "{depth} {masked} {opacity} {pattern}: {:?}",
+                        doc.warnings
+                    );
+                    assert_eq!(doc.layers[0].opacity, f64::from(opacity) / 255.);
+                    assert_eq!(doc.layers[0].mask.is_some(), masked);
+                    if let Some(mask) = &doc.layers[0].mask {
+                        for x in 0..2 {
+                            let value = native(mask_values[x], depth);
+                            assert_eq!(
+                                mask.steps[1].pixels.get16(x as i32, 0),
+                                [value, value, value, 65535]
+                            );
+                        }
+                    }
+                    let source = doc.layers[0].pixels.rgba16();
+                    assert_eq!(
+                        source,
+                        SAVED
+                            .into_iter()
+                            .flatten()
+                            .map(|n| native(n, depth))
+                            .collect::<Vec<_>>()
+                    );
+                    let mask = doc.layers[0]
+                        .mask
+                        .as_ref()
+                        .map(|m| m.steps[1].pixels.rgba16());
+                    let current = doc.export_png().unwrap();
+                    let mut engine = Engine::new();
+                    engine.doc = doc;
+                    let layer = engine.doc.layers[0].id.clone();
+                    let effect = engine.doc.layers[0].effects[0].id.clone();
+                    engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":false})], None, None, "Bypass masked overlay").unwrap();
+                    assert_eq!(engine.undo.len(), 1);
+                    assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                    assert_eq!(
+                        engine.doc.layers[0]
+                            .mask
+                            .as_ref()
+                            .map(|m| m.steps[1].pixels.rgba16()),
+                        mask
+                    );
+                    engine.undo("human").unwrap();
+                    assert_eq!(engine.doc.export_png().unwrap(), current);
+                    for output in [
+                        psd::encode(&engine.doc).unwrap(),
+                        psd::encode_psb(&engine.doc).unwrap(),
+                    ] {
+                        let reopened = psd::decode(&output).unwrap();
+                        assert!(!reopened.read_only);
+                        assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                        assert_eq!(
+                            reopened.layers[0]
+                                .mask
+                                .as_ref()
+                                .map(|m| m.steps[1].pixels.rgba16()),
+                            mask
+                        );
+                        assert_eq!(reopened.layers[0].opacity, f64::from(opacity) / 255.);
+                        assert_eq!(reopened.export_png().unwrap(), current);
+                    }
+                }
+            }
+        }
+    }
+}

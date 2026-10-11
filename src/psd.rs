@@ -1861,9 +1861,13 @@ fn decode_parts(
                             };
                             match detail {
                                 Ok(details) => {
-                                    let imported = if signature == b"8BIM" && section == 0 && maskdata.is_empty() && clipping == 0 && opacity == 1. && blend == "normal" && imported_styles.is_empty() {
+                                    // Supported overlays preserve source alpha and run before
+                                    // the ordinary raster mask and layer opacity. Mask decoding
+                                    // still validates every field; the complete native composite
+                                    // gate below verifies their combined appearance.
+                                    let imported = if signature == b"8BIM" && section == 0 && clipping == 0 && blend == "normal" && imported_styles.is_empty() {
                                         styles::native_overlays(payload, &source_patterns, depth)
-                                    } else { Err("Photoshop styles with masks, clipping, folders, layer blending or duplicate blocks remain protected".into()) };
+                                    } else { Err("Photoshop styles with clipping, folders, layer blending or duplicate blocks remain protected".into()) };
                                     match imported {
                                         Ok((effects, pattern)) => {
                                             imported_styles = effects;
