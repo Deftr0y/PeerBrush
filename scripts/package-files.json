@@ -259,7 +259,13 @@
     "vendor/egui-winit/src/lib.rs",
     "vendor/egui-winit/src/window_settings.rs",
     "src/ui/shortcuts.rs",
-    "docs/canvas-tablet.md"
+    "docs/canvas-tablet.md",
+    "src/production_export.rs",
+    "src/production_export/jobs.rs",
+    "src/production_export/library.rs",
+    "src/ui/exports.rs",
+    "tests/production_export.rs",
+    "docs/production-export.md"
   ],
   "portable": [
     "LICENSE",
@@ -300,7 +306,8 @@
     "docs/ui-ember.md",
     "docs/unicode-filenames.md",
     "integrations/segmentation-requirements.txt",
-    "integrations/segmentation_rembg.py"
+    "integrations/segmentation_rembg.py",
+    "docs/production-export.md"
   ],
   "readme": "scripts/package-readme.md",
   "vendored": [

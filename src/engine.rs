@@ -464,6 +464,8 @@ pub struct Engine {
     pub brush_library: std::sync::Arc<std::sync::Mutex<crate::brush_library::Library>>,
     pub tool_settings: std::sync::Arc<std::sync::Mutex<crate::tool_settings::Store>>,
     pub filter_library: std::sync::Arc<std::sync::Mutex<crate::filter_library::Library>>,
+    pub export_library:
+        std::sync::Arc<std::sync::Mutex<crate::production_export::library::Library>>,
     pub(crate) proposals: Vec<crate::collaboration::Proposal>,
     pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
     pub(crate) code_jobs: Vec<crate::code::Job>,
@@ -610,6 +612,7 @@ impl Engine {
                 crate::brush_library::Library::default(),
             )),
             tool_settings: Default::default(),
+            export_library: Default::default(),
             filter_library: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::filter_library::Library::default(),
             )),

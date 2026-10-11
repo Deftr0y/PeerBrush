@@ -541,6 +541,28 @@ pub fn export_confirmed_source(
     )
 }
 fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
+    if request["skip_existing"] == true {
+        return Err(
+            "Use exports start with an explicit existing-file policy for batch skips".into(),
+        );
+    }
+    export_derived_guarded(
+        shared,
+        path,
+        request,
+        &crate::production_export::Control::default(),
+        |doc| doc.export_png(),
+    )
+    .map(|_| ())
+}
+pub(crate) fn export_derived_guarded(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    control: &crate::production_export::Control,
+    encode: impl FnOnce(&crate::engine::Document) -> Result<Vec<u8>, String>,
+) -> Result<bool, String> {
+    control.check()?;
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -558,7 +580,8 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
     {
         return Err("Export alias must resolve to a .png destination".into());
     }
-    if lease.expected.is_some() && request["overwrite"] != true {
+    if lease.expected.is_some() && request["overwrite"] != true && request["skip_existing"] != true
+    {
         return Err(
             "Export destination exists. Confirm overwrite=true or choose a new path.".into(),
         );
@@ -584,9 +607,13 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
         e.doc.clone()
     };
     // Protect sources owned by another project or application instance too.
+    if lease.expected.is_some() && request["skip_existing"] == true {
+        return Ok(false);
+    }
     let project = shared.lock().unwrap().project_id.clone();
     let _ownership = crate::file_ownership::Ownership::save(path, &project)?;
-    let bytes = doc.export_png()?;
+    let bytes = encode(&doc)?;
+    control.check()?;
     let backup = lease.preserve()?;
     let e = shared.lock().unwrap();
     e.ensure_open()?;
@@ -594,12 +621,15 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
         return Err("Project source changed before exporting".into());
     }
     lease.validate()?;
-    atomic_write_checked(path, &bytes, |_| lease.validate())?;
+    atomic_write_checked(path, &bytes, |_| {
+        control.check()?;
+        lease.validate()
+    })?;
     crate::file_safety::published_version(path, &bytes)?;
     if let Some(backup) = backup {
         lease.prune(&backup);
     }
-    Ok(())
+    Ok(true)
 }
 
 pub fn tools() -> Value {
@@ -618,7 +648,9 @@ pub fn tools() -> Value {
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_recovery","description":"List complete instance-local autosave versions and failures. Restore an explicit snapshot into a new independent unsaved project, retaining original files and recovery versions. Returns actual image content with coordinates. Only human input may discard an explicit version; never discard to hide an autosave failure.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","restore","discard"]},"snapshot":{"type":"string"},"actor":{"type":"string"}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_filters","description":"Browse whole-image filter presets; thumbnail renders a standard reference image, preview renders the explicitly targeted current project without history and returns frozen commands. Apply with peerbrush_edit filter.add/update; edit settings, strength, bypass, delete and reorder non-destructively. Top filters run last after the composite. Save/rename/delete/import/export validated instance-local custom presets outside history. Curated presets are immutable. Preview requires current project_id/document_id/expected_revision; original 8/16-bit sources stay editable.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","thumbnail","preview","save","rename","delete","import","export"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"kind":{"type":"string"},"settings":{"type":"object"},"weight":{"type":"number","minimum":0,"maximum":1},"data":{"type":"object"},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_code","description":"Run bounded Rhai code against a frozen native 8/16-bit project, then commit shared commands atomically. start requires explicit project/document/revision, a named AI actor, active owned task, description and declared scopes. Code cannot bypass locks/reservations or read files/network. Returns run ID immediately; status returns completion and actual PNG with document coordinates. cancel or human takeover discards unfinished work. read_pixel, begin_pixels, write_pixel, commit_pixels and edit are documented in capabilities. One undo step; source changes reject the whole run.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","cancel"]},"actor":{"type":"string"},"task":{"type":"string"},"run":{"type":"string"},"description":{"type":"string","maxLength":240},"scopes":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}},"additionalProperties":false}},"script":{"type":"string","maxLength":65536},"max_edge":{"type":"integer","minimum":32,"maximum":1024}},"required":["action","project_id","document_id"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_exports","description":"Native-depth PNG production presets and selected layer/folder batches. list returns instance-local preset revision; save_preset/delete_preset require expected_library_revision and never enter document history. plan/preview/start require observed project_id/document_id/expected_revision. Targets are isolated selected roots with their masks/effects and internal clipping; ancestor folders and document filters are excluded. An empty target list exports the current composite with document filters. Standalone adjustments/clipped layers and protected-source layers require their containing folder/composite. Presets define portable filenames, explicit numbered duplicates, canvas/alpha bounds, transparent padding and named scale variants. PNGs preserve original 8/16-bit channels and ICC tags; no implicit depth/profile conversion. preview returns actual image pixels with document coordinates. start requires an existing output directory and explicit existing-file policy (error by default, skip, or replace); status reports each written/skipped/failed/not-written output. cancel preserves completed PNGs and editable sources. Loaded sources, file ownership, concurrent edits and destination conflicts remain guarded.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","save_preset","delete_preset","plan","preview","start","status","cancel"]},"preset":{"type":"string"},"name":{"type":"string"},"actor":{"type":"string"},"expected_library_revision":{"type":"integer","minimum":0},"targets":{"type":"array","maxItems":1024,"items":{"type":"string"}},"directory":{"type":"string"},"existing":{"type":"string","enum":["error","skip","replace"]},"run":{"type":"string"},"output_index":{"type":"integer","minimum":0,"maximum":63},"max_edge":{"type":"integer","minimum":32,"maximum":1024},"settings":{"type":"object","properties":{"template":{"type":"string","maxLength":160},"crop":{"type":"string","enum":["canvas","alpha"]},"padding":{"type":"integer","minimum":0,"maximum":4096},"resampling":{"type":"string","enum":["nearest","bilinear"]},"duplicate_names":{"type":"string","enum":["error","number"]},"variants":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":48},"scale":{"type":"number","minimum":0.01,"maximum":8}},"required":["name","scale"],"additionalProperties":false}}},"required":["template","crop","padding","resampling","duplicate_names","variants"],"additionalProperties":false}},"required":["action"],"additionalProperties":false}}));
     for tool in tools.as_array_mut().unwrap() {
+        // Project/source properties are added consistently below.
         if !matches!(
             tool["name"].as_str(),
             Some("peerbrush_capabilities" | "peerbrush_brushes")
@@ -718,6 +750,9 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
+    if method == "exports" {
+        return crate::production_export::request(shared, p);
+    }
     if method == "recovery" {
         let workspace = crate::workspace::attach(shared);
         let (dir, error) = {
@@ -1254,6 +1289,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "brush",
                     "color",
                     "filters",
+                    "exports",
                     "selection",
                     "pen",
                     "solo_color",
@@ -1650,6 +1686,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             let method = name.strip_prefix("peerbrush_").unwrap_or(name);
             if ![
                 "capabilities",
+                "exports",
                 "brushes",
                 "tool_settings",
                 "filters",
@@ -2427,6 +2464,12 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().filter_library.lock().unwrap() = library;
+    let library =
+        crate::production_export::library::Library::load(state_dir.join("export-presets.json"));
+    if let Some(error) = &library.error {
+        shared.lock().unwrap().status = error.clone();
+    }
+    *shared.lock().unwrap().export_library.lock().unwrap() = library;
     let workspace = crate::workspace::attach(&shared);
     workspace.lock().unwrap().recovery_dir = Some(state_dir.clone());
     // Preserve the preceding session's index before the running session updates its own.
@@ -2682,6 +2725,51 @@ pub fn stdio(state_dir: &Path) -> Result<(), String> {
 mod save_loss_tests {
     use super::*;
     use crate::engine::Document;
+
+    #[test]
+    fn derived_exports_refuse_later_human_work_and_cancellation_at_publication() {
+        for depth in [8, 16] {
+            for cancel in [false, true] {
+                let root =
+                    std::env::temp_dir().join(format!("peerbrush-export-race-{}", engine::id()));
+                std::fs::create_dir_all(&root).unwrap();
+                let path = root.join("Original.png");
+                let mut engine = Engine::new();
+                engine.doc = Document::new_depth(8, 6, depth).unwrap();
+                let shared = Arc::new(Mutex::new(engine));
+                export(&shared, &path).unwrap();
+                let original = std::fs::read(&path).unwrap();
+                let source = shared.lock().unwrap().doc.clone();
+                let before = serde_json::to_value(&source).unwrap();
+                let control = crate::production_export::Control::default();
+                let error=export_derived_guarded(&shared,&path,&json!({"document_id":source.id,"expected_revision":source.revision,"overwrite":true}),&control,|doc|{
+                let bytes=doc.export_png()?;
+                if cancel {control.cancel();} else {shared.lock().unwrap().edit("human",&[json!({"op":"fill","layer":source.layers[0].id,"rect":[1,2,3,4],"color":[53,97,173,255]})],None,None,"Later human pixels")?;}
+                Ok(bytes)
+            }).unwrap_err();
+                assert!(
+                    error.contains(if cancel { "canceled" } else { "source changed" }),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                let engine = shared.lock().unwrap();
+                assert_eq!(engine.saved_revision, 0);
+                if cancel {
+                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                    assert!(engine.undo.is_empty());
+                } else {
+                    assert_eq!(
+                        engine.doc.layers[0].pixels.get16(1, 2),
+                        [53 * 257, 97 * 257, 173 * 257, 65535]
+                    );
+                    assert_eq!(engine.undo.len(), 1);
+                }
+                drop(engine);
+                drop(shared);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn accepted_output_cannot_publish_over_later_human_work() {

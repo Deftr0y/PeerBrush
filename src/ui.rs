@@ -7,6 +7,7 @@ mod calibration;
 mod color;
 mod compatibility;
 mod effects;
+mod exports;
 mod file_drop;
 mod file_ownership;
 mod filename;
@@ -441,6 +442,7 @@ pub struct PeerBrush {
     read_only_info: Option<String>,
     save_report: Option<crate::compatibility::SaveReport>,
     save_loss_review: Option<compatibility::SaveReview>,
+    export_editor: Option<exports::Editor>,
     new_width: u32,
     new_bit_depth: u16,
     new_height: u32,
@@ -766,6 +768,7 @@ impl PeerBrush {
             read_only_info: None,
             save_report: None,
             save_loss_review: None,
+            export_editor: None,
             new_width: 1024,
             new_bit_depth: 8,
             new_height: 768,
@@ -4201,6 +4204,10 @@ impl PeerBrush {
             if panel == "saved_versions" {
                 self.recover_previous_save();
             }
+            if panel == "exports" {
+                let doc = self.shared.lock().unwrap().doc.clone();
+                self.open_exports(&doc);
+            }
             if panel == "save_report" {
                 self.open_save_report();
             } else {
@@ -4606,6 +4613,10 @@ impl PeerBrush {
                         }
                         if ui.button("Export PNG...").clicked() {
                             self.export();
+                            ui.close_menu();
+                        }
+                        if ui.button("Production export…").clicked() {
+                            self.open_exports(&doc);
                             ui.close_menu();
                         }
                     });
@@ -5041,6 +5052,7 @@ impl PeerBrush {
         self.geometry_window(ctx, &doc);
         self.source_window(ctx, &doc);
         self.filters_window(ctx, &doc);
+        self.exports_window(ctx, &doc);
         self.protection_window(ctx, &doc);
         self.compatibility_window(ctx, &doc);
         if self.show_new {
@@ -5185,6 +5197,7 @@ impl PeerBrush {
     fn finish_capture(&mut self, ctx: &egui::Context, drawn_generation: u64) {
         let time = ctx.input(|i| i.time);
         let ready = !self.pending
+            && self.exports_capture_ready()
             && drawn_generation == self.canvas_generation
             && time >= self.capture_ready_at
             && !self.animation.fading()
@@ -5213,6 +5226,7 @@ impl eframe::App for PeerBrush {
         self.draw(ctx);
     }
     fn on_exit(&mut self) {
+        crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
         self.store_current_tool_profile();
         if let Err(error) = self.tool_settings_store.lock().unwrap().flush() {
             eprintln!("PeerBrush: tool settings not saved: {error}");

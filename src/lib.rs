@@ -35,6 +35,7 @@ pub mod merge;
 pub mod path;
 pub mod placement;
 pub mod preview;
+pub mod production_export;
 pub mod psd;
 pub mod raster;
 pub mod recovery;
