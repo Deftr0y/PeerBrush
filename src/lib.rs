@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod code;
 pub mod collaboration;
 pub mod color_profile;
+pub mod compatibility;
 pub mod compositor;
 pub mod controls;
 pub mod depth16;

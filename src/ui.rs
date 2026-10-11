@@ -5,6 +5,7 @@ mod brush;
 mod brush_toolbar_tests;
 mod calibration;
 mod color;
+mod compatibility;
 mod effects;
 mod file_drop;
 mod file_ownership;
@@ -436,6 +437,7 @@ pub struct PeerBrush {
     load_preview: Option<TextureHandle>,
     show_new: bool,
     read_only_info: Option<String>,
+    save_report: Option<crate::compatibility::SaveReport>,
     new_width: u32,
     new_bit_depth: u16,
     new_height: u32,
@@ -757,6 +759,7 @@ impl PeerBrush {
             load_preview: None,
             show_new: false,
             read_only_info: None,
+            save_report: None,
             new_width: 1024,
             new_bit_depth: 8,
             new_height: 768,
@@ -3918,6 +3921,11 @@ impl PeerBrush {
             if panel == "saved_versions" {
                 self.recover_previous_save();
             }
+            if panel == "save_report" {
+                self.open_save_report();
+            } else {
+                self.save_report = None;
+            }
             self.read_only_info = if panel == "document_info" || panel == "document_sources" {
                 let id = self.shared.lock().unwrap().doc.id.clone();
                 ctx.data_mut(|data| {
@@ -4427,6 +4435,10 @@ impl PeerBrush {
                             self.save(true);
                             ui.close_menu();
                         }
+                        if ui.button("PSD compatibility…").clicked() {
+                            self.open_save_report();
+                            ui.close_menu();
+                        }
                         ui.separator();
                         if ui.button("Import images...").clicked() {
                             self.import();
@@ -4847,6 +4859,7 @@ impl PeerBrush {
         self.source_window(ctx, &doc);
         self.filters_window(ctx, &doc);
         self.protection_window(ctx, &doc);
+        self.compatibility_window(ctx, &doc);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")
@@ -8727,6 +8740,65 @@ mod tests {
         assert!(!app.show_connection);
         assert_eq!(app.message, "Ready in Codex. Reload its MCP tools.");
         assert!(app.shared.lock().unwrap().mcp_clients.is_empty());
+    }
+    #[test]
+    fn compatibility_report_is_view_only_and_closes_when_the_source_changes() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc = Document::new_depth(8, 8, depth).unwrap();
+                engine.doc.layers[0].effects.push(crate::effects::Effect {
+                    id: crate::engine::id(),
+                    kind: "invert".into(),
+                    enabled: true,
+                    weight: 1.,
+                    settings: json!({}),
+                });
+                app.selected = engine.doc.layers[0].id.clone();
+            }
+            let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+            let original = app.shared.lock().unwrap().doc.export_png().unwrap();
+            app.workspace_root.lock().unwrap().capture_panel = Some("save_report".into());
+            let draw = |app: &mut PeerBrush| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            };
+            let mut output = draw(&mut app);
+            for _ in 0..4 {
+                output = draw(&mut app);
+            }
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("PSD / PSB compatibility"));
+            assert!(text.contains("Layer effects are baked"));
+            assert!(text.contains("no profile conversion"));
+            assert_eq!(
+                serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+                before
+            );
+            assert_eq!(
+                app.shared.lock().unwrap().doc.export_png().unwrap(),
+                original
+            );
+            assert!(app.shared.lock().unwrap().undo.is_empty());
+            app.shared.lock().unwrap().doc.revision += 1;
+            frame(&mut app, &ctx, vec![], Default::default());
+            assert!(app.save_report.is_none());
+            assert!(app.message.contains("Document changed"));
+        }
     }
     #[test]
     fn protected_photoshop_report_is_view_only_and_bound_to_the_current_source() {

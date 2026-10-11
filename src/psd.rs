@@ -206,6 +206,55 @@ fn standard_clipping(doc: &Document) -> bool {
     })
 }
 
+pub(crate) struct StandardPlan {
+    pub composite: bool,
+    pub hidden_sources: bool,
+}
+pub(crate) fn standard_plan(doc: &Document) -> StandardPlan {
+    StandardPlan {
+        composite: !doc.filters.is_empty()
+            || doc.layers.iter().any(|layer| layer.kind == "adjustment")
+            || !standard_clipping(doc),
+        hidden_sources: !doc.filters.is_empty(),
+    }
+}
+pub(crate) fn standard_order(doc: &Document) -> Vec<(&Layer, u32)> {
+    fn collect<'a>(doc: &'a Document, parent: Option<&str>, out: &mut Vec<(&'a Layer, u32)>) {
+        for layer in doc
+            .layers
+            .iter()
+            .filter(|layer| layer.parent.as_deref() == parent)
+        {
+            if layer.kind == "group" && crate::effects::active(layer) {
+                out.push((layer, 0));
+            } else if layer.kind == "group" {
+                out.push((layer, 1));
+                collect(doc, Some(&layer.id), out);
+                out.push((layer, 3));
+            } else {
+                out.push((layer, 0));
+            }
+        }
+    }
+    let mut out = vec![];
+    collect(doc, None, &mut out);
+    out
+}
+pub(crate) fn standard_bounds(doc: &Document, layer: &Layer, section: u32) -> [i32; 4] {
+    if section != 0 {
+        [0; 4]
+    } else if crate::effects::canvas_frame(layer) {
+        [0, 0, doc.width as i32, doc.height as i32]
+    } else {
+        [
+            layer.x,
+            layer.y,
+            layer.x + layer.pixels.width as i32,
+            layer.y + layer.pixels.height as i32,
+        ]
+    }
+}
+
 fn default_blending_ranges(bytes: &[u8], channels: u16) -> bool {
     bytes.is_empty()
         // Photoshop may include transparency/mask channel pairs in addition to
@@ -426,10 +475,8 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     };
     // Ordinary raster clipping remains standard, editable PSD layer data.
     // Adjustments and unsupported clipping units still need a standard bake.
-    let baked = if !doc.filters.is_empty()
-        || doc.layers.iter().any(|l| l.kind == "adjustment")
-        || !standard_clipping(doc)
-    {
+    let plan = standard_plan(doc);
+    let baked = if plan.composite {
         let mut layer = Layer::new(
             "PeerBrush composite · editable sources in PeerBrush",
             "paint",
@@ -450,7 +497,7 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     // Keep standard original raster/mask channels alongside a visible filtered
     // composite. Their root visibility is presentation-only in the saved PSD;
     // private sources retain the actual editable visibility and filter stack.
-    let standard_sources = if !doc.filters.is_empty() {
+    let standard_sources = if plan.hidden_sources {
         let mut source = doc.clone();
         source.filters.clear();
         for layer in &mut source.layers {
@@ -462,27 +509,13 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     } else {
         None
     };
-    fn order<'a>(doc: &'a Document, parent: Option<&str>, out: &mut Vec<(&'a Layer, u32)>) {
-        for l in doc.layers.iter().filter(|l| l.parent.as_deref() == parent) {
-            if l.kind == "group" && crate::effects::active(l) {
-                // A group effect is baked as one standard raster layer; embedded sources retain its editable children.
-                out.push((l, 0));
-            } else if l.kind == "group" {
-                out.push((l, 1));
-                order(doc, Some(&l.id), out);
-                out.push((l, 3));
-            } else {
-                out.push((l, 0));
-            }
-        }
-    }
     if let Some(layer) = &baked {
         ordered.push((layer, 0));
         if let Some(source) = &standard_sources {
-            order(source, None, &mut ordered);
+            ordered.extend(standard_order(source));
         }
     } else {
-        order(doc, None, &mut ordered);
+        ordered.extend(standard_order(doc));
     }
     let empty_layer = Layer::new("Canvas", "paint", doc.width, doc.height);
     if ordered.is_empty() {
@@ -496,21 +529,8 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     let mut records = vec![];
     let mut channels = vec![];
     for (l, section) in &ordered {
-        let canvas_frame = crate::effects::canvas_frame(l);
-        let (w, h) = if *section == 0 {
-            if canvas_frame {
-                (doc.width, doc.height)
-            } else {
-                (l.pixels.width, l.pixels.height)
-            }
-        } else {
-            (0, 0)
-        };
-        let (x, y) = if *section == 0 && !canvas_frame {
-            (l.x, l.y)
-        } else {
-            (0, 0)
-        };
+        let [x, y, right, bottom] = standard_bounds(doc, l, *section);
+        let (w, h) = ((right - x) as u32, (bottom - y) as u32);
         i32b(&mut records, y);
         i32b(&mut records, x);
         i32b(&mut records, y + h as i32);

@@ -24,6 +24,8 @@ args = ["mcp"]
 
 Codex shares MCP configuration across desktop, CLI and IDE. Restart Codex or start a fresh session after registering to load the tools. [Official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
+Unreleased: `peerbrush_document` / CLI `document` with `action:"save_report"`, observed `document_id` and `expected_revision` returns a view-only [PSD/PSB compatibility report](photoshop-fidelity.md#save-compatibility-report-unreleased). Include `project_id` for an explicit project. The report derives standard layer representation, bounds, baking and supplementary-source limitations from the same plan as the encoder; `has_editability_losses` flags those limits. No file is written, no profile is converted and history stays unchanged. A stale source is refused. Explicit lossy-save acceptance and receiving-application validation remain separate queued work.
+
 Tools: `peerbrush_observe`, `peerbrush_edit`, `peerbrush_proposal`, `peerbrush_task`, `peerbrush_document`, `peerbrush_history`, `peerbrush_capabilities`, `peerbrush_place_image`, `peerbrush_segment`, `peerbrush_brushes`, and `peerbrush_projects`.
 
 Use `peerbrush_projects` with `action:"list"` to discover stable project IDs. Observe the intended `project_id`, then supply that ID, its `document_id` and exact `expected_revision` for every targeted mutation. Background edits never select the visible tab. `projects:new/open` creates another independent project; only human input can request activation or select a tab. The older `document:new/open` actions remain explicit replacements with dirty/source guards. See [project actions and transfer examples](projects.md).
