@@ -3961,7 +3961,7 @@ impl PeerBrush {
             self.request_close(lifecycle::Intent::Close(id));
         }
     }
-    // Commands before selection release must not act on old coverage. Require
+    // Commands before selection completion must not act on old coverage. Require
     // an explicit retry; never retain delayed destructive/clipboard work.
     fn hold_canvas_selection_shortcuts(
         &self,
@@ -3969,7 +3969,6 @@ impl PeerBrush {
         doc: &Document,
     ) -> Option<Vec<egui::Event>> {
         if !matches!(self.tool, Tool::Selection | Tool::MagicWand)
-            || ["polygon", "magnetic"].contains(&self.selection_kind.as_str())
             || self.lifecycle.is_some()
             || self.lifecycle_frame
             || self.shortcuts.open
@@ -4014,7 +4013,9 @@ impl PeerBrush {
                 input.events.len(),
             )
         });
-        if !focused || release.is_none() && !primary_down {
+        let path_tool = self.tool == Tool::Selection
+            && ["polygon", "magnetic"].contains(&self.selection_kind.as_str());
+        if !focused || !path_tool && release.is_none() && !primary_down {
             return None;
         }
         let press = press.filter(|(_, pos)| {
@@ -4023,16 +4024,33 @@ impl PeerBrush {
             })
         });
         let owner = self.canvas_press_document.as_deref() == Some(doc.id.as_str());
-        let start = if owner { 0 } else { press?.0 };
-        let end = release.unwrap_or(event_count);
+        let start = if owner || path_tool && !self.selection_path.is_empty() {
+            0
+        } else {
+            press?.0
+        };
+        // A path spans clicks and remains unfinished after mouse release.
+        // Enter/double-click can finish it later in this frame; require a new
+        // shortcut after that commit rather than using previous coverage.
+        let end = if path_tool {
+            event_count
+        } else {
+            release.unwrap_or(event_count)
+        };
         ctx.input_mut(|input| {
             let original = input.events.clone();
             input.events = original
                 .iter()
                 .enumerate()
                 .filter(|(index, event)| {
+                    let remove_anchor = path_tool
+                        && !self.selection_path.is_empty()
+                        && matches!(event,
+                        egui::Event::Key { key: egui::Key::Delete, pressed: true, modifiers, .. }
+                            if !modifiers.any());
                     !(*index >= start
                         && *index < end
+                        && !remove_anchor
                         && self.shortcuts.selection_dependent_event(event))
                 })
                 .map(|(_, event)| event.clone())
@@ -5097,7 +5115,15 @@ impl PeerBrush {
         if let Some(original) = held_selection_shortcuts {
             ctx.input_mut(|i| i.events = original);
             if show_held_shortcut_message && !self.selection_commit_failed {
-                self.message = if ctx.input(|i| i.pointer.primary_down()) {
+                self.message = if self.tool == Tool::Selection
+                    && ["polygon", "magnetic"].contains(&self.selection_kind.as_str())
+                {
+                    if self.selection_path.is_empty() {
+                        "Selection path ended; retry the shortcut"
+                    } else {
+                        "Finish or cancel the selection path, then retry the shortcut"
+                    }
+                } else if ctx.input(|i| i.pointer.primary_down()) {
                     "Release the selection gesture, then retry the shortcut"
                 } else {
                     "Selection gesture ended; retry the shortcut"
@@ -11196,6 +11222,217 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn unfinished_selection_paths_require_explicit_clipboard_or_transform_retry() {
+        for depth in [8, 16] {
+            for kind in ["polygon", "magnetic"] {
+                for action in ["copy", "cut", "paste", "move", "rotate", "scale"] {
+                    let (mut app, ctx, point, _) =
+                        pressed_selection_fixture(depth, Tool::Selection, kind);
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![primary_release(point)],
+                        Default::default(),
+                    );
+                    let before = {
+                        let mut engine = app.shared.lock().unwrap();
+                        engine
+                            .edit(
+                                "human",
+                                &[json!({"op":"selection","kind":"rectangle","rect":[0,0,2,2]})],
+                                None,
+                                None,
+                                "Previous selection",
+                            )
+                            .unwrap();
+                        engine.undo.clear();
+                        engine.doc.clone()
+                    };
+                    app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
+                    let path = app.selection_path.clone();
+                    let event = match action {
+                        "copy" => egui::Event::Copy,
+                        "cut" => egui::Event::Cut,
+                        "paste" => egui::Event::Paste(String::new()),
+                        "move" => shortcut_press(egui::Key::W),
+                        "rotate" => shortcut_press(egui::Key::E),
+                        _ => shortcut_press(egui::Key::R),
+                    };
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![egui::Event::PointerMoved(Pos2::new(1., 1.)), event.clone()],
+                        Default::default(),
+                    );
+                    assert!(app.tool == Tool::Selection);
+                    assert_eq!(app.selection_path, path);
+                    assert!(app.message.contains("Finish or cancel the selection path"));
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&engine.doc).unwrap(),
+                            serde_json::to_value(&before).unwrap()
+                        );
+                        assert!(engine.undo.is_empty());
+                    }
+                    assert!(matches!(
+                        app.clipboard
+                            .replies
+                            .recv_timeout(Duration::from_millis(30)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    let release_key = |event: &egui::Event| {
+                        if let egui::Event::Key {
+                            key,
+                            physical_key,
+                            modifiers,
+                            ..
+                        } = event
+                        {
+                            Some(egui::Event::Key {
+                                key: *key,
+                                physical_key: *physical_key,
+                                modifiers: *modifiers,
+                                pressed: false,
+                                repeat: false,
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    frame(
+                        &mut app,
+                        &ctx,
+                        release_key(&event).into_iter().collect(),
+                        Default::default(),
+                    );
+                    // Completing the path and requesting work in one frame must
+                    // still require a retry; no work is queued behind the commit.
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![shortcut_press(egui::Key::Enter), event.clone()],
+                        Default::default(),
+                    );
+                    assert!(app.tool == Tool::Selection);
+                    assert!(app.selection_path.is_empty());
+                    assert!(app.message.contains("Selection path ended"));
+                    assert!(matches!(
+                        app.clipboard
+                            .replies
+                            .recv_timeout(Duration::from_millis(30)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        assert_eq!(engine.doc.selection, Some([4, 5, 12, 13]));
+                        assert_eq!(
+                            engine.doc.layers[0].pixels.rgba16(),
+                            before.layers[0].pixels.rgba16()
+                        );
+                        assert_eq!(engine.undo.len(), 1);
+                    }
+                    let mut releases = vec![egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: Some(egui::Key::Enter),
+                        modifiers: Default::default(),
+                        pressed: false,
+                        repeat: false,
+                    }];
+                    releases.extend(release_key(&event));
+                    frame(&mut app, &ctx, releases, Default::default());
+                    if action == "paste" {
+                        continue;
+                    }
+                    frame(&mut app, &ctx, vec![event], Default::default());
+                    if matches!(action, "copy" | "cut") {
+                        let reply = app
+                            .clipboard
+                            .replies
+                            .recv_timeout(Duration::from_secs(3))
+                            .unwrap();
+                        assert!(reply.result.is_ok(), "{:?}", reply.result);
+                    }
+                    match action {
+                        "move" => assert!(app.tool == Tool::Move),
+                        "rotate" => assert!(app.tool == Tool::Rotate),
+                        "scale" => assert!(app.tool == Tool::Scale),
+                        _ => {}
+                    }
+                    let mut engine = app.shared.lock().unwrap();
+                    for y in 0..32 {
+                        for x in 0..32 {
+                            assert_eq!(
+                                engine.doc.layers[0].pixels.get16(x, y),
+                                if action == "cut" && (4..12).contains(&x) && (5..13).contains(&y) {
+                                    [0; 4]
+                                } else {
+                                    before.layers[0].pixels.get16(x, y)
+                                }
+                            );
+                        }
+                    }
+                    if action == "cut" {
+                        engine.undo("human").unwrap();
+                    }
+                    engine.undo("human").unwrap();
+                    assert_eq!(engine.doc.selection, before.selection);
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        before.export_png().unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_path_shortcut_guard_preserves_anchor_delete_and_escape() {
+        for depth in [8, 16] {
+            for kind in ["polygon", "magnetic"] {
+                let (mut app, ctx, point, before) =
+                    pressed_selection_fixture(depth, Tool::Selection, kind);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![primary_release(point), egui::Event::Cut],
+                    Default::default(),
+                );
+                assert_eq!(app.selection_path.len(), 1);
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                app.selection_path.push([12., 5.]);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![shortcut_press(egui::Key::Delete)],
+                    Default::default(),
+                );
+                assert_eq!(app.selection_path.len(), 1);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::Copy, shortcut_press(egui::Key::Escape)],
+                    Default::default(),
+                );
+                assert!(app.selection_path.is_empty());
+                let engine = app.shared.lock().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                assert!(engine.undo.is_empty());
+                drop(engine);
+                assert!(matches!(
+                    app.clipboard
+                        .replies
+                        .recv_timeout(Duration::from_millis(30)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+            }
+        }
+    }
+
     #[test]
     fn rectangle_gestures_keep_shortcuts_safe_and_escape_cancels_through_release() {
         for depth in [8, 16] {
