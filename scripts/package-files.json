@@ -274,7 +274,10 @@
     "tests/psd_patterns.rs",
     "src/effects/gradient.rs",
     "src/ui/gradient_stops.rs",
-    "tests/gradient_stops.rs"
+    "tests/gradient_stops.rs",
+    "src/effects/contours.rs",
+    "src/ui/contour_points.rs",
+    "tests/custom_contours.rs"
   ],
   "portable": [
     "LICENSE",

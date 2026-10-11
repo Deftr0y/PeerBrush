@@ -6,6 +6,7 @@ mod brush_toolbar_tests;
 mod calibration;
 mod color;
 mod compatibility;
+mod contour_points;
 mod effects;
 mod exports;
 mod file_drop;

@@ -26,6 +26,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 ("cone", "Cone"),
                 ("ring", "Ring"),
                 ("smooth", "Smooth"),
+                ("custom", "Custom"),
             ],
         ),
         (
@@ -112,6 +113,11 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                         let r = ui.selectable_value(&mut selected, id.into(), label);
                         if r.changed() {
                             value[key] = json!(selected);
+                            if key == "contour" {
+                                if selected == "custom" {
+                                    value["contour_points"] = json!([{"position":0.,"value":0.},{"position":1.,"value":1.}]);
+                                } else { value.as_object_mut().unwrap().remove("contour_points"); }
+                            }
                             if key == "pattern" && selected != "bitmap" {
                                 for key in crate::effects::styles::bitmap_defaults()
                                     .as_object()
@@ -271,6 +277,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
     if kind == "gradient_overlay" {
         changed = gradient_stops::controls(ui, value).or(changed);
     }
+    changed = contour_points::controls(ui, value).or(changed);
     for (key, label) in [
         ("reverse", "Reverse"),
         ("invert", "Invert"),

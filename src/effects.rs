@@ -12,6 +12,7 @@ pub const BUDGET: usize = 256 * 1024 * 1024;
 pub const WORKING_BUDGET: usize = 256 * 1024 * 1024;
 pub mod catalog;
 pub mod channel_clamp;
+pub mod contours;
 pub mod gradient;
 pub mod patterns;
 pub mod posterize;
@@ -173,6 +174,9 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
     }
     if !v.is_object() {
         return Err("Effect settings must be an object".into());
+    }
+    if v.get("contour_points").is_some() && !contours::contains(kind) {
+        return Err("Custom contour points are unsupported for this effect".into());
     }
     if styles::contains(kind) {
         return styles::validate(kind, v);

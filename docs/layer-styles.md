@@ -9,7 +9,7 @@ Unreleased source diagnostics now inspect bounded `lfx2`/`lmfx` descriptors and 
 | Effect | Available settings |
 | --- | --- |
 | Bevel & Emboss | Inner/Outer/Emboss/Pillow, size, soften, depth, light angle/altitude, Up/Down, highlight/shadow colors, contour, opacity and blend |
-| Contour | Linear/Cone/Ring/Smooth profile, range, invert, opacity and blend; maps the incoming relief/tone |
+| Contour | Linear/Cone/Ring/Smooth/Custom profile, range, invert, opacity and blend; maps the incoming relief/tone |
 | Texture | Embedded native bitmap PNG with tile transforms and sampling, or Checker/Stripes/Dots/Noise; lighting angle, depth, shadow/highlight colors, opacity and blend |
 | Stroke | Circular outline size, Inside/Outside/Center, color, opacity and blend |
 | Inner Shadow | Size, distance, angle, choke, contour, color, opacity and blend |
@@ -87,3 +87,9 @@ Supported Photoshop overlay imports now retain supported raster masks and layer 
 Plain Photoshop Gradient Overlay import additionally supports Linear/Reflected at the horizontal/vertical cardinal axes, retaining angle, reverse and all stop definitions (QA pending). Unscaled document alignment, exact native composite matching and the existing color/interpolation limits remain mandatory.
 
 Supported overlay-only styles also retain validated default raster clipping groups (QA pending). Original foreground/base samples and clipping relationships remain editable; standard saves bake the overlay appearance while retaining clipping. Missing/incompatible bases and unsupported clipping structures stay protected.
+
+## Custom contours (unreleased; QA pending)
+
+Contour, Bevel & Emboss, Inner Shadow, Inner Glow, Satin, Outer Glow and Drop Shadow offer a Custom contour with a compact point editor. Each curve has 2–16 points with strictly increasing normalized positions and fixed 0/100% endpoints; values are independently bounded to 0–100% and can rise or fall. Piecewise linear mapping uses native channels. Add inserts a sampled point into the largest gap without changing the curve; remove affects interior points. Endpoint values remain editable. Selecting a preset removes the custom definition in the same shared edit.
+
+MCP/CLI settings use `contour:"custom"` and `contour_points:[{"position":0,"value":0},{"position":1,"value":1}]`. Unknown fields, invalid endpoints, duplicate positions, excessive counts and points attached to presets or unrelated effects reject atomically. Curves are prepared once per effect render; previews and history keep the ordinary shared command path, reservations and original native raster/mask sources. Supplementary PSD/PSB source format 21 retains even disabled definitions alongside current standard rasters and merged composites. Older readers protect newer sources. Native8/16 mapping, gesture, protocol, undo/save and malformed-source coverage is queued for combined QA. This adds native contour controls; it does not import Photoshop contour descriptors or establish Photoshop relief/shadow equivalence.

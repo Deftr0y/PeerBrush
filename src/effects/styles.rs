@@ -123,10 +123,14 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
             && !(bitmap && bitmap_defaults.get(key).is_some())
             && !(kind == "gradient_overlay"
                 && matches!(key.as_str(), "color_stops" | "alpha_stops"))
+            && !(crate::effects::contours::contains(kind) && key == "contour_points")
         {
             return Err(format!("Unsupported {kind} setting: {key}"));
         }
         match key.as_str() {
+            "contour_points" => {
+                crate::effects::contours::Curve::decode(v)?;
+            }
             "color_stops" | "alpha_stops" => {
                 crate::effects::gradient::validate(v, key == "alpha_stops")?
             }
@@ -155,7 +159,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                     return Err(format!("{key} must be true or false"));
                 }
             }
-            "contour" => choice(v, &["linear", "cone", "ring", "smooth"], key)?,
+            "contour" => choice(v, &["linear", "cone", "ring", "smooth", "custom"], key)?,
             "pattern" if matches!(kind, "pattern_overlay" | "texture") => {
                 choice(v, &["checker", "stripes", "dots", "noise", "bitmap"], key)?
             }
@@ -199,6 +203,11 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                 }
             }
         }
+    }
+    if value["contour"] == "custom" {
+        crate::effects::contours::Curve::decode(&value["contour_points"])?;
+    } else if value.get("contour_points").is_some() {
+        return Err("Contour points require the Custom contour".into());
     }
     if bitmap {
         crate::effects::patterns::get(
@@ -369,7 +378,19 @@ pub fn apply(
     let opacity = number(v, "opacity");
     let bitmap = crate::effects::patterns::from_settings(kind, v)?;
     let blend = v["blend"].as_str().unwrap_or("normal");
-    let contour = v["contour"].as_str().unwrap_or("linear");
+    let curve = if v["contour"] == "custom" {
+        Some(crate::effects::contours::Curve::decode(
+            &v["contour_points"],
+        )?)
+    } else {
+        None
+    };
+    let contour = |position| {
+        curve.as_ref().map_or_else(
+            || profile(position, v["contour"].as_str().unwrap_or("linear")),
+            |curve| curve.sample(position),
+        )
+    };
     for y in 0..h {
         for x in 0..w {
             let at = (y * w + x) * 4;
@@ -447,17 +468,16 @@ pub fn apply(
                         + f64::from(original[1]) * 0.7152
                         + f64::from(original[2]) * 0.0722)
                         / 65535.;
-                    let mut mapped = profile(luma / range, contour);
+                    let mut mapped = contour(luma / range);
                     if v["invert"] == true {
                         mapped = 1. - mapped;
                     }
                     tint = [word(mapped); 3];
                 }
                 "outer_glow" => {
-                    coverage = profile(
-                        (field[y * w + x] / (1. - number(v, "spread")).max(0.01)).min(1.),
-                        contour,
-                    ) * (1. - a);
+                    coverage =
+                        contour((field[y * w + x] / (1. - number(v, "spread")).max(0.01)).min(1.))
+                            * (1. - a);
                     behind = true;
                     outside = true;
                 }
@@ -467,35 +487,29 @@ pub fn apply(
                     } else {
                         1. - field[y * w + x]
                     };
-                    coverage = profile(
-                        (coverage / (1. - number(v, "spread")).max(0.01)).min(1.),
-                        contour,
-                    );
+                    coverage = contour((coverage / (1. - number(v, "spread")).max(0.01)).min(1.));
                 }
                 "drop_shadow" => {
-                    coverage = profile(
+                    coverage = contour(
                         (sample(&field, w, h, x as f64 - dx, y as f64 - dy)
                             / (1. - number(v, "spread")).max(0.01))
                         .min(1.),
-                        contour,
                     );
                     behind = true;
                     outside = true;
                 }
                 "inner_shadow" => {
-                    coverage = profile(
+                    coverage = contour(
                         ((1. - sample(&field, w, h, x as f64 - dx, y as f64 - dy))
                             / (1. - number(v, "spread")).max(0.01))
                         .min(1.),
-                        contour,
                     );
                 }
                 "satin" => {
-                    coverage = profile(
+                    coverage = contour(
                         (sample(&field, w, h, x as f64 + dx, y as f64 + dy)
                             - sample(&field, w, h, x as f64 - dx, y as f64 - dy))
                         .abs(),
-                        contour,
                     );
                     if v["invert"] == true {
                         coverage = 1. - coverage;
@@ -516,7 +530,7 @@ pub fn apply(
                     if v["style"] == "pillow" {
                         light *= 2. * field[y * w + x] - 1.;
                     }
-                    coverage = profile(light.abs().min(1.), contour);
+                    coverage = contour(light.abs().min(1.));
                     tint = if light >= 0. { color } else { color2 };
                     if matches!(v["style"].as_str(), Some("outer" | "emboss")) {
                         outside = true;
