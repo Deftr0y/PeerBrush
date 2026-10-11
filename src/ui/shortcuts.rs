@@ -136,7 +136,7 @@ impl Shortcuts {
         }
         this
     }
-    fn allowed(key: egui::Key) -> bool {
+    pub(super) fn allowed(key: egui::Key) -> bool {
         matches!(
             key,
             egui::Key::A
