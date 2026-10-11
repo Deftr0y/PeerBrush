@@ -4420,7 +4420,7 @@ impl PeerBrush {
                         let ai=self.tool_preferences_ai(time);
                         liquify::toolbar(ui, &mut self.radius, &mut self.liquify,radius,strength,ai);
                     }
-                    self.transform_snap_toolbar(ui);
+                    self.transform_snap_toolbar(ui, &doc);
                     self.retouch_toolbar(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::button(ui, Icon::Frame, "Frame selection or canvas · F").clicked()

@@ -7,10 +7,31 @@ pub const MOVE_SNAP: f64 = 8.0;
 pub const ANGLE_SNAP: f64 = 15.0;
 pub const SCALE_SNAP: f64 = 0.1;
 
+/// Positive scale magnitudes and explicit reflection flags share one interpretation.
+pub fn scales(c: &Value) -> Result<(f64, f64), String> {
+    let axis = |name: &str, mirror: &str| {
+        let value = c.get(name).map_or(Ok(1.), |v| {
+            v.as_f64().ok_or("Transform scale must be a number")
+        })?;
+        let reflected = c.get(mirror).map_or(Ok(false), |v| {
+            v.as_bool()
+                .ok_or("Transform mirror flags must be true or false")
+        })?;
+        if !value.is_finite() || !(0.05..=20.).contains(&value) {
+            return Err("Transform scale must be 0.05–20".to_string());
+        }
+        Ok(if reflected { -value } else { value })
+    };
+    Ok((axis("scale_x", "mirror_x")?, axis("scale_y", "mirror_y")?))
+}
+
 /// Resolve document-space snapping before previews, reservations and history.
 pub fn resolve_command(command: &Value) -> Result<Value, String> {
     if !matches!(command["op"].as_str(), Some("move" | "transform")) {
         return Ok(command.clone());
+    }
+    if command["op"] == "transform" {
+        scales(command)?;
     }
     let Some(snap) = command.get("snap") else {
         return Ok(command.clone());
@@ -49,6 +70,9 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
 }
 pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> {
     for command in &mut commands {
+        if command["op"] == "transform" {
+            scales(command)?;
+        }
         if command.get("snap").is_some()
             && matches!(command["op"].as_str(), Some("move" | "transform"))
         {
@@ -132,7 +156,8 @@ pub fn selection_with_coverage(
     let (sx, sy) = if moving {
         (1., 1.)
     } else {
-        (n("scale_x", 1.), n("scale_y", 1.))
+        let (sx, sy) = scales(c)?;
+        (sx as f32, sy as f32)
     };
     let (sin, cos) = if moving {
         (0., 1.)
@@ -186,7 +211,8 @@ fn selection_impl(
     let (sx, sy) = if move_only {
         (1.0, 1.0)
     } else {
-        (n("scale_x", 1.0), n("scale_y", 1.0))
+        let (sx, sy) = scales(c)?;
+        (sx as f32, sy as f32)
     };
     let px = c["pivot"][0]
         .as_f64()
@@ -197,8 +223,8 @@ fn selection_impl(
     if ![dx, dy, angle, px, py]
         .iter()
         .all(|v| v.is_finite() && v.abs() <= 100000.0)
-        || !(0.05..=20.0).contains(&sx)
-        || !(0.05..=20.0).contains(&sy)
+        || !(0.05..=20.0).contains(&sx.abs())
+        || !(0.05..=20.0).contains(&sy.abs())
     {
         return Err("Invalid selection transform".into());
     }
@@ -308,13 +334,24 @@ fn selection_impl(
         }
     }
     let expanded = (left, top, w, h) != (ox, oy, layer.pixels.width, layer.pixels.height);
+    let shift_unedited = |source: &Raster| {
+        let mut shifted = copy_shift(source, w, h, ox - left, oy - top);
+        shifted.retained = source.retained.clone();
+        if let Some(original) = &mut shifted.retained {
+            original.matrix = crate::retained::compose(
+                [1., 0., 0., 1., (ox - left) as f64, (oy - top) as f64],
+                original.matrix,
+            );
+        }
+        shifted
+    };
     if let Some(m) = &mut layer.mask {
         if mask || expanded {
             m.cache_key = crate::engine::id();
         }
         if expanded {
             for step in &mut m.steps {
-                step.pixels = copy_shift(&step.pixels, w, h, ox - left, oy - top);
+                step.pixels = shift_unedited(&step.pixels);
             }
         }
     }
@@ -329,7 +366,7 @@ fn selection_impl(
                 }
                 layer.kind = "paint".into();
             }
-            layer.pixels = copy_shift(&layer.pixels, w, h, ox - left, oy - top);
+            layer.pixels = shift_unedited(&layer.pixels);
         }
     } else {
         layer.pixels = out;
@@ -337,6 +374,19 @@ fn selection_impl(
     }
     layer.x = left;
     layer.y = top;
+    if expanded {
+        for effect in &mut layer.effects {
+            if effect.kind == "liquify" {
+                crate::geometry::map_effect(
+                    &effect.kind,
+                    &mut effect.settings,
+                    [1., 1.],
+                    [ox - left, oy - top],
+                    true,
+                )?;
+            }
+        }
+    }
     Ok((b, transformed))
 }
 
@@ -587,6 +637,9 @@ fn sample_words16(words: &[u16], w: u32, h: u32, x: f32, y: f32) -> [u16; 4] {
 
 /// The shared whole-layer affine operation, including native mask sources.
 pub(crate) fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    if c["mask"] == true && c["op"] == "transform" {
+        return crate::retained::mask(layer, c);
+    }
     crate::retained::layer(layer, c)
 }
 pub(crate) fn move_layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
@@ -649,7 +702,33 @@ pub fn tree_bounds(doc: &Document, roots: &[String]) -> Option<[i32; 4]> {
 }
 pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), String> {
     if c["mask"] == true {
-        return Err("Select Color to transform the folder and its children".into());
+        if c["op"] == "move" {
+            return Err("Select Color to move the folder and its children".into());
+        }
+        if doc.selection.is_some() && c["selection_only"] != false {
+            let coverage = crate::selection::current(doc).ok_or("Selection no longer exists")?;
+            let node = doc
+                .layers
+                .iter_mut()
+                .find(|l| l.id == root)
+                .ok_or("Folder no longer exists")?;
+            let mut temporary = node.clone();
+            temporary.kind = "paint".into();
+            let transformed = selection_with_coverage(&mut temporary, &coverage, c)?;
+            temporary.kind = "group".into();
+            *node = temporary;
+            doc.selection = Some(transformed.bounds);
+            doc.selection_polygon = None;
+            doc.selection_coverage = Some(transformed);
+            return Ok(());
+        }
+        return layer(
+            doc.layers
+                .iter_mut()
+                .find(|l| l.id == root)
+                .ok_or("Folder no longer exists")?,
+            c,
+        );
     }
     let ids = tree_ids(doc, &[root.into()]);
     if doc.layers.iter().any(|l| ids.contains(&l.id) && l.locked) {

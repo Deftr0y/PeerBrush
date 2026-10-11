@@ -107,8 +107,9 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         return crate::transform::move_layer(layer, c);
     }
     let n = |key: &str, d: f64| c[key].as_f64().unwrap_or(d);
-    let (angle, sx, sy) = (n("angle", 0.), n("scale_x", 1.), n("scale_y", 1.));
-    if !angle.is_finite() || !(0.05..=20.).contains(&sx) || !(0.05..=20.).contains(&sy) {
+    let angle = n("angle", 0.);
+    let (sx, sy) = crate::transform::scales(c)?;
+    if !angle.is_finite() {
         return Err("Transform scale must be 0.05–20 and rotation must be finite".into());
     }
     let (px, py) = (
@@ -276,6 +277,50 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+/// Mask-only placement keeps Color and other mask steps unchanged. Off-frame
+/// mask samples remain in the retained original, including through a PSD save.
+pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    let (sx, sy) = crate::transform::scales(c)?;
+    let angle = c["angle"].as_f64().unwrap_or(0.);
+    let px = c["pivot"][0]
+        .as_f64()
+        .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.)
+        - layer.x as f64;
+    let py = c["pivot"][1]
+        .as_f64()
+        .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.)
+        - layer.y as f64;
+    if ![angle, px, py]
+        .iter()
+        .all(|v| v.is_finite() && v.abs() <= 100000.)
+    {
+        return Err("Invalid mask transform".into());
+    }
+    let mask = layer.mask.as_mut().ok_or("Layer has no mask")?;
+    let index = if let Some(id) = c["step"].as_str() {
+        mask.steps
+            .iter()
+            .position(|s| s.id == id && s.kind == "paint")
+    } else {
+        mask.steps.iter().rposition(|s| s.kind == "paint")
+    }
+    .ok_or("Select a paint mask step to transform")?;
+    let (sin, cos) = angle.to_radians().sin_cos();
+    let (a, b, cc, d) = (
+        exact(cos) * sx,
+        exact(sin) * sx,
+        -exact(sin) * sy,
+        exact(cos) * sy,
+    );
+    let mut original = Original::from(&mask.steps[index].pixels);
+    original.matrix = compose(
+        [a, b, cc, d, px - a * px - cc * py, py - b * px - d * py],
+        original.matrix,
+    );
+    mask.steps[index].pixels = original.render(layer.pixels.width, layer.pixels.height)?;
+    mask.cache_key = crate::engine::id();
+    Ok(())
+}
 pub fn observe(r: &Raster) -> Value {
     r.retained.as_ref().map(|s|json!({"width":s.pixels.width,"height":s.pixels.height,"bit_depth":s.pixels.depth,"matrix":s.matrix,"bytes":s.pixels.bytes()})).unwrap_or(Value::Null)
 }
@@ -288,7 +333,11 @@ pub fn has_originals(doc: &Document) -> bool {
     })
 }
 fn same(a: &Raster, b: &Raster) -> bool {
-    (a.width, a.height, a.depth) == (b.width, b.height, b.depth)
+    // An unshifted storage expansion with identical tiles changes no samples.
+    // The retained matrix can legitimately stay identical in that case.
+    a.depth == b.depth
+        && a.width >= b.width
+        && a.height >= b.height
         && a.tiles.len() == b.tiles.len()
         && a.samples16.len() == b.samples16.len()
         && a.tiles.iter().all(|(k, v)| {

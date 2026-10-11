@@ -968,8 +968,11 @@ impl Engine {
                     num(c, "angle", 0.).to_radians()
                 };
                 let (sin, cos) = angle.sin_cos();
-                let sx = if moving { 1. } else { num(c, "scale_x", 1.) };
-                let sy = if moving { 1. } else { num(c, "scale_y", 1.) };
+                let (sx, sy) = if moving {
+                    (1., 1.)
+                } else {
+                    crate::transform::scales(c).unwrap_or((1., 1.))
+                };
                 let px = c["pivot"][0]
                     .as_f64()
                     .unwrap_or((b[0] as f64 + b[2] as f64) / 2.);

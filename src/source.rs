@@ -445,7 +445,8 @@ pub fn transformed(before: &Layer, after: &mut Layer, c: &Value) -> Result<(), S
     if cos.abs() < 0.000001 {
         cos = 0.;
     }
-    let (sx, sy) = (n("scale_x", 1.), n("scale_y", 1.));
+    let (sx, sy) = crate::transform::scales(c)?;
+    let (sx, sy) = (sx as f32, sy as f32);
     let px = c["pivot"][0]
         .as_f64()
         .map(|v| v as f32)
