@@ -781,3 +781,131 @@ fn duplicate_respects_photoshop_timestamp_copy_flag_without_reusing_unique_layer
     copyable[3].data = timestamp(true);
     assert_eq!(psd::metadata_for_duplicate(&copyable), copyable);
 }
+
+#[test]
+fn known_layer_reader_versions_preserve_standard_metadata_native_sources_and_history() {
+    for depth in [8, 16] {
+        for version in (70u32..=160).step_by(10) {
+            let mut original = fixture(depth);
+            let marker = LayerMetadata {
+                key: "lyvr".into(),
+                data: version.to_be_bytes().to_vec(),
+            };
+            original.layers[0].psd_metadata.push(marker.clone());
+            let pixels = original.layers[0].pixels.rgba16();
+            let png = original.export_png().unwrap();
+            for large in [false, true] {
+                let encoded = if large {
+                    psd::encode_psb(&original).unwrap()
+                } else {
+                    psd::encode(&original).unwrap()
+                };
+                let at = encoded.windows(4).position(|v| v == b"PBR1").unwrap() + 4;
+                let mut source = vec![];
+                ZlibDecoder::new(&encoded[at..])
+                    .read_to_end(&mut source)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&source).unwrap()["format"],
+                    24
+                );
+                let standard = ordinary(&encoded);
+                let loaded = psd::decode(&standard).unwrap();
+                assert!(!loaded.read_only, "{:?}", loaded.warnings);
+                assert_eq!(
+                    loaded.layers[0].psd_metadata,
+                    original.layers[0].psd_metadata
+                );
+                assert_eq!(loaded.layers[0].pixels.rgba16(), pixels);
+                assert_eq!(loaded.export_png().unwrap(), png);
+                let mut e = Engine::new();
+                e.doc = loaded;
+                let layer = e.doc.layers[0].id.clone();
+                e.edit(
+                    "human",
+                    &[json!({"op":"layer.update","layer":layer,"opacity":0.5})],
+                    None,
+                    None,
+                    "Preserve layer version",
+                )
+                .unwrap();
+                assert_eq!(e.undo.len(), 1);
+                assert_eq!(e.doc.layers[0].pixels.rgba16(), pixels);
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), png);
+                e.edit(
+                    "human",
+                    &[json!({"op":"layer.duplicate","layers":[layer]})],
+                    None,
+                    None,
+                    "Duplicate retained layer version",
+                )
+                .unwrap();
+                assert_eq!(e.doc.layers.len(), 2);
+                for l in &e.doc.layers {
+                    assert!(l.psd_metadata.contains(&marker));
+                }
+                e.undo("human").unwrap();
+                let saved = if large {
+                    psd::encode_psb(&e.doc).unwrap()
+                } else {
+                    psd::encode(&e.doc).unwrap()
+                };
+                assert_eq!(&saved[payload_range(&saved, b"lyvr")], marker.data);
+                for bytes in [saved.clone(), ordinary(&saved)] {
+                    let reopened = psd::decode(&bytes).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(
+                        reopened.layers[0].psd_metadata,
+                        original.layers[0].psd_metadata
+                    );
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), pixels);
+                    assert_eq!(reopened.export_png().unwrap(), png);
+                }
+            }
+        }
+    }
+}
+#[test]
+fn unknown_malformed_or_duplicate_layer_versions_never_authorize_editing() {
+    for depth in [8, 16] {
+        let mut doc = fixture(depth);
+        doc.layers[0].psd_metadata.push(LayerMetadata {
+            key: "lyvr".into(),
+            data: 160u32.to_be_bytes().to_vec(),
+        });
+        for encoded in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+            let original = ordinary(&encoded);
+            let range = payload_range(&original, b"lyvr");
+            for version in [0u32, 69, 71, 161, 170, u32::MAX] {
+                let mut bad = original.clone();
+                bad[range.clone()].copy_from_slice(&version.to_be_bytes());
+                let protected = psd::decode(&bad).unwrap();
+                assert!(protected.read_only);
+                assert_eq!(protected.export_png().unwrap(), doc.export_png().unwrap());
+            }
+            // The version marker cannot override an unsupported sibling source.
+            let mut bad = original.clone();
+            let unknown = payload_range(&bad, b"lnsr");
+            bad[unknown.start - 8..unknown.start - 4].copy_from_slice(b"SoLd");
+            assert!(psd::decode(&bad).unwrap().read_only);
+            let mut bad = original.clone();
+            let duplicate = payload_range(&bad, b"lnsr");
+            bad[duplicate.start - 8..duplicate.start - 4].copy_from_slice(b"lyvr");
+            bad[duplicate].copy_from_slice(&160u32.to_be_bytes());
+            assert!(psd::decode(&bad).unwrap().read_only);
+        }
+        for data in [
+            vec![],
+            vec![0; 3],
+            vec![0; 5],
+            vec![0; 128],
+            170u32.to_be_bytes().to_vec(),
+        ] {
+            doc.layers[0].psd_metadata.last_mut().unwrap().data = data;
+            assert!(psd::validate(&doc).is_err());
+            assert!(psd::encode(&doc).is_err());
+            assert!(psd::encode_psb(&doc).is_err());
+        }
+    }
+}

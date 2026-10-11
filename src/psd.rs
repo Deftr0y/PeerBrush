@@ -398,13 +398,24 @@ fn validate_metadata_entry(entry: &LayerMetadata) -> Result<(), String> {
             }
         }
         "lnsr" if entry.data.len() == 4 => Ok(()),
+        // A minimum Photoshop reader version is a compatibility marker, not
+        // permission to ignore layer sources. Every other feature is validated
+        // independently; newer/unknown versions remain protected.
+        "lyvr" if entry.data.len() == 4 => {
+            let version = u32::from_be_bytes(entry.data.as_slice().try_into().unwrap());
+            if (70..=160).contains(&version) && version % 10 == 0 {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        }
         "shmd" => static_timestamp_metadata(&entry.data),
         _ => Err(invalid()),
     }
 }
 
 pub fn validate_metadata(entries: &[LayerMetadata]) -> Result<(), String> {
-    if entries.len() > 4 {
+    if entries.len() > 5 {
         return Err("Photoshop layer metadata exceeds its bounded tag count".into());
     }
     let mut keys = std::collections::HashSet::new();
@@ -791,7 +802,13 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc.layers.iter().any(|l| {
+        format: if doc
+            .layers
+            .iter()
+            .any(|l| l.psd_metadata.iter().any(|m| m.key == "lyvr"))
+        {
+            24
+        } else if doc.layers.iter().any(|l| {
             l.effects
                 .iter()
                 .any(|e| crate::effects::gradient::positioned(&e.kind, &e.settings))
@@ -1650,7 +1667,7 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=23).contains(&e.format)
+                if (1..=24).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash
@@ -1853,7 +1870,7 @@ fn decode_parts(
                                 );
                             }
                         }
-                        b"fxrp" | b"lclr" | b"lnsr" | b"shmd" => {
+                        b"fxrp" | b"lclr" | b"lnsr" | b"shmd" | b"lyvr" => {
                             if payload.len() > 128 {
                                 warnings.push(format!(
                                     "Unsupported Photoshop layer metadata: {}",
