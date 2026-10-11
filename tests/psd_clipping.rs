@@ -1313,6 +1313,15 @@ fn photoshop_overlay_blend_enum_import_uses_exact_native_composite_gate() {
 }
 
 fn gradient_payload(reverse: bool, omit: Option<&str>, smoothness: f64) -> Vec<u8> {
+    positioned_gradient_payload(reverse, omit, smoothness, 100., None)
+}
+fn positioned_gradient_payload(
+    reverse: bool,
+    omit: Option<&str>,
+    smoothness: f64,
+    scale: f64,
+    offset: Option<(f64, f64)>,
+) -> Vec<u8> {
     let desc = |class: &str, fields: Vec<(&str, &[u8; 4], Vec<u8>)>| {
         overlay_descriptor(
             class,
@@ -1369,23 +1378,34 @@ fn gradient_payload(reverse: bool, omit: Option<&str>, smoothness: f64) -> Vec<u
             ("Trns", b"VlLs", alphas),
         ],
     );
-    let effect = desc(
-        "GrFl",
-        vec![
-            ("enab", b"bool", vec![1]),
-            ("present", b"bool", vec![1]),
-            ("showInDialog", b"bool", vec![1]),
-            ("Md  ", b"enum", enum_bytes("BlnM", "Nrml")),
-            ("Opct", b"UntF", unit("#Prc", 100.)),
-            ("Grad", b"Objc", gradient),
-            ("Angl", b"UntF", unit("#Ang", 0.)),
-            ("Type", b"enum", enum_bytes("GrdT", "Lnr ")),
-            ("Rvrs", b"bool", vec![u8::from(reverse)]),
-            ("Dthr", b"bool", vec![0]),
-            ("Algn", b"bool", vec![0]),
-            ("Scl ", b"UntF", unit("#Prc", 100.)),
-        ],
-    );
+    let mut effect_fields = vec![
+        ("enab", b"bool", vec![1]),
+        ("present", b"bool", vec![1]),
+        ("showInDialog", b"bool", vec![1]),
+        ("Md  ", b"enum", enum_bytes("BlnM", "Nrml")),
+        ("Opct", b"UntF", unit("#Prc", 100.)),
+        ("Grad", b"Objc", gradient),
+        ("Angl", b"UntF", unit("#Ang", 0.)),
+        ("Type", b"enum", enum_bytes("GrdT", "Lnr ")),
+        ("Rvrs", b"bool", vec![u8::from(reverse)]),
+        ("Dthr", b"bool", vec![0]),
+        ("Algn", b"bool", vec![0]),
+        ("Scl ", b"UntF", unit("#Prc", scale)),
+    ];
+    if let Some((x, y)) = offset {
+        effect_fields.push((
+            "Ofst",
+            b"Objc",
+            desc(
+                "Pnt ",
+                vec![
+                    ("Hrzn", b"UntF", unit("#Prc", x)),
+                    ("Vrtc", b"UntF", unit("#Prc", y)),
+                ],
+            ),
+        ));
+    }
+    let effect = desc("GrFl", effect_fields);
     let root = desc(
         "Lefx",
         vec![
@@ -2774,5 +2794,165 @@ fn unsupported_hard_shadow_definitions_stay_protected_even_when_disabled() {
                 assert_eq!(rendered(&doc), expected);
             }
         }
+    }
+}
+
+#[test]
+fn photoshop_gradient_placement_retains_native_sources_and_exact_standard_output() {
+    for depth in [8, 16] {
+        for (width, height) in [(2, 1), (1, 2)] {
+            for (angle, scale, offset) in [
+                (0f64, 0.1, (0.25, -0.375)),
+                (180., 0.5, (-0.25, 0.375)),
+                (90., 2., (0.125, -0.375)),
+                (-90., 10., (-1., 1.)),
+                (0., 1., (1., -1.)),
+            ] {
+                for reflected in [false, true] {
+                    for reverse in [false, true] {
+                        for enabled in [false, true] {
+                            let mut payload = positioned_gradient_payload(
+                                reverse,
+                                None,
+                                0.,
+                                scale * 100.,
+                                Some((offset.0 * 100., offset.1 * 100.)),
+                            );
+                            let at = payload
+                                .windows(12)
+                                .position(|v| v == b"AnglUntF#Ang")
+                                .unwrap()
+                                + 12;
+                            payload[at..at + 8].copy_from_slice(&angle.to_be_bytes());
+                            if reflected {
+                                let at = payload.windows(4).position(|v| v == b"Lnr ").unwrap();
+                                payload[at..at + 4].copy_from_slice(b"Rflc");
+                            }
+                            if !enabled {
+                                let at =
+                                    payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                                payload[at] = 0;
+                            }
+                            let mut spec = Spec::paint("Synthetic positioned gradient", SAVED);
+                            spec.tags.push((*b"lfx2", payload));
+                            let mut bytes = fixture_size(&[spec], depth, width, height);
+                            let expected = std::array::from_fn::<_, 2, _>(|i| {
+                                if !enabled {
+                                    return SAVED[i].map(|n| native(n, depth));
+                                }
+                                let x = if width == 2 { i as f64 } else { 0. };
+                                let y = if height == 2 { i as f64 } else { 0. };
+                                let px = (x + 0.5) / f64::from(width) - 0.5 - offset.0;
+                                let py = (y + 0.5) / f64::from(height) - 0.5 - offset.1;
+                                let p = if angle == 0. {
+                                    px
+                                } else if angle == 180. {
+                                    -px
+                                } else if angle == 90. {
+                                    -py
+                                } else {
+                                    py
+                                };
+                                let mut t = if reflected {
+                                    2. * p.abs() / scale
+                                } else {
+                                    0.5 + p / scale
+                                };
+                                if reverse {
+                                    t = 1. - t;
+                                }
+                                let n = native((t.clamp(0., 1.) * 65535.).round() as u16, depth);
+                                [n, n, n, 65535]
+                            });
+                            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                            for c in 0..4 {
+                                for p in expected {
+                                    composite_sample(&mut bytes, p, c, depth);
+                                }
+                            }
+                            let doc = psd::decode(&bytes).unwrap();
+                            assert!(!doc.read_only,"{depth} {width}x{height} {angle} {scale} {offset:?} {reflected} {reverse} {enabled}: {:?}",doc.warnings);
+                            assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+                            assert_eq!(doc.layers[0].effects[0].settings["scale"], scale);
+                            assert_eq!(doc.layers[0].effects[0].settings["offset_x"], offset.0);
+                            assert_eq!(doc.layers[0].effects[0].settings["offset_y"], offset.1);
+                            let source = doc.layers[0].pixels.rgba16();
+                            assert_eq!(
+                                source,
+                                SAVED
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|n| native(n, depth))
+                                    .collect::<Vec<_>>()
+                            );
+                            let current = doc.export_png().unwrap();
+                            for output in
+                                [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()]
+                            {
+                                let reopened = psd::decode(&output).unwrap();
+                                assert!(!reopened.read_only);
+                                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                                assert_eq!(reopened.export_png().unwrap(), current);
+                                assert_eq!(
+                                    reopened.layers[0].effects[0].settings,
+                                    doc.layers[0].effects[0].settings
+                                );
+                            }
+                            let layer = doc.layers[0].id.clone();
+                            let effect = doc.layers[0].effects[0].id.clone();
+                            let mut e = Engine::new();
+                            e.doc = doc;
+                            e.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})],None,None,"Gradient bypass").unwrap();
+                            e.undo("human").unwrap();
+                            assert_eq!(e.doc.export_png().unwrap(), current);
+                            assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
+fn photoshop_gradient_placement_rejects_invalid_units_ranges_and_composite_mismatch() {
+    for depth in [8, 16] {
+        for (scale, offset) in [
+            (0., (0., 0.)),
+            (9.99, (0., 0.)),
+            (1000.01, (0., 0.)),
+            (100., (-100.01, 0.)),
+            (100., (0., 100.01)),
+        ] {
+            let mut spec = Spec::paint("Synthetic protected placement", SAVED);
+            spec.tags.push((
+                *b"lfx2",
+                positioned_gradient_payload(false, None, 0., scale, Some(offset)),
+            ));
+            let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+            assert!(doc.read_only);
+            assert!(doc.layers[0].effects.is_empty());
+            assert_eq!(
+                doc.layers[0].pixels.get16(0, 0),
+                SAVED[0].map(|n| native(n, depth))
+            );
+        }
+        for needle in [b"HrznUntF#Prc", b"Scl UntF#Prc"] {
+            let mut payload = positioned_gradient_payload(false, None, 0., 50., Some((25., -37.5)));
+            let at = payload.windows(12).rposition(|v| v == needle).unwrap() + 8;
+            payload[at..at + 4].copy_from_slice(b"#Pxl");
+            let mut spec = Spec::paint("Synthetic malformed placement", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+            assert!(doc.read_only);
+            assert!(doc.layers[0].effects.is_empty());
+        }
+        let mut spec = Spec::paint("Synthetic mismatched placement", SAVED);
+        spec.tags.push((
+            *b"lfx2",
+            positioned_gradient_payload(false, None, 0., 50., Some((25., -37.5))),
+        ));
+        let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+        assert!(doc.read_only);
+        assert!(doc.layers[0].effects.is_empty());
     }
 }

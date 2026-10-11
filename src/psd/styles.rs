@@ -236,6 +236,16 @@ fn percent(value: &Value) -> Result<f64, String> {
     }
     Ok(n / 100.)
 }
+fn bounded_percent(value: &Value, min: f64, max: f64) -> Result<f64, String> {
+    if value["type"] != "UntF" || value["value"][0] != "#Prc" {
+        return Err("Photoshop gradient placement requires percentage units".into());
+    }
+    value["value"][1]
+        .as_f64()
+        .filter(|n| n.is_finite() && (min..=max).contains(n))
+        .map(|n| n / 100.)
+        .ok_or_else(|| format!("Photoshop gradient percentage must be {min}–{max}"))
+}
 fn overlay_blend(value: &Value) -> Result<&'static str, String> {
     if value["type"] != "enum" || value["value"][0] != "BlnM" {
         return Err("Invalid Photoshop overlay blend enumeration".into());
@@ -686,19 +696,22 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
     if angle["type"] != "UntF"
         || angle["value"][0] != "#Ang"
         || ![-180., -90., 0., 90., 180.].contains(&degrees)
-        || percent(field(fields, "Scl "))? != 1.
     {
-        return Err("Only unscaled cardinal-axis Photoshop gradients can be imported".into());
+        return Err("Only cardinal-axis Photoshop gradients can be imported".into());
     }
-    if let Some(offset) = fields.get("Ofst") {
+    let scale = bounded_percent(field(fields, "Scl "), 10., 1000.)?;
+    let offset = if let Some(offset) = fields.get("Ofst") {
         let offset = descriptor(offset, "Pnt ")?;
-        if offset.len() != 2
-            || offset.get("Hrzn").is_none_or(|v| percent(v) != Ok(0.))
-            || offset.get("Vrtc").is_none_or(|v| percent(v) != Ok(0.))
-        {
-            return Err("Offset Photoshop gradients remain protected".into());
+        if offset.len() != 2 {
+            return Err("Gradient offset requires exactly two percentage coordinates".into());
         }
-    }
+        Some((
+            bounded_percent(field(offset, "Hrzn"), -100., 100.)?,
+            bounded_percent(field(offset, "Vrtc"), -100., 100.)?,
+        ))
+    } else {
+        None
+    };
     let gradient = descriptor(field(fields, "Grad"), "Grdn")?;
     if gradient
         .keys()
@@ -712,7 +725,11 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
             "Noise, smooth or unsupported Photoshop gradient definitions remain protected".into(),
         );
     }
-    let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":blend,"angle":degrees,"scale":1.,"style":style,"reverse":required_bool("Rvrs")?});
+    let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":blend,"angle":degrees,"scale":scale,"style":style,"reverse":required_bool("Rvrs")?});
+    if let Some((x, y)) = offset {
+        settings["offset_x"] = json!(x);
+        settings["offset_y"] = json!(y);
+    }
     for (input, output, class, alpha) in [
         ("Clrs", "color_stops", "Clrt", false),
         ("Trns", "alpha_stops", "TrnS", true),
