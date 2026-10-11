@@ -135,7 +135,17 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 ("size", "Size", 0., 64., " px"),
                 ("soften", "Soften", 0., 64., " px"),
                 ("distance", "Distance", 0., 128., " px"),
-                ("angle", "Angle", -180., 180., "°"),
+                (
+                    "angle",
+                    if kind == "texture" {
+                        "Light angle"
+                    } else {
+                        "Angle"
+                    },
+                    -180.,
+                    180.,
+                    "°",
+                ),
                 ("altitude", "Altitude", 0., 90., "°"),
                 (
                     "spread",
@@ -151,7 +161,17 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 ("depth", "Depth", 0., 10., "%"),
                 ("range", "Range", 0.01, 1., "%"),
                 ("bitmap_scale", "Scale", 0.01, 8., "%"),
-                ("bitmap_angle", "Angle", -180., 180., "°"),
+                (
+                    "bitmap_angle",
+                    if kind == "texture" {
+                        "Tile angle"
+                    } else {
+                        "Angle"
+                    },
+                    -180.,
+                    180.,
+                    "°",
+                ),
                 ("phase_x", "Phase X", -32768., 32768., " px"),
                 ("phase_y", "Phase Y", -32768., 32768., " px"),
                 (
@@ -200,7 +220,9 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
     for (key, label) in [
         (
             "color",
-            if kind == "bevel_emboss" {
+            if kind == "texture" {
+                "Shadow"
+            } else if kind == "bevel_emboss" {
                 "Highlight"
             } else {
                 "Color"
@@ -208,14 +230,16 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
         ),
         (
             "color2",
-            if kind == "bevel_emboss" {
+            if kind == "texture" {
+                "Highlight"
+            } else if kind == "bevel_emboss" {
                 "Shadow"
             } else {
                 "Second color"
             },
         ),
     ] {
-        if defaults.get(key).is_none() || bitmap {
+        if defaults.get(key).is_none() || (bitmap && kind != "texture") {
             continue;
         }
         let mut rgb: [f32; 3] = std::array::from_fn(|i| {
@@ -264,7 +288,7 @@ mod tests {
     #[test]
     fn style_opacity_drag_previews_native_pixels_and_commits_one_undo() {
         for depth in [8, 16] {
-            for kind in ["color_overlay", "drop_shadow", "pattern_overlay"] {
+            for kind in ["color_overlay", "drop_shadow", "pattern_overlay", "texture"] {
                 let ctx = egui::Context::default();
                 let mut e = crate::engine::Engine::new();
                 e.doc = Document::new_depth(32, 32, depth).unwrap();
@@ -277,12 +301,29 @@ mod tests {
                 }
                 let layer = e.doc.layers[0].id.clone();
                 let mut command = json!({"op":"effect.add","layer":layer,"kind":kind});
-                if kind == "pattern_overlay" {
+                if matches!(kind, "pattern_overlay" | "texture") {
                     use base64::{engine::general_purpose::STANDARD, Engine as _};
-                    let png = if depth == 16 {
-                        crate::raster::png16(1, 1, &[57313, 16317, 29119, 65535]).unwrap()
+                    let words: Vec<u16> = if kind == "texture" {
+                        vec![
+                            57313, 16317, 29119, 65535, 11317, 52319, 29123, 65535, 31721, 13723,
+                            59127, 65535,
+                        ]
                     } else {
-                        crate::raster::png(1, 1, &[223, 63, 113, 255]).unwrap()
+                        vec![57313, 16317, 29119, 65535]
+                    };
+                    let width = (words.len() / 4) as u32;
+                    let png = if depth == 16 {
+                        crate::raster::png16(width, 1, &words).unwrap()
+                    } else {
+                        crate::raster::png(
+                            width,
+                            1,
+                            &words
+                                .into_iter()
+                                .map(crate::raster::project16)
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap()
                     };
                     command["settings"] =
                         json!({"pattern":"bitmap","bitmap_png":STANDARD.encode(png)});

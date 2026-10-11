@@ -81,7 +81,7 @@ impl Bitmap {
     }
 }
 pub fn active(kind: &str, settings: &Value) -> bool {
-    kind == "pattern_overlay" && settings["pattern"] == "bitmap"
+    matches!(kind, "pattern_overlay" | "texture") && settings["pattern"] == "bitmap"
 }
 pub fn get(source: &str) -> Result<Arc<Bitmap>, String> {
     if source.is_empty() || source.len() > ENCODED_LIMIT.div_ceil(3) * 4 {

@@ -149,7 +149,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                 }
             }
             "contour" => choice(v, &["linear", "cone", "ring", "smooth"], key)?,
-            "pattern" if kind == "pattern_overlay" => {
+            "pattern" if matches!(kind, "pattern_overlay" | "texture") => {
                 choice(v, &["checker", "stripes", "dots", "noise", "bitmap"], key)?
             }
             "pattern" => choice(v, &["checker", "stripes", "dots", "noise"], key)?,
@@ -200,6 +200,9 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                 .ok_or("Bitmap pattern requires bitmap_png")?,
         )?;
         for key in ["color", "color2", "scale", "invert"] {
+            if kind == "texture" && matches!(key, "color" | "color2") {
+                continue;
+            }
             if value.get(key).is_some_and(|v| *v != defaults[key]) {
                 return Err(format!("{key} applies only to procedural patterns"));
             }
@@ -407,8 +410,21 @@ pub fn apply(
                     }
                 }
                 "texture" => {
-                    let light = (pattern(x as f64 + angle.cos(), y as f64 - angle.sin(), v)
-                        - pattern(x as f64 - angle.cos(), y as f64 + angle.sin(), v))
+                    let height = |x: f64, y: f64| {
+                        if let Some(bitmap) = &bitmap {
+                            let p = bitmap.sample(x, y, v);
+                            let luma = (f64::from(p[0]) * 0.2126
+                                + f64::from(p[1]) * 0.7152
+                                + f64::from(p[2]) * 0.0722)
+                                / 65535.;
+                            // Transparent samples are neutral height, without projecting channels.
+                            0.5 + (luma - 0.5) * f64::from(p[3]) / 65535.
+                        } else {
+                            pattern(x, y, v)
+                        }
+                    };
+                    let light = (height(x as f64 + angle.cos(), y as f64 - angle.sin())
+                        - height(x as f64 - angle.cos(), y as f64 + angle.sin()))
                         * number(v, "depth");
                     coverage = light.abs().min(1.);
                     tint = if light > 0. { color2 } else { color };

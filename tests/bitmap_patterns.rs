@@ -400,3 +400,97 @@ fn bitmap_icc_uses_the_shared_native_depth_importer_and_rejects_bad_profiles() {
         .encode(raster::png16_with_profile(2, 2, &words, Some(b"unsupported profile")).unwrap());
     assert!(patterns::get(&invalid).is_err());
 }
+
+#[test]
+fn bitmap_texture_uses_native_luminance_height_and_transparency_is_neutral() {
+    for depth in [8, 16] {
+        let samples = [0u16, 16385, 32769, 49153];
+        let native: Vec<u16> = samples
+            .into_iter()
+            .map(|n| {
+                if depth == 8 {
+                    u16::from(raster::project16(n)) * 257
+                } else {
+                    n
+                }
+            })
+            .collect();
+        let words: Vec<u16> = native.iter().flat_map(|n| [*n, *n, *n, 65535]).collect();
+        let png = if depth == 16 {
+            raster::png16(4, 1, &words).unwrap()
+        } else {
+            raster::png(
+                4,
+                1,
+                &words
+                    .iter()
+                    .copied()
+                    .map(raster::project16)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let v = json!({"pattern":"bitmap","bitmap_png":STANDARD.encode(png),"sampling":"nearest","angle":0.,"depth":1.,"opacity":1.,"color":[0.,0.,0.],"color2":[1.,1.,1.]});
+        let original = [12345, 23457, 34569, 41317];
+        let mut pixels: Vec<u16> = (0..4).flat_map(|_| original).collect();
+        effects::styles::apply(&mut pixels, 4, 1, "texture", &v).unwrap();
+        for x in 0..4 {
+            let delta = i32::from(native[(x + 1) % 4]) - i32::from(native[(x + 3) % 4]);
+            let c = if delta > 0 { 65535 } else { 0 };
+            let mut expected = raster::blend16(
+                [original[0], original[1], original[2], 65535],
+                [c, c, c, delta.unsigned_abs() as u16],
+                1.,
+                "normal",
+            );
+            expected[3] = original[3];
+            assert_eq!(&pixels[x * 4..x * 4 + 4], &expected);
+        }
+        let transparent: Vec<u16> = words
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2], 0])
+            .collect();
+        let transparent = STANDARD.encode(raster::png16(4, 1, &transparent).unwrap());
+        let mut v = v.clone();
+        v["bitmap_png"] = json!(transparent);
+        let mut pixels: Vec<u16> = (0..4).flat_map(|_| original).collect();
+        effects::styles::apply(&mut pixels, 4, 1, "texture", &v).unwrap();
+        assert_eq!(pixels, (0..4).flat_map(|_| original).collect::<Vec<_>>());
+    }
+}
+#[test]
+fn bitmap_texture_shared_commands_keep_native_sources_geometry_history_and_format19() {
+    let (png, _) = tile(16);
+    let mut e = fixture(8);
+    let before = e.doc.export_png().unwrap();
+    let source = e.doc.layers[0].pixels.rgba16();
+    let layer = e.doc.layers[0].id.clone();
+    let command = json!({"op":"effect.add","layer":layer,"kind":"texture","settings":{"pattern":"bitmap","bitmap_png":png,"bitmap_scale":1.3,"bitmap_angle":17.,"phase_x":2.,"phase_y":-1.,"angle":61.,"color":[0.1,0.2,0.3],"color2":[0.7,0.8,0.9]}});
+    let preview = Engine::preview_edits(e.doc.clone(), std::slice::from_ref(&command)).unwrap();
+    assert_eq!(e.doc.bit_depth, 8);
+    e.edit("human", &[command], None, None, "Bitmap Texture")
+        .unwrap();
+    assert_eq!(e.doc.bit_depth, 16);
+    assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+    assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+    assert_ne!(e.doc.export_png().unwrap(), before);
+    assert_eq!(e.undo.len(), 1);
+    let current = e.doc.export_png().unwrap();
+    for bytes in [
+        psd::encode(&e.doc).unwrap(),
+        psd::encode_psb(&e.doc).unwrap(),
+    ] {
+        let d = psd::decode(&bytes).unwrap();
+        assert_eq!(d.layers[0].effects[0].settings["bitmap_png"], png);
+        assert_eq!(d.layers[0].pixels.rgba16(), source);
+        assert_eq!(d.export_png().unwrap(), current);
+    }
+    let mut invalid = e.doc.layers[0].effects[0].settings.clone();
+    invalid["invert"] = json!(true);
+    assert!(effects::validate("texture", &invalid).is_err());
+    e.undo("human").unwrap();
+    assert_eq!(e.doc.bit_depth, 8);
+    assert_eq!(e.doc.export_png().unwrap(), before);
+    e.redo("human").unwrap();
+    assert_eq!(e.doc.export_png().unwrap(), current);
+}

@@ -9,6 +9,7 @@ struct Pending {
     revision: u64,
     layer: String,
     effect: String,
+    kind: String,
     settings: Value,
     receiver: ResultReceiver,
 }
@@ -27,8 +28,11 @@ fn apply(
         return Err("Pattern source changed while choosing the PNG · import cancelled".into());
     }
     let mut settings = pending.settings.clone();
-    let defaults = crate::effects::styles::defaults("pattern_overlay");
+    let defaults = crate::effects::styles::defaults(&pending.kind);
     for key in ["color", "color2", "scale", "invert"] {
+        if pending.kind == "texture" && matches!(key, "color" | "color2") {
+            continue;
+        }
         settings[key] = defaults[key].clone();
     }
     settings["pattern"] = json!("bitmap");
@@ -115,6 +119,7 @@ pub(super) fn control(
             revision,
             layer: layer.id.clone(),
             effect: effect.id.clone(),
+            kind: effect.kind.clone(),
             settings: effect.settings.clone(),
             receiver: Arc::new(Mutex::new(rx)),
         };
@@ -170,6 +175,7 @@ mod tests {
             revision: e.doc.revision,
             layer,
             effect: effect.id.clone(),
+            kind: effect.kind.clone(),
             settings: effect.settings.clone(),
             receiver: Arc::new(Mutex::new(rx)),
         };
