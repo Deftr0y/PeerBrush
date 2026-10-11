@@ -4252,6 +4252,35 @@ impl PeerBrush {
                     (input.events.len() != original.len()).then_some(original)
                 })
             };
+            if self.tool == Tool::Selection
+                && ["polygon", "magnetic"].contains(&self.selection_kind.as_str())
+                && !self.selection_path.is_empty()
+            {
+                // Anchor keys may continue repeating after Enter, cancellation
+                // or removal of the last anchor. Preserve canvas handling, but
+                // require a new press before they become document edits.
+                ctx.input(|input| {
+                    for event in &input.events {
+                        if let egui::Event::Key {
+                            key,
+                            physical_key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } = event
+                        {
+                            if matches!(key, egui::Key::Delete | egui::Key::Backspace)
+                                && !modifiers.any()
+                            {
+                                self.selection_shortcut_keys.insert(*key);
+                                if let Some(key) = physical_key {
+                                    self.selection_shortcut_keys.insert(*key);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
             let (copy, cut, paste, merged) = ctx.input(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy))
@@ -11806,6 +11835,154 @@ mod tests {
         }
     }
 
+    #[test]
+    fn held_lasso_anchor_keys_cannot_become_document_edits_after_completion() {
+        for depth in [8, 16] {
+            for kind in ["polygon", "magnetic"] {
+                for anchor_key in [egui::Key::Delete, egui::Key::Backspace] {
+                    let (mut app, ctx, point, original) =
+                        pressed_selection_fixture(depth, Tool::Selection, kind);
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![
+                            primary_release(point),
+                            egui::Event::PointerMoved(Pos2::new(1., 1.)),
+                        ],
+                        Default::default(),
+                    );
+                    app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.], [3., 9.]];
+                    let key = |pressed, repeat, modifiers| egui::Event::Key {
+                        key: anchor_key,
+                        physical_key: Some(anchor_key),
+                        pressed,
+                        repeat,
+                        modifiers,
+                    };
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![key(true, false, Default::default())],
+                        Default::default(),
+                    );
+                    assert_eq!(app.selection_path.len(), 4);
+                    assert!(app.shared.lock().unwrap().undo.is_empty());
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![shortcut_press(egui::Key::Enter)],
+                        Default::default(),
+                    );
+                    assert!(app.selection_path.is_empty());
+                    let completed = app.shared.lock().unwrap().doc.clone();
+                    assert!(completed.selection.is_some());
+                    assert_eq!(
+                        completed.layers[0].pixels.rgba16(),
+                        original.layers[0].pixels.rgba16()
+                    );
+                    assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+                    let modifiers = if anchor_key == egui::Key::Backspace {
+                        egui::Modifiers {
+                            alt: true,
+                            ..Default::default()
+                        }
+                    } else {
+                        Default::default()
+                    };
+                    // A repeat retains the same physical press, including if
+                    // modifiers change from anchor removal to foreground fill.
+                    frame(&mut app, &ctx, vec![key(true, true, modifiers)], modifiers);
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        assert_eq!(
+                            engine.doc.layers[0].pixels.rgba16(),
+                            original.layers[0].pixels.rgba16(),
+                            "{depth} {kind} {anchor_key:?}: anchor repeat edited artwork"
+                        );
+                        assert_eq!(engine.doc.selection, completed.selection);
+                        assert_eq!(engine.doc.revision, completed.revision);
+                        assert_eq!(engine.undo.len(), 1);
+                    }
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![key(false, false, Default::default())],
+                        Default::default(),
+                    );
+                    frame(&mut app, &ctx, vec![key(true, false, modifiers)], modifiers);
+                    {
+                        let mut engine = app.shared.lock().unwrap();
+                        assert_ne!(
+                            engine.doc.layers[0].pixels.rgba16(),
+                            original.layers[0].pixels.rgba16(),
+                            "a fresh document-edit press was lost"
+                        );
+                        assert_eq!(
+                            engine.doc.layers[0].pixels.get16(0, 0),
+                            original.layers[0].pixels.get16(0, 0)
+                        );
+                        assert_eq!(engine.doc.selection, completed.selection);
+                        assert_eq!(engine.undo.len(), 2);
+                        engine.undo("human").unwrap();
+                        assert_eq!(
+                            engine.doc.layers[0].pixels.rgba16(),
+                            original.layers[0].pixels.rgba16()
+                        );
+                        assert_eq!(engine.doc.selection, completed.selection);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn held_lasso_anchor_keys_preserve_layers_after_removing_the_last_anchor() {
+        for depth in [8, 16] {
+            for kind in ["polygon", "magnetic"] {
+                let (mut app, ctx, point, original) =
+                    pressed_selection_fixture(depth, Tool::Selection, kind);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        primary_release(point),
+                        egui::Event::PointerMoved(Pos2::new(1., 1.)),
+                    ],
+                    Default::default(),
+                );
+                app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.]];
+                let event = |repeat| egui::Event::Key {
+                    key: egui::Key::Delete,
+                    physical_key: Some(egui::Key::Delete),
+                    pressed: true,
+                    repeat,
+                    modifiers: Default::default(),
+                };
+                for remaining in (0..3).rev() {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![event(remaining != 2)],
+                        Default::default(),
+                    );
+                    assert_eq!(app.selection_path.len(), remaining);
+                }
+                frame(&mut app, &ctx, vec![event(true)], Default::default());
+                let engine = app.shared.lock().unwrap();
+                assert_eq!(
+                    engine.doc.layers.len(),
+                    original.layers.len(),
+                    "{depth} {kind}: anchor repeat deleted a layer"
+                );
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    original.layers[0].pixels.rgba16()
+                );
+                assert_eq!(engine.doc.selection, original.selection);
+                assert_eq!(engine.doc.revision, original.revision);
+                assert!(engine.undo.is_empty());
+            }
+        }
+    }
     #[test]
     fn held_selection_shortcut_repeats_cannot_run_after_completion_without_key_release() {
         for depth in [8, 16] {
