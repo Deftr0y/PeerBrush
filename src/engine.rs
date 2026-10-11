@@ -157,6 +157,9 @@ pub struct Document {
     pub icc_profile: Option<std::sync::Arc<Vec<u8>>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub srgb_tagged: bool,
+    /// Preferred per-layer Photoshop mask settings, retained as standard data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_global_mask: Option<crate::psd::GlobalMaskSettings>,
     pub layers: Vec<Layer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<crate::effects::Effect>,
@@ -188,6 +191,7 @@ impl Document {
             bit_depth: 8,
             icc_profile: None,
             srgb_tagged: false,
+            psd_global_mask: None,
             layers: vec![Layer::new("Paint 1", "paint", w, h)],
             filters: vec![],
             selection: None,

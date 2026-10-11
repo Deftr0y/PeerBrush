@@ -1,9 +1,10 @@
 use peerbrush::{
-    engine::{Document, Engine, Layer},
+    engine::{Document, Engine, Layer, Mask, MaskStep},
     psd::{self, LayerMetadata},
     raster::Raster,
 };
 use serde_json::json;
+use std::io::{Read, Write};
 
 fn timestamp(copy: bool) -> Vec<u8> {
     let mut descriptor = vec![];
@@ -82,6 +83,358 @@ fn payload_range(bytes: &[u8], key: &[u8; 4]) -> std::ops::Range<usize> {
         .unwrap();
     let length = u32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
     at + 12..at + 12 + length
+}
+
+fn global_mask_range(bytes: &[u8]) -> (usize, std::ops::Range<usize>) {
+    let wide = bytes[4..6] == 2u16.to_be_bytes();
+    let size = if wide { 8 } else { 4 };
+    let color = u32::from_be_bytes(bytes[26..30].try_into().unwrap()) as usize;
+    let resources = 30 + color;
+    let resources_len =
+        u32::from_be_bytes(bytes[resources..resources + 4].try_into().unwrap()) as usize;
+    let section = resources + 4 + resources_len;
+    let info = section + size;
+    let info_len = if wide {
+        u64::from_be_bytes(bytes[info..info + size].try_into().unwrap()) as usize
+    } else {
+        u32::from_be_bytes(bytes[info..info + size].try_into().unwrap()) as usize
+    };
+    let mask = info + size + info_len;
+    let mask_len = u32::from_be_bytes(bytes[mask..mask + 4].try_into().unwrap()) as usize;
+    (section, mask + 4..mask + 4 + mask_len)
+}
+fn replace_global_mask(bytes: &[u8], data: &[u8]) -> Vec<u8> {
+    let (section, range) = global_mask_range(bytes);
+    let wide = bytes[4..6] == 2u16.to_be_bytes();
+    let size = if wide { 8 } else { 4 };
+    let old_len = if wide {
+        u64::from_be_bytes(bytes[section..section + size].try_into().unwrap()) as usize
+    } else {
+        u32::from_be_bytes(bytes[section..section + size].try_into().unwrap()) as usize
+    };
+    let mut out = bytes.to_vec();
+    out.splice(range.clone(), data.iter().copied());
+    out[range.start - 4..range.start].copy_from_slice(&(data.len() as u32).to_be_bytes());
+    let length = old_len - range.len() + data.len();
+    if wide {
+        out[section..section + size].copy_from_slice(&(length as u64).to_be_bytes());
+    } else {
+        out[section..section + size].copy_from_slice(&(length as u32).to_be_bytes());
+    }
+    out
+}
+fn per_layer_global_mask() -> Vec<u8> {
+    // The preferred kind uses per-layer values. Overlay settings are preserved,
+    // not applied to raster or mask samples.
+    vec![0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 50, 128, 0, 0, 0]
+}
+
+#[test]
+fn per_layer_global_mask_settings_keep_standard_layers_editable_and_survive_native_edits() {
+    for depth in [8, 16] {
+        let original = fixture(depth);
+        let original_png = original.export_png().unwrap();
+        for large in [false, true] {
+            let bytes = if large {
+                psd::encode_psb(&original).unwrap()
+            } else {
+                psd::encode(&original).unwrap()
+            };
+            for length in 13..=16 {
+                let settings = &per_layer_global_mask()[..length];
+                let external = replace_global_mask(&ordinary(&bytes), settings);
+                let loaded = psd::decode(&external).unwrap();
+                assert!(!loaded.read_only, "{:?}", loaded.warnings);
+                assert_eq!(loaded.layers.len(), 1);
+                assert_eq!(loaded.bit_depth, depth);
+                assert_eq!(loaded.export_png().unwrap(), original_png);
+                assert_eq!(
+                    loaded.layers[0].pixels.rgba16(),
+                    original.layers[0].pixels.rgba16()
+                );
+                let mut engine = Engine::new();
+                engine.doc = loaded;
+                let layer = engine.doc.layers[0].id.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"selection","kind":"rectangle","rect":[0,0,1,1]})],
+                        None,
+                        None,
+                        "Select native pixel",
+                    )
+                    .unwrap();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"paint.clear_selection","layer":layer})],
+                        None,
+                        None,
+                        "Clear selected pixel",
+                    )
+                    .unwrap();
+                assert_eq!(engine.doc.layers[0].pixels.get16(0, 0), [0; 4]);
+                assert_eq!(
+                    engine.doc.layers[0].pixels.get16(1, 0),
+                    original.layers[0].pixels.get16(1, 0)
+                );
+                for saved in [
+                    psd::encode(&engine.doc).unwrap(),
+                    psd::encode_psb(&engine.doc).unwrap(),
+                ] {
+                    assert_eq!(&saved[global_mask_range(&saved).1], settings);
+                    for reopening in [saved.clone(), ordinary(&saved)] {
+                        let restored = psd::decode(&reopening).unwrap();
+                        assert!(!restored.read_only, "{:?}", restored.warnings);
+                        assert_eq!(restored.bit_depth, depth);
+                        assert_eq!(
+                            restored.layers[0].pixels.rgba16(),
+                            engine.doc.layers[0].pixels.rgba16()
+                        );
+                        assert_eq!(
+                            restored.export_png().unwrap(),
+                            engine.doc.export_png().unwrap()
+                        );
+                        let resaved = psd::encode(&restored).unwrap();
+                        assert_eq!(&resaved[global_mask_range(&resaved).1], settings);
+                    }
+                }
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.export_png().unwrap(), original_png);
+                let undone = psd::encode(&engine.doc).unwrap();
+                assert_eq!(&undone[global_mask_range(&undone).1], settings);
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_or_malformed_global_mask_settings_remain_protected_with_saved_precision() {
+    for depth in [8, 16] {
+        let original = fixture(depth);
+        for bytes in [
+            psd::encode(&original).unwrap(),
+            psd::encode_psb(&original).unwrap(),
+        ] {
+            let mut cases = vec![vec![0; 12], vec![0; 17]];
+            for (offset, value) in [
+                (1, 1),
+                (10, 1),
+                (11, 101),
+                (12, 0),
+                (12, 1),
+                (12, 129),
+                (15, 1),
+            ] {
+                let mut settings = per_layer_global_mask();
+                settings[offset] = value;
+                cases.push(settings);
+            }
+            for settings in cases {
+                // Test standard-only files and attempts to bypass protection
+                // through otherwise valid supplementary sources.
+                for source in [bytes.clone(), ordinary(&bytes)] {
+                    let protected = psd::decode(&replace_global_mask(&source, &settings)).unwrap();
+                    assert!(protected.read_only, "{depth}-bit {settings:?}");
+                    assert!(protected
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("global layer mask")));
+                    assert_eq!(protected.bit_depth, depth);
+                    assert_eq!(
+                        protected.export_png().unwrap(),
+                        original.export_png().unwrap()
+                    );
+                    assert!(psd::encode(&protected).is_err());
+                    assert!(psd::encode_psb(&protected).is_err());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn preferred_global_mask_settings_preserve_per_layer_masks_clipping_and_folders() {
+    for depth in [8, 16] {
+        let mut doc = fixture(depth);
+        doc.width = 4;
+        doc.height = 3;
+        let mut folder = Layer::new("Masked folder", "group", 4, 3);
+        folder.pixels = Raster::new_depth(4, 3, depth);
+        let mut base = Layer::new("Clipping base", "paint", 2, 1);
+        base.pixels = Raster::new_depth(2, 1, depth);
+        base.pixels.set16(0, 0, [10123, 20247, 30371, 65535]);
+        base.pixels.set16(1, 0, [40123, 50247, 60371, 65535]);
+        base.parent = Some(folder.id.clone());
+        base.x = 1;
+        base.y = 1;
+        doc.layers[0].parent = base.parent.clone();
+        doc.layers[0].clip_to = Some(base.id.clone());
+        doc.layers[0].x = 1;
+        doc.layers[0].y = 1;
+        let mask = |width, height| {
+            let mut pixels = Raster::new_depth(width, height, depth);
+            pixels.set16(0, 0, [65535; 4]);
+            pixels.set16(1, 0, [32769, 32769, 32769, 65535]);
+            Mask {
+                enabled: true,
+                cache_key: peerbrush::engine::id(),
+                steps: vec![MaskStep {
+                    id: peerbrush::engine::id(),
+                    kind: "paint".into(),
+                    enabled: true,
+                    weight: 1.,
+                    value: 1.,
+                    pixels,
+                    settings: json!({}),
+                }],
+            }
+        };
+        doc.layers[0].mask = Some(mask(2, 1));
+        // Folder mask is local to its stored frame, as are raster masks.
+        folder.mask = Some(mask(4, 3));
+        doc.layers.insert(0, folder);
+        doc.layers.push(base);
+        let expected = doc.export_png().unwrap();
+        for encoded in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+            let external = replace_global_mask(&ordinary(&encoded), &per_layer_global_mask());
+            let restored = psd::decode(&external).unwrap();
+            assert!(!restored.read_only, "{:?}", restored.warnings);
+            assert_eq!(restored.layers.len(), 3);
+            assert_eq!(restored.layers[0].kind, "group");
+            assert_eq!(
+                restored.layers[1].parent.as_ref(),
+                Some(&restored.layers[0].id)
+            );
+            assert_eq!(
+                restored.layers[1].clip_to.as_ref(),
+                Some(&restored.layers[2].id)
+            );
+            for index in [1, 2] {
+                assert_eq!(
+                    restored.layers[index].pixels.rgba16(),
+                    doc.layers[index].pixels.rgba16()
+                );
+                assert_eq!([restored.layers[index].x, restored.layers[index].y], [1, 1]);
+            }
+            for index in [0, 1] {
+                assert_eq!(
+                    peerbrush::depth16::mask_image(&restored, index)
+                        .unwrap()
+                        .unwrap()
+                        .words,
+                    peerbrush::depth16::mask_image(&doc, index)
+                        .unwrap()
+                        .unwrap()
+                        .words
+                );
+            }
+            assert_eq!(restored.export_png().unwrap(), expected);
+            let saved = psd::encode_psb(&restored).unwrap();
+            assert_eq!(&saved[global_mask_range(&saved).1], per_layer_global_mask());
+            assert_eq!(
+                psd::decode(&ordinary(&saved))
+                    .unwrap()
+                    .export_png()
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+fn rewrite_private_document(bytes: &[u8], update: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let color = u32::from_be_bytes(bytes[26..30].try_into().unwrap()) as usize;
+    let resources = 30 + color;
+    let resources_len =
+        u32::from_be_bytes(bytes[resources..resources + 4].try_into().unwrap()) as usize;
+    let start = bytes.windows(4).position(|word| word == b"PBR1").unwrap();
+    let length = u32::from_be_bytes(bytes[start - 4..start].try_into().unwrap()) as usize;
+    let mut json = vec![];
+    flate2::read::ZlibDecoder::new(&bytes[start + 4..start + length])
+        .read_to_end(&mut json)
+        .unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    update(&mut value["document"]);
+    let mut zip = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    zip.write_all(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut payload = b"PBR1".to_vec();
+    payload.extend(zip.finish().unwrap());
+    let new_len = payload.len();
+    payload.resize(new_len + new_len % 2, 0);
+    let mut out = bytes.to_vec();
+    out.splice(start..start + length + length % 2, payload.iter().copied());
+    out[start - 4..start].copy_from_slice(&(new_len as u32).to_be_bytes());
+    let new_resources = resources_len - length - length % 2 + payload.len();
+    out[resources..resources + 4].copy_from_slice(&(new_resources as u32).to_be_bytes());
+    out
+}
+
+#[test]
+fn supplementary_sources_cannot_drop_or_replace_standard_global_mask_settings() {
+    for depth in [8, 16] {
+        let mut original = fixture(depth);
+        original.psd_global_mask = Some(psd::GlobalMaskSettings {
+            data: per_layer_global_mask(),
+        });
+        for encoded in [
+            psd::encode(&original).unwrap(),
+            psd::encode_psb(&original).unwrap(),
+        ] {
+            for remove in [false, true] {
+                let changed = rewrite_private_document(&encoded, |doc| {
+                    if remove {
+                        doc.as_object_mut().unwrap().remove("psd_global_mask");
+                    } else {
+                        doc["psd_global_mask"]["data"][2] = json!(127);
+                    }
+                });
+                assert_eq!(
+                    &changed[global_mask_range(&changed).1],
+                    per_layer_global_mask()
+                );
+                let protected = psd::decode(&changed).unwrap();
+                assert!(protected.read_only);
+                assert!(protected
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("definitions were changed")));
+                assert_eq!(protected.psd_global_mask, original.psd_global_mask);
+                assert_eq!(protected.bit_depth, depth);
+                assert_eq!(
+                    protected.export_png().unwrap(),
+                    original.export_png().unwrap()
+                );
+                assert!(psd::encode(&protected).is_err());
+                let shared = std::sync::Arc::new(std::sync::Mutex::new({
+                    let mut engine = Engine::new();
+                    engine.doc = protected;
+                    engine
+                }));
+                peerbrush::server::compatible_copy(&shared, "human", Some(0)).unwrap();
+                let copied = shared.lock().unwrap();
+                assert_eq!(copied.doc.psd_global_mask, None);
+                assert_eq!(copied.doc.bit_depth, depth);
+                assert_eq!(
+                    copied.doc.export_png().unwrap(),
+                    original.export_png().unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unsupported_global_mask_settings_cannot_be_injected_into_editable_saves() {
+    for depth in [8, 16] {
+        for data in [vec![], vec![0; 12], vec![0; 16], vec![0; 4096]] {
+            let mut doc = fixture(depth);
+            doc.psd_global_mask = Some(psd::GlobalMaskSettings { data });
+            assert!(psd::validate(&doc).is_err());
+            assert!(psd::encode(&doc).is_err());
+            assert!(psd::encode_psb(&doc).is_err());
+        }
+    }
 }
 
 #[test]

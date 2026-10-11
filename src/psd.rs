@@ -298,6 +298,30 @@ pub struct LayerMetadata {
     pub data: Vec<u8>,
 }
 
+/// The preferred global-mask kind delegates mask values to individual layers.
+/// Retain its overlay bytes in standard PSD/PSB data without changing pixels.
+/// Other kinds, color spaces and payload extensions remain protected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalMaskSettings {
+    pub data: Vec<u8>,
+}
+impl GlobalMaskSettings {
+    fn validate(&self) -> Result<(), String> {
+        validate_global_mask_settings(&self.data)
+    }
+}
+fn validate_global_mask_settings(data: &[u8]) -> Result<(), String> {
+    if !(13..=16).contains(&data.len())
+        || data[..2] != [0, 0]
+        || u16::from_be_bytes(data[10..12].try_into().unwrap()) > 100
+        || data[12] != 128
+        || data[13..].iter().any(|value| *value != 0)
+    {
+        return Err("Unsupported Photoshop global layer mask settings".into());
+    }
+    Ok(())
+}
+
 fn static_timestamp_metadata(data: &[u8]) -> Result<(), String> {
     if data.len() > 128 {
         return Err("Photoshop timestamp metadata exceeds its bounded size".into());
@@ -716,7 +740,12 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     let mut layer_section = vec![];
     if high {
         layout.length(&mut layer_section, 0); // Primary8-bit layer information is empty.
-        u32b(&mut layer_section, 0); // Global layer mask.
+        block(
+            &mut layer_section,
+            doc.psd_global_mask
+                .as_ref()
+                .map_or(&[], |mask| mask.data.as_slice()),
+        );
         layer_section.extend(b"8BIMLr16");
         layout.write_block(&mut layer_section, &info);
         layer_section.resize(layer_section.len() + (4 - info.len() % 4) % 4, 0);
@@ -724,7 +753,12 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         layout.length(&mut layer_section, 0);
     } else {
         layout.write_block(&mut layer_section, &info);
-        u32b(&mut layer_section, 0);
+        block(
+            &mut layer_section,
+            doc.psd_global_mask
+                .as_ref()
+                .map_or(&[], |mask| mask.data.as_slice()),
+        );
     }
     let (w, h) = (doc.width, doc.height);
     let mut composite = vec![];
@@ -1467,6 +1501,12 @@ fn decode_parts(
     let mut rr = Cursor::new(resources);
     let mut embedded = None;
     let mut warnings = global_warnings(layer_section, depth, layout)?;
+    let (_, global_mask, _) = global_blocks(layer_section, layout)?;
+    let global_mask_settings = (!global_mask.is_empty()
+        && validate_global_mask_settings(global_mask).is_ok())
+    .then(|| GlobalMaskSettings {
+        data: global_mask.to_vec(),
+    });
     let mut has_merged_composite = true;
     let mut icc_profile = None;
     let mut seen_profile = false;
@@ -1555,6 +1595,7 @@ fn decode_parts(
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash
+                    && e.document.psd_global_mask == global_mask_settings
                     && validate(&e.document).is_ok()
                 {
                     control.progress("Ready", 1, 1)?;
@@ -1942,6 +1983,7 @@ fn decode_parts(
     doc.bit_depth = depth;
     doc.icc_profile = icc_profile;
     doc.srgb_tagged = srgb_tagged;
+    doc.psd_global_mask = global_mask_settings;
     doc.layers.clear();
     let mut parents = Vec::<String>::new();
     let mut source_indices = std::collections::HashMap::new();
@@ -2056,7 +2098,7 @@ fn global_blocks(section: &[u8], layout: Layout) -> Result<GlobalBlocks<'_>, Str
 fn global_warnings(section: &[u8], depth: u16, layout: Layout) -> Result<Vec<String>, String> {
     let (primary, mask, tags) = global_blocks(section, layout)?;
     let mut warnings = vec![];
-    if !mask.is_empty() {
+    if !mask.is_empty() && validate_global_mask_settings(mask).is_err() {
         warnings
             .push("Photoshop global layer masks are protected; using the saved composite".into());
     }
@@ -2211,6 +2253,9 @@ fn decode_channel_16(data: &[u8], w: u32, h: u32, layout: Layout) -> Result<Vec<
     decode_planes_16(data, w, h, 1, layout)
 }
 pub fn validate(doc: &Document) -> Result<(), String> {
+    if let Some(mask) = &doc.psd_global_mask {
+        mask.validate()?;
+    }
     if let Some(profile) = &doc.icc_profile {
         if doc.srgb_tagged {
             return Err(
