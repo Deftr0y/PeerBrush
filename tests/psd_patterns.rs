@@ -82,11 +82,31 @@ fn fixture(depth: u16, compression: u8, id: &str) -> (Vec<u8>, Vec<u16>) {
                 c.push(row.len() as u8 - 1);
                 c.extend(row);
             }
-        } else if compression == 2 {
+        } else if compression == 2 || compression == 3 {
             use std::io::Write;
             let mut zip =
                 flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            for row in rows {
+            for mut row in rows {
+                if compression == 3 {
+                    if depth == 16 {
+                        let values: Vec<_> = row
+                            .chunks_exact(2)
+                            .map(|v| u16::from_be_bytes([v[0], v[1]]))
+                            .collect();
+                        row = values
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(i, v)| {
+                                v.wrapping_sub(if i == 0 { 0 } else { values[i - 1] })
+                                    .to_be_bytes()
+                            })
+                            .collect();
+                    } else {
+                        for i in (1..row.len()).rev() {
+                            row[i] = row[i].wrapping_sub(row[i - 1]);
+                        }
+                    }
+                }
                 zip.write_all(&row).unwrap();
             }
             c.extend(zip.finish().unwrap());
@@ -159,7 +179,7 @@ fn inject(bytes: &[u8], tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
 #[test]
 fn supported_rgb_assets_preserve_every_native_sample_and_asset_coordinates() {
     for depth in [8, 16] {
-        for compression in [0, 1, 2] {
+        for compression in [0, 1, 2, 3] {
             for tag in ["Patt", "Pat2", "Pat3"] {
                 let (bytes, words) = fixture(depth, compression, "synthetic-pattern");
                 let sources = patterns::decode(&bytes, tag, &Control::default()).unwrap();
@@ -256,93 +276,95 @@ fn unsupported_channel_precision_compression_masks_and_bounds_never_substitute_p
 #[test]
 fn psd_psb_pattern_sources_are_view_only_with_exact_current_native_composites() {
     for depth in [8, 16] {
-        let mut doc = Document::new_depth(8, 6, depth).unwrap();
-        doc.layers[0]
-            .pixels
-            .set16(3, 2, [12345, 23457, 34569, 65535]);
-        let current = doc.export_png().unwrap();
-        let (patt, words) = fixture(depth, 1, "synthetic-pattern");
-        for (tag, encoded) in [
-            (b"Patt", psd::encode(&doc).unwrap()),
-            (b"Pat2", psd::encode_psb(&doc).unwrap()),
-        ] {
-            let bytes = inject(&encoded, tag, &patt);
-            let restored = psd::decode(&bytes).unwrap();
-            assert!(restored.read_only);
-            assert_eq!(restored.export_png().unwrap(), current);
-            assert_eq!(restored.source_patterns.len(), 1);
-            assert_eq!(restored.source_patterns[0].pixels.rgba16(), words);
-            assert!(restored.layers[0].effects.is_empty());
-            assert!(serde_json::to_value(&restored)
-                .unwrap()
-                .get("source_patterns")
-                .is_none());
-            let mut e = Engine::new();
-            e.doc = restored;
-            let before = e.doc.export_png().unwrap();
-            let id = e.doc.layers[0].id.clone();
-            assert!(e
-                .edit(
-                    "human",
-                    &[json!({"op":"paint.fill","layer":id})],
-                    None,
-                    None,
-                    "Protected"
-                )
-                .is_err());
-            assert!(e.undo.is_empty());
-            assert_eq!(e.doc.export_png().unwrap(), before);
+        for compression in [1, 2, 3] {
+            let mut doc = Document::new_depth(8, 6, depth).unwrap();
+            doc.layers[0]
+                .pixels
+                .set16(3, 2, [12345, 23457, 34569, 65535]);
+            let current = doc.export_png().unwrap();
+            let (patt, words) = fixture(depth, compression, "synthetic-pattern");
+            for (tag, encoded) in [
+                (b"Patt", psd::encode(&doc).unwrap()),
+                (b"Pat2", psd::encode_psb(&doc).unwrap()),
+            ] {
+                let bytes = inject(&encoded, tag, &patt);
+                let restored = psd::decode(&bytes).unwrap();
+                assert!(restored.read_only);
+                assert_eq!(restored.export_png().unwrap(), current);
+                assert_eq!(restored.source_patterns.len(), 1);
+                assert_eq!(restored.source_patterns[0].pixels.rgba16(), words);
+                assert!(restored.layers[0].effects.is_empty());
+                assert!(serde_json::to_value(&restored)
+                    .unwrap()
+                    .get("source_patterns")
+                    .is_none());
+                let mut e = Engine::new();
+                e.doc = restored;
+                let before = e.doc.export_png().unwrap();
+                let id = e.doc.layers[0].id.clone();
+                assert!(e
+                    .edit(
+                        "human",
+                        &[json!({"op":"paint.fill","layer":id})],
+                        None,
+                        None,
+                        "Protected"
+                    )
+                    .is_err());
+                assert!(e.undo.is_empty());
+                assert_eq!(e.doc.export_png().unwrap(), before);
+            }
         }
     }
 }
 #[test]
 fn shared_pattern_inspection_returns_actual_native_pngs_with_source_guards_and_asset_space() {
     for depth in [8, 16] {
-        let mut e = Engine::new();
-        let (bytes, words) = fixture(depth, 1, "synthetic-pattern");
-        e.doc.source_patterns = patterns::decode(&bytes, "Patt", &Control::default()).unwrap();
-        e.doc.read_only = true;
-        let before = serde_json::to_value(&e.doc).unwrap();
-        let id = e.doc.id.clone();
-        let revision = e.doc.revision;
-        let shared = Arc::new(Mutex::new(e));
-        let request = json!({"action":"pattern_sources","document_id":id,"expected_revision":revision,"pattern_index":0});
-        let result = server::dispatch(&shared, "document", &request).unwrap();
-        assert_eq!(result["coordinate_space"], "pattern_asset");
-        assert!(result["images"][0].get("document_rect").is_none());
-        assert_eq!(result["images"][0]["asset_rect"], json!([-2, 5, 1, 7]));
-        assert_eq!(result["images"][0]["native_depth"], depth);
-        let png = STANDARD
-            .decode(result["images"][0]["data"].as_str().unwrap())
-            .unwrap();
-        let decoded = image::load_from_memory(&png).unwrap();
-        assert_eq!(decoded.into_rgba16().into_raw(), words);
-        assert_eq!(
-            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
-            before
-        );
-        assert!(shared.lock().unwrap().undo.is_empty());
-        for patch in [
-            json!({"pattern_index":1}),
-            json!({"pattern_index":-1}),
-            json!({"pattern_index":0.5}),
-            json!({"document_id":"different"}),
-            json!({"expected_revision":revision+1}),
-        ] {
-            let mut p = request.clone();
-            for (k, v) in patch.as_object().unwrap() {
-                p[k] = v.clone();
+        for compression in [1, 2, 3] {
+            let mut e = Engine::new();
+            let (bytes, words) = fixture(depth, compression, "synthetic-pattern");
+            e.doc.source_patterns = patterns::decode(&bytes, "Patt", &Control::default()).unwrap();
+            e.doc.read_only = true;
+            let before = serde_json::to_value(&e.doc).unwrap();
+            let id = e.doc.id.clone();
+            let revision = e.doc.revision;
+            let shared = Arc::new(Mutex::new(e));
+            let request = json!({"action":"pattern_sources","document_id":id,"expected_revision":revision,"pattern_index":0});
+            let result = server::dispatch(&shared, "document", &request).unwrap();
+            assert_eq!(result["coordinate_space"], "pattern_asset");
+            assert!(result["images"][0].get("document_rect").is_none());
+            assert_eq!(result["images"][0]["asset_rect"], json!([-2, 5, 1, 7]));
+            assert_eq!(result["images"][0]["native_depth"], depth);
+            let png = STANDARD
+                .decode(result["images"][0]["data"].as_str().unwrap())
+                .unwrap();
+            let decoded = image::load_from_memory(&png).unwrap();
+            assert_eq!(decoded.into_rgba16().into_raw(), words);
+            assert_eq!(
+                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                before
+            );
+            assert!(shared.lock().unwrap().undo.is_empty());
+            for patch in [
+                json!({"pattern_index":1}),
+                json!({"pattern_index":-1}),
+                json!({"pattern_index":0.5}),
+                json!({"document_id":"different"}),
+                json!({"expected_revision":revision+1}),
+            ] {
+                let mut p = request.clone();
+                for (k, v) in patch.as_object().unwrap() {
+                    p[k] = v.clone();
+                }
+                assert!(server::dispatch(&shared, "document", &p).is_err());
             }
-            assert!(server::dispatch(&shared, "document", &p).is_err());
         }
     }
 }
-
 fn replace_first_channel_payload(bytes: &[u8], payload: &[u8]) -> Vec<u8> {
-    let marker = [0, 0, 0, 16, 0, 0, 0, 5];
     let at = bytes
-        .windows(marker.len())
-        .position(|v| v == marker)
+        .windows(8)
+        .position(|v| (v[..4] == [0, 0, 0, 8] || v[..4] == [0, 0, 0, 16]) && v[4..] == [0, 0, 0, 5])
         .unwrap();
     let channel_len = u32::from_be_bytes(bytes[at - 4..at].try_into().unwrap()) as usize;
     let pattern_len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
@@ -359,6 +381,7 @@ fn replace_first_channel_payload(bytes: &[u8], payload: &[u8]) -> Vec<u8> {
     out.resize(out.len().div_ceil(4) * 4, 0);
     out
 }
+
 #[test]
 fn zip_patterns_reject_truncation_trailing_streams_corrupt_checksums_and_excessive_output() {
     use std::io::Write;
@@ -402,5 +425,37 @@ fn zip_patterns_reject_truncation_trailing_streams_corrupt_checksums_and_excessi
             .is_err(),
             "truncated compressed prefix {end}"
         );
+    }
+}
+
+#[test]
+fn predicted_pattern_rows_reset_and_wrap_at_their_original_channel_precision() {
+    use std::io::Write;
+    for depth in [8, 16] {
+        let (bytes, mut expected) = fixture(depth, 3, "synthetic-pattern");
+        let samples = [65013u16, 17, 64121, 997, 64531, 233];
+        let mut raw = Vec::new();
+        for (y, row) in samples.chunks_exact(3).enumerate() {
+            let mut previous = 0u16;
+            for (i, &value) in row.iter().enumerate() {
+                let value = if depth == 16 {
+                    value
+                } else {
+                    u16::from(raster::project16(value)) * 257
+                };
+                if depth == 16 {
+                    raw.extend(value.wrapping_sub(previous).to_be_bytes());
+                } else {
+                    raw.push(raster::project16(value).wrapping_sub(raster::project16(previous)));
+                }
+                previous = value;
+                expected[(y * 3 + i) * 4] = value;
+            }
+        }
+        let mut zip = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zip.write_all(&raw).unwrap();
+        let modified = replace_first_channel_payload(&bytes, &zip.finish().unwrap());
+        let sources = patterns::decode(&modified, "Patt", &Control::default()).unwrap();
+        assert_eq!(sources[0].pixels.rgba16(), expected);
     }
 }

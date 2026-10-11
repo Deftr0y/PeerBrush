@@ -195,13 +195,13 @@ pub fn decode(data: &[u8], tag: &str, control: &Control) -> Result<Vec<Source>, 
                     }
                     n
                 }
-                2 => {
+                2 | 3 => {
                     validate_zip(payload, row_bytes * height as usize, control)?;
                     payload.len()
                 }
                 _ => {
                     return Err(
-                        "Only raw, PackBits and ZIP RGB pattern channels can be inspected".into(),
+                        "Only raw, PackBits, ZIP and ZIP-predicted RGB pattern channels can be inspected".into(),
                     )
                 }
             };

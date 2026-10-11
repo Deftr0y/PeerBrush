@@ -147,6 +147,9 @@ fn pattern_payload(enabled: bool, identity: &str, omit: &str, scale: f64) -> Vec
 }
 const PATTERN: [[u16; 4]; 2] = [[31337, 12347, 54323, 65535], [43219, 19237, 22349, 65535]];
 fn pattern_resource(depth: u16, identity: &str) -> Vec<u8> {
+    pattern_resource_compression(depth, identity, 0)
+}
+fn pattern_resource_compression(depth: u16, identity: &str, compression: u8) -> Vec<u8> {
     let rect = [0i32, 0, 1, 2]
         .into_iter()
         .flat_map(i32::to_be_bytes)
@@ -158,9 +161,35 @@ fn pattern_resource(depth: u16, identity: &str) -> Vec<u8> {
         let mut data = u32::from(depth).to_be_bytes().to_vec();
         data.extend(&rect);
         data.extend(depth.to_be_bytes());
-        data.push(0);
-        for pixel in PATTERN {
-            sample(&mut data, pixel[channel], depth);
+        data.push(compression);
+        let mut row = Vec::new();
+        for (i, pixel) in PATTERN.iter().enumerate() {
+            let n = native(pixel[channel], depth);
+            if compression == 3 {
+                let prev = if i == 0 {
+                    0
+                } else {
+                    native(PATTERN[i - 1][channel], depth)
+                };
+                if depth == 16 {
+                    row.extend(n.wrapping_sub(prev).to_be_bytes());
+                } else {
+                    row.push(
+                        peerbrush::raster::project16(n)
+                            .wrapping_sub(peerbrush::raster::project16(prev)),
+                    );
+                }
+            } else {
+                sample(&mut row, n, depth);
+            }
+        }
+        if compression >= 2 {
+            use std::io::Write;
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            z.write_all(&row).unwrap();
+            data.extend(z.finish().unwrap());
+        } else {
+            data.extend(row);
         }
         block(&mut arrays, &data);
     }
@@ -208,58 +237,60 @@ fn inject_pattern(
 #[test]
 fn plain_photoshop_pattern_import_retains_native_tiles_sources_and_editable_saves() {
     for depth in [8, 16] {
-        for enabled in [true, false] {
-            let mut spec = Spec::paint("Synthetic pattern source", SAVED);
-            spec.tags.push((
-                *b"lfx2",
-                pattern_payload(enabled, "synthetic-pattern", "", 100.),
-            ));
-            let bytes = inject_pattern(
-                fixture(&[spec], depth),
-                depth,
-                &pattern_resource(depth, "synthetic-pattern"),
-                enabled,
-            );
-            let doc = psd::decode(&bytes).unwrap();
-            assert!(!doc.read_only, "{:?}", doc.warnings);
-            assert_eq!(doc.layers[0].effects[0].kind, "pattern_overlay");
-            assert_eq!(doc.layers[0].effects[0].enabled, enabled);
-            let bitmap = peerbrush::effects::patterns::get(
-                doc.layers[0].effects[0].settings["bitmap_png"]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(bitmap.depth, depth);
-            for x in 0..2 {
-                assert_eq!(
-                    doc.layers[0].pixels.get16(x, 0),
-                    SAVED[x as usize].map(|n| native(n, depth))
+        for compression in [0, 2, 3] {
+            for enabled in [true, false] {
+                let mut spec = Spec::paint("Synthetic pattern source", SAVED);
+                spec.tags.push((
+                    *b"lfx2",
+                    pattern_payload(enabled, "synthetic-pattern", "", 100.),
+                ));
+                let bytes = inject_pattern(
+                    fixture(&[spec], depth),
+                    depth,
+                    &pattern_resource_compression(depth, "synthetic-pattern", compression),
+                    enabled,
                 );
-            }
-            let rendered = doc.export_png().unwrap();
-            let source = doc.layers[0].pixels.rgba16();
-            let layer = doc.layers[0].id.clone();
-            let effect = doc.layers[0].effects[0].id.clone();
-            let mut engine = Engine::new();
-            engine.doc = doc;
-            let mut settings = engine.doc.layers[0].effects[0].settings.clone();
-            settings["phase_x"] = json!(1.);
-            engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings})],None,None,"Pattern phase").unwrap();
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
-            assert_eq!(engine.undo.len(), 1);
-            engine.undo("human").unwrap();
-            assert_eq!(engine.doc.export_png().unwrap(), rendered);
-            for large in [false, true] {
-                let reopened = psd::decode(&if large {
-                    psd::encode_psb(&engine.doc).unwrap()
-                } else {
-                    psd::encode(&engine.doc).unwrap()
-                })
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(!doc.read_only, "{:?}", doc.warnings);
+                assert_eq!(doc.layers[0].effects[0].kind, "pattern_overlay");
+                assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+                let bitmap = peerbrush::effects::patterns::get(
+                    doc.layers[0].effects[0].settings["bitmap_png"]
+                        .as_str()
+                        .unwrap(),
+                )
                 .unwrap();
-                assert!(!reopened.read_only);
-                assert_eq!(reopened.export_png().unwrap(), rendered);
-                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                assert_eq!(bitmap.depth, depth);
+                for x in 0..2 {
+                    assert_eq!(
+                        doc.layers[0].pixels.get16(x, 0),
+                        SAVED[x as usize].map(|n| native(n, depth))
+                    );
+                }
+                let rendered = doc.export_png().unwrap();
+                let source = doc.layers[0].pixels.rgba16();
+                let layer = doc.layers[0].id.clone();
+                let effect = doc.layers[0].effects[0].id.clone();
+                let mut engine = Engine::new();
+                engine.doc = doc;
+                let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+                settings["phase_x"] = json!(1.);
+                engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings})],None,None,"Pattern phase").unwrap();
+                assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                assert_eq!(engine.undo.len(), 1);
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.export_png().unwrap(), rendered);
+                for large in [false, true] {
+                    let reopened = psd::decode(&if large {
+                        psd::encode_psb(&engine.doc).unwrap()
+                    } else {
+                        psd::encode(&engine.doc).unwrap()
+                    })
+                    .unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.export_png().unwrap(), rendered);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                }
             }
         }
     }
