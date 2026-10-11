@@ -434,6 +434,126 @@ fn transparent_photoshop_patterns_retain_native_sources_blends_guards_and_workin
     }
 }
 #[test]
+fn omitted_pattern_angle_imports_as_unrotated_with_exact_native_source_and_save_guards() {
+    for depth in [8, 16] {
+        for enabled in [false, true] {
+            for compression in [0, 2, 3] {
+                let build = |omit| {
+                    let mut spec = Spec::paint("Synthetic optional angle", SAVED);
+                    spec.tags.push((
+                        *b"lfx2",
+                        pattern_payload(enabled, "synthetic-pattern", omit, 100.),
+                    ));
+                    inject_pattern(
+                        fixture(&[spec], depth),
+                        depth,
+                        &pattern_resource_compression(depth, "synthetic-pattern", compression),
+                        enabled,
+                    )
+                };
+                let doc = psd::decode(&build("Angl")).unwrap();
+                assert!(
+                    !doc.read_only,
+                    "{depth} {enabled} {compression}: {:?}",
+                    doc.warnings
+                );
+                let explicit = psd::decode(&build("")).unwrap();
+                assert_eq!(doc.layers[0].effects.len(), 1);
+                assert_eq!(
+                    doc.layers[0].effects[0].settings,
+                    explicit.layers[0].effects[0].settings
+                );
+                assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+                assert_eq!(doc.layers[0].effects[0].settings["bitmap_angle"], 0.);
+                assert_eq!(
+                    rendered(&doc),
+                    if enabled { PATTERN } else { SAVED }
+                        .into_iter()
+                        .flat_map(|pixel| pixel.map(|n| native(n, depth)))
+                        .collect::<Vec<_>>()
+                );
+                let source = doc.layers[0].pixels.rgba16();
+                let current = doc.export_png().unwrap();
+                let mut engine = Engine::new();
+                engine.doc = doc;
+                let layer = engine.doc.layers[0].id.clone();
+                let effect = engine.doc.layers[0].effects[0].id.clone();
+                engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})],None,None,"Optional-angle bypass").unwrap();
+                assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                assert_eq!(engine.undo.len(), 1);
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.export_png().unwrap(), current);
+                for bytes in [
+                    psd::encode(&engine.doc).unwrap(),
+                    psd::encode_psb(&engine.doc).unwrap(),
+                ] {
+                    let reopened = psd::decode(&bytes).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.bit_depth, depth);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                    assert_eq!(
+                        reopened.layers[0].effects[0].settings["bitmap_png"],
+                        engine.doc.layers[0].effects[0].settings["bitmap_png"]
+                    );
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                    assert_eq!(
+                        psd::decode(&ordinary(&bytes))
+                            .unwrap()
+                            .export_png()
+                            .unwrap(),
+                        current
+                    );
+                }
+                let mut mismatch = build("Angl");
+                let at = mismatch.len() - 8 * usize::from(depth / 8);
+                mismatch[at] ^= 1;
+                assert!(psd::decode(&mismatch).unwrap().read_only);
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_unsupported_pattern_angles_never_default_to_zero() {
+    for depth in [8, 16] {
+        for enabled in [false, true] {
+            for (unit, angle) in [
+                (b"#Prc", 0f64),
+                (b"#Ang", 1.),
+                (b"#Ang", f64::NAN),
+                (b"#Ang", f64::INFINITY),
+            ] {
+                let mut payload = pattern_payload(enabled, "synthetic-pattern", "", 100.);
+                let at = payload
+                    .windows(12)
+                    .position(|bytes| bytes == b"AnglUntF#Ang")
+                    .unwrap();
+                payload[at + 8..at + 12].copy_from_slice(unit);
+                payload[at + 12..at + 20].copy_from_slice(&angle.to_be_bytes());
+                let mut spec = Spec::paint("Synthetic guarded angle", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let bytes = inject_pattern(
+                    fixture(&[spec], depth),
+                    depth,
+                    &pattern_resource(depth, "synthetic-pattern"),
+                    enabled,
+                );
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(doc.read_only, "{depth} {enabled} {unit:?} {angle}");
+                assert_eq!(doc.bit_depth, depth);
+                assert_eq!(
+                    rendered(&doc),
+                    if enabled { PATTERN } else { SAVED }
+                        .into_iter()
+                        .flat_map(|pixel| pixel.map(|n| native(n, depth)))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn unsupported_missing_ambiguous_unused_and_mismatched_pattern_sources_stay_protected() {
     for depth in [8, 16] {
         for (identity, omit, scale) in [

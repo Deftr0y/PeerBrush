@@ -554,8 +554,11 @@ fn pattern_overlay(
     if fields
         .get("showInDialog")
         .is_some_and(|v| boolean(v).is_none())
-        || field(fields, "Angl")["type"] != "UntF"
-        || field(fields, "Angl")["value"] != json!(["#Ang", 0.])
+        // Unrotated pattern definitions may omit Angle. It defaults to zero
+        // in the primary effect reader; an explicit value must remain strict.
+        || fields.get("Angl").is_some_and(|angle| {
+            angle["type"] != "UntF" || angle["value"] != json!(["#Ang", 0.])
+        })
         || percent(field(fields, "Scl "))? != 1.
         || boolean(field(fields, "Algn")) != Some(false)
         || fields
