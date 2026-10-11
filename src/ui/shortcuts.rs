@@ -291,6 +291,16 @@ impl Shortcuts {
                 if is_key(egui::Key::Delete) && !modifiers.any() {
                     return true;
                 }
+                if modifiers.alt
+                    && !modifiers.command
+                    && [egui::Key::B, egui::Key::Backspace].into_iter().any(is_key)
+                    || (modifiers.command || modifiers.ctrl)
+                        && !modifiers.alt
+                        && !modifiers.shift
+                        && is_key(egui::Key::D)
+                {
+                    return true;
+                }
                 ["Move", "Rotate artwork", "Scale artwork"]
                     .into_iter()
                     .any(|action| {

@@ -11388,6 +11388,153 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_selections_hold_foreground_fill_and_selected_duplication_until_retry() {
+        for depth in [8, 16] {
+            for kind in ["wand", "polygon", "magnetic"] {
+                for action in ["fill_b", "fill_backspace", "duplicate"] {
+                    let (mut app, ctx, point, before) = pressed_selection_fixture(
+                        depth,
+                        if kind == "wand" {
+                            Tool::MagicWand
+                        } else {
+                            Tool::Selection
+                        },
+                        kind,
+                    );
+                    let path = kind != "wand";
+                    if path {
+                        frame(
+                            &mut app,
+                            &ctx,
+                            vec![primary_release(point)],
+                            Default::default(),
+                        );
+                        app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
+                    }
+                    let modifiers = if action == "duplicate" {
+                        egui::Modifiers {
+                            ctrl: true,
+                            command: true,
+                            ..Default::default()
+                        }
+                    } else {
+                        egui::Modifiers {
+                            alt: true,
+                            ..Default::default()
+                        }
+                    };
+                    let key = match action {
+                        "fill_b" => egui::Key::B,
+                        "fill_backspace" => egui::Key::Backspace,
+                        _ => egui::Key::D,
+                    };
+                    let event = |pressed| egui::Event::Key {
+                        key,
+                        physical_key: Some(key),
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    };
+                    frame(
+                        &mut app,
+                        &ctx,
+                        if path {
+                            vec![egui::Event::PointerMoved(Pos2::new(1., 1.)), event(true)]
+                        } else {
+                            vec![event(true)]
+                        },
+                        modifiers,
+                    );
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        assert_eq!(
+                            serde_json::to_value(&engine.doc).unwrap(),
+                            serde_json::to_value(&before).unwrap(),
+                            "{depth} {kind} {action}"
+                        );
+                        assert!(engine.undo.is_empty());
+                    }
+                    // Release the shortcut before completing the gesture.
+                    frame(&mut app, &ctx, vec![event(false)], Default::default());
+                    if path {
+                        frame(
+                            &mut app,
+                            &ctx,
+                            vec![shortcut_press(egui::Key::Enter)],
+                            Default::default(),
+                        );
+                    } else {
+                        frame(
+                            &mut app,
+                            &ctx,
+                            vec![egui::Event::PointerMoved(point), primary_release(point)],
+                            Default::default(),
+                        );
+                    }
+                    assert_eq!(
+                        app.shared.lock().unwrap().doc.selection,
+                        Some([4, 5, 12, 13]),
+                        "{depth} {kind} {action}"
+                    );
+                    assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+                    frame(&mut app, &ctx, vec![event(true)], modifiers);
+                    let mut engine = app.shared.lock().unwrap();
+                    assert_eq!(
+                        engine.undo.len(),
+                        2,
+                        "{depth} {kind} {action}: {}",
+                        app.message
+                    );
+                    if action == "duplicate" {
+                        assert_eq!(engine.doc.layers.len(), 2);
+                        let duplicate = engine
+                            .doc
+                            .layers
+                            .iter()
+                            .find(|layer| layer.id != before.layers[0].id)
+                            .unwrap();
+                        assert_eq!([duplicate.x, duplicate.y], [4, 5]);
+                        assert_eq!([duplicate.pixels.width, duplicate.pixels.height], [8, 8]);
+                        assert_eq!(duplicate.pixels.depth, depth);
+                        for y in 0..8 {
+                            for x in 0..8 {
+                                assert_eq!(
+                                    duplicate.pixels.get16(x, y),
+                                    before.layers[0].pixels.get16(x + 4, y + 5)
+                                );
+                            }
+                        }
+                    } else {
+                        for y in 0..32 {
+                            for x in 0..32 {
+                                assert_eq!(
+                                    engine.doc.layers[0].pixels.get16(x, y),
+                                    if (4..12).contains(&x) && (5..13).contains(&y) {
+                                        app.color.map(|channel| u16::from(channel) * 257)
+                                    } else {
+                                        before.layers[0].pixels.get16(x, y)
+                                    }
+                                );
+                            }
+                        }
+                    }
+                    engine.undo("human").unwrap();
+                    engine.undo("human").unwrap();
+                    assert_eq!(engine.doc.selection, before.selection);
+                    assert_eq!(
+                        engine.doc.layers[0].pixels.rgba16(),
+                        before.layers[0].pixels.rgba16()
+                    );
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        before.export_png().unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn selection_path_shortcut_guard_preserves_anchor_delete_and_escape() {
         for depth in [8, 16] {
             for kind in ["polygon", "magnetic"] {
