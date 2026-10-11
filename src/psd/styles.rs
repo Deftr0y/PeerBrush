@@ -242,18 +242,59 @@ pub(super) fn native_overlays(
     depth: u16,
 ) -> Result<(Vec<crate::effects::Effect>, Option<usize>), String> {
     let parsed = root(bytes)?;
-    if parsed["items"].get("patternFill").is_some() {
-        let (effect, index) = pattern_overlay(&parsed, patterns, depth)?;
-        return Ok((vec![effect], Some(index)));
+    if !matches!(parsed["class"].as_str(), Some("null" | "Lefx")) {
+        return Err("Unsupported Photoshop effects class".into());
     }
-    let effects = if parsed["items"].get("GrFl").is_some()
-        || parsed["items"].get("gradientFillMulti").is_some()
-    {
-        gradient_overlay(&parsed)
-    } else {
-        color_overlays(bytes)
-    }?;
-    Ok((effects, None))
+    let items = parsed["items"]
+        .as_object()
+        .ok_or("Invalid effects object")?;
+    if items.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "masterFXSwitch"
+                | "Scl "
+                | "SoFi"
+                | "solidFillMulti"
+                | "patternFill"
+                | "GrFl"
+                | "gradientFillMulti"
+        )
+    }) {
+        return Err("Unsupported Photoshop style in overlay stack".into());
+    }
+    let mut effects = vec![];
+    let mut pattern_index = None;
+    // Photoshop overlays run Color, Pattern, Gradient. Keep the same execution
+    // order in the native stack (the UI displays the last effect at the top).
+    // Reference: psd-tools/composite/composite.py::_OVERLAY_DRAWS.
+    // Each family still requires a single unambiguous, fully supported entry.
+    // Never try alternative orders merely to match the saved appearance.
+    for keys in [
+        &["SoFi", "solidFillMulti"][..],
+        &["patternFill"][..],
+        &["GrFl", "gradientFillMulti"][..],
+    ] {
+        if !keys.iter().any(|key| items.contains_key(*key)) {
+            continue;
+        }
+        let mut isolated = parsed.clone();
+        isolated["items"].as_object_mut().unwrap().retain(|key, _| {
+            matches!(key.as_str(), "masterFXSwitch" | "Scl ") || keys.contains(&key.as_str())
+        });
+        match keys[0] {
+            "SoFi" => effects.extend(color_overlay_root(&isolated)?),
+            "patternFill" => {
+                let (effect, index) = pattern_overlay(&isolated, patterns, depth)?;
+                effects.push(effect);
+                pattern_index = Some(index);
+            }
+            _ => effects.extend(gradient_overlay(&isolated)?),
+        }
+    }
+    if effects.is_empty() {
+        return Err("No supported Photoshop overlay definitions".into());
+    }
+    Ok((effects, pattern_index))
 }
 fn pattern_overlay(
     root: &Value,
@@ -558,8 +599,7 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
     }])
 }
 /// Small explicit import subset. The caller must verify the entire saved composite.
-pub(super) fn color_overlays(bytes: &[u8]) -> Result<Vec<crate::effects::Effect>, String> {
-    let root = root(bytes)?;
+fn color_overlay_root(root: &Value) -> Result<Vec<crate::effects::Effect>, String> {
     if !matches!(root["class"].as_str(), Some("null" | "Lefx")) {
         return Err("Unsupported Photoshop effects class".into());
     }

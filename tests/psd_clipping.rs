@@ -1465,3 +1465,179 @@ fn missing_or_unsupported_photoshop_gradient_fields_protect_without_panics() {
         }
     }
 }
+
+// Independent descriptor and composite fixtures: do not build the source PSD
+// using the importer or native style renderer under test.
+fn mixed_overlay_payload(enabled: [bool; 3], master: bool) -> Vec<u8> {
+    let sources = [
+        ("SoFi", overlay_payload(true, enabled[0], [111., 67., 231.])),
+        (
+            "patternFill",
+            pattern_payload(enabled[1], "synthetic-pattern", "", 100.),
+        ),
+        ("GrFl", gradient_payload(false, None, 0.)),
+    ];
+    let mut entries = vec![("masterFXSwitch", b"bool", vec![u8::from(master)])];
+    // Deliberately serialize in reverse family order. Property order must not
+    // become native execution order.
+    for (key, bytes) in sources.into_iter().rev() {
+        let needle = [key.as_bytes(), b"Objc"].concat();
+        let at = bytes
+            .windows(needle.len())
+            .position(|v| v == needle)
+            .unwrap();
+        let mut effect = bytes[at + needle.len()..].to_vec();
+        if key == "GrFl" {
+            let at = effect.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+            effect[at] = u8::from(enabled[2]);
+        }
+        if key != "SoFi" {
+            let at = effect
+                .windows(12)
+                .position(|v| v == b"OpctUntF#Prc")
+                .unwrap()
+                + 12;
+            effect[at..at + 8].copy_from_slice(&50f64.to_be_bytes());
+        }
+        entries.push((key, b"Objc", effect));
+    }
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        overlay_descriptor("Lefx", entries),
+    ]
+    .concat()
+}
+fn mixed_overlay_fixture(depth: u16, enabled: [bool; 3], master: bool, mismatch: bool) -> Vec<u8> {
+    let mut spec = Spec::paint("Synthetic mixed overlays", SAVED);
+    spec.tags
+        .push((*b"lmfx", mixed_overlay_payload(enabled, master)));
+    let mut bytes = inject_pattern(
+        fixture(&[spec], depth),
+        depth,
+        &pattern_resource(depth, "synthetic-pattern"),
+        false,
+    );
+    let mut merged = SAVED.map(|p| p.map(|n| native(n, depth)));
+    if master {
+        for (x, pixel) in merged.iter_mut().enumerate() {
+            if enabled[0] {
+                pixel[..3].copy_from_slice(&[111 * 257, 67 * 257, 231 * 257]);
+            }
+            for (active, tint) in [
+                (
+                    enabled[1],
+                    [
+                        native(PATTERN[x][0], depth),
+                        native(PATTERN[x][1], depth),
+                        native(PATTERN[x][2], depth),
+                    ],
+                ),
+                (enabled[2], [if x == 0 { 16384 } else { 49151 }; 3]),
+            ] {
+                if active {
+                    for c in 0..3 {
+                        let value = ((f64::from(pixel[c]) * 32767. + f64::from(tint[c]) * 32768.)
+                            / 65535.)
+                            .round() as u16;
+                        pixel[c] = native(value, depth);
+                    }
+                }
+            }
+        }
+    }
+    if mismatch {
+        merged[0][0] = merged[0][0].saturating_add(if depth == 16 { 1 } else { 257 });
+    }
+    bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+    for channel in 0..4 {
+        for pixel in merged {
+            sample(&mut bytes, pixel[channel], depth);
+        }
+    }
+    bytes
+}
+#[test]
+fn mixed_photoshop_overlays_retain_order_disabled_sources_undo_and_native_saves() {
+    for depth in [8, 16] {
+        for flags in 0u8..8 {
+            let enabled = [flags & 1 != 0, flags & 2 != 0, flags & 4 != 0];
+            for master in [false, true] {
+                let doc =
+                    psd::decode(&mixed_overlay_fixture(depth, enabled, master, false)).unwrap();
+                assert!(
+                    !doc.read_only,
+                    "{depth} {flags} {master}: {:?}",
+                    doc.warnings
+                );
+                let effects = &doc.layers[0].effects;
+                assert_eq!(
+                    effects.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+                    ["color_overlay", "pattern_overlay", "gradient_overlay"]
+                );
+                assert_eq!(
+                    effects.iter().map(|e| e.enabled).collect::<Vec<_>>(),
+                    enabled.map(|v| v && master)
+                );
+                let source = doc.layers[0].pixels.rgba16();
+                assert_eq!(
+                    source,
+                    SAVED
+                        .into_iter()
+                        .flatten()
+                        .map(|n| native(n, depth))
+                        .collect::<Vec<_>>()
+                );
+                let current = doc.export_png().unwrap();
+                let mut engine = Engine::new();
+                engine.doc = doc;
+                let layer = engine.doc.layers[0].id.clone();
+                let effect = engine.doc.layers[0].effects[1].id.clone();
+                let mut settings = engine.doc.layers[0].effects[1].settings.clone();
+                settings["phase_x"] = json!(1.);
+                engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings})], None, None, "Mixed pattern phase").unwrap();
+                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.export_png().unwrap(), current);
+                for bytes in [
+                    psd::encode(&engine.doc).unwrap(),
+                    psd::encode_psb(&engine.doc).unwrap(),
+                ] {
+                    let reopened = psd::decode(&bytes).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                    assert_eq!(reopened.layers[0].effects.len(), 3);
+                }
+            }
+        }
+    }
+}
+#[test]
+fn mixed_photoshop_overlays_protect_mismatches_and_unknown_even_disabled_styles() {
+    for depth in [8, 16] {
+        let mismatched = psd::decode(&mixed_overlay_fixture(depth, [true; 3], true, true)).unwrap();
+        assert!(mismatched.read_only);
+        for master in [false, true] {
+            let mut payload = mixed_overlay_payload([false; 3], master);
+            let at = payload.windows(4).position(|v| v == b"SoFi").unwrap();
+            payload[at..at + 4].copy_from_slice(b"DrSh");
+            let mut spec = Spec::paint("Synthetic unsupported mixed styles", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            let bytes = inject_pattern(
+                fixture(&[spec], depth),
+                depth,
+                &pattern_resource(depth, "synthetic-pattern"),
+                false,
+            );
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(doc.read_only);
+            assert_eq!(doc.bit_depth, depth);
+            assert!(doc
+                .warnings
+                .iter()
+                .any(|v| v.contains("Unsupported Photoshop style")));
+        }
+    }
+}
