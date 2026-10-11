@@ -119,9 +119,9 @@ impl PeerBrush {
                 if self.selection_kind == "wand" {
                     sampling_changed |= ui.checkbox(&mut self.selection_contiguous, "Contiguous").changed();
                 }
-                sampling_changed |= ui.checkbox(&mut self.selection_merged, "Merged")
+                sampling_changed |= ui.checkbox(&mut self.selection_merged, "All Layers")
                     .on_hover_text(
-                        "Sample the rendered composite; disable to sample the active layer",
+                        "Sample visible rendered artwork across all layers. Leave off to sample only the active layer.",
                     ).changed();
                 if self.selection_kind == "wand" {
                     let toggle = ui.checkbox(&mut self.selection_live_wand, "Live updates")

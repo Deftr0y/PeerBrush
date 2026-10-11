@@ -642,7 +642,7 @@ impl PeerBrush {
             selection_tolerance: 24.,
             selection_color_similarity: false,
             selection_contiguous: true,
-            selection_merged: true,
+            selection_merged: false,
             selection_live_wand: true,
             selection_width: 12.,
             selection_path: vec![],
@@ -6419,6 +6419,110 @@ mod tests {
         );
         assert_eq!(app.shared.lock().unwrap().doc.layers[0].opacity, 1.);
         assert!(app.message.contains("cancelled"));
+    }
+    #[test]
+    fn all_layers_defaults_off_samples_active_layer_and_keeps_explicit_choices() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            assert!(!app.selection_merged);
+            let before = {
+                let mut e = app.shared.lock().unwrap();
+                e.doc = Document::new_depth(8, 8, depth).unwrap();
+                for y in 0..8 {
+                    for x in 0..8 {
+                        e.doc.layers[0].pixels.set16(
+                            x,
+                            y,
+                            if x < 4 {
+                                [12347, 33559, 51237, 65535]
+                            } else {
+                                [51239, 12349, 33561, 65535]
+                            },
+                        );
+                    }
+                }
+                let mut top = crate::engine::Layer::new("Opaque cover", "paint", 8, 8);
+                top.pixels = crate::raster::Raster::new_depth(8, 8, depth);
+                for y in 0..8 {
+                    for x in 0..8 {
+                        top.pixels.set16(x, y, [22001, 22003, 22005, 65535]);
+                    }
+                }
+                e.doc.layers.insert(0, top);
+                e.doc.clone()
+            };
+            app.select_content(&before.layers[1].id);
+            app.select_tool(Tool::MagicWand);
+            app.selection_kind = "wand".into();
+            app.selection_tolerance = 0.;
+            frame(&mut app, &ctx, vec![], Default::default());
+            let canvas = app.view_rect.unwrap();
+            click(
+                &mut app,
+                &ctx,
+                canvas.min + Vec2::new(1.5, 2.5) * (canvas.width() / 8.),
+            );
+            assert_eq!(app.shared.lock().unwrap().doc.selection, Some([0, 0, 4, 8]));
+            fn checkbox(app: &mut PeerBrush, ctx: &egui::Context) -> Pos2 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                );
+                assert!(!output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text()=="Merged")));
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == "All Layers" => {
+                            Some(text.pos + text.galley.size() * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .expect("All Layers checkbox must be visible")
+            }
+            let at = checkbox(&mut app, &ctx);
+            click(&mut app, &ctx, at);
+            assert!(app.selection_merged);
+            {
+                let e = app.shared.lock().unwrap();
+                assert_eq!(e.doc.selection, Some([0, 0, 8, 8]));
+                assert_eq!(e.undo.len(), 2);
+                assert_eq!(
+                    crate::selection::wand_source(&e.doc).unwrap().command["sample_merged"],
+                    true
+                );
+                for (layer, original) in e.doc.layers.iter().zip(&before.layers) {
+                    assert_eq!(layer.pixels.rgba16(), original.pixels.rgba16());
+                }
+            }
+            for kind in ["quick", "object", "wand"] {
+                app.select_tool(if kind == "wand" {
+                    Tool::MagicWand
+                } else {
+                    Tool::Selection
+                });
+                app.selection_kind = kind.into();
+                frame(&mut app, &ctx, vec![], Default::default());
+                assert!(
+                    app.selection_merged,
+                    "Explicit All Layers choice must survive sampler changes"
+                );
+            }
+            let at = checkbox(&mut app, &ctx);
+            click(&mut app, &ctx, at);
+            assert!(!app.selection_merged);
+            let mut e = app.shared.lock().unwrap();
+            assert_eq!(e.doc.selection, Some([0, 0, 4, 8]));
+            assert_eq!(e.undo.len(), 3);
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.selection, Some([0, 0, 8, 8]));
+            e.undo("human").unwrap();
+            assert_eq!(e.doc.selection, Some([0, 0, 4, 8]));
+            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        }
     }
     #[test]
     fn color_similarity_checkbox_replays_wand_once_and_respects_live_toggle() {
