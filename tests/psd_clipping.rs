@@ -1837,6 +1837,36 @@ fn normalized_style_fixture(
     opacity: f64,
     variant: &str,
 ) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
+    style_color_fixture(
+        depth,
+        family,
+        flags,
+        opacity,
+        [FLOAT_COLOR, FLOAT_COLOR2],
+        None,
+        variant,
+    )
+}
+fn grayscale_style_fixture(
+    depth: u16,
+    family: &str,
+    flags: u8,
+    opacity: f64,
+    gray: [f64; 2],
+    variant: &str,
+) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
+    let colors = gray.map(|black| [(100. - black) / 100.; 3]);
+    style_color_fixture(depth, family, flags, opacity, colors, Some(gray), variant)
+}
+fn style_color_fixture(
+    depth: u16,
+    family: &str,
+    flags: u8,
+    opacity: f64,
+    colors: [[f64; 3]; 2],
+    gray: Option<[f64; 2]>,
+    variant: &str,
+) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
     let mut payload = match family {
         "color" => overlay_payload(true, true, [111., 67., 231.]),
         "gradient" => gradient_payload(false, None, 0.),
@@ -1845,11 +1875,14 @@ fn normalized_style_fixture(
     };
     // Substitute complete independently encoded descriptors, including the
     // variable-length channel IDs; no parser or native renderer builds fixtures.
-    for (old, color) in if family == "gradient" {
-        vec![([0f64; 3], FLOAT_COLOR), ([255f64; 3], FLOAT_COLOR2)]
+    for (index, (old, color)) in (if family == "gradient" {
+        vec![([0f64; 3], colors[0]), ([255f64; 3], colors[1])]
     } else {
-        vec![([111f64, 67., 231.], FLOAT_COLOR)]
-    } {
+        vec![([111f64, 67., 231.], colors[0])]
+    })
+    .into_iter()
+    .enumerate()
+    {
         let needle = overlay_descriptor(
             "RGBC",
             ["Rd  ", "Grn ", "Bl  "]
@@ -1858,12 +1891,22 @@ fn normalized_style_fixture(
                 .map(|(key, n)| (key, b"doub", n.to_be_bytes().to_vec()))
                 .collect(),
         );
-        let mut fields = ["redFloat", "greenFloat", "blueFloat"]
-            .into_iter()
-            .zip(color)
-            .map(|(key, n)| (key, b"doub", n.to_be_bytes().to_vec()))
-            .collect::<Vec<_>>();
+        let mut fields = if let Some(gray) = gray {
+            vec![("Gry ", b"doub", gray[index].to_be_bytes().to_vec())]
+        } else {
+            ["redFloat", "greenFloat", "blueFloat"]
+                .into_iter()
+                .zip(color)
+                .map(|(key, n)| (key, b"doub", n.to_be_bytes().to_vec()))
+                .collect::<Vec<_>>()
+        };
         match variant {
+            "gray-integer" => {
+                fields[0].1 = b"long";
+                fields[0].2 = (gray.unwrap()[index] as i32).to_be_bytes().to_vec();
+            }
+            "gray-high" => fields[0].2 = 100.00001f64.to_be_bytes().to_vec(),
+            "extra-channel" => fields.push(("Rd  ", b"doub", 13f64.to_be_bytes().to_vec())),
             "mixed" => fields[1].0 = "Grn ",
             "incomplete" => {
                 fields.pop();
@@ -1889,8 +1932,16 @@ fn normalized_style_fixture(
             "book" => fields.push(("bookID", b"long", 123i32.to_be_bytes().to_vec())),
             _ => {}
         }
-        let replacement =
-            overlay_descriptor(if variant == "class" { "HSBl" } else { "RGBC" }, fields);
+        let replacement = overlay_descriptor(
+            if variant == "class" {
+                "HSBl"
+            } else if gray.is_some() {
+                "Grsc"
+            } else {
+                "RGBC"
+            },
+            fields,
+        );
         let at = payload
             .windows(needle.len())
             .position(|v| v == needle)
@@ -1915,7 +1966,14 @@ fn normalized_style_fixture(
     if family == "drop" {
         source[1][3] = 0;
     }
-    let mut spec = Spec::paint("Synthetic normalized Photoshop RGB", source);
+    let mut spec = Spec::paint(
+        if gray.is_some() {
+            "Synthetic Photoshop grayscale style"
+        } else {
+            "Synthetic normalized Photoshop RGB"
+        },
+        source,
+    );
     spec.tags.push((*b"lfx2", payload));
     let mut merged = source.map(|p| {
         if p[3] == 0 {
@@ -1930,10 +1988,10 @@ fn normalized_style_fixture(
             let tint = if family == "gradient" {
                 let t = if x == 0 { 0.25 } else { 0.75 };
                 std::array::from_fn(|c| {
-                    ((FLOAT_COLOR[c] * (1. - t) + FLOAT_COLOR2[c] * t) * 65535.).round() as u16
+                    ((colors[0][c] * (1. - t) + colors[1][c] * t) * 65535.).round() as u16
                 })
             } else {
-                FLOAT_COLOR.map(|c| (c * 65535.).round() as u16)
+                colors[0].map(|c| (c * 65535.).round() as u16)
             };
             if family == "drop" {
                 if x == 1 {
@@ -1970,6 +2028,137 @@ fn normalized_style_fixture(
     )
 }
 
+#[test]
+fn grayscale_photoshop_style_colors_retain_native_precision_sources_history_and_saves() {
+    for depth in [8, 16] {
+        for family in ["color", "gradient", "inner", "drop"] {
+            for (grays, variant) in [
+                ([0f64, 100.], ""),
+                ([41.937, 73.351], ""),
+                ([37., 73.], "gray-integer"),
+            ] {
+                for flags in 0..4 {
+                    for opacity in [37f64, 100.] {
+                        let (mut bytes, merged, source) =
+                            grayscale_style_fixture(depth, family, flags, opacity, grays, variant);
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {family} {grays:?} {flags} {opacity}: {:?}",
+                            doc.warnings
+                        );
+                        assert_eq!(doc.bit_depth, depth);
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(rendered(&doc), merged);
+                        assert_eq!(doc.layers[0].effects[0].enabled, flags == 3);
+                        for (index, black) in grays
+                            .into_iter()
+                            .enumerate()
+                            .take(if family == "gradient" { 2 } else { 1 })
+                        {
+                            let imported = if family == "gradient" {
+                                &doc.layers[0].effects[0].settings["color_stops"][index]["color"]
+                            } else {
+                                &doc.layers[0].effects[0].settings["color"]
+                            };
+                            let expected_color = [(100. - black) / 100.; 3];
+                            assert_eq!(imported, &json!(expected_color));
+                        }
+                        let current = doc.export_png().unwrap();
+                        for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.bit_depth, depth);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(
+                                reopened.layers[0].effects[0].settings,
+                                doc.layers[0].effects[0].settings
+                            );
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            assert_eq!(
+                                psd::decode(&ordinary(&output))
+                                    .unwrap()
+                                    .export_png()
+                                    .unwrap(),
+                                current
+                            );
+                            let matte = merged
+                                .chunks_exact(4)
+                                .flat_map(|p| {
+                                    let alpha = f64::from(p[3]) / 65535.;
+                                    (0..4).map(move |c| {
+                                        if c == 3 {
+                                            p[c]
+                                        } else {
+                                            native(
+                                                (f64::from(p[c]) * alpha + 65535. * (1. - alpha))
+                                                    .round()
+                                                    as u16,
+                                                depth,
+                                            )
+                                        }
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(saved_composite(&output, depth), matte);
+                        }
+                        let mut engine = Engine::new();
+                        let layer = doc.layers[0].id.clone();
+                        let effect = doc.layers[0].effects[0].id.clone();
+                        engine.doc = doc;
+                        engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":flags!=3})], None, None, "Grayscale style bypass").unwrap();
+                        assert_eq!(engine.undo.len(), 1);
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        let at =
+                            bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+                        bytes[at] ^= 1;
+                        assert!(
+                            psd::decode(&bytes).unwrap().read_only,
+                            "grayscale composite mismatch was accepted"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
+fn malformed_grayscale_photoshop_style_colors_stay_protected_even_when_disabled() {
+    for depth in [8, 16] {
+        for family in ["color", "gradient", "inner", "drop"] {
+            for flags in [0, 3] {
+                for variant in [
+                    "incomplete",
+                    "both",
+                    "extra-channel",
+                    "unit",
+                    "boolean",
+                    "negative",
+                    "gray-high",
+                    "nan",
+                    "infinity",
+                    "book",
+                    "class",
+                ] {
+                    let (bytes, _, _) = grayscale_style_fixture(
+                        depth,
+                        family,
+                        flags,
+                        100.,
+                        [41.937, 73.351],
+                        variant,
+                    );
+                    let doc = psd::decode(&bytes).unwrap();
+                    assert!(doc.read_only, "{depth} {family} {flags} {variant}");
+                    assert_eq!(doc.bit_depth, depth);
+                    assert!(doc.layers[0].effects.is_empty());
+                }
+            }
+        }
+    }
+}
 #[test]
 fn normalized_photoshop_rgb_style_colors_retain_native_samples_definitions_history_and_saves() {
     for depth in [8, 16] {

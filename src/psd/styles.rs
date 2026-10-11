@@ -266,6 +266,19 @@ fn overlay_blend(value: &Value) -> Result<&'static str, String> {
 // Accept one complete spelling only; never clamp HDR values or mix scales.
 // Reference: psd-tools/composite/paint.py::_get_color and terminology.py.
 fn rgb_color(value: &Value) -> Result<Vec<f64>, String> {
+    if value["value"]["class"] == "Grsc" {
+        let channels = descriptor(value, "Grsc")?;
+        if channels.len() != 1 || !channels.contains_key("Gry ") {
+            return Err("Photoshop grayscale colors require one plain gray channel".into());
+        }
+        let black = plain_number(field(channels, "Gry "))?;
+        if !(0.0..=100.).contains(&black) {
+            return Err("Photoshop grayscale black percentage must be within 0–100".into());
+        }
+        // Grsc stores percent black: zero is white and 100 is black.
+        // Preserve fractional source values in normalized RGB, without bytes.
+        return Ok(vec![(100. - black) / 100.; 3]);
+    }
     let channels = descriptor(value, "RGBC")?;
     let byte_keys = ["Rd  ", "Grn ", "Bl  "];
     let float_keys = ["redFloat", "greenFloat", "blueFloat"];
