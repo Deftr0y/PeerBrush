@@ -443,6 +443,7 @@ pub struct PeerBrush {
     show_new: bool,
     read_only_info: Option<String>,
     read_only_patterns: Option<String>,
+    selection_commit_failed: bool,
     save_report: Option<crate::compatibility::SaveReport>,
     save_loss_review: Option<compatibility::SaveReview>,
     export_editor: Option<exports::Editor>,
@@ -770,6 +771,7 @@ impl PeerBrush {
             show_new: false,
             read_only_info: None,
             read_only_patterns: None,
+            selection_commit_failed: false,
             save_report: None,
             save_loss_review: None,
             export_editor: None,
@@ -816,6 +818,11 @@ impl PeerBrush {
     }
     fn edit(&mut self, commands: Vec<Value>, label: &str) {
         self.close_proposal();
+        let selection_edit = commands.iter().any(|command| {
+            command["op"]
+                .as_str()
+                .is_some_and(|op| op == "selection" || op.starts_with("selection."))
+        });
         let result = self
             .shared
             .lock()
@@ -837,7 +844,10 @@ impl PeerBrush {
                 self.message = label.into();
                 self.last_preview = None;
             }
-            Err(e) => self.message = e,
+            Err(e) => {
+                self.selection_commit_failed |= selection_edit;
+                self.message = e;
+            }
         }
     }
     fn select_tool(&mut self, tool: Tool) {
@@ -4174,6 +4184,7 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.selection_commit_failed = false;
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
         self.temporary_pen_tool(ctx);
@@ -4985,7 +4996,8 @@ impl PeerBrush {
         if let Some((original, late, _)) = deferred_shortcuts {
             ctx.input_mut(|i| i.events = late);
             let current = self.shared.lock().unwrap().doc.clone();
-            if current.id == doc.id && self.tab_transfer.is_none() {
+            if current.id == doc.id && self.tab_transfer.is_none() && !self.selection_commit_failed
+            {
                 self.doc_snapshot = current.clone();
                 self.document_shortcuts(ctx, &current);
                 ctx.request_repaint();
@@ -10727,6 +10739,77 @@ mod tests {
                     engine.doc.export_png().unwrap(),
                     before.export_png().unwrap()
                 );
+            }
+        }
+    }
+    #[test]
+    fn rejected_wand_release_never_replays_whole_layer_clipboard_delete_or_transform() {
+        for depth in [8, 16] {
+            for protected in [false, true] {
+                for action in ["copy", "cut", "delete", "move", "rotate", "scale"] {
+                    let (mut app, ctx, point, _) = pressed_wand_fixture(depth);
+                    let before = {
+                        let mut e = app.shared.lock().unwrap();
+                        if protected {
+                            e.doc.read_only = true;
+                        } else {
+                            e.reserve(
+                                "assistant",
+                                "Synthetic selection reservation",
+                                vec![crate::engine::Scope {
+                                    target: None,
+                                    rect: None,
+                                }],
+                            )
+                            .unwrap();
+                        }
+                        e.doc.clone()
+                    };
+                    let event = match action {
+                        "copy" => egui::Event::Copy,
+                        "cut" => egui::Event::Cut,
+                        "delete" => shortcut_press(egui::Key::Delete),
+                        "move" => shortcut_press(egui::Key::W),
+                        "rotate" => shortcut_press(egui::Key::E),
+                        _ => shortcut_press(egui::Key::R),
+                    };
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![primary_release(point), event],
+                        Default::default(),
+                    );
+                    assert!(
+                        app.selection_commit_failed,
+                        "{depth}-bit {action} protected={protected}"
+                    );
+                    assert_eq!(app.tool, Tool::MagicWand);
+                    assert!(
+                        app.message
+                            .contains(if protected { "read-only" } else { "Reserved" }),
+                        "{}",
+                        app.message
+                    );
+                    let e = app.shared.lock().unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&e.doc).unwrap(),
+                        serde_json::to_value(&before).unwrap()
+                    );
+                    assert!(e.undo.is_empty());
+                    assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                    drop(e);
+                    if matches!(action, "copy" | "cut") {
+                        assert!(
+                            matches!(
+                                app.clipboard
+                                    .replies
+                                    .recv_timeout(Duration::from_millis(50)),
+                                Err(mpsc::RecvTimeoutError::Timeout)
+                            ),
+                            "No clipboard operation should have been sent"
+                        );
+                    }
+                }
             }
         }
     }
