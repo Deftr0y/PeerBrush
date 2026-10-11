@@ -156,16 +156,13 @@ pub fn decode(data: &[u8], tag: &str, control: &Control) -> Result<Vec<Source>, 
             }
             let bytes = arrays.block()?;
             if bytes.is_empty() {
-                if index < 3 {
-                    return Err("Empty RGB pattern channel".into());
-                }
-                continue;
+                return Err("Empty written pattern channel".into());
             }
-            if index >= 3 {
-                return Err(
-                    "Pattern masks, transparency and extra written channels remain protected"
-                        .into(),
-                );
+            // RGB occupies the first three color slots. Photoshop presets put
+            // optional transparency in the final slot, after the reserved slot.
+            // Never reinterpret an extra color plane or mask as transparency.
+            if index >= 3 && index != count + 1 {
+                return Err("Pattern masks and extra written channels remain protected".into());
             }
             let mut channel = Cursor::new(bytes);
             let d = channel.u32()?;
@@ -208,7 +205,7 @@ pub fn decode(data: &[u8], tag: &str, control: &Control) -> Result<Vec<Source>, 
             if payload.len() != expected {
                 return Err("Pattern channel length does not match its native rows".into());
             }
-            channels.push((compression, payload));
+            channels.push((if index < 3 { index } else { 3 }, compression, payload));
         }
         if arrays.pos != arrays.data.len() || c.pos != bytes.len() {
             return Err("Unknown trailing pattern data".into());
@@ -222,15 +219,15 @@ pub fn decode(data: &[u8], tag: &str, control: &Control) -> Result<Vec<Source>, 
             return Err("Decoded pattern assets exceed 16 MiB".into());
         }
         let mut pixels = Raster::new_depth(width, height, d);
-        for (index, (compression, payload)) in channels.iter().enumerate() {
+        for (index, compression, payload) in &channels {
             let mut encoded = Vec::with_capacity(payload.len() + 2);
             encoded.extend_from_slice(&u16::from(*compression).to_be_bytes());
             encoded.extend_from_slice(payload);
             super::stream_layer_channel(
                 &encoded,
                 &mut pixels,
-                index,
-                index == 0,
+                *index,
+                *index == 0,
                 Layout::Psd,
                 control,
             )?;

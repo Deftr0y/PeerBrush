@@ -20,6 +20,9 @@ fn rectangle(out: &mut Vec<u8>) {
     }
 }
 fn fixture(depth: u16, compression: u8, id: &str) -> (Vec<u8>, Vec<u16>) {
+    fixture_alpha(depth, compression, id, false)
+}
+fn fixture_alpha(depth: u16, compression: u8, id: &str, alpha: bool) -> (Vec<u8>, Vec<u16>) {
     let mut words = Vec::new();
     for y in 0..2 {
         for x in 0..3 {
@@ -27,7 +30,11 @@ fn fixture(depth: u16, compression: u8, id: &str) -> (Vec<u8>, Vec<u16>) {
                 12345 + x * 911 + y * 103,
                 23457 + x * 719 + y * 97,
                 34569 + x * 619 + y * 71,
-                65535,
+                if alpha {
+                    [0, 41317, 65535, 21117, 1, 53219][(y * 3 + x) as usize]
+                } else {
+                    65535
+                },
             ]);
         }
     }
@@ -52,7 +59,12 @@ fn fixture(depth: u16, compression: u8, id: &str) -> (Vec<u8>, Vec<u16>) {
     let mut arrays = Vec::new();
     rectangle(&mut arrays);
     u32b(&mut arrays, 24);
-    for channel in 0..3 {
+    for slot in 0..26 {
+        if slot >= 3 && !(alpha && slot == 25) {
+            u32b(&mut arrays, 0);
+            continue;
+        }
+        let channel = if slot == 25 { 3 } else { slot };
         u32b(&mut arrays, 1);
         let mut c = Vec::new();
         u32b(&mut c, u32::from(depth));
@@ -117,14 +129,79 @@ fn fixture(depth: u16, compression: u8, id: &str) -> (Vec<u8>, Vec<u16>) {
         }
         block(&mut arrays, &c);
     }
-    for _ in 3..26 {
-        u32b(&mut arrays, 0);
-    }
     block(&mut pattern, &arrays);
     let mut out = Vec::new();
     block(&mut out, &pattern);
     out.resize(out.len().div_ceil(4) * 4, 0);
     (out, words)
+}
+#[test]
+fn trailing_pattern_transparency_preserves_hidden_rgb_and_every_native_alpha_sample() {
+    for depth in [8, 16] {
+        for compression in [0, 1, 2, 3] {
+            for tag in ["Patt", "Pat2", "Pat3"] {
+                let (bytes, words) = fixture_alpha(depth, compression, "transparent-pattern", true);
+                let tile = patterns::decode(&bytes, tag, &Control::default())
+                    .unwrap()
+                    .remove(0);
+                assert_eq!(tile.pixels.rgba16(), words);
+                assert_eq!(tile.bounds, [-2, 5, 1, 7]);
+                assert_eq!(tile.bit_depth, depth);
+                let png = if depth == 16 {
+                    raster::png16(3, 2, &tile.pixels.rgba16()).unwrap()
+                } else {
+                    raster::png(3, 2, &tile.pixels.rgba()).unwrap()
+                };
+                assert_eq!(
+                    image::load_from_memory(&png)
+                        .unwrap()
+                        .into_rgba16()
+                        .into_raw(),
+                    words
+                );
+            }
+        }
+    }
+}
+#[test]
+fn malformed_or_misplaced_pattern_transparency_rejects_instead_of_becoming_opaque() {
+    for depth in [8, 16] {
+        let (bytes, _) = fixture_alpha(depth, 0, "transparent-pattern", true);
+        let pattern_len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let alpha_len = 23 + 6 * usize::from(depth / 8);
+        let at = 4 + pattern_len - alpha_len;
+        for (offset, patch) in [
+            (
+                0,
+                (if depth == 8 { 16u32 } else { 8 }).to_be_bytes().to_vec(),
+            ),
+            (4, 6i32.to_be_bytes().to_vec()),
+            (20, 32u16.to_be_bytes().to_vec()),
+            (22, vec![4]),
+        ] {
+            let mut bad = bytes.clone();
+            bad[at + offset..at + offset + patch.len()].copy_from_slice(&patch);
+            assert!(patterns::decode(&bad, "Patt", &Control::default()).is_err());
+        }
+        // Move a complete alpha plane into the reserved slot without changing any lengths.
+        let mut bad = bytes.clone();
+        bad[at - 12..4 + pattern_len].rotate_left(4);
+        assert!(patterns::decode(&bad, "Patt", &Control::default()).is_err());
+        // A written-but-empty trailing plane cannot silently default to opaque.
+        let mut bad = bytes[..at].to_vec();
+        bad[at - 4..at].copy_from_slice(&0u32.to_be_bytes());
+        bad[..4].copy_from_slice(&((pattern_len - alpha_len) as u32).to_be_bytes());
+        let first = bytes
+            .windows(8)
+            .position(|v| v[..4] == u32::from(depth).to_be_bytes() && v[4..] == [0, 0, 0, 5])
+            .unwrap();
+        let arrays_at = first - 32;
+        let arrays_len = u32::from_be_bytes(bytes[arrays_at..arrays_at + 4].try_into().unwrap());
+        bad[arrays_at..arrays_at + 4]
+            .copy_from_slice(&(arrays_len - alpha_len as u32).to_be_bytes());
+        bad.resize(bad.len().div_ceil(4) * 4, 0);
+        assert!(patterns::decode(&bad, "Patt", &Control::default()).is_err());
+    }
 }
 fn inject(bytes: &[u8], tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let large = bytes[4..6] == [0, 2];
@@ -282,7 +359,7 @@ fn psd_psb_pattern_sources_are_view_only_with_exact_current_native_composites() 
                 .pixels
                 .set16(3, 2, [12345, 23457, 34569, 65535]);
             let current = doc.export_png().unwrap();
-            let (patt, words) = fixture(depth, compression, "synthetic-pattern");
+            let (patt, words) = fixture_alpha(depth, compression, "synthetic-pattern", true);
             for (tag, encoded) in [
                 (b"Patt", psd::encode(&doc).unwrap()),
                 (b"Pat2", psd::encode_psb(&doc).unwrap()),
@@ -322,7 +399,7 @@ fn shared_pattern_inspection_returns_actual_native_pngs_with_source_guards_and_a
     for depth in [8, 16] {
         for compression in [1, 2, 3] {
             let mut e = Engine::new();
-            let (bytes, words) = fixture(depth, compression, "synthetic-pattern");
+            let (bytes, words) = fixture_alpha(depth, compression, "synthetic-pattern", true);
             e.doc.source_patterns = patterns::decode(&bytes, "Patt", &Control::default()).unwrap();
             e.doc.read_only = true;
             let before = serde_json::to_value(&e.doc).unwrap();
