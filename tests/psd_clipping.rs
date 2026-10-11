@@ -232,7 +232,9 @@ fn plain_photoshop_pattern_import_retains_native_tiles_sources_and_editable_save
             let effect = doc.layers[0].effects[0].id.clone();
             let mut engine = Engine::new();
             engine.doc = doc;
-            engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":{"phase_x":1.}})],None,None,"Pattern phase").unwrap();
+            let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+            settings["phase_x"] = json!(1.);
+            engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings})],None,None,"Pattern phase").unwrap();
             assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
             assert_eq!(engine.undo.len(), 1);
             engine.undo("human").unwrap();

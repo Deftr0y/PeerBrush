@@ -10783,7 +10783,7 @@ mod tests {
                         app.selection_commit_failed,
                         "{depth}-bit {action} protected={protected}"
                     );
-                    assert_eq!(app.tool, Tool::MagicWand);
+                    assert!(app.tool == Tool::MagicWand);
                     assert!(
                         app.message
                             .contains(if protected { "read-only" } else { "Reserved" }),

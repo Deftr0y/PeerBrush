@@ -63,7 +63,7 @@ pub(super) fn controls(ui: &mut egui::Ui, value: &mut Value) -> Option<egui::Res
                     ui.horizontal(|ui| {
                         controls::label(ui,"Midpoint");let mut n=stop["midpoint"].as_f64().unwrap_or(0.5) as f32*100.;
                         let r=controls::range(ui,(key,index,"midpoint"),&mut n,1.0..=99.,160.,"%",1,false);
-                        if r.changed(){stop["midpoint"]=json!(n/100.);changed=Some(r);}
+                        if r.changed(){stop["midpoint"]=json!((f64::from(n)/100.).clamp(0.01,0.99));changed=Some(r);}
                     });
                 }
             }
@@ -71,4 +71,124 @@ pub(super) fn controls(ui: &mut egui::Ui, value: &mut Value) -> Option<egui::Res
         });
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn gradient_midpoint_limit_drags_preview_native_pixels_and_commit_once() {
+        for depth in [8, 16] {
+            for (delta, endpoint) in [(-300., 0.01), (300., 0.99)] {
+                let ctx = egui::Context::default();
+                let mut engine = crate::engine::Engine::new();
+                engine.doc = Document::new_depth(32, 24, depth).unwrap();
+                for y in 0..24 {
+                    for x in 0..32 {
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(x, y, [12347, 23459, 34571, 65535]);
+                    }
+                }
+                let layer = engine.doc.layers[0].id.clone();
+                engine.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":{"opacity":1.,"angle":0.,"color_stops":[{"position":0.,"color":[0.,0.,0.],"midpoint":0.35},{"position":1.,"color":[1.,1.,1.]}]}})], None, None, "Gradient").unwrap();
+                engine.undo.clear();
+                let before = engine.doc.clone();
+                let effect = engine.doc.layers[0].effects[0].id.clone();
+                let shared = Arc::new(std::sync::Mutex::new(engine));
+                let connection = crate::server::Connection {
+                    port: 0,
+                    token: String::new(),
+                    state_dir: Default::default(),
+                    instance_lock: None,
+                    availability: Default::default(),
+                };
+                let mut app = PeerBrush::init(&ctx, shared.clone(), connection);
+                app.selected = layer.clone();
+                app.selection_layers = [layer.clone()].into_iter().collect();
+                app.effect_selected = Some((layer, false, effect));
+                let native = |doc: &Document| {
+                    if depth == 16 {
+                        crate::depth16::render(doc).unwrap().words
+                    } else {
+                        doc.preview_native8(None, 32, None, false)
+                            .unwrap()
+                            .2
+                            .into_iter()
+                            .map(u16::from)
+                            .collect()
+                    }
+                };
+                let mut time = 0.;
+                let mut draw = |app: &mut PeerBrush, events| {
+                    time += 0.05;
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1100., 1100.),
+                            )),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                let start = output
+                    .shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.job.text == "35.0%" => {
+                            Some(Rect::from_min_size(t.pos, t.galley.size()).center())
+                        }
+                        _ => None,
+                    })
+                    .expect("Compact midpoint control");
+                let end = start + Vec2::new(delta, 0.);
+                let button = |pos, pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                draw(
+                    &mut app,
+                    vec![egui::Event::PointerMoved(start), button(start, true)],
+                );
+                draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                let commands = app
+                    .parameter_gesture
+                    .as_ref()
+                    .expect("Valid midpoint gesture")
+                    .commands
+                    .clone();
+                let draft =
+                    crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
+                assert_eq!(
+                    draft.layers[0].effects[0].settings["color_stops"][0]["midpoint"],
+                    json!(endpoint)
+                );
+                assert_ne!(native(&draft), native(&before));
+                {
+                    let engine = shared.lock().unwrap();
+                    assert!(engine.undo.is_empty());
+                    assert_eq!(engine.doc.revision, before.revision);
+                }
+                draw(&mut app, vec![button(end, false)]);
+                let mut engine = shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(native(&engine.doc), native(&draft));
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                engine.undo("human").unwrap();
+                assert_eq!(native(&engine.doc), native(&before));
+            }
+        }
+    }
 }
