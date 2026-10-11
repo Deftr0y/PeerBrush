@@ -550,6 +550,7 @@ impl Engine {
             .resolve_commands(&commands)?;
         let mut imported_bytes = 0;
         let mut selection_gesture = SelectionGesture::default();
+        let resolved = crate::transform::resolve_commands(resolved)?;
         for command in &resolved {
             selection_gesture.prepare(&mut engine.doc, command);
             if command["op"] == "image.import" {
@@ -1206,6 +1207,7 @@ impl Engine {
             .lock()
             .unwrap()
             .resolve_commands(&commands)?;
+        let resolved = crate::transform::resolve_commands(resolved)?;
         let commands = resolved.as_slice();
         let before = self.doc.clone();
         let mut scopes = vec![];

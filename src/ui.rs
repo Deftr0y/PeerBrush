@@ -26,6 +26,7 @@ mod tabs;
 mod tool_settings;
 #[cfg(test)]
 mod tool_settings_tests;
+mod transform_snapping;
 use crate::{controls, thumbnails};
 use crate::{
     engine::Document,
@@ -2704,9 +2705,6 @@ impl PeerBrush {
                     angle = ((p[1] - pivot[1]).atan2(p[0] - pivot[0])
                         - (a[1] - pivot[1]).atan2(a[0] - pivot[0]))
                     .to_degrees();
-                    if ui.input(|i| i.modifiers.shift) {
-                        angle = (angle / 15.0).round() * 15.0;
-                    }
                 } else {
                     let amount = (((pos.x - screen(a).x) - (pos.y - screen(a).y)) * 0.012)
                         .exp()
@@ -2726,9 +2724,33 @@ impl PeerBrush {
         }
         if self.gizmo_handle != 0 {
             for target in &targets {
-                self.transient.push(if self.tool==Tool::Move {
-                    json!({"op":"move","layer":target.id,"dx":dx.round(),"dy":dy.round(),"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":selection_only})
-                } else {json!({"op":"transform","layer":target.id,"angle":angle,"scale_x":sx,"scale_y":sy,"pivot":pivot,"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":selection_only})});
+                let snap = ui.input(|i| i.modifiers.shift);
+                let command = if self.tool == Tool::Move {
+                    json!({"op":"move","layer":target.id,"dx":dx,"dy":dy,"snap":snap,"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":selection_only})
+                } else {
+                    json!({"op":"transform","layer":target.id,"angle":angle,"scale_x":sx,"scale_y":sy,"snap":snap,"pivot":pivot,"mask":self.mask,"step":if targets.len()==1 {self.mask_step.clone()}else{None},"selection_only":selection_only})
+                };
+                match crate::transform::resolve_command(&command) {
+                    Ok(mut command) => {
+                        if self.tool == Tool::Move {
+                            dx = command["dx"].as_f64().unwrap() as f32;
+                            dy = command["dy"].as_f64().unwrap() as f32;
+                            dx = dx.round();
+                            dy = dy.round();
+                            command["dx"] = json!(dx);
+                            command["dy"] = json!(dy);
+                        } else {
+                            angle = command["angle"].as_f64().unwrap() as f32;
+                            sx = command["scale_x"].as_f64().unwrap() as f32;
+                            sy = command["scale_y"].as_f64().unwrap() as f32;
+                        }
+                        self.transient.push(command);
+                    }
+                    Err(error) => {
+                        self.message = error;
+                        self.transient.clear();
+                    }
+                }
             }
         }
         let painter = ui.painter().with_clip_rect(available);
@@ -2785,6 +2807,36 @@ impl PeerBrush {
                 Rect::from_center_size(center, Vec2::splat(13.0)),
                 2.0,
                 if hit == 3 { ACCENT } else { Color32::WHITE },
+            );
+        }
+        if self.gizmo_handle != 0 {
+            let value = match self.tool {
+                Tool::Move => format!("X {dx:.0} · Y {dy:.0} px"),
+                Tool::Rotate => format!("{angle:.0}°"),
+                _ => format!("X {:.0}% · Y {:.0}%", sx * 100., sy * 100.),
+            };
+            let label = format!(
+                "{value}{}",
+                if ui.input(|i| i.modifiers.shift) {
+                    " · Snap"
+                } else {
+                    ""
+                }
+            );
+            let position = center + Vec2::new(0., 88.);
+            painter.text(
+                position + Vec2::splat(1.),
+                egui::Align2::CENTER_TOP,
+                &label,
+                egui::FontId::proportional(12.),
+                Color32::BLACK,
+            );
+            painter.text(
+                position,
+                egui::Align2::CENTER_TOP,
+                label,
+                egui::FontId::proportional(12.),
+                ACCENT,
             );
         }
         if self.gizmo_handle != 0
@@ -4368,6 +4420,7 @@ impl PeerBrush {
                         let ai=self.tool_preferences_ai(time);
                         liquify::toolbar(ui, &mut self.radius, &mut self.liquify,radius,strength,ai);
                     }
+                    self.transform_snap_toolbar(ui);
                     self.retouch_toolbar(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::button(ui, Icon::Frame, "Frame selection or canvas · F").clicked()

@@ -3,6 +3,60 @@ use crate::{
     raster::{blend, check_size, Raster},
 };
 use serde_json::Value;
+pub const MOVE_SNAP: f64 = 8.0;
+pub const ANGLE_SNAP: f64 = 15.0;
+pub const SCALE_SNAP: f64 = 0.1;
+
+/// Resolve document-space snapping before previews, reservations and history.
+pub fn resolve_command(command: &Value) -> Result<Value, String> {
+    if !matches!(command["op"].as_str(), Some("move" | "transform")) {
+        return Ok(command.clone());
+    }
+    let Some(snap) = command.get("snap") else {
+        return Ok(command.clone());
+    };
+    if !snap
+        .as_bool()
+        .ok_or("Transform snap must be true or false")?
+    {
+        return Ok(command.clone());
+    }
+    let mut resolved = command.clone();
+    let fields = if command["op"] == "move" {
+        vec![
+            ("dx", 0., MOVE_SNAP, -100000., 100000.),
+            ("dy", 0., MOVE_SNAP, -100000., 100000.),
+        ]
+    } else {
+        vec![
+            ("angle", 0., ANGLE_SNAP, -100000., 100000.),
+            ("scale_x", 1., SCALE_SNAP, 0.05, 20.),
+            ("scale_y", 1., SCALE_SNAP, 0.05, 20.),
+        ]
+    };
+    for (key, default, step, min, max) in fields {
+        let number = command.get(key).map_or(Ok(default), |v| {
+            v.as_f64().ok_or("Snapped transform values must be numbers")
+        })?;
+        if !number.is_finite() || number < min || number > max {
+            return Err("Snapped transform values exceed their supported bounds".into());
+        }
+        let lower = (min / step).ceil() * step;
+        let upper = (max / step).floor() * step;
+        resolved[key] = serde_json::json!(((number / step).round() * step).clamp(lower, upper));
+    }
+    Ok(resolved)
+}
+pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> {
+    for command in &mut commands {
+        if command.get("snap").is_some()
+            && matches!(command["op"].as_str(), Some("move" | "transform"))
+        {
+            *command = resolve_command(command)?;
+        }
+    }
+    Ok(commands)
+}
 pub(crate) fn copy_shift(source: &Raster, w: u32, h: u32, dx: i32, dy: i32) -> Raster {
     if (source.width, source.height, dx, dy) == (w, h, 0, 0) {
         return source.clone();

@@ -46,6 +46,8 @@ Use the small **Q / W / E / R** controls at the bottom right for Select, Move, R
 
 **Q** hides gizmos; **W** shows move; **E** shows rotation; **R** shows scale. Select a layer, then drag the colored X/Y handles or the center handle. Move/scale axis handles constrain that axis. Shift snaps rotation to 15° or makes scaling uniform. Escape cancels a drag. **D** selects the eraser.
 
+**Unreleased snapping:** hold Shift during W/E/R gestures to move on an 8-document-pixel grid, rotate in 15° steps, or scale uniformly in 10% steps. Release Shift to return to free values during the same drag. The compact toolbar and canvas labels show snapping and current values; the actual artwork previews through the shared engine, and release commits one undo step.
+
 Gizmos preview the actual pixels and apply one undoable edit on release. An active selection transforms its pixels while preserving the remainder of the layer. Its outline rotates, scales and moves with the content; subsequent painting, fills and copying respect that shape. Without a selection, the whole layer transforms. Rotation and scaling resample raster content; undo before trying another transform to retain the original pixels. Whole-group transforms remain planned.
 
 The top bar shows green **MCP connected** when a live client is attached, red otherwise. The animated center line shows agent-supplied progress and tool activity. It is a shared activity display, not access to a model's private reasoning.
