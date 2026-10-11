@@ -338,6 +338,7 @@ pub struct PeerBrush {
     geometry: Option<geometry::Editor>,
     source_editor: Option<source::Editor>,
     pen: pen::State,
+    straight: brush::Straight,
     filter_editor: Option<filters::Editor>,
     task_undo_review: Option<Value>,
     proposal_review: Option<String>,
@@ -648,6 +649,7 @@ impl PeerBrush {
             geometry: None,
             source_editor: None,
             pen: pen::State::default(),
+            straight: brush::Straight::default(),
             filter_editor: None,
             task_undo_review: None,
             proposal_review: None,
@@ -799,6 +801,11 @@ impl PeerBrush {
         }
     }
     fn select_tool(&mut self, tool: Tool) {
+        if self.tool != tool {
+            self.straight.reset();
+        } else {
+            self.straight.cancel();
+        }
         self.store_current_tool_profile();
         self.restore_tool_profile(tool);
         self.tool = tool;
@@ -2887,6 +2894,26 @@ impl PeerBrush {
         }
     }
     fn canvas(&mut self, ui: &mut egui::Ui, doc: &Document) {
+        if self.brush_tool()
+            && !self.points.is_empty()
+            && (self.drag_revision.is_some_and(|v| v != doc.revision)
+                || self
+                    .straight
+                    .document
+                    .as_ref()
+                    .is_some_and(|v| *v != doc.id))
+        {
+            self.points.clear();
+            self.drag_start = None;
+            self.drag_revision = None;
+            self.straight.reset();
+            self.live_gesture = None;
+            self.straight.cancelled = true;
+            self.stroke_pressures.clear();
+            self.stroke_has_pressure = false;
+            self.current_pressure = None;
+            self.message = "Image changed during brush stroke · preview cancelled".into();
+        }
         if [Tool::Clone, Tool::Heal].contains(&self.tool)
             && !self.points.is_empty()
             && self.retouch_revision != Some(doc.revision)
@@ -3038,6 +3065,21 @@ impl PeerBrush {
         }
         if self.geometry.is_some() || self.source_editor.is_some() || self.filter_editor.is_some() {
             return;
+        }
+        if self.brush_tool() && self.straight.cancelled {
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.straight.cancelled = false;
+            }
+            return;
+        }
+        if self.brush_tool()
+            && self.points.is_empty()
+            && self.drag_start.is_none()
+            && !ui.input(|i| i.pointer.primary_down())
+        {
+            // Sampling and size controls can finish without a canvas stroke release.
+            self.straight.cancel();
+            self.drag_revision = None;
         }
         let to_screen = |p: [f32; 2]| rect.min + Vec2::new(p[0] * scale, p[1] * scale);
         let to_doc = |p: Pos2| [(p.x - rect.min.x) / scale, (p.y - rect.min.y) / scale];
@@ -3230,7 +3272,9 @@ impl PeerBrush {
                 } else {
                     self.color
                 };
-                self.paint_command(self.points.clone(), color, "Brush stroke");
+                if !self.straight.line {
+                    self.paint_command(self.points.clone(), color, "Brush stroke");
+                }
                 self.points.clear();
                 self.stroke_pressures.clear();
                 self.stroke_has_pressure = false;
@@ -3300,6 +3344,15 @@ impl PeerBrush {
         }) {
             self.current_pressure = None;
         }
+        if response.hovered() && ui.input(|i| i.pointer.primary_pressed()) && self.brush_tool() {
+            if let Some(pos) = response
+                .interact_pointer_pos()
+                .filter(|p| rect.contains(*p))
+            {
+                self.straight_click(doc, to_doc(pos), ui.input(|i| i.modifiers.shift));
+            }
+        }
+        self.straight_modifier(ui.input(|i| i.modifiers.shift));
         if response.drag_started() {
             if let Some(pos) = ui
                 .input(|i| i.pointer.press_origin())
@@ -3311,6 +3364,11 @@ impl PeerBrush {
                         return;
                     }
                     self.drag_start = Some(point);
+                    if self.brush_tool() {
+                        self.straight_drag(ui.input(|i| i.modifiers.shift));
+                        self.straight.document = Some(doc.id.clone());
+                        self.drag_revision = Some(doc.revision);
+                    }
                     self.points = vec![point];
                     self.stroke_pressures = vec![self.current_pressure.unwrap_or(1.)];
                     self.stroke_has_pressure = self.current_pressure.is_some();
@@ -3335,6 +3393,7 @@ impl PeerBrush {
             }
         }
         if !self.points.is_empty() {
+            self.straight_axis();
             if ![
                 Tool::Brush,
                 Tool::Eraser,
@@ -3371,7 +3430,8 @@ impl PeerBrush {
                 self.transient.push(json!({"op":if self.tool==Tool::Gradient{"gradient"}else{"shape"},"layer":self.selected,"kind":if self.tool==Tool::Ellipse{"ellipse"}else{"rectangle"},"rect":area,"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}));
             }
         }
-        if response.drag_stopped() {
+        let finished_line = self.straight.line && response.clicked();
+        if response.drag_stopped() || finished_line {
             self.transient.clear();
             if let (Some(a), Some(b)) = (self.drag_start, self.points.last().copied()) {
                 let area = [
@@ -3394,8 +3454,10 @@ impl PeerBrush {
             self.stroke_has_pressure = false;
             self.current_pressure = None;
             self.drag_start = None;
+            self.drag_revision = None;
+            self.straight.cancel();
         }
-        if response.clicked() {
+        if response.clicked() && !finished_line {
             if let Some(pos) = response.interact_pointer_pos() {
                 if rect.contains(pos) {
                     let p = to_doc(pos);
@@ -4311,6 +4373,8 @@ impl PeerBrush {
                     self.frame_pending = true;
                 }
                 if i.key_pressed(egui::Key::Escape) {
+                    let cancelled=self.straight.line || !self.points.is_empty();
+                    self.straight.cancel();self.straight.cancelled=cancelled;self.drag_revision=None;
                     self.points.clear();self.stroke_pressures.clear();self.stroke_has_pressure=false;self.current_pressure=None;
                     self.drag_start = None;
                     self.gizmo_handle = 0;
@@ -11492,6 +11556,304 @@ mod tests {
                 app.shared.lock().unwrap().doc.selection_coverage,
                 before.selection_coverage
             );
+        }
+    }
+    fn straight_preview(
+        app: &mut PeerBrush,
+        ctx: &egui::Context,
+        before: &Document,
+        mods: egui::Modifiers,
+    ) -> Document {
+        let c = app.stroke_command(
+            app.points.clone(),
+            if app.mask {
+                [app.mask_value, app.mask_value, app.mask_value, app.color[3]]
+            } else {
+                app.color
+            },
+        );
+        let preview = Engine::preview_edits(before.clone(), &[c]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            frame(app, ctx, vec![], mods);
+            if app.canvas_pixels.as_ref().is_some_and(|(w, h, p)| {
+                preview.preview(None, (*w).max(*h), None, false).unwrap().2 == *p
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Straight preview absent"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.shared.lock().unwrap().doc.export_png().unwrap(),
+            before.export_png().unwrap()
+        );
+        preview
+    }
+    #[test]
+    fn straight_shift_clicks_preview_native_pixels_join_endpoints_and_commit_once() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let (mut app, ctx, before) = deselection_fixture(depth);
+                app.select_tool(Tool::Brush);
+                app.mask = mask;
+                app.mask_value = 0;
+                if mask {
+                    app.shared
+                        .lock()
+                        .unwrap()
+                        .edit(
+                            "human",
+                            &[json!({"op":"mask.add","layer":app.selected,"value":255})],
+                            None,
+                            None,
+                            "Mask",
+                        )
+                        .unwrap();
+                }
+                app.shared.lock().unwrap().undo.clear();
+                app.brush.tip = crate::brush::TipKind::Grain;
+                app.brush.seed = 19;
+                app.brush.density = 0.7;
+                app.brush.flow = 0.6;
+                app.brush.opacity = 0.75;
+                app.radius = 2.;
+                frame(&mut app, &ctx, vec![], Default::default());
+                let r = app.view_rect.unwrap();
+                let scale = r.width() / 32.;
+                let pos = |p: [f32; 2]| r.min + Vec2::new(p[0], p[1]) * scale;
+                app.current_pressure = Some(0.35);
+                click(&mut app, &ctx, pos([7., 12.]));
+                assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+                for (count, point, previous) in
+                    [(2, [21., 12.], [7., 12.]), (3, [14., 6.], [21., 12.])]
+                {
+                    let source = app.shared.lock().unwrap().doc.clone();
+                    app.current_pressure = Some(0.9);
+                    let p = pos(point);
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![
+                            egui::Event::PointerMoved(p),
+                            button(p, egui::PointerButton::Primary, true, shift),
+                        ],
+                        shift,
+                    );
+                    assert!(app.straight.line);
+                    assert_eq!(app.points.len(), 2);
+                    for axis in 0..2 {
+                        assert!((app.points[0][axis] - previous[axis]).abs() < 0.0001);
+                        assert!((app.points[1][axis] - point[axis]).abs() < 0.0001);
+                    }
+                    assert_eq!(app.stroke_pressures.last().copied(), Some(0.9));
+                    let preview = straight_preview(&mut app, &ctx, &source, shift);
+                    assert_eq!(app.shared.lock().unwrap().undo.len(), count - 1);
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![button(p, egui::PointerButton::Primary, false, shift)],
+                        shift,
+                    );
+                    let e = app.shared.lock().unwrap();
+                    assert_eq!(e.undo.len(), count, "{}", app.message);
+                    assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+                    assert_eq!(
+                        e.doc.layers[0].pixels.get16(0, 0),
+                        before.layers[0].pixels.get16(0, 0)
+                    );
+                    if mask {
+                        assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
+                    }
+                }
+                let mut e = app.shared.lock().unwrap();
+                let reopened = crate::psd::decode(&crate::psd::encode(&e.doc).unwrap()).unwrap();
+                assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+                assert_eq!(reopened.bit_depth, depth);
+                for _ in 0..3 {
+                    e.undo("human").unwrap();
+                }
+                assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
+            }
+        }
+    }
+    #[test]
+    fn straight_shift_drag_latches_document_axis_and_modifier_changes_keep_one_undo() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        for depth in [8, 16] {
+            for horizontal in [false, true] {
+                let (mut app, ctx, before) = deselection_fixture(depth);
+                app.select_tool(Tool::Brush);
+                app.radius = 2.;
+                frame(&mut app, &ctx, vec![], Default::default());
+                let r = app.view_rect.unwrap();
+                let scale = r.width() / 32.;
+                let pos = |p: [f32; 2]| r.min + Vec2::new(p[0], p[1]) * scale;
+                let a = [8., 8.];
+                let b = if horizontal { [20., 11.] } else { [11., 20.] };
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(pos(a)),
+                        button(pos(a), egui::PointerButton::Primary, true, shift),
+                    ],
+                    shift,
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(pos(b))],
+                    shift,
+                );
+                let c = app.stroke_command(app.points.clone(), app.color);
+                let (p, _) = crate::brush::points_from_command(&c).unwrap();
+                assert_eq!(
+                    c["stroke_axis"],
+                    if horizontal { "horizontal" } else { "vertical" }
+                );
+                assert!((p.last().unwrap()[if horizontal { 1 } else { 0 }] - 8.).abs() < 0.0001);
+                let swapped = if horizontal { [14., 21.] } else { [24., 14.] };
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(pos(swapped))],
+                    shift,
+                );
+                let c = app.stroke_command(app.points.clone(), app.color);
+                assert_eq!(
+                    c["stroke_axis"],
+                    if horizontal { "horizontal" } else { "vertical" }
+                );
+                straight_preview(&mut app, &ctx, &before, shift);
+                frame(&mut app, &ctx, vec![], Default::default());
+                assert!(app.straight.axis.is_none());
+                let prefix = app.points.clone();
+                let next = [25., 19.];
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(pos(next))],
+                    shift,
+                );
+                let c = app.stroke_command(app.points.clone(), app.color);
+                let index = c["stroke_axis_from"].as_u64().unwrap() as usize;
+                let (p, _) = crate::brush::points_from_command(&c).unwrap();
+                assert_eq!(&p[..index], &prefix[..index]);
+                let preview = straight_preview(&mut app, &ctx, &before, shift);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![button(
+                        pos(next),
+                        egui::PointerButton::Primary,
+                        false,
+                        shift,
+                    )],
+                    shift,
+                );
+                let mut e = app.shared.lock().unwrap();
+                assert_eq!(e.undo.len(), 1, "{}", app.message);
+                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
+            }
+        }
+    }
+    #[test]
+    fn straight_cancelled_shift_click_never_becomes_a_release_dab_after_human_edits_or_escape() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        for cancel in ["human", "escape", "alt"] {
+            let (mut app, ctx, _) = deselection_fixture(16);
+            app.select_tool(Tool::Brush);
+            app.radius = 2.;
+            frame(&mut app, &ctx, vec![], Default::default());
+            let r = app.view_rect.unwrap();
+            let scale = r.width() / 32.;
+            let a = r.min + Vec2::new(8., 12.) * scale;
+            let b = r.min + Vec2::new(20., 12.) * scale;
+            click(&mut app, &ctx, a);
+            let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(b),
+                    button(b, egui::PointerButton::Primary, true, shift),
+                ],
+                shift,
+            );
+            assert!(app.straight.line);
+            if cancel == "human" {
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .edit(
+                        "human",
+                        &[json!({"op":"layer.update","layer":app.selected,"name":"Human rename"})],
+                        None,
+                        None,
+                        "Rename",
+                    )
+                    .unwrap();
+                frame(&mut app, &ctx, vec![], shift);
+            } else if cancel == "alt" {
+                let alt = egui::Modifiers {
+                    alt: true,
+                    ..Default::default()
+                };
+                frame(&mut app, &ctx, vec![], alt);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![button(b, egui::PointerButton::Primary, false, alt)],
+                    alt,
+                );
+            } else {
+                key(&mut app, &ctx, egui::Key::Escape);
+            }
+            if cancel != "alt" {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![button(b, egui::PointerButton::Primary, false, shift)],
+                    shift,
+                );
+            } else {
+                frame(&mut app, &ctx, vec![], Default::default());
+            }
+            let e = app.shared.lock().unwrap();
+            assert!(
+                e.doc.export_png().unwrap() == before,
+                "Cancelled {cancel} wrote pixels"
+            );
+            assert_eq!(e.undo.len(), if cancel == "human" { 2 } else { 1 });
+            if cancel == "human" {
+                assert_eq!(e.doc.layers[0].name, "Human rename");
+            }
+            drop(e);
+            if cancel == "alt" {
+                app.color = [255, 0, 0, 255];
+                click(&mut app, &ctx, b);
+                assert_eq!(
+                    app.shared.lock().unwrap().undo.len(),
+                    2,
+                    "Sampling must not leave a stale line gesture"
+                );
+            }
         }
     }
     #[test]

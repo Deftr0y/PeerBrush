@@ -1,5 +1,117 @@
 use super::*;
+#[derive(Default)]
+pub(super) struct Straight {
+    last: Option<Last>,
+    pub axis: Option<(usize, &'static str)>,
+    pub line: bool,
+    pub document: Option<String>,
+    pub cancelled: bool,
+    shift: bool,
+    start: usize,
+}
+struct Last {
+    document: String,
+    revision: u64,
+    layer: String,
+    mask: bool,
+    step: Option<String>,
+    tool: Tool,
+    point: [f32; 2],
+    pressure: f32,
+}
+impl Straight {
+    pub(super) fn cancel(&mut self) {
+        self.axis = None;
+        self.line = false;
+        self.shift = false;
+        self.start = 0;
+        self.document = None;
+        self.cancelled = false;
+    }
+    pub(super) fn reset(&mut self) {
+        self.cancel();
+        self.last = None;
+    }
+}
 impl PeerBrush {
+    pub(super) fn brush_tool(&self) -> bool {
+        matches!(
+            self.tool,
+            Tool::Brush | Tool::Eraser | Tool::Smudge | Tool::Clone | Tool::Heal
+        )
+    }
+    pub(super) fn straight_click(&mut self, doc: &Document, point: [f32; 2], shift: bool) {
+        if !shift || !self.brush_tool() {
+            return;
+        }
+        let Some(last) = self.straight.last.as_ref().filter(|v| {
+            v.document == doc.id
+                && v.revision == doc.revision
+                && v.layer == self.selected
+                && v.mask == self.mask
+                && v.step == self.mask_step
+                && v.tool == self.tool
+        }) else {
+            return;
+        };
+        let (start, pressure) = (last.point, last.pressure);
+        if !self.begin_retouch(doc, start) {
+            return;
+        }
+        self.straight.cancel();
+        self.straight.line = true;
+        self.straight.document = Some(doc.id.clone());
+        self.drag_start = Some(point);
+        self.drag_revision = Some(doc.revision);
+        self.points = vec![start, point];
+        self.stroke_pressures = vec![pressure, self.current_pressure.unwrap_or(1.)];
+        self.stroke_has_pressure = self.current_pressure.is_some() || pressure != 1.;
+        self.live_gesture = Some(crate::engine::id());
+    }
+    pub(super) fn straight_drag(&mut self, shift: bool) {
+        self.straight.cancel();
+        self.straight.shift = shift;
+    }
+    pub(super) fn straight_modifier(&mut self, shift: bool) {
+        if !self.brush_tool() || self.straight.line {
+            return;
+        }
+        if self.straight.shift && !shift {
+            if self.straight.axis.is_some() && !self.points.is_empty() {
+                if let Ok((points, _)) = crate::brush::points_from_command(
+                    &self.stroke_command(self.points.clone(), self.color),
+                ) {
+                    self.points = points;
+                }
+            }
+            self.straight.axis = None;
+        }
+        if shift && !self.straight.shift {
+            self.straight.start = self.points.len().saturating_sub(1);
+        }
+        self.straight.shift = shift;
+    }
+    pub(super) fn straight_axis(&mut self) {
+        if self.brush_tool()
+            && self.straight.shift
+            && !self.straight.line
+            && self.straight.axis.is_none()
+            && self.points.len() > self.straight.start + 1
+        {
+            let a = self.points[self.straight.start];
+            let b = *self.points.last().unwrap();
+            if (a[0] - b[0]).hypot(a[1] - b[1]) > 0. {
+                self.straight.axis = Some((
+                    self.straight.start,
+                    if crate::brush::horizontal_axis(a, b) {
+                        "horizontal"
+                    } else {
+                        "vertical"
+                    },
+                ));
+            }
+        }
+    }
     pub(super) fn toolbar_brush_opacity(&mut self, ui: &mut egui::Ui) {
         controls::label(
             ui,
@@ -169,7 +281,31 @@ impl PeerBrush {
         }
     }
     pub(super) fn paint_command(&mut self, points: Vec<[f32; 2]>, color: Pixel, label: &str) {
-        self.edit(vec![self.stroke_command(points, color)], label);
+        let command = self.stroke_command(points, color);
+        let last = crate::brush::points_from_command(&command)
+            .ok()
+            .and_then(|(p, pressure)| {
+                p.last()
+                    .map(|v| (*v, pressure.and_then(|p| p.last().copied()).unwrap_or(1.)))
+            });
+        let (document, revision) = {
+            let e = self.shared.lock().unwrap();
+            (e.doc.id.clone(), e.doc.revision)
+        };
+        self.edit(vec![command], label);
+        let e = self.shared.lock().unwrap();
+        self.straight.last = last
+            .filter(|_| e.doc.id == document && e.doc.revision == revision + 1)
+            .map(|(point, pressure)| Last {
+                document,
+                revision: e.doc.revision,
+                layer: self.selected.clone(),
+                mask: self.mask,
+                step: self.mask_step.clone(),
+                tool: self.tool,
+                point,
+                pressure,
+            });
     }
     pub(super) fn stroke_command(&self, points: Vec<[f32; 2]>, color: Pixel) -> Value {
         let b = self.brush;
@@ -186,6 +322,18 @@ impl PeerBrush {
             "wetness":b.wetness,"load":b.load,"pickup":b.pickup});
         if let Some(pressures) = pressures {
             command["pressures"] = json!(pressures);
+        }
+        if let Some((start, axis)) = self.straight.axis {
+            command["stroke_axis"] = json!(axis);
+            command["stroke_axis_from"] = json!(start);
+        }
+        if let Some(revision) = self.drag_revision {
+            command["source_revision"] = json!(revision);
+            command["document_id"] = json!(self
+                .straight
+                .document
+                .as_ref()
+                .unwrap_or(&self.doc_snapshot.id));
         }
         self.retouch_command(&mut command, &sampled_points);
         command

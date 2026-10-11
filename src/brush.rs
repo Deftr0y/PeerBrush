@@ -354,7 +354,34 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
         pressures = values.iter().map(pressure).collect::<Result<Vec<_>, _>>()?;
         explicit = true;
     }
+    if let Some(axis) = c.get("stroke_axis") {
+        let axis = axis
+            .as_str()
+            .filter(|v| matches!(*v, "horizontal" | "vertical" | "axis"))
+            .ok_or("Stroke axis must be horizontal, vertical or axis")?;
+        let start = c
+            .get("stroke_axis_from")
+            .map(|v| {
+                v.as_u64()
+                    .filter(|i| *i < points.len() as u64)
+                    .ok_or("Stroke axis start must index an existing point")
+            })
+            .transpose()?
+            .unwrap_or(0) as usize;
+        let anchor = points[start];
+        let horizontal = axis == "horizontal"
+            || (axis == "axis" && horizontal_axis(anchor, *points.last().unwrap()));
+        for point in &mut points[start..] {
+            point[if horizontal { 1 } else { 0 }] = anchor[if horizontal { 1 } else { 0 }];
+        }
+    } else if c.get("stroke_axis_from").is_some() {
+        return Err("Stroke axis start requires a stroke axis".into());
+    }
     Ok((points, explicit.then_some(pressures)))
+}
+/// Choose in document coordinates; a view's pan/zoom never changes the axis.
+pub fn horizontal_axis(a: [f32; 2], b: [f32; 2]) -> bool {
+    (b[0] - a[0]).abs() >= (b[1] - a[1]).abs()
 }
 fn pressure(value: &Value) -> Result<f32, String> {
     value

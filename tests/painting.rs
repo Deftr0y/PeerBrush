@@ -403,3 +403,112 @@ fn painting_and_smudge_share_preview_commit_undo_and_lock_rules() {
             .contains("Reserved"));
     }
 }
+
+#[test]
+fn stroke_axis_projects_only_the_requested_tail_and_preserves_pressure() {
+    let command = json!({"points":[[3,4,0.2],[8,9,0.5],[20,12,0.8],[30,18,1.0]],"stroke_axis":"horizontal","stroke_axis_from":1});
+    let (p, pressure) = brush::points_from_command(&command).unwrap();
+    assert_eq!(p, vec![[3., 4.], [8., 9.], [20., 9.], [30., 9.]]);
+    assert_eq!(pressure.unwrap(), vec![0.2, 0.5, 0.8, 1.]);
+    let (p, _) =
+        brush::points_from_command(&json!({"points":[[4,3],[8,28]],"stroke_axis":"axis"})).unwrap();
+    assert_eq!(p, vec![[4., 3.], [4., 28.]]);
+    for extra in [
+        json!({"stroke_axis":true}),
+        json!({"stroke_axis":"diagonal"}),
+        json!({"stroke_axis":"vertical","stroke_axis_from":-1}),
+        json!({"stroke_axis":"axis","stroke_axis_from":2}),
+        json!({"stroke_axis_from":0}),
+    ] {
+        let mut c = json!({"points":[[4,3],[8,28]]});
+        c.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert!(brush::points_from_command(&c).is_err());
+    }
+}
+#[test]
+fn stroke_axis_matches_native_rendering_selection_masks_undo_and_psd_for_every_brush_tool() {
+    for depth in [8, 16] {
+        for op in ["paint", "erase", "smudge", "clone", "heal"] {
+            for mask in [false, true] {
+                let mut e = Engine::new();
+                e.doc = Document::new_depth(64, 32, depth).unwrap();
+                let id = e.doc.layers[0].id.clone();
+                for y in 0..32 {
+                    for x in 0..64 {
+                        e.doc.layers[0].pixels.set16(
+                            x,
+                            y,
+                            [10001 + x as u16 * 251, 20003 + y as u16 * 347, 30007, 65535],
+                        );
+                    }
+                }
+                e.edit(
+                    "human",
+                    &[
+                        json!({"op":"selection","kind":"ellipse","rect":[10,4,55,30],"feather":1}),
+                        json!({"op":"selection","rect":[24,12,29,20],"mode":"subtract"}),
+                    ],
+                    None,
+                    None,
+                    "Area",
+                )
+                .unwrap();
+                if mask {
+                    e.edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":id,"value":255})],
+                        None,
+                        None,
+                        "Mask",
+                    )
+                    .unwrap();
+                }
+                e.undo.clear();
+                let before = e.doc.clone();
+                let mut c = json!({"op":if op=="erase" {"paint"} else {op},"erase":op=="erase","layer":id,"mask":mask,"points":[[14,17,0.3],[30,24,0.6],[49,21,1.0]],"stroke_axis":"horizontal","radius":3,"tip":"grain","grain":2.5,"seed":17,"density":0.7,"hardness":0.7,"spacing":0.2,"opacity":0.8,"flow":0.65,"color":[20,240,120,255],"load":0.2,"source":[3,4],"source_layer":id,"sample_merged":false,"document_id":before.id,"source_revision":before.revision});
+                let preview = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
+                let mut expected = c.clone();
+                let (p, _) = brush::points_from_command(&c).unwrap();
+                expected.as_object_mut().unwrap().remove("stroke_axis");
+                expected["points"] = json!(p);
+                expected["pressures"] = json!([0.3, 0.6, 1.0]);
+                let rendered = Engine::preview_edits(before.clone(), &[expected]).unwrap();
+                assert_eq!(
+                    preview.export_png().unwrap(),
+                    rendered.export_png().unwrap(),
+                    "{depth} {op} mask={mask}"
+                );
+                e.edit(
+                    "human",
+                    &[c.clone()],
+                    Some(before.revision),
+                    None,
+                    "Axis stroke",
+                )
+                .unwrap();
+                assert_eq!(e.undo.len(), 1);
+                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+                assert_eq!(
+                    e.doc.layers[0].pixels.get16(2, 2),
+                    before.layers[0].pixels.get16(2, 2)
+                );
+                let reopened =
+                    peerbrush::psd::decode(&peerbrush::psd::encode(&e.doc).unwrap()).unwrap();
+                assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+                assert_eq!(reopened.bit_depth, depth);
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                e.redo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+                let current = e.doc.export_png().unwrap();
+                c["source_revision"] = json!(e.doc.revision);
+                e.reserve("other", "Stroke", vec![Scope::layer(&id)])
+                    .unwrap();
+                assert!(e.edit("human", &[c], None, None, "Blocked axis").is_err());
+                assert_eq!(e.doc.export_png().unwrap(), current);
+            }
+        }
+    }
+}
