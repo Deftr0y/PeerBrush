@@ -316,13 +316,17 @@ fn unsupported_missing_ambiguous_unused_and_mismatched_pattern_sources_stay_prot
 // Handwritten standard PSD records, independent of PeerBrush's encoder/private
 // sources. Input order is the editor's top-to-bottom tree, including dividers.
 fn fixture(specs: &[Spec], depth: u16) -> Vec<u8> {
+    fixture_size(specs, depth, 2, 1)
+}
+fn fixture_size(specs: &[Spec], depth: u16, width: u32, height: u32) -> Vec<u8> {
+    assert_eq!(width * height, 2);
     let mut records = vec![];
     let mut channels = vec![];
     for spec in specs.iter().rev() {
         let (w, h) = if spec.section.is_some() {
             (0i32, 0i32)
         } else {
-            (2, 1)
+            (width as i32, height as i32)
         };
         for value in [0i32, 0, h, w] {
             records.extend(value.to_be_bytes());
@@ -353,7 +357,7 @@ fn fixture(specs: &[Spec], depth: u16) -> Vec<u8> {
         let mut extra = vec![];
         let mut mask = vec![];
         if spec.mask.is_some() {
-            for value in [0i32, 0, 1, 2] {
+            for value in [0i32, 0, height as i32, width as i32] {
                 mask.extend(value.to_be_bytes());
             }
             mask.extend([255, 0, 0, 0]);
@@ -390,8 +394,8 @@ fn fixture(specs: &[Spec], depth: u16) -> Vec<u8> {
     out.extend(1u16.to_be_bytes());
     out.extend([0; 6]);
     out.extend(4u16.to_be_bytes());
-    out.extend(1u32.to_be_bytes());
-    out.extend(2u32.to_be_bytes());
+    out.extend(height.to_be_bytes());
+    out.extend(width.to_be_bytes());
     out.extend(depth.to_be_bytes());
     out.extend(3u16.to_be_bytes());
     out.extend([0; 8]);
@@ -2146,6 +2150,136 @@ fn supported_photoshop_overlays_retain_raster_masks_and_layer_opacity_at_native_
                     }
                 }
             }
+        }
+    }
+}
+
+fn axial_gradient_payload(degrees: f64, reflected: bool, reverse: bool) -> Vec<u8> {
+    let mut payload = gradient_payload(reverse, None, 0.);
+    let at = payload
+        .windows(12)
+        .position(|v| v == b"AnglUntF#Ang")
+        .unwrap()
+        + 12;
+    payload[at..at + 8].copy_from_slice(&degrees.to_be_bytes());
+    if reflected {
+        let at = payload.windows(4).position(|v| v == b"Lnr ").unwrap();
+        payload[at..at + 4].copy_from_slice(b"Rflc");
+    }
+    payload
+}
+#[test]
+fn photoshop_cardinal_and_reflected_gradients_keep_native_orientation_and_sources() {
+    for depth in [8, 16] {
+        for (width, height) in [(2u32, 1u32), (1, 2)] {
+            for degrees in [-180f64, -90., 0., 90., 180.] {
+                for reflected in [false, true] {
+                    for reverse in [false, true] {
+                        let mut spec = Spec::paint("Synthetic axial gradient", SAVED);
+                        spec.tags.push((
+                            *b"lfx2",
+                            axial_gradient_payload(degrees, reflected, reverse),
+                        ));
+                        let mut bytes = fixture_size(&[spec], depth, width, height);
+                        let merged = std::array::from_fn::<_, 2, _>(|index| {
+                            // Analytic cardinal coordinates, without trigonometry or
+                            // the native gradient sampler/renderer under test.
+                            let x = if width == 2 {
+                                if index == 0 {
+                                    -0.25
+                                } else {
+                                    0.25
+                                }
+                            } else {
+                                0.
+                            };
+                            let y = if height == 2 {
+                                if index == 0 {
+                                    -0.25
+                                } else {
+                                    0.25
+                                }
+                            } else {
+                                0.
+                            };
+                            let position: f64 = if degrees == 90. {
+                                -y
+                            } else if degrees == -90. {
+                                y
+                            } else if degrees.abs() == 180. {
+                                -x
+                            } else {
+                                x
+                            };
+                            let mut t = if reflected {
+                                2. * position.abs()
+                            } else {
+                                0.5 + position
+                            };
+                            if reverse {
+                                t = 1. - t;
+                            }
+                            let value = native((t * 65535.).round() as u16, depth);
+                            [value, value, value, 65535]
+                        });
+                        bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                        for channel in 0..4 {
+                            for pixel in merged {
+                                sample(&mut bytes, pixel[channel], depth);
+                            }
+                        }
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {width}x{height} {degrees} {reflected} {reverse}: {:?}",
+                            doc.warnings
+                        );
+                        assert_eq!(doc.layers[0].effects[0].settings["angle"], degrees);
+                        assert_eq!(
+                            doc.layers[0].effects[0].settings["style"],
+                            if reflected { "reflected" } else { "linear" }
+                        );
+                        assert_eq!(doc.layers[0].effects[0].settings["reverse"], reverse);
+                        let source = doc.layers[0].pixels.rgba16();
+                        assert_eq!(
+                            source,
+                            SAVED
+                                .into_iter()
+                                .flatten()
+                                .map(|n| native(n, depth))
+                                .collect::<Vec<_>>()
+                        );
+                        let current = doc.export_png().unwrap();
+                        for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
+fn arbitrary_gradient_rotation_and_shape_remain_protected_even_when_disabled() {
+    for depth in [8, 16] {
+        for degrees in [-181., -89., 45., 89., 181.] {
+            let mut payload = axial_gradient_payload(degrees, true, false);
+            let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+            payload[at] = 0;
+            let mut spec = Spec::paint("Synthetic unsupported rotated gradient", SAVED);
+            spec.tags.push((*b"lmfx", payload));
+            assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+        }
+        for shape in [b"Rdl ", b"Angl", b"Dmnd", b"????"] {
+            let mut payload = axial_gradient_payload(90., true, false);
+            let at = payload.windows(4).position(|v| v == b"Rflc").unwrap();
+            payload[at..at + 4].copy_from_slice(shape);
+            let mut spec = Spec::paint("Synthetic unsupported gradient shape", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
         }
     }
 }

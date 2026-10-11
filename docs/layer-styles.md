@@ -76,10 +76,12 @@ A single unscaled, unrotated bitmap Pattern Overlay with a supported blend with 
 
 ## Mixed Photoshop overlays (unreleased; QA pending)
 
-A supported Color, bitmap Pattern and linear Gradient Overlay can coexist on the same ordinary raster layer. Each family retains fully validated definitions, including disabled entries and embedded tile data. Native execution follows Color, Pattern, Gradient, independent of descriptor property order; the workspace displays the final step at the top. The complete saved native composite must match exactly before editing is enabled. Unsupported families, unknown fields, ambiguous aliases, unsupported multi-effect lists and unused pattern assets still protect the whole source. Native8/16 stack rendering, source retention, undo and PSD/PSB save coverage is added for combined QA. This does not recover broader styled sources.
+A supported Color, bitmap Pattern and plain Gradient Overlay can coexist on the same ordinary raster layer. Each family retains fully validated definitions, including disabled entries and embedded tile data. Native execution follows Color, Pattern, Gradient, independent of descriptor property order; the workspace displays the final step at the top. The complete saved native composite must match exactly before editing is enabled. Unsupported families, unknown fields, ambiguous aliases, unsupported multi-effect lists and unused pattern assets still protect the whole source. Native8/16 stack rendering, source retention, undo and PSD/PSB save coverage is added for combined QA. This does not recover broader styled sources.
 
 Pattern and Gradient overlays additionally accept Normal/Multiply/Screen/Overlay/Darken/Lighten on import (QA pending). Every other source/placement limit and exact native composite gate remains in force.
 
 Explicit Photoshop Color/Gradient multi-effect lists retain 1–16 supported entries per family in file order, including disabled definitions, within a 32-effect total stack limit (QA pending). Multiple Pattern instances and unsupported entries stay protected. Shared reorder, bypass, settings and undo controls operate on each retained definition.
 
 Supported Photoshop overlay imports now retain supported raster masks and layer opacity, including zero opacity (QA pending). Every mask/source validator and exact composite gate remains active; unsupported masks, clipping, folder styles and non-Normal layer blending remain protected.
+
+Plain Photoshop Gradient Overlay import additionally supports Linear/Reflected at the horizontal/vertical cardinal axes, retaining angle, reverse and all stop definitions (QA pending). Unscaled document alignment, exact native composite matching and the existing color/interpolation limits remain mandatory.

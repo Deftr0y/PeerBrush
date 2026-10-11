@@ -218,21 +218,21 @@ pub(super) fn inspect(bytes: &[u8]) -> Result<Vec<String>, String> {
 
 fn plain_number(value: &Value) -> Result<f64, String> {
     if !matches!(value["type"].as_str(), Some("doub" | "long")) {
-        return Err("Color Overlay requires plain RGB channel numbers".into());
+        return Err("Photoshop style requires plain channel/coordinate numbers".into());
     }
     value["value"]
         .as_f64()
-        .ok_or("Invalid Color Overlay number".into())
+        .ok_or("Invalid Photoshop style number".into())
 }
 fn percent(value: &Value) -> Result<f64, String> {
     if value["type"] != "UntF" || value["value"][0] != "#Prc" {
-        return Err("Color Overlay requires percentage units".into());
+        return Err("Photoshop style requires percentage units".into());
     }
     let n = value["value"][1]
         .as_f64()
-        .ok_or("Invalid Color Overlay percentage")?;
+        .ok_or("Invalid Photoshop style percentage")?;
     if !(0.0..=100.).contains(&n) {
-        return Err("Color Overlay percentage is outside 0–100".into());
+        return Err("Photoshop style percentage is outside 0–100".into());
     }
     Ok(n / 100.)
 }
@@ -446,11 +446,11 @@ fn pattern_overlay(
 fn descriptor<'a>(value: &'a Value, class: &str) -> Result<&'a Map<String, Value>, String> {
     if !matches!(value["type"].as_str(), Some("Objc" | "GlbO")) || value["value"]["class"] != class
     {
-        return Err("Unsupported Photoshop gradient descriptor class".into());
+        return Err("Unsupported Photoshop style descriptor class".into());
     }
     value["value"]["items"]
         .as_object()
-        .ok_or("Invalid Photoshop gradient properties".into())
+        .ok_or("Invalid Photoshop style properties".into())
 }
 fn field<'a>(fields: &'a Map<String, Value>, key: &str) -> &'a Value {
     static NULL: Value = Value::Null;
@@ -529,18 +529,24 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
         return Err("Dithered or layer-aligned Photoshop gradients remain protected".into());
     }
     let blend = overlay_blend(field(fields, "Md  "))?;
-    if field(fields, "Type")["type"] != "enum"
-        || field(fields, "Type")["value"] != json!(["GrdT", "Lnr "])
-    {
-        return Err("Only linear Photoshop Gradient Overlay can be imported".into());
+    if field(fields, "Type")["type"] != "enum" || field(fields, "Type")["value"][0] != "GrdT" {
+        return Err("Invalid Photoshop Gradient Overlay shape enumeration".into());
     }
+    let style = match field(fields, "Type")["value"][1].as_str() {
+        Some("Lnr ") => "linear",
+        Some("Rflc") => "reflected",
+        _ => return Err("Unsupported Photoshop Gradient Overlay shape".into()),
+    };
     let angle = field(fields, "Angl");
+    let degrees = angle["value"][1]
+        .as_f64()
+        .ok_or("Missing Photoshop gradient angle")?;
     if angle["type"] != "UntF"
         || angle["value"][0] != "#Ang"
-        || angle["value"][1].as_f64() != Some(0.)
+        || ![-180., -90., 0., 90., 180.].contains(&degrees)
         || percent(field(fields, "Scl "))? != 1.
     {
-        return Err("Rotated or scaled Photoshop gradients remain protected".into());
+        return Err("Only unscaled cardinal-axis Photoshop gradients can be imported".into());
     }
     if let Some(offset) = fields.get("Ofst") {
         let offset = descriptor(offset, "Pnt ")?;
@@ -564,7 +570,7 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
             "Noise, smooth or unsupported Photoshop gradient definitions remain protected".into(),
         );
     }
-    let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":blend,"angle":0.,"scale":1.,"style":"linear","reverse":required_bool("Rvrs")?});
+    let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":blend,"angle":degrees,"scale":1.,"style":style,"reverse":required_bool("Rvrs")?});
     for (input, output, class, alpha) in [
         ("Clrs", "color_stops", "Clrt", false),
         ("Trns", "alpha_stops", "TrnS", true),
