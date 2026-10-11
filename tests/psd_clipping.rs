@@ -1771,3 +1771,247 @@ fn unsupported_or_mismatched_pattern_and_gradient_blends_keep_sources_protected(
         }
     }
 }
+
+fn multi_overlay_payload(
+    enabled: [bool; 4],
+    master: bool,
+    color_count: usize,
+    gradient_count: usize,
+    include_pattern: bool,
+) -> Vec<u8> {
+    let mut color = (color_count as u32).to_be_bytes().to_vec();
+    let mut gradient = (gradient_count as u32).to_be_bytes().to_vec();
+    for (list, key, count, offset) in [
+        (&mut color, "SoFi", color_count, 0),
+        (&mut gradient, "GrFl", gradient_count, 2),
+    ] {
+        for index in 0..count {
+            let payload = if offset == 0 {
+                overlay_payload(
+                    true,
+                    enabled[index % 2],
+                    if index % 2 == 0 {
+                        [111., 67., 231.]
+                    } else {
+                        [31., 197., 83.]
+                    },
+                )
+            } else {
+                gradient_payload(index % 2 != 0, None, 0.)
+            };
+            let needle = [key.as_bytes(), b"Objc"].concat();
+            let at = payload
+                .windows(needle.len())
+                .position(|v| v == needle)
+                .unwrap()
+                + needle.len();
+            let mut effect = payload[at..].to_vec();
+            let at = effect.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+            effect[at] = u8::from(enabled[offset + index % 2]);
+            let at = effect
+                .windows(12)
+                .position(|v| v == b"OpctUntF#Prc")
+                .unwrap()
+                + 12;
+            effect[at..at + 8].copy_from_slice(&50f64.to_be_bytes());
+            list.extend(b"Objc");
+            list.extend(effect);
+        }
+    }
+    let mut entries = vec![
+        ("masterFXSwitch", b"bool", vec![u8::from(master)]),
+        ("gradientFillMulti", b"VlLs", gradient),
+        ("solidFillMulti", b"VlLs", color),
+    ];
+    if include_pattern {
+        let payload = pattern_payload(false, "synthetic-pattern", "", 100.);
+        let at = payload
+            .windows(15)
+            .position(|v| v == b"patternFillObjc")
+            .unwrap()
+            + 15;
+        entries.push(("patternFill", b"Objc", payload[at..].to_vec()));
+    }
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        overlay_descriptor("Lefx", entries),
+    ]
+    .concat()
+}
+#[test]
+fn multiple_photoshop_overlays_preserve_file_order_disabled_entries_and_native_sources() {
+    for depth in [8, 16] {
+        for flags in 0u8..16 {
+            let enabled = [
+                flags & 1 != 0,
+                flags & 2 != 0,
+                flags & 4 != 0,
+                flags & 8 != 0,
+            ];
+            for master in [false, true] {
+                let mut spec = Spec::paint("Synthetic multiple overlays", SAVED);
+                spec.tags.push((
+                    *b"lmfx",
+                    multi_overlay_payload(enabled, master, 2, 2, false),
+                ));
+                let mut bytes = fixture(&[spec], depth);
+                let mut merged = SAVED.map(|p| p.map(|n| native(n, depth)));
+                if master {
+                    for (x, pixel) in merged.iter_mut().enumerate() {
+                        let colors = [
+                            [111 * 257, 67 * 257, 231 * 257],
+                            [31 * 257, 197 * 257, 83 * 257],
+                            [if x == 0 { 16384 } else { 49151 }; 3],
+                            [if x == 0 { 49151 } else { 16384 }; 3],
+                        ];
+                        for (active, tint) in enabled.into_iter().zip(colors) {
+                            if active {
+                                for c in 0..3 {
+                                    pixel[c] = native(
+                                        ((f64::from(pixel[c]) * 32767.
+                                            + f64::from(tint[c]) * 32768.)
+                                            / 65535.)
+                                            .round() as u16,
+                                        depth,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                for channel in 0..4 {
+                    for pixel in merged {
+                        sample(&mut bytes, pixel[channel], depth);
+                    }
+                }
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(
+                    !doc.read_only,
+                    "{depth} {flags} {master}: {:?}",
+                    doc.warnings
+                );
+                assert_eq!(
+                    doc.layers[0]
+                        .effects
+                        .iter()
+                        .map(|e| e.kind.as_str())
+                        .collect::<Vec<_>>(),
+                    [
+                        "color_overlay",
+                        "color_overlay",
+                        "gradient_overlay",
+                        "gradient_overlay"
+                    ]
+                );
+                assert_eq!(
+                    doc.layers[0]
+                        .effects
+                        .iter()
+                        .map(|e| e.enabled)
+                        .collect::<Vec<_>>(),
+                    enabled.map(|v| v && master)
+                );
+                assert_eq!(
+                    doc.layers[0].effects[0].settings["color"],
+                    json!([111. / 255., 67. / 255., 231. / 255.])
+                );
+                assert_eq!(
+                    doc.layers[0].effects[1].settings["color"],
+                    json!([31. / 255., 197. / 255., 83. / 255.])
+                );
+                assert_eq!(doc.layers[0].effects[2].settings["reverse"], false);
+                assert_eq!(doc.layers[0].effects[3].settings["reverse"], true);
+                let source = doc.layers[0].pixels.rgba16();
+                assert_eq!(
+                    source,
+                    SAVED
+                        .into_iter()
+                        .flatten()
+                        .map(|n| native(n, depth))
+                        .collect::<Vec<_>>()
+                );
+                let current = doc.export_png().unwrap();
+                let mut engine = Engine::new();
+                engine.doc = doc;
+                let layer = engine.doc.layers[0].id.clone();
+                let effect = engine.doc.layers[0].effects[0].id.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"effect.reorder","layer":layer,"effect":effect,"index":3})],
+                        None,
+                        None,
+                        "Reorder imported overlays",
+                    )
+                    .unwrap();
+                assert_eq!(engine.undo.len(), 1);
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.export_png().unwrap(), current);
+                for output in [
+                    psd::encode(&engine.doc).unwrap(),
+                    psd::encode_psb(&engine.doc).unwrap(),
+                ] {
+                    let reopened = psd::decode(&output).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.layers[0].effects.len(), 4);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                }
+            }
+        }
+    }
+}
+#[test]
+fn multiple_overlay_limits_aliases_and_unsupported_disabled_entries_protect_atomically() {
+    for depth in [8, 16] {
+        for (colors, gradients, pattern, protected) in [
+            (16, 16, false, false),
+            (16, 16, true, true),
+            (17, 1, false, true),
+            (0, 1, false, true),
+        ] {
+            let mut spec = Spec::paint("Synthetic bounded overlays", SAVED);
+            spec.tags.push((
+                *b"lmfx",
+                multi_overlay_payload([false; 4], false, colors, gradients, pattern),
+            ));
+            let mut bytes = fixture(&[spec], depth);
+            if pattern {
+                bytes = inject_pattern(
+                    bytes,
+                    depth,
+                    &pattern_resource(depth, "synthetic-pattern"),
+                    false,
+                );
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert_eq!(
+                doc.read_only, protected,
+                "{depth} {colors} {gradients} {pattern}: {:?}",
+                doc.warnings
+            );
+            if !protected {
+                assert_eq!(doc.layers[0].effects.len(), 32);
+            }
+        }
+        for invalid in ["alias", "unsupported"] {
+            let mut payload = multi_overlay_payload([false; 4], false, 2, 2, false);
+            if invalid == "unsupported" {
+                let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
+                payload[at..at + 4].copy_from_slice(b"HrdL");
+            } else {
+                let at = payload.windows(4).position(|v| v == b"Lefx").unwrap() + 4;
+                payload[at..at + 4].copy_from_slice(&4u32.to_be_bytes());
+                overlay_id(&mut payload, "SoFi");
+                payload.extend(b"Objc");
+                payload.extend(overlay_descriptor("SoFi", vec![]));
+            }
+            let mut spec = Spec::paint("Synthetic invalid multi overlays", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+            assert!(doc.read_only);
+        }
+    }
+}

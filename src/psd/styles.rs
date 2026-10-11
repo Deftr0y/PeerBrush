@@ -281,28 +281,56 @@ pub(super) fn native_overlays(
     // Photoshop overlays run Color, Pattern, Gradient. Keep the same execution
     // order in the native stack (the UI displays the last effect at the top).
     // Reference: psd-tools/composite/composite.py::_OVERLAY_DRAWS.
-    // Each family still requires a single unambiguous, fully supported entry.
+    // Preserve multi-overlay entries in file order, including disabled entries.
     // Never try alternative orders merely to match the saved appearance.
     for keys in [
         &["SoFi", "solidFillMulti"][..],
         &["patternFill"][..],
         &["GrFl", "gradientFillMulti"][..],
     ] {
-        if !keys.iter().any(|key| items.contains_key(*key)) {
+        let present = keys
+            .iter()
+            .filter(|key| items.contains_key(**key))
+            .collect::<Vec<_>>();
+        if present.is_empty() {
             continue;
         }
-        let mut isolated = parsed.clone();
-        isolated["items"].as_object_mut().unwrap().retain(|key, _| {
-            matches!(key.as_str(), "masterFXSwitch" | "Scl ") || keys.contains(&key.as_str())
-        });
-        match keys[0] {
-            "SoFi" => effects.extend(color_overlay_root(&isolated)?),
-            "patternFill" => {
-                let (effect, index) = pattern_overlay(&isolated, patterns, depth)?;
-                effects.push(effect);
-                pattern_index = Some(index);
+        if present.len() != 1 {
+            return Err("Ambiguous Photoshop single/multiple overlay aliases".into());
+        }
+        let key = *present[0];
+        let source = field(items, key);
+        let entries = if source["type"] == "VlLs" {
+            let entries = source["value"]
+                .as_array()
+                .filter(|v| (1..=16).contains(&v.len()))
+                .ok_or("Photoshop overlay list requires 1–16 definitions")?;
+            if key == "patternFill" || entries.len() > 1 && !key.ends_with("Multi") {
+                return Err(
+                    "Multiple overlays require an explicit Photoshop multi-effect key".into(),
+                );
             }
-            _ => effects.extend(gradient_overlay(&isolated)?),
+            entries.iter().collect::<Vec<_>>()
+        } else {
+            vec![source]
+        };
+        if effects.len() + entries.len() > 32 {
+            return Err("Photoshop overlay stack exceeds the shared 32-effect limit".into());
+        }
+        for entry in entries {
+            let mut isolated = parsed.clone();
+            let isolated_items = isolated["items"].as_object_mut().unwrap();
+            isolated_items.retain(|key, _| matches!(key.as_str(), "masterFXSwitch" | "Scl "));
+            isolated_items.insert(keys[0].into(), entry.clone());
+            match keys[0] {
+                "SoFi" => effects.extend(color_overlay_root(&isolated)?),
+                "patternFill" => {
+                    let (effect, index) = pattern_overlay(&isolated, patterns, depth)?;
+                    effects.push(effect);
+                    pattern_index = Some(index);
+                }
+                _ => effects.extend(gradient_overlay(&isolated)?),
+            }
         }
     }
     if effects.is_empty() {
