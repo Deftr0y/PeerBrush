@@ -1,3 +1,4 @@
+use flate2::read::ZlibDecoder;
 use peerbrush::{
     engine::{Document, Engine, Layer, Mask, MaskStep},
     psd::{self, LayerMetadata},
