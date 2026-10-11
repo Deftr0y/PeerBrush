@@ -216,6 +216,20 @@ impl PeerBrush {
         let view = self.view;
         let to_doc = |p: Pos2| view.document(p, rect, scale);
         let to_screen = |p: [f32; 2]| view.point(p, rect, scale);
+        if self.selection_pointer_cancelled {
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.selection_pointer_cancelled = false;
+                self.canvas_press_document = None;
+            }
+            return;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.selection_pointer_cancelled = ui.input(|i| i.pointer.primary_down());
+            self.selection_path.clear();
+            self.points.clear();
+            self.drag_start = None;
+            return;
+        }
         // The response covers only the canvas workspace, excluding panels and controls.
         if response.clicked()
             && response
@@ -223,12 +237,6 @@ impl PeerBrush {
                 .is_some_and(|p| !view.contains(p, rect, scale))
         {
             self.deselect_area(doc, false);
-            return;
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.selection_path.clear();
-            self.points.clear();
-            self.drag_start = None;
             return;
         }
         let path_tool = ["polygon", "magnetic"].contains(&self.selection_kind.as_str());

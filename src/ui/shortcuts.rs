@@ -269,6 +269,42 @@ impl Shortcuts {
     pub fn size_held(&self, input: &egui::InputState) -> bool {
         self.preferences.bindings["Size / hardness gesture"].held(input)
     }
+    pub(super) fn selection_dependent_event(&self, event: &egui::Event) -> bool {
+        match event {
+            egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => true,
+            egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                let is_key = |wanted| *key == wanted || *physical_key == Some(wanted);
+                if (modifiers.command || modifiers.ctrl)
+                    && !modifiers.alt
+                    && [egui::Key::C, egui::Key::X, egui::Key::V]
+                        .into_iter()
+                        .any(is_key)
+                {
+                    return true;
+                }
+                if is_key(egui::Key::Delete) && !modifiers.any() {
+                    return true;
+                }
+                ["Move", "Rotate artwork", "Scale artwork"]
+                    .into_iter()
+                    .any(|action| {
+                        let binding = &self.preferences.bindings[action];
+                        !modifiers.command
+                            && !modifiers.ctrl
+                            && !modifiers.alt
+                            && modifiers.shift == binding.shift
+                            && binding.key().is_some_and(is_key)
+                    })
+            }
+            _ => false,
+        }
+    }
     pub fn tool_label(&self, tool: Tool) -> String {
         TOOLS
             .iter()

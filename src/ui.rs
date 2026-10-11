@@ -444,6 +444,7 @@ pub struct PeerBrush {
     read_only_info: Option<String>,
     read_only_patterns: Option<String>,
     selection_commit_failed: bool,
+    selection_pointer_cancelled: bool,
     save_report: Option<crate::compatibility::SaveReport>,
     save_loss_review: Option<compatibility::SaveReview>,
     export_editor: Option<exports::Editor>,
@@ -772,6 +773,7 @@ impl PeerBrush {
             read_only_info: None,
             read_only_patterns: None,
             selection_commit_failed: false,
+            selection_pointer_cancelled: false,
             save_report: None,
             save_loss_review: None,
             export_editor: None,
@@ -851,6 +853,7 @@ impl PeerBrush {
         }
     }
     fn select_tool(&mut self, tool: Tool) {
+        self.selection_pointer_cancelled = false;
         if self.tool != tool {
             self.straight.reset();
         } else {
@@ -3016,6 +3019,7 @@ impl PeerBrush {
         if response.hovered()
             && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
         {
+            self.selection_pointer_cancelled = false;
             self.layer_clipboard = false;
             if ui.input(|i| i.pointer.primary_down()) {
                 self.canvas_press_document = Some(doc.id.clone());
@@ -3598,6 +3602,7 @@ impl PeerBrush {
             return;
         };
         self.canvas_press_document = None;
+        self.selection_pointer_cancelled = false;
         self.canvas_input_region = None;
         self.project_views.insert(
             self.project_id.clone(),
@@ -3954,6 +3959,85 @@ impl PeerBrush {
         if let Some((id, _shared)) = close {
             self.request_close(lifecycle::Intent::Close(id));
         }
+    }
+    // Commands before selection release must not act on old coverage. Require
+    // an explicit retry; never retain delayed destructive/clipboard work.
+    fn hold_canvas_selection_shortcuts(
+        &self,
+        ctx: &egui::Context,
+        doc: &Document,
+    ) -> Option<Vec<egui::Event>> {
+        if !matches!(self.tool, Tool::Selection | Tool::MagicWand)
+            || ["polygon", "magnetic"].contains(&self.selection_kind.as_str())
+            || self.lifecycle.is_some()
+            || self.lifecycle_frame
+            || self.shortcuts.open
+            || self.filter_editor.is_some()
+            || self.rename_edit.is_some()
+            || ctx
+                .memory(|m| m.focused())
+                .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some())
+        {
+            return None;
+        }
+        let (release, press, focused, primary_down, event_count) = ctx.input(|input| {
+            let release = input.events.iter().position(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    }
+                )
+            });
+            let end = release.unwrap_or(input.events.len());
+            let press =
+                input.events[..end]
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, event)| match event {
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            ..
+                        } => Some((index + 1, *pos)),
+                        _ => None,
+                    });
+            (
+                release,
+                press,
+                input.focused,
+                input.pointer.primary_down(),
+                input.events.len(),
+            )
+        });
+        if !focused || release.is_none() && !primary_down {
+            return None;
+        }
+        let press = press.filter(|(_, pos)| {
+            self.canvas_input_region.is_some_and(|(rect, layer)| {
+                rect.contains(*pos) && ctx.layer_id_at(*pos) == Some(layer)
+            })
+        });
+        let owner = self.canvas_press_document.as_deref() == Some(doc.id.as_str());
+        let start = if owner { 0 } else { press?.0 };
+        let end = release.unwrap_or(event_count);
+        ctx.input_mut(|input| {
+            let original = input.events.clone();
+            input.events = original
+                .iter()
+                .enumerate()
+                .filter(|(index, event)| {
+                    !(*index >= start
+                        && *index < end
+                        && self.shortcuts.selection_dependent_event(event))
+                })
+                .map(|(_, event)| event.clone())
+                .collect();
+            (input.events.len() != original.len()).then_some(original)
+        })
     }
     // Canvas gestures commit in the central panel. Shortcuts delivered after
     // their mouse release must see that commit, rather than the frame's snapshot.
@@ -4585,7 +4669,12 @@ impl PeerBrush {
             }
         }
         self.file_drop_feedback(ctx);
+        let held_selection_shortcuts = self.hold_canvas_selection_shortcuts(ctx, &doc);
         let deferred_shortcuts = self.defer_canvas_shortcuts(ctx, &doc);
+        let show_held_shortcut_message = held_selection_shortcuts.is_some()
+            && deferred_shortcuts
+                .as_ref()
+                .is_none_or(|(_, late, _)| late.is_empty());
         self.document_shortcuts(ctx, &doc);
         egui::TopBottomPanel::top("context")
             .exact_height(48.0)
@@ -5003,6 +5092,17 @@ impl PeerBrush {
                 ctx.request_repaint();
             }
             ctx.input_mut(|i| i.events = original);
+        }
+        if let Some(original) = held_selection_shortcuts {
+            ctx.input_mut(|i| i.events = original);
+            if show_held_shortcut_message && !self.selection_commit_failed {
+                self.message = if ctx.input(|i| i.pointer.primary_down()) {
+                    "Release the selection gesture, then retry the shortcut"
+                } else {
+                    "Selection gesture ended; retry the shortcut"
+                }
+                .into();
+            }
         }
 
         if self.tab_transfer.is_none() {
@@ -10645,6 +10745,13 @@ mod tests {
         }
     }
     fn pressed_wand_fixture(depth: u16) -> (PeerBrush, egui::Context, Pos2, Document) {
+        pressed_selection_fixture(depth, Tool::MagicWand, "wand")
+    }
+    fn pressed_selection_fixture(
+        depth: u16,
+        tool: Tool,
+        kind: &str,
+    ) -> (PeerBrush, egui::Context, Pos2, Document) {
         let (mut app, ctx) = small_fixture();
         let before = {
             let mut engine = app.shared.lock().unwrap();
@@ -10666,7 +10773,8 @@ mod tests {
             engine.doc.clone()
         };
         app.clipboard = crate::clipboard::Worker::memory(ctx.clone());
-        app.select_tool(Tool::MagicWand);
+        app.select_tool(tool);
+        app.selection_kind = kind.into();
         app.selection_tolerance = 0.;
         app.selection_merged = false;
         frame(&mut app, &ctx, vec![], Default::default());
@@ -10905,7 +11013,7 @@ mod tests {
         }
     }
     #[test]
-    fn shortcut_before_wand_release_retains_event_order_and_focus_guards() {
+    fn shortcut_before_wand_release_requires_retry_and_preserves_focus_guards() {
         for depth in [8, 16] {
             let (mut app, ctx, point, _) = pressed_wand_fixture(depth);
             frame(
@@ -10914,8 +11022,12 @@ mod tests {
                 vec![shortcut_press(egui::Key::W), primary_release(point)],
                 Default::default(),
             );
-            assert!(app.tool == Tool::Move);
-            assert_eq!(app.shared.lock().unwrap().doc.selection, None);
+            assert!(app.tool == Tool::MagicWand);
+            assert_eq!(
+                app.shared.lock().unwrap().doc.selection,
+                Some([4, 5, 12, 13])
+            );
+            assert!(app.message.contains("retry the shortcut"));
             assert!(app.canvas_press_document.is_none());
             let (mut app, ctx, point, _) = pressed_wand_fixture(depth);
             app.shortcuts.open = true;
@@ -10926,6 +11038,206 @@ mod tests {
                 Default::default(),
             );
             assert!(app.tool == Tool::MagicWand);
+        }
+    }
+    #[test]
+    fn held_wand_shortcuts_preserve_sources_until_release_and_explicit_retry() {
+        for depth in [8, 16] {
+            for action in ["copy", "cut", "paste", "delete", "move", "rotate", "scale"] {
+                let (mut app, ctx, point, before) = pressed_wand_fixture(depth);
+                let event = match action {
+                    "copy" => egui::Event::Copy,
+                    "cut" => egui::Event::Cut,
+                    "paste" => egui::Event::Paste(String::new()),
+                    "delete" => shortcut_press(egui::Key::Delete),
+                    "move" => shortcut_press(egui::Key::W),
+                    "rotate" => shortcut_press(egui::Key::E),
+                    _ => shortcut_press(egui::Key::R),
+                };
+                frame(&mut app, &ctx, vec![event.clone()], Default::default());
+                assert!(app.tool == Tool::MagicWand);
+                assert!(app.message.contains("Release the selection gesture"));
+                {
+                    let engine = app.shared.lock().unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&engine.doc).unwrap(),
+                        serde_json::to_value(&before).unwrap()
+                    );
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        before.export_png().unwrap()
+                    );
+                    assert!(engine.undo.is_empty());
+                }
+                if matches!(action, "copy" | "cut" | "paste") {
+                    assert!(matches!(
+                        app.clipboard
+                            .replies
+                            .recv_timeout(Duration::from_millis(50)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                }
+                let mut release_events = vec![primary_release(point)];
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    modifiers,
+                    ..
+                } = event.clone()
+                {
+                    release_events.push(egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: false,
+                        repeat: false,
+                        modifiers,
+                    });
+                }
+                frame(&mut app, &ctx, release_events, Default::default());
+                assert!(app.tool == Tool::MagicWand);
+                assert_eq!(
+                    app.shared.lock().unwrap().doc.selection,
+                    Some([4, 5, 12, 13])
+                );
+                assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+                if matches!(action, "copy" | "cut" | "paste") {
+                    assert!(matches!(
+                        app.clipboard
+                            .replies
+                            .recv_timeout(Duration::from_millis(50)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                }
+                if action == "paste" {
+                    continue;
+                }
+                frame(&mut app, &ctx, vec![event], Default::default());
+                if matches!(action, "copy" | "cut") {
+                    assert!(app
+                        .clipboard
+                        .replies
+                        .recv_timeout(Duration::from_secs(3))
+                        .unwrap()
+                        .result
+                        .is_ok());
+                }
+                match action {
+                    "move" => assert!(app.tool == Tool::Move),
+                    "rotate" => assert!(app.tool == Tool::Rotate),
+                    "scale" => assert!(app.tool == Tool::Scale),
+                    _ => {}
+                }
+                let mut engine = app.shared.lock().unwrap();
+                for y in 0..32 {
+                    for x in 0..32 {
+                        let expected = if matches!(action, "cut" | "delete")
+                            && (4..12).contains(&x)
+                            && (5..13).contains(&y)
+                        {
+                            [0; 4]
+                        } else {
+                            before.layers[0].pixels.get16(x, y)
+                        };
+                        assert_eq!(
+                            engine.doc.layers[0].pixels.get16(x, y),
+                            expected,
+                            "{depth} {action} {x},{y}"
+                        );
+                    }
+                }
+                if matches!(action, "cut" | "delete") {
+                    engine.undo("human").unwrap();
+                }
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    before.export_png().unwrap()
+                );
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.selection, None);
+            }
+        }
+    }
+    #[test]
+    fn cancelling_a_held_selection_never_retains_a_clipboard_or_transform_shortcut() {
+        for depth in [8, 16] {
+            for event in [
+                egui::Event::Copy,
+                egui::Event::Cut,
+                shortcut_press(egui::Key::W),
+            ] {
+                let (mut app, ctx, point, before) = pressed_wand_fixture(depth);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![event, shortcut_press(egui::Key::Escape)],
+                    Default::default(),
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![primary_release(point)],
+                    Default::default(),
+                );
+                assert!(app.tool == Tool::MagicWand);
+                let engine = app.shared.lock().unwrap();
+                assert_eq!(
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                assert!(engine.undo.is_empty());
+                drop(engine);
+                assert!(matches!(
+                    app.clipboard
+                        .replies
+                        .recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+            }
+        }
+    }
+    #[test]
+    fn rectangle_gestures_keep_shortcuts_safe_and_escape_cancels_through_release() {
+        for depth in [8, 16] {
+            for cancel in [false, true] {
+                let (mut app, ctx, point, before) =
+                    pressed_selection_fixture(depth, Tool::Selection, "rectangle");
+                let scale = app.view_rect.unwrap().width() / 32.;
+                let end = point + Vec2::splat(8. * scale);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(end), shortcut_press(egui::Key::W)],
+                    Default::default(),
+                );
+                assert!(app.tool == Tool::Selection);
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                if cancel {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![shortcut_press(egui::Key::Escape)],
+                        Default::default(),
+                    );
+                }
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![primary_release(end)],
+                    Default::default(),
+                );
+                let engine = app.shared.lock().unwrap();
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                if cancel {
+                    assert_eq!(engine.doc.selection, None);
+                    assert!(engine.undo.is_empty());
+                } else {
+                    assert_eq!(engine.doc.selection, Some([6, 7, 15, 16]));
+                    assert_eq!(engine.undo.len(), 1);
+                }
+            }
         }
     }
     #[test]
