@@ -67,6 +67,250 @@ fn sample(out: &mut Vec<u8>, value: u16, depth: u16) {
 }
 const SAVED: [[u16; 4]; 2] = [[12345, 23456, 34567, 65535], [54321, 32123, 11223, 65535]];
 
+fn pattern_text(value: &str) -> Vec<u8> {
+    let words = value.encode_utf16().collect::<Vec<_>>();
+    let mut out = (words.len() as u32).to_be_bytes().to_vec();
+    for word in words {
+        out.extend(word.to_be_bytes());
+    }
+    out
+}
+fn pattern_payload(enabled: bool, identity: &str, omit: &str, scale: f64) -> Vec<u8> {
+    let mut mode = vec![];
+    overlay_id(&mut mode, "BlnM");
+    overlay_id(&mut mode, "Nrml");
+    let percent = |n: f64| [b"#Prc".to_vec(), n.to_be_bytes().to_vec()].concat();
+    let mut properties = vec![
+        ("enab", b"bool", vec![u8::from(enabled)]),
+        ("present", b"bool", vec![1]),
+        ("Md  ", b"enum", mode),
+        ("Opct", b"UntF", percent(100.)),
+        (
+            "Angl",
+            b"UntF",
+            [b"#Ang".to_vec(), 0f64.to_be_bytes().to_vec()].concat(),
+        ),
+        ("Scl ", b"UntF", percent(scale)),
+        ("Algn", b"bool", vec![0]),
+        (
+            "phase",
+            b"Objc",
+            overlay_descriptor(
+                "Pnt ",
+                vec![
+                    ("Hrzn", b"doub", 0f64.to_be_bytes().to_vec()),
+                    ("Vrtc", b"doub", 0f64.to_be_bytes().to_vec()),
+                ],
+            ),
+        ),
+        (
+            "Ptrn",
+            b"Objc",
+            overlay_descriptor(
+                "Ptrn",
+                vec![
+                    ("Nm  ", b"TEXT", pattern_text("Synthetic tile")),
+                    ("Idnt", b"TEXT", pattern_text(identity)),
+                ],
+            ),
+        ),
+    ];
+    properties.retain(|(key, _, _)| *key != omit);
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        overlay_descriptor(
+            "Lefx",
+            vec![
+                ("masterFXSwitch", b"bool", vec![1]),
+                ("Scl ", b"UntF", percent(100.)),
+                (
+                    "patternFill",
+                    b"Objc",
+                    overlay_descriptor("patternFill", properties),
+                ),
+            ],
+        ),
+    ]
+    .concat()
+}
+const PATTERN: [[u16; 4]; 2] = [[31337, 12347, 54323, 65535], [43219, 19237, 22349, 65535]];
+fn pattern_resource(depth: u16, identity: &str) -> Vec<u8> {
+    let rect = [0i32, 0, 1, 2]
+        .into_iter()
+        .flat_map(i32::to_be_bytes)
+        .collect::<Vec<_>>();
+    let mut arrays = rect.clone();
+    arrays.extend(3u32.to_be_bytes());
+    for channel in 0..3 {
+        arrays.extend(1u32.to_be_bytes());
+        let mut data = u32::from(depth).to_be_bytes().to_vec();
+        data.extend(&rect);
+        data.extend(depth.to_be_bytes());
+        data.push(0);
+        for pixel in PATTERN {
+            sample(&mut data, pixel[channel], depth);
+        }
+        block(&mut arrays, &data);
+    }
+    arrays.extend([0; 8]);
+    let mut pattern = 1u32.to_be_bytes().to_vec();
+    pattern.extend(3u32.to_be_bytes());
+    pattern.extend(1i16.to_be_bytes());
+    pattern.extend(2i16.to_be_bytes());
+    pattern.extend(pattern_text("Synthetic tile"));
+    pattern.push(identity.len() as u8);
+    pattern.extend(identity.as_bytes());
+    pattern.extend(3u32.to_be_bytes());
+    block(&mut pattern, &arrays);
+    let mut out = vec![];
+    block(&mut out, &pattern);
+    out.resize(out.len().div_ceil(4) * 4, 0);
+    out
+}
+fn inject_pattern(
+    mut bytes: Vec<u8>,
+    depth: u16,
+    resource: &[u8],
+    replace_composite: bool,
+) -> Vec<u8> {
+    let at = 34;
+    let n = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let mut section = bytes[at + 4..at + 4 + n].to_vec();
+    tag(&mut section, b"Patt", resource);
+    section.resize(section.len().div_ceil(4) * 4, 0);
+    let composite = bytes[at + 4 + n..].to_vec();
+    bytes.truncate(at);
+    block(&mut bytes, &section);
+    if replace_composite {
+        bytes.extend(0u16.to_be_bytes());
+        for channel in 0..4 {
+            for pixel in PATTERN {
+                sample(&mut bytes, pixel[channel], depth);
+            }
+        }
+    } else {
+        bytes.extend(composite);
+    }
+    bytes
+}
+#[test]
+fn plain_photoshop_pattern_import_retains_native_tiles_sources_and_editable_saves() {
+    for depth in [8, 16] {
+        for enabled in [true, false] {
+            let mut spec = Spec::paint("Synthetic pattern source", SAVED);
+            spec.tags.push((
+                *b"lfx2",
+                pattern_payload(enabled, "synthetic-pattern", "", 100.),
+            ));
+            let bytes = inject_pattern(
+                fixture(&[spec], depth),
+                depth,
+                &pattern_resource(depth, "synthetic-pattern"),
+                enabled,
+            );
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{:?}", doc.warnings);
+            assert_eq!(doc.layers[0].effects[0].kind, "pattern_overlay");
+            assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+            let bitmap = peerbrush::effects::patterns::get(
+                doc.layers[0].effects[0].settings["bitmap_png"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(bitmap.depth, depth);
+            for x in 0..2 {
+                assert_eq!(
+                    doc.layers[0].pixels.get16(x, 0),
+                    SAVED[x as usize].map(|n| native(n, depth))
+                );
+            }
+            let rendered = doc.export_png().unwrap();
+            let source = doc.layers[0].pixels.rgba16();
+            let layer = doc.layers[0].id.clone();
+            let effect = doc.layers[0].effects[0].id.clone();
+            let mut engine = Engine::new();
+            engine.doc = doc;
+            engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":{"phase_x":1.}})],None,None,"Pattern phase").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            assert_eq!(engine.undo.len(), 1);
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), rendered);
+            for large in [false, true] {
+                let reopened = psd::decode(&if large {
+                    psd::encode_psb(&engine.doc).unwrap()
+                } else {
+                    psd::encode(&engine.doc).unwrap()
+                })
+                .unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.export_png().unwrap(), rendered);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+            }
+        }
+    }
+}
+#[test]
+fn unsupported_missing_ambiguous_unused_and_mismatched_pattern_sources_stay_protected() {
+    for depth in [8, 16] {
+        for (identity, omit, scale) in [
+            ("missing", "", 100.),
+            ("synthetic-pattern", "Ptrn", 100.),
+            ("synthetic-pattern", "phase", 100.),
+            ("synthetic-pattern", "Angl", 100.),
+            ("synthetic-pattern", "Algn", 100.),
+            ("synthetic-pattern", "Opct", 100.),
+            ("synthetic-pattern", "", 50.),
+        ] {
+            let mut spec = Spec::paint("Synthetic protected pattern", SAVED);
+            spec.tags
+                .push((*b"lfx2", pattern_payload(true, identity, omit, scale)));
+            let doc = psd::decode(&inject_pattern(
+                fixture(&[spec], depth),
+                depth,
+                &pattern_resource(depth, "synthetic-pattern"),
+                false,
+            ))
+            .unwrap();
+            assert!(doc.read_only, "{identity}/{omit}/{scale}");
+            assert!(doc.layers[0].effects.is_empty());
+            assert_eq!(
+                doc.layers[0].pixels.get16(0, 0),
+                SAVED[0].map(|n| native(n, depth))
+            );
+        }
+        let mut spec = Spec::paint("Synthetic gated pattern", SAVED);
+        spec.tags.push((
+            *b"lfx2",
+            pattern_payload(true, "synthetic-pattern", "", 100.),
+        ));
+        let base = fixture(&[spec], depth);
+        for resource in [
+            pattern_resource(depth, "synthetic-pattern"),
+            [
+                pattern_resource(depth, "synthetic-pattern"),
+                pattern_resource(depth, "unused-pattern"),
+            ]
+            .concat(),
+            [
+                pattern_resource(depth, "synthetic-pattern"),
+                pattern_resource(depth, "synthetic-pattern"),
+            ]
+            .concat(),
+            pattern_resource(if depth == 16 { 8 } else { 16 }, "synthetic-pattern"),
+        ] {
+            let doc = psd::decode(&inject_pattern(base.clone(), depth, &resource, false)).unwrap();
+            assert!(doc.read_only);
+            assert!(doc.layers[0].effects.is_empty());
+            assert_eq!(
+                doc.layers[0].pixels.get16(0, 0),
+                SAVED[0].map(|n| native(n, depth))
+            );
+        }
+    }
+}
+
 // Handwritten standard PSD records, independent of PeerBrush's encoder/private
 // sources. Input order is the editor's top-to-bottom tree, including dividers.
 fn fixture(specs: &[Spec], depth: u16) -> Vec<u8> {

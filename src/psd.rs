@@ -1629,6 +1629,34 @@ fn decode_parts(
                 .into(),
         );
     }
+    let mut source_patterns: Vec<patterns::Source> = vec![];
+    for (key, payload) in global_blocks(layer_section, layout)?.2 {
+        if matches!(key, b"Patt" | b"Pat2" | b"Pat3") {
+            let tag = std::str::from_utf8(key).unwrap();
+            match patterns::decode(payload, tag, control) {
+                Ok(mut assets) => {
+                    let bytes: usize = source_patterns
+                        .iter()
+                        .map(|p| p.pixels.bytes())
+                        .sum::<usize>()
+                        + assets.iter().map(|p| p.pixels.bytes()).sum::<usize>();
+                    if source_patterns.len() + assets.len() > 16 || bytes > 16 * 1024 * 1024 {
+                        warnings.push("Embedded Photoshop patterns exceed the bounded inspection budget; additional assets remain protected".into());
+                    } else {
+                        for asset in &mut assets {
+                            asset.source_index += source_patterns.len();
+                        }
+                        source_patterns.extend(assets);
+                    }
+                }
+                Err(reason) => {
+                    control.check()?;
+                    warnings.push(format!("Cannot inspect Photoshop pattern assets ({tag}): {reason}; using the protected saved composite"));
+                }
+            }
+        }
+    }
+    let mut used_patterns = std::collections::HashSet::new();
     let mut records = vec![];
     if !layer_section.is_empty() {
         let info = layer_info(layer_section, depth, layout)?;
@@ -1834,10 +1862,13 @@ fn decode_parts(
                             match detail {
                                 Ok(details) => {
                                     let imported = if signature == b"8BIM" && section == 0 && maskdata.is_empty() && clipping == 0 && opacity == 1. && blend == "normal" && imported_styles.is_empty() {
-                                        styles::native_overlays(payload)
+                                        styles::native_overlays(payload, &source_patterns, depth)
                                     } else { Err("Photoshop styles with masks, clipping, folders, layer blending or duplicate blocks remain protected".into()) };
                                     match imported {
-                                        Ok(effects) => imported_styles = effects,
+                                        Ok((effects, pattern)) => {
+                                            imported_styles = effects;
+                                            if let Some(index) = pattern { used_patterns.insert(index); }
+                                        },
                                         Err(reason) => {
                                             warnings.push(format!("Photoshop layer styles ({tag_name}) remain protected: {reason}; using the saved composite"));
                                             warnings.extend(details);
@@ -1930,6 +1961,18 @@ fn decode_parts(
                     mask_enabled,
                     section,
                     clipped: clipping == 1,
+                });
+            }
+            // Admit pattern resource blocks only when every asset is retained in a supported
+            // native style. Unused assets, duplicate tags and unrelated sources stay protected.
+            if !source_patterns.is_empty() && used_patterns.len() == source_patterns.len() {
+                warnings.retain(|w| {
+                    ![
+                        "Unsupported global Photoshop feature: Patt",
+                        "Unsupported global Photoshop feature: Pat2",
+                        "Unsupported global Photoshop feature: Pat3",
+                    ]
+                    .contains(&w.as_str())
                 });
             }
             if warnings.is_empty() {
@@ -2028,33 +2071,7 @@ fn decode_parts(
         }
     }
     let mut doc = Document::new(w, h)?;
-    for (key, payload) in global_blocks(layer_section, layout)?.2 {
-        if matches!(key, b"Patt" | b"Pat2" | b"Pat3") {
-            let tag = std::str::from_utf8(key).unwrap();
-            match patterns::decode(payload, tag, control) {
-                Ok(mut assets) => {
-                    let bytes: usize = doc
-                        .source_patterns
-                        .iter()
-                        .map(|p| p.pixels.bytes())
-                        .sum::<usize>()
-                        + assets.iter().map(|p| p.pixels.bytes()).sum::<usize>();
-                    if doc.source_patterns.len() + assets.len() > 16 || bytes > 16 * 1024 * 1024 {
-                        warnings.push("Embedded Photoshop patterns exceed the bounded inspection budget; additional assets remain protected".into());
-                    } else {
-                        for asset in &mut assets {
-                            asset.source_index += doc.source_patterns.len();
-                        }
-                        doc.source_patterns.extend(assets);
-                    }
-                }
-                Err(reason) => {
-                    control.check()?;
-                    warnings.push(format!("Cannot inspect Photoshop pattern assets ({tag}): {reason}; using the protected saved composite"));
-                }
-            }
-        }
-    }
+    doc.source_patterns = source_patterns;
     doc.bit_depth = depth;
     doc.icc_profile = icc_profile;
     doc.srgb_tagged = srgb_tagged;

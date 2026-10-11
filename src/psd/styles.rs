@@ -1,4 +1,5 @@
-//! Bounded view-only object-effects inspection. Reading a descriptor never authorizes editing.
+//! Bounded object-effects inspection and conservative overlay import.
+//! Descriptor recognition alone never authorizes editing; the caller verifies the native composite.
 //! Binary layout: https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/
 use super::Cursor;
 use serde_json::{json, Map, Value};
@@ -100,10 +101,8 @@ impl Reader<'_> {
                 json!([std::str::from_utf8(unit).unwrap(), self.number()?])
             }
             b"enum" => json!([self.id()?, self.id()?]),
-            b"TEXT" => {
-                self.text()?;
-                Value::Null
-            }
+            // Retained internally for bounded pattern-ID resolution; never exposed by inspect.
+            b"TEXT" => json!(self.text()?),
             b"type" | b"GlbC" => {
                 self.text()?;
                 json!(self.id()?)
@@ -237,13 +236,132 @@ fn percent(value: &Value) -> Result<f64, String> {
     }
     Ok(n / 100.)
 }
-pub(super) fn native_overlays(bytes: &[u8]) -> Result<Vec<crate::effects::Effect>, String> {
+pub(super) fn native_overlays(
+    bytes: &[u8],
+    patterns: &[super::patterns::Source],
+    depth: u16,
+) -> Result<(Vec<crate::effects::Effect>, Option<usize>), String> {
     let parsed = root(bytes)?;
-    if parsed["items"].get("GrFl").is_some() || parsed["items"].get("gradientFillMulti").is_some() {
+    if parsed["items"].get("patternFill").is_some() {
+        let (effect, index) = pattern_overlay(&parsed, patterns, depth)?;
+        return Ok((vec![effect], Some(index)));
+    }
+    let effects = if parsed["items"].get("GrFl").is_some()
+        || parsed["items"].get("gradientFillMulti").is_some()
+    {
         gradient_overlay(&parsed)
     } else {
         color_overlays(bytes)
+    }?;
+    Ok((effects, None))
+}
+fn pattern_overlay(
+    root: &Value,
+    patterns: &[super::patterns::Source],
+    depth: u16,
+) -> Result<(crate::effects::Effect, usize), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    if !matches!(root["class"].as_str(), Some("null" | "Lefx")) {
+        return Err("Unsupported Photoshop effects class".into());
     }
+    let items = root["items"].as_object().ok_or("Invalid effects object")?;
+    if items
+        .keys()
+        .any(|k| !matches!(k.as_str(), "masterFXSwitch" | "Scl " | "patternFill"))
+        || items.get("Scl ").is_some_and(|v| percent(v) != Ok(1.))
+    {
+        return Err("Only a single unscaled plain Pattern Overlay can be imported".into());
+    }
+    let master = boolean(field(items, "masterFXSwitch")).ok_or("Missing style master switch")?;
+    let fields = descriptor(field(items, "patternFill"), "patternFill")?;
+    if fields.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "enab"
+                | "present"
+                | "showInDialog"
+                | "Md  "
+                | "Opct"
+                | "Ptrn"
+                | "Angl"
+                | "Scl "
+                | "Algn"
+                | "Lnkd"
+                | "phase"
+        )
+    }) {
+        return Err("Unsupported Pattern Overlay property".into());
+    }
+    let enabled = boolean(field(fields, "enab")).ok_or("Missing pattern enabled state")?;
+    let present = boolean(field(fields, "present")).ok_or("Missing pattern present state")?;
+    if fields
+        .get("showInDialog")
+        .is_some_and(|v| boolean(v).is_none())
+        || field(fields, "Md  ")["type"] != "enum"
+        || field(fields, "Md  ")["value"] != json!(["BlnM", "Nrml"])
+        || field(fields, "Angl")["type"] != "UntF"
+        || field(fields, "Angl")["value"] != json!(["#Ang", 0.])
+        || percent(field(fields, "Scl "))? != 1.
+        || boolean(field(fields, "Algn")) != Some(false)
+        || fields
+            .get("Lnkd")
+            .is_some_and(|v| boolean(v) != Some(false))
+    {
+        return Err(
+            "Only Normal, unrotated, unscaled, document-aligned patterns can be imported".into(),
+        );
+    }
+    let phase = descriptor(field(fields, "phase"), "Pnt ")?;
+    if phase.len() != 2
+        || plain_number(field(phase, "Hrzn"))? != 0.
+        || plain_number(field(phase, "Vrtc"))? != 0.
+    {
+        return Err("Offset Photoshop patterns remain protected".into());
+    }
+    let pattern = descriptor(field(fields, "Ptrn"), "Ptrn")?;
+    if pattern
+        .keys()
+        .any(|k| !matches!(k.as_str(), "Nm  " | "Idnt"))
+        || pattern.get("Nm  ").is_some_and(|v| v["type"] != "TEXT")
+        || field(pattern, "Idnt")["type"] != "TEXT"
+    {
+        return Err("Unsupported pattern identity fields".into());
+    }
+    let identity = field(pattern, "Idnt")["value"]
+        .as_str()
+        .ok_or("Invalid pattern identity")?;
+    let identity = identity.strip_suffix('\0').unwrap_or(identity);
+    let matches = patterns
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.pattern_id == identity)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err("Missing or ambiguous embedded pattern identity".into());
+    }
+    let (index, source) = matches[0];
+    if source.bit_depth != depth
+        || source.bounds != [0, 0, source.width as i32, source.height as i32]
+    {
+        return Err("Pattern precision or source origin requires protected interpretation".into());
+    }
+    let png = if depth == 16 {
+        crate::raster::png16(source.width, source.height, &source.pixels.rgba16())?
+    } else {
+        crate::raster::png(source.width, source.height, &source.pixels.rgba())?
+    };
+    let settings = json!({"opacity":percent(field(fields, "Opct"))?,"blend":"normal","pattern":"bitmap","bitmap_png":STANDARD.encode(png),"bitmap_scale":1.,"bitmap_angle":0.,"phase_x":0.,"phase_y":0.,"sampling":"nearest"});
+    crate::effects::validate("pattern_overlay", &settings)?;
+    Ok((
+        crate::effects::Effect {
+            id: crate::engine::id(),
+            kind: "pattern_overlay".into(),
+            enabled: master && enabled && present,
+            weight: 1.,
+            settings,
+        },
+        index,
+    ))
 }
 fn descriptor<'a>(value: &'a Value, class: &str) -> Result<&'a Map<String, Value>, String> {
     if !matches!(value["type"].as_str(), Some("Objc" | "GlbO")) || value["value"]["class"] != class
