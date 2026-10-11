@@ -257,6 +257,8 @@ fn overlay_blend(value: &Value) -> Result<&'static str, String> {
         Some("Ovrl") => Ok("overlay"),
         Some("Drkn") => Ok("darken"),
         Some("Lghn") => Ok("lighten"),
+        Some("Dfrn") => Ok("difference"),
+        Some("Xclu") => Ok("exclusion"),
         _ => Err("Unsupported Photoshop overlay blend remains protected".into()),
     }
 }

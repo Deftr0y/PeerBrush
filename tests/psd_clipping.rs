@@ -2241,6 +2241,179 @@ fn photoshop_pattern_and_gradient_blends_retain_native_sources_and_editable_save
     }
 }
 #[test]
+fn photoshop_inversion_styles_preserve_sources_composites_and_undo() {
+    for depth in [8, 16] {
+        for family in ["color", "pattern", "gradient", "inner"] {
+            for enabled in [false, true] {
+                for opacity in [37f64, 100.] {
+                    for (mode, blend) in [(b"Dfrn", "difference"), (b"Xclu", "exclusion")] {
+                        let mut payload = match family {
+                            "color" => overlay_payload(true, enabled, [111., 67., 231.]),
+                            "pattern" => pattern_payload(enabled, "synthetic-pattern", "", 100.),
+                            "gradient" => gradient_payload(false, None, 0.),
+                            _ => hard_shadow_payload("IrSh", enabled, true, 180., opacity, ""),
+                        };
+                        let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
+                        payload[at..at + 4].copy_from_slice(mode);
+                        let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                        payload[at] = u8::from(enabled);
+                        let at = payload
+                            .windows(12)
+                            .position(|v| v == b"OpctUntF#Prc")
+                            .unwrap()
+                            + 12;
+                        payload[at..at + 8].copy_from_slice(&opacity.to_be_bytes());
+                        let mut spec = Spec::paint("Synthetic inversion style", SAVED);
+                        spec.tags.push((*b"lfx2", payload));
+                        let mut bytes = fixture(&[spec], depth);
+                        if family == "pattern" {
+                            bytes = inject_pattern(
+                                bytes,
+                                depth,
+                                &pattern_resource(depth, "synthetic-pattern"),
+                                false,
+                            );
+                        }
+                        let mut merged = SAVED.map(|p| p.map(|v| native(v, depth)));
+                        if enabled {
+                            let coverage = (65535. * opacity / 100.).round() / 65535.;
+                            for x in 0..2 {
+                                if family == "inner" && x == 1 {
+                                    continue;
+                                }
+                                for c in 0..3 {
+                                    let tint = match family {
+                                        "pattern" => native(PATTERN[x][c], depth),
+                                        "gradient" => {
+                                            if x == 0 {
+                                                16384
+                                            } else {
+                                                49151
+                                            }
+                                        }
+                                        _ => [111 * 257, 67 * 257, 231 * 257][c],
+                                    };
+                                    let base = f64::from(merged[x][c]) / 65535.;
+                                    let tint = f64::from(tint) / 65535.;
+                                    let color = if blend == "difference" {
+                                        (base - tint).abs()
+                                    } else {
+                                        base + tint - 2. * base * tint
+                                    };
+                                    merged[x][c] = native(
+                                        ((base * (1. - coverage) + color * coverage) * 65535.)
+                                            .round() as u16,
+                                        depth,
+                                    );
+                                }
+                            }
+                        }
+                        bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                        for c in 0..4 {
+                            for pixel in merged {
+                                composite_sample(&mut bytes, pixel, c, depth);
+                            }
+                        }
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {family} {enabled} {opacity} {blend}: {:?}",
+                            doc.warnings
+                        );
+                        assert_eq!(rendered(&doc), merged.concat());
+                        assert_eq!(doc.layers[0].effects[0].settings["blend"], blend);
+                        assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+                        let source = SAVED.map(|p| p.map(|v| native(v, depth))).concat();
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                        let current = doc.export_png().unwrap();
+                        let settings = doc.layers[0].effects[0].settings.clone();
+                        let mut engine = Engine::new();
+                        engine.doc = doc;
+                        let layer = engine.doc.layers[0].id.clone();
+                        let effect = engine.doc.layers[0].effects[0].id.clone();
+                        engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Inversion style bypass").unwrap();
+                        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(engine.undo.len(), 1);
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        for output in [
+                            psd::encode(&engine.doc).unwrap(),
+                            psd::encode_psb(&engine.doc).unwrap(),
+                        ] {
+                            assert_eq!(saved_composite(&output, depth), merged.concat());
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            assert_eq!(
+                                reopened.layers[0].effects[0].settings["blend"],
+                                settings["blend"]
+                            );
+                            let standard = psd::decode(&ordinary(&output)).unwrap();
+                            assert!(!standard.read_only);
+                            assert_eq!(standard.export_png().unwrap(), current);
+                        }
+                        let at =
+                            bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth == 16);
+                        bytes[at] ^= 1;
+                        let protected = psd::decode(&bytes).unwrap();
+                        assert!(protected.read_only);
+                        assert!(protected.layers[0].effects.is_empty());
+                        assert_eq!(protected.bit_depth, depth);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn inversion_style_blends_do_not_unlock_unknown_or_independent_exterior_definitions() {
+    for depth in [8, 16] {
+        for family in ["color", "pattern", "gradient", "inner", "drop"] {
+            for mode in [b"Dfrn", b"Xclu", b"????"] {
+                if family != "drop" && mode != b"????" {
+                    continue;
+                }
+                // Disabled definitions match the original composite, so this
+                // proves descriptor protection rather than a pixel mismatch.
+                let mut payload = match family {
+                    "color" => overlay_payload(true, false, [111., 67., 231.]),
+                    "pattern" => pattern_payload(false, "synthetic-pattern", "", 100.),
+                    "gradient" => gradient_payload(false, None, 0.),
+                    "inner" => hard_shadow_payload("IrSh", false, true, 180., 100., ""),
+                    _ => hard_shadow_payload("DrSh", false, true, 180., 100., ""),
+                };
+                let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
+                payload[at..at + 4].copy_from_slice(mode);
+                let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                payload[at] = 0;
+                let mut spec = Spec::paint("Synthetic protected inversion style", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let mut bytes = fixture(&[spec], depth);
+                if family == "pattern" {
+                    bytes = inject_pattern(
+                        bytes,
+                        depth,
+                        &pattern_resource(depth, "synthetic-pattern"),
+                        false,
+                    );
+                }
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(doc.read_only, "{depth} {family} {mode:?}");
+                assert!(doc.layers[0].effects.is_empty());
+                assert_eq!(
+                    doc.layers[0].pixels.rgba16(),
+                    SAVED.map(|p| p.map(|v| native(v, depth))).concat()
+                );
+                assert!(psd::encode(&doc).is_err());
+                assert!(psd::encode_psb(&doc).is_err());
+            }
+        }
+    }
+}
+
+#[test]
 fn unsupported_or_mismatched_pattern_and_gradient_blends_keep_sources_protected() {
     for depth in [8, 16] {
         for pattern in [false, true] {
