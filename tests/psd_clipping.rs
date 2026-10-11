@@ -2179,6 +2179,209 @@ fn plain_photoshop_linear_gradient_import_retains_native_source_and_reversible_s
         }
     }
 }
+fn midpoint_gradient_payload(reverse: bool, color: i32, alpha: i32) -> Vec<u8> {
+    let mut payload = gradient_payload(reverse, None, 0.);
+    let midpoints = payload
+        .windows(8)
+        .enumerate()
+        .filter_map(|(at, bytes)| (bytes == b"Mdpnlong").then_some(at + 8))
+        .collect::<Vec<_>>();
+    assert_eq!(midpoints.len(), 4);
+    for (at, value) in midpoints.into_iter().zip([color, 50, alpha, 50]) {
+        payload[at..at + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    // Independent transparency ramp, separate from the RGB midpoint.
+    let at = payload
+        .windows(12)
+        .enumerate()
+        .filter_map(|(at, v)| (v == b"OpctUntF#Prc").then_some(at + 12))
+        .nth(1)
+        .unwrap();
+    payload[at..at + 8].copy_from_slice(&0f64.to_be_bytes());
+    payload
+}
+#[test]
+fn photoshop_gradient_midpoints_retain_native_sources_independent_coverage_and_saves() {
+    // Expected values come from two line segments meeting at (midpoint, 0.5),
+    // independently of the shared gradient sampler and PSD descriptor reader.
+    let ramp = |position: f64, midpoint: i32| {
+        let midpoint = f64::from(midpoint) / 100.;
+        if position <= midpoint {
+            position / midpoint / 2.
+        } else {
+            0.5 + (position - midpoint) / (1. - midpoint) / 2.
+        }
+    };
+    for depth in [8, 16] {
+        for (color, alpha) in [(1, 99), (25, 75), (75, 25), (99, 1)] {
+            for reverse in [false, true] {
+                for flags in [
+                    [true; 3],
+                    [false, true, true],
+                    [true, false, true],
+                    [true, true, false],
+                ] {
+                    for opacity in [37f64, 100.] {
+                        let mut payload = midpoint_gradient_payload(reverse, color, alpha);
+                        for (key, enabled) in [
+                            (b"masterFXSwitchbool".as_slice(), flags[0]),
+                            (b"enabbool".as_slice(), flags[1]),
+                            (b"presentbool".as_slice(), flags[2]),
+                        ] {
+                            let at = payload.windows(key.len()).position(|v| v == key).unwrap()
+                                + key.len();
+                            payload[at] = u8::from(enabled);
+                        }
+                        let at = payload
+                            .windows(12)
+                            .position(|v| v == b"OpctUntF#Prc")
+                            .unwrap()
+                            + 12;
+                        payload[at..at + 8].copy_from_slice(&opacity.to_be_bytes());
+                        let enabled = flags.into_iter().all(|flag| flag);
+                        let expected = std::array::from_fn::<_, 2, _>(|x| {
+                            let source = SAVED[x].map(|n| native(n, depth));
+                            if !enabled {
+                                return source;
+                            }
+                            let position = if reverse {
+                                1. - (x as f64 + 0.5) / 2.
+                            } else {
+                                (x as f64 + 0.5) / 2.
+                            };
+                            let tint = (ramp(position, color) * 65535.).round();
+                            // Coverage enters blending as a native alpha sample.
+                            let weight = (ramp(position, alpha) * (opacity / 100.) * 65535.)
+                                .round()
+                                / 65535.;
+                            std::array::from_fn(|c| {
+                                if c == 3 {
+                                    65535
+                                } else {
+                                    native(
+                                        (((1. - weight) * (f64::from(source[c]) / 65535.)
+                                            + weight * (tint / 65535.))
+                                            * 65535.)
+                                            .round() as u16,
+                                        depth,
+                                    )
+                                }
+                            })
+                        });
+                        let mut spec = Spec::paint("Synthetic midpoint gradient", SAVED);
+                        spec.tags.push((*b"lfx2", payload));
+                        let mut bytes = fixture(&[spec], depth);
+                        bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                        for c in 0..4 {
+                            for pixel in expected {
+                                composite_sample(&mut bytes, pixel, c, depth);
+                            }
+                        }
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {color} {alpha} {reverse} {flags:?} {opacity}: {:?}",
+                            doc.warnings
+                        );
+                        let settings = &doc.layers[0].effects[0].settings;
+                        assert_eq!(
+                            settings["color_stops"][0]["midpoint"],
+                            f64::from(color) / 100.
+                        );
+                        assert_eq!(
+                            settings["alpha_stops"][0]["midpoint"],
+                            f64::from(alpha) / 100.
+                        );
+                        assert_eq!(settings["alpha_stops"][0]["opacity"], 0.);
+                        assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+                        let source = SAVED.map(|p| p.map(|n| native(n, depth))).concat();
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(rendered(&doc), expected.concat());
+                        let current = doc.export_png().unwrap();
+                        for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                            assert_eq!(saved_composite(&output, depth), expected.concat());
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(reopened.layers[0].effects[0].settings, *settings);
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            assert_eq!(
+                                psd::decode(&ordinary(&output))
+                                    .unwrap()
+                                    .export_png()
+                                    .unwrap(),
+                                current
+                            );
+                        }
+                        let mut engine = Engine::new();
+                        let layer = doc.layers[0].id.clone();
+                        let effect = doc.layers[0].effects[0].id.clone();
+                        engine.doc = doc;
+                        engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Gradient bypass").unwrap();
+                        assert_eq!(engine.undo.len(), 1);
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        let at =
+                            bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+                        bytes[at] ^= 1;
+                        assert!(
+                            psd::decode(&bytes).unwrap().read_only,
+                            "midpoint composite mismatch was accepted"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
+fn photoshop_gradient_midpoints_reject_invalid_values_and_types_even_when_disabled() {
+    for depth in [8, 16] {
+        for disabled in [false, true] {
+            for alpha in [false, true] {
+                for value in [-1, 0, 100, i32::MAX] {
+                    let mut payload = midpoint_gradient_payload(
+                        false,
+                        if alpha { 25 } else { value },
+                        if alpha { value } else { 75 },
+                    );
+                    if disabled {
+                        let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                        payload[at] = 0;
+                    }
+                    let mut spec = Spec::paint("Synthetic invalid midpoint", SAVED);
+                    spec.tags.push((*b"lfx2", payload));
+                    assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+                }
+                for (kind, value) in [
+                    (b"doub", 25f64.to_be_bytes().to_vec()),
+                    (b"bool", vec![1]),
+                    (
+                        b"UntF",
+                        [b"#Prc".to_vec(), 25f64.to_be_bytes().to_vec()].concat(),
+                    ),
+                ] {
+                    let mut payload = midpoint_gradient_payload(false, 25, 75);
+                    let matches = payload
+                        .windows(8)
+                        .enumerate()
+                        .filter_map(|(at, v)| (v == b"Mdpnlong").then_some(at))
+                        .collect::<Vec<_>>();
+                    let at = matches[if alpha { 2 } else { 0 }] + 4;
+                    payload.splice(at..at + 8, [kind.to_vec(), value].concat());
+                    if disabled {
+                        let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                        payload[at] = 0;
+                    }
+                    let mut spec = Spec::paint("Synthetic invalid midpoint type", SAVED);
+                    spec.tags.push((*b"lfx2", payload));
+                    assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+                }
+            }
+        }
+    }
+}
 #[test]
 fn missing_or_unsupported_photoshop_gradient_fields_protect_without_panics() {
     for depth in [8, 16] {

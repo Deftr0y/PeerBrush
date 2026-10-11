@@ -793,12 +793,17 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
                     }
             }) || field(stop, "Lctn")["type"] != "long"
                 || field(stop, "Mdpn")["type"] != "long"
-                || plain_number(field(stop, "Mdpn"))? != 50.
+                || !(1. ..=99.).contains(&plain_number(field(stop, "Mdpn"))?)
             {
                 return Err("Unsupported Photoshop gradient stop fields/midpoint".into());
             }
-            let mut result =
-                json!({"position":plain_number(field(stop, "Lctn"))?/4096.,"midpoint":0.5});
+            // ASL midpoints are integer percentages of the following segment.
+            // Krita's ASL parser creates INTERP_LINEAR segments with this ratio;
+            // the shared native gradient sampler uses the same piecewise rule.
+            let mut result = json!({
+                "position":plain_number(field(stop, "Lctn"))?/4096.,
+                "midpoint":plain_number(field(stop, "Mdpn"))?/100.
+            });
             if alpha {
                 result["opacity"] = json!(percent(field(stop, "Opct"))?);
             } else {
