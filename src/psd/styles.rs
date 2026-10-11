@@ -596,12 +596,15 @@ fn pattern_overlay(
         return Err("Missing or ambiguous embedded pattern identity".into());
     }
     let (index, source) = matches[0];
-    if source.bit_depth != depth
+    // Pattern channels carry their own precision. An 8-bit tile is exactly
+    // representable in a 16-bit document; retain its PNG8 source rather than
+    // projecting the document or pretending the tile contains native low bits.
+    if !(source.bit_depth == depth || source.bit_depth == 8 && depth == 16)
         || source.bounds != [0, 0, source.width as i32, source.height as i32]
     {
         return Err("Pattern precision or source origin requires protected interpretation".into());
     }
-    let png = if depth == 16 {
+    let png = if source.bit_depth == 16 {
         crate::raster::png16(source.width, source.height, &source.pixels.rgba16())?
     } else {
         crate::raster::png(source.width, source.height, &source.pixels.rgba())?

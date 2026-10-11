@@ -434,6 +434,161 @@ fn transparent_photoshop_patterns_retain_native_sources_blends_guards_and_workin
     }
 }
 #[test]
+fn eight_bit_photoshop_pattern_sources_remain_eight_bit_inside_native_sixteen_bit_documents() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    for compression in [0, 1, 2, 3] {
+        for enabled in [false, true] {
+            for (mode, blend, opacity, alpha) in [
+                (b"Nrml", "normal", 100f64, false),
+                (b"Mltp", "multiply", 100., false),
+                (b"Scrn", "screen", 100., false),
+                (b"Ovrl", "overlay", 100., false),
+                (b"Drkn", "darken", 100., false),
+                (b"Lghn", "lighten", 100., false),
+                (b"Nrml", "normal", 37., true),
+                (b"Mltp", "multiply", 37., true),
+            ] {
+                let mut pixels = PATTERN;
+                if alpha {
+                    pixels[0][3] = 0;
+                    pixels[1][3] = 41317;
+                }
+                let tile = pixels.map(|p| p.map(|v| native(v, 8)));
+                let mut payload = pattern_payload(enabled, "synthetic-pattern", "", 100.);
+                let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
+                payload[at..at + 4].copy_from_slice(mode);
+                let at = payload
+                    .windows(12)
+                    .position(|v| v == b"OpctUntF#Prc")
+                    .unwrap()
+                    + 12;
+                payload[at..at + 8].copy_from_slice(&opacity.to_be_bytes());
+                let mut spec = Spec::paint("Synthetic mixed pattern precision", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let mut bytes = inject_pattern(
+                    fixture(&[spec], 16),
+                    16,
+                    &pattern_resource_pixels(8, "synthetic-pattern", compression, pixels, alpha),
+                    false,
+                );
+                // Reference uses the asset's byte samples and the document's
+                // original low bits, independently of the native effect renderer.
+                let mut merged = SAVED;
+                if enabled {
+                    for x in 0..2 {
+                        let coverage = (f64::from(tile[x][3]) * opacity / 100.).round() / 65535.;
+                        for c in 0..3 {
+                            let base = f64::from(SAVED[x][c]) / 65535.;
+                            let tint = f64::from(tile[x][c]) / 65535.;
+                            let color = match blend {
+                                "multiply" => base * tint,
+                                "screen" => base + tint - base * tint,
+                                "overlay" if base <= 0.5 => 2. * base * tint,
+                                "overlay" => 1. - 2. * (1. - base) * (1. - tint),
+                                "darken" => base.min(tint),
+                                "lighten" => base.max(tint),
+                                _ => tint,
+                            };
+                            merged[x][c] = ((base * (1. - coverage) + color * coverage) * 65535.)
+                                .round() as u16;
+                        }
+                    }
+                }
+                bytes.truncate(bytes.len() - 16);
+                for c in 0..4 {
+                    for pixel in merged {
+                        composite_sample(&mut bytes, pixel, c, 16);
+                    }
+                }
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(
+                    !doc.read_only,
+                    "{compression} {enabled} {blend} {alpha}: {:?}",
+                    doc.warnings
+                );
+                assert_eq!(doc.bit_depth, 16);
+                assert_eq!(doc.layers[0].pixels.rgba16(), SAVED.concat());
+                assert_eq!(rendered(&doc), merged.concat());
+                let bitmap = doc.layers[0].effects[0].settings["bitmap_png"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let png = STANDARD.decode(&bitmap).unwrap();
+                assert_eq!(png[24], 8, "retain the original PNG8 channel depth");
+                assert_eq!(
+                    image::load_from_memory(&png)
+                        .unwrap()
+                        .into_rgba16()
+                        .into_raw(),
+                    tile.concat()
+                );
+                assert_eq!(peerbrush::effects::patterns::get(&bitmap).unwrap().depth, 8);
+                let current = doc.export_png().unwrap();
+                let mut engine = Engine::new();
+                engine.doc = doc;
+                let layer = engine.doc.layers[0].id.clone();
+                let effect = engine.doc.layers[0].effects[0].id.clone();
+                engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Mixed precision pattern bypass").unwrap();
+                assert_eq!(engine.doc.bit_depth, 16);
+                assert_eq!(engine.doc.layers[0].pixels.rgba16(), SAVED.concat());
+                assert_eq!(engine.undo.len(), 1);
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.export_png().unwrap(), current);
+                for output in [
+                    psd::encode(&engine.doc).unwrap(),
+                    psd::encode_psb(&engine.doc).unwrap(),
+                ] {
+                    assert_eq!(saved_composite(&output, 16), merged.concat());
+                    let reopened = psd::decode(&output).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.bit_depth, 16);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), SAVED.concat());
+                    assert_eq!(reopened.layers[0].effects[0].settings["bitmap_png"], bitmap);
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                    let standard = psd::decode(&ordinary(&output)).unwrap();
+                    assert!(!standard.read_only);
+                    assert_eq!(standard.bit_depth, 16);
+                    assert_eq!(standard.export_png().unwrap(), current);
+                }
+                // One native-word disagreement still protects the complete source.
+                let at = bytes.len() - 15;
+                bytes[at] ^= 1;
+                let protected = psd::decode(&bytes).unwrap();
+                assert!(protected.read_only);
+                assert!(protected.layers[0].effects.is_empty());
+                assert_eq!(protected.bit_depth, 16);
+            }
+        }
+    }
+}
+
+#[test]
+fn sixteen_bit_photoshop_patterns_never_become_editable_eight_bit_sources() {
+    for compression in [0, 1, 2, 3] {
+        for enabled in [false, true] {
+            let mut spec = Spec::paint("Synthetic protected precision", SAVED);
+            spec.tags.push((
+                *b"lfx2",
+                pattern_payload(enabled, "synthetic-pattern", "", 100.),
+            ));
+            let bytes = inject_pattern(
+                fixture(&[spec], 8),
+                8,
+                &pattern_resource_compression(16, "synthetic-pattern", compression),
+                enabled,
+            );
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(doc.read_only, "{compression} {enabled}");
+            assert_eq!(doc.bit_depth, 8);
+            assert!(doc.layers[0].effects.is_empty());
+            assert!(doc.warnings.iter().any(|w| w.contains("Pattern precision")));
+            assert!(psd::encode(&doc).is_err());
+            assert!(psd::encode_psb(&doc).is_err());
+        }
+    }
+}
+
+#[test]
 fn omitted_pattern_angle_imports_as_unrotated_with_exact_native_source_and_save_guards() {
     for depth in [8, 16] {
         for enabled in [false, true] {
@@ -858,9 +1013,19 @@ fn protocol_default_range_psd_opens_editable_and_protected_report_keeps_source_i
 }
 fn saved_composite(bytes: &[u8], depth: u16) -> Vec<u16> {
     let bytes = ordinary(bytes);
-    let n = u32::from_be_bytes(bytes[34..38].try_into().unwrap()) as usize;
-    let plane = &bytes[40 + n..];
-    assert_eq!(&bytes[38 + n..40 + n], &[0, 0]);
+    let (n, header) = if bytes[4..6] == 2u16.to_be_bytes() {
+        (
+            u64::from_be_bytes(bytes[34..42].try_into().unwrap()) as usize,
+            42,
+        )
+    } else {
+        (
+            u32::from_be_bytes(bytes[34..38].try_into().unwrap()) as usize,
+            38,
+        )
+    };
+    let plane = &bytes[header + n + 2..];
+    assert_eq!(&bytes[header + n..header + n + 2], &[0, 0]);
     let words: Vec<u16> = if depth == 16 {
         plane
             .chunks_exact(2)
