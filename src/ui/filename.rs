@@ -6,34 +6,14 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-const FONTS: &[(&str, &[u8])] = &[
-    (
-        "Noto Sans Hebrew",
-        include_bytes!("../../assets/fonts/NotoSansHebrew-Regular.ttf"),
-    ),
-    (
-        "Noto Sans Arabic",
-        include_bytes!("../../assets/fonts/NotoSansArabic-Regular.ttf"),
-    ),
-    (
-        "Noto Sans Devanagari",
-        include_bytes!("../../assets/fonts/NotoSansDevanagari-Regular.ttf"),
-    ),
-    (
-        "Noto Sans CJK SC",
-        include_bytes!("../../assets/fonts/NotoSansCJKsc-Regular.otf"),
-    ),
-];
-
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 64;
 const SYSTEM_FONT_BYTES: usize = 64 * 1024 * 1024;
 const SYSTEM_FACE_BYTES: usize = 32 * 1024 * 1024;
 // Representative clusters select one complete face per script; collection
 // indices are retained. Installed fonts are presentation inputs only.
-const SCRIPTS: &[(&str, &[&str], &str)] = &[
+const SCRIPTS: &[(&[&str], &str)] = &[
     (
-        "Noto Sans Hebrew",
         &[
             "Segoe UI",
             "Arial",
@@ -44,7 +24,6 @@ const SCRIPTS: &[(&str, &[&str], &str)] = &[
         "שלום",
     ),
     (
-        "Noto Sans Arabic",
         &[
             "Segoe UI",
             "Arial",
@@ -55,7 +34,6 @@ const SCRIPTS: &[(&str, &[&str], &str)] = &[
         "مرحبا بالعالم",
     ),
     (
-        "Noto Sans Devanagari",
         &[
             "Nirmala UI",
             "Kohinoor Devanagari",
@@ -65,7 +43,6 @@ const SCRIPTS: &[(&str, &[&str], &str)] = &[
         "हिन्दी",
     ),
     (
-        "Noto Sans CJK SC",
         &[
             "Microsoft YaHei",
             "PingFang SC",
@@ -75,12 +52,10 @@ const SCRIPTS: &[(&str, &[&str], &str)] = &[
         "漢字",
     ),
     (
-        "Noto Sans CJK SC",
         &["Yu Gothic", "Hiragino Sans", "Noto Sans CJK JP"],
         "あいう",
     ),
     (
-        "Noto Sans CJK SC",
         &["Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR"],
         "한글",
     ),
@@ -167,7 +142,7 @@ fn catalog() -> &'static FontCatalog {
         let mut faces: Vec<SystemFace> = Vec::new();
         let mut scripts = Vec::new();
         let mut retained = 0usize;
-        for (_, preferred, sample) in SCRIPTS {
+        for (preferred, sample) in SCRIPTS {
             let selected = selected_system_face(&installed, preferred, sample);
             let index = selected.and_then(|selected| {
                 if let Some(index) = faces.iter().position(|face| face.id == selected.id) {
@@ -191,9 +166,6 @@ fn catalog() -> &'static FontCatalog {
         for face in &faces {
             db.load_font_source(usvg::fontdb::Source::Binary(face.bytes.clone()));
         }
-        for (_, bytes) in FONTS {
-            db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(*bytes)));
-        }
         db.set_sans_serif_family("Ubuntu Sans");
         FontCatalog {
             db: Arc::new(db),
@@ -212,11 +184,6 @@ pub(super) fn install_fallbacks(fonts: &mut egui::FontDefinitions) {
             .font_data
             .insert(format!("Installed fallback {index}"), data.into());
     }
-    for (name, bytes) in FONTS {
-        fonts
-            .font_data
-            .insert((*name).into(), egui::FontData::from_static(bytes).into());
-    }
     for family in [
         egui::FontFamily::Proportional,
         egui::FontFamily::Name("medium".into()),
@@ -227,11 +194,6 @@ pub(super) fn install_fallbacks(fonts: &mut egui::FontDefinitions) {
             .entry(family.clone())
             .or_default()
             .extend((0..catalog.faces.len()).map(|index| format!("Installed fallback {index}")));
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .extend(FONTS.iter().map(|(name, _)| (*name).into()));
     }
 }
 
@@ -252,9 +214,7 @@ fn script_font(c: char) -> &'static str {
         _ => return "Ubuntu Sans",
     };
     let catalog = catalog();
-    catalog.scripts[script].map_or(SCRIPTS[script].0, |index| {
-        catalog.faces[index].family.as_str()
-    })
+    catalog.scripts[script].map_or("Ubuntu Sans", |index| catalog.faces[index].family.as_str())
 }
 
 fn escaped_xml(text: &str) -> String {
@@ -663,7 +623,7 @@ mod tests {
         for (script, index) in catalog.scripts.iter().enumerate() {
             if let Some(index) = index {
                 let face = &catalog.faces[*index];
-                assert!(covers(&face.bytes, face.index, SCRIPTS[script].2));
+                assert!(covers(&face.bytes, face.index, SCRIPTS[script].1));
             }
         }
         let mut fonts = egui::FontDefinitions::default();
@@ -690,7 +650,7 @@ mod tests {
     fn absent_script_font_renders_missing_glyphs_without_rewriting_the_name() {
         let mut db = usvg::fontdb::Database::new();
         db.load_font_data(include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf").to_vec());
-        let logical = "हिन्दी.psd";
+        let logical = "हिन्दी";
         let tree = tree(logical, "Ubuntu Sans", 12., false, Arc::new(db)).unwrap();
         let Some(usvg::Node::Text(text)) = tree.node_by_id("filename") else {
             panic!("Missing filename text");
@@ -703,7 +663,7 @@ mod tests {
             .map(|glyph| glyph.text.clone())
             .collect::<String>();
         assert!(missing.contains('ह'));
-        assert_eq!(logical, "हिन्दी.psd");
+        assert_eq!(logical, "हिन्दी");
         let mut pixels = tiny_skia::Pixmap::new(128, 128).unwrap();
         resvg::render(
             &tree,
@@ -787,11 +747,18 @@ mod tests {
             .filter(|(text, _, _)| text.contains('ل') || text.contains('ا'))
             .map(|(_, id, _)| *id)
             .collect();
-        assert_ne!(
-            arabic.iter().map(|(_, id, _)| *id).collect::<Vec<_>>(),
-            isolated_ids,
-            "Joined Arabic must use contextual forms"
-        );
+        if catalog().scripts[1].is_some() {
+            assert_ne!(
+                arabic.iter().map(|(_, id, _)| *id).collect::<Vec<_>>(),
+                isolated_ids,
+                "Joined Arabic must use contextual forms"
+            );
+        } else {
+            assert!(
+                arabic.iter().all(|(_, id, _)| *id == 0),
+                "Absent Arabic coverage must show missing glyphs"
+            );
+        }
         let latin = joined.iter().find(|(text, _, _)| text == "p").unwrap();
         assert!(
             arabic[0].2 > latin.2,
