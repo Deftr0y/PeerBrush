@@ -2256,6 +2256,16 @@ fn decode_parts(
                         changed = true;
                     }
                 }
+                if changed {
+                    // The first render has populated derived effect caches.
+                    // This alternate source must not reuse the clone's old
+                    // keys: both native8/native16 and ancestor projections
+                    // need fresh derived identities without a history edit.
+                    crate::effects::invalidate(
+                        &mut candidate,
+                        &[serde_json::json!({"op":"document.settings"})],
+                    );
+                }
                 if changed && imported_style_composite_matches(&candidate, &merged)? {
                     doc = candidate;
                     Ok(true)

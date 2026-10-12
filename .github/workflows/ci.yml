@@ -51,7 +51,29 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo fmt --all -- --check
-      - run: cargo test --locked
+      - name: Run regression tests and summarize failures
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/peerbrush-tests.log"
+          test_status=${PIPESTATUS[0]}
+          python - "$RUNNER_TEMP/peerbrush-tests.log" "$GITHUB_STEP_SUMMARY" "$test_status" <<'PY'
+          import re, sys
+          from pathlib import Path
+          log = Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
+          failures = re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$', log, re.M)
+          results = re.findall(r'^test result: (?:ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored;', log, re.M)
+          # Publish only bounded test identifiers/counts, never arbitrary
+          # panic output, environment values, paths or fixture contents.
+          with Path(sys.argv[2]).open('a', encoding='utf-8') as summary:
+              summary.write('### Regression tests\n\n')
+              summary.write(f'Exit status: {int(sys.argv[3])}\n\n')
+              summary.writelines(f'- `{line}`\n' for line in results[:100])
+              if failures:
+                  summary.write('\nFailed tests:\n\n')
+                  summary.writelines(f'- `{name[:256]}`\n' for name in failures[:100])
+          PY
+          exit "$test_status"
       - run: cargo clippy --all-targets --locked
       - run: python scripts/test_package.py
       - run: python scripts/build_release.py
