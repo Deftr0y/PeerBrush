@@ -2703,6 +2703,25 @@ fn positioned_gradient_payload(
     scale: f64,
     offset: Option<(f64, f64)>,
 ) -> Vec<u8> {
+    custom_gradient_payload(
+        reverse,
+        omit,
+        smoothness,
+        scale,
+        offset,
+        &[(0, 50, [0.; 3]), (4096, 50, [255.; 3])],
+        Some(&[(0, 50, 100.), (4096, 50, 100.)]),
+    )
+}
+fn custom_gradient_payload(
+    reverse: bool,
+    omit: Option<&str>,
+    smoothness: f64,
+    scale: f64,
+    offset: Option<(f64, f64)>,
+    color_stops: &[(i32, i32, [f64; 3])],
+    alpha_stops: Option<&[(i32, i32, f64)]>,
+) -> Vec<u8> {
     let desc = |class: &str, fields: Vec<(&str, &[u8; 4], Vec<u8>)>| {
         overlay_descriptor(
             class,
@@ -2719,15 +2738,14 @@ fn positioned_gradient_payload(
         out
     };
     let unit = |unit: &str, n: f64| [unit.as_bytes().to_vec(), n.to_be_bytes().to_vec()].concat();
-    let mut colors = 2u32.to_be_bytes().to_vec();
-    let mut alphas = 2u32.to_be_bytes().to_vec();
-    for (position, value) in [(0i32, 0f64), (4096, 255.)] {
+    let mut colors = (color_stops.len() as u32).to_be_bytes().to_vec();
+    for &(position, midpoint, value) in color_stops {
         let rgb = desc(
             "RGBC",
             vec![
-                ("Rd  ", b"doub", value.to_be_bytes().to_vec()),
-                ("Grn ", b"doub", value.to_be_bytes().to_vec()),
-                ("Bl  ", b"doub", value.to_be_bytes().to_vec()),
+                ("Rd  ", b"doub", value[0].to_be_bytes().to_vec()),
+                ("Grn ", b"doub", value[1].to_be_bytes().to_vec()),
+                ("Bl  ", b"doub", value[2].to_be_bytes().to_vec()),
             ],
         );
         colors.extend(b"Objc");
@@ -2737,28 +2755,31 @@ fn positioned_gradient_payload(
                 ("Clr ", b"Objc", rgb),
                 ("Type", b"enum", enum_bytes("Clry", "UsrS")),
                 ("Lctn", b"long", position.to_be_bytes().to_vec()),
-                ("Mdpn", b"long", 50i32.to_be_bytes().to_vec()),
-            ],
-        ));
-        alphas.extend(b"Objc");
-        alphas.extend(desc(
-            "TrnS",
-            vec![
-                ("Opct", b"UntF", unit("#Prc", 100.)),
-                ("Lctn", b"long", position.to_be_bytes().to_vec()),
-                ("Mdpn", b"long", 50i32.to_be_bytes().to_vec()),
+                ("Mdpn", b"long", midpoint.to_be_bytes().to_vec()),
             ],
         ));
     }
-    let gradient = desc(
-        "Grdn",
-        vec![
-            ("GrdF", b"enum", enum_bytes("GrdF", "CstS")),
-            ("Intr", b"doub", smoothness.to_be_bytes().to_vec()),
-            ("Clrs", b"VlLs", colors),
-            ("Trns", b"VlLs", alphas),
-        ],
-    );
+    let mut gradient_fields = vec![
+        ("GrdF", b"enum", enum_bytes("GrdF", "CstS")),
+        ("Intr", b"doub", smoothness.to_be_bytes().to_vec()),
+        ("Clrs", b"VlLs", colors),
+    ];
+    if let Some(alpha_stops) = alpha_stops {
+        let mut alphas = (alpha_stops.len() as u32).to_be_bytes().to_vec();
+        for &(position, midpoint, value) in alpha_stops {
+            alphas.extend(b"Objc");
+            alphas.extend(desc(
+                "TrnS",
+                vec![
+                    ("Opct", b"UntF", unit("#Prc", value)),
+                    ("Lctn", b"long", position.to_be_bytes().to_vec()),
+                    ("Mdpn", b"long", midpoint.to_be_bytes().to_vec()),
+                ],
+            ));
+        }
+        gradient_fields.push(("Trns", b"VlLs", alphas));
+    }
+    let gradient = desc("Grdn", gradient_fields);
     let mut effect_fields = vec![
         ("enab", b"bool", vec![1]),
         ("present", b"bool", vec![1]),
@@ -2802,6 +2823,249 @@ fn positioned_gradient_payload(
     ]
     .concat()
 }
+#[test]
+fn photoshop_gradient_clamped_stops_preserve_native_sources_controls_and_standard_saves() {
+    let a = [37.153, 112.347, 221.789];
+    let b = [211.237, 53.193, 9.413];
+    let mut cases = vec![
+        vec![(0, 31, a)],
+        vec![(2048, 87, a)],
+        vec![(4096, 1, b)],
+        vec![(1536, 31, a), (2560, 87, b)],
+        vec![(512, 31, a), (3584, 87, b)],
+        vec![(512, 31, a), (4096, 87, b)],
+        vec![(0, 31, a), (3584, 87, b)],
+    ];
+    cases.push(
+        (1..=14)
+            .map(|i| (i * 256, 50, if i % 2 == 0 { a } else { b }))
+            .collect(),
+    );
+    // The reference operates on the original Photoshop knots: outside their
+    // range the nearest value is constant, without synthetic native endpoints.
+    let reference = |stops: &[(i32, i32, f64)], position: f64| -> f64 {
+        let coordinate = position * 4096.;
+        if coordinate <= f64::from(stops[0].0) {
+            return stops[0].2;
+        }
+        for pair in stops.windows(2) {
+            if coordinate <= f64::from(pair[1].0) {
+                let ratio = (coordinate - f64::from(pair[0].0)) / f64::from(pair[1].0 - pair[0].0);
+                let midpoint = f64::from(pair[0].1) / 100.;
+                let weight = if ratio <= midpoint {
+                    ratio / (2. * midpoint)
+                } else {
+                    0.5 + (ratio - midpoint) / (2. * (1. - midpoint))
+                };
+                return pair[0].2 * (1. - weight) + pair[1].2 * weight;
+            }
+        }
+        stops.last().unwrap().2
+    };
+    for depth in [8, 16] {
+        for (case, colors) in cases.iter().enumerate() {
+            let alpha = match case % 4 {
+                0 => None,
+                1 => Some(vec![(0, 99, 0.)]),
+                2 => Some(vec![(2048, 1, 41.937)]),
+                _ => Some(vec![(1536, 75, 12.319), (2560, 25, 84.731)]),
+            };
+            for reverse in [false, true] {
+                for offset in [-25f64, 0., 25.] {
+                    for enabled in [false, true] {
+                        let mut payload = custom_gradient_payload(
+                            reverse,
+                            None,
+                            0.,
+                            100.,
+                            Some((offset, 0.)),
+                            colors,
+                            alpha.as_deref(),
+                        );
+                        let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                        payload[at] = u8::from(enabled);
+                        let at = payload
+                            .windows(12)
+                            .position(|v| v == b"OpctUntF#Prc")
+                            .unwrap()
+                            + 12;
+                        payload[at..at + 8].copy_from_slice(&37f64.to_be_bytes());
+                        let merged = std::array::from_fn::<_, 2, _>(|x| {
+                            let source = SAVED[x].map(|n| native(n, depth));
+                            if !enabled {
+                                return source;
+                            }
+                            let mut position =
+                                ((x as f64 + 0.5) / 2. - offset / 100.).clamp(0., 1.);
+                            if reverse {
+                                position = 1. - position;
+                            }
+                            let coverage = alpha
+                                .as_ref()
+                                .map_or(1., |stops| reference(stops, position) / 100.);
+                            let weight = (coverage * (37. / 100.) * 65535.).round() / 65535.;
+                            std::array::from_fn(|channel| {
+                                if channel == 3 {
+                                    return 65535;
+                                }
+                                let knots = colors
+                                    .iter()
+                                    .map(|&(position, midpoint, color)| {
+                                        (position, midpoint, color[channel] / 255.)
+                                    })
+                                    .collect::<Vec<_>>();
+                                let tint = (reference(&knots, position) * 65535.).round() / 65535.;
+                                native(
+                                    ((f64::from(source[channel]) / 65535. * (1. - weight)
+                                        + tint * weight)
+                                        * 65535.)
+                                        .round() as u16,
+                                    depth,
+                                )
+                            })
+                        });
+                        let mut spec = Spec::paint("Synthetic clamped gradient", SAVED);
+                        spec.tags.push((*b"lfx2", payload));
+                        let mut bytes = fixture(&[spec], depth);
+                        bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                        for channel in 0..4 {
+                            for pixel in merged {
+                                composite_sample(&mut bytes, pixel, channel, depth);
+                            }
+                        }
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {case} {reverse} {offset} {enabled}: {:?}",
+                            doc.warnings
+                        );
+                        let source = SAVED.map(|p| p.map(|v| native(v, depth))).concat();
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(rendered(&doc), merged.concat());
+                        let settings = doc.layers[0].effects[0].settings.clone();
+                        let color_stops = settings["color_stops"].as_array().unwrap();
+                        assert_eq!(
+                            color_stops.len(),
+                            colors.len()
+                                + usize::from(colors[0].0 != 0)
+                                + usize::from(colors.last().unwrap().0 != 4096)
+                        );
+                        for &(position, midpoint, color) in colors {
+                            let stop = color_stops
+                                .iter()
+                                .find(|s| s["position"] == f64::from(position) / 4096.)
+                                .unwrap();
+                            assert_eq!(stop["midpoint"], f64::from(midpoint) / 100.);
+                            assert_eq!(stop["color"], json!(color.map(|v| v / 255.)));
+                        }
+                        let alpha_stops = settings["alpha_stops"].as_array().unwrap();
+                        if let Some(alpha) = &alpha {
+                            assert_eq!(
+                                alpha_stops.len(),
+                                alpha.len()
+                                    + usize::from(alpha[0].0 != 0)
+                                    + usize::from(alpha.last().unwrap().0 != 4096)
+                            );
+                            for &(position, midpoint, opacity) in alpha {
+                                let stop = alpha_stops
+                                    .iter()
+                                    .find(|s| s["position"] == f64::from(position) / 4096.)
+                                    .unwrap();
+                                assert_eq!(stop["midpoint"], f64::from(midpoint) / 100.);
+                                assert_eq!(stop["opacity"], opacity / 100.);
+                            }
+                        } else {
+                            assert!(alpha_stops.is_empty());
+                        }
+                        let current = doc.export_png().unwrap();
+                        for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                            assert_eq!(saved_composite(&output, depth), merged.concat());
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(reopened.layers[0].effects[0].settings, settings);
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            let standard = psd::decode(&ordinary(&output)).unwrap();
+                            assert!(!standard.read_only);
+                            assert_eq!(standard.layers[0].pixels.rgba16(), merged.concat());
+                            assert_eq!(standard.export_png().unwrap(), current);
+                        }
+                        let mut engine = Engine::new();
+                        let layer = doc.layers[0].id.clone();
+                        let effect = doc.layers[0].effects[0].id.clone();
+                        engine.doc = doc;
+                        engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Clamped gradient bypass").unwrap();
+                        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(engine.undo.len(), 1);
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        let at =
+                            bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth == 16);
+                        bytes[at] ^= 1;
+                        let protected = psd::decode(&bytes).unwrap();
+                        assert!(protected.read_only);
+                        assert!(protected.layers[0].effects.is_empty());
+                        assert_eq!(protected.bit_depth, depth);
+                        assert!(psd::encode(&protected).is_err());
+                        assert!(psd::encode_psb(&protected).is_err());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn photoshop_gradient_clamped_stops_reject_malformed_or_excessive_source_lists() {
+    let supported = vec![(0, 50, [31.; 3]), (4096, 50, [211.; 3])];
+    for depth in [8, 16] {
+        for alpha in [false, true] {
+            for variant in 0..10 {
+                let mut stops = vec![(1024, 50, [31.; 3]), (3072, 50, [83.; 3])];
+                match variant {
+                    0 => stops.clear(),
+                    1 => stops[0].0 = -1,
+                    2 => stops[1].0 = 4097,
+                    3 => stops[1].0 = stops[0].0,
+                    4 => stops.reverse(),
+                    5 => stops[0].1 = 0,
+                    6 => stops[0].1 = 100,
+                    7 => stops = (0..17).map(|i| (i * 256, 50, [31.; 3])).collect(),
+                    8 => stops = (1..=16).map(|i| (i * 240, 50, [31.; 3])).collect(),
+                    _ => stops = (0..16).map(|i| (i * 256, 50, [31.; 3])).collect(),
+                }
+                let alphas = stops
+                    .iter()
+                    .map(|&(position, midpoint, values)| (position, midpoint, values[0]))
+                    .collect::<Vec<_>>();
+                let mut payload = custom_gradient_payload(
+                    false,
+                    None,
+                    0.,
+                    100.,
+                    None,
+                    if alpha { &supported } else { &stops },
+                    if alpha { Some(&alphas) } else { None },
+                );
+                let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                payload[at] = 0;
+                let mut spec = Spec::paint("Synthetic protected clamped gradient", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+                assert!(doc.read_only, "{depth} {alpha} {variant}");
+                assert_eq!(doc.bit_depth, depth);
+                assert!(doc.layers[0].effects.is_empty());
+                assert_eq!(
+                    doc.layers[0].pixels.rgba16(),
+                    SAVED.map(|p| p.map(|v| native(v, depth))).concat()
+                );
+                assert!(psd::encode(&doc).is_err());
+                assert!(psd::encode_psb(&doc).is_err());
+            }
+        }
+    }
+}
+
 #[test]
 fn plain_photoshop_linear_gradient_import_retains_native_source_and_reversible_stops() {
     for depth in [8, 16] {
@@ -3061,7 +3325,6 @@ fn missing_or_unsupported_photoshop_gradient_fields_protect_without_panics() {
             Some("Lctn"),
             Some("Clr "),
             Some("Clrs"),
-            Some("Trns"),
             Some("Md  "),
             Some("Intr"),
             Some("Type"),

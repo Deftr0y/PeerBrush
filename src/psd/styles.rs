@@ -839,15 +839,22 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
         ("Clrs", "color_stops", "Clrt", false),
         ("Trns", "alpha_stops", "TrnS", true),
     ] {
+        // An omitted transparency list means opaque coverage. Explicit empty
+        // or malformed lists remain invalid, rather than silently defaulting.
+        if alpha && !gradient.contains_key(input) {
+            settings[output] = json!([]);
+            continue;
+        }
         let list = field(gradient, input);
         if list["type"] != "VlLs" {
             return Err("Gradient stops require descriptor lists".into());
         }
         let list = list["value"]
             .as_array()
-            .filter(|s| (2..=16).contains(&s.len()))
-            .ok_or("Gradient requires 2–16 source stops")?;
+            .filter(|s| (1..=16).contains(&s.len()))
+            .ok_or("Gradient requires 1–16 source stops")?;
         let mut stops = vec![];
+        let mut previous = -1.;
         for entry in list {
             let stop = descriptor(entry, class)?;
             if stop.keys().any(|k| {
@@ -866,8 +873,13 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
             // ASL midpoints are integer percentages of the following segment.
             // Krita's ASL parser creates INTERP_LINEAR segments with this ratio;
             // the shared native gradient sampler uses the same piecewise rule.
+            let position = plain_number(field(stop, "Lctn"))? / 4096.;
+            if !(0.0..=1.).contains(&position) || position <= previous {
+                return Err("Photoshop gradient stops must strictly increase within 0–4096".into());
+            }
+            previous = position;
             let mut result = json!({
-                "position":plain_number(field(stop, "Lctn"))?/4096.,
+                "position":position,
                 "midpoint":plain_number(field(stop, "Mdpn"))?/100.
             });
             if alpha {
@@ -883,6 +895,24 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
                 result["color"] = json!(rgb_color(field(stop, "Clr "))?);
             }
             stops.push(result);
+        }
+        // Photoshop extends the nearest stop outside its range, including a
+        // one-stop constant ramp. Native controls require explicit endpoints;
+        // retain every original stop and add only equivalent constant edges.
+        if stops[0]["position"] != 0. {
+            let mut edge = stops[0].clone();
+            edge["position"] = json!(0.);
+            edge["midpoint"] = json!(0.5);
+            stops.insert(0, edge);
+        }
+        if stops.last().unwrap()["position"] != 1. {
+            let mut edge = stops.last().unwrap().clone();
+            edge["position"] = json!(1.);
+            edge["midpoint"] = json!(0.5);
+            stops.push(edge);
+        }
+        if stops.len() > 16 {
+            return Err("Photoshop gradient endpoints exceed the shared 16-stop limit".into());
         }
         settings[output] = json!(stops);
     }
