@@ -77,6 +77,30 @@ class Msix(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'file collides'):
             msix.validate_casefold_paths(['assets','assets/logo.png'])
 
+    def test_execution_alias_requires_explicit_native_entry_point(self):
+        data = msix.manifest_bytes(self.template, self.identity, '0.2.0')
+        root = ET.fromstring(data)
+        alias = root.find('f:Applications/f:Application/f:Extensions/uap5:Extension', msix.NS)
+        self.assertEqual(alias.get('Executable'), 'peerbrush.exe')
+        self.assertEqual(alias.get('EntryPoint'), 'Windows.FullTrustApplication')
+        for entry_point in [None, 'Incorrect.EntryPoint']:
+            if entry_point is None:
+                alias.attrib.pop('EntryPoint', None)
+            else:
+                alias.set('EntryPoint', entry_point)
+            with self.assertRaisesRegex(ValueError, 'full-trust entry point'):
+                msix.validate_manifest(ET.tostring(root), self.identity, '0.2.0')
+
+    @unittest.skipUnless(msix.os.name == 'nt', 'Windows SDK validation requires Windows')
+    def test_windows_sdk_accepts_synthetic_package_before_native_build(self):
+        # Exercise the real SDK schema/semantic checks without compiling or
+        # executing the synthetic PE, signing, installation, or trust changes.
+        report = msix.build(self.root, self.archive, self.root/'sdk-package',
+                            self.identity, development=True)
+        self.assertFalse(report['signed'])
+        self.assertFalse(report['installed_tested'])
+        self.assertTrue((self.root/'sdk-package'/report['package']).is_file())
+
     def test_store_identity_is_required_and_local_identity_is_explicit(self):
         for identity in [{}, {'name':'x'}, {'name':'REPLACE_WITH_ID','publisher':'CN=Demo','publisher_display_name':'Demo'}]:
             with self.assertRaises(ValueError):msix.identity_values(identity)

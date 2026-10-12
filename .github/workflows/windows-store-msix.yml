@@ -74,11 +74,11 @@ jobs:
           $commit = (& git rev-parse HEAD).Trim()
           Invoke-Checked $python @('scripts/release_gate.py', '--commit', $commit)
           Invoke-Checked $python @('scripts/package.py', '--check-source')
+          Invoke-Checked $python @('scripts/test_msix.py')
           Invoke-Checked $cargo @('fmt', '--all', '--', '--check')
           Invoke-Checked $cargo @('test', '--locked')
           Invoke-Checked $cargo @('clippy', '--all-targets', '--locked')
           Invoke-Checked $python @('scripts/test_package.py')
-          Invoke-Checked $python @('scripts/test_msix.py')
           Invoke-Checked $python @('scripts/test_sign_macos.py')
           Invoke-Checked $python @('scripts/build_release.py')
           Invoke-Checked $python @('scripts/test_msix_runtime_tests.py')
@@ -93,6 +93,7 @@ jobs:
             '--identity', 'packaging/msix/identity.store.json',
             '--expected-package-family', 'Deftroy.PeerBrush_wszhgmjq5tjta',
             '--package-version', '1.25.0.0',
+            '--makeappx', $makeAppx,
             '--output', 'dist/store-candidate'
           )
           Invoke-Checked $python $packageArgs

@@ -26,7 +26,8 @@
                           BackgroundColor="transparent" Square44x44Logo="MsixAssets\Square44x44Logo.png"
                           Square150x150Logo="MsixAssets\Square150x150Logo.png" />
       <Extensions>
-        <uap5:Extension Category="windows.appExecutionAlias" Executable="peerbrush.exe">
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="peerbrush.exe"
+                        EntryPoint="Windows.FullTrustApplication">
           <uap5:AppExecutionAlias><uap5:ExecutionAlias Alias="peerbrush-mcp.exe" /></uap5:AppExecutionAlias>
         </uap5:Extension>
         <uap:Extension Category="windows.fileTypeAssociation">

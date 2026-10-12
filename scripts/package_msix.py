@@ -173,6 +173,12 @@ def validate_manifest(data, identity, version, extra_types=(), msix_version=None
     app = applications[0]
     if app.get('{'+NS['uap10']+'}RuntimeBehavior') != 'packagedClassicApp' or app.get('{'+NS['uap10']+'}TrustLevel') != 'mediumIL':
         raise ValueError('Expected normal-user full-trust desktop runtime')
+    alias_extensions = app.findall('f:Extensions/uap5:Extension', NS)
+    if len(alias_extensions) != 1 or alias_extensions[0].attrib != {
+        'Category': 'windows.appExecutionAlias', 'Executable': 'peerbrush.exe',
+        'EntryPoint': 'Windows.FullTrustApplication',
+    }:
+        raise ValueError('Execution alias requires the native executable and full-trust entry point')
     aliases = app.findall('f:Extensions/uap5:Extension/uap5:AppExecutionAlias/uap5:ExecutionAlias', NS)
     if len(aliases) != 1 or aliases[0].get('Alias') != 'peerbrush-mcp.exe':
         raise ValueError('Missing stable MCP execution alias')
