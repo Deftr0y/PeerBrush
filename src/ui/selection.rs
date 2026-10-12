@@ -289,12 +289,51 @@ impl PeerBrush {
         {
             self.selection_gesture_source = Some(self.selection_source(doc));
         }
+        // A later move in this frame updates response.interact_pointer_pos().
+        // Clicks must use their release position, not the subsequent hover.
+        let max_click_dist = ui
+            .ctx()
+            .options(|options| options.input_options.max_click_dist);
+        let click_pos = ui
+            .input(|i| {
+                let mut click = None;
+                let mut origin: Option<Pos2> = None;
+                let mut could_click = true;
+                for event in &i.events {
+                    match event {
+                        egui::Event::PointerButton {
+                            pos, pressed: true, ..
+                        } => {
+                            origin = Some(*pos);
+                            could_click = true;
+                        }
+                        egui::Event::PointerMoved(pos) => {
+                            if origin.is_some_and(|start| start.distance(*pos) > max_click_dist) {
+                                could_click = false;
+                            }
+                        }
+                        egui::Event::PointerButton {
+                            pos,
+                            button,
+                            pressed: false,
+                            ..
+                        } => {
+                            // The first release can finish a prior-frame press.
+                            // Later drags must not replace an earlier click.
+                            // The response below still gates click ownership.
+                            if *button == egui::PointerButton::Primary && could_click {
+                                click = Some(*pos);
+                            }
+                            origin = None;
+                        }
+                        _ => {}
+                    }
+                }
+                click
+            })
+            .or_else(|| response.interact_pointer_pos());
         // The response covers only the canvas workspace, excluding panels and controls.
-        if response.clicked()
-            && response
-                .interact_pointer_pos()
-                .is_some_and(|p| !view.contains(p, rect, scale))
-        {
+        if response.clicked() && click_pos.is_some_and(|p| !view.contains(p, rect, scale)) {
             self.deselect_area(doc, false);
             return;
         }
@@ -305,10 +344,7 @@ impl PeerBrush {
                 self.selection_path.pop();
             }
             if response.clicked() || response.double_clicked() {
-                if let Some(pos) = response
-                    .interact_pointer_pos()
-                    .filter(|p| view.contains(*p, rect, scale))
-                {
+                if let Some(pos) = click_pos.filter(|p| view.contains(*p, rect, scale)) {
                     if self.selection_path.is_empty() {
                         self.selection_gesture_mode = Some(self.selection_mode_for(ui));
                     }
@@ -465,7 +501,7 @@ impl PeerBrush {
             self.selection_gesture_mode = None;
         }
         if response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(pos) = click_pos {
                 if view.contains(pos, rect, scale)
                     && ["wand", "quick", "row", "column"].contains(&self.selection_kind.as_str())
                 {

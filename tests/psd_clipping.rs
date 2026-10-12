@@ -4207,8 +4207,9 @@ fn multiple_overlay_limits_aliases_and_unsupported_disabled_entries_protect_atom
         for invalid in ["alias", "unsupported"] {
             let mut payload = multi_overlay_payload([false; 4], false, 2, 2, false);
             if invalid == "unsupported" {
-                let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
-                payload[at..at + 4].copy_from_slice(b"HrdL");
+                // Hard Light is supported; use an unknown enum to exercise
+                // protection even when both the entry and master are disabled.
+                set_style_blend(&mut payload, "????");
             } else {
                 let at = payload.windows(4).position(|v| v == b"Lefx").unwrap() + 4;
                 payload[at..at + 4].copy_from_slice(&4u32.to_be_bytes());
@@ -4219,7 +4220,46 @@ fn multiple_overlay_limits_aliases_and_unsupported_disabled_entries_protect_atom
             let mut spec = Spec::paint("Synthetic invalid multi overlays", SAVED);
             spec.tags.push((*b"lfx2", payload));
             let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
-            assert!(doc.read_only);
+            assert!(doc.read_only, "{depth} {invalid}: {:?}", doc.warnings);
+            assert!(doc.layers[0].effects.is_empty());
+            assert_eq!(
+                doc.layers[0].pixels.rgba16(),
+                SAVED.map(|p| p.map(|v| native(v, depth))).concat()
+            );
+            assert!(psd::encode(&doc).is_err());
+            assert!(psd::encode_psb(&doc).is_err());
+        }
+    }
+}
+
+#[test]
+fn multiple_disabled_overlays_preserve_supported_hard_light_blends() {
+    for depth in [8, 16] {
+        for master in [false, true] {
+            let mut payload = multi_overlay_payload([false; 4], master, 2, 2, false);
+            set_style_blend(&mut payload, "HrdL");
+            let mut spec = Spec::paint("Synthetic disabled Hard Light multi overlays", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+            assert!(!doc.read_only, "{depth} {master}: {:?}", doc.warnings);
+            let source = SAVED.map(|p| p.map(|v| native(v, depth))).concat();
+            let current = doc.export_png().unwrap();
+            for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                let reopened = psd::decode(&output).unwrap();
+                for imported in [&doc, &reopened] {
+                    assert!(!imported.read_only);
+                    assert_eq!(imported.layers[0].effects.len(), 4);
+                    assert!(imported.layers[0].effects.iter().all(|e| !e.enabled));
+                    assert_eq!(imported.layers[0].effects[2].kind, "gradient_overlay");
+                    assert_eq!(
+                        imported.layers[0].effects[2].settings["blend"],
+                        "hard_light"
+                    );
+                    assert_eq!(imported.layers[0].pixels.rgba16(), source);
+                    assert_eq!(imported.export_png().unwrap(), current);
+                }
+                assert_eq!(saved_composite(&output, depth), source);
+            }
         }
     }
 }

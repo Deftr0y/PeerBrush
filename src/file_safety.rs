@@ -179,6 +179,14 @@ pub struct Lease {
     pub path: PathBuf,
     pub expected: Option<Version>,
 }
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A concurrently spawned child can temporarily inherit this handle.
+        // Closing only our descriptor would leave the completed save locked
+        // until that child closes its copy. Release the lease explicitly.
+        let _ = self._file.unlock();
+    }
+}
 impl Lease {
     pub fn acquire(path: &Path) -> Result<Self, String> {
         let path = canonical_destination(path)?;
@@ -208,12 +216,13 @@ impl Lease {
         file.try_lock().map_err(|_| {
             "Another PeerBrush save is using this directory. Retry when it finishes.".to_string()
         })?;
-        let expected = snapshot(&path)?;
-        Ok(Self {
+        let mut lease = Self {
             _file: file,
             path,
-            expected,
-        })
+            expected: None,
+        };
+        lease.expected = snapshot(&lease.path)?;
+        Ok(lease)
     }
     pub fn validate(&self) -> Result<(), String> {
         if snapshot(&self.path)? != self.expected {
@@ -387,4 +396,29 @@ pub fn previous_versions(path: &Path) -> Result<Vec<PreviousVersion>, String> {
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp_ms));
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_save_releases_lease_while_an_inherited_handle_remains_open() {
+        let dir = std::env::temp_dir().join(format!("pb-save-lease-{}", crate::engine::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("drawing.psd");
+        let lease = Lease::acquire(&path).unwrap();
+        // Duplicate the open file description just as a concurrent process
+        // launch can before exec closes its inherited descriptors.
+        let inherited = lease._file.try_clone().unwrap();
+        assert!(Lease::acquire(&path).is_err());
+        drop(lease);
+        let next = Lease::acquire(&path).expect("the completed save must release its lock");
+        assert!(Lease::acquire(&path).is_err());
+        drop(inherited);
+        assert!(Lease::acquire(&path).is_err());
+        drop(next);
+        assert!(Lease::acquire(&path).is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

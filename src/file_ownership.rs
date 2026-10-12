@@ -12,6 +12,14 @@ struct Lock {
     project: String,
     key: String,
 }
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // Only the final Arc owner releases this lock. A child process may
+        // still hold an inherited descriptor until exec, so close alone is
+        // insufficient to make a released project immediately reopenable.
+        let _ = self._file.unlock();
+    }
+}
 fn locks() -> &'static Mutex<HashMap<String, Weak<Lock>>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<Lock>>>> = OnceLock::new();
     LOCKS.get_or_init(Default::default)
@@ -97,6 +105,11 @@ fn claim(key: String, project: &str, reuse: bool) -> Result<Arc<Lock>, String> {
         };
         return Err(format!("File already open or opening in another PeerBrush instance{project}. Return to that instance; its work is preserved."));
     }
+    let lock = Arc::new(Lock {
+        _file: file,
+        project: project.into(),
+        key: key.clone(),
+    });
     if record.exists()
         && !fs::symlink_metadata(&record).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
     {
@@ -111,11 +124,6 @@ fn claim(key: String, project: &str, reuse: bool) -> Result<Arc<Lock>, String> {
     info.write_all(project.as_bytes())
         .map_err(|e| e.to_string())?;
     info.sync_all().map_err(|e| e.to_string())?;
-    let lock = Arc::new(Lock {
-        _file: file,
-        project: project.into(),
-        key: key.clone(),
-    });
     registry.insert(key, Arc::downgrade(&lock));
     Ok(lock)
 }
@@ -194,6 +202,31 @@ pub(crate) fn local_project(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_owner_releases_lock_while_an_inherited_handle_remains_open() {
+        let dir = std::env::temp_dir().join(format!("pb-owner-release-{}", crate::engine::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("drawing.psd");
+        let owner = Ownership::open(&path, "original-project").unwrap();
+        let inherited = owner.files.lock().unwrap().as_ref().unwrap()[0]
+            ._file
+            .try_clone()
+            .unwrap();
+        let snapshot = owner.clone();
+        drop(owner);
+        assert!(Ownership::open(&path, "next-project").is_err());
+        drop(snapshot);
+        let next =
+            Ownership::open(&path, "next-project").expect("the final owner must release its lock");
+        assert!(Ownership::open(&path, "other-project").is_err());
+        drop(inherited);
+        assert!(Ownership::open(&path, "other-project").is_err());
+        drop(next);
+        assert!(Ownership::open(&path, "other-project").is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn staged_identity_is_owned_before_publication_and_release_reaches_snapshots() {
         let dir = std::env::temp_dir().join(format!("pb-staged-owner-{}", crate::engine::id()));

@@ -11875,6 +11875,109 @@ mod tests {
     }
 
     #[test]
+    fn selection_clicks_use_release_position_before_later_pointer_motion() {
+        for depth in [8, 16] {
+            for kind in ["polygon", "magnetic", "wand", "quick", "row", "column"] {
+                let tool = if kind == "wand" {
+                    Tool::MagicWand
+                } else {
+                    Tool::Selection
+                };
+                let (mut app, ctx, point, before) =
+                    pressed_selection_fixture_with_previous(depth, tool, kind, true);
+                let rect = app.view_rect.unwrap();
+                let p = app.view.document(point, rect, rect.width() / 32.);
+                let path_tool = ["polygon", "magnetic"].contains(&kind);
+                let expected = if path_tool {
+                    before.clone()
+                } else {
+                    Engine::preview_edits(
+                        before.clone(),
+                        &[app.select_command(&before, &[p], "replace")],
+                    )
+                    .unwrap()
+                };
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        primary_release(point),
+                        egui::Event::PointerMoved(Pos2::new(1., 1.)),
+                    ],
+                    Default::default(),
+                );
+                if path_tool {
+                    let anchor = if kind == "magnetic" {
+                        crate::selection::magnetic_point(&before, p, app.selection_width)
+                    } else {
+                        p
+                    };
+                    assert_eq!(app.selection_path, vec![anchor], "{depth} {kind}");
+                }
+                let engine = app.shared.lock().unwrap();
+                assert_eq!(engine.doc.selection, expected.selection, "{depth} {kind}");
+                let coverage = engine.doc.selection_coverage.as_ref().unwrap();
+                let expected_coverage = expected.selection_coverage.as_ref().unwrap();
+                assert_eq!(coverage.origin, expected_coverage.origin);
+                assert_eq!(coverage.bounds, expected_coverage.bounds);
+                // Equivalent contours can begin at different boundary vertices.
+                assert_eq!(coverage.mask.rgba(), expected_coverage.mask.rgba());
+                assert_eq!(engine.doc.selection_polygon, expected.selection_polygon);
+                assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+                assert_eq!(engine.undo.len(), usize::from(!path_tool));
+                if path_tool {
+                    assert_eq!(engine.doc.revision, before.revision);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_clicks_ignore_later_drag_releases() {
+        for depth in [8, 16] {
+            for kind in ["polygon", "wand"] {
+                let tool = if kind == "wand" {
+                    Tool::MagicWand
+                } else {
+                    Tool::Selection
+                };
+                let (mut app, ctx, point, before) =
+                    pressed_selection_fixture_with_previous(depth, tool, kind, true);
+                let rect = app.view_rect.unwrap();
+                let p = app.view.document(point, rect, rect.width() / 32.);
+                let end = rect.center();
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        primary_release(point),
+                        button(
+                            point,
+                            egui::PointerButton::Primary,
+                            true,
+                            Default::default(),
+                        ),
+                        egui::Event::PointerMoved(end),
+                        primary_release(end),
+                        egui::Event::PointerMoved(point),
+                    ],
+                    Default::default(),
+                );
+                let engine = app.shared.lock().unwrap();
+                if kind == "polygon" {
+                    assert_eq!(app.selection_path, vec![p]);
+                    assert_eq!(engine.doc.selection, before.selection);
+                    assert!(engine.undo.is_empty());
+                } else {
+                    assert_eq!(engine.doc.selection, Some([4, 5, 12, 13]));
+                    assert_eq!(engine.undo.len(), 1);
+                }
+                assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+            }
+        }
+    }
+
+    #[test]
     fn selection_focus_loss_cancels_drafts_without_running_document_shortcuts() {
         for depth in [8, 16] {
             for kind in ["wand", "rectangle", "polygon", "magnetic"] {
@@ -11908,6 +12011,12 @@ mod tests {
                                     egui::Event::PointerMoved(Pos2::new(1., 1.)),
                                 ],
                                 Default::default(),
+                            );
+                            assert_eq!(app.selection_path.len(), 1);
+                            assert_eq!(
+                                app.shared.lock().unwrap().doc.selection,
+                                before.selection,
+                                "initial path click changed existing coverage"
                             );
                             app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
                         } else if kind == "rectangle" {
@@ -14599,6 +14708,63 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn deselection_clicks_use_release_position_before_later_pointer_motion() {
+        for depth in [8, 16] {
+            for kind in [
+                "rectangle",
+                "ellipse",
+                "row",
+                "column",
+                "lasso",
+                "polygon",
+                "magnetic",
+                "wand",
+                "quick",
+                "object",
+            ] {
+                let (mut app, ctx, before) = deselection_fixture(depth);
+                app.select_tool(if kind == "wand" {
+                    Tool::MagicWand
+                } else {
+                    Tool::Selection
+                });
+                app.selection_kind = kind.into();
+                frame(&mut app, &ctx, vec![], Default::default());
+                let rect = app.view_rect.unwrap();
+                let outside = rect.left_center() - Vec2::new(12., 0.);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(outside),
+                        button(
+                            outside,
+                            egui::PointerButton::Primary,
+                            true,
+                            Default::default(),
+                        ),
+                    ],
+                    Default::default(),
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        primary_release(outside),
+                        egui::Event::PointerMoved(rect.center()),
+                    ],
+                    Default::default(),
+                );
+                let engine = app.shared.lock().unwrap();
+                assert!(engine.doc.selection.is_none(), "{depth} {kind}");
+                assert!(app.selection_path.is_empty());
+                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+            }
+        }
+    }
+
     #[test]
     fn deselection_reservations_and_text_focus_preserve_artwork() {
         for depth in [8, 16] {
