@@ -45,6 +45,8 @@ Implemented, acceptance pending. One unscaled Normal solid-color `FrFX` definiti
 
 Regression coverage specifies independent half-coverage edge samples, master/present/enabled states, single/list aliases, native source retention, current standard PSD/PSB composites, editable reopening, bypass/undo and one-sample mismatch protection. Formatting and compile checking passed; automated and fresh native workspace acceptance remain pending. This does not establish general Photoshop Stroke equivalence or recover the broader representative styled document.
 
+A fresh isolated native workspace opened an independent 256×160 Outside Stroke fixture as editable native16 at revision zero. The application capture was inspected and shows the rendered outline and native Stroke control over the retained checker source. Broader Inside/Center, depth, interaction and final CI acceptance remain separately pending.
+
 ## CI checkpoints
 
 Commit `0b91a4c` passed all three native jobs and matching platform package inspection in [GitHub Actions](https://github.com/Deftr0y/PeerBrush/actions/runs/38275647900). Commit `197eac5` also has a [successful complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38285419164), while its other run failed an intermittent file-ownership regression. Later runs must be verified separately; a successful older checkpoint does not close the current development queue.
@@ -52,3 +54,7 @@ Commit `0b91a4c` passed all three native jobs and matching platform package insp
 ## PB-137 ownership release hardening
 
 The [639a369 Linux run](https://github.com/Deftr0y/PeerBrush/actions/runs/38287773856) identified an ownership-busy failure at the first open after cancellation (`tests/file_ownership.rs:105`), while another run's Linux job passed. Final native ownership now explicitly unlocks its OS handles before closing them. [Rust's lock contract](https://doc.rust-lang.org/std/fs/struct.File.html#method.lock) allows duplicated or inherited descriptors to keep a lock alive after the original closes; a deterministic regression retains those descriptors across reacquisition and verifies that the new owner still blocks hard-link aliases. This addresses that lock-lifetime condition; the intermittent CI cause and broader original data-loss report are not yet proven resolved. Formatting and compile checking passed; cross-platform CI acceptance is pending.
+
+## PB-080 workspace cache identity
+
+The registry cache now retains and checks the weak identity of its root engine, alongside the weak workspace. Closing the root can remove its registry handle while an engine snapshot keeps the registry alive. Previously its address-only key could then collide with a new root after allocation reuse. The weak root pins that allocation until cache retirement; identity validation also rejects a stale cache entry. A deterministic regression simulates the collision after close, preserves the old snapshot, and verifies independent project lookup and active identity. Formatting and compile checking passed; CI and native lifecycle acceptance remain pending. This is a separate isolation fix, not an established explanation for the original data-loss report.
