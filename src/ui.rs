@@ -231,6 +231,14 @@ struct TabTransfer {
     target: String,
     move_layers: bool,
 }
+struct TransformGestureSource {
+    document: String,
+    revision: u64,
+    roots: Vec<String>,
+    tool: Tool,
+    mask: bool,
+    step: Option<String>,
+}
 impl TabTransfer {
     fn request(&self) -> crate::workspace::Transfer<'_> {
         crate::workspace::Transfer {
@@ -482,6 +490,7 @@ pub struct PeerBrush {
     activity_text: String,
     activity_changed: std::time::Instant,
     gizmo_handle: u8,
+    gizmo_source: Option<TransformGestureSource>,
     drag_revision: Option<u64>,
     gizmo_bounds: Option<(String, u64, [i32; 4])>,
 }
@@ -819,6 +828,7 @@ impl PeerBrush {
             activity_text: String::new(),
             activity_changed: std::time::Instant::now(),
             gizmo_handle: 0,
+            gizmo_source: None,
             drag_revision: None,
             gizmo_bounds: None,
         }
@@ -884,6 +894,7 @@ impl PeerBrush {
         self.drag_revision = None;
         self.gizmo_bounds = None;
         self.gizmo_handle = 0;
+        self.gizmo_source = None;
         self.points.clear();
         self.stroke_pressures.clear();
         self.stroke_has_pressure = false;
@@ -2679,6 +2690,40 @@ impl PeerBrush {
         available: Rect,
     ) {
         let roots = crate::tree::roots(doc, &self.selection_layers.iter().cloned().collect());
+        let focused = ui.input(|input| {
+            input.focused
+                && !input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        });
+        let stale = self.gizmo_source.as_ref().is_some_and(|source| {
+            source.document != doc.id
+                || source.revision != doc.revision
+                || source.roots != roots
+                || source.tool != self.tool
+                || source.mask != self.mask
+                || source.step != self.mask_step
+        });
+        if !focused || stale {
+            if self.gizmo_handle != 0 {
+                self.gizmo_handle = 0;
+                self.gizmo_source = None;
+                self.drag_start = None;
+                self.drag_revision = None;
+                self.live_gesture = None;
+                self.transient.clear();
+                self.last_preview = None;
+                self.canvas_selection = None;
+                self.message = if stale {
+                    "Transform source changed · preview cancelled; start a new drag"
+                } else {
+                    "Transform cancelled after focus loss · start a new drag"
+                }
+                .into();
+            }
+            return;
+        }
         let targets = doc
             .layers
             .iter()
@@ -2775,6 +2820,14 @@ impl PeerBrush {
                 self.live_gesture = Some(crate::engine::id());
                 self.drag_start = Some(view.document(pos, rect, scale));
                 self.drag_revision = Some(doc.revision);
+                self.gizmo_source = Some(TransformGestureSource {
+                    document: doc.id.clone(),
+                    revision: doc.revision,
+                    roots: roots.clone(),
+                    tool: self.tool,
+                    mask: self.mask,
+                    step: self.mask_step.clone(),
+                });
             }
         }
         let mut dx = 0.0;
@@ -2826,6 +2879,10 @@ impl PeerBrush {
                 };
                 match crate::transform::resolve_command(&command) {
                     Ok(mut command) => {
+                        if let Some(source) = &self.gizmo_source {
+                            command["document_id"] = json!(source.document);
+                            command["source_revision"] = json!(source.revision);
+                        }
                         if self.tool == Tool::Move {
                             dx = command["dx"].as_f64().unwrap() as f32;
                             dy = command["dy"].as_f64().unwrap() as f32;
@@ -2950,6 +3007,7 @@ impl PeerBrush {
             self.last_preview = None;
             self.drag_start = None;
             self.gizmo_handle = 0;
+            self.gizmo_source = None;
             self.drag_revision = None;
             self.live_gesture = None;
         }
@@ -4400,6 +4458,7 @@ impl PeerBrush {
                     self.points.clear();self.stroke_pressures.clear();self.stroke_has_pressure=false;self.current_pressure=None;
                     self.drag_start = None;
                     self.gizmo_handle = 0;
+                    self.gizmo_source = None;
                     self.live_gesture = None;
                 }
                 if i.key_pressed(egui::Key::Escape) {
@@ -13592,6 +13651,340 @@ mod tests {
             "Live rotation preview must not commit history"
         );
     }
+    #[test]
+    fn transform_drafts_cancel_on_source_focus_and_target_changes_without_rebasing_selection() {
+        for depth in [8, 16] {
+            for tool in [Tool::Move, Tool::Rotate, Tool::Scale] {
+                for change in [
+                    "selection",
+                    "focus",
+                    "focus-return",
+                    "target",
+                    "channel",
+                    "document",
+                ] {
+                    let (mut app, ctx) = small_fixture();
+                    let (layer, second, step) =
+                        {
+                            let mut engine = app.shared.lock().unwrap();
+                            engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                            let layer = engine.doc.layers[0].id.clone();
+                            for y in 5..13 {
+                                for x in 4..12 {
+                                    engine.doc.layers[0].pixels.set16(
+                                        x,
+                                        y,
+                                        [12347, 23459, 34571, 65535],
+                                    );
+                                }
+                            }
+                            engine.doc.layers[0]
+                                .pixels
+                                .set16(25, 25, [51239, 12349, 33561, 65535]);
+                            // A quarter-turn of a uniform square is invisible.
+                            // Retain an asymmetric native sample for retry proof.
+                            engine.doc.layers[0]
+                                .pixels
+                                .set16(4, 5, [51347, 10359, 22371, 65535]);
+                            engine.edit("human", &[
+                            json!({"op":"layer.add","name":"Other target"}),
+                            json!({"op":"mask.add","layer":layer,"value":255}),
+                            json!({"op":"selection","kind":"rectangle","rect":[4,5,12,13]}),
+                        ], None, None, "Fixture").unwrap();
+                            let second = engine
+                                .doc
+                                .layers
+                                .iter_mut()
+                                .find(|l| l.name == "Other target")
+                                .unwrap();
+                            second.pixels.set16(7, 8, [43591, 22347, 10539, 65535]);
+                            let second = second.id.clone();
+                            let step = engine
+                                .doc
+                                .layers
+                                .iter()
+                                .find(|l| l.id == layer)
+                                .unwrap()
+                                .mask
+                                .as_ref()
+                                .unwrap()
+                                .steps[0]
+                                .id
+                                .clone();
+                            engine.undo.clear();
+                            (layer, second, step)
+                        };
+                    app.select_content(&layer);
+                    app.select_tool(tool);
+                    frame(&mut app, &ctx, vec![], Default::default());
+                    let rect = app.view_rect.unwrap();
+                    let center = rect.min + Vec2::new(8., 9.) * (rect.width() / 32.);
+                    let (start, end) = if tool == Tool::Rotate {
+                        (center + Vec2::new(58., 0.), center + Vec2::new(0., 58.))
+                    } else {
+                        (center, center + Vec2::new(35., 10.))
+                    };
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![
+                            egui::Event::PointerMoved(start),
+                            button(
+                                start,
+                                egui::PointerButton::Primary,
+                                true,
+                                Default::default(),
+                            ),
+                        ],
+                        Default::default(),
+                    );
+                    assert_ne!(app.gizmo_handle, 0, "{depth} {} {change}", tool.label());
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![egui::Event::PointerMoved(end)],
+                        Default::default(),
+                    );
+                    assert_eq!(app.transient.len(), 1);
+                    assert_eq!(app.transient[0]["selection_only"], true);
+                    assert!(app.shared.lock().unwrap().undo.is_empty());
+                    let events = match change {
+                        "selection" => {
+                            app.shared
+                                .lock()
+                                .unwrap()
+                                .edit(
+                                    "other",
+                                    &[json!({"op":"selection.clear"})],
+                                    None,
+                                    None,
+                                    "Newer coverage",
+                                )
+                                .unwrap();
+                            vec![egui::Event::PointerMoved(end)]
+                        }
+                        "focus" => vec![
+                            egui::Event::WindowFocused(false),
+                            egui::Event::PointerMoved(end),
+                        ],
+                        "focus-return" => vec![
+                            egui::Event::WindowFocused(false),
+                            egui::Event::WindowFocused(true),
+                            egui::Event::PointerMoved(end),
+                        ],
+                        "target" => {
+                            app.select_content(&second);
+                            vec![egui::Event::PointerMoved(end)]
+                        }
+                        "channel" => {
+                            app.mask = true;
+                            app.mask_step = Some(step);
+                            vec![egui::Event::PointerMoved(end)]
+                        }
+                        _ => {
+                            app.shared.lock().unwrap().doc.id = "different-transform-source".into();
+                            vec![egui::Event::PointerMoved(end)]
+                        }
+                    };
+                    let later = app.shared.lock().unwrap().doc.clone();
+                    let history = app.shared.lock().unwrap().undo.len();
+                    frame(&mut app, &ctx, events, Default::default());
+                    assert_eq!(app.gizmo_handle, 0, "{depth} {} {change}", tool.label());
+                    assert!(app.gizmo_source.is_none());
+                    assert!(app.transient.is_empty());
+                    assert!(app.drag_start.is_none());
+                    assert!(app.drag_revision.is_none());
+                    assert!(app.live_gesture.is_none());
+                    // Late release after cancellation cannot use newer coverage,
+                    // retarget the transform or commit a whole-layer fallback.
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![
+                            egui::Event::WindowFocused(true),
+                            button(end, egui::PointerButton::Primary, false, Default::default()),
+                        ],
+                        Default::default(),
+                    );
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        assert_eq!(engine.undo.len(), history);
+                        assert_eq!(
+                            engine.doc.export_png().unwrap(),
+                            later.export_png().unwrap()
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&engine.doc).unwrap(),
+                            serde_json::to_value(&later).unwrap()
+                        );
+                    }
+                    // A fresh press can still transform the current selected
+                    // source, preview actual pixels and commit one exact undo.
+                    app.select_content(&layer);
+                    {
+                        let mut engine = app.shared.lock().unwrap();
+                        engine
+                            .edit(
+                                "human",
+                                &[json!({"op":"selection","kind":"rectangle","rect":[4,5,12,13]})],
+                                None,
+                                None,
+                                "Retry coverage",
+                            )
+                            .unwrap();
+                        engine.undo.clear();
+                    }
+                    frame(&mut app, &ctx, vec![], Default::default());
+                    let before = app.shared.lock().unwrap().doc.clone();
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![
+                            egui::Event::PointerMoved(start),
+                            button(
+                                start,
+                                egui::PointerButton::Primary,
+                                true,
+                                Default::default(),
+                            ),
+                        ],
+                        Default::default(),
+                    );
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![egui::Event::PointerMoved(end)],
+                        Default::default(),
+                    );
+                    assert_eq!(app.transient.len(), 1);
+                    assert_eq!(app.transient[0]["selection_only"], true);
+                    let draft = Engine::preview_edits(before.clone(), &app.transient).unwrap();
+                    assert!(
+                        draft.export_png().unwrap() != before.export_png().unwrap(),
+                        "{depth} {} {change}: retry must render the transformed pixels",
+                        tool.label()
+                    );
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![button(
+                            end,
+                            egui::PointerButton::Primary,
+                            false,
+                            Default::default(),
+                        )],
+                        Default::default(),
+                    );
+                    let mut engine = app.shared.lock().unwrap();
+                    assert_eq!(engine.undo.len(), 1, "{}", app.message);
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        draft.export_png().unwrap()
+                    );
+                    engine.undo("human").unwrap();
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        before.export_png().unwrap()
+                    );
+                    assert_eq!(
+                        engine.doc.layers[0].pixels.rgba16(),
+                        before.layers[0].pixels.rgba16()
+                    );
+                    assert_eq!(engine.doc.selection_coverage, before.selection_coverage);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_draft_commands_reject_source_races_in_shared_previews_and_transactions() {
+        for depth in [8, 16] {
+            for tool in [Tool::Move, Tool::Rotate, Tool::Scale] {
+                let (mut app, ctx) = small_fixture();
+                {
+                    let mut engine = app.shared.lock().unwrap();
+                    engine.doc.bit_depth = depth;
+                    engine.doc.ensure_depth();
+                    for y in 5..13 {
+                        for x in 4..12 {
+                            engine.doc.layers[0]
+                                .pixels
+                                .set16(x, y, [12347, 23459, 34571, 65535]);
+                        }
+                    }
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"selection","kind":"rectangle","rect":[4,5,12,13]})],
+                            None,
+                            None,
+                            "Fixture",
+                        )
+                        .unwrap();
+                    engine.undo.clear();
+                }
+                app.select_tool(tool);
+                frame(&mut app, &ctx, vec![], Default::default());
+                let before = app.shared.lock().unwrap().doc.clone();
+                let rect = app.view_rect.unwrap();
+                let center = rect.min + Vec2::new(8., 9.) * (rect.width() / 32.);
+                let (start, end) = if tool == Tool::Rotate {
+                    (center + Vec2::new(58., 0.), center + Vec2::new(0., 58.))
+                } else {
+                    (center, center + Vec2::new(35., 10.))
+                };
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(start),
+                        button(
+                            start,
+                            egui::PointerButton::Primary,
+                            true,
+                            Default::default(),
+                        ),
+                    ],
+                    Default::default(),
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(end)],
+                    Default::default(),
+                );
+                let commands = app.transient.clone();
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0]["document_id"], before.id);
+                assert_eq!(commands[0]["source_revision"], before.revision);
+                assert!(Engine::preview_edits(before.clone(), &commands).is_ok());
+                let mut engine = app.shared.lock().unwrap();
+                engine
+                    .edit(
+                        "other",
+                        &[json!({"op":"selection.clear"})],
+                        None,
+                        None,
+                        "Later coverage",
+                    )
+                    .unwrap();
+                let later = engine.doc.clone();
+                assert!(Engine::preview_edits(later.clone(), &commands).is_err());
+                assert!(engine
+                    .edit("human", &commands, None, None, "Reject stale transform")
+                    .is_err());
+                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(&later).unwrap()
+                );
+                let mut other = before;
+                other.id = "different-transform-source".into();
+                assert!(Engine::preview_edits(other, &commands).is_err());
+            }
+        }
+    }
+
     #[test]
     fn folder_gizmo_wer_previews_and_commits_only_the_wand_selection() {
         for depth in [8, 16] {
