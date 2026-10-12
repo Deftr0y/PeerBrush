@@ -1930,11 +1930,14 @@ fn decode_parts(
                                     // and clipping decoding still validate every field. The complete
                                     // native composite gate below verifies their combined appearance.
                                     // Hard shadows have stricter source/placement limits below.
+                                    // Ordinary layer opacity fades both paint and styles after
+                                    // rendering, preserving the original binary casting alpha.
+                                    // Reference: psd-tools/composite/composite.py::_EffectCanvas.
                                     let imported = if signature == b"8BIM" && section == 0 && blend == "normal" && imported_styles.is_empty() {
                                         styles::native_styles(payload, &source_patterns, depth).and_then(|(effects, pattern)| {
                                             if effects.iter().any(|e| matches!(e.kind.as_str(), "drop_shadow" | "inner_shadow"))
-                                                && (!maskdata.is_empty() || clipping != 0 || opacity != 1.) {
-                                                Err("Hard Photoshop shadows with masks, clipping or reduced layer opacity remain protected".into())
+                                                && (!maskdata.is_empty() || clipping != 0) {
+                                                Err("Hard Photoshop shadows with masks or clipping remain protected".into())
                                             } else { Ok((effects, pattern)) }
                                         })
                                     } else { Err("Photoshop styles with folders, layer blending or duplicate blocks remain protected".into()) };

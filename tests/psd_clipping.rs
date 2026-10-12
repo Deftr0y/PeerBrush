@@ -4891,6 +4891,16 @@ fn framed_shadow_fixture(
     payload: &[u8],
     merged: &[[u16; 4]],
 ) -> Vec<u8> {
+    framed_shadow_fixture_opacity(depth, source, payload, merged, 255)
+}
+
+fn framed_shadow_fixture_opacity(
+    depth: u16,
+    source: &[[u16; 4]],
+    payload: &[u8],
+    merged: &[[u16; 4]],
+    opacity: u8,
+) -> Vec<u8> {
     assert_eq!(source.len(), 16);
     assert_eq!(merged.len(), 16);
     let mut record = vec![];
@@ -4913,7 +4923,7 @@ fn framed_shadow_fixture(
         channels.extend(data);
     }
     record.extend(b"8BIMnorm");
-    record.extend([255, 0, 0, 0]);
+    record.extend([opacity, 0, 0, 0]);
     let mut extra = vec![0; 8];
     let name = b"Synthetic pixel shadow";
     extra.push(name.len() as u8);
@@ -5106,6 +5116,134 @@ fn photoshop_pixel_aligned_hard_shadows_retain_angles_sources_undo_and_standard_
                         assert!(protected.read_only);
                         assert_eq!(protected.bit_depth, depth);
                         assert!(protected.layers[0].effects.is_empty());
+                        assert!(psd::encode(&protected).is_err());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn photoshop_hard_shadows_fade_with_layer_opacity_after_casting_and_retain_native_sources() {
+    // Independent binary-alpha casts, then one fade of the complete layer.
+    // Applying layer opacity before casting would fade the shadow twice.
+    for depth in [8, 16] {
+        let source = std::array::from_fn::<_, 16, _>(|i| {
+            let (x, y) = (i % 4, i / 4);
+            [
+                native(12347 + i as u16 * 107, depth),
+                native(23459 + i as u16 * 113, depth),
+                native(34571 + i as u16 * 127, depth),
+                if (1..=2).contains(&x) && (1..=2).contains(&y) {
+                    65535
+                } else {
+                    0
+                },
+            ]
+        });
+        for (angle, distance, dx, dy) in [(180., 1f64, 1i32, 0i32), (45., 2., -1, 1)] {
+            for kind in ["DrSh", "IrSh"] {
+                for opacity in [0u8, 1, 64, 128, 254] {
+                    for enabled in [false, true] {
+                        let mut payload = hard_shadow_payload(kind, enabled, true, angle, 37., "");
+                        let at = payload.windows(4).position(|v| v == b"Dstn").unwrap() + 12;
+                        payload[at..at + 8].copy_from_slice(&distance.to_be_bytes());
+                        let style_alpha = (65535f64 * 0.37).round() as u16;
+                        let tint = [111u16 * 257, 67 * 257, 231 * 257];
+                        let mut merged = source;
+                        for i in 0..16 {
+                            let (x, y) = (i as i32 % 4 - dx, i as i32 / 4 - dy);
+                            let cast = (0..4).contains(&x)
+                                && (0..4).contains(&y)
+                                && source[(y * 4 + x) as usize][3] == 65535;
+                            if merged[i][3] == 0 {
+                                merged[i] = if enabled && kind == "DrSh" && cast {
+                                    [tint[0], tint[1], tint[2], native(style_alpha, depth)]
+                                } else {
+                                    [0; 4]
+                                };
+                            } else if enabled && kind == "IrSh" && !cast {
+                                for c in 0..3 {
+                                    merged[i][c] = native(
+                                        ((f64::from(source[i][c]) * f64::from(65535 - style_alpha)
+                                            + f64::from(tint[c]) * f64::from(style_alpha))
+                                            / 65535.)
+                                            .round() as u16,
+                                        depth,
+                                    );
+                                }
+                            }
+                            if opacity == 0 {
+                                merged[i] = [0; 4];
+                            } else if depth == 16 {
+                                merged[i][3] = (f64::from(merged[i][3])
+                                    * f64::from(f32::from(opacity) / 255.))
+                                .round() as u16;
+                            } else {
+                                merged[i][3] =
+                                    ((f32::from(merged[i][3] / 257) * (f32::from(opacity) / 255.))
+                                        .round() as u16)
+                                        * 257;
+                            }
+                        }
+                        let bytes = framed_shadow_fixture_opacity(
+                            depth, &source, &payload, &merged, opacity,
+                        );
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {kind} {angle} {opacity} {enabled}: {:?}",
+                            doc.warnings
+                        );
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+                        assert_eq!(doc.layers[0].opacity, f32::from(opacity) / 255.);
+                        assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+                        assert_eq!(rendered(&doc), merged.concat());
+                        let current = doc.export_png().unwrap();
+                        let settings = doc.layers[0].effects[0].settings.clone();
+                        let layer = doc.layers[0].id.clone();
+                        let mut engine = Engine::new();
+                        engine.doc = doc;
+                        engine
+                            .edit(
+                                "human",
+                                &[json!({"op":"layer.update","layer":layer,"opacity":1.})],
+                                None,
+                                None,
+                                "Restore layer opacity",
+                            )
+                            .unwrap();
+                        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+                        assert_eq!(engine.doc.layers[0].effects[0].settings, settings);
+                        assert_eq!(engine.undo.len(), 1);
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        for output in [
+                            psd::encode(&engine.doc).unwrap(),
+                            psd::encode_psb(&engine.doc).unwrap(),
+                        ] {
+                            // Compare independent standard white-matte words/alpha,
+                            // including zero opacity, without an RGB unmatting tolerance.
+                            assert_eq!(
+                                saved_composite(&output, depth),
+                                saved_composite(&bytes, depth)
+                            );
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                            assert_eq!(reopened.layers[0].opacity, f32::from(opacity) / 255.);
+                            assert_eq!(reopened.layers[0].effects[0].settings, settings);
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                        }
+                        // Opacity does not weaken descriptor protection, even
+                        // when neither the layer nor the effect is visible.
+                        let invalid = hard_shadow_payload(kind, false, true, angle, 37., "global");
+                        let protected = psd::decode(&framed_shadow_fixture_opacity(
+                            depth, &source, &invalid, &merged, opacity,
+                        ))
+                        .unwrap();
+                        assert!(protected.read_only);
                         assert!(psd::encode(&protected).is_err());
                     }
                 }
