@@ -5125,6 +5125,433 @@ fn photoshop_pixel_aligned_hard_shadows_retain_angles_sources_undo_and_standard_
 }
 
 #[test]
+fn photoshop_mixed_overlays_and_hard_shadows_keep_original_casts_sources_and_native_saves() {
+    for depth in [8, 16] {
+        let source = std::array::from_fn::<_, 16, _>(|i| {
+            let (x, y) = (i % 4, i / 4);
+            [
+                native(12347 + i as u16 * 107, depth),
+                native(23459 + i as u16 * 113, depth),
+                native(34571 + i as u16 * 127, depth),
+                if (1..=2).contains(&x) && (1..=2).contains(&y) {
+                    65535
+                } else {
+                    0
+                },
+            ]
+        });
+        for flags in 0u8..32 {
+            let enabled = std::array::from_fn(|i| flags & (1 << i) != 0);
+            for master in [false, true] {
+                let opacity = if flags % 2 == 0 { 255 } else { 128 };
+                let payload = mixed_shadow_overlay_payload(enabled, master, flags % 3 == 0, "");
+                // Independent per-pixel reference: each shadow reads source
+                // alpha, overlays tint only original coverage, and the outer
+                // shadow is placed beneath the complete styled image.
+                let mix = |under: [u16; 3], over: [u16; 3], percent: f64| {
+                    let alpha = (65535. * percent / 100.).round();
+                    std::array::from_fn(|c| {
+                        native(
+                            ((f64::from(under[c]) * (65535. - alpha) + f64::from(over[c]) * alpha)
+                                / 65535.)
+                                .round() as u16,
+                            depth,
+                        )
+                    })
+                };
+                let tint = [111u16 * 257, 67 * 257, 231 * 257];
+                let cast = |x: i32, y: i32| {
+                    (0..4).contains(&x)
+                        && (0..4).contains(&y)
+                        && source[(y * 4 + x) as usize][3] == 65535
+                };
+                let merged = std::array::from_fn::<_, 16, _>(|i| {
+                    let (x, y) = (i as i32 % 4, i as i32 / 4);
+                    let mut result = source[i];
+                    if result[3] != 0 {
+                        let mut rgb: [u16; 3] = result[..3].try_into().unwrap();
+                        if master {
+                            if enabled[0] {
+                                rgb = mix(rgb, tint, 43.);
+                            }
+                            if enabled[1] {
+                                rgb = mix(
+                                    rgb,
+                                    std::array::from_fn(|c| {
+                                        native(PATTERN[(x % 2) as usize][c], depth)
+                                    }),
+                                    50.,
+                                );
+                            }
+                            if enabled[2] {
+                                rgb = mix(
+                                    rgb,
+                                    [((f64::from(x) + 0.5) / 4. * 65535.).round() as u16; 3],
+                                    50.,
+                                );
+                            }
+                            if enabled[3] && !cast(x + 1, y - 1) {
+                                rgb = mix(rgb, tint, 37.);
+                            }
+                        }
+                        result[..3].copy_from_slice(&rgb);
+                    } else {
+                        result = if master && enabled[4] && cast(x - 1, y) {
+                            [
+                                tint[0],
+                                tint[1],
+                                tint[2],
+                                native((65535f64 * 0.23).round() as u16, depth),
+                            ]
+                        } else {
+                            [0; 4]
+                        };
+                    }
+                    result[3] = if depth == 16 {
+                        (f64::from(result[3]) * f64::from(f32::from(opacity) / 255.)).round() as u16
+                    } else {
+                        ((f32::from(result[3] / 257) * (f32::from(opacity) / 255.)).round() as u16)
+                            * 257
+                    };
+                    result
+                });
+                let bytes = inject_pattern(
+                    framed_shadow_fixture_opacity(depth, &source, &payload, &merged, opacity),
+                    depth,
+                    &pattern_resource(depth, "synthetic-pattern"),
+                    false,
+                );
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(
+                    !doc.read_only,
+                    "{depth} {flags} {master}: {:?}",
+                    doc.warnings
+                );
+                assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+                assert_eq!(rendered(&doc), merged.concat());
+                assert_eq!(
+                    doc.layers[0]
+                        .effects
+                        .iter()
+                        .map(|e| e.kind.as_str())
+                        .collect::<Vec<_>>(),
+                    [
+                        "color_overlay",
+                        "pattern_overlay",
+                        "gradient_overlay",
+                        "inner_shadow",
+                        "drop_shadow"
+                    ]
+                );
+                assert_eq!(
+                    doc.layers[0]
+                        .effects
+                        .iter()
+                        .map(|e| e.enabled)
+                        .collect::<Vec<_>>(),
+                    enabled.map(|v| master && v)
+                );
+                let tile = peerbrush::effects::patterns::get(
+                    doc.layers[0].effects[1].settings["bitmap_png"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(tile.depth, depth);
+                for x in 0..2 {
+                    assert_eq!(
+                        tile.sample(x as f64, 0., &doc.layers[0].effects[1].settings),
+                        PATTERN[x].map(|v| native(v, depth))
+                    );
+                }
+                let definitions = doc.layers[0]
+                    .effects
+                    .iter()
+                    .map(|e| (e.kind.clone(), e.settings.clone(), e.enabled))
+                    .collect::<Vec<_>>();
+                let current = doc.export_png().unwrap();
+                let layer = doc.layers[0].id.clone();
+                let inner = doc.layers[0].effects[3].id.clone();
+                let mut engine = Engine::new();
+                engine.doc = doc;
+                engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":inner,"enabled":!(master && enabled[3])})], None, None, "Mixed inner bypass").unwrap();
+                assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+                assert_eq!(engine.undo.len(), 1);
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.export_png().unwrap(), current);
+                for output in [
+                    psd::encode(&engine.doc).unwrap(),
+                    psd::encode_psb(&engine.doc).unwrap(),
+                ] {
+                    assert_eq!(
+                        saved_composite(&output, depth),
+                        saved_composite(&bytes, depth)
+                    );
+                    let reopened = psd::decode(&output).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                    assert_eq!(
+                        reopened.layers[0]
+                            .effects
+                            .iter()
+                            .map(|e| (e.kind.clone(), e.settings.clone(), e.enabled))
+                            .collect::<Vec<_>>(),
+                        definitions
+                    );
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                    let standard = psd::decode(&ordinary(&output)).unwrap();
+                    assert!(!standard.read_only);
+                    assert_eq!(standard.export_png().unwrap(), current);
+                }
+                // An opaque original source sample cannot be hidden by matte
+                // normalization; a one-word discrepancy retains protection.
+                let mut mismatch = bytes;
+                let at = mismatch.len() - 64 * usize::from(depth / 8)
+                    + 5 * usize::from(depth / 8)
+                    + usize::from(depth == 16);
+                mismatch[at] ^= 1;
+                let protected = psd::decode(&mismatch).unwrap();
+                assert!(protected.read_only);
+                assert!(psd::encode(&protected).is_err());
+            }
+        }
+    }
+}
+
+fn mixed_shadow_overlay_payload(
+    enabled: [bool; 5],
+    master: bool,
+    list: bool,
+    variant: &str,
+) -> Vec<u8> {
+    let list_variant = format!("list:{variant}");
+    let sources = [
+        (
+            if list { "dropShadowMulti" } else { "DrSh" },
+            if list { b"VlLs" } else { b"Objc" },
+            hard_shadow_payload(
+                "DrSh",
+                enabled[4],
+                master,
+                180.,
+                23.,
+                if list { "list" } else { "" },
+            ),
+        ),
+        ("GrFl", b"Objc", gradient_payload(false, None, 0.)),
+        (
+            if list { "innerShadowMulti" } else { "IrSh" },
+            if list { b"VlLs" } else { b"Objc" },
+            hard_shadow_payload(
+                "IrSh",
+                enabled[3],
+                master,
+                45.,
+                37.,
+                if list { &list_variant } else { variant },
+            ),
+        ),
+        (
+            "SoFi",
+            b"Objc",
+            overlay_payload(true, enabled[0], [111., 67., 231.]),
+        ),
+        (
+            "patternFill",
+            b"Objc",
+            pattern_payload(enabled[1], "synthetic-pattern", "", 100.),
+        ),
+    ];
+    let mut entries = vec![("masterFXSwitch", b"bool", vec![u8::from(master)])];
+    for (key, kind, source) in sources {
+        let needle = [key.as_bytes(), kind].concat();
+        let at = source
+            .windows(needle.len())
+            .position(|v| v == needle)
+            .unwrap();
+        let mut definition = source[at + needle.len()..].to_vec();
+        if key == "GrFl" {
+            let at = definition
+                .windows(8)
+                .position(|v| v == b"enabbool")
+                .unwrap()
+                + 8;
+            definition[at] = u8::from(enabled[2]);
+        }
+        if ["SoFi", "GrFl", "patternFill"].contains(&key) {
+            let percent: f64 = if key == "SoFi" { 43. } else { 50. };
+            let at = definition
+                .windows(12)
+                .position(|v| v == b"OpctUntF#Prc")
+                .unwrap()
+                + 12;
+            definition[at..at + 8].copy_from_slice(&percent.to_be_bytes());
+        }
+        if ["IrSh", "innerShadowMulti"].contains(&key) {
+            if let Some(at) = definition.windows(12).position(|v| v == b"DstnUntF#Pxl") {
+                definition[at + 12..at + 20].copy_from_slice(&2f64.to_be_bytes());
+            }
+        }
+        entries.push((key, kind, definition));
+    }
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        overlay_descriptor("Lefx", entries),
+    ]
+    .concat()
+}
+
+#[test]
+fn photoshop_mixed_overlays_and_shadows_protect_unsupported_disabled_definitions() {
+    for depth in [8, 16] {
+        let source = [[
+            native(12347, depth),
+            native(23459, depth),
+            native(34571, depth),
+            65535,
+        ]; 16];
+        for list in [false, true] {
+            for variant in [
+                "global",
+                "antialias",
+                "angle",
+                "choke",
+                "size",
+                "noise",
+                "contour",
+                "unknown",
+                "missing",
+                "multiple_list",
+                "empty_list",
+                "boolean_list",
+                "wrong_list_class",
+                "both_aliases",
+            ] {
+                if !list
+                    && [
+                        "multiple_list",
+                        "empty_list",
+                        "boolean_list",
+                        "wrong_list_class",
+                        "both_aliases",
+                    ]
+                    .contains(&variant)
+                {
+                    continue;
+                }
+                let payload = mixed_shadow_overlay_payload([false; 5], false, list, variant);
+                let bytes = inject_pattern(
+                    framed_shadow_fixture(depth, &source, &payload, &source),
+                    depth,
+                    &pattern_resource(depth, "synthetic-pattern"),
+                    false,
+                );
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(doc.read_only, "{depth} {list} {variant}");
+                assert_eq!(rendered(&doc), source.concat());
+                assert!(doc.layers[0].effects.is_empty());
+                assert!(psd::encode(&doc).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn photoshop_mixed_shadow_stacks_enforce_shared_effect_count_and_original_alpha_limits() {
+    let definition = |key: &str, source: Vec<u8>| {
+        let needle = [key.as_bytes(), b"Objc"].concat();
+        let at = source
+            .windows(needle.len())
+            .position(|v| v == needle)
+            .unwrap();
+        source[at + needle.len()..].to_vec()
+    };
+    let color = definition("SoFi", overlay_payload(true, false, [111., 67., 231.]));
+    let gradient = definition("GrFl", gradient_payload(false, None, 0.));
+    let inner = definition(
+        "IrSh",
+        hard_shadow_payload("IrSh", false, false, 180., 37., ""),
+    );
+    let drop = definition(
+        "DrSh",
+        hard_shadow_payload("DrSh", false, false, 180., 23., ""),
+    );
+    let list = |definition: &[u8], count: u32| {
+        let mut bytes = count.to_be_bytes().to_vec();
+        for _ in 0..count {
+            bytes.extend(b"Objc");
+            bytes.extend(definition);
+        }
+        bytes
+    };
+    for depth in [8, 16] {
+        let source = [[
+            native(12347, depth),
+            native(23459, depth),
+            native(34571, depth),
+            65535,
+        ]; 16];
+        for gradient_count in [14, 15, 16] {
+            let payload = [
+                0u32.to_be_bytes().to_vec(),
+                16u32.to_be_bytes().to_vec(),
+                overlay_descriptor(
+                    "Lefx",
+                    vec![
+                        ("masterFXSwitch", b"bool", vec![0]),
+                        ("solidFillMulti", b"VlLs", list(&color, 16)),
+                        (
+                            "gradientFillMulti",
+                            b"VlLs",
+                            list(&gradient, gradient_count),
+                        ),
+                        ("IrSh", b"Objc", inner.clone()),
+                        ("DrSh", b"Objc", drop.clone()),
+                    ],
+                ),
+            ]
+            .concat();
+            let doc =
+                psd::decode(&framed_shadow_fixture(depth, &source, &payload, &source)).unwrap();
+            assert_eq!(
+                doc.read_only,
+                gradient_count != 14,
+                "{depth} {gradient_count}: {:?}",
+                doc.warnings
+            );
+            assert_eq!(rendered(&doc), source.concat());
+            if gradient_count == 14 {
+                assert_eq!(doc.layers[0].effects.len(), 32);
+                assert!(doc.layers[0].effects.iter().all(|e| !e.enabled));
+                let reopened = psd::decode(&psd::encode(&doc).unwrap()).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.layers[0].effects.len(), 32);
+            } else {
+                assert!(psd::encode(&doc).is_err());
+            }
+        }
+        let payload = mixed_shadow_overlay_payload([false; 5], false, false, "");
+        let mut partial = source;
+        partial[5][3] = native(12347, depth);
+        let bytes = inject_pattern(
+            framed_shadow_fixture(depth, &partial, &payload, &partial),
+            depth,
+            &pattern_resource(depth, "synthetic-pattern"),
+            false,
+        );
+        let protected = psd::decode(&bytes).unwrap();
+        assert!(protected.read_only);
+        assert!(protected
+            .warnings
+            .iter()
+            .any(|v| v.contains("partial-alpha")));
+        assert_eq!(protected.bit_depth, depth);
+        assert!(psd::encode(&protected).is_err());
+    }
+}
+
+#[test]
 fn photoshop_hard_shadows_fade_with_layer_opacity_after_casting_and_retain_native_sources() {
     // Independent binary-alpha casts, then one fade of the complete layer.
     // Applying layer opacity before casting would fade the shadow twice.

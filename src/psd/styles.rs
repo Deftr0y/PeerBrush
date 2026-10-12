@@ -365,14 +365,6 @@ pub(super) fn native_styles(
         .as_object()
         .ok_or("Invalid effects object")?;
     if items.keys().any(|key| {
-        matches!(
-            key.as_str(),
-            "DrSh" | "IrSh" | "dropShadowMulti" | "innerShadowMulti"
-        )
-    }) {
-        return Ok((vec![hard_shadow(&parsed)?], None));
-    }
-    if items.keys().any(|key| {
         !matches!(
             key.as_str(),
             "masterFXSwitch"
@@ -382,6 +374,10 @@ pub(super) fn native_styles(
                 | "patternFill"
                 | "GrFl"
                 | "gradientFillMulti"
+                | "IrSh"
+                | "innerShadowMulti"
+                | "DrSh"
+                | "dropShadowMulti"
         )
     }) {
         return Err("Unsupported Photoshop style in overlay stack".into());
@@ -443,14 +439,43 @@ pub(super) fn native_styles(
             }
         }
     }
+    // Overlays preserve alpha. A hard Inner Shadow can therefore cast from
+    // that same original alpha after the overlay colors have been applied.
+    // Apply the single Normal Drop Shadow last: its behind compositing keeps
+    // it beneath the styled image, and its grown alpha cannot feed an inner
+    // shadow or become overlay coverage. The caller still requires binary
+    // source alpha, Normal layer blend, no masks/clipping and an exact composite.
+    // Reference: Krita kis_layer_style_projection_plane.cpp (overlay inner
+    // shadow and stylesBefore drop shadow). Multiple casts per family remain protected.
+    for keys in [["IrSh", "innerShadowMulti"], ["DrSh", "dropShadowMulti"]] {
+        let present = keys
+            .iter()
+            .filter(|key| items.contains_key(**key))
+            .collect::<Vec<_>>();
+        if present.is_empty() {
+            continue;
+        }
+        if present.len() != 1 {
+            return Err("Ambiguous Photoshop single/multiple shadow aliases".into());
+        }
+        if effects.len() == 32 {
+            return Err("Photoshop style stack exceeds the shared 32-effect limit".into());
+        }
+        let mut isolated = parsed.clone();
+        isolated["items"].as_object_mut().unwrap().retain(|key, _| {
+            matches!(key.as_str(), "masterFXSwitch" | "Scl ") || key == *present[0]
+        });
+        effects.push(hard_shadow(&isolated)?);
+    }
     if effects.is_empty() {
         return Err("No supported Photoshop overlay definitions".into());
     }
     Ok((effects, pattern_index))
 }
 // Shadow fields follow psd-tools/api/effects.py and Krita's ASL serializer.
-// Keep this separate from overlay stacks: exterior/interior combinations need
-// independent effect-source and backdrop handling rather than sequential tinting.
+// Validate each isolated shadow definition. The native stack builder keeps
+// casts bound to original alpha; independent exterior backdrop blends and
+// multiple casts in one family still require separate source/backdrop handling.
 fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
     let items = root["items"].as_object().ok_or("Invalid effects object")?;
     let shadow_keys = ["DrSh", "dropShadowMulti", "IrSh", "innerShadowMulti"];
