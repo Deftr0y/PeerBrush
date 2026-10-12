@@ -326,6 +326,174 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
 mod tests {
     use super::*;
     #[test]
+    fn held_style_parameters_require_fresh_press_after_cancellation() {
+        for depth in [8, 16] {
+            for interruption in ["revision", "identity", "escape", "focus", "focus_return"] {
+                let ctx = egui::Context::default();
+                let mut engine = crate::engine::Engine::new();
+                engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                engine.doc.layers[0]
+                    .pixels
+                    .set16(12, 16, [12347, 23459, 34571, 65535]);
+                let layer = engine.doc.layers[0].id.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"effect.add","layer":layer,"kind":"color_overlay"})],
+                        None,
+                        None,
+                        "Fixture",
+                    )
+                    .unwrap();
+                engine.undo.clear();
+                let effect = engine.doc.layers[0].effects[0].id.clone();
+                let shared = Arc::new(std::sync::Mutex::new(engine));
+                let mut app = PeerBrush::init(
+                    &ctx,
+                    shared.clone(),
+                    crate::server::Connection {
+                        port: 0,
+                        token: String::new(),
+                        state_dir: Default::default(),
+                        instance_lock: None,
+                        availability: Default::default(),
+                    },
+                );
+                app.selected = layer.clone();
+                app.selection_layers = [layer.clone()].into_iter().collect();
+                app.effect_selected = Some((layer.clone(), false, effect));
+                let mut time = 0.;
+                let mut draw = |app: &mut PeerBrush, events| {
+                    time += 0.05;
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1100., 1000.),
+                            )),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                let start = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "75%" => {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()).center())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let button = |pos, pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                draw(
+                    &mut app,
+                    vec![egui::Event::PointerMoved(start), button(start, true)],
+                );
+                let moved = start - Vec2::new(25., 0.);
+                draw(&mut app, vec![egui::Event::PointerMoved(moved)]);
+                draw(&mut app, vec![egui::Event::PointerMoved(moved)]);
+                assert!(app.parameter_gesture.is_some());
+                let mut events = vec![];
+                match interruption {
+                    "revision" => {
+                        shared
+                            .lock()
+                            .unwrap()
+                            .edit(
+                                "human",
+                                &[json!({"op":"layer.update","layer":layer,"name":"Later work"})],
+                                None,
+                                None,
+                                "Later edit",
+                            )
+                            .unwrap();
+                    }
+                    "identity" => {
+                        shared.lock().unwrap().doc.id = crate::engine::id();
+                    }
+                    "escape" => events.push(egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }),
+                    "focus" => events.push(egui::Event::WindowFocused(false)),
+                    _ => events.extend([
+                        egui::Event::WindowFocused(false),
+                        egui::Event::WindowFocused(true),
+                    ]),
+                }
+                let later = shared.lock().unwrap().doc.clone();
+                let history = shared.lock().unwrap().undo.len();
+                draw(&mut app, events);
+                let late = moved - Vec2::new(22., 0.);
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::WindowFocused(true),
+                        egui::Event::PointerMoved(late),
+                    ],
+                );
+                draw(&mut app, vec![egui::Event::PointerMoved(late)]);
+                assert!(
+                    app.parameter_gesture.is_none(),
+                    "{depth}/{interruption}: held gesture rebound"
+                );
+                draw(&mut app, vec![button(late, false)]);
+                assert_eq!(
+                    serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&later).unwrap()
+                );
+                assert_eq!(shared.lock().unwrap().undo.len(), history);
+                // A new physical press may start another rendered preview.
+                draw(&mut app, vec![]);
+                draw(
+                    &mut app,
+                    vec![egui::Event::PointerMoved(start), button(start, true)],
+                );
+                draw(&mut app, vec![egui::Event::PointerMoved(moved)]);
+                draw(&mut app, vec![egui::Event::PointerMoved(moved)]);
+                let commands = app
+                    .parameter_gesture
+                    .as_ref()
+                    .expect("Fresh retry")
+                    .commands
+                    .clone();
+                let draft = crate::engine::Engine::preview_edits(later.clone(), &commands).unwrap();
+                assert_ne!(draft.export_png().unwrap(), later.export_png().unwrap());
+                assert_eq!(shared.lock().unwrap().undo.len(), history);
+                draw(&mut app, vec![button(moved, false)]);
+                let mut engine = shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), history + 1);
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    draft.export_png().unwrap()
+                );
+                engine.undo("human").unwrap();
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    later.export_png().unwrap()
+                );
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    later.layers[0].pixels.rgba16()
+                );
+            }
+        }
+    }
+    #[test]
     fn style_opacity_drag_previews_native_pixels_and_commits_one_undo() {
         for depth in [8, 16] {
             for kind in ["color_overlay", "drop_shadow", "pattern_overlay", "texture"] {

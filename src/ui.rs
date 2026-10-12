@@ -431,6 +431,7 @@ pub struct PeerBrush {
     thumb_pending: HashMap<String, u64>,
     thumb_document: String,
     parameter_gesture: Option<ParameterEdit>,
+    cancelled_parameter: Option<egui::Id>,
     blend_hover: Option<(String, String)>,
     transient: Vec<Value>,
     points: Vec<[f32; 2]>,
@@ -763,6 +764,7 @@ impl PeerBrush {
             thumb_pending: HashMap::new(),
             thumb_document: String::new(),
             parameter_gesture: None,
+            cancelled_parameter: None,
             blend_hover: None,
             transient: vec![],
             points: vec![],
@@ -1210,6 +1212,9 @@ impl PeerBrush {
         let Some(edit) = self.parameter_gesture.take() else {
             return;
         };
+        if cancel {
+            self.cancelled_parameter = Some(edit.control);
+        }
         self.last_preview = None;
         if let Some(ctx) = &edit.typing {
             controls::cancel_number_edit(ctx, edit.control);
@@ -1219,6 +1224,7 @@ impl PeerBrush {
         }
         let mut engine = self.shared.lock().unwrap();
         if engine.doc.id != edit.document || engine.doc.revision != edit.revision {
+            self.cancelled_parameter = Some(edit.control);
             self.message = "Image changed during parameter edit · preview cancelled".into();
             return;
         }
@@ -1234,6 +1240,11 @@ impl PeerBrush {
             .unwrap_or_else(|error| error);
     }
     fn layer_parameter(&mut self, extra: Value, label: &str, response: &egui::Response) {
+        // A cancelled control must not rebind a still-held pointer to newer work.
+        // The next physical press clears this transient guard in draw().
+        if self.cancelled_parameter == Some(response.id) {
+            return;
+        }
         let down = response.is_pointer_button_down_on() || response.dragged();
         let mut command = extra;
         if command["op"] != "selection.wand_update" {
@@ -1330,6 +1341,7 @@ impl PeerBrush {
                 }
                 Err(error) => {
                     self.parameter_gesture = None;
+                    self.cancelled_parameter = Some(response.id);
                     self.message = error;
                 }
             }
@@ -4752,9 +4764,18 @@ impl PeerBrush {
             return;
         }
         pattern_source::poll(self, ctx);
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            self.cancelled_parameter = None;
+        }
+        let parameter_focus_lost = ctx.input(|i| {
+            !i.focused
+                || i.events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        });
         if self.lifecycle.is_some() || self.lifecycle_frame {
             // The review owns keyboard/canvas input for the entire frame.
-        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        } else if parameter_focus_lost || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.finish_parameter(true);
         } else if !ctx.input(|i| i.pointer.any_down())
             && !self.parameter_gesture.as_ref().is_some_and(|edit| {
