@@ -222,6 +222,26 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                     continue;
                 }
                 controls::label(ui, label);
+                if matches!(key, "angle" | "bitmap_angle") {
+                    let mut degrees = value[key].as_f64().or_else(|| defaults[key].as_f64()).unwrap_or(0.);
+                    let (name, help) = if key == "bitmap_angle" {
+                        ("Tile angle", "Tile rotation: 0° points right; +90° rotates clockwise.")
+                    } else {
+                        match kind {
+                            "drop_shadow" | "inner_shadow" => ("Shadow direction", "Shadow displacement: 0° points right; +90° points up. The light is opposite the shadow direction. Distance is independent."),
+                            "bevel_emboss" | "texture" => ("Light angle", "Light direction: 0° points right; +90° points up. Altitude and distance remain independent."),
+                            "satin" => ("Satin direction", "Satin samples along this axis: 0° is horizontal; +90° is vertical. Distance is independent."),
+                            _ => ("Gradient angle", "Gradient direction: 0° points right; +90° points up. Scale and offset remain independent."),
+                        }
+                    };
+                    let response = controls::angle(ui, key, &mut degrees, key == "bitmap_angle", name, help);
+                    if response.changed() || response.double_clicked() || controls::number_editing(&response.ctx, response.id) {
+                        value[key] = json!(degrees);
+                        changed = Some(response);
+                    }
+                    ui.end_row();
+                    continue;
+                }
                 let multiplier = if suffix == "%" { 100. } else { 1. };
                 let mut n = value[key]
                     .as_f64()
@@ -325,6 +345,246 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn style_angle_dials_preview_native_sources_commit_once_and_type_exact_degrees() {
+        for depth in [8, 16] {
+            for (kind, key) in [
+                ("drop_shadow", "angle"),
+                ("inner_shadow", "angle"),
+                ("satin", "angle"),
+                ("bevel_emboss", "angle"),
+                ("gradient_overlay", "angle"),
+                ("texture", "angle"),
+                ("texture", "bitmap_angle"),
+                ("pattern_overlay", "bitmap_angle"),
+            ] {
+                let ctx = egui::Context::default();
+                let mut engine = crate::engine::Engine::new();
+                engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                for y in 7..22 {
+                    for x in 6..21 {
+                        engine.doc.layers[0].pixels.set16(
+                            x,
+                            y,
+                            [
+                                12347,
+                                23459 + x as u16 * 13,
+                                34571,
+                                if (x + y) % 3 == 0 { 32769 } else { 65535 },
+                            ],
+                        );
+                    }
+                }
+                let layer = engine.doc.layers[0].id.clone();
+                let mut settings = crate::effects::styles::defaults(kind);
+                if settings.get("distance").is_some() {
+                    settings["distance"] = json!(4.);
+                }
+                if settings.get("size").is_some() {
+                    settings["size"] = json!(1.);
+                }
+                if settings.get("angle").is_some() {
+                    settings["angle"] = json!(6.75);
+                }
+                if key == "bitmap_angle" {
+                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    let words = [
+                        65535, 0, 10001, 65535, 0, 65535, 30003, 65535, 50007, 10001, 0, 65535,
+                        10001, 30003, 50007, 32769,
+                    ];
+                    let png = if depth == 16 {
+                        crate::raster::png16(2, 2, &words)
+                    } else {
+                        crate::raster::png(
+                            2,
+                            2,
+                            &words
+                                .into_iter()
+                                .map(crate::raster::project16)
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    .unwrap();
+                    settings = json!({"pattern":"bitmap","bitmap_png":STANDARD.encode(png),"sampling":"nearest","bitmap_scale":3.});
+                    if kind == "texture" {
+                        settings["angle"] = json!(6.75);
+                    }
+                }
+                settings[key] = json!(17.25);
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"effect.add","layer":layer,"kind":kind,"settings":settings})],
+                        None,
+                        None,
+                        "Fixture",
+                    )
+                    .unwrap();
+                engine.undo.clear();
+                let before = engine.doc.clone();
+                assert_eq!(before.bit_depth, depth);
+                let effect = before.layers[0].effects[0].id.clone();
+                let shared = Arc::new(std::sync::Mutex::new(engine));
+                let mut app = PeerBrush::init(
+                    &ctx,
+                    shared.clone(),
+                    crate::server::Connection {
+                        port: 0,
+                        token: String::new(),
+                        state_dir: Default::default(),
+                        instance_lock: None,
+                        availability: Default::default(),
+                    },
+                );
+                app.selected = layer.clone();
+                app.selection_layers = [layer.clone()].into_iter().collect();
+                app.effect_selected = Some((layer, false, effect));
+                let mut time = 0.;
+                let mut draw = |app: &mut PeerBrush, events| {
+                    time += 0.1;
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1100., 1800.),
+                            )),
+                            time: Some(time),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    )
+                };
+                draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                let number = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "17.25°" => {
+                            Some(Rect::from_min_size(text.pos, text.galley.size()).left_center())
+                        }
+                        _ => None,
+                    })
+                    .expect("Dedicated exact-angle control");
+                let center = number - Vec2::new(25., 0.);
+                let start = center + Vec2::new(11., 0.);
+                let end = center - Vec2::new(0., 11.);
+                let button = |pos, pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                draw(
+                    &mut app,
+                    vec![egui::Event::PointerMoved(start), button(start, true)],
+                );
+                draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                draw(&mut app, vec![egui::Event::PointerMoved(end)]);
+                let commands = app
+                    .parameter_gesture
+                    .as_ref()
+                    .expect("Angle draft")
+                    .commands
+                    .clone();
+                let draft =
+                    crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
+                assert_eq!(
+                    draft.layers[0].effects[0].settings[key],
+                    json!(if key == "bitmap_angle" { -90. } else { 90. }),
+                    "{depth}/{kind}/{key}"
+                );
+                assert_ne!(
+                    draft.export_png().unwrap(),
+                    before.export_png().unwrap(),
+                    "{depth}/{kind}/{key}"
+                );
+                assert!(shared.lock().unwrap().undo.is_empty());
+                assert_eq!(
+                    serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                draw(&mut app, vec![button(end, false)]);
+                {
+                    let mut engine = shared.lock().unwrap();
+                    assert_eq!(engine.undo.len(), 1);
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        draft.export_png().unwrap()
+                    );
+                    assert_eq!(
+                        engine.doc.layers[0].pixels.rgba16(),
+                        before.layers[0].pixels.rgba16()
+                    );
+                    engine.undo("human").unwrap();
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        before.export_png().unwrap()
+                    );
+                    engine.redo("human").unwrap();
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        draft.export_png().unwrap()
+                    );
+                }
+                // Pointer focus can open the exact editor through Enter without a mouse double-click.
+                draw(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                );
+                assert!(app
+                    .parameter_gesture
+                    .as_ref()
+                    .is_some_and(|edit| edit.typing.is_some()));
+                draw(
+                    &mut app,
+                    vec![
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            physical_key: None,
+                            pressed: false,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        },
+                        egui::Event::Text("13.1234567890123".into()),
+                    ],
+                );
+                assert_eq!(shared.lock().unwrap().undo.len(), 1);
+                draw(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                );
+                let mut engine = shared.lock().unwrap();
+                assert_eq!(
+                    engine.doc.layers[0].effects[0].settings[key].as_f64(),
+                    Some(13.1234567890123)
+                );
+                assert_eq!(engine.undo.len(), 2);
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                engine.undo("human").unwrap();
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    draft.export_png().unwrap()
+                );
+            }
+        }
+    }
     #[test]
     fn held_style_parameters_require_fresh_press_after_cancellation() {
         for depth in [8, 16] {

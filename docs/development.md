@@ -551,3 +551,7 @@ The bounded hard Normal Drop Shadow importer now retains explicit true/false lay
 ### Cancelled held effect parameters (unreleased)
 
 A focused reproduction showed that a held effect slider could restart after a shared edit cancelled its source-bound draft. A transient control guard now requires a fresh pointer press after revision/document changes, Escape, focus loss (including loss and return in one input frame), or rejected shared previews. Continued motion and late release preserve later artwork, settings and history. No guard is stored in document sources. One new native8/16 RawInput check and affected style/typed-parameter checks passed for actual retry previews, one-step commits and exact source undo. Combined engine/codec/protocol and fresh native-workspace acceptance verification is pending.
+
+### Effects direction dials (unreleased)
+
+PB-106 directional settings now use compact radius controls paired with exact finite f64 degree entry. Pointer/keyboard input, optional snapping and wrapping update ordinary shared effect settings; numeric entry uses the existing source-bound provisional parameter lifecycle. Native8/16 focused gesture checks retain actual previews, one-step commits, exact undo/redo and original source samples. Direction conventions and research tradeoffs are documented in [layer styles](layer-styles.md#direction-controls-unreleased). Combined engine/codec/protocol and fresh native-workspace acceptance verification is pending; hierarchy and dedicated color pickers remain queued.

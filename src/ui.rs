@@ -1273,7 +1273,12 @@ impl PeerBrush {
         } else {
             vec![command]
         };
-        if response.double_clicked() && controls::number_editing(&response.ctx, response.id) {
+        if controls::number_editing(&response.ctx, response.id)
+            && !self
+                .parameter_gesture
+                .as_ref()
+                .is_some_and(|edit| edit.control == response.id && edit.typing.is_some())
+        {
             self.finish_parameter(false);
             let doc = self.shared.lock().unwrap().doc.clone();
             self.parameter_gesture = Some(ParameterEdit {
