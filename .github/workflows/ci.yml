@@ -104,7 +104,23 @@ jobs:
       - run: cargo clippy --all-targets --locked
       - run: python scripts/test_package.py
       - run: python scripts/build_release.py
-      - run: python scripts/package.py
+      - name: Package and report archive sizes
+        shell: bash
+        run: |
+          python scripts/package.py
+          python - <<'PY'
+          import os, re
+          from pathlib import Path
+          rows = []
+          for archive in sorted(Path('dist').glob('PeerBrush-*.zip')):
+              if re.fullmatch(r'PeerBrush-[0-9A-Za-z.+-]{1,192}\.zip', archive.name):
+                  rows.append((archive.name, archive.stat().st_size))
+          for name, size in rows:
+              print(f'::notice title=Verified package archive bytes::{name}: {size}')
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as summary:
+              summary.write('\n### Package archive sizes\n\n')
+              summary.writelines(f'- `{name}`: {size:,} bytes\n' for name, size in rows)
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: PeerBrush-${{ runner.os }}

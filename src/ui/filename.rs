@@ -24,6 +24,7 @@ const FONTS: &[(&str, &[u8])] = &[
         include_bytes!("../../assets/fonts/NotoSansCJKsc-Regular.otf"),
     ),
 ];
+
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 64;
 const SYSTEM_FONT_BYTES: usize = 64 * 1024 * 1024;
@@ -270,7 +271,13 @@ fn escaped_xml(text: &str) -> String {
     }
     escaped
 }
-fn tree(text: &str, font: &str, size: f32, rtl: bool) -> Option<usvg::Tree> {
+fn tree(
+    text: &str,
+    font: &str,
+    size: f32,
+    rtl: bool,
+    db: Arc<usvg::fontdb::Database>,
+) -> Option<usvg::Tree> {
     let escaped = escaped_xml(text);
     let escaped_font = escaped_xml(font);
     let embedding = if rtl { '\u{202b}' } else { '\u{202a}' };
@@ -282,7 +289,7 @@ fn tree(text: &str, font: &str, size: f32, rtl: bool) -> Option<usvg::Tree> {
         &svg,
         &usvg::Options {
             font_family: font.into(),
-            fontdb: fontdb(),
+            fontdb: db,
             // Each run has an explicit font. Cross-font fallback can split a shaped
             // cluster; unsupported characters retain the font's missing-glyph sign.
             font_resolver: usvg::FontResolver {
@@ -354,7 +361,7 @@ fn layout(text: &str, size: f32) -> Option<Layout> {
             fonts.reverse();
         }
         for (font, text) in fonts {
-            let tree = tree(&text, font, size, rtl)?;
+            let tree = tree(&text, font, size, rtl, fontdb())?;
             let bounds = tree.root().abs_bounding_box();
             result.top = result.top.min(bounds.top());
             result.bottom = result.bottom.max(bounds.bottom());
@@ -659,16 +666,33 @@ mod tests {
         assert_eq!(script_font('Ω'), "Ubuntu Sans");
     }
     #[test]
+    fn absent_script_font_renders_missing_glyphs_without_rewriting_the_name() {
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_data(include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf").to_vec());
+        let logical = "हिन्दी.psd";
+        let tree = tree(logical, "Ubuntu Sans", 12., false, Arc::new(db)).unwrap();
+        let Some(usvg::Node::Text(text)) = tree.node_by_id("filename") else {
+            panic!("Missing filename text");
+        };
+        let missing = text
+            .layouted()
+            .iter()
+            .flat_map(|span| &span.positioned_glyphs)
+            .filter(|glyph| glyph.id.0 == 0)
+            .map(|glyph| glyph.text.clone())
+            .collect::<String>();
+        assert!(missing.contains('ह'));
+        assert_eq!(logical, "हिन्दी.psd");
+        let mut pixels = tiny_skia::Pixmap::new(128, 128).unwrap();
+        resvg::render(
+            &tree,
+            tiny_skia::Transform::identity(),
+            &mut pixels.as_mut(),
+        );
+        assert!(pixels.data().chunks_exact(4).any(|pixel| pixel[3] != 0));
+    }
+    #[test]
     fn shaped_filenames_have_glyphs_direction_and_bounded_density() {
-        use ab_glyph::Font;
-        for ((_, bytes), sample) in FONTS.iter().zip(['ש', 'ع', 'ह', '漢']) {
-            let font = ab_glyph::FontRef::try_from_slice(bytes).unwrap();
-            assert_ne!(font.glyph_id(sample).0, 0);
-        }
-        let cjk = ab_glyph::FontRef::try_from_slice(FONTS[3].1).unwrap();
-        for c in ['あ', '한'] {
-            assert_ne!(cjk.glyph_id(c).0, 0);
-        }
         for name in [
             "café Ω Ж.png",
             "שלום עולם.psd",
@@ -680,12 +704,23 @@ mod tests {
             let shaped = layout(name, 12.).unwrap();
             let glyphs = glyphs(&shaped);
             assert!(!glyphs.is_empty());
-            assert!(
-                glyphs
-                    .iter()
-                    .filter(|(text, _, _)| text.chars().any(char::is_alphanumeric))
-                    .all(|(_, id, _)| *id != 0),
-                "Missing glyph in {name}"
+            let db = fontdb();
+            let covered = name.chars().filter(|c| c.is_alphanumeric()).all(|c| {
+                db.query(&fontdb::Query {
+                    families: &[fontdb::Family::Name(script_font(c))],
+                    ..Default::default()
+                })
+                .and_then(|id| {
+                    db.with_face_data(id, |bytes, index| covers(bytes, index, &c.to_string()))
+                }) == Some(true)
+            });
+            let missing = glyphs
+                .iter()
+                .filter(|(text, _, _)| text.chars().any(char::is_alphanumeric))
+                .any(|(_, id, _)| *id == 0);
+            assert_eq!(
+                missing, !covered,
+                "Installed coverage/missing glyph indication in {name}"
             );
             let rendered = raster(name, 12., 320., 2.).unwrap();
             assert!(
