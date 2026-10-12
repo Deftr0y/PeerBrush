@@ -555,3 +555,7 @@ A focused reproduction showed that a held effect slider could restart after a sh
 ### Effects direction dials (unreleased)
 
 PB-106 directional settings now use compact radius controls paired with exact finite f64 degree entry. Pointer/keyboard input, optional snapping and wrapping update ordinary shared effect settings; numeric entry uses the existing source-bound provisional parameter lifecycle. Native8/16 focused gesture checks retain actual previews, one-step commits, exact undo/redo and original source samples. Direction conventions and research tradeoffs are documented in [layer styles](layer-styles.md#direction-controls-unreleased). Combined engine/codec/protocol and fresh native-workspace acceptance verification is pending; hierarchy and dedicated color pickers remain queued.
+
+### Independent expanded effect owners (unreleased)
+
+PB-106 Color/Mask stacks can retain multiple expanded effects. Primary names and strength rows remain distinct from compact indented settings; closing an inactive owner preserves the active inspector. Numeric ranges fit the remaining child column, without decorative guide borders. Per-project expansion stays in presentation state, outside history/PSD sources, and deleted owners are discarded. One new native8/16 narrow-stack input check and affected menu/angle checks passed for independent ownership, unchanged document/history, real management and rendered parameter previews. Combined engine/codec/protocol and fresh native-workspace acceptance verification is pending.

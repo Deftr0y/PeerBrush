@@ -272,6 +272,7 @@ struct ProjectView {
     mask: bool,
     mask_step: Option<String>,
     effect_selected: Option<(String, bool, String)>,
+    effect_expanded: HashSet<(String, bool, String)>,
     isolate: bool,
     collapsed: HashSet<String>,
     zoom: f32,
@@ -488,6 +489,7 @@ pub struct PeerBrush {
     collapsed: HashSet<String>,
     mask_step: Option<String>,
     effect_selected: Option<(String, bool, String)>,
+    effect_expanded: HashSet<(String, bool, String)>,
     activity_text: String,
     activity_changed: std::time::Instant,
     gizmo_handle: u8,
@@ -827,6 +829,7 @@ impl PeerBrush {
             collapsed: HashSet::new(),
             mask_step: None,
             effect_selected: None,
+            effect_expanded: HashSet::new(),
             activity_text: String::new(),
             activity_changed: std::time::Instant::now(),
             gizmo_handle: 0,
@@ -3694,6 +3697,7 @@ impl PeerBrush {
                 mask: self.mask,
                 mask_step: self.mask_step.clone(),
                 effect_selected: self.effect_selected.clone(),
+                effect_expanded: self.effect_expanded.clone(),
                 isolate: self.isolate,
                 collapsed: self.collapsed.clone(),
                 zoom: self.zoom,
@@ -3732,6 +3736,7 @@ impl PeerBrush {
             self.mask = view.mask;
             self.mask_step = view.mask_step;
             self.effect_selected = view.effect_selected;
+            self.effect_expanded = view.effect_expanded;
             self.set_solo(view.isolate);
             self.collapsed = view.collapsed;
             self.zoom = view.zoom;
@@ -3745,6 +3750,7 @@ impl PeerBrush {
             self.mask = false;
             self.mask_step = None;
             self.effect_selected = None;
+            self.effect_expanded.clear();
             self.set_solo(false);
             self.collapsed.clear();
             self.zoom = 1.;
@@ -4839,6 +4845,20 @@ impl PeerBrush {
             self.finish_parameter(true);
             self.message = "Image changed during parameter edit · preview cancelled".into();
         }
+        self.effect_expanded.retain(|(layer, mask, effect)| {
+            doc.layers
+                .iter()
+                .find(|entry| &entry.id == layer)
+                .is_some_and(|entry| {
+                    if *mask {
+                        entry.mask.as_ref().is_some_and(|channel| {
+                            channel.steps.iter().any(|step| &step.id == effect)
+                        })
+                    } else {
+                        entry.effects.iter().any(|step| &step.id == effect)
+                    }
+                })
+        });
         self.thumb_worker.document(&doc);
         if self.thumb_document != doc.id {
             self.retouch_source = None;

@@ -152,7 +152,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
         });
     }
     egui::Grid::new((ui.id(), "style controls"))
-        .spacing(Vec2::new(8., 6.))
+        .spacing(Vec2::new(6., 3.))
         .show(ui, |ui| {
             for (key, label, min, max, suffix) in [
                 ("opacity", "Opacity", 0., 1., "%"),
@@ -253,7 +253,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                     key,
                     &mut n,
                     min * multiplier..=max * multiplier,
-                    160.,
+                    160_f32.min(ui.available_width()).max(70.),
                     suffix,
                     if suffix == " px" { 1 } else { 0 },
                     false,

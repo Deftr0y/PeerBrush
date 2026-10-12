@@ -45,7 +45,7 @@ pub(super) fn settings(
         _ => vec![],
     };
     egui::Grid::new((ui.id(), "settings"))
-        .spacing(Vec2::new(8.0, 6.0))
+        .spacing(Vec2::new(6.0, 3.0))
         .show(ui, |ui| {
             for (key, label, min, max, suffix) in params {
                 controls::label(ui, label);
@@ -61,7 +61,7 @@ pub(super) fn settings(
                     key,
                     &mut value,
                     min * scale..=max * scale,
-                    160.0,
+                    160.0_f32.min(ui.available_width()).max(70.),
                     suffix,
                     if scale == 100.0 || ["radius", "spread", "hue", "levels"].contains(&key) {
                         0
@@ -101,7 +101,7 @@ pub(super) fn settings(
         let mut values: [f32; 3] =
             std::array::from_fn(|i| settings[band][i].as_f64().unwrap_or(0.0) as f32);
         egui::Grid::new((ui.id(), "balance axes"))
-            .spacing(Vec2::new(8.0, 6.0))
+            .spacing(Vec2::new(6.0, 3.0))
             .show(ui, |ui| {
                 for (i, label) in ["Cyan ↔ Red", "Magenta ↔ Green", "Yellow ↔ Blue"]
                     .into_iter()
@@ -152,7 +152,7 @@ pub(super) fn settings(
                         .id_salt("stroke")
                         .show(ui, |ui| {
                             egui::Grid::new("stroke params")
-                                .spacing(Vec2::new(8.0, 6.0))
+                                .spacing(Vec2::new(6.0, 3.0))
                                 .show(ui, |ui| {
                                     for (key, label, min, max, suffix, default) in [
                                         (
@@ -450,11 +450,26 @@ impl PeerBrush {
             .is_some_and(|(l, m, e)| l == layer && *m == mask && e == effect)
     }
     pub(super) fn select_effect(&mut self, layer: &str, mask: bool, effect: &str) {
-        self.effect_selected = if self.effect_is_selected(layer, mask, effect) {
-            None
+        self.finish_parameter(true);
+        let key = (layer.to_string(), mask, effect.to_string());
+        if self.effect_is_expanded(layer, mask, effect) {
+            self.effect_expanded.remove(&key);
+            if self.effect_is_selected(layer, mask, effect) {
+                self.effect_selected = None;
+            }
         } else {
-            Some((layer.into(), mask, effect.into()))
-        };
+            if let Some(selected) = &self.effect_selected {
+                self.effect_expanded.insert(selected.clone());
+            }
+            self.effect_expanded.insert(key.clone());
+            self.effect_selected = Some(key);
+        }
+    }
+    pub(super) fn effect_is_expanded(&self, layer: &str, mask: bool, effect: &str) -> bool {
+        self.effect_is_selected(layer, mask, effect)
+            || self
+                .effect_expanded
+                .contains(&(layer.to_string(), mask, effect.to_string()))
     }
     pub(super) fn effect_weight(
         &mut self,
@@ -491,13 +506,13 @@ impl PeerBrush {
         let width = (ui.available_width() - 120.0).clamp(24.0, 125.0);
         ui.add_sized(
             [width, 22.0],
-            egui::Button::new(RichText::new(name).size(12.0))
+            egui::Button::new(RichText::new(name).size(12.5).strong())
                 .selected(selected)
                 .frame(false)
                 .truncate(),
         )
         .on_hover_text(format!(
-            "{name} · Select to edit settings · click again to close · right-click for actions"
+            "{name} · Expand or collapse settings · Other effects can stay open · right-click for actions"
         ))
     }
     pub(super) fn effect_bake_menu(
@@ -615,6 +630,8 @@ impl PeerBrush {
             );
             let removed = !self.effect_present(&l.id, mask, effect);
             if removed {
+                self.effect_expanded
+                    .remove(&(l.id.clone(), mask, effect.to_string()));
                 if self.effect_is_selected(&l.id, mask, effect) {
                     self.effect_selected = None;
                 }
@@ -714,7 +731,7 @@ impl PeerBrush {
                             let title = Self::effect_title(
                                 ui,
                                 name,
-                                self.effect_is_selected(&l.id, true, &step.id),
+                                self.effect_is_expanded(&l.id, true, &step.id),
                             );
                             self.effect_bake_menu(&title, l, true, &step.id, index, doc.revision);
                             if title.clicked() {
@@ -729,59 +746,66 @@ impl PeerBrush {
                             self.effect_actions(ui, l, true, &step.id, index, doc.revision);
                             self.effect_weight(ui, &step.id, step.weight, true);
                         });
-                        if self.effect_is_selected(&l.id, true, &step.id) {
-                            if let Some(preview) = self.thumbnail_for(doc, &l.id, true, Some(index))
-                            {
-                                ui.add(egui::Image::new((preview.id(), Vec2::splat(40.0))))
-                                    .on_hover_text("Result through this effect");
-                            }
-                            if ["fill", "levels", "blur"].contains(&step.kind.as_str()) {
-                                let mut value = step.value;
-                                let range = match step.kind.as_str() {
-                                    "fill" => 0.0..=255.0,
-                                    "blur" => 0.0..=64.0,
-                                    _ => 0.1..=5.0,
-                                };
-                                ui.horizontal(|ui| {
-                                    controls::label(
-                                        ui,
-                                        if step.kind == "fill" {
-                                            "Value"
-                                        } else if step.kind == "blur" {
-                                            "Radius"
-                                        } else {
-                                            "Gamma"
-                                        },
-                                    );
-                                    let response = controls::range(
-                                        ui,
-                                        (&step.id, "value"),
-                                        &mut value,
-                                        range,
-                                        180.0,
-                                        if step.kind == "blur" { " px" } else { "" },
-                                        if step.kind == "levels" { 1 } else { 0 },
-                                        false,
-                                    );
-                                    if response.changed() || response.double_clicked() {
+                        if self.effect_is_expanded(&l.id, true, &step.id) {
+                            ui.spacing_mut().indent = 14.;
+                            ui.visuals_mut().indent_has_left_vline = false;
+                            ui.indent(("effect parameters", &step.id), |ui| {
+                                ui.spacing_mut().item_spacing.y = 3.;
+                                if let Some(preview) =
+                                    self.thumbnail_for(doc, &l.id, true, Some(index))
+                                {
+                                    ui.add(egui::Image::new((preview.id(), Vec2::splat(40.0))))
+                                        .on_hover_text("Result through this effect");
+                                }
+                                if ["fill", "levels", "blur"].contains(&step.kind.as_str()) {
+                                    let mut value = step.value;
+                                    let range = match step.kind.as_str() {
+                                        "fill" => 0.0..=255.0,
+                                        "blur" => 0.0..=64.0,
+                                        _ => 0.1..=5.0,
+                                    };
+                                    ui.horizontal(|ui| {
+                                        controls::label(
+                                            ui,
+                                            if step.kind == "fill" {
+                                                "Value"
+                                            } else if step.kind == "blur" {
+                                                "Radius"
+                                            } else {
+                                                "Gamma"
+                                            },
+                                        );
+                                        let response = controls::range(
+                                            ui,
+                                            (&step.id, "value"),
+                                            &mut value,
+                                            range,
+                                            180.0_f32.min(ui.available_width()).max(70.),
+                                            if step.kind == "blur" { " px" } else { "" },
+                                            if step.kind == "levels" { 1 } else { 0 },
+                                            false,
+                                        );
+                                        if response.changed() || response.double_clicked() {
+                                            self.layer_parameter(
+                                                json!({"step":step.id,"value":value}),
+                                                "Mask parameter",
+                                                &response,
+                                            );
+                                        }
+                                    });
+                                }
+                                if ["curves", "gaussian", "adjust"].contains(&step.kind.as_str()) {
+                                    let mut values = step.settings.clone();
+                                    if let Some(response) = settings(ui, &step.kind, &mut values) {
                                         self.layer_parameter(
-                                            json!({"step":step.id,"value":value}),
+                                            json!({"step":step.id,"settings":values}),
                                             "Mask parameter",
                                             &response,
                                         );
                                     }
-                                });
-                            }
-                            if ["curves", "gaussian", "adjust"].contains(&step.kind.as_str()) {
-                                let mut values = step.settings.clone();
-                                if let Some(response) = settings(ui, &step.kind, &mut values) {
-                                    self.layer_parameter(
-                                        json!({"step":step.id,"settings":values}),
-                                        "Mask parameter",
-                                        &response,
-                                    );
                                 }
-                            }
+                            });
+                            ui.add_space(5.);
                         }
                     });
                 }
@@ -832,7 +856,7 @@ impl PeerBrush {
                             let title = Self::effect_title(
                                 ui,
                                 effect_name(&effect.kind),
-                                self.effect_is_selected(&l.id, false, &effect.id),
+                                self.effect_is_expanded(&l.id, false, &effect.id),
                             );
                             self.effect_bake_menu(&title, l, false, &effect.id, index, revision);
                             if title.clicked() {
@@ -841,26 +865,32 @@ impl PeerBrush {
                             self.effect_actions(ui, l, false, &effect.id, index, revision);
                             self.effect_weight(ui, &effect.id, effect.weight, false);
                         });
-                        if self.effect_is_selected(&l.id, false, &effect.id) {
-                            if matches!(effect.kind.as_str(), "pattern_overlay" | "texture") {
-                                pattern_source::control(self, ui, l, effect, revision);
-                            }
-                            if effect.kind == "liquify"
-                                && ui
-                                    .button("Edit on canvas")
-                                    .on_hover_text("Paint an editable distortion")
-                                    .clicked()
-                            {
-                                self.activate_liquify(Some(effect.id.clone()));
-                            }
-                            let mut values = effect.settings.clone();
-                            if let Some(response) = settings(ui, &effect.kind, &mut values) {
-                                self.layer_parameter(
-                                    json!({"effect":effect.id,"settings":values}),
-                                    "Effect parameter",
-                                    &response,
-                                );
-                            }
+                        if self.effect_is_expanded(&l.id, false, &effect.id) {
+                            ui.spacing_mut().indent = 14.;
+                            ui.visuals_mut().indent_has_left_vline = false;
+                            ui.indent(("effect parameters", &effect.id), |ui| {
+                                ui.spacing_mut().item_spacing.y = 3.;
+                                if matches!(effect.kind.as_str(), "pattern_overlay" | "texture") {
+                                    pattern_source::control(self, ui, l, effect, revision);
+                                }
+                                if effect.kind == "liquify"
+                                    && ui
+                                        .button("Edit on canvas")
+                                        .on_hover_text("Paint an editable distortion")
+                                        .clicked()
+                                {
+                                    self.activate_liquify(Some(effect.id.clone()));
+                                }
+                                let mut values = effect.settings.clone();
+                                if let Some(response) = settings(ui, &effect.kind, &mut values) {
+                                    self.layer_parameter(
+                                        json!({"effect":effect.id,"settings":values}),
+                                        "Effect parameter",
+                                        &response,
+                                    );
+                                }
+                            });
+                            ui.add_space(5.);
                         }
                     });
                 }
@@ -979,6 +1009,96 @@ mod tests {
                     },
                 ],
             );
+        }
+    }
+    #[test]
+    fn expanded_color_and_mask_settings_keep_independent_owners_without_document_edits() {
+        for depth in [8, 16] {
+            for mask in [false, true] {
+                let (mut app, ctx, _, _) = menu_fixture(depth, mask);
+                let layer = app.selected.clone();
+                app.shared.lock().unwrap().edit("human", &[if mask {
+                    json!({"op":"mask.step.add","layer":layer,"kind":"blur","value":3.})
+                } else {
+                    json!({"op":"effect.add","layer":layer,"kind":"blur","settings":{"radius":3.}})
+                }], None, None, "Fixture").unwrap();
+                app.shared.lock().unwrap().undo.clear();
+                let before = app.shared.lock().unwrap().doc.clone();
+                let (first, second) = if mask {
+                    let steps = &before.layers[0].mask.as_ref().unwrap().steps;
+                    (
+                        steps
+                            .iter()
+                            .find(|step| step.kind == "levels")
+                            .unwrap()
+                            .id
+                            .clone(),
+                        steps
+                            .iter()
+                            .find(|step| step.kind == "blur")
+                            .unwrap()
+                            .id
+                            .clone(),
+                    )
+                } else {
+                    (
+                        before.layers[0]
+                            .effects
+                            .iter()
+                            .find(|effect| effect.kind == "adjust")
+                            .unwrap()
+                            .id
+                            .clone(),
+                        before.layers[0]
+                            .effects
+                            .iter()
+                            .find(|effect| effect.kind == "blur")
+                            .unwrap()
+                            .id
+                            .clone(),
+                    )
+                };
+                menu_frame(&mut app, &ctx, vec![]);
+                let output = menu_frame(&mut app, &ctx, vec![]);
+                let at = menu_label(
+                    &output,
+                    if mask {
+                        "Levels"
+                    } else {
+                        effect_name("adjust")
+                    },
+                );
+                menu_click(&mut app, &ctx, at);
+                let output = menu_frame(&mut app, &ctx, vec![]);
+                let at = menu_label(&output, if mask { "Feather" } else { effect_name("blur") });
+                menu_click(&mut app, &ctx, at);
+                let output = menu_frame(&mut app, &ctx, vec![]);
+                menu_label(&output, if mask { "Gamma" } else { "Brightness" });
+                menu_label(&output, "Radius");
+                assert!(app.effect_is_expanded(&layer, mask, &first));
+                assert!(app.effect_is_expanded(&layer, mask, &second));
+                assert!(app.effect_is_selected(&layer, mask, &second));
+                // Closing another owner's settings keeps the active inspector and target.
+                let at = menu_label(
+                    &output,
+                    if mask {
+                        "Levels"
+                    } else {
+                        effect_name("adjust")
+                    },
+                );
+                menu_click(&mut app, &ctx, at);
+                menu_frame(&mut app, &ctx, vec![]);
+                assert!(!app.effect_is_expanded(&layer, mask, &first));
+                assert!(app.effect_is_expanded(&layer, mask, &second));
+                assert!(app.effect_is_selected(&layer, mask, &second));
+                let engine = app.shared.lock().unwrap();
+                assert!(engine.undo.is_empty());
+                assert_eq!(
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+            }
         }
     }
     fn open_invert_menu(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
@@ -1454,7 +1574,7 @@ fn channel_clamp_settings(ui: &mut egui::Ui, settings: &mut Value) -> Option<egu
         }
     });
     egui::Grid::new((ui.id(), "clamp bounds"))
-        .spacing(Vec2::new(8.0, 6.0))
+        .spacing(Vec2::new(6.0, 3.0))
         .show(ui, |ui| {
             for (key, label, original, limit) in [
                 ("minimum", "Minimum", minimum, 0.0..=maximum as f32 * 100.0),
