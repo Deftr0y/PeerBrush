@@ -455,15 +455,28 @@ mod tests {
             assert!(!shared.lock().unwrap().closed);
             click(&mut app, &ctx, false, 0);
             click(&mut app, &ctx, true, 0);
-            wait_save(&mut app, &ctx, &shared, before.revision);
-            for _ in 0..20 {
+            // Closing clears the engine's revision and sources. A fast save
+            // can finish and close in the same frame; observe the final state
+            // rather than relying on the transient saved_revision marker.
+            for _ in 0..200 {
                 frame(&mut app, &ctx, vec![]);
                 if shared.lock().unwrap().closed {
                     break;
                 }
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(shared.lock().unwrap().closed);
+            assert!(
+                shared.lock().unwrap().closed,
+                "Reviewed close did not finish: {}",
+                app.message
+            );
             let decoded = crate::psd::decode(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(!decoded.read_only);
+            assert_eq!(decoded.bit_depth, depth);
+            assert_eq!(
+                decoded.layers[0].pixels.rgba16(),
+                before.layers[0].pixels.rgba16()
+            );
             assert_eq!(decoded.export_png().unwrap(), before.export_png().unwrap());
             assert_eq!(decoded.layers[0].effects.len(), 1);
             let state = app.connection.state_dir.clone();
