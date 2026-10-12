@@ -1,5 +1,7 @@
 # PeerBrush development
 
+- Follow the [development guide](docs/development-guide.md) for branch names, pull request targets, verification and promotion. Never create branches under `codex/` (in any capitalization). Use `feature/<version>/<topic>` or `fix/<version>/<topic>`, based on the matching `version/<version>` branch. Promote through `version/<version>` → `dev` → `main`; preserve shared history with merge commits between promotion branches. Historical maintenance and website content have separate documented roles.
+
 - Git attribution belongs to the human contributor. Never register an LLM or AI tool as a commit author, committer, co-author or contributor, or add automated contributor badges. Use an approved human identity from `.github/human-contributors.json`; adding another identity requires the maintainer to verify that it belongs to a human. GitHub's signing service is allowed only as a committer. Keep the README's AI-development disclosure.
 
 - Preserve the GPL v3 license and Ember palette from MayaMCP.

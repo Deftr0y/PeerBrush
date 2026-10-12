@@ -1,5 +1,7 @@
 # Development
 
+Start with the [development guide](development-guide.md) for branch naming, pull requests, build setup, acceptance checks and release promotion. This page records implementation details and verification history. See the [0.26 development queue](development-0.26.md) for unreleased work.
+
 ## Selection and mask refinement (PB-063)
 
 Typed `selection.refine`, `selection.import`, `mask.from_selection` and `mask.refine` share UI/MCP/CLI editing, reservations and history. Source-dependent commands can require exact `document_id`/`source_revision`. Smoothing, feathering, morphology and contrast use bounded tiles/halos; image-guided feathering uses a local linear model with an 8-bit guide and native16 mask output. Mask results append an opaque grayscale paint step, retaining original editable steps beneath it. Soft document selections currently use 8-bit confidence. Source RGB/alpha channels are untouched.
