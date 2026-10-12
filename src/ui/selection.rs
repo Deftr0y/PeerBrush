@@ -290,11 +290,22 @@ impl PeerBrush {
             self.selection_gesture_source = Some(self.selection_source(doc));
         }
         // The response covers only the canvas workspace, excluding panels and controls.
-        if response.clicked()
-            && response
-                .interact_pointer_pos()
-                .is_some_and(|p| !view.contains(p, rect, scale))
-        {
+        // Movement after a release can share its frame. Use the actual button
+        // location for clicks rather than the pointer's later hover location.
+        let click_pos = ui
+            .input(|i| {
+                i.events.iter().rev().find_map(|event| match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    } => Some(*pos),
+                    _ => None,
+                })
+            })
+            .or_else(|| response.interact_pointer_pos());
+        if response.clicked() && click_pos.is_some_and(|p| !view.contains(p, rect, scale)) {
             self.deselect_area(doc, false);
             return;
         }
@@ -305,10 +316,7 @@ impl PeerBrush {
                 self.selection_path.pop();
             }
             if response.clicked() || response.double_clicked() {
-                if let Some(pos) = response
-                    .interact_pointer_pos()
-                    .filter(|p| view.contains(*p, rect, scale))
-                {
+                if let Some(pos) = click_pos.filter(|p| view.contains(*p, rect, scale)) {
                     if self.selection_path.is_empty() {
                         self.selection_gesture_mode = Some(self.selection_mode_for(ui));
                     }
@@ -465,7 +473,7 @@ impl PeerBrush {
             self.selection_gesture_mode = None;
         }
         if response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(pos) = click_pos {
                 if view.contains(pos, rect, scale)
                     && ["wand", "quick", "row", "column"].contains(&self.selection_kind.as_str())
                 {

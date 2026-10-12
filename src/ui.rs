@@ -11972,6 +11972,11 @@ mod tests {
                                 Default::default(),
                             );
                             app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
+                            assert_eq!(
+                                app.shared.lock().unwrap().doc.selection,
+                                before.selection,
+                                "{depth} {kind}: initial anchor release changed previous coverage"
+                            );
                         } else if kind == "rectangle" {
                             let end = point + Vec2::splat(app.view_rect.unwrap().width() / 4.);
                             frame(

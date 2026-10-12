@@ -1,5 +1,12 @@
 # PeerBrush follow-ups
 
+## Version 0.25 release scope
+
+Version 0.25 retains the implemented compact effect controls and native-depth color pickers (PB-106), categorized native layer styles (PB-136), selection/transform gesture guards (PB-110), and guarded selected-content Cut/Paste (PB-133). Combined verification of the current source is pending. Broader Photoshop layer-style fidelity and editable reopening of unsupported styled originals (PB-122) are deferred to a later version; the original precision and protected composite remain preserved. Existing bounded import improvements remain subject to exact composite matching. A separately reported selection recurrence and native clipboard transport acceptance remain unresolved; neither is marked complete.
+
+PB-110 additionally preserves the actual click-release location when later hover movement arrives in the same frame. Lasso anchor release cannot clear earlier shared coverage by using the new hover location. The focused native8/16 focus-loss regression passed with explicit coverage preservation before cancellation; combined acceptance is pending.
+
+
 This is the living backlog for ideas raised during development. Add new requests here as they arrive, keep the user's intent, and move them to the appropriate milestone. Update status only after implementation and verification.
 
 Implementation status describes current development source. Work completed after the published v0.1.4 checkpoint remains unreleased until it is included in a separately verified package.
