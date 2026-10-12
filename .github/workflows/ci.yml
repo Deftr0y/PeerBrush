@@ -63,6 +63,12 @@ jobs:
           log = Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
           failures = re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$', log, re.M)
           results = re.findall(r'^test result: (?:ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored;', log, re.M)
+          if failures:
+              print('::error title=Regression test failures::' + ', '.join(name[:128] for name in failures[:32]))
+          elif int(sys.argv[3]):
+              codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
+              detail = ', '.join(codes) if codes else 'No failing test identifier was reported'
+              print('::error title=Regression test run failed::' + detail)
           # Publish only bounded test identifiers/counts, never arbitrary
           # panic output, environment values, paths or fixture contents.
           with Path(sys.argv[2]).open('a', encoding='utf-8') as summary:
