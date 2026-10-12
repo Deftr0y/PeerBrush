@@ -4956,6 +4956,102 @@ fn axial_gradient_payload(degrees: f64, reflected: bool, reverse: bool) -> Vec<u
     }
     payload
 }
+
+#[test]
+fn photoshop_nonaxial_gradient_shapes_keep_native_grid_sources_and_exact_composites() {
+    for depth in [8, 16] {
+        for (shape, name) in [
+            (b"Rdl ", "radial"),
+            (b"Angl", "angle"),
+            (b"Dmnd", "diamond"),
+        ] {
+            for degrees in [0., 90.] {
+                for reverse in [false, true] {
+                    for enabled in [false, true] {
+                        let mut payload = axial_gradient_payload(degrees, false, reverse);
+                        let at = payload.windows(4).position(|v| v == b"Lnr ").unwrap();
+                        payload[at..at + 4].copy_from_slice(shape);
+                        let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                        payload[at] = u8::from(enabled);
+                        let mut spec =
+                            Spec::paint("Synthetic integer-center gradient shape", SAVED);
+                        spec.tags.push((*b"lfx2", payload));
+                        let mut bytes = fixture(&[spec], depth);
+                        // The 2x1 integer grid is centered at (1,0), radius 1.
+                        // Radius/Manhattan samples are 1 and 0. Angle's left
+                        // axis is 1/2 or 3/4; its singular center is 1/4.
+                        let positions = if name == "angle" {
+                            [if degrees == 0. { 0.5 } else { 0.75 }, 0.25]
+                        } else {
+                            [1., 0.]
+                        };
+                        let expected = std::array::from_fn::<_, 2, _>(|x| {
+                            if !enabled {
+                                return SAVED[x].map(|n| native(n, depth));
+                            }
+                            let t: f64 = if reverse {
+                                1. - positions[x]
+                            } else {
+                                positions[x]
+                            };
+                            let channel = native((t * 65535.).round() as u16, depth);
+                            [channel, channel, channel, 65535]
+                        });
+                        bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                        for channel in 0..4 {
+                            for pixel in expected {
+                                composite_sample(&mut bytes, pixel, channel, depth);
+                            }
+                        }
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {name} {degrees} {reverse} {enabled}: {:?}",
+                            doc.warnings
+                        );
+                        assert_eq!(doc.layers[0].effects[0].settings["style"], name);
+                        assert_eq!(doc.layers[0].effects[0].settings["pixel_grid"], true);
+                        assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+                        let source = SAVED.map(|p| p.map(|n| native(n, depth))).concat();
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(rendered(&doc), expected.concat());
+                        let current = doc.export_png().unwrap();
+                        for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(
+                                reopened.layers[0].effects[0].settings,
+                                doc.layers[0].effects[0].settings
+                            );
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            assert_eq!(saved_composite(&output, depth), expected.concat());
+                        }
+                        let mut engine = Engine::new();
+                        let layer = doc.layers[0].id.clone();
+                        let effect = doc.layers[0].effects[0].id.clone();
+                        engine.doc = doc;
+                        engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Gradient shape bypass").unwrap();
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        let at =
+                            bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+                        bytes[at] ^= 1;
+                        assert!(psd::decode(&bytes).unwrap().read_only);
+                    }
+                }
+            }
+        }
+        let mut payload = axial_gradient_payload(0., false, false);
+        let at = payload.windows(4).position(|v| v == b"Lnr ").unwrap();
+        payload[at..at + 4].copy_from_slice(b"????");
+        let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+        payload[at] = 0;
+        let mut spec = Spec::paint("Synthetic disabled unknown shape", SAVED);
+        spec.tags.push((*b"lfx2", payload));
+        assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+    }
+}
 #[test]
 fn photoshop_cardinal_and_reflected_gradients_keep_native_orientation_and_sources() {
     for depth in [8, 16] {
@@ -5051,7 +5147,7 @@ fn photoshop_cardinal_and_reflected_gradients_keep_native_orientation_and_source
     }
 }
 #[test]
-fn arbitrary_gradient_rotation_and_shape_remain_protected_even_when_disabled() {
+fn arbitrary_gradient_rotation_and_unmatched_shapes_remain_protected() {
     for depth in [8, 16] {
         for degrees in [-181., -89., 45., 89., 181.] {
             let mut payload = axial_gradient_payload(degrees, true, false);

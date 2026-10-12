@@ -867,6 +867,9 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
     let style = match field(fields, "Type")["value"][1].as_str() {
         Some("Lnr ") => "linear",
         Some("Rflc") => "reflected",
+        Some("Rdl ") => "radial",
+        Some("Angl") => "angle",
+        Some("Dmnd") => "diamond",
         _ => return Err("Unsupported Photoshop Gradient Overlay shape".into()),
     };
     let angle = field(fields, "Angl");
@@ -906,11 +909,13 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
         );
     }
     let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":blend,"angle":degrees,"scale":scale,"style":style,"reverse":required_bool("Rvrs")?});
-    if align_layer {
-        // Retain the explicit layer-aligned definition through the existing
-        // native integer-grid geometry. Recognition never bypasses the
-        // caller's exact complete-composite gate.
+    if align_layer || matches!(style, "radial" | "angle" | "diamond") {
+        // Explicit alignment and the newly supported shapes use the existing
+        // native integer grid. Recognition never bypasses the caller's exact
+        // complete-composite gate. Shape IDs: ag-psd src/descriptor.ts, GrdT.
         settings["pixel_grid"] = json!(true);
+    }
+    if align_layer {
         settings["align_layer"] = json!(true);
     }
     if let Some((x, y)) = offset {

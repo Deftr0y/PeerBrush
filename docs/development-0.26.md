@@ -30,3 +30,11 @@ The regression fixture supplies independent 8/16-bit integer-center ramp samples
 Implemented, acceptance pending. Bounded cardinal Linear/Reflected Gradient Overlays can retain an explicit `Algn=true` definition using the existing native integer grid and alpha-bound layer alignment. Document-aligned gradients keep their earlier first-choice placement. Dither, unsupported interpolation, malformed fields and other unsupported structures remain protected; every accepted import still requires an exact complete native composite match.
 
 The additional native8/16 fixture checks transparent hidden source RGB, enabled/disabled definitions, independent integer-center samples, editable PSD/PSB saves, effect bypass/undo and one-word mismatch protection. No new source format or rendering formula is introduced. Automated and native acceptance remain pending.
+
+## PB-122 additional gradient shapes
+
+Implemented, acceptance pending. Radial, Angle and Diamond descriptors now map to the existing integer-grid native renderer alongside Linear and Reflected. Their PSD IDs follow the [primary ag-psd descriptor codec](https://github.com/Agamnentzar/ag-psd/blob/master/src/descriptor.ts). Cardinal angle, native RGB stops, scale/offset, alpha-stop, descriptor and complete exact-composite guards continue to apply. Unknown shapes and unsupported rotation remain protected even when disabled. This is a bounded import extension, not full Photoshop gradient compatibility.
+
+Independent native8/16 fixtures cover radius/Manhattan coordinates, angle-axis and singular-center samples, reverse, enabled/disabled definitions, original sources, editable PSD/PSB reopening, effect bypass/undo and exact mismatch protection. Automated acceptance is pending.
+
+Offline 256×160 native8/16 fixtures for the document-aligned Linear import retained every original channel, editable PSD/PSB sources and exact rendered export through bypass/undo. The rendered gradient and recovered source images were inspected. Native workspace interaction and final combined CI acceptance remain pending.
