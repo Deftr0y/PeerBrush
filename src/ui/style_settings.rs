@@ -5,6 +5,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
     if kind == "gradient_overlay" {
         defaults["offset_x"] = json!(0.);
         defaults["offset_y"] = json!(0.);
+        defaults["smoothness"] = json!(0.);
     }
     if bitmap {
         for (key, value) in crate::effects::styles::bitmap_defaults()
@@ -184,6 +185,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 ),
                 ("depth", "Depth", 0., 10., "%"),
                 ("range", "Range", 0.01, 1., "%"),
+                ("smoothness", "Color smoothness", 0., 1., "%"),
                 ("offset_x", "Offset X", -1., 1., "%"),
                 ("offset_y", "Offset Y", -1., 1., "%"),
                 ("highlight_opacity", "Highlight opacity", 0., 1., "%"),
@@ -219,6 +221,9 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 ),
             ] {
                 if defaults.get(key).is_none() || (bitmap && key == "scale") {
+                    continue;
+                }
+                if key == "smoothness" && value["color_stops"].as_array().is_none_or(|stops| stops.len() < 3) {
                     continue;
                 }
                 controls::label(ui, label);

@@ -6,6 +6,10 @@ pub fn gridded(kind: &str, value: &Value) -> bool {
         && (value.get("pixel_grid").is_some() || value.get("align_layer").is_some())
 }
 
+pub fn smoothed(kind: &str, value: &Value) -> bool {
+    kind == "gradient_overlay" && value.get("smoothness").is_some()
+}
+
 /// Explicit integer-center placement. Legacy gradients retain their existing
 /// normalized pixel-center geometry unless this mode is enabled.
 pub(super) struct Grid {
@@ -139,7 +143,7 @@ pub fn validate(value: &Value, alpha: bool) -> Result<(), String> {
     }
     Ok(())
 }
-fn interval(stops: &[Value], position: f64) -> (&Value, &Value, f64) {
+fn interval(stops: &[Value], position: f64) -> (usize, f64) {
     let position = position.clamp(0., 1.);
     let index = stops
         .windows(2)
@@ -154,16 +158,42 @@ fn interval(stops: &[Value], position: f64) -> (&Value, &Value, f64) {
     } else {
         0.5 + 0.5 * (t - midpoint) / (1. - midpoint)
     };
-    (a, b, t.clamp(0., 1.))
+    (index, t.clamp(0., 1.))
 }
 pub fn sample(value: &Value, position: f64) -> ([u16; 3], f64) {
     let colors = value["color_stops"].as_array().filter(|s| s.len() >= 2);
     let rgb = if let Some(stops) = colors {
-        let (a, b, t) = interval(stops, position);
+        let (index, t) = interval(stops, position);
+        let (a, b) = (&stops[index], &stops[index + 1]);
+        let smoothness = if stops.len() > 2 {
+            value["smoothness"].as_f64().unwrap_or(0.)
+        } else {
+            0.
+        };
         std::array::from_fn(|c| {
-            ((a["color"][c].as_f64().unwrap() * (1. - t) + b["color"][c].as_f64().unwrap() * t)
-                * 65535.)
-                .round() as u16
+            let left = a["color"][c].as_f64().unwrap();
+            let right = b["color"][c].as_f64().unwrap();
+            let linear = left * (1. - t) + right * t;
+            // A native Catmull-Rom color curve, with duplicated outer knots.
+            // Keep the original linear calculation unchanged at zero strength.
+            let color = if smoothness == 0. {
+                linear
+            } else {
+                let previous = stops[index.saturating_sub(1)]["color"][c].as_f64().unwrap();
+                let next = stops[(index + 2).min(stops.len() - 1)]["color"][c]
+                    .as_f64()
+                    .unwrap();
+                let tangent_left = (right - previous) / 2.;
+                let tangent_right = (next - left) / 2.;
+                let t2 = t * t;
+                let t3 = t2 * t;
+                let curve = (2. * t3 - 3. * t2 + 1.) * left
+                    + (t3 - 2. * t2 + t) * tangent_left
+                    + (-2. * t3 + 3. * t2) * right
+                    + (t3 - t2) * tangent_right;
+                (linear + (curve - linear) * smoothness).clamp(0., 1.)
+            };
+            (color * 65535.).round() as u16
         })
     } else {
         std::array::from_fn(|c| {
@@ -177,7 +207,8 @@ pub fn sample(value: &Value, position: f64) -> ([u16; 3], f64) {
 }
 pub fn opacity_at(value: &Value, position: f64) -> f64 {
     if let Some(stops) = value["alpha_stops"].as_array().filter(|s| s.len() >= 2) {
-        let (a, b, t) = interval(stops, position);
+        let (index, t) = interval(stops, position);
+        let (a, b) = (&stops[index], &stops[index + 1]);
         a["opacity"].as_f64().unwrap() * (1. - t) + b["opacity"].as_f64().unwrap() * t
     } else {
         1.

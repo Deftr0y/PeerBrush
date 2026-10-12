@@ -55,6 +55,201 @@ fn strip(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn gradient_color_smoothness_keeps_native_sources_alpha_history_and_standard_output() {
+    for depth in [8, 16] {
+        let mut engine = Engine::new();
+        engine.doc = Document::new_depth(8, 1, depth).unwrap();
+        for x in 0..8 {
+            engine.doc.layers[0].pixels.set16(
+                x,
+                0,
+                [
+                    12347 + x as u16 * 107,
+                    23459,
+                    34571,
+                    if x == 2 { 0 } else { 65535 },
+                ],
+            );
+        }
+        let source = engine.doc.layers[0].pixels.rgba16();
+        let layer = engine.doc.layers[0].id.clone();
+        let values = [
+            0.123456789012345,
+            0.912345678901234,
+            0.312345678901234,
+            0.712345678901234,
+        ];
+        let stops = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| json!({"position":i as f64/3.,"midpoint":0.5,"color":[v,1.-v,v/3.]}))
+            .collect::<Vec<_>>();
+        let settings = json!({"pixel_grid":true,"angle":0.,"opacity":1.,"color_stops":stops});
+        engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":settings})],None,None,"Native linear stops").unwrap();
+        engine.undo.clear();
+        let original = engine.doc.export_png().unwrap();
+        let effect = engine.doc.layers[0].effects[0].id.clone();
+        for strength in [0.375, 1.] {
+            let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+            settings["smoothness"] = json!(strength);
+            let command =
+                json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
+            let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), original);
+            assert!(engine.undo.is_empty());
+            assert_ne!(draft.export_png().unwrap(), original);
+            let rendered = native(&draft);
+            for x in 0..8usize {
+                if source[x * 4 + 3] == 0 {
+                    continue;
+                }
+                let position = x as f64 / 8.;
+                let index = ((position * 3.).floor() as usize).min(2);
+                let left = index as f64 / 3.;
+                let right = (index + 1) as f64 / 3.;
+                let t = (position - left) / (right - left);
+                let t = if t <= 0.5 {
+                    t / 2. / 0.5
+                } else {
+                    0.5 + (t - 0.5) / 0.5 / 2.
+                };
+                for c in 0..3 {
+                    let component = |i: usize| {
+                        if c == 0 {
+                            values[i]
+                        } else if c == 1 {
+                            1. - values[i]
+                        } else {
+                            values[i] / 3.
+                        }
+                    };
+                    let a = component(index.saturating_sub(1));
+                    let b = component(index);
+                    let d = component(index + 1);
+                    let f = component((index + 2).min(3));
+                    // Independent standard cubic polynomial (renderer uses Hermite).
+                    let cubic = (2. * b
+                        + (d - a) * t
+                        + (2. * a - 5. * b + 4. * d - f) * t * t
+                        + (-a + 3. * b - 3. * d + f) * t * t * t)
+                        / 2.;
+                    let linear = b * (1. - t) + d * t;
+                    let value = (linear + (cubic - linear) * strength).clamp(0., 1.);
+                    let word = (value * 65535.).round() as u16;
+                    let expected = if depth == 16 {
+                        word
+                    } else {
+                        u16::from(peerbrush::raster::project16(word)) * 257
+                    };
+                    assert_eq!(rendered[x * 4 + c], expected, "{depth} {strength} {x} {c}");
+                }
+            }
+            engine
+                .edit("human", &[command], None, None, "Color smoothness")
+                .unwrap();
+            assert_eq!(engine.undo.len(), 1);
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                draft.export_png().unwrap()
+            );
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            let current = engine.doc.export_png().unwrap();
+            for enabled in [false, true] {
+                let doc=Engine::preview_edits(engine.doc.clone(),&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":enabled})]).unwrap();
+                let current = doc.export_png().unwrap();
+                for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                    use std::io::Read;
+                    let at = bytes.windows(4).position(|v| v == b"PBR1").unwrap() + 4;
+                    let mut raw = vec![];
+                    flate2::read::ZlibDecoder::new(&bytes[at..])
+                        .read_to_end(&mut raw)
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["format"],
+                        28
+                    );
+                    let reopened = psd::decode(&bytes).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                    assert_eq!(
+                        reopened.layers[0].effects[0].settings,
+                        doc.layers[0].effects[0].settings
+                    );
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                    let standard = psd::decode(&strip(&bytes)).unwrap();
+                    assert!(!standard.read_only);
+                    assert_eq!(standard.export_png().unwrap(), current);
+                    assert_eq!(native(&standard), native(&doc));
+                }
+            }
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), original);
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            engine.redo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), current);
+            engine.undo("human").unwrap();
+        }
+        let mut alpha_settings = settings.clone();
+        alpha_settings["alpha_stops"] = json!([{"position":0.,"opacity":0.123456789012345,"midpoint":0.37},{"position":0.5,"opacity":0.912345678901234,"midpoint":0.63},{"position":1.,"opacity":0.312345678901234}]);
+        let mut smooth = alpha_settings.clone();
+        smooth["smoothness"] = json!(1.);
+        for x in 0..129 {
+            let t = x as f64 / 128.;
+            assert_eq!(
+                effects::gradient::opacity_at(&alpha_settings, t).to_bits(),
+                effects::gradient::opacity_at(&smooth, t).to_bits()
+            );
+        }
+        let before = serde_json::to_value(&engine.doc).unwrap();
+        let history = engine.undo.len();
+        for invalid in [json!(-0.1), json!(1.1), json!(true), json!("smooth")] {
+            assert!(engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":{"smoothness":invalid}})],None,None,"Invalid smoothness").is_err());
+            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+            assert_eq!(engine.undo.len(), history);
+        }
+        for kind in ["color_overlay", "inner_shadow", "pattern_overlay"] {
+            assert!(effects::validate(kind, &json!({"smoothness":1.})).is_err());
+        }
+    }
+}
+
+#[test]
+fn gradient_color_smoothness_zero_and_two_stop_paths_keep_exact_legacy_samples() {
+    for colors in [
+        json!([]),
+        json!([{"position":0.,"color":[0.123456789012345,0.234567890123456,0.345678901234567]},{"position":1.,"color":[0.812345678901234,0.712345678901234,0.612345678901234]}]),
+        json!([{"position":0.,"color":[1.,0.,1.]},{"position":0.33,"color":[0.,1.,0.],"midpoint":0.37},{"position":0.67,"color":[0.,1.,0.]},{"position":1.,"color":[1.,0.,1.]}]),
+    ] {
+        let value =
+            json!({"color":[0.13,0.27,0.39],"color2":[0.81,0.72,0.63],"color_stops":colors});
+        let mut zero = value.clone();
+        zero["smoothness"] = json!(0.);
+        for x in 0..129 {
+            let t = x as f64 / 128.;
+            assert_eq!(
+                effects::gradient::sample(&value, t),
+                effects::gradient::sample(&zero, t)
+            );
+        }
+        if colors.as_array().unwrap().len() < 3 {
+            let mut smooth = value.clone();
+            smooth["smoothness"] = json!(1.);
+            for x in 0..129 {
+                let t = x as f64 / 128.;
+                assert_eq!(
+                    effects::gradient::sample(&value, t),
+                    effects::gradient::sample(&smooth, t)
+                );
+            }
+        } else {
+            let mut smooth = value.clone();
+            smooth["smoothness"] = json!(1.);
+            assert_eq!(effects::gradient::sample(&smooth, 0.5).0, [0, 65535, 0]);
+        }
+    }
+}
+
+#[test]
 fn gradient_pixel_grid_matches_calibrated_knots_at_native_precision() {
     // Independently read knot samples from Photoshop's saved geometry BMP:
     // Patchy bb6b9426080842af6f4f65acb122516e07328323, gradient-overlay-geometry.

@@ -153,6 +153,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                         | "offset_y"
                         | "pixel_grid"
                         | "align_layer"
+                        | "smoothness"
                 ))
             && !(crate::effects::contours::contains(kind) && key == "contour_points")
         {
@@ -216,6 +217,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
             _ => {
                 let (min, max) = match key.as_str() {
                     "opacity" | "spread" | "highlight_opacity" | "shadow_opacity" => (0., 1.),
+                    "smoothness" => (0., 1.),
                     "size" | "soften" => (0., 64.),
                     "distance" => (0., 128.),
                     "angle" => (-180., 180.),

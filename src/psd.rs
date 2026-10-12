@@ -805,6 +805,12 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         format: if doc.layers.iter().any(|l| {
             l.effects
                 .iter()
+                .any(|e| crate::effects::gradient::smoothed(&e.kind, &e.settings))
+        }) {
+            28
+        } else if doc.layers.iter().any(|l| {
+            l.effects
+                .iter()
                 .any(|e| crate::effects::gradient::gridded(&e.kind, &e.settings))
         }) {
             27
@@ -1685,7 +1691,7 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=27).contains(&e.format)
+                if (1..=28).contains(&e.format)
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash
