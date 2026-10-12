@@ -45,7 +45,7 @@ Implemented, acceptance pending. One unscaled Normal solid-color `FrFX` definiti
 
 Regression coverage specifies independent half-coverage edge samples, master/present/enabled states, single/list aliases, native source retention, current standard PSD/PSB composites, editable reopening, bypass/undo and one-sample mismatch protection. Formatting and compile checking passed; automated and fresh native workspace acceptance remain pending. This does not establish general Photoshop Stroke equivalence or recover the broader representative styled document.
 
-A fresh isolated native workspace opened an independent 256×160 Outside Stroke fixture as editable native16 at revision zero. The application capture was inspected and shows the rendered outline and native Stroke control over the retained checker source. Broader Inside/Center, depth, interaction and final CI acceptance remain separately pending.
+Six independent 256×160 Stroke fixtures opened in a fresh isolated native workspace as editable native8/16 at revision zero. Captures were inspected for Inside, Outside and Center placement and show the rendered outlines and native Stroke control over the retained checker source. Interaction and final CI acceptance remain separately pending.
 
 ## CI checkpoints
 
@@ -58,3 +58,9 @@ The [639a369 Linux run](https://github.com/Deftr0y/PeerBrush/actions/runs/382877
 ## PB-080 workspace cache identity
 
 The registry cache now retains and checks the weak identity of its root engine, alongside the weak workspace. Closing the root can remove its registry handle while an engine snapshot keeps the registry alive. Previously its address-only key could then collide with a new root after allocation reuse. The weak root pins that allocation until cache retirement; identity validation also rejects a stale cache entry. A deterministic regression simulates the collision after close, preserves the old snapshot, and verifies independent project lookup and active identity. Formatting and compile checking passed; CI and native lifecycle acceptance remain pending. This is a separate isolation fix, not an established explanation for the original data-loss report.
+
+## PB-141 installed-font discovery
+
+Implemented discovery and presentation selection, acceptance pending. The existing fontdb codec scans standard Windows, macOS and Linux font locations. Regular installed faces are selected only after checking representative complete Hebrew, Arabic, Devanagari, Han, kana and Hangul samples. Collection indices are retained. Ubuntu Sans stays primary; the existing bundled language fonts remain a temporary fallback while replacement acceptance and archive reductions are pending.
+
+Selected font bytes are snapshotted and shared by the filename shaper, with a 32 MiB per-file and 64 MiB retained-data bound. The presentation catalog neither retains font paths nor downloads missing fonts. Existing bidi/shaping and 64-entry/8 MiB texture bounds remain in force. Runtime font-family names are XML-escaped. Document Text definitions, logical filenames, original paths, history and pixels are unchanged. Additional coverage checks installed selection, absent/invalid/oversized fonts, complete script samples, collection indices and primary-font order. Formatting and compile checking passed; CI, native multilingual acceptance and bundled-font removal remain pending.

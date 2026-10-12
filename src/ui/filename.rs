@@ -26,8 +26,191 @@ const FONTS: &[(&str, &[u8])] = &[
 ];
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 64;
+const SYSTEM_FONT_BYTES: usize = 64 * 1024 * 1024;
+const SYSTEM_FACE_BYTES: usize = 32 * 1024 * 1024;
+// Representative clusters select one complete face per script; collection
+// indices are retained. Installed fonts are presentation inputs only.
+const SCRIPTS: &[(&str, &[&str], &str)] = &[
+    (
+        "Noto Sans Hebrew",
+        &[
+            "Segoe UI",
+            "Arial",
+            "Arial Hebrew",
+            "Noto Sans Hebrew",
+            "DejaVu Sans",
+        ],
+        "שלום",
+    ),
+    (
+        "Noto Sans Arabic",
+        &[
+            "Segoe UI",
+            "Arial",
+            "Geeza Pro",
+            "Noto Sans Arabic",
+            "DejaVu Sans",
+        ],
+        "مرحبا بالعالم",
+    ),
+    (
+        "Noto Sans Devanagari",
+        &[
+            "Nirmala UI",
+            "Kohinoor Devanagari",
+            "Devanagari Sangam MN",
+            "Noto Sans Devanagari",
+        ],
+        "हिन्दी",
+    ),
+    (
+        "Noto Sans CJK SC",
+        &[
+            "Microsoft YaHei",
+            "PingFang SC",
+            "Noto Sans CJK SC",
+            "WenQuanYi Zen Hei",
+        ],
+        "漢字",
+    ),
+    (
+        "Noto Sans CJK SC",
+        &["Yu Gothic", "Hiragino Sans", "Noto Sans CJK JP"],
+        "あいう",
+    ),
+    (
+        "Noto Sans CJK SC",
+        &["Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR"],
+        "한글",
+    ),
+];
+struct SystemFace {
+    id: fontdb::ID,
+    family: String,
+    bytes: Arc<Vec<u8>>,
+    index: u32,
+}
+struct FontCatalog {
+    db: Arc<usvg::fontdb::Database>,
+    faces: Vec<SystemFace>,
+    scripts: Vec<Option<usize>>,
+}
+fn covers(bytes: &[u8], index: u32, sample: &str) -> bool {
+    use ab_glyph::Font;
+    ab_glyph::FontRef::try_from_slice_and_index(bytes, index).is_ok_and(|font| {
+        sample
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .all(|c| font.glyph_id(c).0 != 0)
+    })
+}
+fn selected_system_face(
+    db: &fontdb::Database,
+    preferred: &[&str],
+    sample: &str,
+) -> Option<SystemFace> {
+    let mut candidates = preferred
+        .iter()
+        .filter_map(|family| {
+            db.query(&fontdb::Query {
+                families: &[fontdb::Family::Name(family)],
+                ..Default::default()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut remaining = db
+        .faces()
+        .filter(|face| face.style == fontdb::Style::Normal)
+        .collect::<Vec<_>>();
+    remaining.sort_by_key(|face| {
+        (
+            face.weight.0.abs_diff(400),
+            face.post_script_name.clone(),
+            face.index,
+        )
+    });
+    candidates.extend(remaining.into_iter().map(|face| face.id));
+    let mut seen = std::collections::HashSet::new();
+    for id in candidates {
+        if !seen.insert(id) {
+            continue;
+        }
+        let face = db.face(id)?;
+        // Check file length before fontdb reads it; never retain unbounded
+        // installed font data or map files that another process can modify.
+        let fontdb::Source::File(path) = &face.source else {
+            continue;
+        };
+        if !std::fs::metadata(path).is_ok_and(|m| m.len() <= SYSTEM_FACE_BYTES as u64) {
+            continue;
+        }
+        if let Some(Some(bytes)) = db.with_face_data(id, |bytes, index| {
+            (bytes.len() <= SYSTEM_FACE_BYTES && covers(bytes, index, sample))
+                .then(|| bytes.to_vec())
+        }) {
+            return Some(SystemFace {
+                id,
+                family: face.families.first()?.0.clone(),
+                bytes: Arc::new(bytes),
+                index: face.index,
+            });
+        }
+    }
+    None
+}
+fn catalog() -> &'static FontCatalog {
+    static CATALOG: OnceLock<FontCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut installed = fontdb::Database::new();
+        installed.load_system_fonts();
+        let mut faces: Vec<SystemFace> = Vec::new();
+        let mut scripts = Vec::new();
+        let mut retained = 0usize;
+        for (_, preferred, sample) in SCRIPTS {
+            let selected = selected_system_face(&installed, preferred, sample);
+            let index = selected.and_then(|selected| {
+                if let Some(index) = faces.iter().position(|face| face.id == selected.id) {
+                    return Some(index);
+                }
+                if retained + selected.bytes.len() > SYSTEM_FONT_BYTES {
+                    return None;
+                }
+                retained += selected.bytes.len();
+                faces.push(selected);
+                Some(faces.len() - 1)
+            });
+            scripts.push(index);
+        }
+        // Snapshot selected bytes into the shaping database. The catalog does
+        // not keep paths, reread files per label, or download missing fonts.
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(
+            include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf").as_slice(),
+        )));
+        for face in &faces {
+            db.load_font_source(usvg::fontdb::Source::Binary(face.bytes.clone()));
+        }
+        for (_, bytes) in FONTS {
+            db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(*bytes)));
+        }
+        db.set_sans_serif_family("Ubuntu Sans");
+        FontCatalog {
+            db: Arc::new(db),
+            faces,
+            scripts,
+        }
+    })
+}
 
 pub(super) fn install_fallbacks(fonts: &mut egui::FontDefinitions) {
+    let catalog = catalog();
+    for (index, face) in catalog.faces.iter().enumerate() {
+        let mut data = egui::FontData::from_static(face.bytes.as_slice());
+        data.index = face.index;
+        fonts
+            .font_data
+            .insert(format!("Installed fallback {index}"), data.into());
+    }
     for (name, bytes) in FONTS {
         fonts
             .font_data
@@ -40,6 +223,11 @@ pub(super) fn install_fallbacks(fonts: &mut egui::FontDefinitions) {
     ] {
         fonts
             .families
+            .entry(family.clone())
+            .or_default()
+            .extend((0..catalog.faces.len()).map(|index| format!("Installed fallback {index}")));
+        fonts
+            .families
             .entry(family)
             .or_default()
             .extend(FONTS.iter().map(|(name, _)| (*name).into()));
@@ -47,39 +235,28 @@ pub(super) fn install_fallbacks(fonts: &mut egui::FontDefinitions) {
 }
 
 fn fontdb() -> Arc<usvg::fontdb::Database> {
-    static DB: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
-    DB.get_or_init(|| {
-        let mut db = usvg::fontdb::Database::new();
-        for bytes in
-            std::iter::once(include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf").as_slice())
-                .chain(FONTS.iter().map(|(_, bytes)| *bytes))
-        {
-            db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(bytes)));
-        }
-        db.set_sans_serif_family("Ubuntu Sans");
-        Arc::new(db)
-    })
-    .clone()
+    catalog().db.clone()
 }
 
 fn script_font(c: char) -> &'static str {
-    match c as u32 {
-        0x0590..=0x05ff | 0xfb1d..=0xfb4f => "Noto Sans Hebrew",
+    let script = match c as u32 {
+        0x0590..=0x05ff | 0xfb1d..=0xfb4f => 0,
         0x0600..=0x06ff | 0x0750..=0x077f | 0x08a0..=0x08ff | 0xfb50..=0xfdff | 0xfe70..=0xfeff => {
-            "Noto Sans Arabic"
+            1
         }
-        0x0900..=0x097f | 0xa8e0..=0xa8ff => "Noto Sans Devanagari",
-        0x1100..=0x11ff
-        | 0x2e80..=0x9fff
-        | 0xac00..=0xd7ff
-        | 0xf900..=0xfaff
-        | 0xff00..=0xffef
-        | 0x20000..=0x3134f => "Noto Sans CJK SC",
-        _ => "Ubuntu Sans",
-    }
+        0x0900..=0x097f | 0xa8e0..=0xa8ff => 2,
+        0x3040..=0x30ff | 0x31f0..=0x31ff | 0xff65..=0xff9f => 4,
+        0x1100..=0x11ff | 0x3130..=0x318f | 0xa960..=0xa97f | 0xac00..=0xd7ff => 5,
+        0x2e80..=0x9fff | 0xf900..=0xfaff | 0xff00..=0xffef | 0x20000..=0x3134f => 3,
+        _ => return "Ubuntu Sans",
+    };
+    let catalog = catalog();
+    catalog.scripts[script].map_or(SCRIPTS[script].0, |index| {
+        catalog.faces[index].family.as_str()
+    })
 }
 
-fn tree(text: &str, font: &str, size: f32, rtl: bool) -> Option<usvg::Tree> {
+fn escaped_xml(text: &str) -> String {
     let mut escaped = String::new();
     for c in text.chars() {
         match c {
@@ -91,10 +268,15 @@ fn tree(text: &str, font: &str, size: f32, rtl: bool) -> Option<usvg::Tree> {
             c => escaped.push(c),
         }
     }
+    escaped
+}
+fn tree(text: &str, font: &str, size: f32, rtl: bool) -> Option<usvg::Tree> {
+    let escaped = escaped_xml(text);
+    let escaped_font = escaped_xml(font);
     let embedding = if rtl { '\u{202b}' } else { '\u{202a}' };
     let end = '\u{202c}';
     let svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16384" height="128"><text id="filename" x="0" y="80" font-family="{font}" font-size="{size}" fill="white" xml:space="preserve">{embedding}{escaped}{end}</text></svg>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16384" height="128"><text id="filename" x="0" y="80" font-family="{escaped_font}" font-size="{size}" fill="white" xml:space="preserve">{embedding}{escaped}{end}</text></svg>"#
     );
     usvg::Tree::from_str(
         &svg,
@@ -410,6 +592,72 @@ pub(super) fn project_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn installed_face_selection_requires_coverage_and_bounded_owned_data() {
+        let dir = std::env::temp_dir().join(format!("pb-ui-font-{}", crate::engine::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("Ubuntu.ttf");
+        let original = include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf");
+        std::fs::write(&path, original).unwrap();
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&path).unwrap();
+        let face = selected_system_face(&db, &["Ubuntu Sans"], "café Ω Ж").unwrap();
+        assert_eq!(face.bytes.as_slice(), original);
+        assert_eq!(face.index, 0);
+        assert_eq!(face.family, "Ubuntu Sans");
+        assert!(selected_system_face(&db, &["Ubuntu Sans"], "\u{10ffff}").is_none());
+        assert!(selected_system_face(&fontdb::Database::new(), &[], "हिन्दी").is_none());
+        assert!(!covers(b"invalid font", 0, "abc"));
+        assert!(!covers(original, u32::MAX, "abc"));
+        assert_eq!(
+            escaped_xml("Font & <Family> \" '"),
+            "Font &amp; &lt;Family&gt; &quot; &apos;"
+        );
+        // The font's metadata was already discovered. Recheck current length
+        // before reading selected data, including a subsequently enlarged file.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(SYSTEM_FACE_BYTES as u64 + 1).unwrap();
+        assert!(selected_system_face(&db, &["Ubuntu Sans"], "abc").is_none());
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn installed_catalog_keeps_primary_font_and_complete_script_faces() {
+        let catalog = catalog();
+        assert!(
+            catalog
+                .faces
+                .iter()
+                .map(|face| face.bytes.len())
+                .sum::<usize>()
+                <= SYSTEM_FONT_BYTES
+        );
+        for (script, index) in catalog.scripts.iter().enumerate() {
+            if let Some(index) = index {
+                let face = &catalog.faces[*index];
+                assert!(covers(&face.bytes, face.index, SCRIPTS[script].2));
+            }
+        }
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "Ubuntu Sans".into());
+        install_fallbacks(&mut fonts);
+        assert_eq!(
+            fonts.families[&egui::FontFamily::Proportional][0],
+            "Ubuntu Sans"
+        );
+        for (index, face) in catalog.faces.iter().enumerate() {
+            assert_eq!(
+                fonts.font_data[&format!("Installed fallback {index}")].index,
+                face.index
+            );
+        }
+        assert_eq!(script_font('A'), "Ubuntu Sans");
+        assert_eq!(script_font('Ω'), "Ubuntu Sans");
+    }
     #[test]
     fn shaped_filenames_have_glyphs_direction_and_bounded_density() {
         use ab_glyph::Font;

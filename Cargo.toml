@@ -8,6 +8,7 @@ description = "You and your AI. Same canvas."
 [dependencies]
 rhai = { version = "1.24", features = ["serde", "sync", "no_module", "no_time", "no_custom_syntax"] }
 resvg = { version = "0.48.1", default-features = false, features = ["text"] }
+fontdb = { version = "0.24", default-features = false, features = ["fs"] }
 unicode-bidi = "0.3"
 roxmltree = "0.21"
 svgtypes = "0.16"

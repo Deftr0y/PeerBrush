@@ -2280,6 +2280,7 @@ dependencies = [
  "clipboard-win",
  "eframe",
  "flate2",
+ "fontdb",
  "image",
  "moxcms",
  "resvg",
