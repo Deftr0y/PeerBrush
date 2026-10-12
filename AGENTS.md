@@ -1,5 +1,7 @@
 # PeerBrush development
 
+- Git attribution belongs to the human contributor. Do not use Codex or another AI tool as a commit author, committer or co-author, or add automated contributor badges. Keep the README's AI-development disclosure.
+
 - Preserve the GPL v3 license and Ember palette from MayaMCP.
 - Use compact, unboxed range values. Avoid decorative containers and borders that add clutter or waste space.
 - Show the actual rendered result while the user works: strokes, transforms, blend choices, effect changes and layer reordering. Preview through the shared engine, without committing history until the gesture finishes. Outline-only feedback is insufficient.

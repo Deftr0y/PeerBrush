@@ -23,9 +23,9 @@ Instead of treating AI as a separate prompt box, PeerBrush gives both the user a
 
 The goal is simple: **Make AI a participant in the creative workflow, not just a generator.**
 
-![The native PeerBrush workspace](docs/images/workspace.png)
+![The native PeerBrush workspace editing a mountain lake at sunset](docs/images/workspace.png)
 
-*Actual native workspace. Ember orange identifies human interaction; blue identifies AI work.*
+*Actual native workspace with ImageGen example artwork. Ember orange identifies human interaction; blue identifies AI work.*
 
 ## A shared creative workspace
 
@@ -142,3 +142,5 @@ The shell uses Rust, egui/eframe and wgpu. Sparse copy-on-write tiles share unch
 ## License
 
 GNU General Public License v3. See [LICENSE](LICENSE). Bundled fonts and dependencies retain their own licenses; portable packages include source and third-party notices.
+
+<sub>This project is developed with AI assistance.</sub>

@@ -3,6 +3,42 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  attribution:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check new commit attribution
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CURRENT_BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, re, subprocess
+          base, head = os.environ['BASE'], os.environ['HEAD']
+          def exists(ref):
+              return subprocess.run(['git', 'cat-file', '-e', ref + '^{commit}'], stderr=subprocess.DEVNULL).returncode == 0
+          revision = [head]
+          if base and set(base) != {'0'} and exists(base):
+              revision += ['--not', base]
+          elif os.environ['CURRENT_BRANCH'] != os.environ['DEFAULT_BRANCH']:
+              default = 'origin/' + os.environ['DEFAULT_BRANCH']
+              if exists(default):
+                  revision += ['--not', default]
+          commits = subprocess.check_output(['git', 'rev-list', *revision], text=True).splitlines()
+          for commit in commits:
+              text = subprocess.check_output(['git', 'show', '-s', '--format=%an%n%ae%n%cn%n%ce%n%B', commit], text=True)
+              identity = '\n'.join(text.splitlines()[:4])
+              trailers = '\n'.join(line for line in text.splitlines()[4:] if re.match(r'(?i)\s*co-authored-by\s*:', line))
+              if re.search(r'(?i)\bcodex\b|codex@openai\.com', identity + '\n' + trailers):
+                  raise SystemExit(f'{commit}: AI tools must not be credited as Git contributors. Use the human contributor identity and keep the README disclosure.')
+          print(f'Checked attribution for {len(commits)} new commits.')
+          PY
   native:
     strategy:
       fail-fast: false
