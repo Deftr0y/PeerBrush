@@ -1,6 +1,6 @@
 # PeerBrush 0.25
 
-Version 0.25 uses application version 0.25.0. Actual published downloads, release status and verification results are recorded on [GitHub Releases](https://github.com/Deftr0y/PeerBrush/releases). Actions candidates are not published downloads.
+Version 0.25 uses application version 0.25.0. The [published experimental prerelease](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.25) was released on 2026-10-12 from `f5083d2e33a0158c9976db5de89549bd34ee7bc3`. Windows x64, Linux x64 and macOS arm64 packages share that source commit. All packages are unsigned.
 
 ## Changes since 0.2
 
@@ -23,3 +23,5 @@ Release validation covers engine, codec, protocol, input-adapter and packaging c
 Packages retain the existing unsigned distribution policy. See [release packages](release-packages.md) and [Photoshop fidelity](photoshop-fidelity.md).
 
 The combined local run passed 874 Rust checks across 84 targets and 18 packaging checks, with eight optional checks ignored and two local clipboard checks excluded. Formatting and Clippy passed with existing warnings. Fresh isolated Windows 8/16-bit gradient workspaces preserved original source words, zero editing history, editable PSD/PSB reopening and independently decoded exact standard channels and current merged composites. The protected Photoshop reference source and embedded pattern remained unchanged. Exact-source platform CI and public archive verification are separate publication gates.
+
+[Exact-source platform CI](https://github.com/Deftr0y/PeerBrush/actions/runs/38252533281) passed on all three platforms. Actual public assets, their corresponding source, architecture, licenses and SHA-256 checksums were verified. The official website home, Downloads and dated version history were read back at version 0.25.

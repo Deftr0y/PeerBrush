@@ -1,6 +1,6 @@
 # Release packages
 
-PeerBrush 0.25 source uses application version **0.25.0**, with a separate Windows launcher workspace named `PeerBrush-0.25.0`. Its distribution retains the unsigned package policy. Actual published assets, checksums and verification results are listed on [GitHub Releases](https://github.com/Deftr0y/PeerBrush/releases); see [0.25 changes and limits](release-0.25.md).
+The [published PeerBrush 0.25 prerelease](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.25) uses application version **0.25.0**, with a separate Windows launcher workspace named `PeerBrush-0.25.0`. Its distribution retains the unsigned package policy. Actual published assets, checksums and verification results are listed on [GitHub Releases](https://github.com/Deftr0y/PeerBrush/releases); see [0.25 changes and limits](release-0.25.md).
 
 The [published PeerBrush 0.2 prerelease](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2) uses application version **0.2.0**. Its Windows x64, Linux x64 and macOS arm64 packages are unsigned; native publisher signing, notarization and archive signatures are deferred. Public archive checksums are included in the release. Release candidates in Actions are not published downloads.
 
