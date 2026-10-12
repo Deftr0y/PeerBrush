@@ -279,7 +279,9 @@
     "tests/gradient_stops.rs",
     "src/effects/contours.rs",
     "src/ui/contour_points.rs",
-    "tests/custom_contours.rs"
+    "tests/custom_contours.rs",
+    "docs/layer-styles.md",
+    "docs/release-0.25.md"
   ],
   "portable": [
     "LICENSE",
@@ -321,7 +323,9 @@
     "docs/unicode-filenames.md",
     "integrations/segmentation-requirements.txt",
     "integrations/segmentation_rembg.py",
-    "docs/production-export.md"
+    "docs/production-export.md",
+    "docs/layer-styles.md",
+    "docs/release-0.25.md"
   ],
   "readme": "scripts/package-readme.md",
   "vendored": [
