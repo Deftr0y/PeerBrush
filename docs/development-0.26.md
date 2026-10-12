@@ -1,6 +1,6 @@
 # PeerBrush 0.26 development
 
-Unreleased development on `codex/0.26`, starting from the published 0.25 source and its documentation updates. Published downloads remain 0.25. This queue supplements the acceptance criteria in [FOLLOWUPS.MD](../FOLLOWUPS.MD); an existing implementation is not evidence that outstanding acceptance work passed.
+Unreleased development on `version/0.26`, starting from the published 0.25 source and its documentation updates. Focused work uses `feature/0.26/<topic>` or `fix/0.26/<topic>` and follows the [development guide](development-guide.md). Published downloads remain 0.25. This queue supplements the acceptance criteria in [FOLLOWUPS.MD](../FOLLOWUPS.MD); an existing implementation is not evidence that outstanding acceptance work passed.
 
 Work proceeds in the backlog's established priority order:
 
