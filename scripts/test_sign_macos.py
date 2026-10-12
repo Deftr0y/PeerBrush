@@ -33,7 +33,7 @@ class Signing(unittest.TestCase):
         self.commit = packaging.git(self.fixture.root, 'rev-parse', 'HEAD').decode().strip()
         self.external = tempfile.TemporaryDirectory(prefix='peerbrush-sign-test-')
         self.addCleanup(self.external.cleanup)
-        self.base = pathlib.Path(self.external.name)
+        self.base = pathlib.Path(self.external.name).resolve()
         self.work = self.base / 'work'
         self.output = self.base / 'output'
         self.calls = []
@@ -147,11 +147,71 @@ class Signing(unittest.TestCase):
             self.sign()
         self.assertEqual(self.calls, [])
 
+    def test_explicit_file_keychain_reaches_identity_signing_and_every_notary_command(self):
+        keychain = self.base / 'synthetic signing.keychain-db'
+        keychain.write_bytes(b'SYNTHETIC_NON_SECRET_KEYCHAIN')
+        final = self.sign(keychain=keychain)
+        notary = [c for c in self.calls if 'notarytool' in c and '--find' not in c]
+        self.assertEqual({c[2] for c in notary}, {'history', 'submit', 'wait', 'info', 'log'})
+        for command in notary:
+            self.assertEqual(command.count('--keychain'), 1)
+            self.assertEqual(command[command.index('--keychain') + 1], str(keychain))
+            self.assertEqual(command[command.index('--keychain-profile') + 1], self.kwargs['profile'])
+        identity = next(c for c in self.calls if 'find-identity' in c)
+        self.assertEqual(identity[-1], str(keychain))
+        signed = next(c for c in self.calls if '--sign' in c)
+        self.assertEqual(signed[signed.index('--keychain') + 1], str(keychain))
+        self.assertNotIn(str(keychain), final.read_bytes().decode('latin1'))
+
+    def test_default_keychain_behavior_is_unchanged(self):
+        self.sign()
+        self.assertFalse(any('--keychain' in c for c in self.calls))
+
+    def test_invalid_explicit_keychains_fail_before_native_commands(self):
+        keychain = self.base / 'regular.keychain-db'
+        keychain.write_bytes(b'SYNTHETIC_NON_SECRET_KEYCHAIN')
+        symlink = self.base / 'linked.keychain-db'
+        symlink.symlink_to(keychain)
+        linked_directory = self.base / 'linked-directory'
+        linked_directory.symlink_to(self.base, target_is_directory=True)
+        for path in [pathlib.Path('relative.keychain-db'), self.base / 'missing',
+                     self.base, symlink, linked_directory / keychain.name]:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'explicit keychain'):
+                self.sign(keychain=path)
+        self.assertEqual(self.calls, [])
+
+    def test_resume_uses_selected_keychain_without_new_submission(self):
+        first = self.base / 'first.keychain-db'
+        second = self.base / 'second.keychain-db'
+        first.write_bytes(b'SYNTHETIC_NON_SECRET_KEYCHAIN')
+        second.write_bytes(b'SYNTHETIC_NON_SECRET_KEYCHAIN')
+        self.interrupt_wait = True
+        with self.assertRaisesRegex(ValueError, 'did not complete'):
+            self.sign(keychain=first)
+        self.interrupt_wait = False
+        initial_calls = len(self.calls)
+        self.sign(resume=True, keychain=second)
+        for command in self.calls[initial_calls:]:
+            if 'notarytool' in command and '--find' not in command:
+                self.assertEqual(command[command.index('--keychain') + 1], str(second))
+        self.assertEqual(sum('submit' in c for c in self.calls), 1)
+        self.assertEqual(sum('--sign' in c for c in self.calls), 1)
+
+    def test_public_submission_receipt_is_emitted_before_interrupted_wait(self):
+        self.interrupt_wait = True
+        receipts = []
+        with self.assertRaisesRegex(ValueError, 'did not complete'):
+            self.sign(on_submission=receipts.append)
+        self.assertEqual(receipts, [{'submission_id': SUBMISSION, 'commit': self.commit,
+                                    'unsigned_archive_sha256': self.kwargs['expected_sha256'],
+                                    'submission_archive_sha256': packaging.digest(self.work / 'submission.zip')}])
+        self.assertNotIn(self.kwargs['profile'], json.dumps(receipts))
+
     def test_wrong_archive_hash_or_unsafe_work_fail_before_signing(self):
         with self.assertRaisesRegex(ValueError, 'SHA-256'):
             self.sign(expected_sha256='0'*64)
         with self.assertRaisesRegex(ValueError, 'outside the source'):
-            self.sign(work=self.fixture.root / 'private-signing')
+            self.sign(work=self.fixture.root.resolve() / 'private-signing')
         self.assertEqual(self.calls, [])
 
     def test_wrong_keychain_identity_or_team_never_signs(self):

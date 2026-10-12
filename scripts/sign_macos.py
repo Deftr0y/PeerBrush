@@ -45,7 +45,7 @@ def parse_json(text, description):
     return result
 
 
-def validate_configuration(team_id, identity, profile, revision):
+def validate_configuration(team_id, identity, profile, revision, keychain=None):
     if sys.platform != 'darwin':
         raise ValueError('Developer ID signing requires an actual macOS runner')
     if not re.fullmatch(r'[A-Z0-9]{10}', team_id or ''):
@@ -56,10 +56,23 @@ def validate_configuration(team_id, identity, profile, revision):
         raise ValueError('An existing notarytool keychain profile name is required')
     if not re.fullmatch(r'[1-9][0-9]*', str(revision)):
         raise ValueError('An explicit positive signing packaging revision is required')
+    if keychain is not None:
+        keychain = pathlib.Path(keychain)
+        if (not keychain.is_absolute() or not keychain.is_file()
+                or any(path.is_symlink() for path in [keychain, *keychain.parents])):
+            raise ValueError('An explicit keychain must be an existing absolute regular file without links')
 
 
-def preflight(team_id, identity, profile):
-    available = run(['/usr/bin/security', 'find-identity', '-v', '-p', 'codesigning']).stdout
+def notary_credentials(profile, keychain=None):
+    # TN3147: a file-based keychain must be selected explicitly on every call.
+    # Adding it to the keychain search list does not select it for notarytool.
+    options = ['--keychain-profile', profile]
+    return options + (['--keychain', str(keychain)] if keychain is not None else [])
+
+
+def preflight(team_id, identity, profile, keychain=None):
+    available = run(['/usr/bin/security', 'find-identity', '-v', '-p', 'codesigning']
+                    + ([str(keychain)] if keychain is not None else [])).stdout
     identities = re.findall(r'\b([0-9A-Fa-f]{40})\s+"([^"\n]+)"', available)
     selected = [name for fingerprint, name in identities if fingerprint.upper() == identity]
     if len(selected) != 1 or not selected[0].startswith('Developer ID Application: ') or not selected[0].endswith(f' ({team_id})'):
@@ -68,7 +81,7 @@ def preflight(team_id, identity, profile):
     # partition-list changes, API keys or account configuration are performed.
     run(['/usr/bin/xcrun', '--find', 'notarytool'])
     run(['/usr/bin/xcrun', '--find', 'stapler'])
-    run(['/usr/bin/xcrun', 'notarytool', 'history', '--keychain-profile', profile,
+    run(['/usr/bin/xcrun', 'notarytool', 'history', *notary_credentials(profile, keychain),
          '--output-format', 'json'])
 
 
@@ -149,8 +162,10 @@ def save_state(work, state):
 
 
 def sign_archive(archive, output, work, commit, version, expected_sha256,
-                 team_id, identity, profile, revision, source_root=None, resume=False):
-    validate_configuration(team_id, identity, profile, revision)
+                 team_id, identity, profile, revision, source_root=None, resume=False,
+                 keychain=None, on_submission=None):
+    validate_configuration(team_id, identity, profile, revision, keychain)
+    credentials = notary_credentials(profile, keychain)
     identity = identity.upper()
     root = source_root or pathlib.Path(__file__).resolve().parents[1]
     archive = regular_file(archive.absolute().parent, archive.name)
@@ -183,7 +198,7 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
         # A failed/ambiguous submit leaves this directory in place. Do not retry
         # automatically; reconcile notarytool history before another upload.
         state = {'configuration': configuration}
-    preflight(team_id, identity, profile)
+    preflight(team_id, identity, profile, keychain)
     prefix = inspected['prefix'].rstrip('/')
     bundle = work / 'payload' / prefix
     app = bundle / APP
@@ -193,7 +208,8 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
         # Signing the bundle signs its main executable. --deep is verification
         # only; newly introduced helpers require an explicit inside-out review.
         run(['/usr/bin/codesign', '--force', '--sign', identity, '--options', 'runtime',
-             '--timestamp', '--identifier', BUNDLE_ID, str(app)])
+             '--timestamp', '--identifier', BUNDLE_ID]
+            + (['--keychain', str(keychain)] if keychain is not None else []) + [str(app)])
         verify_native(app, team_id)
         before = tree_hashes(bundle)
         allowed = set(MACOS_SIGNING_FILES) - {'PeerBrush.app/Contents/CodeResources'}
@@ -206,23 +222,29 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
         state['bundle_hashes'] = tree_hashes(work / 'payload')
         save_state(work, state)
         submitted = parse_json(run(['/usr/bin/xcrun', 'notarytool', 'submit', str(work / 'submission.zip'),
-                                    '--keychain-profile', profile, '--output-format', 'json'], timeout=1800).stdout, 'notarization submission')
+                                    *credentials, '--output-format', 'json'], timeout=1800).stdout, 'notarization submission')
         submission_id = submitted.get('id', '')
         if not re.fullmatch(UUID, submission_id):
             raise ValueError('No valid notarization submission ID returned; reconcile history before another upload')
         state['submission_id'] = submission_id
         save_state(work, state)
     submission_id = state['submission_id']
+    if on_submission is not None:
+        # Publish only a credential-free receipt before the potentially long
+        # wait, so an interrupted runner can reconcile this exact submission.
+        on_submission({'submission_id': submission_id, 'commit': commit,
+                       'unsigned_archive_sha256': expected_sha256,
+                       'submission_archive_sha256': state['submission_sha256']})
     # A timeout or pending result keeps the exact payload and ID for --resume.
     # Do not use another submit call to check an existing job.
-    run(['/usr/bin/xcrun', 'notarytool', 'wait', submission_id, '--keychain-profile', profile,
+    run(['/usr/bin/xcrun', 'notarytool', 'wait', submission_id, *credentials,
          '--timeout', '30m', '--output-format', 'json'], timeout=1860)
     status = parse_json(run(['/usr/bin/xcrun', 'notarytool', 'info', submission_id,
-                             '--keychain-profile', profile, '--output-format', 'json']).stdout, 'notarization status')
+                             *credentials, '--output-format', 'json']).stdout, 'notarization status')
     if status.get('id') != submission_id or status.get('status') != 'Accepted':
         raise ValueError('Notarization is not Accepted; preserve the work directory and resume only the same submission')
     log = parse_json(run(['/usr/bin/xcrun', 'notarytool', 'log', submission_id,
-                          '--keychain-profile', profile]).stdout, 'notarization log')
+                          *credentials]).stdout, 'notarization log')
     if str(log.get('jobId', '')).lower() != submission_id or log.get('status') != 'Accepted' or log.get('sha256') != state['submission_sha256']:
         raise ValueError('Notarization log does not match the exact submitted archive')
     if log.get('issues') not in [None, []]:
@@ -305,12 +327,15 @@ def main():
                   'revision': 'Positive integer for the explicit apple-signed-rN packaging label'}
     for name, help_text in input_help.items():
         parser.add_argument('--' + name, required=True, help=help_text)
+    parser.add_argument('--keychain', type=pathlib.Path,
+                        help='Existing absolute file-based keychain for both signing and every notarytool call')
     parser.add_argument('--resume', action='store_true', help='Wait for the saved submission without uploading again')
     args = parser.parse_args()
     try:
         result = sign_archive(args.archive, args.output, args.work, args.commit, args.version,
                               args.expected_sha256, args.team_id, args.identity, args.profile,
-                              args.revision, resume=args.resume)
+                              args.revision, resume=args.resume, keychain=args.keychain,
+                              on_submission=lambda receipt: print(json.dumps(receipt), flush=True))
         print(json.dumps({'file': result.name, 'sha256': digest(result),
                           'status': 'signed-notarized-stapled; native UI/download testing still required'}))
     except (ValueError, OSError, KeyError, zipfile.BadZipFile) as error:
