@@ -944,9 +944,9 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
             {
                 return Err("Unsupported Photoshop gradient stop fields/midpoint".into());
             }
-            // ASL midpoints are integer percentages of the following segment.
-            // Krita's ASL parser creates INTERP_LINEAR segments with this ratio;
-            // the shared native gradient sampler uses the same piecewise rule.
+            // Photoshop stores each midpoint on the destination stop. Read
+            // and validate all source fields before translating to the native
+            // outgoing-segment representation below.
             let position = plain_number(field(stop, "Lctn"))? / 4096.;
             if !(0.0..=1.).contains(&position) || position <= previous {
                 return Err("Photoshop gradient stops must strictly increase within 0–4096".into());
@@ -970,6 +970,13 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
             }
             stops.push(result);
         }
+        // The first Photoshop midpoint is unused. Native sources place the
+        // ratio on the preceding stop; never reinterpret already-saved native
+        // definitions. Reference: Patchy docs/ps-compat.md (PS calibration).
+        for index in 0..stops.len() - 1 {
+            stops[index]["midpoint"] = stops[index + 1]["midpoint"].clone();
+        }
+        stops.last_mut().unwrap()["midpoint"] = json!(0.5);
         // Photoshop extends the nearest stop outside its range, including a
         // one-stop constant ramp. Native controls require explicit endpoints;
         // retain every original stop and add only equivalent constant edges.

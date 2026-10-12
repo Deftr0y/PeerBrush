@@ -2854,7 +2854,7 @@ fn photoshop_gradient_clamped_stops_preserve_native_sources_controls_and_standar
         for pair in stops.windows(2) {
             if coordinate <= f64::from(pair[1].0) {
                 let ratio = (coordinate - f64::from(pair[0].0)) / f64::from(pair[1].0 - pair[0].0);
-                let midpoint = f64::from(pair[0].1) / 100.;
+                let midpoint = f64::from(pair[1].1) / 100.;
                 let weight = if ratio <= midpoint {
                     ratio / (2. * midpoint)
                 } else {
@@ -2953,12 +2953,17 @@ fn photoshop_gradient_clamped_stops_preserve_native_sources_controls_and_standar
                                 + usize::from(colors[0].0 != 0)
                                 + usize::from(colors.last().unwrap().0 != 4096)
                         );
-                        for &(position, midpoint, color) in colors {
+                        for (index, &(position, _, color)) in colors.iter().enumerate() {
                             let stop = color_stops
                                 .iter()
                                 .find(|s| s["position"] == f64::from(position) / 4096.)
                                 .unwrap();
-                            assert_eq!(stop["midpoint"], f64::from(midpoint) / 100.);
+                            assert_eq!(
+                                stop["midpoint"],
+                                colors
+                                    .get(index + 1)
+                                    .map_or(0.5, |stop| f64::from(stop.1) / 100.)
+                            );
                             assert_eq!(stop["color"], json!(color.map(|v| v / 255.)));
                         }
                         let alpha_stops = settings["alpha_stops"].as_array().unwrap();
@@ -2969,12 +2974,17 @@ fn photoshop_gradient_clamped_stops_preserve_native_sources_controls_and_standar
                                     + usize::from(alpha[0].0 != 0)
                                     + usize::from(alpha.last().unwrap().0 != 4096)
                             );
-                            for &(position, midpoint, opacity) in alpha {
+                            for (index, &(position, _, opacity)) in alpha.iter().enumerate() {
                                 let stop = alpha_stops
                                     .iter()
                                     .find(|s| s["position"] == f64::from(position) / 4096.)
                                     .unwrap();
-                                assert_eq!(stop["midpoint"], f64::from(midpoint) / 100.);
+                                assert_eq!(
+                                    stop["midpoint"],
+                                    alpha
+                                        .get(index + 1)
+                                        .map_or(0.5, |stop| f64::from(stop.1) / 100.)
+                                );
                                 assert_eq!(stop["opacity"], opacity / 100.);
                             }
                         } else {
@@ -3122,7 +3132,7 @@ fn midpoint_gradient_payload(reverse: bool, color: i32, alpha: i32) -> Vec<u8> {
         .filter_map(|(at, bytes)| (bytes == b"Mdpnlong").then_some(at + 8))
         .collect::<Vec<_>>();
     assert_eq!(midpoints.len(), 4);
-    for (at, value) in midpoints.into_iter().zip([color, 50, alpha, 50]) {
+    for (at, value) in midpoints.into_iter().zip([50, color, 50, alpha]) {
         payload[at..at + 4].copy_from_slice(&value.to_be_bytes());
     }
     // Independent transparency ramp, separate from the RGB midpoint.
@@ -3313,6 +3323,90 @@ fn photoshop_gradient_midpoints_reject_invalid_values_and_types_even_when_disabl
                     spec.tags.push((*b"lfx2", payload));
                     assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn photoshop_gradient_destination_midpoints_ignore_only_valid_first_stop_ratios() {
+    for depth in [8, 16] {
+        let mut baseline = None;
+        for (color_first, alpha_first) in [(1i32, 99i32), (99, 1), (17, 83)] {
+            let mut payload = midpoint_gradient_payload(false, 75, 25);
+            let offsets = payload
+                .windows(8)
+                .enumerate()
+                .filter_map(|(at, v)| (v == b"Mdpnlong").then_some(at + 8))
+                .collect::<Vec<_>>();
+            payload[offsets[0]..offsets[0] + 4].copy_from_slice(&color_first.to_be_bytes());
+            payload[offsets[2]..offsets[2] + 4].copy_from_slice(&alpha_first.to_be_bytes());
+            let expected = std::array::from_fn::<_, 2, _>(|x| {
+                let source = SAVED[x].map(|v| native(v, depth));
+                let tint = (65535f64 * if x == 0 { 1. / 6. } else { 0.5 }).round();
+                let alpha = (65535f64
+                    * if x == 0 {
+                        0.5
+                    } else {
+                        0.5 + (0.75 - 0.25) / (1. - 0.25) / 2.
+                    })
+                .round()
+                    / 65535.;
+                std::array::from_fn(|c| {
+                    if c == 3 {
+                        65535
+                    } else {
+                        native(
+                            (f64::from(source[c]) * (1. - alpha) + tint * alpha).round() as u16,
+                            depth,
+                        )
+                    }
+                })
+            });
+            let mut spec = Spec::paint("Synthetic destination midpoints", SAVED);
+            spec.tags.push((*b"lfx2", payload.clone()));
+            let mut bytes = fixture(&[spec], depth);
+            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+            for c in 0..4 {
+                for pixel in expected {
+                    composite_sample(&mut bytes, pixel, c, depth);
+                }
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(
+                !doc.read_only,
+                "{depth} {color_first} {alpha_first}: {:?}",
+                doc.warnings
+            );
+            assert_eq!(rendered(&doc), expected.concat());
+            assert_eq!(
+                doc.layers[0].effects[0].settings["color_stops"][0]["midpoint"],
+                0.75
+            );
+            assert_eq!(
+                doc.layers[0].effects[0].settings["alpha_stops"][0]["midpoint"],
+                0.25
+            );
+            assert_eq!(
+                doc.layers[0].effects[0].settings["color_stops"][1]["midpoint"],
+                0.5
+            );
+            let current = doc.export_png().unwrap();
+            if let Some(before) = &baseline {
+                assert_eq!(&current, before);
+            } else {
+                baseline = Some(current);
+            }
+            // An unused field is still validated, never a loophole for an
+            // unsupported definition whose initial appearance happens to match.
+            for index in [0, 2] {
+                let mut malformed = payload.clone();
+                malformed[offsets[index]..offsets[index] + 4].copy_from_slice(&0i32.to_be_bytes());
+                let at = malformed.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                malformed[at] = 0;
+                let mut invalid = Spec::paint("Synthetic invalid unused midpoint", SAVED);
+                invalid.tags.push((*b"lfx2", malformed));
+                assert!(psd::decode(&fixture(&[invalid], depth)).unwrap().read_only);
             }
         }
     }
