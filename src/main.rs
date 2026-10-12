@@ -1,28 +1,36 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-use peerbrush::{engine::Engine, server, ui::PeerBrush};
+use peerbrush::{activation, engine::Engine, server, ui::PeerBrush};
 use serde_json::{json, Value};
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 fn main() {
     if let Err(error) = run() {
         eprintln!("PeerBrush: {error}");
+        // File-association launches have no console. Keep failures visible without
+        // interfering with the stdio MCP bridge or command-line clients.
+        #[cfg(windows)]
+        {
+            let native = activation::native_error_dialog(std::env::args_os().skip(1));
+            if native {
+                rfd::MessageDialog::new()
+                    .set_title("PeerBrush could not open")
+                    .set_description(&error)
+                    .set_level(rfd::MessageLevel::Error)
+                    .show();
+            }
+        }
         std::process::exit(1);
     }
 }
 fn run() -> Result<(), String> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let mut state_dir = server::default_state_dir();
-    if let Some(i) = args.iter().position(|a| a == "--state-dir") {
-        if i + 1 >= args.len() {
-            return Err("--state-dir needs a path".into());
-        }
-        state_dir = PathBuf::from(args.remove(i + 1));
-        args.remove(i);
+    let (state_dir, args) = activation::arguments(
+        std::env::args_os().skip(1),
+        peerbrush::packaged::default_state_dir(server::default_state_dir())?,
+    )?;
+    if !peerbrush::packaged::external_config_is_visible(&state_dir)? {
+        return Err("The state directory would be hidden from external AI clients by Windows package isolation. Choose a writable --state-dir outside AppData.".into());
     }
-    match args.first().map(String::as_str) {
+    match args.first().and_then(|a| a.to_str()) {
         Some("--version" | "-V") => {
             println!("PeerBrush {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -37,15 +45,22 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("cli") => {
-            let method = args.get(1).map(String::as_str).unwrap_or("observe");
-            let params = if let Some(file) = args.get(2).filter(|s| s.starts_with('@')) {
+            let method = args
+                .get(1)
+                .map(|a| a.to_str().ok_or("CLI method must be valid text"))
+                .transpose()?
+                .unwrap_or("observe");
+            let raw = args
+                .get(2)
+                .map(|a| a.to_str().ok_or("CLI parameters must be valid text"))
+                .transpose()?;
+            let params = if let Some(file) = raw.filter(|s| s.starts_with('@')) {
                 serde_json::from_slice::<Value>(
                     &std::fs::read(&file[1..]).map_err(|e| e.to_string())?,
                 )
                 .map_err(|e| e.to_string())?
             } else {
-                serde_json::from_str::<Value>(args.get(2).map(String::as_str).unwrap_or("{}"))
-                    .map_err(|e| e.to_string())?
+                serde_json::from_str::<Value>(raw.unwrap_or("{}")).map_err(|e| e.to_string())?
             };
             let mut reply =
                 server::client(&state_dir, "rpc", &json!({"method":method,"params":params}))?;
@@ -72,17 +87,41 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("--help") => {
-            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [--headless]\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]");
+            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\nFiles open in independent project tabs, preserving existing work.");
             return Ok(());
         }
         _ => {}
     }
-    if server::focus_existing(&state_dir) {
+    let launch = activation::Launch::parse(args)?;
+    let files = launch.absolute_files()?;
+    if server::activate_existing(&state_dir, &files)? {
         return Ok(());
     }
     let shared = Arc::new(Mutex::new(Engine::new()));
-    let connection = server::start(shared.clone(), state_dir)?;
-    if args.iter().any(|a| a == "--headless") {
+    if !launch.headless {
+        activation::enable(&shared);
+        if !files.is_empty() {
+            activation::enqueue(&shared, files.clone())?;
+        }
+    }
+    let connection = match server::start(shared.clone(), state_dir.clone()) {
+        Ok(connection) => connection,
+        Err(error) => {
+            // Another Explorer launch can acquire the instance lock before its
+            // connection file is ready. Wait briefly for that same instance.
+            if error.starts_with("PeerBrush is already running for this workspace") {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::time::Instant::now() < deadline {
+                    if server::activate_existing(&state_dir, &files)? {
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            return Err(error);
+        }
+    };
+    if launch.headless {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }

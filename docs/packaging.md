@@ -39,3 +39,9 @@ Each run stages source, notices and the native ZIP in a fresh temporary director
 Run a clean contributor build from the extracted source before publication. Follow [release maintenance](https://github.com/Deftr0y/PeerBrush/blob/main/docs/release-maintenance.md) for media/privacy review, signatures, native verification and authorized publication. Filtering new archives does not remove historical Git blobs or previously published downloads. Archive signatures do not replace Windows Authenticode or Apple signing/notarization.
 
 For an explicitly authorized packaging-only correction, `--binary-source-commit` can retain an existing executable while recording its original full commit. Every application/build input must match that original commit; changed or missing engine inputs reject the correction. The source archive and packaging revision identify the new reviewed policy separately. Preserve executable hashes, publish the correction explicitly and verify replacement assets before removing superseded uploads.
+
+## Optional Windows installation package
+
+The Windows portable artifact can also be wrapped in MSIX, with a Start menu entry, PSD/PSB Open with registration, stable external MCP alias and OS-managed package updates. See [Windows installation and MSIX](msix.md) for identity inputs, build commands, Store review restrictions, Windows 10 integration fallback and required installed-runtime tests. Portable releases on all three platforms remain supported.
+
+Publisher-signing setup, exact public identity inputs and publication gates are in [signing onboarding](signing-onboarding.md). Apple Developer ID signing is documented in [macOS signing](macos-signing.md). These are preparation workflows and do not publish or change historical releases.

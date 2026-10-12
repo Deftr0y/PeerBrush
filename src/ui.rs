@@ -1,4 +1,5 @@
 use crate::icons::{self, Icon};
+mod activation;
 mod animation;
 mod brush;
 #[cfg(test)]
@@ -506,6 +507,7 @@ impl PeerBrush {
         Self::init(&cc.egui_ctx, shared, connection)
     }
     fn init(ctx: &egui::Context, shared: Shared, connection: Connection) -> Self {
+        crate::activation::enable(&shared);
         let mut fonts = egui::FontDefinitions::default();
         for (name, bytes) in [
             (
@@ -1401,7 +1403,7 @@ impl PeerBrush {
         if self.connecting {
             return;
         }
-        let executable = match std::env::current_exe() {
+        let executable = match crate::packaged::mcp_command() {
             Ok(path) => path,
             Err(error) => {
                 self.receive_connection(Err(format!("Could not locate PeerBrush: {error}")));
@@ -4612,6 +4614,7 @@ impl PeerBrush {
             if let Ok(mut e) = self.workspace_root.try_lock() {
                 if e.focus_requested {
                     e.focus_requested = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
@@ -4822,6 +4825,7 @@ impl PeerBrush {
         if self.lifecycle.is_none() && !self.lifecycle_frame {
             self.import_dialog(ctx);
             self.image_open_dialog(ctx);
+            self.open_activated_file(ctx);
         }
         if self.rename_edit.as_ref().is_some_and(|edit| {
             edit.document != doc.id || !doc.layers.iter().any(|l| l.id == edit.layer)
@@ -5505,14 +5509,17 @@ impl PeerBrush {
         if self.show_connection {
             let mut open = true;
             egui::Window::new("AI connection settings").open(&mut open).default_width(550.0).show(ctx, |ui| {
-                ui.label(RichText::new("MCP is ready").color(Color32::from_rgb(166, 215, 157)).strong());
                 ui.label("Connect AI handles discovery and installed clients. Manual configuration is available here for other clients.");
                 if !self.connect_feedback.is_empty() { ui.label(&self.connect_feedback); }
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.connection_codex, true, "Codex");
                     ui.selectable_value(&mut self.connection_codex, false, "Other clients");
                 });
-                let exe = std::env::current_exe().unwrap_or_default().to_string_lossy().into_owned();
+                let exe = match crate::packaged::mcp_command() {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(error) => { ui.label(error); return; }
+                };
+                ui.label(RichText::new("MCP is ready").color(Color32::from_rgb(166, 215, 157)).strong());
                 let state = self.connection.state_dir.to_string_lossy().into_owned();
                 let config = if self.connection_codex {
                     ui.label("Add to ~/.codex/config.toml, then restart Codex.");

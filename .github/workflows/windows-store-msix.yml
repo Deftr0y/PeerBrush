@@ -1,0 +1,134 @@
+name: Windows Store MSIX candidate
+
+on:
+  push:
+    branches:
+      - codex/windows-store-msix-20261012
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  store-candidate:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate and build unsigned Store candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw 'Visual Studio Installer vswhere.exe is missing.' }
+
+          $vsInstall = & $vswhere -latest -products '*' -requires `
+            Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            Microsoft.VisualStudio.Component.Windows11SDK.26100 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsInstall) { throw 'MSVC v143 or Windows 11 SDK 10.0.26100 is missing.' }
+
+          $devCmd = Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat'
+          $varsCommand = 'call "' + $devCmd + '" -no_logo -arch=x64 -host_arch=x64 && set'
+          $vars = & cmd.exe /d /s /c $varsCommand
+          if ($LASTEXITCODE -ne 0) { throw 'Visual Studio x64 developer environment could not initialize.' }
+          foreach ($line in $vars) {
+            $separator = $line.IndexOf('=')
+            if ($separator -gt 0) {
+              $name = $line.Substring(0, $separator)
+              $value = $line.Substring($separator + 1)
+              [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+            }
+          }
+
+          $sdk = Join-Path $programFilesX86 'Windows Kits\10\bin\10.0.26100.0\x64'
+          $makeAppx = Join-Path $sdk 'MakeAppx.exe'
+          if (-not (Test-Path -LiteralPath $makeAppx)) { throw 'Windows SDK 10.0.26100 MakeAppx.exe is missing.' }
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw 'MSVC compiler is missing from the x64 developer environment.' }
+          if (-not (Get-Command link.exe -ErrorAction SilentlyContinue)) { throw 'MSVC linker is missing from the x64 developer environment.' }
+
+          $python = (Get-Command python.exe -ErrorAction Stop).Source
+          $cargo = (Get-Command cargo.exe -ErrorAction Stop).Source
+          $rustc = (Get-Command rustc.exe -ErrorAction Stop).Source
+          Write-Host (& $python --version)
+          Write-Host (& $rustc --version)
+          Write-Host (& $cargo --version)
+          Write-Host "Visual Studio: $vsInstall"
+          Write-Host "Windows SDK: 10.0.26100.0"
+          Write-Host "MSVC: $env:VCToolsVersion"
+          Write-Host "MakeAppx: $makeAppx"
+
+          function Invoke-Checked([string]$Executable, [string[]]$Arguments) {
+            & $Executable @Arguments
+            if ($LASTEXITCODE -ne 0) { throw "$Executable $Arguments failed with exit code $LASTEXITCODE" }
+          }
+
+          $commit = (& git rev-parse HEAD).Trim()
+          Invoke-Checked $python @('scripts/release_gate.py', '--commit', $commit)
+          Invoke-Checked $python @('scripts/package.py', '--check-source')
+          Invoke-Checked $cargo @('fmt', '--all', '--', '--check')
+          Invoke-Checked $cargo @('test', '--locked')
+          Invoke-Checked $cargo @('clippy', '--all-targets', '--locked')
+          Invoke-Checked $python @('scripts/test_package.py')
+          Invoke-Checked $python @('scripts/test_msix.py')
+          Invoke-Checked $python @('scripts/test_sign_macos.py')
+          Invoke-Checked $python @('scripts/build_release.py')
+          Invoke-Checked $python @('scripts/test_msix_runtime_tests.py')
+          Invoke-Checked $python @('scripts/package.py')
+
+          $portable = 'dist/PeerBrush-0.25.0-Windows-x64.zip'
+          if (-not (Test-Path -LiteralPath $portable)) { throw 'Expected portable package was not produced.' }
+          $portableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portable).Hash.ToLowerInvariant()
+          $packageArgs = @(
+            'scripts/package_msix.py', '--portable', $portable,
+            '--portable-sha256', $portableHash,
+            '--identity', 'packaging/msix/identity.store.json',
+            '--expected-package-family', 'Deftroy.PeerBrush_wszhgmjq5tjta',
+            '--package-version', '1.25.0.0',
+            '--output', 'dist/store-candidate'
+          )
+          Invoke-Checked $python $packageArgs
+
+          $msix = @(Get-ChildItem -LiteralPath 'dist/store-candidate' -Filter '*.msix' -File)
+          if ($msix.Count -ne 1) { throw "Expected exactly one MSIX; found $($msix.Count)." }
+          $reportPath = $msix[0].FullName + '.json'
+          $report = Get-Content -Raw -LiteralPath $reportPath | ConvertFrom-Json
+          if ($report.signed -ne $false -or $report.installed_tested -ne $false) { throw 'MSIX report has unexpected signing or installation-test status.' }
+          if ($report.commit -ne $commit) { throw 'MSIX report commit does not match the checked-out source.' }
+
+          $metadata = [ordered]@{
+            commit = $commit
+            source = 'Deftr0y/PeerBrush'
+            runner = 'windows-2022'
+            rustc = (& $rustc --version).Trim()
+            cargo = (& $cargo --version).Trim()
+            msvc = $env:VCToolsVersion
+            windows_sdk = '10.0.26100.0'
+            package = $msix[0].Name
+            package_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $msix[0].FullName).Hash.ToLowerInvariant()
+            signed = $false
+            installed_tested = $false
+          }
+          $metadata | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath 'dist/store-candidate/build-environment.json'
+
+      - name: Upload Store candidate and matching portable package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PeerBrush-0.25.0-Windows-x64-Store-candidate
+          path: |
+            dist/store-candidate/*.msix
+            dist/store-candidate/*.msix.json
+            dist/store-candidate/*.msix.sha256
+            dist/store-candidate/build-environment.json
+            dist/PeerBrush-0.25.0-Windows-x64.zip
+            dist/PeerBrush-0.25.0-Windows-x64.sha256
+          if-no-files-found: error
+          retention-days: 7

@@ -54,8 +54,23 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked
       - run: python scripts/test_package.py
+      - run: python scripts/test_msix.py
+      - run: python scripts/test_sign_macos.py
       - run: python scripts/build_release.py
+      - run: python scripts/test_msix_runtime_tests.py
       - run: python scripts/package.py
+      - name: Build unsigned MSIX with explicit local-test identity
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])'
+          python scripts/package_msix.py --portable "dist/PeerBrush-$version-Windows-x64.zip" --development-identity
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: MSIX-local-test
+          path: dist/msix/*
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: PeerBrush-${{ runner.os }}
