@@ -10905,6 +10905,14 @@ mod tests {
         tool: Tool,
         kind: &str,
     ) -> (PeerBrush, egui::Context, Pos2, Document) {
+        pressed_selection_fixture_with_previous(depth, tool, kind, false)
+    }
+    fn pressed_selection_fixture_with_previous(
+        depth: u16,
+        tool: Tool,
+        kind: &str,
+        previous: bool,
+    ) -> (PeerBrush, egui::Context, Pos2, Document) {
         let (mut app, ctx) = small_fixture();
         let before = {
             let mut engine = app.shared.lock().unwrap();
@@ -10923,6 +10931,18 @@ mod tests {
                 }
             }
             app.selected = engine.doc.layers[0].id.clone();
+            if previous {
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"selection","kind":"rectangle","rect":[0,0,2,2]})],
+                        None,
+                        None,
+                        "Previous coverage",
+                    )
+                    .unwrap();
+                engine.undo.clear();
+            }
             engine.doc.clone()
         };
         app.clipboard = crate::clipboard::Worker::memory(ctx.clone());
@@ -11353,31 +11373,15 @@ mod tests {
         for depth in [8, 16] {
             for kind in ["polygon", "magnetic"] {
                 for action in ["copy", "cut", "paste", "move", "rotate", "scale"] {
-                    let (mut app, ctx, point, _) =
-                        pressed_selection_fixture(depth, Tool::Selection, kind);
+                    let (mut app, ctx, point, before) =
+                        pressed_selection_fixture_with_previous(depth, Tool::Selection, kind, true);
                     frame(
                         &mut app,
                         &ctx,
                         vec![primary_release(point)],
                         Default::default(),
                     );
-                    let before = {
-                        let mut engine = app.shared.lock().unwrap();
-                        engine
-                            .edit(
-                                "human",
-                                &[json!({"op":"selection","kind":"rectangle","rect":[0,0,2,2]})],
-                                None,
-                                None,
-                                "Previous selection",
-                            )
-                            .unwrap();
-                        engine.undo.clear();
-                        engine.doc.clone()
-                    };
                     app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
-                    // The manually seeded path starts after the prior coverage.
-                    app.selection_gesture_source = Some(app.selection_source(&before));
                     let path = app.selection_path.clone();
                     let event = match action {
                         "copy" => egui::Event::Copy,
@@ -11833,7 +11837,8 @@ mod tests {
                         } else {
                             Tool::Selection
                         };
-                        let (mut app, ctx, point, _) = pressed_selection_fixture(depth, tool, kind);
+                        let (mut app, ctx, point, before) =
+                            pressed_selection_fixture_with_previous(depth, tool, kind, true);
                         let path_tool = ["polygon", "magnetic"].contains(&kind);
                         if path_tool {
                             frame(
@@ -11856,12 +11861,6 @@ mod tests {
                             );
                             assert!(app.drag_start.is_some());
                         }
-                        let before = {
-                            let mut engine = app.shared.lock().unwrap();
-                            engine.edit("human", &[json!({"op":"selection","kind":"rectangle","rect":[0,0,2,2]})], None, None, "Previous selected area").unwrap();
-                            engine.undo.clear();
-                            engine.doc.clone()
-                        };
                         let modifiers = match action {
                             "fill" => egui::Modifiers {
                                 alt: true,
@@ -12467,19 +12466,8 @@ mod tests {
     #[test]
     fn late_merged_copy_keeps_the_wand_release_selection_modifiers() {
         for depth in [8, 16] {
-            let (mut app, ctx, point, _) = pressed_wand_fixture(depth);
-            {
-                let mut e = app.shared.lock().unwrap();
-                e.edit(
-                    "human",
-                    &[json!({"op":"selection","kind":"rectangle","rect":[0,0,2,2]})],
-                    None,
-                    None,
-                    "Initial selection",
-                )
-                .unwrap();
-                e.undo.clear();
-            }
+            let (mut app, ctx, point, _) =
+                pressed_selection_fixture_with_previous(depth, Tool::MagicWand, "wand", true);
             frame(
                 &mut app,
                 &ctx,
