@@ -55,6 +55,265 @@ fn strip(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn gradient_pixel_grid_matches_calibrated_knots_at_native_precision() {
+    // Independently read knot samples from Photoshop's saved geometry BMP:
+    // Patchy bb6b9426080842af6f4f65acb122516e07328323, gradient-overlay-geometry.
+    // This verifies placement only, without assuming its cubic interpolation.
+    let cases = [
+        (
+            "reflected",
+            90.,
+            1.46,
+            [10, 10, 34, 70],
+            vec![(22, 40, [83, 91, 94])],
+        ),
+        (
+            "reflected",
+            0.,
+            1.46,
+            [44, 10, 69, 51],
+            vec![(56, 30, [83, 91, 94])],
+        ),
+        (
+            "radial",
+            90.,
+            1.46,
+            [80, 10, 110, 66],
+            vec![(95, 38, [83, 91, 94])],
+        ),
+        (
+            "diamond",
+            90.,
+            1.46,
+            [160, 10, 190, 66],
+            vec![(175, 38, [83, 91, 94])],
+        ),
+        (
+            "angle",
+            90.,
+            1.46,
+            [10, 80, 54, 130],
+            vec![(32, 105, [255, 0, 0])],
+        ),
+        (
+            "linear",
+            90.,
+            1.46,
+            [64, 80, 92, 130],
+            vec![
+                (78, 105, [74, 81, 84]),
+                (78, 87, [253, 253, 253]),
+                (78, 123, [254, 254, 254]),
+            ],
+        ),
+    ];
+    for depth in [8, 16] {
+        for (style, angle, scale, bounds, knots) in &cases {
+            let mut engine = Engine::new();
+            engine.doc = Document::new_depth(200, 140, depth).unwrap();
+            let layer = engine.doc.layers[0].id.clone();
+            for y in 0..140 {
+                for x in 0..200 {
+                    engine.doc.layers[0].pixels.set16(
+                        x,
+                        y,
+                        [
+                            12347,
+                            23459,
+                            34571,
+                            if (bounds[0]..bounds[2]).contains(&x)
+                                && (bounds[1]..bounds[3]).contains(&y)
+                            {
+                                65535
+                            } else {
+                                0
+                            },
+                        ],
+                    );
+                }
+            }
+            let source = engine.doc.layers[0].pixels.rgba16();
+            let quarter = if *style == "angle" {
+                [255., 0., 0.]
+            } else {
+                [254.; 3]
+            };
+            let colors = [
+                [83., 91., 94.],
+                quarter,
+                [74., 81., 84.],
+                [253.; 3],
+                [83., 91., 94.],
+            ];
+            let stops=colors.into_iter().enumerate().map(|(i,color)|json!({"position":i as f64/4.,"midpoint":0.5,"color":color.map(|v|v/255.)})).collect::<Vec<_>>();
+            let command = json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":{"style":style,"angle":angle,"scale":scale,"opacity":1.,"pixel_grid":true,"align_layer":true,"color_stops":stops}});
+            let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
+            assert!(engine.undo.is_empty());
+            engine
+                .edit(
+                    "human",
+                    &[command],
+                    None,
+                    None,
+                    "Calibrated native gradient grid",
+                )
+                .unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                draft.export_png().unwrap()
+            );
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            let words = if depth == 16 {
+                depth16::render(&engine.doc).unwrap().words
+            } else {
+                engine
+                    .doc
+                    .preview(None, 200, None, false)
+                    .unwrap()
+                    .2
+                    .into_iter()
+                    .map(|v| u16::from(v) * 257)
+                    .collect()
+            };
+            for &(x, y, color) in knots {
+                let at = ((y * 200 + x) * 4) as usize;
+                assert_eq!(
+                    words[at..at + 3],
+                    color.map(|v| v * 257),
+                    "{depth} {style} {x} {y}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gradient_pixel_grid_retains_legacy_sources_history_and_current_standard_saves() {
+    for depth in [8, 16] {
+        let mut engine = Engine::new();
+        engine.doc = Document::new_depth(4, 2, depth).unwrap();
+        for y in 0..2 {
+            for x in 0..4 {
+                engine.doc.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [
+                        12347 + x as u16 * 101,
+                        23459 + y as u16 * 107,
+                        34571,
+                        if x == 2 {
+                            0
+                        } else if x == 1 {
+                            32769
+                        } else {
+                            65535
+                        },
+                    ],
+                );
+            }
+        }
+        let layer = engine.doc.layers[0].id.clone();
+        engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":{"angle":0.,"color":[0.,0.,0.],"color2":[1.,1.,1.],"opacity":1.}})],None,None,"Legacy gradient").unwrap();
+        engine.undo.clear();
+        let source = engine.doc.layers[0].pixels.rgba16();
+        let original = engine.doc.export_png().unwrap();
+        let effect = engine.doc.layers[0].effects[0].id.clone();
+        let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+        settings["pixel_grid"] = json!(true);
+        settings["align_layer"] = json!(false);
+        let command =
+            json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
+        let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
+        assert_ne!(draft.export_png().unwrap(), original);
+        assert_eq!(engine.doc.export_png().unwrap(), original);
+        assert!(engine.undo.is_empty());
+        engine
+            .edit("human", &[command], None, None, "Native grid placement")
+            .unwrap();
+        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            draft.export_png().unwrap()
+        );
+        let current = engine.doc.export_png().unwrap();
+        let words = native(&engine.doc);
+        for enabled in [false, true] {
+            for grid in [false, true] {
+                let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+                settings["pixel_grid"] = json!(grid);
+                let doc = Engine::preview_edits(engine.doc.clone(), &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":enabled,"settings":settings})]).unwrap();
+                let current = doc.export_png().unwrap();
+                for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                    use std::io::Read;
+                    let at = bytes.windows(4).position(|v| v == b"PBR1").unwrap() + 4;
+                    let mut raw = vec![];
+                    flate2::read::ZlibDecoder::new(&bytes[at..])
+                        .read_to_end(&mut raw)
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["format"],
+                        27
+                    );
+                    let reopened = psd::decode(&bytes).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                    assert_eq!(
+                        reopened.layers[0].effects[0].settings,
+                        doc.layers[0].effects[0].settings
+                    );
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                    let standard = psd::decode(&strip(&bytes)).unwrap();
+                    assert!(!standard.read_only);
+                    assert_eq!(standard.export_png().unwrap(), current);
+                    assert_eq!(native(&standard), native(&doc));
+                }
+            }
+        }
+        for x in [0usize, 1, 3] {
+            let expected = if depth == 16 {
+                (x as f64 / 4. * 65535.).round() as u16
+            } else {
+                u16::from(peerbrush::raster::project16(
+                    (x as f64 / 4. * 65535.).round() as u16,
+                )) * 257
+            };
+            assert_eq!(words[x * 4], expected);
+        }
+        engine.undo("human").unwrap();
+        assert_eq!(engine.doc.export_png().unwrap(), original);
+        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+        engine.redo("human").unwrap();
+        assert_eq!(engine.doc.export_png().unwrap(), current);
+        let before = serde_json::to_value(&engine.doc).unwrap();
+        let history = engine.undo.len();
+        for invalid in [
+            json!({"pixel_grid":1}),
+            json!({"align_layer":true}),
+            json!({"pixel_grid":false,"align_layer":true}),
+            json!({"pixel_grid":true,"align_layer":1}),
+        ] {
+            assert!(engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":invalid})],None,None,"Invalid grid").is_err());
+            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+            assert_eq!(engine.undo.len(), history);
+        }
+        for kind in ["color_overlay", "pattern_overlay", "drop_shadow"] {
+            assert!(effects::validate(kind, &json!({"pixel_grid":true})).is_err());
+        }
+        let legacy = engine.doc.layers[0].effects[0].settings.clone();
+        let mut disabled = legacy.clone();
+        disabled["pixel_grid"] = json!(false);
+        let mut removed = disabled.clone();
+        removed.as_object_mut().unwrap().remove("pixel_grid");
+        removed.as_object_mut().unwrap().remove("align_layer");
+        let mut a = source.clone();
+        let mut b = source.clone();
+        effects::styles::apply(&mut a, 4, 2, "gradient_overlay", &disabled).unwrap();
+        effects::styles::apply(&mut b, 4, 2, "gradient_overlay", &removed).unwrap();
+        assert_eq!(a, b);
+    }
+}
+
+#[test]
 fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standard_saves() {
     for depth in [8, 16] {
         for (angle, distance, dx, dy) in

@@ -1,6 +1,80 @@
 //! Bounded native RGB and independent opacity stops; no bitmap or display projection.
 use serde_json::Value;
 
+pub fn gridded(kind: &str, value: &Value) -> bool {
+    kind == "gradient_overlay"
+        && (value.get("pixel_grid").is_some() || value.get("align_layer").is_some())
+}
+
+/// Explicit integer-center placement. Legacy gradients retain their existing
+/// normalized pixel-center geometry unless this mode is enabled.
+pub(super) struct Grid {
+    center: (f64, f64),
+    half: f64,
+    direction: (f64, f64),
+    angle: f64,
+}
+impl Grid {
+    pub(super) fn new(alpha: &[f64], w: usize, h: usize, value: &Value) -> Self {
+        let mut bounds = (0usize, 0usize, w, h);
+        if value["align_layer"] == true {
+            let mut visible = (w, h, 0, 0);
+            for (index, a) in alpha.iter().enumerate() {
+                if *a > 0. {
+                    let (x, y) = (index % w, index / w);
+                    visible.0 = visible.0.min(x);
+                    visible.1 = visible.1.min(y);
+                    visible.2 = visible.2.max(x + 1);
+                    visible.3 = visible.3.max(y + 1);
+                }
+            }
+            if visible.2 > visible.0 && visible.3 > visible.1 {
+                bounds = visible;
+            }
+        }
+        let (width, height) = ((bounds.2 - bounds.0) as f64, (bounds.3 - bounds.1) as f64);
+        let degrees = value["angle"].as_f64().unwrap_or(90.);
+        let angle = degrees.to_radians();
+        let direction = match degrees {
+            -180. | 180. => (-1., 0.),
+            -90. => (0., -1.),
+            0. => (1., 0.),
+            90. => (0., 1.),
+            _ => (angle.cos(), angle.sin()),
+        };
+        let scale = value["scale"].as_f64().unwrap_or(1.);
+        Self {
+            center: (
+                (bounds.0 as f64 + width / 2.).floor()
+                    + value["offset_x"].as_f64().unwrap_or(0.) * width,
+                (bounds.1 as f64 + height / 2.).floor()
+                    + value["offset_y"].as_f64().unwrap_or(0.) * height,
+            ),
+            half: ((width * direction.0.abs() + height * direction.1.abs()) * scale / 2.)
+                .floor()
+                .max(1.),
+            direction,
+            angle,
+        }
+    }
+    pub(super) fn position(&self, x: usize, y: usize, style: &str) -> f64 {
+        let (x, y) = (x as f64 - self.center.0, y as f64 - self.center.1);
+        let along = x * self.direction.0 - y * self.direction.1;
+        let across = x * self.direction.1 + y * self.direction.0;
+        match style {
+            "radial" => x.hypot(y) / self.half,
+            "diamond" => (along.abs() + across.abs()) / self.half,
+            "reflected" => along.abs() / self.half,
+            "angle" if x == 0. && y == 0. => 0.25,
+            "angle" => {
+                (y.atan2(x) + self.angle).rem_euclid(std::f64::consts::TAU) / std::f64::consts::TAU
+            }
+            _ => 0.5 + along / (self.half * 2.),
+        }
+        .clamp(0., 1.)
+    }
+}
+
 pub fn positioned(kind: &str, value: &Value) -> bool {
     kind == "gradient_overlay"
         && (value.get("offset_x").is_some() || value.get("offset_y").is_some())

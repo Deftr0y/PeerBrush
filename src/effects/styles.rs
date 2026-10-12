@@ -147,7 +147,12 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
             && !(kind == "gradient_overlay"
                 && matches!(
                     key.as_str(),
-                    "color_stops" | "alpha_stops" | "offset_x" | "offset_y"
+                    "color_stops"
+                        | "alpha_stops"
+                        | "offset_x"
+                        | "offset_y"
+                        | "pixel_grid"
+                        | "align_layer"
                 ))
             && !(crate::effects::contours::contains(kind) && key == "contour_points")
         {
@@ -181,7 +186,8 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                     return Err("Unsupported style blend mode".into());
                 }
             }
-            "reverse" | "invert" | "down" | "pixel_snap" | "source_knockout" => {
+            "reverse" | "invert" | "down" | "pixel_snap" | "source_knockout" | "pixel_grid"
+            | "align_layer" => {
                 if !v.is_boolean() {
                     return Err(format!("{key} must be true or false"));
                 }
@@ -231,6 +237,9 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                 }
             }
         }
+    }
+    if value["align_layer"] == true && value["pixel_grid"] != true {
+        return Err("Layer-aligned gradients require pixel-aligned placement".into());
     }
     if value["contour"] == "custom" {
         crate::effects::contours::Curve::decode(&value["contour_points"])?;
@@ -386,6 +395,8 @@ pub fn apply(
         .map(|p| f64::from(p[3]) / 65535.)
         .collect();
     let mut field = alpha.clone();
+    let gradient_grid = (kind == "gradient_overlay" && v["pixel_grid"] == true)
+        .then(|| crate::effects::gradient::Grid::new(&alpha, w, h, v));
     let size = number(v, "size");
     let distance = number(v, "distance");
     let offset = (number(v, "offset_x"), number(v, "offset_y"));
@@ -467,15 +478,20 @@ pub fn apply(
                     let px = (x as f64 + 0.5) / w as f64 - 0.5 - offset.0;
                     let py = (y as f64 + 0.5) / h as f64 - 0.5 - offset.1;
                     let position = px * direction.0 - py * direction.1;
-                    let mut t = match v["style"].as_str().unwrap_or("linear") {
-                        "radial" => px.hypot(py) * 2. / scale,
-                        "angle" => {
-                            (py.atan2(px) + angle).rem_euclid(std::f64::consts::TAU)
-                                / std::f64::consts::TAU
+                    let style = v["style"].as_str().unwrap_or("linear");
+                    let mut t = if let Some(grid) = &gradient_grid {
+                        grid.position(x, y, style)
+                    } else {
+                        match style {
+                            "radial" => px.hypot(py) * 2. / scale,
+                            "angle" => {
+                                (py.atan2(px) + angle).rem_euclid(std::f64::consts::TAU)
+                                    / std::f64::consts::TAU
+                            }
+                            "reflected" => position.abs() * 2. / scale,
+                            "diamond" => (px.abs() + py.abs()) / scale,
+                            _ => 0.5 + position / scale,
                         }
-                        "reflected" => position.abs() * 2. / scale,
-                        "diamond" => (px.abs() + py.abs()) / scale,
-                        _ => 0.5 + position / scale,
                     }
                     .clamp(0., 1.);
                     if v["reverse"] == true {

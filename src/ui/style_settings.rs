@@ -337,6 +337,23 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
     }
     if kind == "gradient_overlay" {
         changed = gradient_stops::controls(ui, value).or(changed);
+        let mut grid = value["pixel_grid"] == true;
+        let r = ui.checkbox(&mut grid, "Pixel aligned");
+        if r.changed() {
+            value["pixel_grid"] = json!(grid);
+            if !grid && value["align_layer"] == true {
+                value["align_layer"] = json!(false);
+            }
+            changed = Some(r);
+        }
+        if grid {
+            let mut aligned = value["align_layer"] == true;
+            let r = ui.checkbox(&mut aligned, "Align to layer");
+            if r.changed() {
+                value["align_layer"] = json!(aligned);
+                changed = Some(r);
+            }
+        }
     }
     changed = contour_points::controls(ui, value).or(changed);
     for (key, label) in [
