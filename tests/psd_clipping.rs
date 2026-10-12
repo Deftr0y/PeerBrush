@@ -2699,6 +2699,84 @@ fn photoshop_overlay_blend_enum_import_uses_exact_native_composite_gate() {
 fn gradient_payload(reverse: bool, omit: Option<&str>, smoothness: f64) -> Vec<u8> {
     positioned_gradient_payload(reverse, omit, smoothness, 100., None)
 }
+
+#[test]
+fn photoshop_gradient_integer_grid_import_requires_exact_native_composite() {
+    for depth in [8, 16] {
+        for reverse in [false, true] {
+            let mut spec = Spec::paint("Synthetic integer-center gradient", SAVED);
+            spec.tags
+                .push((*b"lfx2", gradient_payload(reverse, None, 0.)));
+            let mut bytes = fixture(&[spec], depth);
+            // At integer x=0,1, center=1 and radius=1, the independent
+            // linear ramp samples 0 and 1/2 (1 and 1/2 when reversed).
+            let expected = [
+                [
+                    if reverse { 65535 } else { 0 },
+                    if reverse { 65535 } else { 0 },
+                    if reverse { 65535 } else { 0 },
+                    65535,
+                ],
+                [native(32768, depth); 4],
+            ];
+            let mut expected = expected;
+            expected[1][3] = 65535;
+            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+            for channel in 0..4 {
+                for pixel in expected {
+                    composite_sample(&mut bytes, pixel, channel, depth);
+                }
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{depth} {reverse}: {:?}", doc.warnings);
+            assert_eq!(doc.layers[0].effects[0].settings["pixel_grid"], true);
+            let source = SAVED.map(|p| p.map(|n| native(n, depth))).concat();
+            assert_eq!(doc.layers[0].pixels.rgba16(), source);
+            assert_eq!(rendered(&doc), expected.concat());
+            let current = doc.export_png().unwrap();
+            for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                assert_eq!(saved_composite(&output, depth), expected.concat());
+                let reopened = psd::decode(&output).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                assert_eq!(
+                    reopened.layers[0].effects[0].settings,
+                    doc.layers[0].effects[0].settings
+                );
+                assert_eq!(reopened.export_png().unwrap(), current);
+                assert_eq!(
+                    psd::decode(&ordinary(&output))
+                        .unwrap()
+                        .export_png()
+                        .unwrap(),
+                    current
+                );
+            }
+            let mut engine = Engine::new();
+            let layer = doc.layers[0].id.clone();
+            let effect = doc.layers[0].effects[0].id.clone();
+            engine.doc = doc;
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":false})],
+                    None,
+                    None,
+                    "Grid gradient bypass",
+                )
+                .unwrap();
+            assert_eq!(rendered(&engine.doc), source);
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), current);
+            // A one-word saved-composite discrepancy cannot authorize editing.
+            let at = bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+            bytes[at] ^= 1;
+            let protected = psd::decode(&bytes).unwrap();
+            assert!(protected.read_only);
+            assert!(protected.layers[0].effects.is_empty());
+        }
+    }
+}
 fn positioned_gradient_payload(
     reverse: bool,
     omit: Option<&str>,

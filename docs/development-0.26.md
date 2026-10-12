@@ -11,9 +11,16 @@ Work proceeds in the backlog's established priority order:
 5. **PB-118 / PB-070:** receiving-application round trips and remaining Photoshop/color-profile fidelity, with actual application/version evidence.
 6. **PB-106 / PB-133:** close outstanding effects UI and native clipboard acceptance checks without replacing a populated human clipboard.
 7. **PB-007 / PB-042 / PB-036 / PB-061 / PB-076 / PB-081:** remaining visual feedback, performance paths and optional refinements after the higher-priority reliability work.
-8. **PB-103 / PB-105:** signing and larger-document architecture remain dependent on signing access and bounded resource measurements; current size limits stay in force until the engine and codec support an increase.
-9. **PB-139:** historical-reference audit may proceed read-only. History rewrites, tag moves and deletion remain subject to the explicit owner-approval requirement recorded in the backlog.
+8. **PB-141:** use installed system fonts for multilingual UI while preserving Ubuntu Sans, Unicode paths, shaping and document Text sources; verify missing-font cases and actual platform package reductions before removing bundled coverage.
+9. **PB-103 / PB-105:** signing and larger-document architecture remain dependent on signing access and bounded resource measurements; current size limits stay in force until the engine and codec support an increase.
+10. **PB-139:** historical-reference audit may proceed read-only. History rewrites, tag moves and deletion remain subject to the explicit owner-approval requirement recorded in the backlog.
 
 The existing GitHub Actions workflow runs engine, codec, protocol and UI regression tests, formatting, Clippy and package checks on every branch push, across Windows, macOS and Linux. Development checkpoints use that workflow for automated testing. A queued run is not a passed run: record the exact tested commit and outcome before closing acceptance work. Native workspace inspection remains separate from CI, as do physical hardware and receiving-application checks.
 
 No release, website deployment, announcement or historical rewrite is part of starting this development branch.
+
+## PB-122 integer-grid gradient import
+
+Implemented, acceptance pending. Existing supported gradient geometry is tried first. If its complete native composite differs, the decoder tries one alternate document with enabled Gradient Overlays using the existing integer-center pixel grid. Only an exact match of every standard white-matte RGB and alpha sample permits editable opening. Original native rasters and all existing descriptor/structure guards remain in force; rejected candidates use the protected saved composite. Mixed per-effect geometry combinations, smooth Photoshop gradients and broader unsupported style structures remain protected.
+
+The regression fixture supplies independent 8/16-bit integer-center ramp samples, reversed placement, editable PSD/PSB reopen, standard-only appearance, effect bypass/undo and one-word mismatch protection. GitHub Actions and fresh native workspace acceptance are pending; this slice does not close PB-122.

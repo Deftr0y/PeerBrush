@@ -2237,14 +2237,34 @@ fn decode_parts(
     // cannot be recovered after clamping and therefore never authorize editing.
     if warnings.is_empty() && doc.layers.iter().any(|l| !l.effects.is_empty()) {
         control.check()?;
-        let matches = if depth == 16 {
-            crate::depth16::render(&doc)
-                .map(|image| merged_white_valid && same_standard_composite(&image.words, &merged))
+        let matches = if merged_white_valid {
+            imported_style_composite_matches(&doc, &merged).and_then(|matches| {
+                if matches {
+                    return Ok(true);
+                }
+                control.check()?;
+                // Preserve already accepted placement. The bounded alternate
+                // uses the same integer-center renderer as native gradients,
+                // and is accepted only by the complete exact-composite gate.
+                // Try one document-wide candidate, never combinations of
+                // per-effect guesses or a pixel tolerance.
+                let mut candidate = doc.clone();
+                let mut changed = false;
+                for effect in candidate.layers.iter_mut().flat_map(|l| &mut l.effects) {
+                    if effect.kind == "gradient_overlay" && effect.enabled {
+                        effect.settings["pixel_grid"] = serde_json::json!(true);
+                        changed = true;
+                    }
+                }
+                if changed && imported_style_composite_matches(&candidate, &merged)? {
+                    doc = candidate;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
         } else {
-            doc.preview_native8(None, w.max(h), None, false)
-                .map(|(_, _, pixels, _)| {
-                    merged_white_valid && same_standard_composite(&pixels, &merged)
-                })
+            Ok(false)
         };
         match matches {
             Ok(true) => {},
@@ -2271,6 +2291,14 @@ fn decode_parts(
     }
     control.progress("Ready", 1, 1)?;
     Ok(doc)
+}
+fn imported_style_composite_matches(doc: &Document, saved: &Raster) -> Result<bool, String> {
+    if saved.is16() {
+        crate::depth16::render(doc).map(|image| same_standard_composite(&image.words, saved))
+    } else {
+        doc.preview_native8(None, doc.width.max(doc.height), None, false)
+            .map(|(_, _, pixels, _)| same_standard_composite(&pixels, saved))
+    }
 }
 fn same_standard_composite<T: Copy + Into<u32>>(actual: &[T], saved: &Raster) -> bool {
     if actual.len() != saved.width as usize * saved.height as usize * 4 {
