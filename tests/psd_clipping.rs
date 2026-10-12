@@ -4724,6 +4724,16 @@ fn hard_shadow_payload(
             vec![u8::from(variant != "knockout")],
         ));
     }
+    if variant == "missing_knockout" {
+        properties.retain(|(key, _, _)| *key != "layerConceals");
+    }
+    if variant == "invalid_knockout" {
+        properties
+            .iter_mut()
+            .find(|(key, _, _)| *key == "layerConceals")
+            .unwrap()
+            .2 = vec![2];
+    }
     if variant == "unknown" {
         properties.push(("unsupportedShadowField", b"bool", vec![0]));
     }
@@ -5125,6 +5135,299 @@ fn photoshop_pixel_aligned_hard_shadows_retain_angles_sources_undo_and_standard_
 }
 
 #[test]
+fn photoshop_partial_alpha_hard_drop_shadows_retain_explicit_knockout_sources_and_native_saves() {
+    for depth in [8, 16] {
+        let alpha = [
+            0u16, 1, 12347, 65535, 32768, 65534, 257, 23459, 54321, 0, 10001, 45679, 34571, 51347,
+            22371, 65535,
+        ];
+        let source = std::array::from_fn::<_, 16, _>(|i| {
+            [
+                native(12347 + i as u16 * 107, depth),
+                native(23459 + i as u16 * 113, depth),
+                native(34571 + i as u16 * 127, depth),
+                native(alpha[i], depth),
+            ]
+        });
+        for (angle, dx, dy) in [(180., 1i32, 0i32), (45., -1, 1)] {
+            for flags in 0u8..4 {
+                let (enabled, master) = (flags & 1 != 0, flags & 2 != 0);
+                for knockout in [false, true] {
+                    for list in [false, true] {
+                        for inner in [false, true] {
+                            for opacity in [64u8, 255] {
+                                let payload = partial_drop_shadow_payload(
+                                    enabled, master, list, knockout, inner, angle, "",
+                                );
+                                let mix = |under: [u16; 3], over: [u16; 3], coverage: f64| {
+                                    let weight = (coverage * 65535.).round();
+                                    std::array::from_fn(|c| {
+                                        native(
+                                            ((f64::from(under[c]) * (65535. - weight)
+                                                + f64::from(over[c]) * weight)
+                                                / 65535.)
+                                                .round()
+                                                as u16,
+                                            depth,
+                                        )
+                                    })
+                                };
+                                let at_alpha = |x: i32, y: i32| {
+                                    if (0..4).contains(&x) && (0..4).contains(&y) {
+                                        source[(y * 4 + x) as usize][3]
+                                    } else {
+                                        0
+                                    }
+                                };
+                                // Independent source-alpha/knockout reference.
+                                // Inner/color styles never alter the casting alpha.
+                                let merged = std::array::from_fn::<_, 16, _>(|i| {
+                                    let (x, y) = (i as i32 % 4, i as i32 / 4);
+                                    let mut rgb: [u16; 3] = source[i][..3].try_into().unwrap();
+                                    if master && inner && source[i][3] != 0 {
+                                        rgb = mix(rgb, [201 * 257, 43 * 257, 77 * 257], 0.43);
+                                        rgb = mix(
+                                            rgb,
+                                            [111 * 257, 67 * 257, 231 * 257],
+                                            (1. - f64::from(at_alpha(x - 1, y)) / 65535.) * 0.23,
+                                        );
+                                    }
+                                    let a = f64::from(source[i][3]) / 65535.;
+                                    let shade = if master && enabled {
+                                        (f64::from(at_alpha(x - dx, y - dy))
+                                            * if knockout { 1. - a } else { 1. }
+                                            * 0.37)
+                                            .round()
+                                            / 65535.
+                                    } else {
+                                        0.
+                                    };
+                                    let total = a + shade * (1. - a);
+                                    let mut pixel = if total == 0. {
+                                        [0; 4]
+                                    } else {
+                                        let mut p = [0; 4];
+                                        for c in 0..3 {
+                                            p[c] = ((f64::from(rgb[c]) * a
+                                                + f64::from(
+                                                    [111u16 * 257, 67 * 257, 231 * 257][c],
+                                                ) * shade
+                                                    * (1. - a))
+                                                / total)
+                                                .round()
+                                                as u16;
+                                        }
+                                        p[3] = (total * 65535.).round() as u16;
+                                        p
+                                    };
+                                    if depth == 8 {
+                                        pixel = pixel.map(|v| native(v, depth));
+                                    }
+                                    // A cast projected to zero native coverage
+                                    // cannot contribute hidden tint to compositing.
+                                    if pixel[3] == 0 {
+                                        return [0; 4];
+                                    }
+                                    pixel[3] = if depth == 16 {
+                                        (f64::from(pixel[3]) * f64::from(f32::from(opacity) / 255.))
+                                            .round() as u16
+                                    } else {
+                                        ((f32::from(pixel[3] / 257) * (f32::from(opacity) / 255.))
+                                            .round()
+                                            as u16)
+                                            * 257
+                                    };
+                                    pixel
+                                });
+                                let mut bytes = framed_shadow_fixture_opacity(
+                                    depth, &source, &payload, &merged, opacity,
+                                );
+                                let doc = psd::decode(&bytes).unwrap();
+                                assert!(!doc.read_only,"{depth} {angle} {flags} {knockout} {list} {inner} {opacity}: {:?}",doc.warnings);
+                                assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+                                assert_eq!(
+                                    rendered(&doc),
+                                    merged.concat(),
+                                    "{depth} {angle} {flags} {knockout} {list} {inner} {opacity}"
+                                );
+                                assert_eq!(doc.layers[0].effects.len(), if inner { 3 } else { 1 });
+                                let drop = doc.layers[0].effects.last().unwrap();
+                                assert_eq!(drop.kind, "drop_shadow");
+                                assert_eq!(drop.settings["source_knockout"], knockout);
+                                assert_eq!(drop.enabled, master && enabled);
+                                let settings = doc.layers[0]
+                                    .effects
+                                    .iter()
+                                    .map(|e| (e.kind.clone(), e.enabled, e.settings.clone()))
+                                    .collect::<Vec<_>>();
+                                let current = doc.export_png().unwrap();
+                                let layer = doc.layers[0].id.clone();
+                                let effect = drop.id.clone();
+                                let mut engine = Engine::new();
+                                engine.doc = doc;
+                                let mut changed = engine.doc.layers[0]
+                                    .effects
+                                    .last()
+                                    .unwrap()
+                                    .settings
+                                    .clone();
+                                changed["source_knockout"] = json!(!knockout);
+                                engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":changed})],None,None,"Imported knockout toggle").unwrap();
+                                assert_eq!(engine.undo.len(), 1);
+                                assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+                                engine.undo("human").unwrap();
+                                assert_eq!(engine.doc.export_png().unwrap(), current);
+                                for output in [
+                                    psd::encode(&engine.doc).unwrap(),
+                                    psd::encode_psb(&engine.doc).unwrap(),
+                                ] {
+                                    assert_eq!(
+                                        saved_composite(&output, depth),
+                                        saved_composite(&bytes, depth)
+                                    );
+                                    let reopened = psd::decode(&output).unwrap();
+                                    assert!(!reopened.read_only);
+                                    assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                                    assert_eq!(
+                                        reopened.layers[0]
+                                            .effects
+                                            .iter()
+                                            .map(|e| (
+                                                e.kind.clone(),
+                                                e.enabled,
+                                                e.settings.clone()
+                                            ))
+                                            .collect::<Vec<_>>(),
+                                        settings
+                                    );
+                                    assert_eq!(reopened.export_png().unwrap(), current);
+                                    assert_eq!(
+                                        psd::decode(&ordinary(&output))
+                                            .unwrap()
+                                            .export_png()
+                                            .unwrap(),
+                                        current
+                                    );
+                                }
+                                let at = bytes.len() - 64 * usize::from(depth / 8)
+                                    + 15 * usize::from(depth / 8)
+                                    + usize::from(depth == 16);
+                                bytes[at] ^= 1;
+                                let protected = psd::decode(&bytes).unwrap();
+                                assert!(protected.read_only);
+                                assert!(psd::encode(&protected).is_err());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn partial_drop_shadow_payload(
+    enabled: bool,
+    master: bool,
+    list: bool,
+    knockout: bool,
+    inner: bool,
+    angle: f64,
+    variant: &str,
+) -> Vec<u8> {
+    let variant = if !knockout && variant.is_empty() {
+        "knockout"
+    } else {
+        variant
+    };
+    let list_variant = format!("list:{variant}");
+    let source = hard_shadow_payload(
+        "DrSh",
+        enabled,
+        master,
+        angle,
+        37.,
+        if list { &list_variant } else { variant },
+    );
+    let key = if list { "dropShadowMulti" } else { "DrSh" };
+    let kind = if list { b"VlLs" } else { b"Objc" };
+    let needle = [key.as_bytes(), kind].concat();
+    let at = source
+        .windows(needle.len())
+        .position(|v| v == needle)
+        .unwrap();
+    let mut drop = source[at + needle.len()..].to_vec();
+    if angle == 45. {
+        if let Some(at) = drop.windows(12).position(|v| v == b"DstnUntF#Pxl") {
+            drop[at + 12..at + 20].copy_from_slice(&2f64.to_be_bytes());
+        }
+    }
+    let mut entries = vec![
+        ("masterFXSwitch", b"bool", vec![u8::from(master)]),
+        (key, kind, drop),
+    ];
+    if inner {
+        let source = hard_shadow_payload("IrSh", true, master, 180., 23., "");
+        let at = source.windows(8).position(|v| v == b"IrShObjc").unwrap() + 8;
+        entries.push(("IrSh", b"Objc", source[at..].to_vec()));
+        let source = overlay_payload(true, true, [201., 43., 77.]);
+        let at = source.windows(8).position(|v| v == b"SoFiObjc").unwrap() + 8;
+        let mut color = source[at..].to_vec();
+        let at = color
+            .windows(12)
+            .position(|v| v == b"OpctUntF#Prc")
+            .unwrap()
+            + 12;
+        color[at..at + 8].copy_from_slice(&43f64.to_be_bytes());
+        entries.push(("SoFi", b"Objc", color));
+    }
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        overlay_descriptor("Lefx", entries),
+    ]
+    .concat()
+}
+
+#[test]
+fn photoshop_partial_alpha_drop_shadows_protect_unsupported_disabled_knockout_definitions() {
+    for depth in [8, 16] {
+        let source = [[
+            native(12347, depth),
+            native(23459, depth),
+            native(34571, depth),
+            native(23459, depth),
+        ]; 16];
+        for variant in [
+            "global",
+            "antialias",
+            "angle",
+            "fractional",
+            "distance",
+            "choke",
+            "size",
+            "noise",
+            "contour",
+            "unknown",
+            "missing",
+            "missing_knockout",
+            "invalid_knockout",
+            "blend",
+        ] {
+            for list in [false, true] {
+                let payload =
+                    partial_drop_shadow_payload(false, false, list, true, false, 180., variant);
+                let doc =
+                    psd::decode(&framed_shadow_fixture(depth, &source, &payload, &source)).unwrap();
+                assert!(doc.read_only, "{depth} {list} {variant}");
+                assert!(doc.layers[0].effects.is_empty());
+                assert_eq!(doc.bit_depth, depth);
+                assert!(psd::encode(&doc).is_err());
+            }
+        }
+    }
+}
+
+#[test]
 fn photoshop_partial_alpha_hard_inner_shadows_retain_native_sources_coverage_and_standard_saves() {
     for depth in [8, 16] {
         let alpha = [
@@ -5325,7 +5628,8 @@ fn partial_inner_shadow_payload(
 }
 
 #[test]
-fn photoshop_partial_alpha_inner_shadows_keep_unsupported_definitions_and_drop_casts_protected() {
+fn photoshop_partial_alpha_inner_shadows_keep_unsupported_definitions_and_unknown_drop_knockout_protected(
+) {
     for depth in [8, 16] {
         let source = std::array::from_fn::<_, 16, _>(|i| {
             [
@@ -5363,17 +5667,12 @@ fn photoshop_partial_alpha_inner_shadows_keep_unsupported_definitions_and_drop_c
                 assert!(psd::encode(&doc).is_err());
             }
         }
-        // A disabled, otherwise valid Drop Shadow with an exact source
-        // composite still needs the separate partial-alpha knockout model.
-        for enabled in [false, true] {
-            let payload = hard_shadow_payload("DrSh", enabled, false, 180., 37., "");
+        // An invisible Drop Shadow cannot bypass required knockout validation.
+        for variant in ["missing_knockout", "invalid_knockout", "blend"] {
+            let payload = hard_shadow_payload("DrSh", false, false, 180., 37., variant);
             let protected =
                 psd::decode(&framed_shadow_fixture(depth, &source, &payload, &source)).unwrap();
             assert!(protected.read_only);
-            assert!(protected
-                .warnings
-                .iter()
-                .any(|v| v.contains("Drop Shadows on partial-alpha")));
             assert!(psd::encode(&protected).is_err());
         }
     }
@@ -5795,14 +6094,19 @@ fn photoshop_mixed_shadow_stacks_enforce_shared_effect_count_and_original_alpha_
             &pattern_resource(depth, "synthetic-pattern"),
             false,
         );
-        let protected = psd::decode(&bytes).unwrap();
-        assert!(protected.read_only);
-        assert!(protected
-            .warnings
-            .iter()
-            .any(|v| v.contains("partial-alpha")));
-        assert_eq!(protected.bit_depth, depth);
-        assert!(psd::encode(&protected).is_err());
+        let supported = psd::decode(&bytes).unwrap();
+        assert!(!supported.read_only, "{:?}", supported.warnings);
+        assert_eq!(supported.layers[0].pixels.rgba16(), partial.concat());
+        assert_eq!(
+            supported.layers[0].effects.last().unwrap().settings["source_knockout"],
+            true
+        );
+        assert_eq!(supported.bit_depth, depth);
+        assert!(
+            !psd::decode(&psd::encode(&supported).unwrap())
+                .unwrap()
+                .read_only
+        );
     }
 }
 
@@ -6213,7 +6517,7 @@ fn unsupported_hard_shadow_definitions_stay_protected_even_when_disabled() {
                     assert_eq!(doc.bit_depth, depth);
                 }
                 if kind == "DrSh" {
-                    for variant in ["blend", "knockout"] {
+                    for variant in ["blend", "missing_knockout", "invalid_knockout"] {
                         let (bytes, expected) =
                             shadow_fixture(depth, kind, enabled, true, false, true, 100., variant);
                         let doc = psd::decode(&bytes).unwrap();

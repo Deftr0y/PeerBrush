@@ -443,8 +443,9 @@ pub(super) fn native_styles(
     // that same original alpha after the overlay colors have been applied.
     // Apply the single Normal Drop Shadow last: its behind compositing keeps
     // it beneath the styled image, and its grown alpha cannot feed an inner
-    // shadow or become overlay coverage. The caller still requires binary
-    // source alpha, Normal layer blend, no masks/clipping and an exact composite.
+    // shadow or become overlay coverage. The caller still requires unchanged
+    // casting alpha, explicit Drop Shadow knockout, Normal layer blend, no masks/clipping
+    // and an exact composite.
     // Reference: Krita kis_layer_style_projection_plane.cpp (overlay inner
     // shadow and stylesBefore drop shadow). Multiple casts per family remain protected.
     for keys in [["IrSh", "innerShadowMulti"], ["DrSh", "dropShadowMulti"]] {
@@ -546,9 +547,8 @@ fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
         .is_some_and(|v| boolean(v).is_none())
         || required_bool("uglg")?
         || required_bool("AntA")?
-        || kind == "drop_shadow" && !required_bool("layerConceals")?
     {
-        return Err("Global-light, antialiased or non-knockout shadows remain protected".into());
+        return Err("Global-light or antialiased shadows remain protected".into());
     }
     let unit = |key: &str, unit: &str| -> Result<f64, String> {
         let value = field(fields, key);
@@ -608,6 +608,11 @@ fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
     }
     if kind == "inner_shadow" {
         settings["blend"] = json!(blend);
+    } else {
+        // Retain pre-composite knockout even on currently binary alpha:
+        // later source edits must not lose the Photoshop definition.
+        // Reference: Krita ASL layerConceals and applyDropShadow knockout.
+        settings["source_knockout"] = json!(required_bool("layerConceals")?);
     }
     crate::effects::validate(kind, &settings)?;
     Ok(crate::effects::Effect {

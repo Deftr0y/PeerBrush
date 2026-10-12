@@ -2149,29 +2149,6 @@ fn decode_parts(
                     } else if rec.layer.kind == "group" {
                         rec.layer.pixels = Raster::new_depth(w, h, depth);
                     }
-                    if rec.layer.effects.iter().any(|e| e.kind == "drop_shadow") {
-                        let pixels = &rec.layer.pixels;
-                        let partial = if pixels.is16() {
-                            pixels.samples16.values().any(|tile| {
-                                tile.chunks_exact(4).any(|p| p[3] != 0 && p[3] != 65535)
-                            })
-                        } else {
-                            pixels
-                                .tiles
-                                .values()
-                                .any(|tile| tile.chunks_exact(4).any(|p| p[3] != 0 && p[3] != 255))
-                        };
-                        if partial {
-                            let reason =
-                                "Hard Photoshop Drop Shadows on partial-alpha sources remain protected";
-                            warnings.push(reason.into());
-                            if rec.source.warnings.len() < 64 {
-                                rec.source.warnings.push(reason.into());
-                            } else {
-                                rec.source.details_truncated = true;
-                            }
-                        }
-                    }
                 }
             }
         }
