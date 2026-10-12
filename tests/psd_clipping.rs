@@ -2834,6 +2834,10 @@ fn photoshop_layer_aligned_gradient_preserves_transparent_sources_and_exact_save
             assert_eq!(doc.layers[0].effects[0].enabled, enabled);
             assert_eq!(rendered(&doc), expected.concat());
             let current = doc.export_png().unwrap();
+            let mut standard = expected;
+            // Standard PSD merged RGB is white-matted; the rendered/exported
+            // transparent pixel has zero RGB, while the encoded RGB is white.
+            standard[0] = [65535, 65535, 65535, 0];
             for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
                 let reopened = psd::decode(&output).unwrap();
                 assert!(!reopened.read_only);
@@ -2843,7 +2847,7 @@ fn photoshop_layer_aligned_gradient_preserves_transparent_sources_and_exact_save
                     doc.layers[0].effects[0].settings
                 );
                 assert_eq!(reopened.export_png().unwrap(), current);
-                assert_eq!(saved_composite(&output, depth), expected.concat());
+                assert_eq!(saved_composite(&output, depth), standard.concat());
             }
             let mut engine = Engine::new();
             let layer = doc.layers[0].id.clone();
