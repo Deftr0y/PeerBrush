@@ -1,6 +1,8 @@
 name: PeerBrush website
 
 on:
+  push:
+    branches: [site-content]
   workflow_dispatch:
     inputs:
       expected_site_commit:
@@ -26,7 +28,7 @@ jobs:
       - name: Check reviewed public output
         shell: bash
         env:
-          EXPECTED_SITE_COMMIT: ${{ inputs.expected_site_commit }}
+          EXPECTED_SITE_COMMIT: ${{ github.event_name == 'push' && github.sha || inputs.expected_site_commit }}
         run: |
           test "$(git rev-parse HEAD)" = "$EXPECTED_SITE_COMMIT"
           test -f public-site/index.html
