@@ -3,7 +3,7 @@ name: Windows Store MSIX candidate
 on:
   push:
     branches:
-      - codex/windows-store-msix-20261012
+      - release/windows-store-v025
   pull_request:
     branches:
       - main
