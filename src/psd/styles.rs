@@ -266,6 +266,50 @@ fn overlay_blend(value: &Value) -> Result<&'static str, String> {
 // Accept one complete spelling only; never clamp HDR values or mix scales.
 // Reference: psd-tools/composite/paint.py::_get_color and terminology.py.
 fn rgb_color(value: &Value) -> Result<Vec<f64>, String> {
+    if value["value"]["class"] == "HSBC" {
+        let channels = descriptor(value, "HSBC")?;
+        if channels.len() != 3
+            || ["H   ", "Strt", "Brgh"]
+                .iter()
+                .any(|key| !channels.contains_key(*key))
+        {
+            return Err(
+                "Photoshop HSB colors require exactly hue, saturation and brightness".into(),
+            );
+        }
+        let component = |key: &str, unit: &str, max: f64| -> Result<f64, String> {
+            let value = field(channels, key);
+            let number = if value["type"] == "UntF" {
+                if value["value"][0] != unit {
+                    return Err("Invalid Photoshop HSB component unit".into());
+                }
+                value["value"][1]
+                    .as_f64()
+                    .ok_or("Invalid Photoshop HSB component")?
+            } else {
+                plain_number(value)?
+            };
+            if !number.is_finite() || !(0.0..=max).contains(&number) {
+                return Err("Photoshop HSB component exceeds its supported range".into());
+            }
+            Ok(number)
+        };
+        let hue = component("H   ", "#Ang", 360.)?.rem_euclid(360.) / 60.;
+        let saturation = component("Strt", "#Prc", 100.)? / 100.;
+        let brightness = component("Brgh", "#Prc", 100.)? / 100.;
+        let fraction = hue - hue.floor();
+        let p = brightness * (1. - saturation);
+        let q = brightness * (1. - saturation * fraction);
+        let t = brightness * (1. - saturation * (1. - fraction));
+        return Ok(match hue as u8 {
+            0 => vec![brightness, t, p],
+            1 => vec![q, brightness, p],
+            2 => vec![p, brightness, t],
+            3 => vec![p, q, brightness],
+            4 => vec![t, p, brightness],
+            _ => vec![brightness, p, q],
+        });
+    }
     if value["value"]["class"] == "Grsc" {
         let channels = descriptor(value, "Grsc")?;
         if channels.len() != 1 || !channels.contains_key("Gry ") {

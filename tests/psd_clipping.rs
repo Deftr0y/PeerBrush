@@ -1948,6 +1948,16 @@ fn style_color_fixture(
             .unwrap();
         payload.splice(at..at + needle.len(), replacement);
     }
+    color_style_document(depth, family, flags, opacity, payload, colors)
+}
+fn color_style_document(
+    depth: u16,
+    family: &str,
+    flags: u8,
+    opacity: f64,
+    mut payload: Vec<u8>,
+    colors: [[f64; 3]; 2],
+) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
     let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
     payload[at] = u8::from(flags & 1 != 0);
     let at = payload
@@ -1966,14 +1976,7 @@ fn style_color_fixture(
     if family == "drop" {
         source[1][3] = 0;
     }
-    let mut spec = Spec::paint(
-        if gray.is_some() {
-            "Synthetic Photoshop grayscale style"
-        } else {
-            "Synthetic normalized Photoshop RGB"
-        },
-        source,
-    );
+    let mut spec = Spec::paint("Synthetic Photoshop style color", source);
     spec.tags.push((*b"lfx2", payload));
     let mut merged = source.map(|p| {
         if p[3] == 0 {
@@ -2028,6 +2031,262 @@ fn style_color_fixture(
     )
 }
 
+#[test]
+fn hsb_photoshop_style_colors_preserve_native_values_sources_undo_and_standard_saves() {
+    let cases: [([[f64; 3]; 2], [[f64; 3]; 2]); 6] = [
+        (
+            [[0., 100., 100.], [60., 100., 100.]],
+            [[1., 0., 0.], [1., 1., 0.]],
+        ),
+        (
+            [[120., 100., 100.], [180., 100., 100.]],
+            [[0., 1., 0.], [0., 1., 1.]],
+        ),
+        (
+            [[240., 100., 100.], [300., 100., 100.]],
+            [[0., 0., 1.], [1., 0., 1.]],
+        ),
+        (
+            [[360., 100., 100.], [0., 0., 37.5]],
+            [[1., 0., 0.], [0.375; 3]],
+        ),
+        (
+            [[30., 37.5, 62.5], [270., 62.5, 37.5]],
+            [[0.625, 0.5078125, 0.390625], [0.2578125, 0.140625, 0.375]],
+        ),
+        (
+            [[330., 100., 100.], [360., 100., 0.]],
+            [[1., 0., 0.5], [0.; 3]],
+        ),
+    ];
+    for depth in [8, 16] {
+        for family in ["color", "gradient", "inner", "drop"] {
+            for (hsb, colors) in cases {
+                for (units, variant) in [(0, ""), (1, ""), (7, ""), (0, "integer")] {
+                    if variant == "integer" && hsb.iter().flatten().any(|n| n.fract() != 0.) {
+                        continue;
+                    }
+                    for flags in [0, 3] {
+                        let (mut bytes, merged, source) =
+                            hsb_style_fixture(depth, family, flags, hsb, colors, units, variant);
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {family} {hsb:?} {units} {flags}: {:?}",
+                            doc.warnings
+                        );
+                        assert_eq!(doc.bit_depth, depth);
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(rendered(&doc), merged);
+                        for (index, color) in colors
+                            .into_iter()
+                            .enumerate()
+                            .take(if family == "gradient" { 2 } else { 1 })
+                        {
+                            let imported = if family == "gradient" {
+                                &doc.layers[0].effects[0].settings["color_stops"][index]["color"]
+                            } else {
+                                &doc.layers[0].effects[0].settings["color"]
+                            };
+                            assert_eq!(imported, &json!(color));
+                        }
+                        let current = doc.export_png().unwrap();
+                        for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.bit_depth, depth);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(
+                                reopened.layers[0].effects[0].settings,
+                                doc.layers[0].effects[0].settings
+                            );
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            assert_eq!(
+                                psd::decode(&ordinary(&output))
+                                    .unwrap()
+                                    .export_png()
+                                    .unwrap(),
+                                current
+                            );
+                            let matte = merged
+                                .chunks_exact(4)
+                                .flat_map(|p| {
+                                    let a = f64::from(p[3]) / 65535.;
+                                    (0..4).map(move |c| {
+                                        if c == 3 {
+                                            p[c]
+                                        } else {
+                                            native(
+                                                (f64::from(p[c]) * a + 65535. * (1. - a)).round()
+                                                    as u16,
+                                                depth,
+                                            )
+                                        }
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(saved_composite(&output, depth), matte);
+                        }
+                        let mut engine = Engine::new();
+                        let layer = doc.layers[0].id.clone();
+                        let effect = doc.layers[0].effects[0].id.clone();
+                        engine.doc = doc;
+                        engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":flags!=3})], None, None, "HSB style bypass").unwrap();
+                        assert_eq!(engine.undo.len(), 1);
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        let at =
+                            bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+                        bytes[at] ^= 1;
+                        assert!(
+                            psd::decode(&bytes).unwrap().read_only,
+                            "HSB composite mismatch was accepted"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+fn hsb_style_fixture(
+    depth: u16,
+    family: &str,
+    flags: u8,
+    hsb: [[f64; 3]; 2],
+    colors: [[f64; 3]; 2],
+    units: u8,
+    variant: &str,
+) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
+    let mut payload = match family {
+        "color" => overlay_payload(true, true, [111., 67., 231.]),
+        "gradient" => gradient_payload(false, None, 0.),
+        "drop" => hard_shadow_payload("DrSh", true, true, 180., 37., ""),
+        _ => hard_shadow_payload("IrSh", true, true, 180., 37., ""),
+    };
+    let olds = if family == "gradient" {
+        vec![[0f64; 3], [255f64; 3]]
+    } else {
+        vec![[111f64, 67., 231.]]
+    };
+    for (index, old) in olds.into_iter().enumerate() {
+        let needle = overlay_descriptor(
+            "RGBC",
+            ["Rd  ", "Grn ", "Bl  "]
+                .into_iter()
+                .zip(old)
+                .map(|(key, n)| (key, b"doub", n.to_be_bytes().to_vec()))
+                .collect(),
+        );
+        let mut fields = ["H   ", "Strt", "Brgh"]
+            .into_iter()
+            .enumerate()
+            .map(|(c, key)| {
+                if units & (1 << c) != 0 {
+                    (
+                        key,
+                        b"UntF",
+                        [
+                            if c == 0 {
+                                b"#Ang".to_vec()
+                            } else {
+                                b"#Prc".to_vec()
+                            },
+                            hsb[index][c].to_be_bytes().to_vec(),
+                        ]
+                        .concat(),
+                    )
+                } else {
+                    (key, b"doub", hsb[index][c].to_be_bytes().to_vec())
+                }
+            })
+            .collect::<Vec<_>>();
+        let set = |field: &mut (&str, &[u8; 4], Vec<u8>), n: f64| {
+            let prefix = if field.1 == b"UntF" {
+                field.2[..4].to_vec()
+            } else {
+                vec![]
+            };
+            field.2 = [prefix, n.to_be_bytes().to_vec()].concat();
+        };
+        match variant {
+            "hue-low" => set(&mut fields[0], -0.01),
+            "hue-high" => set(&mut fields[0], 360.01),
+            "saturation-low" => set(&mut fields[1], -0.01),
+            "saturation-high" => set(&mut fields[1], 100.01),
+            "brightness-low" => set(&mut fields[2], -0.01),
+            "brightness-high" => set(&mut fields[2], 100.01),
+            "nan" => set(&mut fields[0], f64::NAN),
+            "infinity" => set(&mut fields[2], f64::INFINITY),
+            "hue-unit" => fields[0].2[..4].copy_from_slice(b"#Prc"),
+            "percent-unit" => fields[1].2[..4].copy_from_slice(b"#Ang"),
+            "boolean" => {
+                fields[0].1 = b"bool";
+                fields[0].2 = vec![0];
+            }
+            "integer" => {
+                for (c, field) in fields.iter_mut().enumerate() {
+                    field.1 = b"long";
+                    field.2 = (hsb[index][c] as i32).to_be_bytes().to_vec();
+                }
+            }
+            "missing" => {
+                fields.pop();
+            }
+            "extra" => fields.push(("redFloat", b"doub", 0.5f64.to_be_bytes().to_vec())),
+            "book" => fields.push(("bookID", b"long", 1i32.to_be_bytes().to_vec())),
+            _ => {}
+        }
+        let replacement =
+            overlay_descriptor(if variant == "class" { "HSBl" } else { "HSBC" }, fields);
+        let at = payload
+            .windows(needle.len())
+            .position(|v| v == needle)
+            .unwrap();
+        payload.splice(at..at + needle.len(), replacement);
+    }
+    color_style_document(depth, family, flags, 37., payload, colors)
+}
+#[test]
+fn malformed_hsb_photoshop_style_colors_remain_protected_even_when_disabled() {
+    for depth in [8, 16] {
+        for family in ["color", "gradient", "inner", "drop"] {
+            for flags in [0, 3] {
+                for variant in [
+                    "hue-low",
+                    "hue-high",
+                    "saturation-low",
+                    "saturation-high",
+                    "brightness-low",
+                    "brightness-high",
+                    "nan",
+                    "infinity",
+                    "hue-unit",
+                    "percent-unit",
+                    "boolean",
+                    "missing",
+                    "extra",
+                    "book",
+                    "class",
+                ] {
+                    let (bytes, _, _) = hsb_style_fixture(
+                        depth,
+                        family,
+                        flags,
+                        [[30., 37.5, 62.5], [270., 62.5, 37.5]],
+                        [[0.625, 0.5078125, 0.390625], [0.2578125, 0.140625, 0.375]],
+                        7,
+                        variant,
+                    );
+                    let doc = psd::decode(&bytes).unwrap();
+                    assert!(doc.read_only, "{depth} {family} {flags} {variant}");
+                    assert_eq!(doc.bit_depth, depth);
+                    assert!(doc.layers[0].effects.is_empty());
+                }
+            }
+        }
+    }
+}
 #[test]
 fn grayscale_photoshop_style_colors_retain_native_precision_sources_history_and_saves() {
     for depth in [8, 16] {
