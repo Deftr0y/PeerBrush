@@ -1,6 +1,6 @@
 # PeerBrush follow-ups
 
-## Version 0.25 release — 2026-10-12
+## Version 0.25 release â€” 2026-10-12
 
 [Published version 0.25](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.25) retains the implemented compact effect controls and native-depth color pickers (PB-106), categorized native layer styles (PB-136), selection/transform gesture guards (PB-110), and guarded selected-content Cut/Paste (PB-133). Combined local verification passed 874 Rust checks and 18 packaging checks, with eight optional checks ignored and two local clipboard checks excluded. Formatting and Clippy passed with existing warnings. Fresh isolated native8/16 workspaces retained exact source words, editable PSD/PSB saves, standard rasters/alpha and current composites; [Exact-source platform CI](https://github.com/Deftr0y/PeerBrush/actions/runs/38252533281) and actual public Windows/macOS/Linux source, archive and checksum verification passed. Published source: `f5083d2e33a0158c9976db5de89549bd34ee7bc3`. Broader Photoshop layer-style fidelity and editable reopening of unsupported styled originals (PB-122) are deferred to a later version; the original precision and protected composite remain preserved. Existing bounded import improvements remain subject to exact composite matching. A separately reported selection recurrence and native clipboard transport acceptance remain unresolved; neither is marked complete.
 
