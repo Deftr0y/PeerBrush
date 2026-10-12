@@ -7,6 +7,7 @@ mod calibration;
 mod color;
 mod compatibility;
 mod contour_points;
+mod effect_color;
 mod effects;
 mod exports;
 mod file_drop;
@@ -1243,6 +1244,14 @@ impl PeerBrush {
             .unwrap_or_else(|error| error);
     }
     fn layer_parameter(&mut self, extra: Value, label: &str, response: &egui::Response) {
+        if response
+            .ctx
+            .data_mut(|data| data.remove_temp::<bool>(response.id.with("cancel parameter")))
+            .unwrap_or(false)
+        {
+            self.finish_parameter(true);
+            return;
+        }
         // A cancelled control must not rebind a still-held pointer to newer work.
         // The next physical press clears this transient guard in draw().
         if self.cancelled_parameter == Some(response.id) {
@@ -1292,7 +1301,7 @@ impl PeerBrush {
                 commands,
                 label: label.into(),
                 typing: Some(response.ctx.clone()),
-                dirty: false,
+                dirty: response.changed(),
             });
             self.animation.cancel();
             return;
@@ -1306,7 +1315,10 @@ impl PeerBrush {
                 let edit = self.parameter_gesture.as_mut().unwrap();
                 edit.commands = commands;
                 edit.dirty = true;
-                self.finish_parameter(false);
+                self.last_preview = None;
+                if !controls::number_editing(&response.ctx, response.id) {
+                    self.finish_parameter(false);
+                }
             }
             return;
         }
@@ -1343,7 +1355,11 @@ impl PeerBrush {
                         commands,
                         label: label.into(),
                         typing: None,
-                        dirty: true,
+                        dirty: response.changed()
+                            || self
+                                .parameter_gesture
+                                .as_ref()
+                                .is_some_and(|edit| edit.dirty),
                     });
                     self.animation.cancel();
                 }

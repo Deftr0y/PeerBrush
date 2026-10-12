@@ -258,8 +258,8 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                     if suffix == " px" { 1 } else { 0 },
                     false,
                 );
-                if r.changed() {
-                    value[key] = json!(n / multiplier);
+                if r.changed() || r.double_clicked() {
+                    if r.changed() { value[key] = json!(n / multiplier); }
                     changed = Some(r);
                 }
                 ui.end_row();
@@ -296,23 +296,42 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
         {
             continue;
         }
-        let mut rgb: [f32; 3] = std::array::from_fn(|i| {
+        let mut rgb: [f64; 3] = std::array::from_fn(|i| {
             value[key][i]
                 .as_f64()
                 .or_else(|| defaults[key][i].as_f64())
-                .unwrap_or(0.) as f32
+                .unwrap_or(0.)
         });
+        let alpha_key = if kind == "bevel_emboss" {
+            if key == "color" {
+                "highlight_opacity"
+            } else {
+                "shadow_opacity"
+            }
+        } else {
+            "opacity"
+        };
+        let mut alpha = value[alpha_key]
+            .as_f64()
+            .or_else(|| defaults[alpha_key].as_f64())
+            .unwrap_or(1.);
         ui.horizontal(|ui| {
             controls::label(ui, label);
-            for (index, label) in ["R", "G", "B"].into_iter().enumerate() {
-                let mut n = rgb[index] * 100.;
-                let r = controls::range(ui, (key, index), &mut n, 0.0..=100., 60., "%", 1, false)
-                    .on_hover_text(label);
-                if r.changed() {
-                    rgb[index] = n / 100.;
-                    value[key] = json!(rgb);
-                    changed = Some(r);
-                }
+            if let Some(response) = effect_color::control(
+                ui,
+                key,
+                label,
+                &mut rgb,
+                &mut alpha,
+                if kind == "bevel_emboss" {
+                    "Channel opacity"
+                } else {
+                    "Effect opacity"
+                },
+            ) {
+                value[key] = json!(rgb);
+                value[alpha_key] = json!(alpha);
+                changed = Some(response);
             }
         });
     }

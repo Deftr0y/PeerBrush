@@ -882,7 +882,13 @@ impl PeerBrush {
                                     self.activate_liquify(Some(effect.id.clone()));
                                 }
                                 let mut values = effect.settings.clone();
-                                if let Some(response) = settings(ui, &effect.kind, &mut values) {
+                                let document_id = self.doc_snapshot.id.clone();
+                                let response = ui
+                                    .push_id(("settings source", document_id), |ui| {
+                                        settings(ui, &effect.kind, &mut values)
+                                    })
+                                    .inner;
+                                if let Some(response) = response {
                                     self.layer_parameter(
                                         json!({"effect":effect.id,"settings":values}),
                                         "Effect parameter",

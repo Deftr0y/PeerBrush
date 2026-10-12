@@ -143,6 +143,7 @@
     "src/ui/calibration.rs",
     "src/ui/brush_toolbar_tests.rs",
     "src/ui/color.rs",
+    "src/ui/effect_color.rs",
     "src/ui/effects.rs",
     "src/ui/file_drop.rs",
     "src/ui/file_ownership.rs",

@@ -99,11 +99,98 @@ pub fn sample(value: &Value, position: f64) -> ([u16; 3], f64) {
                 .round() as u16
         })
     };
-    let opacity = if let Some(stops) = value["alpha_stops"].as_array().filter(|s| s.len() >= 2) {
+    (rgb, opacity_at(value, position))
+}
+pub fn opacity_at(value: &Value, position: f64) -> f64 {
+    if let Some(stops) = value["alpha_stops"].as_array().filter(|s| s.len() >= 2) {
         let (a, b, t) = interval(stops, position);
         a["opacity"].as_f64().unwrap() * (1. - t) + b["opacity"].as_f64().unwrap() * t
     } else {
         1.
+    }
+}
+/// Compose an ordinary opacity-stop setting; shared validation stays authoritative.
+pub fn set_opacity_at(value: &mut Value, position: f64, opacity: f64) -> Result<(), String> {
+    if !value.is_object() {
+        return Err("Gradient settings must be an object".into());
+    }
+    if !position.is_finite()
+        || !opacity.is_finite()
+        || !(0.0..=1.).contains(&position)
+        || !(0.0..=1.).contains(&opacity)
+    {
+        return Err("Gradient opacity point must have a position and opacity within 0–1".into());
+    }
+    let mut stops = if let Some(existing) = value.get("alpha_stops") {
+        validate(existing, true)?;
+        existing.as_array().unwrap().clone()
+    } else {
+        vec![]
     };
-    (rgb, opacity)
+    if stops.is_empty() {
+        stops = vec![
+            serde_json::json!({"position":0.,"opacity":1.,"midpoint":0.5}),
+            serde_json::json!({"position":1.,"opacity":1.,"midpoint":0.5}),
+        ];
+    }
+    if let Some(stop) = stops
+        .iter_mut()
+        .find(|stop| stop["position"].as_f64() == Some(position))
+    {
+        stop["opacity"] = serde_json::json!(opacity);
+    } else {
+        if stops.len() == 16 {
+            return Err(
+                "Gradient already has 16 opacity stops; remove a stop before adding another".into(),
+            );
+        }
+        let index = stops
+            .iter()
+            .position(|stop| stop["position"].as_f64().unwrap() > position)
+            .unwrap();
+        stops.insert(
+            index,
+            serde_json::json!({"position":position,"opacity":opacity,"midpoint":0.5}),
+        );
+    }
+    let result = serde_json::json!(stops);
+    validate(&result, true)?;
+    value["alpha_stops"] = result;
+    Ok(())
+}
+
+#[cfg(test)]
+mod opacity_editor_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn opacity_point_edits_retain_existing_definitions_and_reject_capacity_atomically() {
+        let mut value = json!({"color_stops":[{"position":0.,"color":[0.123456789,0.234567891,0.345678912],"midpoint":0.23},{"position":1.,"color":[1.,1.,1.]}],"alpha_stops":[{"position":0.,"opacity":0.13,"midpoint":0.27},{"position":1.,"opacity":0.91,"midpoint":0.74}]});
+        let before = value.clone();
+        set_opacity_at(&mut value, 0.375, 0.61234567890123).unwrap();
+        assert_eq!(value["color_stops"], before["color_stops"]);
+        assert_eq!(value["alpha_stops"][0], before["alpha_stops"][0]);
+        assert_eq!(value["alpha_stops"][2], before["alpha_stops"][1]);
+        assert_eq!(opacity_at(&value, 0.375), 0.61234567890123);
+        set_opacity_at(&mut value, 0.375, 0.37).unwrap();
+        assert_eq!(value["alpha_stops"].as_array().unwrap().len(), 3);
+        let mut full = json!({"alpha_stops":(0..16).map(|i|json!({"position":i as f64/15.,"opacity":0.5,"midpoint":0.37})).collect::<Vec<_>>()});
+        let before = full.clone();
+        assert!(set_opacity_at(&mut full, 0.12345, 0.2).is_err());
+        assert_eq!(full, before);
+        for (position, alpha) in [
+            (f64::NAN, 0.2),
+            (0.5, f64::INFINITY),
+            (-0.1, 0.2),
+            (0.3, 1.1),
+        ] {
+            assert!(set_opacity_at(&mut full, position, alpha).is_err());
+            assert_eq!(full, before);
+        }
+        set_opacity_at(&mut full, 0., 0.37).unwrap();
+        assert_eq!(opacity_at(&full, 0.), 0.37);
+        let mut malformed = json!(null);
+        assert!(set_opacity_at(&mut malformed, 0.5, 0.2).is_err());
+        assert_eq!(malformed, json!(null));
+    }
 }

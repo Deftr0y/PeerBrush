@@ -30,6 +30,8 @@ pub(super) fn controls(ui: &mut egui::Ui, value: &mut Value) -> Option<egui::Res
                 let reset=ui.add_enabled(count>0,egui::Button::new(if alpha {"Opaque"}else{"Two colors"}));
                 if reset.clicked() {value.as_object_mut().unwrap().remove(key);changed=Some(reset);}
             });
+            let before_colors = value.clone();
+            let mut alpha_edits = vec![];
             let Some(stops)=value[key].as_array_mut() else{return};
             let count=stops.len();let mut remove=None;
             for index in 0..count {
@@ -40,7 +42,7 @@ pub(super) fn controls(ui: &mut egui::Ui, value: &mut Value) -> Option<egui::Res
                     controls::label(ui,&format!("Stop {}",index+1));
                     let mut n=stop["position"].as_f64().unwrap() as f32*100.;
                     let r=ui.add_enabled_ui(index>0&&index+1<count,|ui|controls::range(ui,(key,index,"position"),&mut n,0.0..=100.,80.,"%",1,false)).inner;
-                    if r.changed() {let epsilon=(next-previous)*1e-6;stop["position"]=json!((f64::from(n)/100.).clamp(previous+epsilon,next-epsilon));changed=Some(r);}
+                    if r.changed() || r.double_clicked() {if r.changed() {let epsilon=(next-previous)*1e-6;stop["position"]=json!((f64::from(n)/100.).clamp(previous+epsilon,next-epsilon));}changed=Some(r);}
                     let r=ui.add_enabled(index>0&&index+1<count,egui::Button::new("×")).on_hover_text("Remove this stop");
                     if r.clicked(){remove=Some(index);changed=Some(r);}
                 });
@@ -48,14 +50,19 @@ pub(super) fn controls(ui: &mut egui::Ui, value: &mut Value) -> Option<egui::Res
                     ui.horizontal(|ui| {
                         controls::label(ui,"Opacity");let mut n=stop["opacity"].as_f64().unwrap() as f32*100.;
                         let r=controls::range(ui,(key,index,"opacity"),&mut n,0.0..=100.,160.,"%",1,false);
-                        if r.changed(){stop["opacity"]=json!(n/100.);changed=Some(r);}
+                        if r.changed() || r.double_clicked(){if r.changed(){stop["opacity"]=json!(n/100.);}changed=Some(r);}
                     });
                 } else {
+                    let position = stop["position"].as_f64().unwrap();
+                    let mut rgb: [f64;3] = std::array::from_fn(|c| stop["color"][c].as_f64().unwrap());
+                    let old_alpha = crate::effects::gradient::opacity_at(&before_colors,position);
+                    let mut opacity = old_alpha;
                     ui.horizontal(|ui| {
-                        for (c,label) in ["R","G","B"].into_iter().enumerate() {
-                            controls::label(ui,label);let mut n=stop["color"][c].as_f64().unwrap() as f32*100.;
-                            let r=controls::range(ui,(key,index,c),&mut n,0.0..=100.,60.,"%",1,false);
-                            if r.changed(){stop["color"][c]=json!(n/100.);changed=Some(r);}
+                        controls::label(ui,"Color");
+                        if let Some(response) = effect_color::control(ui,(key,index,"color"),&format!("Stop {}",index+1),&mut rgb,&mut opacity,"Stop opacity") {
+                            stop["color"] = json!(rgb);
+                            if opacity != old_alpha { alpha_edits.push((position,opacity)); }
+                            changed = Some(response);
                         }
                     });
                 }
@@ -63,11 +70,21 @@ pub(super) fn controls(ui: &mut egui::Ui, value: &mut Value) -> Option<egui::Res
                     ui.horizontal(|ui| {
                         controls::label(ui,"Midpoint");let mut n=stop["midpoint"].as_f64().unwrap_or(0.5) as f32*100.;
                         let r=controls::range(ui,(key,index,"midpoint"),&mut n,1.0..=99.,160.,"%",1,false);
-                        if r.changed(){stop["midpoint"]=json!((f64::from(n)/100.).clamp(0.01,0.99));changed=Some(r);}
+                        if r.changed() || r.double_clicked(){if r.changed(){stop["midpoint"]=json!((f64::from(n)/100.).clamp(0.01,0.99));}changed=Some(r);}
                     });
                 }
             }
             if let Some(index)=remove {stops.remove(index);}
+            for (position,opacity) in alpha_edits {
+                if let Err(error) = crate::effects::gradient::set_opacity_at(value,position,opacity) {
+                    *value = before_colors.clone();
+                    if let Some(response) = &changed {
+                        ui.ctx().data_mut(|data| data.insert_temp(response.id.with("cancel parameter"),true));
+                    }
+                    ui.label(RichText::new(error).size(11.).color(ACCENT));
+                    break;
+                }
+            }
         });
     }
     changed
