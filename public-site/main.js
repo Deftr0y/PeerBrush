@@ -118,7 +118,7 @@ async function loadDownloads() {
     const response = await fetch(feedUrl, { cache: 'no-store' });
     if (response.ok) {const data=await response.json();renderHistory(data);const build=latestRelease(data);if(build)loaded=renderDownloads(build);}
   } catch { /* Keep the verified static download links when the feed is unavailable. */ }
-  if (!loaded) document.querySelector('#build-label').textContent = 'PeerBrush 0.2 · Prerelease';
+  if (!loaded) document.querySelector('#build-label').textContent = 'PeerBrush 0.25 · Prerelease';
 }
 loadDownloads();
 
