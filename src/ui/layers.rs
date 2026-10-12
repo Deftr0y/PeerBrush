@@ -531,32 +531,27 @@ impl PeerBrush {
             {
                 self.inline_rename(ui, name_width);
             } else {
-                let name = ui
-                    .add_sized(
-                        [name_width, 30.0],
-                        egui::Label::new(
-                            RichText::new(&l.name)
-                                .size(12.0)
-                                .font(egui::FontId::new(
-                                    12.0,
-                                    if l.kind == "group" {
-                                        egui::FontFamily::Name("semibold".into())
-                                    } else {
-                                        egui::FontFamily::Proportional
-                                    },
-                                ))
-                                .color(if reserved {
-                                    AI_BLUE
-                                } else if l.visible {
-                                    Color32::WHITE
-                                } else {
-                                    MUTED
-                                }),
-                        )
-                        .truncate()
-                        .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text(tree.tooltip(l));
+                let name = filename::click_label(
+                    ui,
+                    &l.name,
+                    name_width,
+                    egui::FontId::new(
+                        12.,
+                        if l.kind == "group" {
+                            egui::FontFamily::Name("semibold".into())
+                        } else {
+                            egui::FontFamily::Proportional
+                        },
+                    ),
+                    if reserved {
+                        AI_BLUE
+                    } else if l.visible {
+                        Color32::WHITE
+                    } else {
+                        MUTED
+                    },
+                )
+                .on_hover_text(tree.tooltip(l));
                 if name.clicked() {
                     self.select_row(ui, doc, &l.id);
                     let time = ui.input(|i| i.time);
@@ -951,6 +946,47 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("Missing visible {value}"))
+    }
+    #[test]
+    fn shaped_layer_names_keep_inline_rename_selection_and_native_work() {
+        for depth in [8, 16] {
+            let (mut app, ctx, ids, _) = fixture(depth);
+            let logical = "שלום مرحبا हिन्दी 漢字";
+            let (before, undo_count) = {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc.layers[2].name = logical.into();
+                engine.doc.selection = Some([1, 1, 6, 6]);
+                (
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    engine.undo.len(),
+                )
+            };
+            frame(&mut app, &ctx, vec![]);
+            let output = frame(&mut app, &ctx, vec![]);
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == logical)));
+            let row = app.layer_rects[&ids[2]];
+            let at = egui::pos2(row.right() - 80., row.center().y);
+            for _ in 0..2 {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(at), button(at, true)],
+                );
+                frame(&mut app, &ctx, vec![button(at, false)]);
+            }
+            let edit = app
+                .rename_edit
+                .as_ref()
+                .expect("Double-click shaped name must rename inline");
+            assert_eq!(edit.layer, ids[2]);
+            assert_eq!(edit.original, logical);
+            assert_eq!(edit.text, logical);
+            assert_eq!(app.selected, ids[2]);
+            let engine = app.shared.lock().unwrap();
+            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+            assert_eq!(engine.undo.len(), undo_count);
+            assert_eq!(engine.doc.bit_depth, depth);
+        }
     }
     #[test]
     fn collapsed_folder_selection_reveal_keeps_native_mask_target_and_other_folders() {

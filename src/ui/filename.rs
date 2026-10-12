@@ -566,6 +566,27 @@ pub(super) fn label(
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
     response
 }
+pub(super) fn click_label(
+    ui: &mut egui::Ui,
+    text: &str,
+    width: f32,
+    font: egui::FontId,
+    color: Color32,
+) -> egui::Response {
+    let Some(entry) = entry(ui.ctx(), text, font.size, width) else {
+        return ui.add_sized(
+            [width, 30.],
+            egui::Label::new(RichText::new(text).font(font).color(color))
+                .truncate()
+                .sense(egui::Sense::click()),
+        );
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.), egui::Sense::click());
+    paint_entry(ui, &entry, rect, font.size, color);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
+    response
+}
 pub(super) fn project_button(
     ui: &mut egui::Ui,
     text: &str,
