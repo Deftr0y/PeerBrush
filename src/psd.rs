@@ -1692,6 +1692,8 @@ fn decode_parts(
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
                 if (1..=28).contains(&e.format)
+                    && e.document.width == w
+                    && e.document.height == h
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash

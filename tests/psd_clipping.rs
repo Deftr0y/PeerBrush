@@ -1299,6 +1299,40 @@ fn rendered(doc: &Document) -> Vec<u16> {
             .collect()
     }
 }
+#[test]
+fn supplementary_sources_cannot_override_changed_standard_canvas_dimensions() {
+    for depth in [8, 16] {
+        let mut doc = Document::new_depth(2, 4, depth).unwrap();
+        doc.layers[0]
+            .pixels
+            .set16(0, 0, [12347, 23459, 34571, 65535]);
+        doc.layers[0]
+            .pixels
+            .set16(1, 3, [54321, 32123, 11223, 65535]);
+        let original = doc.layers[0].pixels.rgba16();
+        for mut bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+            let editable = psd::decode(&bytes).unwrap();
+            assert!(!editable.read_only);
+            assert_eq!(editable.layers[0].pixels.rgba16(), original);
+            // Same number of samples: neither planar hashes nor unchanged layer
+            // records can identify this externally changed standard header.
+            bytes[14..18].copy_from_slice(&2u32.to_be_bytes());
+            bytes[18..22].copy_from_slice(&4u32.to_be_bytes());
+            let protected = psd::decode(&bytes).unwrap();
+            assert!(protected.read_only);
+            assert_eq!(
+                (protected.width, protected.height, protected.bit_depth),
+                (4, 2, depth)
+            );
+            assert!(protected
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("PeerBrush definitions were changed")));
+            assert!(psd::encode(&protected).is_err());
+            assert!(psd::encode_psb(&protected).is_err());
+        }
+    }
+}
 fn expected(specs: &[Spec], depth: u16, isolated: bool) -> Vec<u16> {
     let op = |a: [u16; 4], b: [u16; 4], t: f64, mode: &str| {
         if depth == 16 {

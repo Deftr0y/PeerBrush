@@ -63,6 +63,10 @@ Save leases and previous-save quota guards now use the same explicit OS unlock o
 
 The registry cache now retains and checks the weak identity of its root engine, alongside the weak workspace. Closing the root can remove its registry handle while an engine snapshot keeps the registry alive. Previously its address-only key could then collide with a new root after allocation reuse. The weak root pins that allocation until cache retirement; identity validation also rejects a stale cache entry. A deterministic regression simulates the collision after close, preserves the old snapshot, and verifies independent project lookup and active identity. Formatting and compile checking passed; CI and native lifecycle acceptance remain pending. This is a separate isolation fix, not an established explanation for the original data-loss report.
 
+## PSD supplementary canvas identity
+
+Supplementary PeerBrush sources now require exact agreement with the standard header's width and height, in addition to existing depth, standard hashes, metadata and source validation. An external dimension swap can retain the same planar sample count and unchanged layer records; those hashes alone cannot establish the canvas identity. A mismatch keeps the saved standard appearance protected at its actual header dimensions and original precision. Native8/16 PSD/PSB regression coverage preserves the unchanged editable case and rejects conflicting sources/saves. Formatting and compile checking passed; CI and native acceptance are pending.
+
 ## PB-141 installed-font discovery
 
 Implemented discovery and presentation selection, acceptance pending. The existing fontdb codec scans standard Windows, macOS and Linux font locations. Regular installed faces are selected only after checking representative complete Hebrew, Arabic, Devanagari, Han, kana and Hangul samples. Collection indices are retained. Ubuntu Sans stays primary; the existing bundled language fonts remain a temporary fallback while replacement acceptance and archive reductions are pending.
