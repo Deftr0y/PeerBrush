@@ -304,6 +304,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
         ("reverse", "Reverse"),
         ("invert", "Invert"),
         ("down", "Down"),
+        ("pixel_snap", "Pixel aligned"),
     ] {
         if defaults.get(key).is_some() && !bitmap {
             let mut enabled = value[key]

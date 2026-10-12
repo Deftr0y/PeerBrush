@@ -18,6 +18,9 @@ pub const KINDS: &[&str] = &[
 pub fn contains(kind: &str) -> bool {
     KINDS.contains(&kind)
 }
+pub fn pixel_aligned_shadow(kind: &str, value: &Value) -> bool {
+    matches!(kind, "inner_shadow" | "drop_shadow") && value.get("pixel_snap").is_some()
+}
 pub fn separate_bevel_channels(kind: &str, value: &Value) -> bool {
     kind == "bevel_emboss"
         && [
@@ -113,6 +116,7 @@ pub fn defaults(kind: &str) -> Value {
             v["angle"] = json!(120.);
             v["spread"] = json!(0.);
             v["contour"] = json!("linear");
+            v["pixel_snap"] = json!(false);
             if kind == "drop_shadow" {
                 v.as_object_mut().unwrap().remove("blend");
             } else {
@@ -173,7 +177,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                     return Err("Unsupported style blend mode".into());
                 }
             }
-            "reverse" | "invert" | "down" => {
+            "reverse" | "invert" | "down" | "pixel_snap" => {
                 if !v.is_boolean() {
                     return Err(format!("{key} must be true or false"));
                 }
@@ -389,7 +393,23 @@ pub fn apply(
         90. => (0., 1.),
         _ => (angle.cos(), angle.sin()),
     };
-    let (dx, dy) = (direction.0 * distance, -direction.1 * distance);
+    let (dx, dy) = if matches!(kind, "inner_shadow" | "drop_shadow") && v["pixel_snap"] == true {
+        // Cast to whole pixels before sampling, using the light-angle form.
+        // This follows Krita's PSD calculateOffset and retains its arithmetic
+        // at half-pixel boundaries after converting native displacement angles.
+        let light = if number(v, "angle") < 0. {
+            number(v, "angle") + 180.
+        } else {
+            number(v, "angle") - 180.
+        };
+        let light = light.to_radians();
+        (
+            -(distance * light.cos()).round(),
+            (distance * light.sin()).round(),
+        )
+    } else {
+        (direction.0 * distance, -direction.1 * distance)
+    };
     if matches!(
         kind,
         "inner_glow" | "outer_glow" | "inner_shadow" | "drop_shadow" | "satin" | "bevel_emboss"

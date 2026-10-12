@@ -53,6 +53,195 @@ fn strip(bytes: &[u8]) -> Vec<u8> {
     ]
     .concat()
 }
+
+#[test]
+fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_saves() {
+    for depth in [8, 16] {
+        for kind in ["drop_shadow", "inner_shadow"] {
+            for (angle, dx, dy) in [(-135., -1, 1), (-45., 1, 1), (45., 1, -1), (135., -1, -1)] {
+                let mut e = Engine::new();
+                e.doc = Document::new_depth(7, 7, depth).unwrap();
+                e.doc.layers[0].psd_metadata.push(psd::LayerMetadata {
+                    key: "lyvr".into(),
+                    data: 160u32.to_be_bytes().to_vec(),
+                });
+                for y in 0..7 {
+                    for x in 0..7 {
+                        let alpha =
+                            if (2..5).contains(&x) && (2..5).contains(&y) && (x, y) != (3, 3) {
+                                65535
+                            } else {
+                                0
+                            };
+                        e.doc.layers[0].pixels.set16(
+                            x,
+                            y,
+                            [12345 + x as u16 * 137, 23457 + y as u16 * 193, 45679, alpha],
+                        );
+                    }
+                }
+                let source = e.doc.layers[0].pixels.rgba16();
+                let layer = e.doc.layers[0].id.clone();
+                let base = e.doc.export_png().unwrap();
+                let mut settings = json!({"size":0.,"distance":2.,"angle":angle,"opacity":0.37,"color":[11111f64/65535.,22223f64/65535.,55555f64/65535.],"pixel_snap":false});
+                if kind == "inner_shadow" {
+                    settings["blend"] = json!("normal");
+                }
+                e.edit(
+                    "human",
+                    &[json!({"op":"effect.add","layer":layer,"kind":kind,"settings":settings})],
+                    None,
+                    None,
+                    "Fractional shadow",
+                )
+                .unwrap();
+                let fractional = e.doc.export_png().unwrap();
+                let effect = e.doc.layers[0].effects[0].id.clone();
+                let mut settings = e.doc.layers[0].effects[0].settings.clone();
+                settings["pixel_snap"] = json!(true);
+                let command =
+                    json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
+                let preview = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
+                assert_eq!(e.undo.len(), 1);
+                assert_eq!(e.doc.export_png().unwrap(), fractional);
+                e.edit("human", &[command], None, None, "Pixel aligned shadow")
+                    .unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+                assert_ne!(e.doc.export_png().unwrap(), fractional);
+                assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+                let mut expected = vec![];
+                let weight = (0.37f64 * 65535.).round() / 65535.;
+                for y in 0..7i32 {
+                    for x in 0..7i32 {
+                        let at = ((y * 7 + x) * 4) as usize;
+                        let original: [u16; 4] = source[at..at + 4].try_into().unwrap();
+                        let sx = x - dx;
+                        let sy = y - dy;
+                        let cast = if (0..7).contains(&sx) && (0..7).contains(&sy) {
+                            source[((sy * 7 + sx) * 4 + 3) as usize]
+                        } else {
+                            0
+                        };
+                        let mut pixel = original;
+                        if kind == "drop_shadow" && original[3] == 0 && cast != 0 {
+                            pixel = [11111, 22223, 55555, (weight * 65535.).round() as u16];
+                        } else if kind == "inner_shadow" && original[3] != 0 && cast == 0 {
+                            for c in 0..3 {
+                                pixel[c] = ((f64::from(original[c]) / 65535. * (1. - weight)
+                                    + f64::from([11111, 22223, 55555][c]) / 65535. * weight)
+                                    * 65535.)
+                                    .round() as u16;
+                            }
+                        }
+                        if depth == 8 {
+                            pixel = pixel.map(|v| ((u32::from(v) + 128) / 257) as u16 * 257);
+                        }
+                        if pixel[3] == 0 {
+                            pixel = [0; 4];
+                        }
+                        expected.extend(pixel);
+                    }
+                }
+                assert_eq!(native(&e.doc), expected, "{depth} {kind} {angle}");
+                let current = e.doc.export_png().unwrap();
+                for enabled in [false, true] {
+                    let mut document = e.doc.clone();
+                    document.layers[0].effects[0].enabled = enabled;
+                    let appearance = document.export_png().unwrap();
+                    for bytes in [
+                        psd::encode(&document).unwrap(),
+                        psd::encode_psb(&document).unwrap(),
+                    ] {
+                        use std::io::Read;
+                        let at = bytes.windows(4).position(|v| v == b"PBR1").unwrap() + 4;
+                        let mut decoded = vec![];
+                        flate2::read::ZlibDecoder::new(&bytes[at..])
+                            .read_to_end(&mut decoded)
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&decoded).unwrap()
+                                ["format"],
+                            25
+                        );
+                        let reopened = psd::decode(&bytes).unwrap();
+                        assert!(!reopened.read_only);
+                        assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                        assert_eq!(
+                            reopened.layers[0].effects[0].settings,
+                            e.doc.layers[0].effects[0].settings
+                        );
+                        assert_eq!(
+                            reopened.layers[0].psd_metadata,
+                            e.doc.layers[0].psd_metadata
+                        );
+                        assert_eq!(reopened.export_png().unwrap(), appearance);
+                        let standard = psd::decode(&strip(&bytes)).unwrap();
+                        assert!(!standard.read_only);
+                        assert_eq!(standard.export_png().unwrap(), appearance);
+                    }
+                }
+                assert_eq!(e.doc.export_png().unwrap(), current);
+                assert_eq!(e.undo.len(), 2);
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), fractional);
+                e.undo("human").unwrap();
+                assert_eq!(e.doc.export_png().unwrap(), base);
+                assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+            }
+        }
+    }
+}
+
+#[test]
+fn pixel_aligned_shadow_validation_reservations_and_protocol_remain_atomic() {
+    let shared = Arc::new(Mutex::new(fixture(16)));
+    let source = shared.lock().unwrap().doc.clone();
+    let layer = source.layers[0].id.clone();
+    for (kind, value) in [
+        ("inner_shadow", json!(null)),
+        ("drop_shadow", json!(1)),
+        ("drop_shadow", json!("yes")),
+        ("color_overlay", json!(true)),
+        ("satin", json!(false)),
+    ] {
+        let result = server::dispatch(
+            &shared,
+            "edit",
+            &json!({"actor":"human","commands":[{"op":"layer.update","layer":layer,"opacity":0.3},{"op":"effect.add","layer":layer,"kind":kind,"settings":{"pixel_snap":value}}]}),
+        );
+        assert!(result.is_err());
+        let e = shared.lock().unwrap();
+        assert_eq!(e.doc.revision, source.revision);
+        assert_eq!(e.doc.export_png().unwrap(), source.export_png().unwrap());
+        assert!(e.undo.is_empty());
+    }
+    {
+        let mut e = shared.lock().unwrap();
+        e.reserve(
+            "other",
+            "Synthetic shadow lease",
+            vec![Scope {
+                target: Some(layer.clone()),
+                rect: Some([0, 0, 64, 64]),
+            }],
+        )
+        .unwrap();
+        assert!(e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"pixel_snap":true}})],None,None,"Reserved pixel shadow").is_err());
+        assert_eq!(e.doc.revision, source.revision);
+        e.leases.clear();
+        e.doc.layers[0].locked = true;
+        assert!(e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"inner_shadow","settings":{"pixel_snap":true}})],None,None,"Locked pixel shadow").is_err());
+        e.doc.layers[0].locked = false;
+    }
+    let reply=server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[{"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"pixel_snap":true,"size":0.,"angle":45.,"distance":2.}}],"max_edge":64})).unwrap();
+    assert!(!reply["images"][0]["data"].as_str().unwrap().is_empty());
+    assert_eq!(reply["images"][0]["document_rect"], json!([0, 0, 64, 64]));
+    assert_eq!(
+        shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+        source.layers[0].pixels.rgba16()
+    );
+    assert_eq!(shared.lock().unwrap().undo.len(), 1);
+}
 #[test]
 fn every_style_renders_native_sources_preserves_source_and_roundtrips_actual_standard_pixels() {
     for depth in [8, 16] {
