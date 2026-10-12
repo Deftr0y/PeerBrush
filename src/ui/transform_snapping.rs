@@ -67,6 +67,8 @@ impl PeerBrush {
                 c["pivot"] = json!(pivot);
                 c["mask"] = json!(self.mask);
                 c["selection_only"] = json!(doc.selection.is_some());
+                c["document_id"] = json!(doc.id);
+                c["source_revision"] = json!(doc.revision);
                 if roots.len() == 1 {
                     c["step"] = json!(self.mask_step);
                 }
@@ -89,6 +91,105 @@ impl PeerBrush {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn toolbar_transform_rejects_same_revision_document_replacement_and_allows_fresh_retry() {
+        for depth in [8, 16] {
+            for selected in [false, true] {
+                for parameters in [
+                    json!({"mirror_x":true}),
+                    json!({"mirror_y":true}),
+                    json!({"angle":90.}),
+                    json!({"angle":-90.}),
+                ] {
+                    let (mut app, _) = super::super::tests::fixture();
+                    let snapshot = {
+                        let mut engine = app.shared.lock().unwrap();
+                        engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(5, 6, [12347, 23459, 34571, 65535]);
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(11, 12, [51347, 10359, 22371, 65535]);
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(25, 25, [43219, 19237, 22349, 65535]);
+                        if selected {
+                            engine.edit("human", &[json!({"op":"selection","kind":"rectangle","rect":[4,5,12,13]})], None, None, "Fixture").unwrap();
+                        }
+                        engine.undo.clear();
+                        engine.doc.clone()
+                    };
+                    app.select_content(&snapshot.layers[0].id);
+                    app.select_tool(Tool::Rotate);
+                    let mut replacement = snapshot.clone();
+                    replacement.id = "replacement-transform-project".into();
+                    replacement.layers[0]
+                        .pixels
+                        .set16(6, 7, [53417, 23149, 13257, 65535]);
+                    assert_eq!(replacement.revision, snapshot.revision);
+                    app.shared.lock().unwrap().doc = replacement.clone();
+                    app.transform_toolbar_action(&snapshot, parameters.clone(), "Stale action");
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        assert!(
+                            engine.undo.is_empty(),
+                            "{depth} {selected} {parameters}: stale action reached replacement"
+                        );
+                        assert_eq!(
+                            serde_json::to_value(&engine.doc).unwrap(),
+                            serde_json::to_value(&replacement).unwrap()
+                        );
+                    }
+                    assert!(
+                        app.message.contains("source project changed"),
+                        "{}",
+                        app.message
+                    );
+                    let bounds = replacement.selection.unwrap_or(
+                        crate::transform::tree_bounds(
+                            &replacement,
+                            &[replacement.layers[0].id.clone()],
+                        )
+                        .unwrap(),
+                    );
+                    let mut command = parameters.clone();
+                    command["op"] = json!("transform");
+                    command["layer"] = json!(replacement.layers[0].id);
+                    command["pivot"] = json!([
+                        (bounds[0] as f64 + bounds[2] as f64) / 2.,
+                        (bounds[1] as f64 + bounds[3] as f64) / 2.
+                    ]);
+                    command["selection_only"] = json!(selected);
+                    let expected =
+                        crate::engine::Engine::preview_edits(replacement.clone(), &[command])
+                            .unwrap();
+                    app.transform_toolbar_action(&replacement, parameters, "Fresh action");
+                    let mut engine = app.shared.lock().unwrap();
+                    assert_eq!(engine.undo.len(), 1, "{}", app.message);
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        expected.export_png().unwrap()
+                    );
+                    assert_eq!(engine.doc.bit_depth, depth);
+                    engine.undo("human").unwrap();
+                    assert_eq!(
+                        engine.doc.export_png().unwrap(),
+                        replacement.export_png().unwrap()
+                    );
+                    assert_eq!(
+                        engine.doc.layers[0].pixels.rgba16(),
+                        replacement.layers[0].pixels.rgba16()
+                    );
+                    assert_eq!(
+                        engine.doc.selection_coverage,
+                        replacement.selection_coverage
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn toolbar_actions_click_through_real_controls_and_commit_one_native_edit() {
         for depth in [8, 16] {
