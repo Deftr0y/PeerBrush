@@ -1254,9 +1254,12 @@ fn saved_composite(bytes: &[u8], depth: u16) -> Vec<u16> {
     } else {
         plane.iter().map(|v| *v as u16 * 257).collect()
     };
-    (0..2)
+    let count = u32::from_be_bytes(bytes[14..18].try_into().unwrap()) as usize
+        * u32::from_be_bytes(bytes[18..22].try_into().unwrap()) as usize;
+    assert_eq!(words.len(), count * 4);
+    (0..count)
         .flat_map(|x| (0..4).map(move |c| (x, c)))
-        .map(|(x, c)| words[c * 2 + x])
+        .map(|(x, c)| words[c * count + x])
         .collect()
 }
 fn stack() -> Vec<Spec> {
@@ -1288,7 +1291,7 @@ fn rendered(doc: &Document) -> Vec<u16> {
     if doc.bit_depth == 16 {
         peerbrush::depth16::render(doc).unwrap().words
     } else {
-        doc.preview(None, 2, None, false)
+        doc.preview(None, doc.width.max(doc.height), None, false)
             .unwrap()
             .2
             .into_iter()
@@ -4671,7 +4674,7 @@ fn hard_shadow_payload(
         (
             "lagl",
             b"UntF",
-            unit(b"#Ang", if variant == "angle" { 45. } else { angle }),
+            unit(b"#Ang", if variant == "angle" { 45.5 } else { angle }),
         ),
         (
             "Dstn",
@@ -4880,6 +4883,267 @@ fn shadow_fixture(
         }
     }
     (bytes, merged.into_iter().flatten().collect())
+}
+
+fn framed_shadow_fixture(
+    depth: u16,
+    source: &[[u16; 4]],
+    payload: &[u8],
+    merged: &[[u16; 4]],
+) -> Vec<u8> {
+    assert_eq!(source.len(), 16);
+    assert_eq!(merged.len(), 16);
+    let mut record = vec![];
+    for value in [0i32, 0, 4, 4] {
+        record.extend(value.to_be_bytes());
+    }
+    record.extend(4u16.to_be_bytes());
+    let mut channels = vec![];
+    for channel in [-1i16, 0, 1, 2] {
+        let mut data = 0u16.to_be_bytes().to_vec();
+        for pixel in source {
+            sample(
+                &mut data,
+                pixel[if channel == -1 { 3 } else { channel as usize }],
+                depth,
+            );
+        }
+        record.extend(channel.to_be_bytes());
+        record.extend((data.len() as u32).to_be_bytes());
+        channels.extend(data);
+    }
+    record.extend(b"8BIMnorm");
+    record.extend([255, 0, 0, 0]);
+    let mut extra = vec![0; 8];
+    let name = b"Synthetic pixel shadow";
+    extra.push(name.len() as u8);
+    extra.extend(name);
+    extra.resize((extra.len() + 3) & !3, 0);
+    tag(&mut extra, b"lfx2", payload);
+    block(&mut record, &extra);
+    let mut info = (-1i16).to_be_bytes().to_vec();
+    info.extend(record);
+    info.extend(channels);
+    if info.len() % 2 != 0 {
+        info.push(0);
+    }
+    let mut section = vec![];
+    if depth == 16 {
+        section.extend([0; 8]);
+        tag(&mut section, b"Lr16", &info);
+        section.resize((section.len() + 3) & !3, 0);
+    } else {
+        block(&mut section, &info);
+        section.extend([0; 4]);
+    }
+    let mut out = b"8BPS".to_vec();
+    out.extend(1u16.to_be_bytes());
+    out.extend([0; 6]);
+    out.extend(4u16.to_be_bytes());
+    out.extend(4u32.to_be_bytes());
+    out.extend(4u32.to_be_bytes());
+    out.extend(depth.to_be_bytes());
+    out.extend(3u16.to_be_bytes());
+    out.extend([0; 8]);
+    block(&mut out, &section);
+    out.extend(0u16.to_be_bytes());
+    for channel in 0..4 {
+        for &pixel in merged {
+            composite_sample(&mut out, pixel, channel, depth);
+        }
+    }
+    out
+}
+
+#[test]
+fn photoshop_pixel_aligned_hard_shadows_retain_angles_sources_undo_and_standard_saves() {
+    // Independent integer casts, including light-angle half-pixel arithmetic.
+    for (angle, distance, dx, dy) in [
+        (45f64, 2f64, -1, 1),
+        (135., 2., 1, 1),
+        (-45., 2., -1, -1),
+        (-135., 2., 1, -1),
+        (120., 2., 1, 2),
+        (30., 2., -2, 1),
+        (60., 1., -1, 1),
+        (-120., 1., 0, -1),
+    ] {
+        for depth in [8, 16] {
+            let source = std::array::from_fn::<_, 16, _>(|i| {
+                let x = i % 4;
+                let y = i / 4;
+                [
+                    12347 + x as u16 * 139,
+                    23459 + y as u16 * 197,
+                    34571,
+                    if (1..3).contains(&x) && (1..3).contains(&y) {
+                        65535
+                    } else {
+                        0
+                    },
+                ]
+                .map(|v| native(v, depth))
+            });
+            for kind in ["DrSh", "IrSh"] {
+                for enabled in [false, true] {
+                    for list in [false, true] {
+                        let mut payload = hard_shadow_payload(
+                            kind,
+                            enabled,
+                            true,
+                            angle,
+                            37.,
+                            if list { "list" } else { "" },
+                        );
+                        let at = payload
+                            .windows(12)
+                            .position(|v| v == b"DstnUntF#Pxl")
+                            .unwrap()
+                            + 12;
+                        payload[at..at + 8].copy_from_slice(&distance.to_be_bytes());
+                        let mut merged = source;
+                        let coverage = (0.37f64 * 65535.).round() / 65535.;
+                        for i in 0..16 {
+                            let x = (i % 4) as i32;
+                            let y = (i / 4) as i32;
+                            let sx = x - dx;
+                            let sy = y - dy;
+                            let cast = if (0..4).contains(&sx) && (0..4).contains(&sy) {
+                                source[(sy * 4 + sx) as usize][3]
+                            } else {
+                                0
+                            };
+                            if enabled && kind == "DrSh" && source[i][3] == 0 && cast != 0 {
+                                merged[i] = [
+                                    111 * 257,
+                                    67 * 257,
+                                    231 * 257,
+                                    (coverage * 65535.).round() as u16,
+                                ]
+                                .map(|v| native(v, depth));
+                            } else if enabled && kind == "IrSh" && source[i][3] != 0 && cast == 0 {
+                                for channel in 0..3 {
+                                    merged[i][channel] = native(
+                                        ((f64::from(source[i][channel]) / 65535. * (1. - coverage)
+                                            + f64::from([111 * 257, 67 * 257, 231 * 257][channel])
+                                                / 65535.
+                                                * coverage)
+                                            * 65535.)
+                                            .round() as u16,
+                                        depth,
+                                    );
+                                }
+                            }
+                            if merged[i][3] == 0 {
+                                merged[i] = [0; 4];
+                            }
+                        }
+                        let mut bytes = framed_shadow_fixture(depth, &source, &payload, &merged);
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{angle} {distance} {depth} {kind} {enabled} {list}: {:?}",
+                            doc.warnings
+                        );
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+                        assert_eq!(rendered(&doc), merged.concat());
+                        let effect = &doc.layers[0].effects[0];
+                        assert_eq!(effect.enabled, enabled);
+                        assert_eq!(effect.settings["pixel_snap"], true);
+                        assert_eq!(
+                            effect.settings["angle"],
+                            (angle + 360.).rem_euclid(360.) - 180.
+                        );
+                        assert_eq!(effect.settings["distance"], distance);
+                        let settings = effect.settings.clone();
+                        let layer = doc.layers[0].id.clone();
+                        let effect = effect.id.clone();
+                        let current = doc.export_png().unwrap();
+                        let mut engine = Engine::new();
+                        engine.doc = doc;
+                        engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})],None,None,"Pixel shadow bypass").unwrap();
+                        assert_eq!(engine.undo.len(), 1);
+                        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        let max = if depth == 16 { 65535u64 } else { 255 };
+                        let divisor = if depth == 16 { 1u64 } else { 257 };
+                        let matte = merged.map(|pixel| {
+                            let pixel = pixel.map(|v| u64::from(v) / divisor);
+                            std::array::from_fn::<_, 4, _>(|channel| {
+                                if channel == 3 {
+                                    (pixel[3] * divisor) as u16
+                                } else {
+                                    (((pixel[channel] * pixel[3]
+                                        + max * (max - pixel[3])
+                                        + max / 2)
+                                        / max)
+                                        * divisor) as u16
+                                }
+                            })
+                        });
+                        for output in [
+                            psd::encode(&engine.doc).unwrap(),
+                            psd::encode_psb(&engine.doc).unwrap(),
+                        ] {
+                            assert_eq!(saved_composite(&output, depth), matte.concat());
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                            assert_eq!(reopened.layers[0].effects[0].settings, settings);
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            let standard = psd::decode(&ordinary(&output)).unwrap();
+                            assert!(!standard.read_only);
+                            assert_eq!(standard.export_png().unwrap(), current);
+                        }
+                        // Change an opaque source pixel, so alpha-zero matte
+                        // normalization cannot erase the independent mismatch.
+                        let at = bytes.len() - 64 * usize::from(depth / 8)
+                            + 5 * usize::from(depth / 8)
+                            + usize::from(depth == 16);
+                        bytes[at] ^= 1;
+                        let protected = psd::decode(&bytes).unwrap();
+                        assert!(protected.read_only);
+                        assert_eq!(protected.bit_depth, depth);
+                        assert!(protected.layers[0].effects.is_empty());
+                        assert!(psd::encode(&protected).is_err());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn photoshop_pixel_aligned_hard_shadows_protect_unsupported_geometry_and_definitions() {
+    for depth in [8, 16] {
+        for kind in ["DrSh", "IrSh"] {
+            for variant in [
+                "angle",
+                "fractional",
+                "distance",
+                "global",
+                "antialias",
+                "choke",
+                "size",
+                "noise",
+                "contour",
+                "unknown",
+                "missing",
+                "mixed",
+            ] {
+                let source = SAVED.map(|p| p.map(|v| native(v, depth))).repeat(8);
+                let payload = hard_shadow_payload(kind, false, true, 45., 100., variant);
+                let doc =
+                    psd::decode(&framed_shadow_fixture(depth, &source, &payload, &source)).unwrap();
+                assert!(doc.read_only, "{depth} {kind} {variant}");
+                assert_eq!(doc.bit_depth, depth);
+                assert!(doc.layers[0].effects.is_empty());
+                assert!(psd::encode(&doc).is_err());
+                assert!(psd::encode_psb(&doc).is_err());
+            }
+        }
+    }
 }
 #[test]
 fn bounded_hard_photoshop_shadows_retain_native_sources_orientation_bypass_undo_and_saves() {

@@ -537,14 +537,15 @@ fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
     };
     let angle = unit("lagl", "#Ang")?;
     let distance = unit("Dstn", "#Pxl")?;
-    if ![-180., -90., 0., 90., 180.].contains(&angle)
+    if !(-180. ..=180.).contains(&angle)
+        || angle.fract() != 0.
         || !(0.0..=128.).contains(&distance)
         || distance.fract() != 0.
         || unit("blur", "#Pxl")? != 0.
         || unit("Ckmt", "#Pxl")? != 0.
         || percent(field(fields, "Nose"))? != 0.
     {
-        return Err("Only cardinal, integer-distance shadows with zero size, choke and noise can be imported".into());
+        return Err("Only integer-angle, integer-distance shadows with zero size, choke and noise can be imported".into());
     }
     let contour = descriptor(field(fields, "TrnS"), "ShpC")?;
     if contour
@@ -574,8 +575,12 @@ fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
         return Err("Independent Photoshop Drop Shadow backdrop blends remain protected".into());
     }
     // Photoshop's angle locates the light; native angle locates displacement.
+    let cardinal = [-180., -90., 0., 90., 180.].contains(&angle);
     let angle = (angle + 360.).rem_euclid(360.) - 180.;
     let mut settings = json!({"opacity":percent(field(fields,"Opct"))?,"color":color,"angle":angle,"distance":distance,"size":0.,"spread":0.,"contour":"linear"});
+    if !cardinal {
+        settings["pixel_snap"] = json!(true);
+    }
     if kind == "inner_shadow" {
         settings["blend"] = json!(blend);
     }
