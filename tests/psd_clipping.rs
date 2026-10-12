@@ -4640,7 +4640,8 @@ fn multiple_overlay_limits_aliases_and_unsupported_disabled_entries_protect_atom
             let mut payload = multi_overlay_payload([false; 4], false, 2, 2, false);
             if invalid == "unsupported" {
                 let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
-                payload[at..at + 4].copy_from_slice(b"HrdL");
+                // Hard Light is now supported; Hue remains outside this subset.
+                payload[at..at + 4].copy_from_slice(b"H   ");
             } else {
                 let at = payload.windows(4).position(|v| v == b"Lefx").unwrap() + 4;
                 payload[at..at + 4].copy_from_slice(&4u32.to_be_bytes());
