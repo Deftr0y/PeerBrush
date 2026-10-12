@@ -3406,9 +3406,6 @@ fn mixed_overlay_fixture(depth: u16, enabled: [bool; 3], master: bool, mismatch:
     let mut merged = SAVED.map(|p| p.map(|n| native(n, depth)));
     if master {
         for (x, pixel) in merged.iter_mut().enumerate() {
-            if enabled[0] {
-                pixel[..3].copy_from_slice(&[111 * 257, 67 * 257, 231 * 257]);
-            }
             for (active, tint) in [
                 (
                     enabled[1],
@@ -3428,6 +3425,9 @@ fn mixed_overlay_fixture(depth: u16, enabled: [bool; 3], master: bool, mismatch:
                         pixel[c] = native(value, depth);
                     }
                 }
+            }
+            if enabled[0] {
+                pixel[..3].copy_from_slice(&[111 * 257, 67 * 257, 231 * 257]);
             }
         }
     }
@@ -3458,11 +3458,11 @@ fn mixed_photoshop_overlays_retain_order_disabled_sources_undo_and_native_saves(
                 let effects = &doc.layers[0].effects;
                 assert_eq!(
                     effects.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
-                    ["color_overlay", "pattern_overlay", "gradient_overlay"]
+                    ["pattern_overlay", "gradient_overlay", "color_overlay"]
                 );
                 assert_eq!(
                     effects.iter().map(|e| e.enabled).collect::<Vec<_>>(),
-                    enabled.map(|v| v && master)
+                    [enabled[1], enabled[2], enabled[0]].map(|v| v && master)
                 );
                 let source = doc.layers[0].pixels.rgba16();
                 assert_eq!(
@@ -3477,8 +3477,8 @@ fn mixed_photoshop_overlays_retain_order_disabled_sources_undo_and_native_saves(
                 let mut engine = Engine::new();
                 engine.doc = doc;
                 let layer = engine.doc.layers[0].id.clone();
-                let effect = engine.doc.layers[0].effects[1].id.clone();
-                let mut settings = engine.doc.layers[0].effects[1].settings.clone();
+                let effect = engine.doc.layers[0].effects[0].id.clone();
+                let mut settings = engine.doc.layers[0].effects[0].settings.clone();
                 settings["phase_x"] = json!(1.);
                 engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings})], None, None, "Mixed pattern phase").unwrap();
                 assert_eq!(engine.undo.len(), 1);
@@ -3523,6 +3523,82 @@ fn mixed_photoshop_overlays_protect_mismatches_and_unknown_even_disabled_styles(
                 .warnings
                 .iter()
                 .any(|v| v.contains("Unsupported Photoshop style")));
+        }
+    }
+}
+
+#[test]
+fn photoshop_modern_normal_overlay_ids_retain_family_order_and_strict_protection() {
+    // Photoshop's overlay-zorder calibration has an opaque red Color Overlay
+    // above a Gradient Overlay and above a Pattern Overlay. Its saved samples
+    // are red in both overlap panels. Use independent synthetic native-depth
+    // sources here; the external file also has unsupported disabled styles.
+    for depth in [8, 16] {
+        for master in [false, true] {
+            let mut payload = mixed_overlay_payload([true; 3], master);
+            while payload.windows(12).any(|v| v == b"BlnM\0\0\0\0Nrml") {
+                let at = payload
+                    .windows(12)
+                    .position(|v| v == b"BlnM\0\0\0\0Nrml")
+                    .unwrap()
+                    + 4;
+                let mut modern = vec![];
+                overlay_id(&mut modern, "normal");
+                payload.splice(at..at + 8, modern);
+            }
+            let reference = mixed_overlay_fixture(depth, [true; 3], master, false);
+            let mut spec = Spec::paint("Synthetic modern normal overlays", SAVED);
+            spec.tags.push((*b"lfx2", payload.clone()));
+            let mut bytes = inject_pattern(
+                fixture(&[spec], depth),
+                depth,
+                &pattern_resource(depth, "synthetic-pattern"),
+                false,
+            );
+            let composite_len = 8 * usize::from(depth / 8);
+            bytes.truncate(bytes.len() - composite_len);
+            bytes.extend_from_slice(&reference[reference.len() - composite_len..]);
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{depth} {master}: {:?}", doc.warnings);
+            assert_eq!(
+                doc.layers[0]
+                    .effects
+                    .iter()
+                    .map(|e| e.kind.as_str())
+                    .collect::<Vec<_>>(),
+                ["pattern_overlay", "gradient_overlay", "color_overlay"]
+            );
+            assert!(doc.layers[0]
+                .effects
+                .iter()
+                .all(|e| e.settings["blend"] == "normal" && e.enabled == master));
+            let source = doc.layers[0].pixels.rgba16();
+            assert_eq!(source, SAVED.map(|p| p.map(|v| native(v, depth))).concat());
+            let current = doc.export_png().unwrap();
+            for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                let reopened = psd::decode(&output).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                assert_eq!(reopened.export_png().unwrap(), current);
+                assert_eq!(
+                    saved_composite(&output, depth),
+                    saved_composite(&bytes, depth)
+                );
+            }
+            // Full IDs are exact, not case-insensitive guesses, even disabled.
+            let at = payload.windows(6).position(|v| v == b"normal").unwrap();
+            payload[at] = b'N';
+            let mut unsupported = Spec::paint("Synthetic unsupported modern enum", SAVED);
+            unsupported.tags.push((*b"lfx2", payload));
+            let protected = psd::decode(&inject_pattern(
+                fixture(&[unsupported], depth),
+                depth,
+                &pattern_resource(depth, "synthetic-pattern"),
+                false,
+            ))
+            .unwrap();
+            assert!(protected.read_only);
+            assert!(psd::encode(&protected).is_err());
         }
     }
 }
@@ -4068,12 +4144,15 @@ fn multiple_photoshop_overlays_preserve_file_order_disabled_entries_and_native_s
                 if master {
                     for (x, pixel) in merged.iter_mut().enumerate() {
                         let colors = [
-                            [111 * 257, 67 * 257, 231 * 257],
-                            [31 * 257, 197 * 257, 83 * 257],
                             [if x == 0 { 16384 } else { 49151 }; 3],
                             [if x == 0 { 49151 } else { 16384 }; 3],
+                            [111 * 257, 67 * 257, 231 * 257],
+                            [31 * 257, 197 * 257, 83 * 257],
                         ];
-                        for (active, tint) in enabled.into_iter().zip(colors) {
+                        for (active, tint) in [enabled[2], enabled[3], enabled[0], enabled[1]]
+                            .into_iter()
+                            .zip(colors)
+                        {
                             if active {
                                 for c in 0..3 {
                                     pixel[c] = native(
@@ -4107,10 +4186,10 @@ fn multiple_photoshop_overlays_preserve_file_order_disabled_entries_and_native_s
                         .map(|e| e.kind.as_str())
                         .collect::<Vec<_>>(),
                     [
-                        "color_overlay",
-                        "color_overlay",
                         "gradient_overlay",
-                        "gradient_overlay"
+                        "gradient_overlay",
+                        "color_overlay",
+                        "color_overlay"
                     ]
                 );
                 assert_eq!(
@@ -4119,18 +4198,18 @@ fn multiple_photoshop_overlays_preserve_file_order_disabled_entries_and_native_s
                         .iter()
                         .map(|e| e.enabled)
                         .collect::<Vec<_>>(),
-                    enabled.map(|v| v && master)
+                    [enabled[2], enabled[3], enabled[0], enabled[1]].map(|v| v && master)
                 );
                 assert_eq!(
-                    doc.layers[0].effects[0].settings["color"],
+                    doc.layers[0].effects[2].settings["color"],
                     json!([111. / 255., 67. / 255., 231. / 255.])
                 );
                 assert_eq!(
-                    doc.layers[0].effects[1].settings["color"],
+                    doc.layers[0].effects[3].settings["color"],
                     json!([31. / 255., 197. / 255., 83. / 255.])
                 );
-                assert_eq!(doc.layers[0].effects[2].settings["reverse"], false);
-                assert_eq!(doc.layers[0].effects[3].settings["reverse"], true);
+                assert_eq!(doc.layers[0].effects[0].settings["reverse"], false);
+                assert_eq!(doc.layers[0].effects[1].settings["reverse"], true);
                 let source = doc.layers[0].pixels.rgba16();
                 assert_eq!(
                     source,
@@ -5725,9 +5804,6 @@ fn photoshop_mixed_overlays_and_hard_shadows_keep_original_casts_sources_and_nat
                     if result[3] != 0 {
                         let mut rgb: [u16; 3] = result[..3].try_into().unwrap();
                         if master {
-                            if enabled[0] {
-                                rgb = mix(rgb, tint, 43.);
-                            }
                             if enabled[1] {
                                 rgb = mix(
                                     rgb,
@@ -5743,6 +5819,9 @@ fn photoshop_mixed_overlays_and_hard_shadows_keep_original_casts_sources_and_nat
                                     [((f64::from(x) + 0.5) / 4. * 65535.).round() as u16; 3],
                                     50.,
                                 );
+                            }
+                            if enabled[0] {
+                                rgb = mix(rgb, tint, 43.);
                             }
                             if enabled[3] && !cast(x + 1, y - 1) {
                                 rgb = mix(rgb, tint, 37.);
@@ -5790,9 +5869,9 @@ fn photoshop_mixed_overlays_and_hard_shadows_keep_original_casts_sources_and_nat
                         .map(|e| e.kind.as_str())
                         .collect::<Vec<_>>(),
                     [
-                        "color_overlay",
                         "pattern_overlay",
                         "gradient_overlay",
+                        "color_overlay",
                         "inner_shadow",
                         "drop_shadow"
                     ]
@@ -5803,10 +5882,11 @@ fn photoshop_mixed_overlays_and_hard_shadows_keep_original_casts_sources_and_nat
                         .iter()
                         .map(|e| e.enabled)
                         .collect::<Vec<_>>(),
-                    enabled.map(|v| master && v)
+                    [enabled[1], enabled[2], enabled[0], enabled[3], enabled[4]]
+                        .map(|v| master && v)
                 );
                 let tile = peerbrush::effects::patterns::get(
-                    doc.layers[0].effects[1].settings["bitmap_png"]
+                    doc.layers[0].effects[0].settings["bitmap_png"]
                         .as_str()
                         .unwrap(),
                 )
@@ -5814,7 +5894,7 @@ fn photoshop_mixed_overlays_and_hard_shadows_keep_original_casts_sources_and_nat
                 assert_eq!(tile.depth, depth);
                 for x in 0..2 {
                     assert_eq!(
-                        tile.sample(x as f64, 0., &doc.layers[0].effects[1].settings),
+                        tile.sample(x as f64, 0., &doc.layers[0].effects[0].settings),
                         PATTERN[x].map(|v| native(v, depth))
                     );
                 }

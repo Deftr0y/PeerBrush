@@ -251,7 +251,7 @@ fn overlay_blend(value: &Value) -> Result<&'static str, String> {
         return Err("Invalid Photoshop overlay blend enumeration".into());
     }
     match value["value"][1].as_str() {
-        Some("Nrml") => Ok("normal"),
+        Some("Nrml" | "normal") => Ok("normal"),
         Some("Mltp") => Ok("multiply"),
         Some("Scrn") => Ok("screen"),
         Some("Ovrl") => Ok("overlay"),
@@ -384,15 +384,16 @@ pub(super) fn native_styles(
     }
     let mut effects = vec![];
     let mut pattern_index = None;
-    // Photoshop overlays run Color, Pattern, Gradient. Keep the same execution
-    // order in the native stack (the UI displays the last effect at the top).
-    // Reference: psd-tools/composite/composite.py::_OVERLAY_DRAWS.
+    // Photoshop overlays run Pattern, Gradient, Color (Color is uppermost).
+    // Keep that execution order; native stacks saved previously keep theirs.
+    // Reference: Patchy Photoshop-produced overlay-zorder fixture, commit
+    // bb6b9426080842af6f4f65acb122516e07328323; see docs/layer-styles.md.
     // Preserve multi-overlay entries in file order, including disabled entries.
     // Never try alternative orders merely to match the saved appearance.
     for keys in [
-        &["SoFi", "solidFillMulti"][..],
         &["patternFill"][..],
         &["GrFl", "gradientFillMulti"][..],
+        &["SoFi", "solidFillMulti"][..],
     ] {
         let present = keys
             .iter()
