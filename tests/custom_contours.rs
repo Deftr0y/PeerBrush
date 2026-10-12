@@ -261,7 +261,12 @@ fn every_custom_style_contour_retains_sources_preview_undo_and_current_psd_psb_o
             ] {
                 assert_eq!(
                     embedded(&output)["format"],
-                    if kind == "bevel_emboss" { 22 } else { 21 }
+                    match kind {
+                        "drop_shadow" => 26,
+                        "inner_shadow" => 25,
+                        "bevel_emboss" => 22,
+                        _ => 21,
+                    }
                 );
                 let reopened = psd::decode(&output).unwrap();
                 assert!(!reopened.read_only);
@@ -319,7 +324,7 @@ fn future_and_malformed_contour_sources_preserve_native_composites_and_disabled_
                         source["document"]["layers"][0]["effects"][0]["settings"]
                             ["contour_points"][1]["position"] = json!(0.);
                     } else {
-                        source["format"] = json!(25);
+                        source["format"] = json!(29);
                     }
                     let protected = psd::decode(&replace_embedded(&bytes, &source)).unwrap();
                     assert!(protected.read_only);
