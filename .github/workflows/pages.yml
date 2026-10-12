@@ -1,0 +1,55 @@
+name: PeerBrush website
+
+on:
+  push:
+    branches: [site-content]
+  workflow_dispatch:
+    inputs:
+      expected_site_commit:
+        description: Full reviewed public site-content commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: site-content
+          persist-credentials: false
+      - name: Check reviewed public output
+        shell: bash
+        env:
+          EXPECTED_SITE_COMMIT: ${{ github.event_name == 'push' && github.sha || inputs.expected_site_commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SITE_COMMIT"
+          test -f public-site/index.html
+          test -f public-site/downloads.json
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload reviewed website output
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public-site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4
