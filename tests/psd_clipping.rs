@@ -3741,6 +3741,160 @@ fn set_style_blend(payload: &mut Vec<u8>, mode: &str) {
     payload.splice(at..at + 8, encoded);
 }
 
+fn append_style_root_field(payload: &mut Vec<u8>, key: &str, kind: &[u8; 4], value: &[u8]) {
+    let count_at = payload.windows(4).position(|v| v == b"Lefx").unwrap() + 4;
+    let count = u32::from_be_bytes(payload[count_at..count_at + 4].try_into().unwrap());
+    payload[count_at..count_at + 4].copy_from_slice(&(count + 1).to_be_bytes());
+    overlay_id(payload, key);
+    payload.extend_from_slice(kind);
+    payload.extend_from_slice(value);
+}
+
+#[test]
+fn photoshop_modifying_effect_counts_validate_hidden_stacks_without_losing_sources() {
+    for depth in [8, 16] {
+        for flags in 0u8..8 {
+            let enabled = [flags & 1 != 0, flags & 2 != 0, flags & 4 != 0];
+            for master in [false, true] {
+                let mut payload = mixed_overlay_payload(enabled, master);
+                append_style_root_field(
+                    &mut payload,
+                    "numModifyingFX",
+                    b"long",
+                    &flags.count_ones().to_be_bytes(),
+                );
+                let reference = mixed_overlay_fixture(depth, enabled, master, false);
+                let mut spec = Spec::paint("Synthetic counted overlays", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let mut bytes = inject_pattern(
+                    fixture(&[spec], depth),
+                    depth,
+                    &pattern_resource(depth, "synthetic-pattern"),
+                    false,
+                );
+                let n = 8 * usize::from(depth / 8);
+                bytes.truncate(bytes.len() - n);
+                bytes.extend_from_slice(&reference[reference.len() - n..]);
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(
+                    !doc.read_only,
+                    "{depth} {flags} {master}: {:?}",
+                    doc.warnings
+                );
+                let source = SAVED.map(|p| p.map(|v| native(v, depth))).concat();
+                assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                let definitions = doc.layers[0].effects.clone();
+                let current = doc.export_png().unwrap();
+                for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                    let reopened = psd::decode(&output).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                    assert_eq!(
+                        saved_composite(&output, depth),
+                        saved_composite(&bytes, depth)
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&reopened.layers[0].effects).unwrap(),
+                        serde_json::to_value(&definitions).unwrap()
+                    );
+                }
+            }
+        }
+        // The stored count is independent of master-off presentation. It
+        // counts every enabled definition, including multi entries.
+        for flags in 0u8..16 {
+            let enabled = std::array::from_fn(|i| flags & (1 << i) != 0);
+            let mut payload = multi_overlay_payload(enabled, false, 16, 16, false);
+            append_style_root_field(
+                &mut payload,
+                "numModifyingFX",
+                b"long",
+                &(flags.count_ones() * 8).to_be_bytes(),
+            );
+            let mut spec = Spec::paint("Synthetic counted hidden lists", SAVED);
+            spec.tags.push((*b"lmfx", payload));
+            let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+            assert!(!doc.read_only, "{depth} {flags}: {:?}", doc.warnings);
+            assert_eq!(doc.layers[0].effects.len(), 32);
+            assert!(doc.layers[0].effects.iter().all(|e| !e.enabled));
+        }
+        for flags in 0u8..32 {
+            for list in [false, true] {
+                let enabled = std::array::from_fn(|i| flags & (1 << i) != 0);
+                let mut payload = mixed_shadow_overlay_payload(enabled, false, list, "");
+                append_style_root_field(
+                    &mut payload,
+                    "numModifyingFX",
+                    b"long",
+                    &flags.count_ones().to_be_bytes(),
+                );
+                let mut spec = Spec::paint("Synthetic counted hidden shadows", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let doc = psd::decode(&inject_pattern(
+                    fixture(&[spec], depth),
+                    depth,
+                    &pattern_resource(depth, "synthetic-pattern"),
+                    false,
+                ))
+                .unwrap();
+                assert!(!doc.read_only, "{depth} {flags} {list}: {:?}", doc.warnings);
+                assert_eq!(doc.layers[0].effects.len(), 5);
+            }
+        }
+        for master in [false, true] {
+            let mut payload = overlay_payload(master, true, [111., 67., 231.]);
+            let at = payload
+                .windows(11)
+                .position(|v| v == b"presentbool")
+                .unwrap()
+                + 11;
+            payload[at] = 0;
+            append_style_root_field(&mut payload, "numModifyingFX", b"long", &1i32.to_be_bytes());
+            let mut spec = Spec::paint("Synthetic enabled unpresent counted style", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+            assert!(!doc.read_only, "{depth} {master}: {:?}", doc.warnings);
+            assert!(!doc.layers[0].effects[0].enabled);
+        }
+    }
+}
+
+#[test]
+fn photoshop_modifying_effect_counts_protect_inconsistent_malformed_and_unsupported_definitions() {
+    for depth in [8, 16] {
+        for master in [false, true] {
+            for (kind, value) in [
+                (b"long", (-1i32).to_be_bytes().to_vec()),
+                (b"long", 1i32.to_be_bytes().to_vec()),
+                (b"long", 33i32.to_be_bytes().to_vec()),
+                (b"doub", 0f64.to_be_bytes().to_vec()),
+                (b"bool", vec![0]),
+            ] {
+                let mut payload = overlay_payload(master, false, [111., 67., 231.]);
+                append_style_root_field(&mut payload, "numModifyingFX", kind, &value);
+                let mut spec = Spec::paint("Synthetic inconsistent effect count", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+                assert!(doc.read_only);
+                assert_eq!(doc.bit_depth, depth);
+                assert_eq!(
+                    doc.layers[0].pixels.rgba16(),
+                    SAVED.map(|p| p.map(|v| native(v, depth))).concat()
+                );
+                assert!(doc.layers[0].effects.is_empty());
+                assert!(psd::encode(&doc).is_err());
+            }
+            let mut payload = overlay_payload(master, false, [111., 67., 231.]);
+            append_style_root_field(&mut payload, "numModifyingFX", b"long", &0i32.to_be_bytes());
+            append_style_root_field(&mut payload, "unknownStyle", b"bool", &[0]);
+            let mut spec = Spec::paint("Synthetic unsupported counted style", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+        }
+    }
+}
+
 // Independent normalized-channel expectations, including source/backdrop endpoint
 // precedence and the Photoshop Soft Light low-backdrop polynomial.
 fn expected_style_blend(base: f64, tint: f64, blend: &str) -> f64 {

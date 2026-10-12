@@ -368,6 +368,7 @@ pub(super) fn native_styles(
         !matches!(
             key.as_str(),
             "masterFXSwitch"
+                | "numModifyingFX"
                 | "Scl "
                 | "SoFi"
                 | "solidFillMulti"
@@ -384,6 +385,21 @@ pub(super) fn native_styles(
     }
     let mut effects = vec![];
     let mut pattern_index = None;
+    // Modern Photoshop stores a redundant count of enabled effects.
+    // Validate it independently of the master switch, including hidden stacks.
+    let modifying = items
+        .get("numModifyingFX")
+        .map(|value| {
+            if value["type"] != "long" {
+                return Err("Photoshop modifying-effect count requires an integer".to_string());
+            }
+            value["value"].as_u64().filter(|n| *n <= 32).ok_or_else(|| {
+                "Photoshop modifying-effect count exceeds the shared limit".to_string()
+            })
+        })
+        .transpose()?;
+    let mut active_sources = 0u64;
+    let source_active = |entry: &Value| entry["value"]["items"]["enab"]["value"] == true;
     // Photoshop overlays run Pattern, Gradient, Color (Color is uppermost).
     // Keep that execution order; native stacks saved previously keep theirs.
     // Reference: Patchy Photoshop-produced overlay-zorder fixture, commit
@@ -438,6 +454,7 @@ pub(super) fn native_styles(
                 }
                 _ => effects.extend(gradient_overlay(&isolated)?),
             }
+            active_sources += u64::from(source_active(entry));
         }
     }
     // Overlays preserve alpha. A hard Inner Shadow can therefore cast from
@@ -468,9 +485,19 @@ pub(super) fn native_styles(
             matches!(key.as_str(), "masterFXSwitch" | "Scl ") || key == *present[0]
         });
         effects.push(hard_shadow(&isolated)?);
+        let source = field(items, present[0]);
+        let entry = if source["type"] == "VlLs" {
+            &source["value"][0]
+        } else {
+            source
+        };
+        active_sources += u64::from(source_active(entry));
     }
     if effects.is_empty() {
         return Err("No supported Photoshop overlay definitions".into());
+    }
+    if modifying.is_some_and(|count| count != active_sources) {
+        return Err("Photoshop modifying-effect count disagrees with its definitions".into());
     }
     Ok((effects, pattern_index))
 }
