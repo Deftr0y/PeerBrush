@@ -55,6 +55,192 @@ fn strip(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standard_saves() {
+    for depth in [8, 16] {
+        for (angle, distance, dx, dy) in
+            [(0., 1f64, 1i32, 0i32), (45., 2., 1, -1), (-135., 2., -1, 1)]
+        {
+            let mut engine = Engine::new();
+            engine.doc = Document::new_depth(4, 4, depth).unwrap();
+            engine.doc.layers[0].psd_metadata.push(psd::LayerMetadata {
+                key: "lyvr".into(),
+                data: 160u32.to_be_bytes().to_vec(),
+            });
+            let alpha = [
+                0u16, 1, 12347, 65535, 32768, 65534, 257, 23459, 54321, 0, 10001, 45679, 34571,
+                51347, 22371, 65535,
+            ];
+            for i in 0..16 {
+                engine.doc.layers[0].pixels.set16(
+                    i % 4,
+                    i / 4,
+                    [
+                        12347 + i as u16 * 107,
+                        23459 + i as u16 * 113,
+                        34571 + i as u16 * 127,
+                        alpha[i as usize],
+                    ],
+                );
+            }
+            let source = engine.doc.layers[0].pixels.rgba16();
+            let layer = engine.doc.layers[0].id.clone();
+            let tint = [11111u16, 22223, 55555];
+            engine.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"size":0.,"distance":distance,"angle":angle,"opacity":0.37,"color":tint.map(|v|f64::from(v)/65535.),"pixel_snap":true,"source_knockout":false}})], None, None, "Legacy cast").unwrap();
+            let original = engine.doc.export_png().unwrap();
+            let effect = engine.doc.layers[0].effects[0].id.clone();
+            let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+            settings["source_knockout"] = json!(true);
+            let command =
+                json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
+            let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
+            assert_eq!(engine.undo.len(), 1);
+            assert_eq!(engine.doc.export_png().unwrap(), original);
+            let reference = |knockout: bool| {
+                let mut output = vec![];
+                for i in 0..16 {
+                    let p: [u16; 4] = source[i * 4..i * 4 + 4].try_into().unwrap();
+                    let (x, y) = (i as i32 % 4 - dx, i as i32 / 4 - dy);
+                    let shifted = if (0..4).contains(&x) && (0..4).contains(&y) {
+                        source[((y * 4 + x) * 4 + 3) as usize]
+                    } else {
+                        0
+                    };
+                    let a = f64::from(p[3]) / 65535.;
+                    let shade = (f64::from(shifted) * if knockout { 1. - a } else { 1. } * 0.37)
+                        .round()
+                        / 65535.;
+                    let total = a + shade * (1. - a);
+                    let mut pixel = if total == 0. {
+                        [0; 4]
+                    } else {
+                        let mut pixel = [0; 4];
+                        for c in 0..3 {
+                            pixel[c] = ((f64::from(p[c]) * a
+                                + f64::from(tint[c]) * shade * (1. - a))
+                                / total)
+                                .round() as u16;
+                        }
+                        pixel[3] = (total * 65535.).round() as u16;
+                        pixel
+                    };
+                    if depth == 8 {
+                        pixel = pixel.map(|v| ((u32::from(v) + 128) / 257) as u16 * 257);
+                    }
+                    if pixel[3] == 0 {
+                        pixel = [0; 4];
+                    }
+                    output.extend(pixel);
+                }
+                output
+            };
+            assert_eq!(native(&engine.doc), reference(false));
+            assert_eq!(native(&draft), reference(true));
+            assert_ne!(draft.export_png().unwrap(), original);
+            engine
+                .edit("human", &[command], None, None, "Source knockout")
+                .unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                draft.export_png().unwrap()
+            );
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            for enabled in [false, true] {
+                let mut doc = engine.doc.clone();
+                doc.layers[0].effects[0].enabled = enabled;
+                let current = doc.export_png().unwrap();
+                for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                    use std::io::Read;
+                    let at = bytes.windows(4).position(|v| v == b"PBR1").unwrap() + 4;
+                    let mut decoded = vec![];
+                    flate2::read::ZlibDecoder::new(&bytes[at..])
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&decoded).unwrap()["format"],
+                        26
+                    );
+                    let reopened = psd::decode(&bytes).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                    assert_eq!(reopened.layers[0].effects[0].settings, settings);
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                    assert_eq!(
+                        psd::decode(&strip(&bytes)).unwrap().export_png().unwrap(),
+                        current
+                    );
+                }
+            }
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), original);
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            let mut legacy = engine.doc.clone();
+            legacy.layers[0].effects[0]
+                .settings
+                .as_object_mut()
+                .unwrap()
+                .remove("source_knockout");
+            assert_eq!(legacy.export_png().unwrap(), original);
+            let bytes = psd::encode(&legacy).unwrap();
+            assert_eq!(psd::decode(&bytes).unwrap().export_png().unwrap(), original);
+        }
+    }
+}
+
+#[test]
+fn drop_shadow_source_knockout_validation_reservations_and_protocol_are_atomic() {
+    let shared = Arc::new(Mutex::new(fixture(16)));
+    let before = shared.lock().unwrap().doc.clone();
+    let layer = before.layers[0].id.clone();
+    for (kind, value) in [
+        ("drop_shadow", json!(null)),
+        ("drop_shadow", json!(1)),
+        ("drop_shadow", json!("yes")),
+        ("inner_shadow", json!(true)),
+        ("outer_glow", json!(false)),
+    ] {
+        assert!(server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[{"op":"layer.update","layer":layer,"opacity":0.3},{"op":"effect.add","layer":layer,"kind":kind,"settings":{"source_knockout":value}}]})).is_err());
+        let engine = shared.lock().unwrap();
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            before.export_png().unwrap()
+        );
+        assert_eq!(engine.doc.revision, before.revision);
+        assert!(engine.undo.is_empty());
+    }
+    {
+        let mut engine = shared.lock().unwrap();
+        engine
+            .reserve(
+                "other",
+                "Synthetic knockout lease",
+                vec![Scope {
+                    target: Some(layer.clone()),
+                    rect: None,
+                }],
+            )
+            .unwrap();
+        assert!(engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"source_knockout":true}})],None,None,"Reserved knockout").is_err());
+        engine.leases.clear();
+        engine.doc.layers[0].locked = true;
+        assert!(engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"source_knockout":true}})],None,None,"Locked knockout").is_err());
+        engine.doc.layers[0].locked = false;
+    }
+    let reply=server::dispatch(&shared,"edit",&json!({"actor":"human","document_id":before.id,"expected_revision":before.revision,"commands":[{"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"source_knockout":true,"size":0.,"distance":1.}}],"max_edge":64})).unwrap();
+    assert!(!reply["images"][0]["data"].as_str().unwrap().is_empty());
+    assert_eq!(reply["images"][0]["document_rect"], json!([0, 0, 64, 64]));
+    let engine = shared.lock().unwrap();
+    assert_eq!(
+        engine.doc.layers[0].effects[0].settings["source_knockout"],
+        true
+    );
+    assert_eq!(
+        engine.doc.layers[0].pixels.rgba16(),
+        before.layers[0].pixels.rgba16()
+    );
+    assert_eq!(engine.undo.len(), 1);
+}
+
+#[test]
 fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_saves() {
     for depth in [8, 16] {
         for kind in ["drop_shadow", "inner_shadow"] {
@@ -161,7 +347,7 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
                         assert_eq!(
                             serde_json::from_slice::<serde_json::Value>(&decoded).unwrap()
                                 ["format"],
-                            25
+                            if kind == "drop_shadow" { 26 } else { 25 }
                         );
                         let reopened = psd::decode(&bytes).unwrap();
                         assert!(!reopened.read_only);

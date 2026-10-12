@@ -21,6 +21,9 @@ pub fn contains(kind: &str) -> bool {
 pub fn pixel_aligned_shadow(kind: &str, value: &Value) -> bool {
     matches!(kind, "inner_shadow" | "drop_shadow") && value.get("pixel_snap").is_some()
 }
+pub fn knockout_shadow(kind: &str, value: &Value) -> bool {
+    kind == "drop_shadow" && value.get("source_knockout").is_some()
+}
 pub fn separate_bevel_channels(kind: &str, value: &Value) -> bool {
     kind == "bevel_emboss"
         && [
@@ -119,6 +122,7 @@ pub fn defaults(kind: &str) -> Value {
             v["pixel_snap"] = json!(false);
             if kind == "drop_shadow" {
                 v.as_object_mut().unwrap().remove("blend");
+                v["source_knockout"] = json!(false);
             } else {
                 v["blend"] = json!("multiply");
             }
@@ -177,7 +181,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
                     return Err("Unsupported style blend mode".into());
                 }
             }
-            "reverse" | "invert" | "down" | "pixel_snap" => {
+            "reverse" | "invert" | "down" | "pixel_snap" | "source_knockout" => {
                 if !v.is_boolean() {
                     return Err(format!("{key} must be true or false"));
                 }
@@ -552,6 +556,12 @@ pub fn apply(
                             / (1. - number(v, "spread")).max(0.01))
                         .min(1.),
                     );
+                    // Optional pre-composite knockout. The later behind blend
+                    // is separate: neither step replaces original alpha/RGB.
+                    // Legacy sources omit this setting and retain their casts.
+                    if v["source_knockout"] == true {
+                        coverage *= 1. - a;
+                    }
                     behind = true;
                     outside = true;
                 }
