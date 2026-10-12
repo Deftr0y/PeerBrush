@@ -22,7 +22,11 @@ impl Reader<'_> {
         String::from_utf16(&words).map_err(|_| "invalid descriptor Unicode".into())
     }
     fn id(&mut self) -> Result<String, String> {
+        self.id_with_form().map(|(name, _)| name)
+    }
+    fn id_with_form(&mut self) -> Result<(String, bool), String> {
         let count = self.cursor.u32()? as usize;
+        let string_id = count != 0;
         let count = if count == 0 { 4 } else { count };
         if count > 128 {
             return Err("descriptor identifier exceeds 128 bytes".into());
@@ -31,7 +35,7 @@ impl Reader<'_> {
         if !bytes.iter().all(|c| (32..=126).contains(c)) {
             return Err("invalid descriptor identifier".into());
         }
-        Ok(std::str::from_utf8(bytes).unwrap().into())
+        Ok((std::str::from_utf8(bytes).unwrap().into(), string_id))
     }
     fn number(&mut self) -> Result<f64, String> {
         let n = f64::from_be_bytes(self.cursor.bytes(8)?.try_into().unwrap());
@@ -100,7 +104,14 @@ impl Reader<'_> {
                 }
                 json!([std::str::from_utf8(unit).unwrap(), self.number()?])
             }
-            b"enum" => json!([self.id()?, self.id()?]),
+            b"enum" => {
+                let class = self.id()?;
+                let (name, string_id) = self.id_with_form()?;
+                // Four-character string IDs are not Photoshop char IDs. In
+                // particular, a string "Mltp" must not become Multiply merely
+                // because the bytes look like that legacy char ID.
+                return Ok(json!({"type":"enum", "value":[class,name], "string_id":string_id}));
+            }
             // Retained internally for bounded pattern-ID resolution; never exposed by inspect.
             b"TEXT" => json!(self.text()?),
             b"type" | b"GlbC" => {
@@ -250,23 +261,23 @@ fn overlay_blend(value: &Value) -> Result<&'static str, String> {
     if value["type"] != "enum" || value["value"][0] != "BlnM" {
         return Err("Invalid Photoshop overlay blend enumeration".into());
     }
-    match value["value"][1].as_str() {
-        Some("Nrml" | "normal") => Ok("normal"),
-        Some("Mltp") => Ok("multiply"),
-        Some("Scrn") => Ok("screen"),
-        Some("Ovrl") => Ok("overlay"),
-        Some("Drkn") => Ok("darken"),
-        Some("Lghn") => Ok("lighten"),
-        Some("Dfrn") => Ok("difference"),
-        Some("Xclu") => Ok("exclusion"),
-        Some("CBrn") => Ok("color_burn"),
-        Some("linearBurn") => Ok("linear_burn"),
-        Some("CDdg") => Ok("color_dodge"),
-        Some("linearDodge") => Ok("linear_dodge"),
-        Some("SftL") => Ok("soft_light"),
-        Some("HrdL") => Ok("hard_light"),
-        Some("Sbtr") => Ok("subtract"),
-        Some("divide") => Ok("divide"),
+    match (value["string_id"].as_bool(), value["value"][1].as_str()) {
+        (Some(false), Some("Nrml")) | (Some(true), Some("normal")) => Ok("normal"),
+        (Some(false), Some("Mltp")) | (Some(true), Some("multiply")) => Ok("multiply"),
+        (Some(false), Some("Scrn")) | (Some(true), Some("screen")) => Ok("screen"),
+        (Some(false), Some("Ovrl")) | (Some(true), Some("overlay")) => Ok("overlay"),
+        (Some(false), Some("Drkn")) | (Some(true), Some("darken")) => Ok("darken"),
+        (Some(false), Some("Lghn")) | (Some(true), Some("lighten")) => Ok("lighten"),
+        (Some(false), Some("Dfrn")) | (Some(true), Some("difference")) => Ok("difference"),
+        (Some(false), Some("Xclu")) | (Some(true), Some("exclusion")) => Ok("exclusion"),
+        (Some(false), Some("CBrn")) | (Some(true), Some("colorBurn")) => Ok("color_burn"),
+        (Some(true), Some("linearBurn")) => Ok("linear_burn"),
+        (Some(false), Some("CDdg")) | (Some(true), Some("colorDodge")) => Ok("color_dodge"),
+        (Some(true), Some("linearDodge")) => Ok("linear_dodge"),
+        (Some(false), Some("SftL")) | (Some(true), Some("softLight")) => Ok("soft_light"),
+        (Some(false), Some("HrdL")) | (Some(true), Some("hardLight")) => Ok("hard_light"),
+        (Some(false), Some("Sbtr")) | (Some(true), Some("subtract")) => Ok("subtract"),
+        (Some(true), Some("divide")) => Ok("divide"),
         _ => Err("Unsupported Photoshop overlay blend remains protected".into()),
     }
 }

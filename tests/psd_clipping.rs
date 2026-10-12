@@ -3899,6 +3899,13 @@ fn photoshop_modifying_effect_counts_protect_inconsistent_malformed_and_unsuppor
 // precedence and the Photoshop Soft Light low-backdrop polynomial.
 fn expected_style_blend(base: f64, tint: f64, blend: &str) -> f64 {
     match blend {
+        "normal" => tint,
+        "multiply" => base * tint,
+        "screen" => 1. - (1. - base) * (1. - tint),
+        "overlay" if base < 0.5 => 2. * base * tint,
+        "overlay" => 1. - 2. * (1. - base) * (1. - tint),
+        "darken" => base.min(tint),
+        "lighten" => base.max(tint),
         "difference" => (base - tint).abs(),
         "exclusion" => base + tint - 2. * base * tint,
         "linear_burn" => (base + tint - 1.).max(0.),
@@ -3943,6 +3950,104 @@ fn photoshop_additional_style_blends_preserve_native_sources_composites_and_undo
             [[0, 65535, 16384, 65535], [65535, 0, 32768, 65535]],
             color,
         );
+    }
+}
+
+#[test]
+fn photoshop_canonical_string_blends_preserve_sources_composites_and_undo() {
+    assert_photoshop_style_blends(
+        &[
+            ("normal", "normal"),
+            ("multiply", "multiply"),
+            ("screen", "screen"),
+            ("overlay", "overlay"),
+            ("darken", "darken"),
+            ("lighten", "lighten"),
+            ("difference", "difference"),
+            ("exclusion", "exclusion"),
+            ("colorBurn", "color_burn"),
+            ("colorDodge", "color_dodge"),
+            ("softLight", "soft_light"),
+            ("hardLight", "hard_light"),
+            ("subtract", "subtract"),
+        ],
+        &["color", "pattern", "gradient", "inner"],
+        SAVED,
+        [111., 67., 231.],
+    );
+}
+
+#[test]
+fn photoshop_blend_id_forms_do_not_unlock_malformed_disabled_or_exterior_styles() {
+    for depth in [8, 16] {
+        for family in ["color", "pattern", "gradient", "inner", "drop"] {
+            for (value, class, string_id) in [
+                ("Mltp", "BlnM", true),
+                ("Scrn", "BlnM", true),
+                ("Ovrl", "BlnM", true),
+                ("Nrml", "BlnM", true),
+                ("Dfrn", "BlnM", true),
+                ("CBrn", "BlnM", true),
+                ("multiply", "????", true),
+                ("Multiply", "BlnM", true),
+                ("soft_light", "BlnM", true),
+                ("dissolve", "BlnM", true),
+                ("Norm", "BlnM", false),
+            ] {
+                let mut payload = match family {
+                    "color" => overlay_payload(false, false, [111., 67., 231.]),
+                    "pattern" => pattern_payload(false, "synthetic-pattern", "", 100.),
+                    "gradient" => gradient_payload(false, None, 0.),
+                    "inner" => hard_shadow_payload("IrSh", false, false, 180., 37., ""),
+                    _ => hard_shadow_payload("DrSh", false, false, 180., 37., ""),
+                };
+                let at = payload
+                    .windows(16)
+                    .position(|v| v == b"\0\0\0\0BlnM\0\0\0\0Nrml")
+                    .unwrap();
+                let mut encoded = vec![];
+                overlay_id(&mut encoded, class);
+                encoded.extend_from_slice(
+                    &(if string_id { value.len() as u32 } else { 0 }).to_be_bytes(),
+                );
+                encoded.extend_from_slice(value.as_bytes());
+                payload.splice(at..at + 16, encoded);
+                if family == "gradient" {
+                    let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                    payload[at] = 0;
+                }
+                let mut spec = Spec::paint("Synthetic unsupported blend ID form", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                let mut bytes = fixture(&[spec], depth);
+                if family == "pattern" {
+                    bytes = inject_pattern(
+                        bytes,
+                        depth,
+                        &pattern_resource(depth, "synthetic-pattern"),
+                        false,
+                    );
+                }
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(
+                    doc.read_only,
+                    "{depth} {family} {value} {class} {string_id}"
+                );
+                assert_eq!(doc.bit_depth, depth);
+                assert_eq!(
+                    doc.layers[0].pixels.rgba16(),
+                    SAVED.map(|p| p.map(|v| native(v, depth))).concat()
+                );
+                assert!(doc.layers[0].effects.is_empty());
+                assert!(psd::encode(&doc).is_err());
+            }
+            if family == "drop" {
+                let mut payload = hard_shadow_payload("DrSh", false, false, 180., 37., "");
+                set_style_blend(&mut payload, "multiply");
+                let mut spec = Spec::paint("Synthetic unsupported exterior string blend", SAVED);
+                spec.tags.push((*b"lfx2", payload));
+                assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+            }
+        }
     }
 }
 
