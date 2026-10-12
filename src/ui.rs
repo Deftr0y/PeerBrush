@@ -447,6 +447,7 @@ pub struct PeerBrush {
     read_only_patterns: Option<String>,
     selection_commit_failed: bool,
     selection_pointer_cancelled: bool,
+    selection_gesture_source: Option<selection::GestureSource>,
     save_report: Option<crate::compatibility::SaveReport>,
     save_loss_review: Option<compatibility::SaveReview>,
     export_editor: Option<exports::Editor>,
@@ -777,6 +778,7 @@ impl PeerBrush {
             read_only_patterns: None,
             selection_commit_failed: false,
             selection_pointer_cancelled: false,
+            selection_gesture_source: None,
             save_report: None,
             save_loss_review: None,
             export_editor: None,
@@ -875,6 +877,7 @@ impl PeerBrush {
             self.selection_kind = "wand".into();
         }
         self.selection_path.clear();
+        self.selection_gesture_source = None;
         self.cancel_pen();
         self.selection_gesture_mode = None;
         self.drag_start = None;
@@ -3639,6 +3642,7 @@ impl PeerBrush {
         self.proposal_review = None;
         self.proposal_rendered = None;
         self.selection_path.clear();
+        self.selection_gesture_source = None;
         self.selection_gesture_mode = None;
         self.project_settings = None;
         self.shared = shared;
@@ -4131,6 +4135,7 @@ impl PeerBrush {
                 || i.events
                     .iter()
                     .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+                || self.selection_gesture_stale(doc)
                 || (owner.as_deref() != Some(doc.id.as_str()) && !pressed_canvas)
             {
                 return None;
@@ -4178,15 +4183,17 @@ impl PeerBrush {
         })
     }
     fn document_shortcuts(&mut self, ctx: &egui::Context, doc: &Document) {
+        let stale_selection = self.selection_gesture_stale(doc);
         if ctx.input(|i| {
             !i.focused
                 || i.events
                     .iter()
                     .any(|event| matches!(event, egui::Event::WindowFocused(false)))
-        }) {
-            // Events already in the frame may outlive window focus. Reject
-            // document actions and keep their keys held until an explicit
-            // release/fresh press, including repeats after focus returns.
+        }) || stale_selection
+        {
+            // Events already in the frame may outlive focus or the selection
+            // source. Reject document actions and keep their keys held until
+            // an explicit release/fresh press, including later repeats.
             ctx.input(|input| {
                 for event in &input.events {
                     if let egui::Event::Key {
@@ -4206,6 +4213,10 @@ impl PeerBrush {
                     }
                 }
             });
+            if stale_selection {
+                self.message =
+                    "Image changed during selection — draft cancelled; retry the shortcut".into();
+            }
             return;
         }
         let typing = self.lifecycle.is_some()
@@ -11365,6 +11376,8 @@ mod tests {
                         engine.doc.clone()
                     };
                     app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
+                    // The manually seeded path starts after the prior coverage.
+                    app.selection_gesture_source = Some(app.selection_source(&before));
                     let path = app.selection_path.clone();
                     let event = match action {
                         "copy" => egui::Event::Copy,
@@ -11645,6 +11658,155 @@ mod tests {
                         before.export_png().unwrap()
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_draft_commands_reject_changes_after_the_canvas_snapshot() {
+        for depth in [8, 16] {
+            let (app, _, _, _) = pressed_selection_fixture(depth, Tool::MagicWand, "wand");
+            let mut engine = app.shared.lock().unwrap();
+            let snapshot = engine.doc.clone();
+            let command = app.select_command(&snapshot, &[[8., 8.]], "replace");
+            assert_eq!(command["document_id"], snapshot.id);
+            assert_eq!(command["source_revision"], snapshot.revision);
+            assert_eq!(command["layer"], app.selected);
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"selection","kind":"rectangle","rect":[0,0,2,2]})],
+                    None,
+                    None,
+                    "Later coverage",
+                )
+                .unwrap();
+            let before = engine.doc.clone();
+            assert!(engine
+                .edit("human", &[command], None, None, "Late wand completion")
+                .is_err());
+            assert_eq!(
+                serde_json::to_value(&engine.doc).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(engine.undo.len(), 1);
+        }
+    }
+
+    #[test]
+    fn selection_drafts_preserve_concurrent_coverage_and_require_a_fresh_retry() {
+        for depth in [8, 16] {
+            for kind in ["wand", "rectangle", "polygon", "magnetic"] {
+                let tool = if kind == "wand" {
+                    Tool::MagicWand
+                } else {
+                    Tool::Selection
+                };
+                let (mut app, ctx, point, _) = pressed_selection_fixture(depth, tool, kind);
+                let path_tool = ["polygon", "magnetic"].contains(&kind);
+                let end = point + Vec2::splat(app.view_rect.unwrap().width() / 4.);
+                if path_tool {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![primary_release(point)],
+                        Default::default(),
+                    );
+                    app.selection_path = vec![[4., 5.], [12., 5.], [12., 13.], [4., 13.]];
+                } else if kind == "rectangle" {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![egui::Event::PointerMoved(end)],
+                        Default::default(),
+                    );
+                    assert!(app.drag_start.is_some());
+                }
+                assert!(
+                    app.selection_gesture_source.is_some(),
+                    "{depth} {kind}: initial source not retained"
+                );
+                let before = {
+                    let mut engine = app.shared.lock().unwrap();
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"selection","kind":"rectangle","rect":[0,0,2,2]})],
+                            None,
+                            None,
+                            "Concurrent selection",
+                        )
+                        .unwrap();
+                    engine.doc.clone()
+                };
+                let mut events = vec![primary_release(if kind == "rectangle" {
+                    end
+                } else {
+                    point
+                })];
+                if path_tool {
+                    events.push(shortcut_press(egui::Key::Enter));
+                }
+                events.push(shortcut_press(egui::Key::Delete));
+                frame(&mut app, &ctx, events, Default::default());
+                assert!(app.selection_gesture_source.is_none());
+                assert!(app.selection_path.is_empty());
+                assert!(app.points.is_empty());
+                assert!(app.drag_start.is_none());
+                {
+                    let engine = app.shared.lock().unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&engine.doc).unwrap(),
+                        serde_json::to_value(&before).unwrap(),
+                        "{depth} {kind}: stale gesture or late Delete changed later work"
+                    );
+                    assert_eq!(engine.undo.len(), 1);
+                }
+                // A held rejected edit is not a retry after cancellation.
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Delete,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: true,
+                        modifiers: Default::default(),
+                    }],
+                    Default::default(),
+                );
+                assert_eq!(app.shared.lock().unwrap().doc.revision, before.revision);
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Delete,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                    Default::default(),
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![shortcut_press(egui::Key::Delete)],
+                    Default::default(),
+                );
+                let mut engine = app.shared.lock().unwrap();
+                assert_ne!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert_eq!(engine.doc.selection, before.selection);
+                assert_eq!(engine.undo.len(), 2);
+                engine.undo("human").unwrap();
+                assert_eq!(
+                    engine.doc.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert_eq!(engine.doc.selection, before.selection);
             }
         }
     }

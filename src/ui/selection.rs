@@ -1,4 +1,9 @@
 use super::*;
+pub(super) struct GestureSource {
+    document: String,
+    revision: u64,
+    layer: String,
+}
 const TOOLS: &[(&str, &str, Icon)] = &[
     ("rectangle", "Rectangular marquee", Icon::Selection),
     ("ellipse", "Elliptical marquee", Icon::EllipticalSelection),
@@ -12,6 +17,32 @@ const TOOLS: &[(&str, &str, Icon)] = &[
     ("object", "Object region", Icon::ObjectSelection),
 ];
 impl PeerBrush {
+    pub(super) fn selection_gesture_stale(&self, doc: &Document) -> bool {
+        self.selection_gesture_source
+            .as_ref()
+            .is_some_and(|source| {
+                source.document != doc.id
+                    || source.revision != doc.revision
+                    || source.layer != self.selected
+            })
+    }
+    pub(super) fn selection_source(&self, doc: &Document) -> GestureSource {
+        GestureSource {
+            document: doc.id.clone(),
+            revision: doc.revision,
+            layer: self.selected.clone(),
+        }
+    }
+    fn cancel_selection_draft(&mut self, primary_down: bool) {
+        self.selection_pointer_cancelled = primary_down;
+        self.canvas_press_document = None;
+        self.selection_path.clear();
+        self.selection_gesture_mode = None;
+        self.selection_gesture_source = None;
+        self.points.clear();
+        self.drag_start = None;
+        self.drag_revision = None;
+    }
     pub(super) fn deselect_area(&mut self, doc: &Document, tool: bool) {
         self.finish_parameter(true);
         self.cancel_geometry();
@@ -67,6 +98,8 @@ impl PeerBrush {
                                     .changed()
                                 {
                                     self.selection_path.clear();
+                                    self.selection_gesture_source = None;
+                                    self.selection_gesture_mode = None;
                                     self.points.clear();
                                     self.drag_start = None;
                                 }
@@ -174,7 +207,7 @@ impl PeerBrush {
         })
         .to_owned()
     }
-    fn select_command(&self, doc: &Document, points: &[[f32; 2]], mode: &str) -> Value {
+    pub(super) fn select_command(&self, doc: &Document, points: &[[f32; 2]], mode: &str) -> Value {
         let a = points.first().copied().unwrap_or([0., 0.]);
         let b = points.last().copied().unwrap_or(a);
         let mut area = [
@@ -202,7 +235,8 @@ impl PeerBrush {
         let polygon = ["lasso", "polygon", "magnetic"]
             .contains(&self.selection_kind.as_str())
             .then_some(points);
-        json!({"op":"selection","kind":self.selection_kind,"mode":mode,"rect":area,"polygon":polygon,"point":a,"points":points,"radius":self.selection_width,"feather":self.selection_feather,"tolerance":self.selection_tolerance,"contiguous":self.selection_contiguous,"sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity,"layer":self.selected})
+        let source = self.selection_gesture_source.as_ref();
+        json!({"op":"selection","document_id":source.map_or(doc.id.as_str(), |s| s.document.as_str()),"source_revision":source.map_or(doc.revision, |s| s.revision),"kind":self.selection_kind,"mode":mode,"rect":area,"polygon":polygon,"point":a,"points":points,"radius":self.selection_width,"feather":self.selection_feather,"tolerance":self.selection_tolerance,"contiguous":self.selection_contiguous,"sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity,"layer":source.map_or(self.selected.as_str(), |s| s.layer.as_str())})
     }
     pub(super) fn selection_canvas(
         &mut self,
@@ -225,13 +259,12 @@ impl PeerBrush {
             // Window focus loss may share a frame with a real or synthesized
             // release. Cancel before response.clicked/drag_stopped can commit
             // an unfinished selection over the existing shared coverage.
-            self.selection_pointer_cancelled = ui.input(|i| i.pointer.primary_down());
-            self.canvas_press_document = None;
-            self.selection_path.clear();
-            self.selection_gesture_mode = None;
-            self.points.clear();
-            self.drag_start = None;
-            self.drag_revision = None;
+            self.cancel_selection_draft(ui.input(|i| i.pointer.primary_down()));
+            return;
+        }
+        if self.selection_gesture_stale(doc) {
+            self.cancel_selection_draft(ui.input(|i| i.pointer.primary_down()));
+            self.message = "Image changed during selection — draft cancelled".into();
             return;
         }
         if self.selection_pointer_cancelled {
@@ -242,11 +275,19 @@ impl PeerBrush {
             return;
         }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.selection_pointer_cancelled = ui.input(|i| i.pointer.primary_down());
-            self.selection_path.clear();
-            self.points.clear();
-            self.drag_start = None;
+            self.cancel_selection_draft(ui.input(|i| i.pointer.primary_down()));
             return;
+        }
+        // Bind even quick-click tools before their release. Paths retain the
+        // first anchor's source across clicks; drafts never retarget later work.
+        if self.selection_gesture_source.is_none()
+            && response.hovered()
+            && ui.input(|i| i.pointer.primary_pressed())
+            && ui
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| view.contains(p, rect, scale))
+        {
+            self.selection_gesture_source = Some(self.selection_source(doc));
         }
         // The response covers only the canvas workspace, excluding panels and controls.
         if response.clicked()
@@ -314,6 +355,8 @@ impl PeerBrush {
                     );
                     self.edit(vec![command], "Lasso selection");
                     self.selection_path.clear();
+                    self.selection_gesture_source = None;
+                    self.selection_gesture_mode = None;
                 }
             }
             if !self.selection_path.is_empty() {
@@ -330,6 +373,10 @@ impl PeerBrush {
                     points.push(p);
                 }
                 painter.add(egui::Shape::line(points, Stroke::new(1.0_f32, ACCENT)));
+            }
+            if self.selection_path.is_empty() && !ui.input(|i| i.pointer.primary_down()) {
+                self.selection_gesture_source = None;
+                self.selection_gesture_mode = None;
             }
             return;
         }
@@ -414,6 +461,8 @@ impl PeerBrush {
             }
             self.points.clear();
             self.drag_start = None;
+            self.selection_gesture_source = None;
+            self.selection_gesture_mode = None;
         }
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
@@ -427,6 +476,10 @@ impl PeerBrush {
                     self.deselect_area(doc, false);
                 }
             }
+            self.selection_gesture_source = None;
+        }
+        if self.drag_start.is_none() && !ui.input(|i| i.pointer.primary_down()) {
+            self.selection_gesture_source = None;
         }
     }
 }
