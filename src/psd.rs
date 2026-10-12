@@ -2251,7 +2251,10 @@ fn decode_parts(
                 let mut candidate = doc.clone();
                 let mut changed = false;
                 for effect in candidate.layers.iter_mut().flat_map(|l| &mut l.effects) {
-                    if effect.kind == "gradient_overlay" && effect.enabled {
+                    if effect.kind == "gradient_overlay"
+                        && effect.enabled
+                        && effect.settings["pixel_grid"] != true
+                    {
                         effect.settings["pixel_grid"] = serde_json::json!(true);
                         changed = true;
                     }

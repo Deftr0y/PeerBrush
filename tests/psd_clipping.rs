@@ -2794,6 +2794,79 @@ fn positioned_gradient_payload(
         Some(&[(0, 50, 100.), (4096, 50, 100.)]),
     )
 }
+
+#[test]
+fn photoshop_layer_aligned_gradient_preserves_transparent_sources_and_exact_saves() {
+    for depth in [8, 16] {
+        for enabled in [false, true] {
+            let source = [[12347, 23459, 34571, 0], [54321, 32123, 11223, 65535]]
+                .map(|p| p.map(|n| native(n, depth)));
+            let mut payload = gradient_payload(false, None, 0.);
+            for (key, value) in [(b"Algnbool", true), (b"enabbool", enabled)] {
+                let at = payload.windows(key.len()).position(|v| v == key).unwrap() + key.len();
+                payload[at] = u8::from(value);
+            }
+            let mut spec = Spec::paint("Synthetic layer-aligned gradient", source);
+            spec.tags.push((*b"lfx2", payload));
+            let mut bytes = fixture(&[spec], depth);
+            let visible = if enabled {
+                [
+                    native(32768, depth),
+                    native(32768, depth),
+                    native(32768, depth),
+                    65535,
+                ]
+            } else {
+                source[1]
+            };
+            let expected = [[0; 4], visible];
+            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+            for channel in 0..4 {
+                for pixel in expected {
+                    composite_sample(&mut bytes, pixel, channel, depth);
+                }
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{depth} {enabled}: {:?}", doc.warnings);
+            assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+            assert_eq!(doc.layers[0].effects[0].settings["align_layer"], true);
+            assert_eq!(doc.layers[0].effects[0].settings["pixel_grid"], true);
+            assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+            assert_eq!(rendered(&doc), expected.concat());
+            let current = doc.export_png().unwrap();
+            for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                let reopened = psd::decode(&output).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                assert_eq!(
+                    reopened.layers[0].effects[0].settings,
+                    doc.layers[0].effects[0].settings
+                );
+                assert_eq!(reopened.export_png().unwrap(), current);
+                assert_eq!(saved_composite(&output, depth), expected.concat());
+            }
+            let mut engine = Engine::new();
+            let layer = doc.layers[0].id.clone();
+            let effect = doc.layers[0].effects[0].id.clone();
+            engine.doc = doc;
+            engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Aligned gradient bypass").unwrap();
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+            assert_eq!(engine.doc.export_png().unwrap(), current);
+            let at = bytes.len() - 7 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+            bytes[at] ^= 1;
+            assert!(psd::decode(&bytes).unwrap().read_only);
+        }
+        for value in [2, 255] {
+            let mut payload = gradient_payload(false, None, 0.);
+            let at = payload.windows(8).position(|v| v == b"Algnbool").unwrap() + 8;
+            payload[at] = value;
+            let mut spec = Spec::paint("Synthetic invalid alignment", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+        }
+    }
+}
 fn custom_gradient_payload(
     reverse: bool,
     omit: Option<&str>,

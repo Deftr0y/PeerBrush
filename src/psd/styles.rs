@@ -856,9 +856,10 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
     {
         return Err("Invalid Gradient Overlay dialog flag".into());
     }
-    if required_bool("Dthr")? || required_bool("Algn")? {
-        return Err("Dithered or layer-aligned Photoshop gradients remain protected".into());
+    if required_bool("Dthr")? {
+        return Err("Dithered Photoshop gradients remain protected".into());
     }
+    let align_layer = required_bool("Algn")?;
     let blend = overlay_blend(field(fields, "Md  "))?;
     if field(fields, "Type")["type"] != "enum" || field(fields, "Type")["value"][0] != "GrdT" {
         return Err("Invalid Photoshop Gradient Overlay shape enumeration".into());
@@ -905,6 +906,13 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
         );
     }
     let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":blend,"angle":degrees,"scale":scale,"style":style,"reverse":required_bool("Rvrs")?});
+    if align_layer {
+        // Retain the explicit layer-aligned definition through the existing
+        // native integer-grid geometry. Recognition never bypasses the
+        // caller's exact complete-composite gate.
+        settings["pixel_grid"] = json!(true);
+        settings["align_layer"] = json!(true);
+    }
     if let Some((x, y)) = offset {
         settings["offset_x"] = json!(x);
         settings["offset_y"] = json!(y);
