@@ -9,8 +9,9 @@ use std::{
 
 struct Lock {
     _file: fs::File,
-    // Keep a physical identity live for as long as its logical lock. Otherwise
-    // a deleted/replaced file's inode can be reused by an unrelated new file.
+    // Unix inode numbers can be reused after unlink while a logical lock lives.
+    // Pin those inodes. Windows replacement must close source/staged handles.
+    #[cfg(unix)]
     _source: Option<fs::File>,
     project: String,
     key: String,
@@ -114,8 +115,11 @@ fn claim(
         };
         return Err(format!("File already open or opening in another PeerBrush instance{project}. Return to that instance; its work is preserved."));
     }
+    #[cfg(not(unix))]
+    drop(source);
     let lock = Arc::new(Lock {
         _file: file,
+        #[cfg(unix)]
         _source: source,
         project: project.into(),
         key: key.clone(),
@@ -213,6 +217,7 @@ pub(crate) fn local_project(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     #[test]
     fn physical_identity_stays_pinned_after_external_unlink_and_staged_publication() {
         let dir = std::env::temp_dir().join(format!("pb-pinned-owner-{}", crate::engine::id()));
