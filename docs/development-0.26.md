@@ -17,6 +17,8 @@ Work proceeds in the backlog's established priority order:
 
 The existing GitHub Actions workflow runs engine, codec, protocol and UI regression tests, formatting, Clippy and package checks on every branch push, across Windows, macOS and Linux. Development checkpoints use that workflow for automated testing. A queued run is not a passed run: record the exact tested commit and outcome before closing acceptance work. Native workspace inspection remains separate from CI, as do physical hardware and receiving-application checks.
 
+CI caches Rust registry data and build outputs with the [official cache action](https://github.com/actions/cache), pinned to its verified Node.js 24 v5 commit. Keys separate runner image/architecture, stable compiler version, dependency manifests and release compiler flags. Tests and package verification still execute on every run; cached builds are not acceptance evidence. Runtime QA state, source-control metadata and credentials are outside the cached paths. Turnaround improvements remain to be measured after the first successful cache population.
+
 No release, website deployment, announcement or historical rewrite is part of starting this development branch.
 
 ## PB-122 integer-grid gradient import
