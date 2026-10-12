@@ -2143,12 +2143,7 @@ fn decode_parts(
                     } else if rec.layer.kind == "group" {
                         rec.layer.pixels = Raster::new_depth(w, h, depth);
                     }
-                    if rec
-                        .layer
-                        .effects
-                        .iter()
-                        .any(|e| matches!(e.kind.as_str(), "drop_shadow" | "inner_shadow"))
-                    {
+                    if rec.layer.effects.iter().any(|e| e.kind == "drop_shadow") {
                         let pixels = &rec.layer.pixels;
                         let partial = if pixels.is16() {
                             pixels.samples16.values().any(|tile| {
@@ -2162,7 +2157,7 @@ fn decode_parts(
                         };
                         if partial {
                             let reason =
-                                "Hard Photoshop shadows on partial-alpha sources remain protected";
+                                "Hard Photoshop Drop Shadows on partial-alpha sources remain protected";
                             warnings.push(reason.into());
                             if rec.source.warnings.len() < 64 {
                                 rec.source.warnings.push(reason.into());

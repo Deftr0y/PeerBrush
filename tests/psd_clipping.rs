@@ -5125,6 +5125,261 @@ fn photoshop_pixel_aligned_hard_shadows_retain_angles_sources_undo_and_standard_
 }
 
 #[test]
+fn photoshop_partial_alpha_hard_inner_shadows_retain_native_sources_coverage_and_standard_saves() {
+    for depth in [8, 16] {
+        let alpha = [
+            0u16, 1, 12347, 65535, 32768, 65534, 257, 23459, 54321, 0, 10001, 45679, 34571, 51347,
+            22371, 65535,
+        ];
+        let source = std::array::from_fn::<_, 16, _>(|i| {
+            [
+                native(12347 + i as u16 * 107, depth),
+                native(23459 + i as u16 * 113, depth),
+                native(34571 + i as u16 * 127, depth),
+                native(alpha[i], depth),
+            ]
+        });
+        for (angle, dx, dy) in [(180., 1i32, 0i32), (45., -1, 1)] {
+            for flags in 0u8..4 {
+                let enabled = flags & 1 != 0;
+                let master = flags & 2 != 0;
+                for list in [false, true] {
+                    for overlay in [false, true] {
+                        for opacity in [64u8, 255] {
+                            let payload = partial_inner_shadow_payload(
+                                enabled, master, list, overlay, angle, "",
+                            );
+                            // No renderer/encoder under test supplies this reference.
+                            // The inverse translated source alpha is the inner
+                            // coverage; the original alpha remains independent.
+                            let mix = |under: [u16; 3], over: [u16; 3], coverage: f64| {
+                                let weight = (65535. * coverage).round();
+                                std::array::from_fn(|c| {
+                                    native(
+                                        ((f64::from(under[c]) * (65535. - weight)
+                                            + f64::from(over[c]) * weight)
+                                            / 65535.)
+                                            .round() as u16,
+                                        depth,
+                                    )
+                                })
+                            };
+                            let merged = std::array::from_fn::<_, 16, _>(|i| {
+                                if source[i][3] == 0 {
+                                    return [0; 4];
+                                }
+                                let (x, y) = (i as i32 % 4 - dx, i as i32 / 4 - dy);
+                                let shifted_alpha = if (0..4).contains(&x) && (0..4).contains(&y) {
+                                    source[(y * 4 + x) as usize][3]
+                                } else {
+                                    0
+                                };
+                                let mut rgb = source[i][..3].try_into().unwrap();
+                                if master && overlay {
+                                    rgb = mix(rgb, [201 * 257, 43 * 257, 77 * 257], 0.43);
+                                }
+                                if master && enabled {
+                                    rgb = mix(
+                                        rgb,
+                                        [111 * 257, 67 * 257, 231 * 257],
+                                        (1. - f64::from(shifted_alpha) / 65535.) * 0.37,
+                                    );
+                                }
+                                let a = if depth == 16 {
+                                    (f64::from(source[i][3]) * f64::from(f32::from(opacity) / 255.))
+                                        .round() as u16
+                                } else {
+                                    ((f32::from(source[i][3] / 257) * (f32::from(opacity) / 255.))
+                                        .round() as u16)
+                                        * 257
+                                };
+                                [rgb[0], rgb[1], rgb[2], a]
+                            });
+                            let mut bytes = framed_shadow_fixture_opacity(
+                                depth, &source, &payload, &merged, opacity,
+                            );
+                            let doc = psd::decode(&bytes).unwrap();
+                            assert!(
+                                !doc.read_only,
+                                "{depth} {angle} {flags} {list} {overlay} {opacity}: {:?}",
+                                doc.warnings
+                            );
+                            assert_eq!(doc.bit_depth, depth);
+                            assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+                            assert_eq!(rendered(&doc), merged.concat());
+                            assert_eq!(doc.layers[0].effects.len(), if overlay { 2 } else { 1 });
+                            let inner = doc.layers[0].effects.last().unwrap();
+                            assert_eq!(inner.kind, "inner_shadow");
+                            assert_eq!(inner.enabled, enabled && master);
+                            let settings = doc.layers[0]
+                                .effects
+                                .iter()
+                                .map(|e| (e.kind.clone(), e.enabled, e.settings.clone()))
+                                .collect::<Vec<_>>();
+                            let layer = doc.layers[0].id.clone();
+                            let effect = inner.id.clone();
+                            let current = doc.export_png().unwrap();
+                            let mut engine = Engine::new();
+                            engine.doc = doc;
+                            engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!(enabled && master)})], None, None, "Partial inner bypass").unwrap();
+                            assert_eq!(engine.undo.len(), 1);
+                            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+                            engine.undo("human").unwrap();
+                            assert_eq!(engine.doc.export_png().unwrap(), current);
+                            for output in [
+                                psd::encode(&engine.doc).unwrap(),
+                                psd::encode_psb(&engine.doc).unwrap(),
+                            ] {
+                                assert_eq!(
+                                    saved_composite(&output, depth),
+                                    saved_composite(&bytes, depth)
+                                );
+                                let reopened = psd::decode(&output).unwrap();
+                                assert!(!reopened.read_only);
+                                assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                                assert_eq!(
+                                    reopened.layers[0]
+                                        .effects
+                                        .iter()
+                                        .map(|e| (e.kind.clone(), e.enabled, e.settings.clone()))
+                                        .collect::<Vec<_>>(),
+                                    settings
+                                );
+                                assert_eq!(reopened.export_png().unwrap(), current);
+                                let standard = psd::decode(&ordinary(&output)).unwrap();
+                                assert!(!standard.read_only);
+                                assert_eq!(standard.export_png().unwrap(), current);
+                            }
+                            // Native one-word/one-byte matte differences protect
+                            // the whole source, with no tolerance for soft alpha.
+                            let at = bytes.len() - 64 * usize::from(depth / 8)
+                                + 15 * usize::from(depth / 8)
+                                + usize::from(depth == 16);
+                            bytes[at] ^= 1;
+                            let protected = psd::decode(&bytes).unwrap();
+                            assert!(protected.read_only);
+                            assert!(protected.layers[0].effects.is_empty());
+                            assert!(psd::encode(&protected).is_err());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn partial_inner_shadow_payload(
+    enabled: bool,
+    master: bool,
+    list: bool,
+    overlay: bool,
+    angle: f64,
+    variant: &str,
+) -> Vec<u8> {
+    let list_variant = format!("list:{variant}");
+    let source = hard_shadow_payload(
+        "IrSh",
+        enabled,
+        master,
+        angle,
+        37.,
+        if list { &list_variant } else { variant },
+    );
+    let key = if list { "innerShadowMulti" } else { "IrSh" };
+    let kind = if list { b"VlLs" } else { b"Objc" };
+    let needle = [key.as_bytes(), kind].concat();
+    let at = source
+        .windows(needle.len())
+        .position(|v| v == needle)
+        .unwrap();
+    let mut inner = source[at + needle.len()..].to_vec();
+    if angle == 45. {
+        if let Some(at) = inner.windows(12).position(|v| v == b"DstnUntF#Pxl") {
+            inner[at + 12..at + 20].copy_from_slice(&2f64.to_be_bytes());
+        }
+    }
+    // Deliberately store the shadow before its overlay. Descriptor property
+    // order must not replace the defined native overlay/inner execution order.
+    let mut entries = vec![
+        ("masterFXSwitch", b"bool", vec![u8::from(master)]),
+        (key, kind, inner),
+    ];
+    if overlay {
+        let source = overlay_payload(true, true, [201., 43., 77.]);
+        let at = source.windows(8).position(|v| v == b"SoFiObjc").unwrap() + 8;
+        let mut color = source[at..].to_vec();
+        let at = color
+            .windows(12)
+            .position(|v| v == b"OpctUntF#Prc")
+            .unwrap()
+            + 12;
+        color[at..at + 8].copy_from_slice(&43f64.to_be_bytes());
+        entries.push(("SoFi", b"Objc", color));
+    }
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        overlay_descriptor("Lefx", entries),
+    ]
+    .concat()
+}
+
+#[test]
+fn photoshop_partial_alpha_inner_shadows_keep_unsupported_definitions_and_drop_casts_protected() {
+    for depth in [8, 16] {
+        let source = std::array::from_fn::<_, 16, _>(|i| {
+            [
+                native(12347 + i as u16 * 97, depth),
+                native(23459, depth),
+                native(34571, depth),
+                native(
+                    if i == 15 {
+                        65535
+                    } else {
+                        12347 + i as u16 * 107
+                    },
+                    depth,
+                ),
+            ]
+        });
+        for variant in [
+            "global",
+            "antialias",
+            "angle",
+            "choke",
+            "size",
+            "noise",
+            "contour",
+            "unknown",
+            "missing",
+        ] {
+            for list in [false, true] {
+                let payload = partial_inner_shadow_payload(false, false, list, true, 180., variant);
+                let doc =
+                    psd::decode(&framed_shadow_fixture(depth, &source, &payload, &source)).unwrap();
+                assert!(doc.read_only, "{depth} {list} {variant}");
+                assert!(doc.layers[0].effects.is_empty());
+                assert_eq!(doc.bit_depth, depth);
+                assert!(psd::encode(&doc).is_err());
+            }
+        }
+        // A disabled, otherwise valid Drop Shadow with an exact source
+        // composite still needs the separate partial-alpha knockout model.
+        for enabled in [false, true] {
+            let payload = hard_shadow_payload("DrSh", enabled, false, 180., 37., "");
+            let protected =
+                psd::decode(&framed_shadow_fixture(depth, &source, &payload, &source)).unwrap();
+            assert!(protected.read_only);
+            assert!(protected
+                .warnings
+                .iter()
+                .any(|v| v.contains("Drop Shadows on partial-alpha")));
+            assert!(psd::encode(&protected).is_err());
+        }
+    }
+}
+
+#[test]
 fn photoshop_mixed_overlays_and_hard_shadows_keep_original_casts_sources_and_native_saves() {
     for depth in [8, 16] {
         let source = std::array::from_fn::<_, 16, _>(|i| {
