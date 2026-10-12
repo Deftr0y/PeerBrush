@@ -51,9 +51,13 @@ Six independent 256×160 Stroke fixtures opened in a fresh isolated native works
 
 Commit `0b91a4c` passed all three native jobs and matching platform package inspection in [GitHub Actions](https://github.com/Deftr0y/PeerBrush/actions/runs/38275647900). Commit `197eac5` also has a [successful complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38285419164), while its other run failed an intermittent file-ownership regression. Later runs must be verified separately; a successful older checkpoint does not close the current development queue.
 
+The standalone Stroke checkpoint `4d09cc1` passed all three native jobs and package inspection in [this complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38289758916). Its [other run](https://github.com/Deftr0y/PeerBrush/actions/runs/38289766620) failed Linux save-safety retention at `tests/file_safety.rs:332`; that result remains separate from the style acceptance.
+
 ## PB-137 ownership release hardening
 
 The [639a369 Linux run](https://github.com/Deftr0y/PeerBrush/actions/runs/38287773856) identified an ownership-busy failure at the first open after cancellation (`tests/file_ownership.rs:105`), while another run's Linux job passed. Final native ownership now explicitly unlocks its OS handles before closing them. [Rust's lock contract](https://doc.rust-lang.org/std/fs/struct.File.html#method.lock) allows duplicated or inherited descriptors to keep a lock alive after the original closes; a deterministic regression retains those descriptors across reacquisition and verifies that the new owner still blocks hard-link aliases. This addresses that lock-lifetime condition; the intermittent CI cause and broader original data-loss report are not yet proven resolved. Formatting and compile checking passed; cross-platform CI acceptance is pending.
+
+Save leases and previous-save quota guards now use the same explicit OS unlock on drop, including fallible lease preparation after acquisition. Additional deterministic coverage retains duplicate descriptors across reacquisition, verifies that the new lease still excludes competitors, and preserves original file bytes. CI adds bounded `SAVE_BUSY` and `BACKUP_STORAGE_FULL` failure categories without publishing arbitrary panic text. These changes address the lock-lifetime condition; the intermittent save-safety failure still requires CI verification.
 
 ## PB-080 workspace cache identity
 

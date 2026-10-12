@@ -73,6 +73,8 @@ jobs:
               sections = re.split(r'^---- ([A-Za-z0-9_:]+) stdout ----$', log, flags=re.M)
               kinds = {
                   'OWNERSHIP_BUSY': 'File already open',
+                  'SAVE_BUSY': 'Another PeerBrush save',
+                  'BACKUP_STORAGE_FULL': 'Previous-save storage is full',
                   'PROJECT_HANDLE_MISSING': 'Missing or closed project ID',
                   'PROJECT_SET_CHANGED': 'The open projects changed',
                   'SOURCE_CHANGED': 'File changed while opening',
