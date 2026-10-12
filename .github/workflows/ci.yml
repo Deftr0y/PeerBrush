@@ -65,6 +65,11 @@ jobs:
           results = re.findall(r'^test result: (?:ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored;', log, re.M)
           if failures:
               print('::error title=Regression test failures::' + ', '.join(name[:128] for name in failures[:32]))
+              locations = re.findall(r"^thread '([A-Za-z0-9_:]+)' panicked at ((?:tests|src)[/\\][A-Za-z0-9_./\\-]+):([0-9]+):([0-9]+)", log, re.M)
+              for name, path, line, column in locations[:32]:
+                  path = path.replace('\\', '/')
+                  if name in failures and '..' not in path.split('/'):
+                      print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Regression failure location::{name[:128]}')
           elif int(sys.argv[3]):
               codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
               detail = ', '.join(codes) if codes else 'No failing test identifier was reported'

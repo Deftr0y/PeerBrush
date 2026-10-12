@@ -161,7 +161,7 @@ Combined QA passed all 792 engine/codec/protocol/UI checks across 85 test target
 
 ## Gradient placement extension (unreleased)
 
-The supported cardinal Linear/Reflected overlay subset additionally retains 10–1000% scale and optional signed canvas-relative offsets within −100–100%. Strict percentage units, explicit two-coordinate offset objects, current native source validation and complete exact standard composite matching remain mandatory. Unsupported alignment/rotation/interpolation and unknown fields preserve protected fallback. See [placement settings and limits](layer-styles.md#photoshop-gradient-placement-extension-unreleased). Native8/16 analytic source, bypass/undo, save and protected-fallback coverage passed combined QA.
+The supported cardinal Linear/Reflected overlay subset additionally retains 10–1000% scale and optional signed canvas-relative offsets within −100–100%. Version 0.26 development also retains bounded alpha-bound layer alignment and Radial/Angle/Diamond definitions using the existing integer grid. Strict percentage units, explicit two-coordinate offset objects, current native source validation and complete exact standard composite matching remain mandatory. Unsupported rotation/interpolation and unknown fields preserve protected fallback. See [placement settings and limits](layer-styles.md#photoshop-gradient-placement-extension-unreleased) and [0.26 acceptance status](development-0.26.md). The earlier document-placement native8/16 source, bypass/undo, save and protected-fallback coverage passed combined QA; newer import acceptance remains tracked separately.
 
 ## ZIP pattern assets (unreleased)
 
