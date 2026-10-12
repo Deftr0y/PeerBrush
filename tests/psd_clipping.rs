@@ -3372,19 +3372,102 @@ fn photoshop_pattern_and_gradient_blends_retain_native_sources_and_editable_save
 }
 #[test]
 fn photoshop_inversion_styles_preserve_sources_composites_and_undo() {
+    assert_photoshop_style_blends(
+        &[("Dfrn", "difference"), ("Xclu", "exclusion")],
+        &["color", "pattern", "gradient", "inner"],
+        SAVED,
+        [111., 67., 231.],
+    );
+}
+
+const ADDITIONAL_STYLE_BLENDS: [(&str, &str); 8] = [
+    ("CBrn", "color_burn"),
+    ("linearBurn", "linear_burn"),
+    ("CDdg", "color_dodge"),
+    ("linearDodge", "linear_dodge"),
+    ("SftL", "soft_light"),
+    ("HrdL", "hard_light"),
+    ("Sbtr", "subtract"),
+    ("divide", "divide"),
+];
+
+fn set_style_blend(payload: &mut Vec<u8>, mode: &str) {
+    let at = payload.windows(4).position(|v| v == b"BlnM").unwrap() + 4;
+    assert_eq!(&payload[at..at + 8], b"\0\0\0\0Nrml");
+    let mut encoded = vec![];
+    overlay_id(&mut encoded, mode);
+    payload.splice(at..at + 8, encoded);
+}
+
+// Independent normalized-channel expectations, including source/backdrop endpoint
+// precedence and the Photoshop Soft Light low-backdrop polynomial.
+fn expected_style_blend(base: f64, tint: f64, blend: &str) -> f64 {
+    match blend {
+        "difference" => (base - tint).abs(),
+        "exclusion" => base + tint - 2. * base * tint,
+        "linear_burn" => (base + tint - 1.).max(0.),
+        "linear_dodge" => (base + tint).min(1.),
+        "subtract" => (base - tint).max(0.),
+        "divide" if base == 0. => 0.,
+        "divide" if tint == 0. => 1.,
+        "divide" => (base / tint).min(1.),
+        "color_dodge" if base == 0. => 0.,
+        "color_dodge" if tint == 1. => 1.,
+        "color_dodge" => (base / (1. - tint)).min(1.),
+        "color_burn" if base == 1. => 1.,
+        "color_burn" if tint == 0. => 0.,
+        "color_burn" => 1. - ((1. - base) / tint).min(1.),
+        "hard_light" if tint <= 0.5 => 2. * base * tint,
+        "hard_light" => 1. - 2. * (1. - base) * (1. - tint),
+        "soft_light" if tint <= 0.5 => base - (1. - 2. * tint) * base * (1. - base),
+        "soft_light" => {
+            let lifted = if base <= 0.25 {
+                base * (4. + base * (-12. + 16. * base))
+            } else {
+                base.sqrt()
+            };
+            base + (2. * tint - 1.) * (lifted - base)
+        }
+        _ => panic!("Missing independent style blend expectation: {blend}"),
+    }
+}
+
+#[test]
+fn photoshop_additional_style_blends_preserve_native_sources_composites_and_undo() {
+    assert_photoshop_style_blends(
+        &ADDITIONAL_STYLE_BLENDS,
+        &["color", "pattern", "gradient", "inner"],
+        SAVED,
+        [111., 67., 231.],
+    );
+    for color in [[0., 255., 127.5], [255., 0., 127.5]] {
+        assert_photoshop_style_blends(
+            &ADDITIONAL_STYLE_BLENDS,
+            &["color"],
+            [[0, 65535, 16384, 65535], [65535, 0, 32768, 65535]],
+            color,
+        );
+    }
+}
+
+fn assert_photoshop_style_blends(
+    modes: &[(&str, &str)],
+    families: &[&str],
+    pixels: [[u16; 4]; 2],
+    color: [f64; 3],
+) {
     for depth in [8, 16] {
-        for family in ["color", "pattern", "gradient", "inner"] {
+        for &family in families {
             for enabled in [false, true] {
                 for opacity in [37f64, 100.] {
-                    for (mode, blend) in [(b"Dfrn", "difference"), (b"Xclu", "exclusion")] {
+                    for &(mode, blend) in modes {
                         let mut payload = match family {
-                            "color" => overlay_payload(true, enabled, [111., 67., 231.]),
+                            "color" => overlay_payload(true, enabled, color),
                             "pattern" => pattern_payload(enabled, "synthetic-pattern", "", 100.),
                             "gradient" => gradient_payload(false, None, 0.),
                             _ => hard_shadow_payload("IrSh", enabled, true, 180., opacity, ""),
                         };
-                        let at = payload.windows(4).position(|v| v == b"Nrml").unwrap();
-                        payload[at..at + 4].copy_from_slice(mode);
+                        set_style_blend(&mut payload, mode);
                         let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
                         payload[at] = u8::from(enabled);
                         let at = payload
@@ -3393,7 +3476,7 @@ fn photoshop_inversion_styles_preserve_sources_composites_and_undo() {
                             .unwrap()
                             + 12;
                         payload[at..at + 8].copy_from_slice(&opacity.to_be_bytes());
-                        let mut spec = Spec::paint("Synthetic inversion style", SAVED);
+                        let mut spec = Spec::paint("Synthetic supported blend style", pixels);
                         spec.tags.push((*b"lfx2", payload));
                         let mut bytes = fixture(&[spec], depth);
                         if family == "pattern" {
@@ -3404,9 +3487,9 @@ fn photoshop_inversion_styles_preserve_sources_composites_and_undo() {
                                 false,
                             );
                         }
-                        let mut merged = SAVED.map(|p| p.map(|v| native(v, depth)));
+                        let mut merged = pixels.map(|p| p.map(|v| native(v, depth)));
                         if enabled {
-                            let coverage = (65535. * opacity / 100.).round() / 65535.;
+                            let coverage = (65535. * (opacity / 100.)).round() / 65535.;
                             for x in 0..2 {
                                 if family == "inner" && x == 1 {
                                     continue;
@@ -3421,15 +3504,12 @@ fn photoshop_inversion_styles_preserve_sources_composites_and_undo() {
                                                 49151
                                             }
                                         }
+                                        "color" => (color[c] / 255. * 65535.).round() as u16,
                                         _ => [111 * 257, 67 * 257, 231 * 257][c],
                                     };
                                     let base = f64::from(merged[x][c]) / 65535.;
                                     let tint = f64::from(tint) / 65535.;
-                                    let color = if blend == "difference" {
-                                        (base - tint).abs()
-                                    } else {
-                                        base + tint - 2. * base * tint
-                                    };
+                                    let color = expected_style_blend(base, tint, blend);
                                     merged[x][c] = native(
                                         ((base * (1. - coverage) + color * coverage) * 65535.)
                                             .round() as u16,
@@ -3453,7 +3533,7 @@ fn photoshop_inversion_styles_preserve_sources_composites_and_undo() {
                         assert_eq!(rendered(&doc), merged.concat());
                         assert_eq!(doc.layers[0].effects[0].settings["blend"], blend);
                         assert_eq!(doc.layers[0].effects[0].enabled, enabled);
-                        let source = SAVED.map(|p| p.map(|v| native(v, depth))).concat();
+                        let source = pixels.map(|p| p.map(|v| native(v, depth))).concat();
                         assert_eq!(doc.layers[0].pixels.rgba16(), source);
                         let current = doc.export_png().unwrap();
                         let settings = doc.layers[0].effects[0].settings.clone();
@@ -3544,16 +3624,86 @@ fn inversion_style_blends_do_not_unlock_unknown_or_independent_exterior_definiti
 }
 
 #[test]
+fn photoshop_additional_style_blends_keep_exterior_and_malformed_definitions_protected() {
+    for depth in [8, 16] {
+        for family in ["color", "pattern", "gradient", "inner", "drop"] {
+            for (mode, _) in ADDITIONAL_STYLE_BLENDS {
+                for variant in 0..4 {
+                    if variant == 0 && family != "drop" {
+                        continue;
+                    }
+                    // Disabled effects already match the stored source. Reject
+                    // unsupported backdrop handling and malformed enum metadata
+                    // before the whole-composite comparison can authorize editing.
+                    let mut payload = match family {
+                        "color" => overlay_payload(true, false, [111., 67., 231.]),
+                        "pattern" => pattern_payload(false, "synthetic-pattern", "", 100.),
+                        "gradient" => gradient_payload(false, None, 0.),
+                        "inner" => hard_shadow_payload("IrSh", false, true, 180., 100., ""),
+                        _ => hard_shadow_payload("DrSh", false, true, 180., 100., ""),
+                    };
+                    set_style_blend(&mut payload, mode);
+                    let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                    payload[at] = 0;
+                    match variant {
+                        1 => {
+                            let at = payload.windows(4).position(|v| v == b"BlnM").unwrap();
+                            payload[at..at + 4].copy_from_slice(b"????");
+                        }
+                        2 => {
+                            let at = payload.windows(4).position(|v| v == b"BlnM").unwrap() - 8;
+                            assert_eq!(&payload[at..at + 4], b"enum");
+                            payload[at..at + 4].copy_from_slice(b"doub");
+                        }
+                        3 => set_style_blend_to_unknown(&mut payload, mode),
+                        _ => {}
+                    }
+                    let mut spec = Spec::paint("Synthetic protected style blend", SAVED);
+                    spec.tags.push((*b"lfx2", payload));
+                    let mut bytes = fixture(&[spec], depth);
+                    if family == "pattern" {
+                        bytes = inject_pattern(
+                            bytes,
+                            depth,
+                            &pattern_resource(depth, "synthetic-pattern"),
+                            false,
+                        );
+                    }
+                    let doc = psd::decode(&bytes).unwrap();
+                    assert!(doc.read_only, "{depth} {family} {mode} {variant}");
+                    assert_eq!(doc.bit_depth, depth);
+                    assert!(doc.layers[0].effects.is_empty());
+                    assert_eq!(
+                        doc.layers[0].pixels.rgba16(),
+                        SAVED.map(|p| p.map(|v| native(v, depth))).concat()
+                    );
+                    assert!(psd::encode(&doc).is_err());
+                    assert!(psd::encode_psb(&doc).is_err());
+                }
+            }
+        }
+    }
+}
+
+fn set_style_blend_to_unknown(payload: &mut [u8], mode: &str) {
+    let at = payload
+        .windows(mode.len())
+        .position(|v| v == mode.as_bytes())
+        .unwrap();
+    payload[at] = b'?';
+}
+
+#[test]
 fn unsupported_or_mismatched_pattern_and_gradient_blends_keep_sources_protected() {
     for depth in [8, 16] {
         for pattern in [false, true] {
             for mode in [
-                b"Nrml", b"Mltp", b"Scrn", b"Ovrl", b"Drkn", b"Lghn", b"HrdL",
+                b"Nrml", b"Mltp", b"Scrn", b"Ovrl", b"Drkn", b"Lghn", b"????",
             ] {
                 let mut bytes = blended_overlay_fixture(depth, pattern, mode, 50.);
                 // One native-word difference must never unlock a styled source.
                 let at = bytes.len() - 8 * usize::from(depth / 8);
-                if mode != b"HrdL" {
+                if mode != b"????" {
                     bytes[at] ^= 1;
                 }
                 let doc = psd::decode(&bytes).unwrap();

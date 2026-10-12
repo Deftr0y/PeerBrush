@@ -259,6 +259,14 @@ fn overlay_blend(value: &Value) -> Result<&'static str, String> {
         Some("Lghn") => Ok("lighten"),
         Some("Dfrn") => Ok("difference"),
         Some("Xclu") => Ok("exclusion"),
+        Some("CBrn") => Ok("color_burn"),
+        Some("linearBurn") => Ok("linear_burn"),
+        Some("CDdg") => Ok("color_dodge"),
+        Some("linearDodge") => Ok("linear_dodge"),
+        Some("SftL") => Ok("soft_light"),
+        Some("HrdL") => Ok("hard_light"),
+        Some("Sbtr") => Ok("subtract"),
+        Some("divide") => Ok("divide"),
         _ => Err("Unsupported Photoshop overlay blend remains protected".into()),
     }
 }
