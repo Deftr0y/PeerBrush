@@ -1956,6 +1956,9 @@ fn decode_parts(
                                             if effects.iter().any(|e| matches!(e.kind.as_str(), "drop_shadow" | "inner_shadow"))
                                                 && (!maskdata.is_empty() || clipping != 0) {
                                                 Err("Hard Photoshop shadows with masks or clipping remain protected".into())
+                                            } else if effects.iter().any(|e| e.kind == "stroke")
+                                                && (!maskdata.is_empty() || clipping != 0) {
+                                                Err("Photoshop strokes with masks or clipping remain protected".into())
                                             } else { Ok((effects, pattern)) }
                                         })
                                     } else { Err("Photoshop styles with folders, layer blending or duplicate blocks remain protected".into()) };
@@ -2160,6 +2163,34 @@ fn decode_parts(
                         rec.layer.pixels = pixels;
                     } else if rec.layer.kind == "group" {
                         rec.layer.pixels = Raster::new_depth(w, h, depth);
+                    }
+                    if rec.layer.effects.iter().any(|e| e.kind == "stroke") {
+                        // Inspect existing sparse native tiles, without allocating
+                        // another full raster. Keep large-source scans cancellable.
+                        let mut partial = false;
+                        if high {
+                            for tile in rec.layer.pixels.samples16.values() {
+                                control.check()?;
+                                if tile.chunks_exact(4).any(|p| !matches!(p[3], 0 | 65535)) {
+                                    partial = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            for tile in rec.layer.pixels.tiles.values() {
+                                control.check()?;
+                                if tile.chunks_exact(4).any(|p| !matches!(p[3], 0 | 255)) {
+                                    partial = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if partial {
+                            warnings.push(
+                                "Photoshop strokes with partial source alpha remain protected"
+                                    .into(),
+                            );
+                        }
                     }
                 }
             }

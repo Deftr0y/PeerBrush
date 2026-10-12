@@ -38,3 +38,13 @@ Implemented, acceptance pending. Radial, Angle and Diamond descriptors now map t
 Independent native8/16 fixtures cover radius/Manhattan coordinates, angle-axis and singular-center samples, reverse, enabled/disabled definitions, original sources, editable PSD/PSB reopening, effect bypass/undo and exact mismatch protection. Automated acceptance is pending.
 
 Sixteen independent offline 256×160 fixtures cover native8/16 Linear, Radial, Angle and Diamond imports, with document or alpha-bound layer alignment. Every original channel (including transparent hidden RGB), editable PSD/PSB definition and rendered export survived save/reopen and exact bypass/undo. The rendered gradient, recovered source and additional shape images were inspected. The layer-alignment regression fixture's standard-composite expectation was corrected to distinguish white-matted PSD RGB from straight-alpha rendered RGB; no renderer or exact-match tolerance changed. Native workspace interaction and final combined CI acceptance remain pending.
+
+## PB-122 standalone solid Stroke
+
+Implemented, acceptance pending. One unscaled Normal solid-color `FrFX` definition, or one explicit `frameFXMulti` entry, can map to the existing native Inside/Outside/Center Stroke renderer. Whole-pixel sizes are bounded to 0–128 pixels. Original native8/16 raster channels remain intact; editable opening requires an exact complete standard composite match. Mixed stacks, multiple strokes, gradient/pattern paint, overprint, masks, clipping, partial source alpha and unsupported fields remain protected, including disabled definitions. Descriptor IDs follow the [primary ag-psd codec](https://github.com/Agamnentzar/ag-psd/blob/master/src/descriptor.ts).
+
+Regression coverage specifies independent half-coverage edge samples, master/present/enabled states, single/list aliases, native source retention, current standard PSD/PSB composites, editable reopening, bypass/undo and one-sample mismatch protection. Formatting and compile checking passed; automated and fresh native workspace acceptance remain pending. This does not establish general Photoshop Stroke equivalence or recover the broader representative styled document.
+
+## CI checkpoints
+
+Commit `0b91a4c` passed all three native jobs and matching platform package inspection in [GitHub Actions](https://github.com/Deftr0y/PeerBrush/actions/runs/38275647900). Commit `197eac5` also has a [successful complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38285419164), while its other run failed an intermittent file-ownership regression. Later runs must be verified separately; a successful older checkpoint does not close the current development queue.
