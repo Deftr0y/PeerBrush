@@ -1,6 +1,6 @@
 # PeerBrush development
 
-- Git attribution belongs to the human contributor. Do not use Codex or another AI tool as a commit author, committer or co-author, or add automated contributor badges. Keep the README's AI-development disclosure.
+- Git attribution belongs to the human contributor. Never register an LLM or AI tool as a commit author, committer, co-author or contributor, or add automated contributor badges. Use an approved human identity from `.github/human-contributors.json`; adding another identity requires the maintainer to verify that it belongs to a human. GitHub's signing service is allowed only as a committer. Keep the README's AI-development disclosure.
 
 - Preserve the GPL v3 license and Ember palette from MayaMCP.
 - Use compact, unboxed range values. Avoid decorative containers and borders that add clutter or waste space.

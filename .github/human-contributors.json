@@ -1,0 +1,15 @@
+{
+  "description": "SHA-256 of the lowercase Git name <email> identity. Only verified humans may be added to humans. GitHub's signing service is permitted only as a committer. AI tools and models must never be registered.",
+  "humans": {
+    "Ilai Perez / Deftr0y": [
+      "91bf500abf8ae99fcf61939cc90407db495d4cb7a010a2c037681a4bfecd2f08",
+      "ee38c3df84ee76a375f78b46d2b298cf2b16a188dbb33fac2c32d188633fa638",
+      "7d72255562da1785d4c0493ea26c05be2d29decbcfc58e48902caaf9979a5890"
+    ]
+  },
+  "committer_services": {
+    "GitHub": [
+      "5c27205b078fedd07c1e9efac9fab370264323d0aeee701ba03792de04d1997c"
+    ]
+  }
+}
