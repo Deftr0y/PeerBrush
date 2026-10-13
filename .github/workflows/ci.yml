@@ -3,6 +3,17 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  branch-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify branch-policy regressions
+        run: python scripts/test_branch_policy.py
+      - name: Enforce branch names and PR destinations
+        shell: bash
+        run: python scripts/check_branch_policy.py --event "$GITHUB_EVENT_PATH" --ref "$GITHUB_REF"
   attribution:
     runs-on: ubuntu-24.04
     steps:
@@ -36,6 +47,7 @@ jobs:
           print(f'Checked approved human attribution for {len(commits)} commits.')
           PY
   native:
+    needs: [branch-policy, attribution]
     strategy:
       fail-fast: false
       matrix:
