@@ -174,8 +174,16 @@ pub(crate) fn destination_key(path: &Path) -> [u64; 2] {
 }
 
 /// A stable lock inode is never unlinked while another process might hold it.
+struct LockedFile(fs::File);
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        // A concurrently launched process can inherit a descriptor. Release
+        // our cooperative lease explicitly before its originating handle closes.
+        let _ = self.0.unlock();
+    }
+}
 pub struct Lease {
-    _file: fs::File,
+    _file: LockedFile,
     pub path: PathBuf,
     pub expected: Option<Version>,
 }
@@ -208,6 +216,7 @@ impl Lease {
         file.try_lock().map_err(|_| {
             "Another PeerBrush save is using this directory. Retry when it finishes.".to_string()
         })?;
+        let file = LockedFile(file);
         let expected = snapshot(&path)?;
         Ok(Self {
             _file: file,
@@ -243,6 +252,7 @@ impl Lease {
             .open(quota)
             .map_err(|e| e.to_string())?;
         quota.lock().map_err(|e| e.to_string())?;
+        let _quota = LockedFile(quota);
         let total = fs::read_dir(&dir)
             .map_err(|e| e.to_string())?
             .flatten()
@@ -387,4 +397,49 @@ pub fn previous_versions(path: &Path) -> Result<Vec<PreviousVersion>, String> {
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp_ms));
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn save_leases_release_before_duplicated_descriptors_close() {
+        let dir = std::env::temp_dir().join(format!("pb-duplicated-lease-{}", crate::engine::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("Artwork.psd");
+        fs::write(&path, b"original source").unwrap();
+        let lease = Lease::acquire(&path).unwrap();
+        let descriptor = lease._file.0.try_clone().unwrap();
+        assert!(Lease::acquire(&path).is_err());
+        drop(lease);
+        let next = Lease::acquire(&path).unwrap();
+        assert!(Lease::acquire(&path).is_err());
+        drop(descriptor);
+        assert!(Lease::acquire(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original source");
+        drop(next);
+        assert!(Lease::acquire(&path).is_ok());
+        let quota_path = dir.join(".peerbrush-versions/quota.lock");
+        let quota = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&quota_path)
+            .unwrap();
+        quota.lock().unwrap();
+        let descriptor = quota.try_clone().unwrap();
+        let guard = LockedFile(quota);
+        drop(guard);
+        let next = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(quota_path)
+            .unwrap();
+        next.try_lock().unwrap();
+        let next = LockedFile(next);
+        drop(descriptor);
+        drop(next);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
