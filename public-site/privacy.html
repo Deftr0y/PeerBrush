@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#161417">
+  <title>PeerBrush Privacy Policy</title>
+  <meta name="description" content="How PeerBrush handles local artwork, optional AI connections, website visits and support messages.">
+  <link rel="canonical" href="https://peerbrush.com/privacy.html">
+  <link rel="icon" type="image/png" href="assets/peerbrush-logo.png">
+  <link rel="stylesheet" href="styles.css?layout=3">
+  <link rel="stylesheet" href="privacy.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="header-shell scrolled"><header class="header wrap">
+    <a class="brand" href="index.html" aria-label="PeerBrush home"><img src="assets/peerbrush-logo.png" alt="" width="34" height="40"><span>Peer<span class="ember">Brush</span></span></a>
+    <nav aria-label="Main navigation"><a href="index.html">Home</a><a href="index.html#downloads">Downloads</a><a href="releases.html">Release notes &amp; docs</a><a href="privacy.html" aria-current="page">Privacy</a></nav>
+    <a class="source-link" href="https://github.com/Deftr0y/PeerBrush">Source</a>
+  </header></div>
+  <main id="main" class="documentation-page privacy-page wrap">
+    <nav class="documentation-nav" aria-label="Page navigation"><a href="index.html">Home</a><a href="#controls">Your choices</a><a href="#changes">Contact</a></nav>
+    <span class="section-label">PEERBRUSH</span>
+    <h1>Privacy policy</h1>
+    <p class="privacy-date">Effective date: 14 October 2026</p>
+    <p class="page-description">How PeerBrush handles your artwork, local app data, optional connections and support messages.</p>
+    <section id="overview" aria-labelledby="overview-title">
+      <h2 id="overview-title">1. Overview</h2>
+      <p>PeerBrush is a desktop image editor maintained by Ilai Perez (Deftroy). This policy covers the PeerBrush application, peerbrush.com, and communications with PeerBrush support.</p>
+      <p>You do not need a PeerBrush account to use the editor. Core editing happens on your device. The application does not automatically upload your artwork to PeerBrush or send PeerBrush usage analytics or crash reports. Optional integrations and the website have the separate data flows described below.</p>
+    </section>
+    <section id="local-work" aria-labelledby="local-work-title">
+      <h2 id="local-work-title">2. Your documents and local storage</h2>
+      <p>PeerBrush reads and processes the images and documents you open, import, create or paste. These can contain personal information. Processing includes image pixels, layers, masks, document metadata, file names and paths, and clipboard content needed for copy and paste.</p>
+      <p>Documents and exports are saved to locations you or a connected client choose. PeerBrush also stores local preferences, presets, preview/cache files and recovery data. Autosave recovery includes document content and metadata such as the document name, original file path and timestamp. Previous-save copies may be stored beside your documents in a .peerbrush-versions folder.</p>
+      <p>These local files are not uploaded to PeerBrush as part of ordinary editing. Your operating system, cloud-synced folders, backup software or clipboard-sync settings may separately copy or transmit them.</p>
+    </section>
+    <section id="ai-connections" aria-labelledby="ai-connections-title">
+      <h2 id="ai-connections-title">3. Connected AI clients and other tools</h2>
+      <p>PeerBrush starts a local MCP service while the application is running. It listens on the device's loopback address (127.0.0.1) and requires a local bearer token. Connect AI can create a local discovery manifest, update supported clients' configuration and keep configuration backups.</p>
+      <p>A client connected to this service can use PeerBrush tools to inspect and edit documents, receive canvas images and document/project information, including names and file paths, and open or save supported local files. Tool results can also include editing history, task descriptions and other document-related information. A requested UI capture saves an image of the PeerBrush window.</p>
+      <p>PeerBrush does not choose your AI model or directly send your editing content to a cloud AI service. A client or bridge you configure may send information it receives to its own AI provider or other services. Those services' privacy policies and settings govern their processing, retention and use for training. Review them before connecting, especially for confidential artwork or images of other people.</p>
+      <p>To stop a client's access, disable or remove its PeerBrush connection in that client and stop the client or bridge. Closing PeerBrush stops its running local editing service. The current application has no separate MCP on/off switch. Keep the local connection token private.</p>
+    </section>
+    <section id="segmentation" aria-labelledby="segmentation-title">
+      <h2 id="segmentation-title">4. Optional automatic selection providers</h2>
+      <p>If you configure an external segmentation provider, PeerBrush passes it an image preview and information needed to locate the selection in the document. The supplied reference integration is designed to run a selected local model through rembg and ONNX Runtime; model weights may need to be downloaded separately.</p>
+      <p>Other provider configurations may use external services. Review the provider and model you choose. Network downloads and any remote processing are subject to the relevant provider's practices.</p>
+    </section>
+    <section id="website" aria-labelledby="website-title">
+      <h2 id="website-title">5. Website and third-party services</h2>
+      <p>peerbrush.com is hosted on GitHub Pages. GitHub records visitors' IP addresses for security purposes. Its handling of hosting and request data is described in the <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub Privacy Statement</a>.</p>
+      <p>The current PeerBrush website does not add advertising or analytics trackers or set its own tracking cookies. Platform information from your browser may be used within the page to suggest a download.</p>
+      <p>If you follow links to GitHub, Discord, an app store or another service, that service's privacy policy applies to your interactions there.</p>
+    </section>
+    <section id="support" aria-labelledby="support-title">
+      <h2 id="support-title">6. Contacting support</h2>
+      <p>If you email <a href="mailto:peerbrush.help@gmail.com">peerbrush.help@gmail.com</a>, we receive your email address, message, and any attachments or other information you choose to send. We use these to respond, troubleshoot and manage the request. Email providers process these communications to deliver and store them.</p>
+      <p>Send only information needed for your request. Do not send passwords, connection tokens or confidential artwork unless it is needed and you are comfortable sharing it. Posts in public issue trackers or community channels may be visible to others.</p>
+      <p>We retain support correspondence for as long as reasonably needed to handle the request and related follow-up, or to meet applicable legal obligations. Contacting support does not subscribe you to marketing.</p>
+    </section>
+    <section id="controls" aria-labelledby="controls-title">
+      <h2 id="controls-title">7. Retention, deletion and your choices</h2>
+      <p>You control your saved artwork and exports. Local data can remain until you remove it or the application or operating system clears it. Autosave versions are rotated and may be cleared after saving or closing a project. Retained versions can be discarded through File → Recover autosaved work.</p>
+      <p>To remove remaining local app data, first save any work you want to keep and close PeerBrush, then remove the relevant state, preview/cache and preference files. Previous-save copies beside documents, exported files, client configuration/backups, cloud backups and copies held by connected providers must be handled separately. Uninstalling the application should not be relied on to erase all of these.</p>
+      <p>To ask about, access, correct or request deletion of personal information you have sent to PeerBrush, email <a href="mailto:peerbrush.help@gmail.com">peerbrush.help@gmail.com</a>. We will address requests as required by applicable law. For information held independently by an AI provider, GitHub or another service, use that service's controls or contact it directly.</p>
+    </section>
+    <section id="security" aria-labelledby="security-title">
+      <h2 id="security-title">8. Security</h2>
+      <p>PeerBrush uses a loopback-only service and a local connection token to limit direct access to its running editor. Local documents, recovery files and caches rely on your device's security and file permissions; PeerBrush does not provide encrypted storage for them. Protect your device, keep software current and connect only clients and providers you trust. No storage or transmission system can be guaranteed completely secure.</p>
+    </section>
+    <section id="changes" aria-labelledby="changes-title">
+      <h2 id="changes-title">9. Changes and contact</h2>
+      <p>We will update this page when PeerBrush's privacy practices change and revise the effective date. For privacy questions, contact <a href="mailto:peerbrush.help@gmail.com">peerbrush.help@gmail.com</a>.</p>
+    </section>
+  </main>
+  <footer class="footer wrap">
+    <a class="brand" href="index.html"><img src="assets/peerbrush-logo.png" alt="" width="26" height="32"><span>Peer<span class="ember">Brush</span></span></a>
+    <span class="footer-license">Free &amp; open source · GPL v3</span>
+    <div><a href="LICENSE.txt">License</a><a href="privacy.html" aria-current="page">Privacy</a><a href="mailto:peerbrush.help@gmail.com">Support</a><a href="https://github.com/Deftr0y/PeerBrush">GitHub</a></div>
+  </footer>
+</body>
+</html>

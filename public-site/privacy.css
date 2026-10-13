@@ -1,0 +1,20 @@
+/* Privacy page styles reuse the existing Ember palette and local fonts. */
+.privacy-page { max-width: 860px; padding-bottom: 80px; }
+.privacy-page .page-description { max-width: 70ch; }
+.privacy-page section { padding-top: 36px; scroll-margin-top: 104px; }
+.privacy-page section h2 { font-size: clamp(23px, 3vw, 31px); line-height: 1.25; letter-spacing: -.02em; }
+.privacy-page section p { margin-top: 16px; line-height: 1.75; overflow-wrap: anywhere; }
+.privacy-page section a { color: var(--ivory); text-decoration: underline; text-underline-offset: .2em; }
+.privacy-page section a:hover { color: var(--orange-hi); }
+.privacy-date { margin-top: 12px; font-size: 14px; }
+@media (max-width: 600px) {
+  .privacy-page { padding-top: 112px; padding-bottom: 48px; }
+  .privacy-page section { padding-top: 28px; }
+}
+@media print {
+  .header-shell, .footer, .skip-link, .documentation-nav { display: none; }
+  body { background: white; color: black; }
+  .privacy-page { width: 100%; max-width: none; padding: 0; }
+  .privacy-page p, .privacy-page section a { color: black; }
+  .privacy-page section h2 { break-after: avoid; }
+}
