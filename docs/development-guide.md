@@ -56,6 +56,8 @@ Behavior changes also require native visual verification: inspect actual rendere
 
 ## Architecture and contribution rules
 
+Development follows [Ponytail's compact project rules](../AGENTS.md#ponytail-development-approach): read the affected flow, reuse existing code and deliver the smallest complete change while preserving validation and verification. The rules are adapted from [upstream revision e39ce9b](https://github.com/DietrichGebert/ponytail/tree/e39ce9bfbd1cc008e3233c065ef70839e604d559) with its [MIT notice](ponytail-license.txt). They are loaded through the repository's `AGENTS.md`; this project setup does not install lifecycle hooks or mode-switching commands. PeerBrush's specific contribution and release requirements remain authoritative.
+
 Editing logic belongs in the engine; native UI, MCP and CLI must share commands, document/revision guards and reservations. Render gestures through the shared preview engine, committing history when the gesture finishes. AI blue feedback and animations belong to presentation and derived caches. Save current standard PSD raster/mask channels and the merged composite alongside retained editable sources. Keep model selection outside PeerBrush.
 
 Use the Ember palette, compact unboxed controls and the connected Color/Mask selector. Preserve native16 samples, unsupported Photoshop protection and unrelated human edits. See [implementation notes](development.md), [Photoshop fidelity](photoshop-fidelity.md), [MCP](mcp.md), [packaging](packaging.md) and the [0.26 queue](development-0.26.md).
