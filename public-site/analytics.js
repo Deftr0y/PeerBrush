@@ -1,7 +1,6 @@
 (() => {
-  // Set this to the verified GoatCounter site's public /count URL before enabling.
-  // An empty endpoint keeps analytics disabled and makes no third-party requests.
-  const endpoint = '';
+  // Public site identifier; no API key or private account credentials are needed.
+  const endpoint = 'https://peerbrush.goatcounter.com/count';
   if (!endpoint || location.protocol !== 'https:' ||
       !['peerbrush.com', 'www.peerbrush.com'].includes(location.hostname) ||
       navigator.doNotTrack === '1' || navigator.globalPrivacyControl === true ||
