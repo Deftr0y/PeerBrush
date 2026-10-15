@@ -154,24 +154,28 @@ jobs:
           keychain = root / 'signing.keychain-db'
           p12 = root / 'identity.p12'
           password = secrets.token_urlsafe(48)
-          def quiet(command):
+          def quiet(stage, command):
               try:
                   return subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+              except subprocess.CalledProcessError as error:
+                  raise SystemExit(f'Apple credential setup failed at {stage} (exit {error.returncode}); tool output was suppressed to protect credentials.') from None
+              except subprocess.TimeoutExpired:
+                  raise SystemExit(f'Apple credential setup failed at {stage} (timed out); tool output was suppressed to protect credentials.') from None
               except (OSError, subprocess.SubprocessError):
-                  raise SystemExit('Apple credential setup failed; tool output was suppressed to protect credentials.') from None
+                  raise SystemExit(f'Apple credential setup failed at {stage} (tool could not run); tool output was suppressed to protect credentials.') from None
           try:
               os.umask(0o077)
               p12.write_bytes(base64.b64decode(values['APPLE_SIGNING_P12_BASE64'], validate=True))
-              quiet(['/usr/bin/security', 'create-keychain', '-p', password, str(keychain)])
-              quiet(['/usr/bin/security', 'set-keychain-settings', '-lut', '7200', str(keychain)])
-              quiet(['/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain)])
-              previous = shlex.split(quiet(['/usr/bin/security', 'list-keychains', '-d', 'user']).stdout)
+              quiet('create-keychain', ['/usr/bin/security', 'create-keychain', '-p', password, str(keychain)])
+              quiet('configure-keychain', ['/usr/bin/security', 'set-keychain-settings', '-lut', '7200', str(keychain)])
+              quiet('unlock-keychain', ['/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain)])
+              previous = shlex.split(quiet('read-keychain-search-list', ['/usr/bin/security', 'list-keychains', '-d', 'user']).stdout)
               (root / 'search-list.json').write_text(json.dumps(previous))
-              quiet(['/usr/bin/security', 'list-keychains', '-d', 'user', '-s', str(keychain), *previous])
-              quiet(['/usr/bin/security', 'import', str(root / 'DeveloperIDG2CA.cer'), '-k', str(keychain)])
-              quiet(['/usr/bin/security', 'import', str(p12), '-k', str(keychain), '-P', values['APPLE_SIGNING_P12_PASSWORD'], '-T', '/usr/bin/codesign'])
-              quiet(['/usr/bin/security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
-              quiet(['/usr/bin/xcrun', 'notarytool', 'store-credentials', 'peerbrush-ci', '--keychain', str(keychain), '--apple-id', values['APPLE_ID'], '--team-id', values['APPLE_TEAM_ID'], '--password', values['APPLE_NOTARY_PASSWORD']])
+              quiet('update-keychain-search-list', ['/usr/bin/security', 'list-keychains', '-d', 'user', '-s', str(keychain), *previous])
+              quiet('import-apple-intermediate', ['/usr/bin/security', 'import', str(root / 'DeveloperIDG2CA.cer'), '-k', str(keychain)])
+              quiet('import-signing-p12', ['/usr/bin/security', 'import', str(p12), '-k', str(keychain), '-P', values['APPLE_SIGNING_P12_PASSWORD'], '-T', '/usr/bin/codesign'])
+              quiet('grant-codesign-key-access', ['/usr/bin/security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
+              quiet('validate-notary-credentials', ['/usr/bin/xcrun', 'notarytool', 'store-credentials', 'peerbrush-ci', '--keychain', str(keychain), '--apple-id', values['APPLE_ID'], '--team-id', values['APPLE_TEAM_ID'], '--password', values['APPLE_NOTARY_PASSWORD']])
           except (OSError, ValueError, binascii.Error):
               raise SystemExit('Apple credential setup failed; inspect secret names and local P12 export without printing their values.') from None
           finally:
