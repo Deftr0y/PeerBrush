@@ -3159,6 +3159,63 @@ impl PeerBrush {
             }
             self.frame_pending = false;
         }
+        let size_mode = [
+            Tool::Brush,
+            Tool::Eraser,
+            Tool::Smudge,
+            Tool::Clone,
+            Tool::Heal,
+            Tool::Liquify,
+        ]
+        .contains(&self.tool)
+            && !ui.ctx().wants_keyboard_input()
+            && !self.shortcuts.open
+            && self.points.is_empty()
+            && self.drag_start.is_none()
+            && self.gizmo_handle == 0
+            && ui.input(|i| self.shortcuts.size_held(i));
+        let navigate = self.lifecycle.is_none()
+            && !self.lifecycle_frame
+            && self.proposal_review.is_none()
+            && self.geometry.is_none()
+            && self.source_editor.is_none()
+            && self.filter_editor.is_none()
+            && !(self.brush_tool() && self.straight.cancelled)
+            && !(size_mode && response.hovered())
+            && self.size_drag.is_none();
+        let zoom_drag = navigate
+            && ui.input(|i| i.modifiers.alt)
+            && response.dragged_by(egui::PointerButton::Secondary);
+        let pan_drag = navigate
+            && !zoom_drag
+            && (response.dragged_by(egui::PointerButton::Middle)
+                || ((self.tool == Tool::Pan || ui.input(|i| i.key_down(egui::Key::Space)))
+                    && response.dragged()));
+        // Apply navigation before building the image mesh and document-coordinate mapping.
+        if navigate {
+            if response.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    let old = self.zoom;
+                    self.zoom = (self.zoom * (scroll * 0.002).exp()).clamp(0.01, 8192.0);
+                    if let Some(anchor) = ui.input(|i| i.pointer.hover_pos()) {
+                        self.pan +=
+                            (anchor - (available.center() + self.pan)) * (1.0 - self.zoom / old);
+                    }
+                }
+            }
+            if zoom_drag {
+                let delta = response.drag_delta();
+                let old = self.zoom;
+                self.zoom = (self.zoom * ((delta.x - delta.y) * 0.008).exp()).clamp(0.01, 8192.0);
+                if let Some(anchor) = response.interact_pointer_pos() {
+                    self.pan +=
+                        (anchor - (available.center() + self.pan)) * (1.0 - self.zoom / old);
+                }
+            } else if pan_drag {
+                self.pan += response.drag_delta();
+            }
+        }
         let scale = fit * self.zoom;
         let size = Vec2::new(canvas_width as f32 * scale, canvas_height as f32 * scale);
         let rect = Rect::from_center_size(available.center() + self.pan, size);
@@ -3234,21 +3291,6 @@ impl PeerBrush {
         }
         let to_screen = |p: [f32; 2]| view.point(p, rect, scale);
         let to_doc = |p: Pos2| view.document(p, rect, scale);
-        let size_mode = [
-            Tool::Brush,
-            Tool::Eraser,
-            Tool::Smudge,
-            Tool::Clone,
-            Tool::Heal,
-            Tool::Liquify,
-        ]
-        .contains(&self.tool)
-            && !ui.ctx().wants_keyboard_input()
-            && !self.shortcuts.open
-            && self.points.is_empty()
-            && self.drag_start.is_none()
-            && self.gizmo_handle == 0
-            && ui.input(|i| self.shortcuts.size_held(i));
         if size_mode && (response.hovered() || self.size_drag.is_some()) {
             if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
                 let (anchor, start, hardness) =
@@ -3333,14 +3375,6 @@ impl PeerBrush {
             }
         }
         if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                let old = self.zoom;
-                self.zoom = (self.zoom * (scroll * 0.002).exp()).clamp(0.01, 8192.0);
-                if let Some(anchor) = ui.input(|i| i.pointer.hover_pos()) {
-                    self.pan += (anchor - rect.center()) * (1.0 - self.zoom / old);
-                }
-            }
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                 if view.contains(p, rect, scale)
                     && ([
@@ -3358,21 +3392,11 @@ impl PeerBrush {
                 }
             }
         }
-        if ui.input(|i| i.modifiers.alt) && response.dragged_by(egui::PointerButton::Secondary) {
-            let delta = response.drag_delta();
-            let old = self.zoom;
-            self.zoom = (self.zoom * ((delta.x - delta.y) * 0.008).exp()).clamp(0.01, 8192.0);
-            if let Some(anchor) = response.interact_pointer_pos() {
-                self.pan += (anchor - rect.center()) * (1.0 - self.zoom / old);
-            }
+        if zoom_drag {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
             return;
         }
-        if response.dragged_by(egui::PointerButton::Middle)
-            || ((self.tool == Tool::Pan || ui.input(|i| i.key_down(egui::Key::Space)))
-                && response.dragged())
-        {
-            self.pan += response.drag_delta();
+        if pan_drag {
             return;
         }
         if [Tool::Clone, Tool::Heal].contains(&self.tool) {
@@ -7904,6 +7928,11 @@ mod tests {
             vec![egui::Event::PointerMoved(b)],
             Default::default(),
         );
+        assert_eq!(
+            app.view_rect.unwrap().center(),
+            b,
+            "pan must render in the input frame"
+        );
         frame(
             &mut app,
             &ctx,
@@ -7926,11 +7955,18 @@ mod tests {
             vec![button(a, egui::PointerButton::Secondary, true, alt)],
             alt,
         );
+        let before_zoom = app.view_rect.unwrap();
+        let old_zoom = app.zoom;
         frame(
             &mut app,
             &ctx,
             vec![egui::Event::PointerMoved(a + Vec2::new(50.0, 0.0))],
             alt,
+        );
+        assert!(
+            (app.view_rect.unwrap().width() / before_zoom.width() - app.zoom / old_zoom).abs()
+                < 0.001,
+            "zoom must render in the input frame"
         );
         frame(
             &mut app,

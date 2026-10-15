@@ -88,6 +88,10 @@ fn run() -> Result<(), String> {
         }
     }
     let options = eframe::NativeOptions {
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            desired_maximum_frame_latency: Some(1),
+            ..Default::default()
+        },
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("PeerBrush")
             .with_icon({

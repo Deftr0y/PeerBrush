@@ -47,6 +47,7 @@
     "examples/brush_performance.rs",
     "examples/gpu16_effects.rs",
     "examples/gpu_effects.rs",
+    "examples/input_performance.rs",
     "examples/preview_performance.rs",
     "examples/tile_performance.rs",
     "integrations/segmentation-requirements.txt",

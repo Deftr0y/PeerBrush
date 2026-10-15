@@ -388,6 +388,62 @@ mod tests {
         }
     }
     #[test]
+    fn wheel_navigation_draws_current_mesh_and_keeps_the_cursor_anchor_at_native_depth() {
+        for depth in [8, 16] {
+            for angle in [0., 37.] {
+                let (mut app, ctx) = super::super::tests::fixture();
+                app.recovery.open = false;
+                app.shared.lock().unwrap().doc = Document::new_depth(96, 60, depth).unwrap();
+                app.view.angle = angle;
+                app.view.mirror_h = true;
+                // Keep asynchronous preview arrival out of the mesh/input assertion.
+                app.pending = true;
+                app.set_canvas(&ctx, 1, 1, vec![233, 84, 32, 255]);
+                let texture = app.texture.as_ref().unwrap().id();
+                let before = crate::psd::encode(&app.shared.lock().unwrap().doc).unwrap();
+                frame(&mut app, &ctx, vec![]);
+                let original = app.view_rect.unwrap();
+                let anchor = original.center() + Vec2::new(40., -10.);
+                let source = app.view.document(anchor, original, original.width() / 96.);
+                let output = frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(anchor),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0., 90.),
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                let rect = app.view_rect.unwrap();
+                assert!(rect.width() > original.width());
+                let scale = rect.width() / 96.;
+                let actual = app.view.document(anchor, rect, scale);
+                assert!((actual[0] - source[0]).abs() < 0.001);
+                assert!((actual[1] - source[1]).abs() < 0.001);
+                let mesh = output
+                    .shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    mesh.vertices.iter().map(|v| v.pos).collect::<Vec<_>>(),
+                    app.view.corners(rect, scale)
+                );
+                assert_eq!(
+                    crate::psd::encode(&app.shared.lock().unwrap().doc).unwrap(),
+                    before
+                );
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+            }
+        }
+    }
+    #[test]
     fn canvas_mesh_uv_and_navigation_preserve_document_sources_and_coordinates() {
         let rect = Rect::from_min_size(Pos2::new(70., 90.), Vec2::new(288., 180.));
         let scale = 3.;
