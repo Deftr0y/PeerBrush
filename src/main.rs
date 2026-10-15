@@ -89,6 +89,11 @@ fn run() -> Result<(), String> {
     }
     let options = eframe::NativeOptions {
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            present_mode: if cfg!(target_os = "windows") {
+                eframe::wgpu::PresentMode::AutoNoVsync
+            } else {
+                eframe::wgpu::PresentMode::AutoVsync
+            },
             desired_maximum_frame_latency: Some(1),
             ..Default::default()
         },

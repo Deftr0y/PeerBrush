@@ -5205,6 +5205,7 @@ impl PeerBrush {
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - 70.0).max(60.0))
                     .show(ui, |ui| {
+                        let mut buttons = Vec::with_capacity(15);
                         for (index, tool) in [
                             Tool::Brush,
                             Tool::Smudge,
@@ -5231,24 +5232,19 @@ impl PeerBrush {
                                 ui.add_space(4.0);
                             }
                             let r = ui
-                                .add_sized(
-                                    [42.0, 39.0],
-                                    egui::Button::new("")
-                                        .selected(self.tool == tool)
-                                        .frame(false),
-                                )
+                                .add_sized([42.0, 39.0], egui::Button::new("").frame(false))
                                 .on_hover_text(self.tool_caption(tool));
-                            let active = ui.ctx().animate_bool_with_time(
-                                r.id.with("selected"),
-                                self.tool == tool,
-                                0.1,
-                            );
-                            if active > 0.0 {
-                                ui.painter().rect_filled(
-                                    r.rect,
-                                    6,
-                                    Color32::from_rgb(74, 48, 71).gamma_multiply(active),
-                                );
+                            if r.clicked() {
+                                self.select_tool(tool);
+                                ui.ctx().request_repaint();
+                            }
+                            buttons.push((tool, r));
+                        }
+                        // Resolve input before painting either the old or new selection.
+                        for (tool, r) in buttons {
+                            if self.tool == tool {
+                                ui.painter()
+                                    .rect_filled(r.rect, 6, Color32::from_rgb(74, 48, 71));
                                 ui.painter().rect_filled(
                                     Rect::from_min_size(
                                         r.rect.left_top(),
@@ -5299,9 +5295,6 @@ impl PeerBrush {
                                     Color32::from_rgb(245, 242, 240)
                                 },
                             );
-                            if r.clicked() {
-                                self.select_tool(tool);
-                            }
                         }
                     });
                 ui.add_space((ui.available_height() - 64.0).max(0.0));
@@ -10440,6 +10433,71 @@ mod tests {
         app.shared.lock().unwrap().doc = doc;
         app.select_content(&id);
         (app, ctx)
+    }
+    #[test]
+    fn toolbar_selection_is_fully_painted_in_the_click_frame() {
+        let (mut app, ctx) = small_fixture();
+        let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+        let mut time = 0.;
+        let mut draw = |app: &mut PeerBrush, events| {
+            time += 1. / 240.;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == Color32::from_rgb(74, 48, 71)
+                            && rect.rect.left() < 60.
+                            && rect.rect.size() == Vec2::new(42., 39.) =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        draw(&mut app, vec![]);
+        let selected = draw(&mut app, vec![]);
+        assert_eq!(selected.len(), 1);
+        let brush = selected[0];
+        let eraser = brush.translate(Vec2::new(0., 5. * 43.));
+        for (tool, rect) in [(Tool::Eraser, eraser), (Tool::Brush, brush)] {
+            let pos = rect.center();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    button(pos, egui::PointerButton::Primary, true, Default::default()),
+                ],
+            );
+            let selected = draw(
+                &mut app,
+                vec![button(
+                    pos,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+            );
+            assert!(app.tool == tool);
+            assert_eq!(selected.len(), 1, "Only the current tool is highlighted");
+            assert!(
+                selected[0].contains(pos),
+                "The clicked tool is painted without a fade"
+            );
+        }
+        let engine = app.shared.lock().unwrap();
+        assert!(engine.undo.is_empty());
+        assert_eq!(engine.doc.export_png().unwrap(), before);
     }
     #[test]
     fn magic_wand_selects_without_creating_or_changing_native_masks() {
