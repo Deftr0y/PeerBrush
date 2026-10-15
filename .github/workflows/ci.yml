@@ -137,6 +137,7 @@ jobs:
           exit "$test_status"
       - run: cargo clippy --all-targets --locked
       - run: python scripts/test_package.py
+      - run: python scripts/test_submit_store_release.py
       - run: python scripts/build_release.py
       - name: Package and report archive sizes
         shell: bash
