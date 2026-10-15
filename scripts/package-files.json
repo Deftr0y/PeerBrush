@@ -281,7 +281,11 @@
     "src/ui/contour_points.rs",
     "tests/custom_contours.rs",
     "docs/layer-styles.md",
-    "docs/release-0.25.md"
+    "docs/release-0.25.md",
+    ".github/workflows/store-submit.yml",
+    "docs/store-automation.md",
+    "scripts/submit_store_release.py",
+    "scripts/test_submit_store_release.py"
   ],
   "portable": [
     "LICENSE",
