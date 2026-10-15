@@ -617,6 +617,7 @@ mod tests {
                 }
             }
             base.mask = Some(Mask {
+                linked: true,
                 enabled: case % 5 != 0,
                 cache_key: id(),
                 steps: vec![MaskStep {

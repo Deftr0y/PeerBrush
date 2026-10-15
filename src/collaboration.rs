@@ -360,6 +360,7 @@ mod tests {
         let mut mask = Raster::new_depth(16, 16, 16);
         mask.set16(2, 2, [12345, 12345, 12345, 65535]);
         draft.layers[0].mask = Some(Mask {
+            linked: true,
             enabled: true,
             cache_key: engine::id(),
             steps: vec![MaskStep {
