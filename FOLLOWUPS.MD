@@ -169,6 +169,8 @@ These requests are queued for later development; they do not replace the active 
 
 | PB-150 | Cohesive, polished popup messages | Queued | Improve popup-message typography, spacing, hierarchy, icons and action-button presentation so information, warnings, errors and confirmations feel consistent with the compact Ember interface. Keep messages readable at small windows and display scaling, make the primary and safe/cancel actions clear, and preserve keyboard focus and dismissal behavior. Do not weaken save-conflict, unsaved-work, duplicate-open or destructive-action safeguards (PB-080/PB-137/PB-138). Verify representative native popups and their action/cancellation flows. |
 
+| PB-151 | Suggest clipboard image dimensions for a new canvas | Queued | When the New Canvas dialog opens and the clipboard contains a readable image, prefill the editable width and height with that image's pixel dimensions as the suggested default canvas size. Reuse the existing clipboard-image support (PB-025/PB-086) where appropriate. Keep ordinary defaults when there is no image or clipboard access fails; validate dimensions against supported canvas limits and report unsupported sizes clearly. Do not overwrite the user's edits while the dialog is open, alter the clipboard, paste the image automatically or create a project until the user confirms. Verify image, non-image, empty and inaccessible clipboard cases, changed clipboard contents on the next dialog opening, manual overrides and cancellation. |
+
 ## Future refinements
 
 | ID | Feature | Status | Acceptance |
