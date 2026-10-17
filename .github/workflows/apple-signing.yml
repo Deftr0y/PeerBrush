@@ -1,0 +1,274 @@
+name: PeerBrush reviewed Apple signing
+run-name: Apple signing for the reviewed PeerBrush 0.25.0 source
+
+# This workflow must live on protected main. Create/protect the apple-signing
+# environment before activation. Commit the keychain patch first, then replace
+# the single allowlist placeholder below with that reviewed commit's full SHA.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Repeat the full reviewed source SHA pinned in this workflow
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peerbrush-apple-signing
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  REVIEWED_SOURCE_COMMIT: 3f8b615c6d3e6503e4a55cce3dc1bfc9b829f1c5
+  RELEASE_VERSION: '0.25.0'
+  APPLE_TEAM: KU3Q7F9Q84
+  APPLE_IDENTITY_SHA1: 144ED1E67A4AF3F374E830FFF429B46109BB53EE
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+jobs:
+  build:
+    if: github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 90
+    outputs:
+      unsigned_sha256: ${{ steps.inspect.outputs.sha256 }}
+    steps:
+      - name: Require the reviewed source before checkout
+        env:
+          SELECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]] || { echo 'Do not rerun notarization automatically; reconcile any prior submission first.'; exit 1; }
+          [[ "$REVIEWED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SELECTED_COMMIT" == "$REVIEWED_SOURCE_COMMIT" ]]
+          [[ "$(uname -m)" == arm64 ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REVIEWED_SOURCE_COMMIT }}
+          persist-credentials: false
+      - name: Check exact source and version
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$REVIEWED_SOURCE_COMMIT" ]]
+          python3 - <<'PY'
+          import os, tomllib
+          assert tomllib.load(open('Cargo.toml', 'rb'))['package']['version'] == os.environ['RELEASE_VERSION']
+          PY
+          python3 scripts/package.py --check-source
+      - name: Test and build without Apple credentials
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          cargo fmt --all -- --check
+          cargo test --locked
+          cargo clippy --all-targets --locked
+          python3 scripts/test_package.py
+          python3 scripts/test_sign_macos.py
+          python3 scripts/build_release.py
+          python3 scripts/package.py
+      - name: Inspect unsigned candidate and record its exact digest
+        id: inspect
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, sys
+          sys.path.insert(0, 'scripts')
+          from package import digest
+          from verify_release import inspect_archive
+          archive = pathlib.Path('dist/PeerBrush-0.25.0-macOS-arm64.zip')
+          inspected = inspect_archive(archive, os.environ['REVIEWED_SOURCE_COMMIT'], os.environ['RELEASE_VERSION'])
+          assert inspected['record']['native_publisher_signing'] == 'not-configured'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('sha256=' + digest(archive) + '\n')
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-unsigned-${{ github.run_id }}
+          path: dist/PeerBrush-0.25.0-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  sign:
+    needs: build
+    if: github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main'
+    environment: apple-signing
+    runs-on: macos-26
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REVIEWED_SOURCE_COMMIT }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: apple-unsigned-${{ github.run_id }}
+          path: ${{ runner.temp }}/apple-unsigned
+          digest-mismatch: error
+      - name: Verify source, unsigned archive, and public Apple intermediate
+        env:
+          SELECTED_COMMIT: ${{ inputs.expected_commit }}
+          UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
+        run: |
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$REVIEWED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SELECTED_COMMIT" == "$REVIEWED_SOURCE_COMMIT" ]]
+          [[ "$(git rev-parse HEAD)" == "$REVIEWED_SOURCE_COMMIT" ]]
+          [[ "$(uname -m)" == arm64 ]]
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+          sys.path.insert(0, 'scripts')
+          from package import digest
+          from verify_release import inspect_archive
+          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-unsigned/PeerBrush-0.25.0-macOS-arm64.zip'
+          expected = os.environ['UNSIGNED_SHA256']
+          assert re.fullmatch('[0-9a-f]{64}', expected) and digest(archive) == expected
+          inspect_archive(archive, os.environ['REVIEWED_SOURCE_COMMIT'], os.environ['RELEASE_VERSION'])
+          PY
+          umask 077
+          mkdir "$RUNNER_TEMP/apple-credentials"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+            -o "$RUNNER_TEMP/apple-credentials/DeveloperIDG2CA.cer"
+          printf '%s  %s\n' f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a \
+            "$RUNNER_TEMP/apple-credentials/DeveloperIDG2CA.cer" | shasum -a 256 -c -
+      - name: Import credentials only after environment approval
+        env:
+          APPLE_SIGNING_P12_BASE64: ${{ secrets.APPLE_SIGNING_P12_BASE64 }}
+          APPLE_SIGNING_P12_PASSWORD: ${{ secrets.APPLE_SIGNING_P12_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          set +x
+          python3 - <<'PY'
+          import base64, binascii, json, os, pathlib, secrets, shlex, subprocess
+          names = ('APPLE_SIGNING_P12_BASE64', 'APPLE_SIGNING_P12_PASSWORD', 'APPLE_ID', 'APPLE_TEAM_ID', 'APPLE_NOTARY_PASSWORD')
+          values = {name: os.environ.pop(name, '') for name in names}
+          if not all(values.values()) or values['APPLE_TEAM_ID'] != os.environ['APPLE_TEAM']:
+              raise SystemExit('Missing Apple environment secrets or unexpected Team ID.')
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-credentials'
+          keychain = root / 'signing.keychain-db'
+          p12 = root / 'identity.p12'
+          password = secrets.token_urlsafe(48)
+          def quiet(stage, command):
+              try:
+                  return subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+              except subprocess.CalledProcessError as error:
+                  raise SystemExit(f'Apple credential setup failed at {stage} (exit {error.returncode}); tool output was suppressed to protect credentials.') from None
+              except subprocess.TimeoutExpired:
+                  raise SystemExit(f'Apple credential setup failed at {stage} (timed out); tool output was suppressed to protect credentials.') from None
+              except (OSError, subprocess.SubprocessError):
+                  raise SystemExit(f'Apple credential setup failed at {stage} (tool could not run); tool output was suppressed to protect credentials.') from None
+          try:
+              os.umask(0o077)
+              p12.write_bytes(base64.b64decode(values['APPLE_SIGNING_P12_BASE64'], validate=True))
+              quiet('create-keychain', ['/usr/bin/security', 'create-keychain', '-p', password, str(keychain)])
+              quiet('configure-keychain', ['/usr/bin/security', 'set-keychain-settings', '-lut', '7200', str(keychain)])
+              quiet('unlock-keychain', ['/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain)])
+              previous = shlex.split(quiet('read-keychain-search-list', ['/usr/bin/security', 'list-keychains', '-d', 'user']).stdout)
+              (root / 'search-list.json').write_text(json.dumps(previous))
+              quiet('update-keychain-search-list', ['/usr/bin/security', 'list-keychains', '-d', 'user', '-s', str(keychain), *previous])
+              quiet('import-apple-intermediate', ['/usr/bin/security', 'import', str(root / 'DeveloperIDG2CA.cer'), '-k', str(keychain)])
+              quiet('import-signing-p12', ['/usr/bin/security', 'import', str(p12), '-k', str(keychain), '-P', values['APPLE_SIGNING_P12_PASSWORD'], '-T', '/usr/bin/codesign'])
+              quiet('grant-codesign-key-access', ['/usr/bin/security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
+              quiet('validate-notary-credentials', ['/usr/bin/xcrun', 'notarytool', 'store-credentials', 'peerbrush-ci', '--keychain', str(keychain), '--apple-id', values['APPLE_ID'], '--team-id', values['APPLE_TEAM_ID'], '--password', values['APPLE_NOTARY_PASSWORD']])
+          except (OSError, ValueError, binascii.Error):
+              raise SystemExit('Apple credential setup failed; inspect secret names and local P12 export without printing their values.') from None
+          finally:
+              p12.unlink(missing_ok=True)
+              values.clear()
+          PY
+      - name: Sign, notarize, staple, and validate the exact candidate
+        env:
+          UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
+        run: |
+          python3 scripts/sign_macos.py \
+            --archive "$RUNNER_TEMP/apple-unsigned/PeerBrush-0.25.0-macOS-arm64.zip" \
+            --output "$RUNNER_TEMP/apple-signed" --work "$RUNNER_TEMP/apple-work" \
+            --commit "$REVIEWED_SOURCE_COMMIT" --version "$RELEASE_VERSION" \
+            --expected-sha256 "$UNSIGNED_SHA256" --team-id "$APPLE_TEAM" \
+            --identity "$APPLE_IDENTITY_SHA1" --profile peerbrush-ci \
+            --keychain "$RUNNER_TEMP/apple-credentials/signing.keychain-db" --revision 1
+      - name: Delete temporary signing credentials before artifact upload
+        if: always()
+        run: |
+          set +x
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-credentials'
+          previous = root / 'search-list.json'
+          try:
+              if previous.is_file():
+                  subprocess.run(['/usr/bin/security', 'list-keychains', '-d', 'user', '-s', *json.loads(previous.read_text())], check=False, capture_output=True, timeout=30)
+          finally:
+              try:
+                  subprocess.run(['/usr/bin/security', 'delete-keychain', str(root / 'signing.keychain-db')], check=False, capture_output=True, timeout=30)
+              finally:
+                  if root.exists():
+                      shutil.rmtree(root)
+          PY
+      - name: Retain the validated candidate and public receipts only
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-signed-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/apple-signed/PeerBrush-0.25.0-macOS-arm64-apple-signed-r1.zip
+            ${{ runner.temp }}/apple-signed/PeerBrush-0.25.0-macOS-arm64-apple-signed-r1.zip.sha256
+            ${{ runner.temp }}/apple-signed/PeerBrush-0.25.0-macOS-arm64-apple-signed-r1.zip.verification.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Preserve resumable public payload with original file modes
+        if: always()
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib, json, os, pathlib, re, tarfile
+          work = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-work'
+          state = work / 'state.json'
+          if state.is_file():
+              data = json.loads(state.read_text())
+              submission = data.get('submission_id', '')
+              receipt = {
+                  'submission_id': submission if re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', submission) else None,
+                  'configuration': data['configuration'],
+                  'submission_archive_sha256': data['submission_sha256'],
+                  'state_sha256': hashlib.sha256(state.read_bytes()).hexdigest(),
+                  'workflow_sha': os.environ['GITHUB_SHA'],
+                  'workflow_run_id': os.environ['GITHUB_RUN_ID'],
+              }
+              (work / 'recovery-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+              # Artifact ZIPs do not preserve executable permissions. A narrow
+              # tar preserves modes for --resume without any keychain or P12.
+              selected = [state, work / 'recovery-receipt.json', work / 'submission.zip']
+              selected += sorted((work / 'payload').rglob('*'))
+              def public_metadata(info):
+                  info.uid = info.gid = 0
+                  info.uname = info.gname = ''
+                  return info
+              destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-recovery.tar'
+              with tarfile.open(destination, 'x') as archive:
+                  for path in selected:
+                      if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                          raise SystemExit('Unexpected recovery payload entry; refusing upload.')
+                      if path.is_file():
+                          archive.add(path, arcname=path.relative_to(work).as_posix(), recursive=False, filter=public_metadata)
+              print('Public recovery receipt: ' + json.dumps(receipt))
+              print('After interruption, reconcile Apple history and resume this exact payload. Do not submit it again.')
+          PYCODE
+      - name: Retain the credentials-free recovery archive
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: apple-recovery-${{ github.run_id }}
+          path: ${{ runner.temp }}/apple-recovery.tar
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 0
+      - name: Remove remaining temporary package data
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/apple-work" "$RUNNER_TEMP/apple-signed" "$RUNNER_TEMP/apple-unsigned" "$RUNNER_TEMP/apple-recovery.tar"

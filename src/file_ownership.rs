@@ -315,6 +315,36 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn final_owner_releases_os_locks_even_with_duplicated_descriptors() {
+        let dir = std::env::temp_dir().join(format!("pb-duplicated-owner-{}", crate::engine::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("Artwork.psd");
+        fs::write(&path, b"source").unwrap();
+        let alias = dir.join("Alias.psd");
+        fs::hard_link(&path, &alias).unwrap();
+        let owner = Ownership::open(&path, "original-project").unwrap();
+        let descriptors = owner
+            .files
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|lock| lock._file.try_clone().unwrap())
+            .collect::<Vec<_>>();
+        assert!(Ownership::open(&alias, "other-project").is_err());
+        drop(owner);
+        // Keep duplicated handles alive across reacquisition, reproducing the
+        // kernel lock lifetime of a concurrently forked process deterministically.
+        let reopened = Ownership::open(&path, "next-project").unwrap();
+        assert!(Ownership::open(&alias, "other-project").is_err());
+        drop(descriptors);
+        assert!(Ownership::open(&alias, "other-project").is_err());
+        drop(reopened);
+        assert!(Ownership::open(&alias, "other-project").is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn staged_identity_is_owned_before_publication_and_release_reaches_snapshots() {
         let dir = std::env::temp_dir().join(format!("pb-staged-owner-{}", crate::engine::id()));
         fs::create_dir(&dir).unwrap();
