@@ -168,14 +168,24 @@ class Signing(unittest.TestCase):
         self.assertFalse(any('--keychain' in c for c in self.calls))
 
     def test_invalid_explicit_keychains_fail_before_native_commands(self):
+        for path in [pathlib.Path('relative.keychain-db'), self.base / 'missing', self.base]:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'explicit keychain'):
+                self.sign(keychain=path)
+        self.assertEqual(self.calls, [])
+
+    def test_linked_explicit_keychains_fail_before_native_commands(self):
         keychain = self.base / 'regular.keychain-db'
         keychain.write_bytes(b'SYNTHETIC_NON_SECRET_KEYCHAIN')
         symlink = self.base / 'linked.keychain-db'
-        symlink.symlink_to(keychain)
         linked_directory = self.base / 'linked-directory'
-        linked_directory.symlink_to(self.base, target_is_directory=True)
-        for path in [pathlib.Path('relative.keychain-db'), self.base / 'missing',
-                     self.base, symlink, linked_directory / keychain.name]:
+        try:
+            symlink.symlink_to(keychain)
+            linked_directory.symlink_to(self.base, target_is_directory=True)
+        except OSError as error:
+            if getattr(error, 'winerror', None) == 1314:
+                self.skipTest('Windows symlink creation privilege is unavailable')
+            raise
+        for path in [symlink, linked_directory / keychain.name]:
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'explicit keychain'):
                 self.sign(keychain=path)
         self.assertEqual(self.calls, [])
