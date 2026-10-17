@@ -83,6 +83,7 @@ pub fn apply(doc: &mut Document, index: usize, c: &Value) -> Result<(), String> 
     }
     let layer = &mut doc.layers[index];
     let mask = layer.mask.get_or_insert_with(|| Mask {
+        linked: true,
         enabled: true,
         steps: vec![],
         cache_key: id(),

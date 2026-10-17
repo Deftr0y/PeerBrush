@@ -34,6 +34,7 @@ fn dab_regions_match_full_native_renders_for_masks_effects_and_changed_settings(
                     settings: json!({"levels":7}),
                 }];
                 base.layers[0].mask = Some(Mask {
+                    linked: true,
                     enabled: true,
                     cache_key: id(),
                     steps: vec![
@@ -115,6 +116,7 @@ fn dirty_stroke_cache_matches_full_render_for_fractional_scales_isolation_and_ta
         backdrop.color = [40, 80, 180, 255];
         source.layers.push(backdrop);
         source.layers[0].mask = Some(Mask {
+            linked: true,
             enabled: true,
             cache_key: id(),
             steps: vec![
@@ -219,6 +221,7 @@ fn cache_resets_for_baselines_and_unbounded_effects() {
         .is_none());
     doc.layers[0].effects.clear();
     doc.layers[0].mask = Some(Mask {
+        linked: true,
         enabled: false,
         cache_key: id(),
         steps: vec![MaskStep {
@@ -455,6 +458,7 @@ fn incremental_engine_previews_match_full_replay_and_reset_settings_baselines_an
     base.layers[0].y = 3;
     let target = base.layers[0].id.clone();
     base.layers[0].mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![
@@ -543,6 +547,7 @@ fn native_dirty_previews_match_full_projection_with_local_masks_and_fractional_s
         }
     }
     source.layers[0].mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![
@@ -645,6 +650,7 @@ fn filtered_fixture(depth: u16) -> Document {
         },
     ];
     paint.mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![
@@ -807,6 +813,7 @@ fn raw_disabled_small_mask_updates_clamped_edge_strips_at_both_depths() {
         layer.y = 23;
         layer.pixels = Raster::new_depth(49, 33, depth);
         layer.mask = Some(Mask {
+            linked: true,
             enabled: false,
             cache_key: id(),
             steps: vec![

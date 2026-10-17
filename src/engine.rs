@@ -32,9 +32,14 @@ pub struct MaskStep {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Mask {
     pub enabled: bool,
+    #[serde(default = "mask_linked")]
+    pub linked: bool,
     pub steps: Vec<MaskStep>,
     #[serde(skip, default = "id")]
     pub cache_key: String,
+}
+fn mask_linked() -> bool {
+    true
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Layer {
@@ -682,7 +687,7 @@ impl Engine {
     }
     fn state_core(&mut self) -> Value {
         self.expire();
-        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"source_structure":self.doc.source_structure,"source_patterns":self.doc.source_patterns,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"source_structure":self.doc.source_structure,"source_patterns":self.doc.source_patterns,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"linked":m.linked,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -1559,6 +1564,19 @@ impl Engine {
         self.apply_inner(c)
     }
     fn apply_inner(&mut self, c: &Value) -> Result<(), String> {
+        let mut linked;
+        let c = if matches!(c["op"].as_str(), Some("move" | "transform"))
+            && c["mask"] == true
+            && self.doc.layers.iter().any(|layer| {
+                c["layer"].as_str() == Some(layer.id.as_str())
+                    && layer.mask.as_ref().is_some_and(|mask| mask.linked)
+            }) {
+            linked = c.clone();
+            linked["mask"] = json!(false);
+            &linked
+        } else {
+            c
+        };
         self.doc.ensure_depth();
         let op = text(c, "op", "");
         let target = text(c, "layer", "");
@@ -1913,6 +1931,7 @@ impl Engine {
             }
             let layer = &mut self.doc.layers[i];
             layer.mask = Some(Mask {
+                linked: true,
                 enabled: true,
                 cache_key: id(),
                 steps: vec![
@@ -2089,6 +2108,9 @@ impl Engine {
                 m.cache_key = id();
             }
             match op {
+                "mask.link" => {
+                    m.linked = c["linked"].as_bool().ok_or("Mask linked must be boolean")?;
+                }
                 "mask.toggle" => {
                     m.enabled = c
                         .get("enabled")

@@ -249,6 +249,7 @@ fn psb_saved_groups_effects_clipping_profiles_and_standard_channels_are_current(
         let mut mask_pixels = Raster::new_depth(3, 2, depth);
         mask_pixels.set16(1, 0, [23459, 23459, 23459, 65535]);
         base.mask = Some(Mask {
+            linked: true,
             enabled: true,
             cache_key: peerbrush::engine::id(),
             steps: vec![

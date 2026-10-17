@@ -22,6 +22,7 @@ fn rich_tree() -> (Document, String, String) {
     let mut mask_pixels = Raster::new(16, 12);
     mask_pixels.set(4, 5, [60, 60, 60, 255]);
     child.mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: engine::id(),
         steps: vec![
@@ -472,6 +473,7 @@ fn native_layer_copy_duplicate_and_cross_depth_paste_preserve_every_word() {
     let mut malformed = restored;
     malformed.layers[0].pixels = Raster::new(8, 8);
     malformed.layers[0].mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: engine::id(),
         steps: vec![MaskStep {

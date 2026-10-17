@@ -129,6 +129,7 @@ mod tests {
             vec![0, 2, 0, 0, 3]
         );
         doc.layers[1].mask = Some(Mask {
+            linked: true,
             enabled: true,
             steps: vec![],
             cache_key: "mask".into(),
@@ -199,6 +200,7 @@ mod tests {
                         let mut paint = Raster::new_depth(l.pixels.width, l.pixels.height, depth);
                         paint.set16(29, 31, [17773, 17773, 17773, 48261]);
                         l.mask = Some(Mask {
+                            linked: true,
                             enabled: true,
                             cache_key: crate::engine::id(),
                             steps: vec![

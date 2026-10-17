@@ -295,6 +295,13 @@ impl Inverse {
                     Some(target),
                     "mask.enabled",
                 );
+                self.field(
+                    &b.linked,
+                    &a.linked,
+                    &mut c.linked,
+                    Some(target),
+                    "mask.linked",
+                );
                 let bid: Vec<_> = b.steps.iter().map(|s| s.id.clone()).collect();
                 let aid: Vec<_> = a.steps.iter().map(|s| s.id.clone()).collect();
                 for step in &a.steps {
