@@ -47,6 +47,7 @@
     "examples/brush_performance.rs",
     "examples/gpu16_effects.rs",
     "examples/gpu_effects.rs",
+    "examples/input_performance.rs",
     "examples/preview_performance.rs",
     "examples/tile_performance.rs",
     "integrations/segmentation-requirements.txt",
@@ -281,7 +282,11 @@
     "src/ui/contour_points.rs",
     "tests/custom_contours.rs",
     "docs/layer-styles.md",
-    "docs/release-0.25.md"
+    "docs/release-0.25.md",
+    ".github/workflows/store-submit.yml",
+    "docs/store-automation.md",
+    "scripts/submit_store_release.py",
+    "scripts/test_submit_store_release.py"
   ],
   "portable": [
     "LICENSE",

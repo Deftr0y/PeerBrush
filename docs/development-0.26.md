@@ -2,12 +2,12 @@
 
 Unreleased development on `version/0.26`, starting from the published 0.25 source and its documentation updates. Focused work uses `feature/0.26/<topic>` or `fix/0.26/<topic>` and follows the [development guide](development-guide.md). Published downloads remain 0.25. This queue supplements the acceptance criteria in [FOLLOWUPS.MD](../FOLLOWUPS.MD); an existing implementation is not evidence that outstanding acceptance work passed.
 
-Work proceeds in the backlog's established priority order:
+Work proceeds in this priority order, updated after the 2026-10-15 responsiveness report:
 
-1. **PB-122 / PB-136:** expand conservative Photoshop style import, preserving native channels and requiring an exact match with the standard saved composite. Keep unsupported documents protected. First slice: connect the existing integer pixel-grid gradient renderer to bounded gradient import without changing previously accepted source placement.
-2. **PB-110:** investigate the reported selection recurrence and preserve selection coverage through copy/paste, transforms and cancellation.
-3. **PB-080 / PB-137 / PB-138:** complete remaining lifecycle and cross-platform native acceptance checks. The original reported incident's cause remains unverified.
-4. **PB-072 / PB-108:** continue canvas/tablet and performance work; physical tablet, eraser-end and driver measurements require actual hardware.
+1. **PB-108 / PB-036 / PB-072:** investigate overall input-to-display delay first. Painting also lags on a blank canvas; the report describes a constant slight delay across the application, not just expensive brush tools. Measure input handling, preview replay/render, navigation and presentation separately. Physical pen-to-display and driver measurements require actual hardware.
+2. **PB-122 / PB-136:** expand conservative Photoshop style import, preserving native channels and requiring an exact match with the standard saved composite. Keep unsupported documents protected. First slice: connect the existing integer pixel-grid gradient renderer to bounded gradient import without changing previously accepted source placement.
+3. **PB-110:** investigate the reported selection recurrence and preserve selection coverage through copy/paste, transforms and cancellation.
+4. **PB-080 / PB-137 / PB-138:** complete remaining lifecycle and cross-platform native acceptance checks. The original reported incident's cause remains unverified.
 5. **PB-118 / PB-070:** receiving-application round trips and remaining Photoshop/color-profile fidelity, with actual application/version evidence.
 6. **PB-106 / PB-133:** close outstanding effects UI and native clipboard acceptance checks without replacing a populated human clipboard.
 7. **PB-007 / PB-042 / PB-036 / PB-061 / PB-076 / PB-081:** remaining visual feedback, performance paths and optional refinements after the higher-priority reliability work.
@@ -20,6 +20,33 @@ The existing GitHub Actions workflow runs engine, codec, protocol and UI regress
 CI caches Rust registry data and build outputs with the [official cache action](https://github.com/actions/cache), pinned to its verified Node.js 24 v5 commit. Keys separate runner image/architecture, stable compiler version, dependency manifests and release compiler flags. Tests and package verification still execute on every run; cached builds are not acceptance evidence. Runtime QA state, source-control metadata and credentials are outside the cached paths. Turnaround improvements remain to be measured after the first successful cache population.
 
 No release, website deployment, announcement or historical rewrite is part of starting this development branch.
+
+## PB-108 application responsiveness
+
+Investigation in progress. Canvas pan and zoom were applied after building the current frame's image mesh, producing a deterministic one-frame navigation delay. Navigation now precedes drawing and coordinate mapping, retaining modal, preview and tool-size gesture guards. The native graphics configuration requests one queued presentation frame instead of the library's default two; the driver may clamp this request.
+
+User acceptance of that first candidate failed: it felt about the same as published 0.25, including a trailing canvas cursor, lagging slider feedback and delayed tool selection. The CPU improvements below do not close this report. A further UI correction removes the range fill's extra 60 ms easing and the tool highlight's 100 ms fade. Toolbar clicks are resolved before painting either selection, so the clicked tool is fully highlighted in the click frame. AI numeric and canvas presentation retain their existing dedicated animation paths.
+
+The next isolated Windows candidate used `AutoNoVsync` with those control fixes. The user reported that both cursor and controls felt quicker. In a further comparison against normal vsync with the same control fixes, the user confirmed that the normal-vsync cursor felt slower. Initial native probe batches of 120 pointer-input UI updates had medians of 0.23–0.51 ms and p95 values of 0.34–1.89 ms, with a 20.03 ms outlier. Those timings cover UI processing, not physical display latency. Windows now requests `AutoNoVsync`, which uses immediate presentation when supported and a supported fallback otherwise; macOS/Linux keep the earlier vsync policy pending native verification. Immediate presentation may tear and consume more GPU time during input. This improvement does not close broader performance and hardware acceptance.
+
+Local verification of these changes passed 889 Rust checks, 18 packaging checks and six branch-policy checks. Eight optional Rust checks were ignored and one real OS clipboard transport check was excluded to preserve clipboard contents. Formatting and all-target Clippy passed with existing warnings. Focused regressions check that range fill follows its current value in the input frame and that only the clicked toolbar selection is fully painted in its click frame, without changing document pixels or history. The new native workspace was visually inspected; a separate fresh native16 run independently checked source samples, painting, exact undo and editable PSD save/reopen output. Diagnostic source, logs and executables remain outside tracked source.
+
+The first brush sample also unnecessarily discarded an exact prepared baseline when starting a new gesture key. The shared preview cache now transfers that baseline only when document identity, revision, layout and prepared keys match. Changed dimensions, isolation, masks and unsupported paths retain full-render guards. The first returned frame still requires a complete texture upload, since a preceding worker frame may not have reached the UI. Cancellation cannot reuse a draft as its committed baseline. Sources, precision, history and save rendering are unchanged.
+
+The navigation regression was reproduced before the change. `cargo run --locked --release --example input_performance` compares the previous full first-input strategy with retained rendering in the same warmed process, then measures 120 successive blank-canvas preview updates at native8/16, with and without smoothing. Sampled source rasters and display frames must equal full shared-engine replay. The relevant brush, preview, renderer and graphics-entry files were unchanged between published 0.25 and the 0.26 starting point.
+
+Paired local Windows release measurements, one paint layer, 18-pixel brush radius, no effects, 1536-pixel preview and smoothing disabled:
+
+| Canvas / depth | Full first input | Retained first input | Continuing median / p95 |
+| --- | --- | --- | --- |
+| 1024×768 / 8-bit | 3.13 ms | 0.72 ms | 0.75 / 1.04 ms |
+| 2048² / 8-bit | 7.27 ms | 1.68 ms | 1.50 / 1.88 ms |
+| 1024×768 / native16 | 6.60 ms | 0.78 ms | 0.73 / 1.00 ms |
+| 2048² / native16 | 15.49 ms | 2.02 ms | 1.62 / 2.99 ms |
+
+These are CPU replay/render observations, excluding OS input delivery, worker scheduling, texture upload, GPU presentation and physical display latency. Smoothing at 0.35 still increases continuing work: the measured native16 2048² p95 was 14.67 ms and maximum 17.57 ms. Broader stroke and startup profiling remain open; these measurements do not establish end-to-end responsiveness.
+
+Windows native8 and native16 artwork was rendered and captured in an isolated workspace. An independent PNG16 decoder verified every original low-bit source sample, exact undo and editable PSD save/reopen output. The saved-path ownership guard refused reopening the active project's file; an exact independent copy was used for the round trip. Physical pointer-to-display timing, native interactive navigation, macOS/Linux acceptance, final CI and user acceptance remain separate.
 
 ## PB-122 integer-grid gradient import
 

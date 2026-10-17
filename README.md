@@ -13,7 +13,7 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/AI_interface-MCP-5aaaff.svg)](docs/mcp.md)
 
-[Download 0.25](https://peerbrush.com/#downloads) · [Release notes](docs/release-0.25.md) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development guide](docs/development-guide.md) · [Roadmap](FOLLOWUPS.MD)
+[Website](https://peerbrush.com/) · [Watch the trailer](https://peerbrush.com/#demo) · [Download 0.25](https://peerbrush.com/#downloads) · [Release notes](docs/release-0.25.md) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development guide](docs/development-guide.md) · [Roadmap](FOLLOWUPS.MD)
 
 </div>
 
