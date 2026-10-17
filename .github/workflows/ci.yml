@@ -137,8 +137,11 @@ jobs:
           exit "$test_status"
       - run: cargo clippy --all-targets --locked
       - run: python scripts/test_package.py
+      - run: python scripts/test_msix.py
+      - run: python scripts/test_sign_macos.py
       - run: python scripts/test_submit_store_release.py
       - run: python scripts/build_release.py
+      - run: python scripts/test_msix_runtime_tests.py
       - name: Package and report archive sizes
         shell: bash
         run: |
@@ -156,6 +159,19 @@ jobs:
               summary.write('\n### Package archive sizes\n\n')
               summary.writelines(f'- `{name}`: {size:,} bytes\n' for name, size in rows)
           PY
+      - name: Build unsigned MSIX with explicit local-test identity
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])'
+          python scripts/package_msix.py --portable "dist/PeerBrush-$version-Windows-x64.zip" --development-identity
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: MSIX-local-test
+          path: dist/msix/*
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: PeerBrush-${{ runner.os }}

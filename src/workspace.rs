@@ -36,6 +36,7 @@ struct Entry {
     handle: Handle,
 }
 pub struct Workspace {
+    pub(crate) activation: crate::activation::Queue,
     pub(crate) open_warning: Option<String>,
     entries: Vec<Entry>,
     active: String,
@@ -104,6 +105,7 @@ pub fn attach(root: &Shared) -> Registry {
         return workspace;
     }
     let workspace = Arc::new(Mutex::new(Workspace {
+        activation: Default::default(),
         entries: vec![Entry {
             id: e.project_id.clone(),
             name: e.doc.name.clone(),

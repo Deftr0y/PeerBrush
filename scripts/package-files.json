@@ -286,7 +286,26 @@
     ".github/workflows/store-submit.yml",
     "docs/store-automation.md",
     "scripts/submit_store_release.py",
-    "scripts/test_submit_store_release.py"
+    "scripts/test_submit_store_release.py",
+    "docs/macos-signing.md",
+    "docs/msix.md",
+    "scripts/package_msix.py",
+    "scripts/sign_macos.py",
+    "scripts/test_msix.py",
+    "scripts/test_msix_runtime.py",
+    "scripts/test_msix_runtime_tests.py",
+    "scripts/test_sign_macos.py",
+    "src/activation.rs",
+    "src/packaged.rs",
+    "src/ui/activation.rs",
+    "docs/release-0.26.md",
+    "packaging/msix/AppxManifest.xml.in",
+    "packaging/msix/identity.example.json",
+    "packaging/msix/identity.store.json",
+    "packaging/msix/product.store.json",
+    "packaging/msix/Assets/Square150x150Logo.png",
+    "packaging/msix/Assets/Square44x44Logo.png",
+    "packaging/msix/Assets/StoreLogo.png"
   ],
   "portable": [
     "LICENSE",
@@ -324,7 +343,8 @@
     "integrations/segmentation_rembg.py",
     "docs/production-export.md",
     "docs/layer-styles.md",
-    "docs/release-0.25.md"
+    "docs/release-0.25.md",
+    "docs/release-0.26.md"
   ],
   "readme": "scripts/package-readme.md",
   "vendored": [
