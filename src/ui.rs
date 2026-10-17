@@ -2665,6 +2665,9 @@ impl PeerBrush {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
                         self.channel_tabs(ui, doc, l.mask.is_some());
+                        if l.mask.is_some() {
+                            self.mask_link_button(ui, doc, &l);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .selectable_label(
@@ -10498,6 +10501,106 @@ mod tests {
         let engine = app.shared.lock().unwrap();
         assert!(engine.undo.is_empty());
         assert_eq!(engine.doc.export_png().unwrap(), before);
+    }
+    #[test]
+    fn mask_link_control_accepts_pointer_and_keyboard_without_changing_artwork_or_target() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc.bit_depth = depth;
+                let id = engine.doc.layers[0].id.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":id})],
+                        None,
+                        None,
+                        "Mask",
+                    )
+                    .unwrap();
+                engine.undo.clear();
+            }
+            app.mask = true;
+            let selected = app.selected.clone();
+            let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+            let draw = |app: &mut PeerBrush, events| {
+                let doc = app.shared.lock().unwrap().doc.clone();
+                let mut response = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300., 180.))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            response = Some(app.mask_link_button(ui, &doc, &doc.layers[0]));
+                        });
+                    },
+                );
+                response.unwrap()
+            };
+            let response = draw(&mut app, vec![]);
+            let pos = response.rect.center();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    button(pos, egui::PointerButton::Primary, true, Default::default()),
+                ],
+            );
+            draw(
+                &mut app,
+                vec![button(
+                    pos,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+            );
+            assert!(
+                !app.shared.lock().unwrap().doc.layers[0]
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .linked
+            );
+            assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+            response.request_focus();
+            for key in [egui::Key::Space, egui::Key::Enter] {
+                let before = app.shared.lock().unwrap().doc.layers[0]
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .linked;
+                for pressed in [true, false] {
+                    draw(
+                        &mut app,
+                        vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                }
+                assert_ne!(
+                    app.shared.lock().unwrap().doc.layers[0]
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .linked,
+                    before
+                );
+            }
+            assert_eq!(app.selected, selected);
+            assert!(app.mask);
+            assert_eq!(app.shared.lock().unwrap().doc.export_png().unwrap(), before);
+            app.shared.lock().unwrap().doc.layers[0].locked = true;
+            assert!(!draw(&mut app, vec![]).enabled());
+        }
     }
     #[test]
     fn magic_wand_selects_without_creating_or_changing_native_masks() {

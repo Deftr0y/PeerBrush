@@ -238,6 +238,7 @@
     "tests/raster_materialization.rs",
     "tests/recovery.rs",
     "tests/retained_transform.rs",
+    "tests/mask_linking.rs",
     "tests/retouch.rs",
     "tests/segmentation.rs",
     "tests/selection_clipboard.rs",

@@ -18,6 +18,7 @@ fn paint_mask(width: u32, height: u32, value: u16) -> Mask {
         .flat_map(|_| [value, value, value, 65535])
         .collect();
     Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![

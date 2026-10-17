@@ -340,6 +340,7 @@ fn editable_vector_masks_effects_and_opacity_losses_are_specific_and_reports_are
         layer.opacity = 0.5;
         layer.effects = vec![effect(true)];
         layer.mask = Some(Mask {
+            linked: true,
             enabled: true,
             cache_key: peerbrush::engine::id(),
             steps: vec![MaskStep {

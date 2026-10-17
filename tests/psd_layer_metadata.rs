@@ -278,6 +278,7 @@ fn preferred_global_mask_settings_preserve_per_layer_masks_clipping_and_folders(
             pixels.set16(0, 0, [65535; 4]);
             pixels.set16(1, 0, [32769, 32769, 32769, 65535]);
             Mask {
+                linked: true,
                 enabled: true,
                 cache_key: peerbrush::engine::id(),
                 steps: vec![MaskStep {
