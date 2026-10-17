@@ -241,13 +241,11 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     }
     let (w, h) = ((right - left) as u32, (bottom - top) as u32);
     check_size(w, h)?;
-    if u64::from(w)
-        * u64::from(h)
-        * (1 + masks.iter().filter(|o| o.pixels.bytes() > 0).count() as u64)
-        > 128_000_000
-    {
-        return Err("Transform exceeds the 128-million-sample work budget".into());
-    }
+    crate::transform::work_budget(
+        w,
+        h,
+        1 + masks.iter().filter(|o| o.pixels.bytes() > 0).count(),
+    )?;
     let local = [1., 0., 0., 1., -left, -top];
     let before = layer.source.is_some().then(|| layer.clone());
     layer.pixels = if let Some(mut o) = color {
@@ -280,8 +278,27 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
 /// Mask-only placement keeps Color and other mask steps unchanged. Off-frame
 /// mask samples remain in the retained original, including through a PSD save.
 pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
-    let (sx, sy) = crate::transform::scales(c)?;
-    let angle = c["angle"].as_f64().unwrap_or(0.);
+    let moving = c["op"] == "move";
+    let (sx, sy) = if moving {
+        (1., 1.)
+    } else {
+        crate::transform::scales(c)?
+    };
+    let angle = if moving {
+        0.
+    } else {
+        c["angle"].as_f64().unwrap_or(0.)
+    };
+    let dx = if moving {
+        c["dx"].as_f64().unwrap_or(0.).round()
+    } else {
+        0.
+    };
+    let dy = if moving {
+        c["dy"].as_f64().unwrap_or(0.).round()
+    } else {
+        0.
+    };
     let px = c["pivot"][0]
         .as_f64()
         .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.)
@@ -290,21 +307,29 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
         .as_f64()
         .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.)
         - layer.y as f64;
-    if ![angle, px, py]
+    if ![angle, px, py, dx, dy]
         .iter()
         .all(|v| v.is_finite() && v.abs() <= 100000.)
     {
         return Err("Invalid mask transform".into());
     }
-    let mask = layer.mask.as_mut().ok_or("Layer has no mask")?;
-    let index = if let Some(id) = c["step"].as_str() {
-        mask.steps
-            .iter()
-            .position(|s| s.id == id && s.kind == "paint")
-    } else {
-        mask.steps.iter().rposition(|s| s.kind == "paint")
+    if c["step"].is_null() {
+        crate::transform::plain_mask(layer)?;
     }
-    .ok_or("Select a paint mask step to transform")?;
+    let mask = layer.mask.as_mut().ok_or("Layer has no mask")?;
+    let indices = mask
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step.kind == "paint" && c["step"].as_str().is_none_or(|id| id == step.id)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if !c["step"].is_null() && indices.is_empty() {
+        return Err("Select a paint mask step to transform".into());
+    }
+    crate::transform::work_budget(layer.pixels.width, layer.pixels.height, indices.len())?;
     let (sin, cos) = angle.to_radians().sin_cos();
     let (a, b, cc, d) = (
         exact(cos) * sx,
@@ -312,12 +337,21 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
         -exact(sin) * sy,
         exact(cos) * sy,
     );
-    let mut original = Original::from(&mask.steps[index].pixels);
-    original.matrix = compose(
-        [a, b, cc, d, px - a * px - cc * py, py - b * px - d * py],
-        original.matrix,
-    );
-    mask.steps[index].pixels = original.render(layer.pixels.width, layer.pixels.height)?;
+    for index in indices {
+        let mut original = Original::from(&mask.steps[index].pixels);
+        original.matrix = compose(
+            [
+                a,
+                b,
+                cc,
+                d,
+                px - a * px - cc * py + dx,
+                py - b * px - d * py + dy,
+            ],
+            original.matrix,
+        );
+        mask.steps[index].pixels = original.render(layer.pixels.width, layer.pixels.height)?;
+    }
     mask.cache_key = crate::engine::id();
     Ok(())
 }

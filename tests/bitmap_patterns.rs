@@ -207,7 +207,7 @@ fn bitmap_sources_roundtrip_with_masks_and_current_standard_psd_psb_channels() {
                 .unwrap();
             assert_eq!(
                 serde_json::from_slice::<Value>(&source).unwrap()["format"],
-                18
+                29
             );
         }
         e.edit(

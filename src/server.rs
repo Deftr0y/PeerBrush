@@ -709,6 +709,11 @@ pub fn capabilities() -> Value {
         json!({"op":"path.handle.move","layer":"PATH_ID","index":1,"handle":"out","point":[210,150]}),
         json!({"op":"path.to_selection","path":"PATH_ID","feather":1}),
     ]);
+    result["mask_link"] = json!({"command":{"op":"mask.link","layer":"LAYER_ID","linked":true},"default":true,"transforms":"Linked masks and Color move/rotate/scale together, including selected areas. Unlinked targets transform independently. Whole mask transforms include all paint steps; an explicit step selects one unlinked paint step. Independent Color and selected linked transforms require fill/paint mask steps; unsupported mask effects are refused without rasterization.","precision":"Native 8/16-bit rasters and retained originals; shared previews, reservations and undo.","psd":"Source format 29 retains link state. Standard mask pixels and composite remain current; external Photoshop link editing is not written or verified and appears in the save report."});
+    result["commands"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"op":"mask.link","layer":"LAYER_ID","linked":false}));
     result["effect_bake"] = json!({"commands":["effect.bake","mask.step.bake"],"scope":"Selected effect plus preceding stack; following effects remain editable. Folder Color flattens all children; editable Color sources rasterize. Mask keeps Color/hierarchy. Whole-target reservations, native 8/16-bit fidelity check and one undo. Inexact prefixes, backdrop-dependent adjustments and expanding styles that shift an attached mask frame are refused."});
     result["commands"].as_array_mut().unwrap().extend([
         json!({"op":"effect.bake","layer":"LAYER_ID","effect":"EFFECT_ID"}),

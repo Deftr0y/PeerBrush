@@ -163,6 +163,7 @@ pub fn from_color_with_native(
         mask.enabled = true;
     } else {
         layer.mask = Some(Mask {
+            linked: true,
             enabled: true,
             cache_key: id(),
             steps: vec![
