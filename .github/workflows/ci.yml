@@ -82,6 +82,8 @@ jobs:
             ~/.cargo/registry/src
             target
           key: peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py') }}
+          restore-keys: |
+            peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo fmt --all -- --check
