@@ -8,7 +8,7 @@ included, and no real submission has been tested.
 ## Missing integration gates
 
 1. Integrate and review the Windows Store packaging/runtime changes into the
-   normal version branch, then promote through `version/0.25` → `dev` → `main`.
+   normal version branch, then promote through `version/0.26` → `dev` → `main`.
    Do not blindly merge the historical Store candidate branch: it also contains
    superseded signing/release changes. Preserve newer fixes and attribution.
 2. The actual release publisher must build the Windows MSIX from the same
