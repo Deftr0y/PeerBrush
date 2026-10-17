@@ -126,6 +126,36 @@ fn failed_and_cancelled_loads_release_pending_ownership_and_close_releases_clone
     server::open(&fixture(), &path).unwrap();
 }
 #[test]
+fn repeated_atomic_saves_keep_native_work_while_engine_snapshots_survive() {
+    let dir = Directory::new();
+    let path = dir.0.join("Repeated.psd");
+    let shared = fixture();
+    server::save(&shared, &path).unwrap();
+    let snapshot = shared.lock().unwrap().clone();
+    let original = snapshot.doc.layers[0].pixels.rgba16();
+    for index in 0..3 {
+        let expected = {
+            let mut engine = shared.lock().unwrap();
+            engine.doc.layers[0].name = format!("Save {index}");
+            engine.doc.layers[0]
+                .pixels
+                .set16(3, 4, [23459 + index, 34571, 45683, 65535]);
+            engine.doc.revision += 1;
+            engine.doc.layers[0].pixels.rgba16()
+        };
+        server::save(&shared, &path).unwrap();
+        let reopened = peerbrush::psd::decode(&fs::read(&path).unwrap()).unwrap();
+        assert!(!reopened.read_only);
+        assert_eq!(reopened.bit_depth, 16);
+        assert_eq!(reopened.layers[0].pixels.rgba16(), expected);
+        let engine = shared.lock().unwrap();
+        assert_eq!(engine.saved_revision, engine.doc.revision);
+    }
+    assert_eq!(snapshot.doc.layers[0].pixels.rgba16(), original);
+    assert!(server::open(&fixture(), &path).is_err());
+    drop(snapshot);
+}
+#[test]
 fn ownership_child() {
     let Some(path) = std::env::var_os("PB_TEST_OPEN_OWNER") else {
         return;

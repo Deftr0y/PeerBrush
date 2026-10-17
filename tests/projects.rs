@@ -217,6 +217,7 @@ fn transfer_preview_and_paste_preserve_native_tree_masks_effects_and_standard_ps
         let mut pixels = Raster::new_depth(12, 10, 16);
         pixels.set16(2, 3, [40001, 40001, 40001, 65535]);
         child.mask = Some(Mask {
+            linked: true,
             enabled: true,
             cache_key: peerbrush::engine::id(),
             steps: vec![MaskStep {

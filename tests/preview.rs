@@ -7,6 +7,68 @@ use peerbrush::{
 use serde_json::json;
 
 #[test]
+fn first_dab_reuses_an_exact_displayed_baseline_across_gesture_keys() {
+    for depth in [8, 16] {
+        for isolate in [false, true] {
+            let mut engine = Engine::new();
+            engine.doc = Document::new_depth(160, 96, depth).unwrap();
+            let target = engine.doc.layers[0].id.clone();
+            let layer = isolate.then_some(target.as_str());
+            let mut cache = Cache::default();
+            let mut base = engine.doc.clone();
+            cache.render(&base, "", None, 117, layer, false).unwrap();
+            for gesture in ["first", "second"] {
+                let command = json!({"op":"paint","layer":target,"points":[[50,45]],"radius":4,"color":[233,84,32,255]});
+                let (draft, dirty) = cache
+                    .edit_with_region(base.clone(), std::slice::from_ref(&command), gesture)
+                    .unwrap();
+                assert!(
+                    dirty.is_some(),
+                    "the exact committed canvas is already displayed"
+                );
+                let frame = cache
+                    .render(&draft, gesture, dirty, 117, layer, false)
+                    .unwrap();
+                assert!(frame.dirty.is_none(), "a new gesture must upload the complete frame even when its CPU render is regional");
+                let reference =
+                    Engine::preview_edits(base.clone(), std::slice::from_ref(&command)).unwrap();
+                assert_eq!(
+                    frame.bytes,
+                    reference.preview(None, 117, layer, false).unwrap().2
+                );
+                assert_eq!(draft.layers[0].pixels, reference.layers[0].pixels);
+                assert_eq!(engine.doc.revision, base.revision);
+                // A cancelled draft cannot serve as the next gesture's baseline.
+                let (_, cancelled) = cache
+                    .edit_with_region(base.clone(), std::slice::from_ref(&command), "cancelled")
+                    .unwrap();
+                assert!(cancelled.is_none());
+                engine
+                    .edit("human", &[command], Some(base.revision), None, "Dot")
+                    .unwrap();
+                base = engine.doc.clone();
+                cache.render(&base, "", None, 117, layer, false).unwrap();
+            }
+            let command = json!({"op":"paint","layer":target,"points":[[90,45]],"radius":4});
+            let (draft, dirty) = cache.edit_with_region(base, &[command], "resized").unwrap();
+            assert!(dirty.is_some());
+            assert!(
+                cache
+                    .render(&draft, "resized", dirty, 118, layer, false)
+                    .unwrap()
+                    .dirty
+                    .is_none(),
+                "changed output dimensions still require a full redraw"
+            );
+            engine.undo("human").unwrap();
+            engine.undo("human").unwrap();
+            assert!(engine.doc.layers[0].pixels.tiles.is_empty());
+            assert!(engine.doc.layers[0].pixels.samples16.is_empty());
+        }
+    }
+}
+
+#[test]
 fn dab_regions_match_full_native_renders_for_masks_effects_and_changed_settings() {
     for depth in [8, 16] {
         for mask in [false, true] {
@@ -34,6 +96,7 @@ fn dab_regions_match_full_native_renders_for_masks_effects_and_changed_settings(
                     settings: json!({"levels":7}),
                 }];
                 base.layers[0].mask = Some(Mask {
+                    linked: true,
                     enabled: true,
                     cache_key: id(),
                     steps: vec![
@@ -115,6 +178,7 @@ fn dirty_stroke_cache_matches_full_render_for_fractional_scales_isolation_and_ta
         backdrop.color = [40, 80, 180, 255];
         source.layers.push(backdrop);
         source.layers[0].mask = Some(Mask {
+            linked: true,
             enabled: true,
             cache_key: id(),
             steps: vec![
@@ -219,6 +283,7 @@ fn cache_resets_for_baselines_and_unbounded_effects() {
         .is_none());
     doc.layers[0].effects.clear();
     doc.layers[0].mask = Some(Mask {
+        linked: true,
         enabled: false,
         cache_key: id(),
         steps: vec![MaskStep {
@@ -455,6 +520,7 @@ fn incremental_engine_previews_match_full_replay_and_reset_settings_baselines_an
     base.layers[0].y = 3;
     let target = base.layers[0].id.clone();
     base.layers[0].mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![
@@ -543,6 +609,7 @@ fn native_dirty_previews_match_full_projection_with_local_masks_and_fractional_s
         }
     }
     source.layers[0].mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![
@@ -645,6 +712,7 @@ fn filtered_fixture(depth: u16) -> Document {
         },
     ];
     paint.mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![
@@ -807,6 +875,7 @@ fn raw_disabled_small_mask_updates_clamped_edge_strips_at_both_depths() {
         layer.y = 23;
         layer.pixels = Raster::new_depth(49, 33, depth);
         layer.mask = Some(Mask {
+            linked: true,
             enabled: false,
             cache_key: id(),
             steps: vec![

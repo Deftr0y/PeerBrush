@@ -351,3 +351,29 @@ fn published_manifest_is_ready_without_an_installed_client() {
     assert!(!report.needs_retry());
     assert!(report.summary().contains("Manual setup"));
 }
+
+#[test]
+fn installed_alias_migrates_old_portable_target_and_repeats_without_rewrites() {
+    let mut f = Fixture::new(&[ClientKind::Codex, ClientKind::Cursor]);
+    f.connect();
+    let old_config = f.text(0);
+    f.executable = f
+        .root
+        .join("Microsoft/WindowsApps/PeerBrush.Test_0123456789abc/peerbrush-mcp.exe");
+    fs::create_dir_all(f.executable.parent().unwrap()).unwrap();
+    fs::write(&f.executable, []).unwrap();
+    let migrated = f.connect();
+    assert_eq!(migrated.registered_count, 2);
+    assert!(migrated.clients.iter().all(|client| client.changed));
+    assert_eq!(
+        fs::read_to_string(migrated.clients[0].backup.as_ref().unwrap()).unwrap(),
+        old_config
+    );
+    let config = f.text(0).parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        config["mcp_servers"]["peerbrush"]["command"].as_str(),
+        f.executable.to_str()
+    );
+    assert_eq!(config["mcp_servers"].as_table().unwrap().len(), 1);
+    assert!(f.connect().clients.iter().all(|client| !client.changed));
+}

@@ -13,6 +13,20 @@ on:
         default: false
         type: boolean
 
+      build_store_msix:
+        description: Prepare unsigned Microsoft Store submission candidate (no upload)
+        required: true
+        default: false
+        type: boolean
+      store_package_version:
+        description: Optional approved Store version A.B.C.0; blank maps Cargo version
+        required: false
+        type: string
+      previous_store_version:
+        description: Previous published Store version A.B.C.0; required for upgrades
+        required: false
+        type: string
+
 permissions:
   contents: read
 
@@ -45,8 +59,36 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked
       - run: python scripts/test_package.py
+      - run: python scripts/test_msix.py
+      - run: python scripts/test_sign_macos.py
+      - run: python scripts/test_submit_store_release.py
       - run: python scripts/build_release.py
+      - run: python scripts/test_msix_runtime_tests.py
       - run: python scripts/package.py
+      - name: Prepare exact-identity Store MSIX candidate
+        if: runner.os == 'Windows' && inputs.build_store_msix
+        shell: pwsh
+        env:
+          STORE_PACKAGE_VERSION: ${{ inputs.store_package_version }}
+          PREVIOUS_STORE_VERSION: ${{ inputs.previous_store_version }}
+        run: |
+          # Public Partner Center identity is committed and reviewed with source.
+          $identityPath = 'packaging/msix/identity.store.json'
+          $product = Get-Content -Raw 'packaging/msix/product.store.json' | ConvertFrom-Json
+          $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])'
+          $packageArgs = @('scripts/package_msix.py', '--portable', "dist/PeerBrush-$version-Windows-x64.zip", '--identity', $identityPath, '--expected-package-family', $product.package_family_name, '--output', 'dist/store-candidate')
+          if ($env:STORE_PACKAGE_VERSION) { $packageArgs += @('--package-version', $env:STORE_PACKAGE_VERSION) }
+          if (-not $env:PREVIOUS_STORE_VERSION) { throw 'Read the actual current Store version and supply previous_store_version before building an update candidate.' }
+          $packageArgs += @('--previous-version', $env:PREVIOUS_STORE_VERSION)
+          $packageArgs += @('--portable-sha256', (Get-FileHash -Algorithm SHA256 "dist/PeerBrush-$version-Windows-x64.zip").Hash.ToLowerInvariant())
+          python @packageArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows' && inputs.build_store_msix
+        with:
+          name: unsigned-store-msix-candidate
+          path: dist/store-candidate/*
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: candidate-${{ runner.os }}

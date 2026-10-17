@@ -105,9 +105,6 @@ pub fn range_with_color(
             (*value - low) / (high - low)
         }
         .clamp(0.0, 1.0);
-        let fraction = ui
-            .ctx()
-            .animate_value_with_time(response.id.with("fill"), fraction, 0.06);
         let fill = fraction * rect.width();
         if fill > 0.0 {
             painter.rect_filled(
@@ -312,6 +309,85 @@ pub fn angle(
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Slider, ui.is_enabled(), format!("{name}: {value} degrees")));
         response.on_hover_text(format!("{help}\nDrag the radius · Shift snaps to 15° · Drag degrees to adjust · Double-click degrees to type · Focus and press Enter to type · Arrow keys adjust 1° (Shift: 15°) · Full turns wrap"))
     }).inner
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn range_fill_tracks_the_current_value_in_the_input_frame() {
+        for logarithmic in [false, true] {
+            let ctx = egui::Context::default();
+            let color = Color32::from_rgb(197, 63, 19);
+            let mut time = 0.;
+            let mut draw = |value: &mut f32, events| {
+                time += 1. / 240.;
+                let mut response = None;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(400.))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            response = Some(range_with_color(
+                                ui,
+                                "range",
+                                value,
+                                1.0..=100.,
+                                180.,
+                                "%",
+                                2,
+                                logarithmic,
+                                color,
+                            ));
+                        });
+                    },
+                );
+                let response = response.unwrap();
+                let fill = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(rect) if rect.fill == color => Some(rect.rect),
+                        _ => None,
+                    })
+                    .unwrap();
+                let fraction = if logarithmic {
+                    value.ln() / 100_f32.ln()
+                } else {
+                    (*value - 1.) / 99.
+                };
+                assert!((fill.width() - response.rect.width() * fraction).abs() < 0.001);
+                response
+            };
+            let mut value = 20.;
+            let response = draw(&mut value, vec![]);
+            // AI presentation supplies its own interpolated value; do not ease it again.
+            value = 65.125;
+            draw(&mut value, vec![]);
+            assert_eq!(value, 65.125);
+            let start = response.rect.center();
+            draw(
+                &mut value,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            let end = start + Vec2::new(50., 0.);
+            let response = draw(&mut value, vec![egui::Event::PointerMoved(end)]);
+            assert!(response.changed());
+        }
+    }
 }
 
 #[cfg(test)]
