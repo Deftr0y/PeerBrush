@@ -802,7 +802,9 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc.layers.iter().any(|l| {
+        format: if doc.layers.iter().any(|layer| layer.mask.is_some()) {
+            29
+        } else if doc.layers.iter().any(|l| {
             l.effects
                 .iter()
                 .any(|e| crate::effects::gradient::smoothed(&e.kind, &e.settings))
@@ -1691,7 +1693,12 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=28).contains(&e.format)
+                if (1..=29).contains(&e.format)
+                    && (e.format >= 29
+                        || e.document
+                            .layers
+                            .iter()
+                            .all(|layer| layer.mask.as_ref().is_none_or(|mask| mask.linked)))
                     && e.document.width == w
                     && e.document.height == h
                     && e.document.bit_depth == depth
@@ -2122,6 +2129,7 @@ fn decode_parts(
                                     }
                                 }
                                 rec.layer.mask = Some(Mask {
+                                    linked: true,
                                     cache_key: crate::engine::id(),
                                     enabled: rec.mask_enabled,
                                     steps: vec![

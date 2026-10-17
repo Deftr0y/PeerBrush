@@ -494,7 +494,7 @@ impl PeerBrush {
                         "AI has reserved this layer or a region; visibility stays available",
                     );
             }
-            let mask_width = if l.mask.is_some() { 35.0 } else { 0.0 };
+            let mask_width = if l.mask.is_some() { 60.0 } else { 0.0 };
             let summary = if l.kind == "group" {
                 let empty = FolderSummary::default();
                 let counts = tree.folders.get(&l.id).unwrap_or(&empty);
@@ -631,6 +631,7 @@ impl PeerBrush {
                 }
             }
             if l.mask.is_some() {
+                self.mask_link_button(ui, doc, l);
                 if self
                     .thumb_button(
                         ui,
@@ -662,6 +663,67 @@ impl PeerBrush {
             disclosure
         })
         .inner
+    }
+    pub(super) fn mask_link_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &Document,
+        layer: &Layer,
+    ) -> egui::Response {
+        let mut linked = layer.mask.as_ref().unwrap().linked;
+        let tip = if linked {
+            "Mask linked · transform Color and Mask together · Click to unlink"
+        } else {
+            "Mask unlinked · transform only the selected Color or Mask · Click to link"
+        };
+        let response = ui
+            .add_enabled_ui(
+                !doc.read_only && !self.busy && !layer.locked && !self.ai_reserved(&layer.id),
+                |ui| icons::small_button(ui, Icon::Connect, tip),
+            )
+            .inner;
+        if response.clicked() {
+            self.edit(vec![json!({"op":"mask.link","layer":layer.id,"linked":!linked,"document_id":doc.id,"source_revision":doc.revision})], if linked { "Unlink mask" } else { "Link mask" });
+            if let Some(mask) = self
+                .shared
+                .lock()
+                .unwrap()
+                .doc
+                .layers
+                .iter()
+                .find(|current| current.id == layer.id)
+                .and_then(|current| current.mask.as_ref())
+            {
+                linked = mask.linked;
+            }
+            ui.ctx().request_repaint();
+        }
+        if !linked {
+            ui.painter().line_segment(
+                [
+                    response.rect.left_bottom() + Vec2::new(2., -4.),
+                    response.rect.right_top() + Vec2::new(-2., 4.),
+                ],
+                Stroke::new(1.5, MUTED),
+            );
+        }
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                response.rect,
+                3,
+                Stroke::new(1., ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Checkbox,
+                response.enabled(),
+                linked,
+                "Link layer mask",
+            )
+        });
+        response
     }
     pub(super) fn layer_list(&mut self, ui: &mut egui::Ui, doc: &Document) {
         let mut context_menu = self

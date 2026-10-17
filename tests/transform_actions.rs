@@ -131,6 +131,14 @@ fn selected_mask_reflections_preserve_color_other_steps_and_folder_children() {
                     )
                     .unwrap();
                 }
+                e.edit(
+                    "human",
+                    &[json!({"op":"mask.link","layer":id,"linked":false})],
+                    None,
+                    None,
+                    "Unlink mask",
+                )
+                .unwrap();
                 e.undo.clear();
                 let before = e.doc.clone();
                 edit(
@@ -363,6 +371,14 @@ fn expanding_selected_mask_keeps_color_original_for_later_inverse_after_reopen()
             .unwrap()
             .pixels
             .clone();
+        e.edit(
+            "human",
+            &[json!({"op":"mask.link","layer":id,"linked":false})],
+            None,
+            None,
+            "Unlink mask",
+        )
+        .unwrap();
         e.edit(
             "human",
             &[json!({"op":"selection","rect":[5,3,8,7]})],
