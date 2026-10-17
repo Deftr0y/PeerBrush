@@ -64,6 +64,7 @@ fn mask(l: &mut Layer, depth: u16, values: [u16; 2]) {
         pixels.set16(x as i32, 0, [v, v, v, 65535]);
     }
     l.mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![MaskStep {

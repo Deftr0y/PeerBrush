@@ -135,6 +135,7 @@ fn selected_folder_batches_render_masks_effects_and_clipping_from_the_shared_eng
         group.pixels = Raster::new_depth(16, 12, depth);
         group.opacity = 0.63;
         group.mask = Some(Mask {
+            linked: true,
             enabled: true,
             cache_key: peerbrush::engine::id(),
             steps: vec![MaskStep {

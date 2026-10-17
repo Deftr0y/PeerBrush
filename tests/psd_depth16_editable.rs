@@ -21,6 +21,7 @@ fn fixture() -> Document {
     let mut paint = Raster::new_depth(3, 2, 16);
     paint.set16(1, 0, [45679, 45679, 45679, 65535]);
     layer.mask = Some(Mask {
+        linked: true,
         enabled: false,
         cache_key: engine::id(),
         steps: vec![

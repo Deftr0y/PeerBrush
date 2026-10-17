@@ -82,6 +82,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<String, String> {
     let adjustment_id = adjustment.id.clone();
     if draft.selection.is_some() {
         adjustment.mask = Some(Mask {
+            linked: true,
             cache_key: id(),
             enabled: true,
             steps: vec![
