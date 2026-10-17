@@ -821,6 +821,7 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             | "tool_settings"
             | "image_info"
             | "focus"
+            | "native_open"
             | "client_state"
             | "capture_ui"
     ) {
@@ -1065,6 +1066,22 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
         "focus" => {
             shared.lock().unwrap().focus_requested = true;
             Ok(json!({"focused":true}))
+        }
+        "native_open" => {
+            let paths = p["paths"].as_array().ok_or("Missing activation paths")?;
+            if paths.len() > crate::activation::MAX_PENDING_FILES {
+                return Err("Too many files in this activation".into());
+            }
+            let paths = paths
+                .iter()
+                .map(|p| {
+                    p.as_str()
+                        .map(PathBuf::from)
+                        .ok_or("Invalid activation path")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let queued = crate::activation::enqueue(shared, paths)?;
+            Ok(json!({"queued":queued}))
         }
         "observe" => observation(shared, p),
         "code" => crate::code::dispatch(shared, actor, p),
@@ -2593,6 +2610,35 @@ pub fn focus_existing(state_dir: &Path) -> bool {
         std::time::Duration::from_millis(500),
     )
     .is_ok_and(|r| r["ok"] == true)
+}
+/// Forward files only after confirming a running listener. The same bearer-authenticated
+/// local endpoint is used; receiving a request never discards or replaces a project.
+pub fn activate_existing(state_dir: &Path, files: &[PathBuf]) -> Result<bool, String> {
+    if !focus_existing(state_dir) {
+        return Ok(false);
+    }
+    if files.is_empty() {
+        return Ok(true);
+    }
+    let paths = files
+        .iter()
+        .map(|p| p.to_str().ok_or("This file path cannot be sent to the existing window without changing its characters"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let reply = client_with_timeout(
+        state_dir,
+        "rpc",
+        &json!({"method":"native_open","params":{"paths":paths}}),
+        std::time::Duration::from_secs(5),
+    )?;
+    if reply["ok"] != true {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or(
+                "The running PeerBrush could not accept these files. Close it and try again.",
+            )
+            .into());
+    }
+    Ok(true)
 }
 fn client_with_timeout(
     state_dir: &Path,
