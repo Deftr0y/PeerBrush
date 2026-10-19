@@ -43,7 +43,7 @@ class Tests(unittest.TestCase):
         from store_release_state import Journal
         directory = tempfile.TemporaryDirectory(prefix='peerbrush-store-submit-test-')
         self.addCleanup(directory.cleanup)
-        self.journal = Journal(Path(directory.name) / 'receipt.json')
+        self.journal = Journal(Path(directory.name).resolve() / 'receipt.json')
         self.journal.bind('v0.26.0', fixture()[0], fixture()[2])
 
     def test_unexpected_exception_redacted(self):

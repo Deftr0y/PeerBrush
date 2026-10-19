@@ -17,7 +17,7 @@ class Tests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='peerbrush-store-state-')
         self.addCleanup(self.temporary.cleanup)
-        self.path = Path(self.temporary.name) / 'release.json'
+        self.path = Path(self.temporary.name).resolve() / 'release.json'
         self.journal = state.Journal(self.path)
         self.journal.bind('v0.26.0', fixture()[0], fixture()[2])
 
