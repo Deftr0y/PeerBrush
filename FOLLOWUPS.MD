@@ -4,7 +4,7 @@
 
 [Version 0.26.0](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0), source `a00cf47accde87400fad3f0fcfc5fe96fc4f5be1`, has verified public macOS arm64 and Linux x64 downloads and a matching live website. The Mac package is a Developer ID signed, notarized and stapled app in a ZIP; a drag-to-Applications DMG is planned, not shipped. Windows Store 0.26 remains pending; submission and certification have not been verified.
 
-The high-priority installation, updates and production-publishing foundations below have no assigned release version yet. All other unfinished development and acceptance work is planned for [v0.3](docs/development-0.3.md), retaining its existing detail and relative priorities. PB-108 remains priority #1 within that v0.3 work. The [0.26 development record](docs/development-0.26.md) preserves earlier implementation, measurements and unresolved acceptance; it is not the next feature queue.
+The high-priority installation, updates and production-publishing foundations below are now proposed for inclusion in [v0.3](docs/development-0.3.md#scope-and-order), following the first measurable PB-108 fix. All other unfinished development and acceptance work retains its existing detail and relative priorities. PB-108 remains priority #1. The [0.26 development record](docs/development-0.26.md) preserves earlier implementation, measurements and unresolved acceptance; it is not the next feature queue.
 
 ## Version 0.25 release — 2026-10-12
 
@@ -19,7 +19,7 @@ Implementation/status cells below retain their historical checkpoint wording and
 
 ## High-priority foundations — installation, updates and production publishing
 
-These are one coordinated workstream, expanded from PB-145–147 rather than duplicated. The release version and implementation sequence remain to be agreed; do not silently assign these foundations to v0.3. Acceptance and the current/manual automation boundary are detailed in the [release plan](docs/release-signing-plan.md#high-priority-installation-and-production-foundations).
+These are one coordinated workstream, expanded from PB-145–147 rather than duplicated. Proposed v0.3 order: settings/migration, installed distributions and file associations, safe updates, then production publishing/Store reconciliation. Acceptance and the current/manual automation boundary are detailed in the [release plan](docs/release-signing-plan.md#high-priority-installation-and-production-foundations). Implementation evidence, rather than inclusion in the milestone, determines readiness.
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |

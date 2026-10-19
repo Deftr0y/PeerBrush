@@ -15,7 +15,7 @@ PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu.
 | `maintenance/archive-<checkpoint>` | Retained historical packaging corrections | No normal development promotion |
 | `maintenance/site-<topic>` | A reviewed website content change | `site-content` |
 
-Planning v0.3 does not create or rename branches or change package versions. Before implementation, establish `version/0.3` from synchronized `dev` under the existing policy, then use `feature/0.3/<topic>` or `fix/0.3/<topic>` targeting it; do not mix new development into published 0.26 artifacts.
+The active `version/0.3` integration branch starts from synchronized `dev`/`main`. Use `feature/0.3/<topic>` or `fix/0.3/<topic>` targeting it; do not mix new development into published 0.26 artifacts. The installation/release foundations are explicitly proposed for v0.3 in its development queue, with PB-108 still first.
 
 The normal promotion order is **feature or fix → matching version → dev → main**. Use lowercase names and a descriptive topic, for example `fix/0.26/selection-coverage`. Never create a `codex/` branch, regardless of capitalization. `origin/` is the remote-tracking prefix, not part of a branch name. Git cannot hold both `version/0.26` and `version/0.26/selection-coverage`; feature and fix names use their own namespace.
 
