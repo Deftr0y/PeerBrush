@@ -29,3 +29,18 @@ Use exact tested commits and applicable engine/codec/protocol checks plus native
 The shared 0.26 code already contains retained first-input rendering, same-frame navigation, immediate human controls, Windows low-latency presentation, guarded native file activation, MSIX packaging/associations and stable installed MCP aliases. Existing brush, shortcut, filter and export preferences persist. Apple signing/notarization/stapling exists for ZIPs. Reuse these implementations; their remaining installed/native acceptance stays open.
 
 PB-108 investigation begins with smoothed stroke tails: appending input changes the preceding final dab, causing the current replay session to discard all accumulated coverage. Measure the same release-mode workloads before and after a focused fix, assert exact native8/16 output and unchanged-prefix retention, then verify the native workspace. Full dab generation, OS delivery, worker scheduling, GPU presentation and physical tablet latency remain distinct measurements.
+
+## PB-108 changed-tail replay
+
+The shared brush session now finds the exact unchanged dab prefix. Reshaped/removed tails restore only their affected tile region from the original source and replay all current dabs contributing to that region in their original order. Other tiles and coverage remain retained. Full validation and stroke work limits still run before mutation. Tails that change or overlap the whole stroke still require that work; dab generation and validation remain linear in total stroke length.
+
+Release-mode CPU measurements on Windows, Intel Core i7-14650HX, using `cargo run --locked --offline --release --example input_performance` and a 1536-edge preview:
+
+| 2048² canvas, smoothing 0.35 | Before median / p95 | After median / p95 |
+| --- | --- | --- |
+| Native8, 120 continuing inputs | 3.96 / 8.29 ms | 2.26 / 3.60 ms |
+| Native16, 120 continuing inputs | 8.41 / 17.66 ms | 5.92 / 11.36 ms |
+
+The before run used the unchanged shared brush implementation at the initial planning merge. A paired, same-process 2048×96 smoothed/tapered 120-input brush-only workload compares complete replay with the retained session and asserts exact output after every input: native8 median/p95 6.56/12.22 ms versus 1.21/2.48 ms; native16 14.80/49.99 ms versus 3.45/8.88 ms. Retained replay processes 4,244 contributing dabs versus 18,606. These samples include normal scheduling variation; they measure CPU work, not physical input-to-display latency or a GPU improvement.
+
+All 29 focused brush-session/equivalence/texture/native16-paint/preview tests passed. New structural coverage verifies exact native8/16 source parity, pressure, textured tips, quantized opacity/flow, erase, polygon/rectangle clipping, taper, tail shrink/re-expansion and retained prefix tile identity. Full regression, exact-head CI and native workspace acceptance are in progress. Startup, controls/navigation stalls, physical tablet latency and user acceptance remain open; this slice does not close PB-108.
