@@ -32,6 +32,12 @@ class SafeError(ValueError):
     """Fixed, credential-free diagnostic explicitly safe for public CI logs."""
 
 
+class RemoteError(SafeError):
+    def __init__(self, status):
+        self.status = status if type(status) is int and 100 <= status <= 599 else None
+        super().__init__(f'Remote request failed (HTTP {self.status or "network error"}); outcome may be uncertain. Inspect the service before retrying.')
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -67,7 +73,7 @@ def request(url, *, method='GET', data=None, headers=None, binary=False, allow_r
     except (urllib.error.URLError, TimeoutError) as error:
         # Error URLs can contain upload SAS credentials. Never print the exception.
         code = getattr(error, 'code', None)
-        raise SafeError(f'Remote request failed (HTTP {code or "network error"}); outcome may be uncertain. Inspect the service before retrying.') from None
+        raise RemoteError(code) from None
     if binary:
         return body
     return json.loads(body) if body else {}
@@ -165,7 +171,7 @@ def published_version(submission):
     return max(version(p['version']) for p in packages)
 
 
-def submit(store, name, package, report, execute=False):
+def submit(store, name, package, report, execute=False, journal=None):
     app = store.call()
     if (app.get('id') != STORE_ID or app.get('packageIdentityName') != IDENTITY or
             app.get('publisherName') != PUBLISHER or app.get('packageFamilyName') != FAMILY):
@@ -181,11 +187,18 @@ def submit(store, name, package, report, execute=False):
     if not execute:
         print('Read-only Store preflight passed. No submission created.')
         return
+    if journal is None or journal.state is None:
+        raise SafeError('Store mutation requires a durable private release receipt.')
+    journal.bind(journal.state['tag'], name, report)
+    if hashlib.sha256(package).hexdigest() != report['sha256']:
+        raise SafeError('Package bytes differ from the private submission receipt.')
     # A create conflict safely stops us if another publisher won the race.
+    journal.phase('create-requested')
     draft = store.call('/submissions', method='POST')
     sid = str(draft.get('id', ''))
     if not re.fullmatch(r'[0-9]+', sid):
         raise SafeError('Invalid new submission ID; inspect Partner Center before retrying.')
+    journal.phase('created', sid)
     print('Created Store submission ' + sid + '. Any failure leaves this draft for inspection.')
     updated = copy.deepcopy(draft)
     if not updated.get('applicationPackages'):
@@ -207,8 +220,11 @@ def submit(store, name, package, report, execute=False):
     with zipfile.ZipFile(zipped, 'w', zipfile.ZIP_STORED) as archive:
         archive.writestr(name, package)
     request(upload, method='PUT', data=zipped.getvalue(), headers={'x-ms-blob-type': 'BlockBlob'}, binary=True)
+    journal.phase('commit-requested')
     store.call('/submissions/' + sid + '/commit', method='POST')
-    await_commit(store, sid)
+    journal.phase('committed')
+    status = await_commit(store, sid)
+    journal.observe(status)
 
 
 def await_commit(store, sid, timeout=600):
@@ -218,7 +234,7 @@ def await_commit(store, sid, timeout=600):
         status = store.call('/submissions/' + sid + '/status').get('status')
         if status in accepted:
             print('Store submission ' + sid + ' reached ' + status + '. Check Partner Center for certification/publication outcome.')
-            return
+            return status
         if status not in {'PendingCommit', 'CommitStarted'}:
             raise SafeError('Store commit failed or returned an unsupported status. Inspect Partner Center; no automatic retry.')
         if time.monotonic() >= deadline:
@@ -230,10 +246,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--submit', action='store_true', help='Create, upload and commit; default is read-only preflight.')
+    parser.add_argument('--state', type=Path, help='Durable private receipt; required for submission, never store it in public source or CI artifacts.')
     args = parser.parse_args()
     try:
+        if args.submit and args.state is None:
+            raise SafeError('Submission requires --state in durable private storage; hosted CI needs a reviewed persistence adapter before activation.')
         name, package, report = released_assets(args.tag)
-        submit(Store(), name, package, report, execute=args.submit)
+        if args.state is None:
+            submit(Store(), name, package, report)
+        else:
+            from store_release_state import locked
+            with locked(args.state) as journal:
+                journal.bind(args.tag, name, report)
+                submit(Store(), name, package, report, execute=args.submit, journal=journal)
     except Exception as error:
         # Known errors contain fixed strings; unexpected exceptions may include secrets.
         message = str(error) if isinstance(error, SafeError) else type(error).__name__

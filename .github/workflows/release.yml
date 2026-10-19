@@ -1,6 +1,8 @@
 name: PeerBrush release candidates
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       expected_commit:
@@ -38,12 +40,12 @@ jobs:
         os: [windows-2025, macos-26, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     env:
-      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.expected_commit }}
+          ref: ${{ inputs.expected_commit || github.sha }}
           persist-credentials: false
       - name: Check exact release source
         shell: bash
@@ -68,6 +70,8 @@ jobs:
         if: runner.os == 'macOS'
         run: python3 -B scripts/test_macos_dmg_native.py
       - run: python scripts/test_submit_store_release.py
+      - run: python scripts/test_store_release_state.py
+      - run: python scripts/test_production_readiness.py
       - run: python scripts/build_release.py
       - run: python scripts/test_msix_runtime_tests.py
       - run: python scripts/package.py
@@ -122,11 +126,11 @@ jobs:
     needs: native
     runs-on: ubuntu-24.04
     env:
-      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.expected_commit }}
+          ref: ${{ inputs.expected_commit || github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
@@ -138,6 +142,8 @@ jobs:
           python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
           python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
+          python scripts/production_readiness.py --directory dist --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist/production-readiness.json
+          echo 'Exact-source candidate archives verified. Production publication remains blocked pending native signing, installed acceptance, protected approval and public asset reconciliation.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: verified-release-candidate

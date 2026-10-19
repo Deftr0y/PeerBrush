@@ -148,6 +148,8 @@ jobs:
         if: runner.os == 'macOS'
         run: python3 -B scripts/test_macos_dmg_native.py
       - run: python scripts/test_submit_store_release.py
+      - run: python scripts/test_store_release_state.py
+      - run: python scripts/test_production_readiness.py
       - run: python scripts/build_release.py
       - run: python scripts/test_msix_runtime_tests.py
       - name: Package and report archive sizes
