@@ -529,6 +529,42 @@ class Packages(unittest.TestCase):
             self.assertTrue({'licenses/epaint_default_fonts-0.31.1/' + name for name in names} <= set(manifest['notice_files']))
             self.assertFalse(any(name.endswith('/private.txt') for name in archive.namelist()))
 
+    def test_tls_notices_include_ring_subcomponents_and_require_exact_checksums(self):
+        (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\nname="ring"\nversion="0.17.14"\nsource="registry+https://example.invalid"\n[[package]]\nname="rustls"\nversion="0.23.46"\nsource="registry+https://example.invalid"\n')
+        self.commit()
+        ring = self.root / 'registry/test/ring-0.17.14'
+        ring.mkdir(parents=True)
+        (ring / 'Cargo.toml').write_text('[package]\nname="ring"\nversion="0.17.14"\nlicense="Apache-2.0 AND ISC"\n')
+        (ring / 'LICENSE').write_text('Synthetic license index')
+        names = packaging.EXTRA_CRATE_NOTICES['ring']
+        for name in names:
+            path = ring / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('Synthetic component notice: ' + name)
+        (ring / 'LICENSE-private').write_text('SYNTHETIC_PRIVATE_CANARY')
+        checksums = {name: packaging.digest(ring / name) for name in names}
+        (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
+        rustls = self.root / 'registry/test/rustls-0.23.46'
+        rustls.mkdir(parents=True)
+        (rustls / 'Cargo.toml').write_text('[package]\nname="rustls"\nversion="0.23.46"\nlicense="Apache-2.0 OR ISC OR MIT"\n')
+        (rustls / 'LICENSE-ISC').write_text('Synthetic ISC alternative')
+        archive_path = self.build('Windows')
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
+            self.assertTrue({'licenses/ring-0.17.14/' + name for name in names} <= set(manifest['notice_files']))
+            self.assertIn('licenses/rustls-0.23.46/LICENSE-ISC', manifest['notice_files'])
+            self.assertFalse(any('LICENSE-private' in name for name in archive.namelist()))
+        notice = ring / 'LICENSE-other-bits'
+        original = notice.read_bytes()
+        notice.write_text('Tampered component notice')
+        with self.assertRaisesRegex(ValueError, 'notice checksum mismatch'):
+            self.build('Windows')
+        notice.write_bytes(original)
+        del checksums['LICENSE-other-bits']
+        (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
+        with self.assertRaisesRegex(ValueError, 'required dependency notice inventory'):
+            self.build('Windows')
+
     def test_dated_repack_names_preserve_internal_layout_and_require_matching_labels(self):
         commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
         for platform in ['Windows', 'Linux', 'macOS']:

@@ -50,10 +50,14 @@ def macos_info(version):
 NOTICE_NAMES = {
     "copying", "copyright", "license", "licence", "notice", "notices", "unlicense",
     "license-0bsd", "license-apache", "license-apache-2.0", "license-bsd",
-    "license-libm-mit", "license-mit", "license-unicode", "license-zlib",
+    "license-libm-mit", "license-mit", "license-isc", "license-unicode", "license-zlib",
     "license.apache", "license.mit",
 }
 EMBEDDED_FONT_NOTICES = {"epaint_default_fonts": {"fonts/Hack-Regular.txt", "fonts/OFL.txt", "fonts/UFL.txt", "fonts/emoji-icon-font-mit-license.txt"}}
+EXTRA_CRATE_NOTICES = {"ring": {
+    "LICENSE-BoringSSL", "LICENSE-other-bits", "src/polyfill/once_cell/LICENSE-APACHE",
+    "src/polyfill/once_cell/LICENSE-MIT", "third_party/fiat/LICENSE",
+}}
 NOTICE_NAMES |= {name + suffix for name in tuple(NOTICE_NAMES) for suffix in (".txt", ".md", ".rst")}
 
 
@@ -118,8 +122,17 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
             selected.add(meta["license-file"])
         # Embedded egui fonts have their own licenses; select checksum-listed notices.
         checksum_file = crate / ".cargo-checksum.json"
+        extra_notices = EXTRA_CRATE_NOTICES.get(package["name"], set())
+        if extra_notices and not checksum_file.exists():
+            raise ValueError("Missing dependency notice checksum inventory")
         if checksum_file.exists():
             checksums = json.loads(regular_file(crate, ".cargo-checksum.json").read_text(encoding="utf-8"))["files"]
+            if not extra_notices <= set(checksums):
+                raise ValueError("Missing required dependency notice inventory")
+            for name in extra_notices:
+                if digest(regular_file(crate, name)) != checksums[name]:
+                    raise ValueError("Dependency notice checksum mismatch")
+            selected.update(extra_notices)
             font_notices = EMBEDDED_FONT_NOTICES.get(package["name"], set())
             if not font_notices <= set(checksums):
                 raise ValueError("Missing embedded font notice inventory")
