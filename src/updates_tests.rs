@@ -288,3 +288,87 @@ fn update_exit_protects_external_source_conflicts_without_saving_over_them() {
     assert_eq!(fs::read(path).unwrap(), b"newer external source");
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn update_exit_waits_for_shared_preferences_and_rejects_mutations_after_closing() {
+    use crate::workspace::lifecycle::{finish_update_exit, update_readiness};
+    let directory = std::env::temp_dir().join(format!("pb-update-library-{}", crate::engine::id()));
+    fs::create_dir(&directory).unwrap();
+    let (root, registry) = workspace();
+    registry.lock().unwrap().recovery_dir = Some(directory.clone());
+    let library = root.lock().unwrap().brush_library.clone();
+    *library.lock().unwrap() = crate::brush_library::Library::load(directory.join("brushes.json"));
+    let reviewed = update_readiness(&registry).unwrap();
+    let held = library.lock().unwrap();
+    let worker_root = root.clone();
+    let worker = std::thread::spawn(move || {
+        crate::server::dispatch(
+            &worker_root,
+            "brushes",
+            &json!({
+                "action":"save", "name":"Guarded brush", "category":"Custom", "settings":crate::brush::Settings::default()
+            }),
+        )
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while registry
+        .lock()
+        .unwrap()
+        .file_operations
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Preference operation did not start"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(finish_update_exit(&registry, &reviewed).is_err());
+    assert!(!root.lock().unwrap().closed);
+    drop(held);
+    assert!(worker.join().unwrap().is_ok());
+    let bytes = fs::read(directory.join("brushes.json")).unwrap();
+    finish_update_exit(&registry, &reviewed).unwrap();
+    for (method, action) in [
+        ("brushes", "save"),
+        ("brushes", "delete"),
+        ("filters", "save"),
+        ("filters", "rename"),
+        ("filters", "delete"),
+        ("filters", "import"),
+        ("tool_settings", "set"),
+        ("exports", "save_preset"),
+        ("exports", "delete_preset"),
+        ("recovery", "discard"),
+    ] {
+        let error = crate::server::dispatch(
+            &root,
+            method,
+            &json!({"action":action,"actor":"human","snapshot":"missing"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("exiting"), "{method}/{action}: {error}");
+    }
+    assert!(crate::server::dispatch(&root, "brushes", &json!({"action":"list"})).is_ok());
+    assert!(crate::server::dispatch(&root, "tool_settings", &json!({"action":"get"})).is_ok());
+    assert_eq!(fs::read(directory.join("brushes.json")).unwrap(), bytes);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn instance_preferences_still_work_after_the_original_project_tab_closes() {
+    let (root, _) = workspace();
+    let _second = crate::workspace::new_project(&root, 8, 8, 8, None).unwrap();
+    let (project, document, revision) = {
+        let engine = root.lock().unwrap();
+        (
+            engine.project_id.clone(),
+            engine.doc.id.clone(),
+            engine.doc.revision,
+        )
+    };
+    crate::workspace::close(&root, &project, &document, revision, false, "human").unwrap();
+    assert!(root.lock().unwrap().closed);
+    assert!(crate::server::dispatch(&root, "brushes", &json!({"action":"save","name":"Still shared", "category":"Custom", "settings":crate::brush::Settings::default()})).is_ok());
+}
