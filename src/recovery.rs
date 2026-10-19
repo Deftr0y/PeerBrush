@@ -138,6 +138,14 @@ pub fn discard(dir: &Path, snapshot: &str) -> Result<(), String> {
         .ok_or("Recovery version no longer exists; refresh the list")?;
     remove(dir, &entry)
 }
+pub fn discard_in(
+    workspace: &workspace::Registry,
+    dir: &Path,
+    snapshot: &str,
+) -> Result<(), String> {
+    let _operation = server::FileOperation::begin_workspace(workspace)?;
+    discard(dir, snapshot)
+}
 fn discard_project(dir: &Path, project: &str) -> Result<(), String> {
     for entry in catalog(dir).into_iter().filter(|e| e.project_id == project) {
         remove(dir, &entry)?;

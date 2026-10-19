@@ -19,6 +19,13 @@ pub type Shared = Arc<Mutex<Engine>>;
 
 pub(crate) struct FileOperation(pub(crate) Arc<std::sync::atomic::AtomicUsize>);
 impl FileOperation {
+    pub(crate) fn begin_workspace(workspace: &crate::workspace::Registry) -> Result<Self, String> {
+        let state = workspace.lock().unwrap();
+        if state.exiting {
+            return Err("Workspace is exiting; settings and recovery remain protected".into());
+        }
+        Ok(Self::track(state.file_operations.clone()))
+    }
     pub(crate) fn begin(shared: &Shared) -> Result<Self, String> {
         let engine = shared.lock().unwrap();
         engine.ensure_open()?;
@@ -780,6 +787,18 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
+    let persistent = match method {
+        "brushes" => matches!(p["action"].as_str(), Some("save" | "delete")),
+        "tool_settings" => p["action"] == "set",
+        "filters" => matches!(
+            p["action"].as_str(),
+            Some("save" | "rename" | "delete" | "import")
+        ),
+        _ => false,
+    };
+    let _operation = persistent
+        .then(|| FileOperation::begin_workspace(&crate::workspace::attach(shared)))
+        .transpose()?;
     if method == "exports" {
         return crate::production_export::request(shared, p);
     }
@@ -816,7 +835,8 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                 Ok(result)
             }
             "discard" if p["actor"] == "human" => {
-                crate::recovery::discard(
+                crate::recovery::discard_in(
+                    &workspace,
                     &dir,
                     p["snapshot"]
                         .as_str()

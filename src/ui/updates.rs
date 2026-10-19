@@ -192,6 +192,7 @@ impl PeerBrush {
     }
     fn update_restart_blocker(&self) -> Option<String> {
         let interaction = self.busy
+            || self.connecting
             || !self.jobs.is_empty()
             || self.load_control.is_some()
             || self.lifecycle.is_some()
@@ -396,6 +397,10 @@ mod tests {
                     engine.undo.len(),
                 )
             };
+            assert!(app.update_restart_blocker().is_none());
+            app.connecting = true;
+            assert!(app.update_restart_blocker().is_some());
+            app.connecting = false;
             app.live_gesture = Some("unfinished human stroke".into());
             assert!(app.update_restart_blocker().is_some());
             app.updates.open = true;
