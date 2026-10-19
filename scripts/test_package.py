@@ -43,6 +43,7 @@ class Packages(unittest.TestCase):
         for name, content in {'Cargo.toml': '[package]\nname="peerbrush"\nversion="0.2.0"\n', 'Cargo.lock': 'version=4\n[[package]]\nname="peerbrush"\nversion="0.2.0"\n', 'LICENSE': 'GNU GENERAL PUBLIC LICENSE\nGPL-3.0-only\n', 'README.md': 'Synthetic package fixture\n', 'FOLLOWUPS.MD': 'Synthetic backlog\n', 'assets/fonts/LICENCE.txt': 'Synthetic font license\n', 'assets/peerbrush-logo.png': 'Synthetic artwork\n', 'src/lib.rs': '// synthetic\n', 'scripts/start-windows.cmd': '@echo off\n', 'docs/usage.md': 'Synthetic instructions\n'}.items():
             (self.root / name).write_text(content, encoding='utf-8')
         (self.root / 'scripts/package-readme.md').write_text('Synthetic focused package README: {{SOURCE_ARCHIVE}}\n', encoding='utf-8')
+        (self.root / 'assets/peerbrush.icns').write_bytes((pathlib.Path(__file__).resolve().parents[1] / 'assets/peerbrush.icns').read_bytes())
         (self.root / '.gitignore').write_text('/output/\n/verified/\n/rejected/\n/registry/\n/synthetic-binary\n', encoding='utf-8')
         (self.root / 'integrations').mkdir()
         (self.root / 'integrations/segmentation_rembg.py').write_text('# Synthetic provider\n', encoding='utf-8')
@@ -110,8 +111,87 @@ class Packages(unittest.TestCase):
                     info = plistlib.loads(package.read(root + 'PeerBrush.app/Contents/Info.plist'))
                     self.assertEqual(info['CFBundleShortVersionString'], '0.2.0')
                     self.assertEqual(info['CFBundleExecutable'], 'peerbrush')
+                    self.assertEqual(info['CFBundleIconFile'], 'PeerBrush.icns')
+                    self.assertEqual({kind['LSHandlerRank'] for kind in info['CFBundleDocumentTypes']}, {'Alternate'})
+                    self.assertEqual({kind['CFBundleTypeRole'] for kind in info['CFBundleDocumentTypes']}, {'Editor'})
+                    resource = root + packaging.MACOS_RESOURCES
+                    self.assertEqual(package.read(resource + 'PeerBrush.icns'), (self.root / 'assets/peerbrush.icns').read_bytes())
+                    for name in ['LICENSE', 'THIRD_PARTY_NOTICES.md', *manifest['notice_files']]:
+                        self.assertEqual(package.read(resource + name), package.read(root + name))
         self.assertEqual(sources[0], sources[1])
         self.assertEqual(sources[0], sources[2])
+
+    def test_macos_installed_resources_and_consent_cannot_be_changed_or_removed(self):
+        path = self.build('macOS')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+        for target, expected in [('PeerBrush.icns', 'committed artwork'),
+                                 ('LICENSE', 'installed license/notices'),
+                                 ('THIRD_PARTY_NOTICES.md', 'installed license/notices'),
+                                 ('licenses/ubuntu-sans/LICENCE.txt', 'installed license/notices')]:
+            name = prefix + packaging.MACOS_RESOURCES + target
+            changed = [(n, data + b'tampered' if n == name else data, mode) for n, data, mode in original]
+            packaging.write_zip(path, changed, 1700000000)
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, expected):
+                verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+        changed = []
+        for name, data, mode in original:
+            if name == prefix + 'PeerBrush.app/Contents/Info.plist':
+                info = plistlib.loads(data)
+                info['CFBundleDocumentTypes'][0]['LSHandlerRank'] = 'Default'
+                data = plistlib.dumps(info)
+            changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        with self.assertRaisesRegex(ValueError, 'document consent'):
+            verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+        changed = []
+        for name, data, mode in original:
+            if name == prefix + 'release.json':
+                manifest = json.loads(data)
+                del manifest['macos_bundle_resources']
+                data = json.dumps(manifest).encode()
+            if not name.startswith(prefix + packaging.MACOS_RESOURCES):
+                changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        with self.assertRaisesRegex(ValueError, 'Missing required installed macOS resources'):
+            verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+
+    def test_historical_macos_layout_remains_valid_for_its_matching_source(self):
+        path = self.build('macOS')
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+        # An earlier source revision had neither ICNS nor installed Resources.
+        (self.root / 'assets/peerbrush.icns').unlink()
+        self.policy['source'].remove('assets/peerbrush.icns')
+        self.save_policy()
+        self.commit()
+        self.build('Windows')
+        source = (self.output / 'PeerBrush-0.2.0-source.zip').read_bytes()
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        changed = []
+        for name, data, mode in original:
+            if name.startswith(prefix + packaging.MACOS_RESOURCES):
+                continue
+            if name == prefix + 'release.json':
+                manifest = json.loads(data)
+                del manifest['macos_bundle_resources']
+                manifest.update(commit=commit, binary_source_commit=commit, source_sha256=verify_release.sha(source))
+                data = json.dumps(manifest).encode()
+            elif name == prefix + 'PeerBrush-0.2.0-source.zip':
+                data = source
+            elif name == prefix + 'PeerBrush.app/Contents/Info.plist':
+                info = plistlib.loads(data)
+                for key in ['CFBundleIconFile', 'CFBundleDocumentTypes', 'UTImportedTypeDeclarations']:
+                    del info[key]
+                data = plistlib.dumps(info)
+            changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        verify_release.inspect_archive(path, commit, '0.2.0', self.root)
 
     def test_untracked_private_files_and_stale_output_never_enter_packages(self):
         (self.root / 'docs' / 'connection.json').write_text('private fixture, must be excluded')

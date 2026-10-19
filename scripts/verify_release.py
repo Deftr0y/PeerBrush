@@ -8,7 +8,7 @@ import plistlib
 import re
 import shutil
 import zipfile
-from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources
+from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, MACOS_RESOURCES, macos_info
 
 
 MACOS_SIGNING_FILES = frozenset({
@@ -129,6 +129,12 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
                 raise ValueError('Launcher differs from selected source')
         if platform == 'macOS':
             expected_entries.add('PeerBrush.app/Contents/Info.plist')
+            if 'assets/peerbrush.icns' in expected_source and manifest.get('macos_bundle_resources') != 1:
+                raise ValueError('Missing required installed macOS resources')
+            if manifest.get('macos_bundle_resources') is not None:
+                if manifest['macos_bundle_resources'] != 1:
+                    raise ValueError('Unsupported macOS bundle resource layout')
+                expected_entries.update(MACOS_RESOURCES + name for name in ['PeerBrush.icns', 'LICENSE', 'THIRD_PARTY_NOTICES.md', *notices])
         expected_entries.update(validate_signing_metadata(manifest, archive, prefix, signing_suffix))
         if set(archive.namelist()) != {prefix + name for name in expected_entries}:
             raise ValueError('Unexpected or missing release entries')
@@ -147,6 +153,14 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             info = plistlib.loads(archive.read(prefix + 'PeerBrush.app/Contents/Info.plist'))
             if info.get('CFBundleShortVersionString') != version or info.get('CFBundleExecutable') != 'peerbrush' or info.get('CFBundleIdentifier') != 'com.peerbrush.PeerBrush' or info.get('CFBundlePackageType') != 'APPL':
                 raise ValueError('macOS app bundle version or executable mismatch')
+            if manifest.get('macos_bundle_resources') == 1:
+                if info != macos_info(version):
+                    raise ValueError('macOS document consent, icon or bundle metadata differs from source')
+                if archive.read(prefix + MACOS_RESOURCES + 'PeerBrush.icns') != expected_source['assets/peerbrush.icns']:
+                    raise ValueError('macOS icon differs from committed artwork')
+                for name in ['LICENSE', 'THIRD_PARTY_NOTICES.md', *notices]:
+                    if archive.read(prefix + MACOS_RESOURCES + name) != archive.read(prefix + name):
+                        raise ValueError('macOS installed license/notices differ from the verified distribution')
         if 'GNU GENERAL PUBLIC LICENSE' not in archive.read(prefix + 'LICENSE').decode('utf-8'):
             raise ValueError('Missing GPL license')
         if not any(n.startswith(prefix + 'licenses/') for n in archive.namelist()):

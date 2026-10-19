@@ -45,7 +45,7 @@ python3 -B scripts/sign_macos.py \
   --output "${SIGNED_OUTPUT:?select a separate directory outside the checkout}"
 ```
 
-The signer verifies the input against the exact committed source policy, then performs these steps:
+The signer verifies the input against the exact committed source policy, then performs these steps. Unreleased v0.3 bundles include the icon, document declarations and installed license/notices described in [macOS integration](macos-integration.md) before sealing. Signing must preserve these bytes; do not add them to an already signed app. Historical 0.26 artifacts and protected signing workflow pins retain their existing source/layout.
 
 - Confirm a valid existing Developer ID Application identity belonging to the explicit team, and validate the existing notary profile's access.
 - Sign the `.app` with hardened runtime and a secure timestamp. Only the reviewed single-executable bundle is supported. There is no `--deep` signing and no entitlement exception such as debugger access, disabled library validation or unsigned executable memory.
