@@ -4826,6 +4826,11 @@ impl PeerBrush {
         } else {
             self.lifecycle_dialog(ctx);
         }
+        // eframe treats any CancelClose as final for this native close frame.
+        // Validate all projects first; a clean approved exit needs no cancellation.
+        if ctx.input(|input| input.viewport().close_requested()) && !self.exit_approved {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if self.exit_approved {
             return;
         }
