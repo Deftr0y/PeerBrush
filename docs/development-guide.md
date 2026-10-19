@@ -1,6 +1,6 @@
 # PeerBrush development guide
 
-PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store 0.26 remains pending. The remaining development backlog is planned for [v0.3](development-0.3.md), separately from the high-priority installation and release foundations whose version is not yet assigned.
+PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store 0.26 remains pending. The active [v0.3 milestone](development-0.3.md) proposes the remaining backlog and installation/release foundations, with PB-108 first. Its approved application version is 0.30.0; development packages are unreleased.
 
 ## Branches and pull requests
 

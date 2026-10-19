@@ -37,7 +37,7 @@ All other existing unfinished work belongs to this planned milestone. Earlier im
 
 PB-108 remains priority #1 for v0.3, followed by PB-122 at #2 and PB-110 at #3. This is the existing feature/reliability order; the high-priority foundations above remain a separate workstream.
 
-PB-108 v0.3 development: shared changed-tail brush replay now retains unaffected coverage instead of restarting a smoothed stroke. The focused 29-test set passes and release CPU workloads show reduced replay time with exact native8/16 output. Full regression/CI/native acceptance is in progress; startup, navigation and physical input latency remain open. See [measurements and limits](docs/development-0.3.md#pb-108-changed-tail-replay). Earlier evidence below is preserved.
+PB-108 v0.3 development: shared changed-tail brush replay now retains unaffected coverage instead of restarting a smoothed stroke. The focused 29-test set and all 923 local Rust checks pass, with eight opt-in checks ignored. Release CPU workloads show reduced replay time with exact native8/16 output. Native Windows rendered workspaces, exact original samples/undo/redo, editable PSD/PSB reopening and independently decoded current merged composites passed. Exact-head cross-platform CI, startup, navigation and physical input latency remain open. See [measurements and limits](docs/development-0.3.md#pb-108-changed-tail-replay). Earlier evidence below is preserved.
 
 | Priority | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- | --- |
