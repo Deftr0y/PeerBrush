@@ -54,6 +54,14 @@ def create_image(payload, image, mount, volume, verify_app=None):
     expected = payload_inventory(payload)
     run(['/usr/bin/hdiutil', 'create', '-srcfolder', str(payload), '-volname', volume,
          '-fs', 'HFS+', '-format', 'UDZO', str(image)], timeout=600)
+    verify_image(image, mount, expected, verify_app)
+    return expected
+
+
+def verify_image(image, mount, expected, verify_app=None):
+    """Recheck a final signed/stapled image against its original payload."""
+    if sys.platform != 'darwin' or mount.exists() or mount.is_symlink():
+        raise ValueError('Native DMG verification needs a fresh macOS mount path')
     run(['/usr/bin/hdiutil', 'verify', str(image)], timeout=600)
     mount.mkdir()
     try:
@@ -73,7 +81,6 @@ def create_image(payload, image, mount, volume, verify_app=None):
             run(['/usr/bin/hdiutil', 'detach', str(mount)])
             if mount.is_mount():
                 raise ValueError('DMG remains mounted; preserve the work directory')
-    return expected
 
 
 def prepare(archive, output, commit, version, expected_sha256, revision, source_root=None):

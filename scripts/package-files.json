@@ -294,6 +294,7 @@
     "scripts/package_macos_dmg.py",
     "scripts/test_macos_dmg.py",
     "scripts/test_macos_dmg_native.py",
+    "scripts/test_sign_macos_dmg.py",
     "scripts/test_msix.py",
     "scripts/test_msix_runtime.py",
     "scripts/test_msix_runtime_tests.py",
