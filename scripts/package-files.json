@@ -42,6 +42,7 @@
     "docs/retained-transforms.md",
     "docs/retouch.md",
     "docs/segmentation.md",
+    "docs/startup-font-diagnostic.md",
     "docs/ui-ember.md",
     "docs/unicode-filenames.md",
     "examples/brush_performance.rs",
