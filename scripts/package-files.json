@@ -128,6 +128,8 @@
     "src/selection/refine.rs",
     "src/selection/system.rs",
     "src/server.rs",
+    "src/settings.rs",
+    "src/settings_tests.rs",
     "src/shaders/composite.wgsl",
     "src/shaders/effects.wgsl",
     "src/smart_mask.rs",
@@ -305,7 +307,8 @@
     "packaging/msix/product.store.json",
     "packaging/msix/Assets/Square150x150Logo.png",
     "packaging/msix/Assets/Square44x44Logo.png",
-    "packaging/msix/Assets/StoreLogo.png"
+    "packaging/msix/Assets/StoreLogo.png",
+    "docs/settings.md"
   ],
   "portable": [
     "LICENSE",
@@ -344,7 +347,8 @@
     "docs/production-export.md",
     "docs/layer-styles.md",
     "docs/release-0.25.md",
-    "docs/release-0.26.md"
+    "docs/release-0.26.md",
+    "docs/settings.md"
   ],
   "readme": "scripts/package-readme.md",
   "vendored": [
