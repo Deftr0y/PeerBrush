@@ -287,7 +287,16 @@
       "caution": "Historical checkpoint. Rebuilt packages remain unsigned; Windows/macOS may show security warnings. Manual desktop verification of the rebuilt executables remains pending."
     }
   ],
-  "caution": "macOS arm64 is Developer ID signed, notarized and stapled. Linux x64 is unsigned. Windows Store 0.26 delivery is pending; previous Windows downloads remain in version history. Manual macOS/Linux desktop interaction and fresh quarantined macOS download testing remain unverified. Unsupported Photoshop originals remain protected.",
+  "caution": "macOS arm64 is Developer ID signed, notarized and stapled. Linux x64 is unsigned. Windows 0.25 is available from Microsoft Store while the Windows 0.26 update is pending. Previous portable downloads remain in version history. Manual macOS/Linux desktop interaction and fresh quarantined macOS download testing remain unverified. Unsupported Photoshop originals remain protected.",
   "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-source.zip",
-  "checksumsUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/SHA256SUMS"
+  "checksumsUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/SHA256SUMS",
+  "windowsStore": {
+    "id": "windows",
+    "name": "Windows",
+    "architecture": "x64",
+    "channel": "microsoft-store",
+    "version": "0.25",
+    "url": "https://apps.microsoft.com/detail/9PNR6T1Q2ZL9",
+    "description": "x64 · Version 0.25 available from Microsoft Store · Windows 0.26 update pending"
+  }
 }

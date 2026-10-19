@@ -14,7 +14,7 @@
   <link rel="preload" href="assets/fonts/UbuntuSans-SemiBold.ttf" as="font" type="font/ttf" crossorigin>
   <link rel="preload" href="assets/showcase/golden-hour-1440.webp" as="image" type="image/webp" imagesrcset="assets/showcase/golden-hour-800.webp 800w, assets/showcase/golden-hour-1440.webp 1440w, assets/showcase/golden-hour-2400.webp 2400w" imagesizes="100vw">
   <link rel="stylesheet" href="styles.css?layout=3">
-  <script src="main.js?release=v0.26.0&amp;layout=2" type="module"></script>
+  <script src="main.js?release=v0.26.0&amp;downloads=2" type="module"></script>
   <script src="analytics.js" defer></script>
 </head>
 <body>
@@ -49,7 +49,8 @@
     <nav aria-label="Main navigation">
       <a href="#layer-story">Layers</a>
       <a href="#workspace">Workspace</a>
-      <a href="#downloads">Downloads</a>
+      <a href="downloads.html">Downloads</a>
+      <a href="windows.html">Windows</a>
       <a href="releases.html">Release notes &amp; docs</a>
       <a href="#contribute">Contribute</a>
     </nav>
@@ -77,8 +78,8 @@
             <a class="button primary" id="primary-download" href="#downloads"><svg class="icon"><use href="#download"/></svg><span>Choose a download</span></a>
             <a class="button ghost" href="#demo"><svg class="icon"><use href="#play"/></svg><span>Watch the trailer</span></a>
           </div>
-          <p class="download-meta" id="download-meta">PeerBrush 0.26.0 · Stable · macOS & Linux</p>
-          <div class="other-downloads" id="other-downloads" aria-label="Other operating systems"></div>
+          <p class="download-meta" id="download-meta">macOS & Linux 0.26.0 · Windows 0.25 available</p>
+          <div class="other-downloads" id="other-downloads" aria-label="Other operating systems"><a class="text-link" href="https://apps.microsoft.com/detail/9PNR6T1Q2ZL9">Windows 0.25 · Microsoft Store</a></div>
           <div class="hero-facts"><span>Free to download and use</span><a href="LICENSE.txt">GPL v3 license <svg class="icon"><use href="#arrow"/></svg></a></div>
         </div>
       </div>
@@ -193,12 +194,13 @@
 
     <section class="downloads-section section wrap" id="downloads" aria-labelledby="downloads-title">
       <div class="section-heading"><div><span class="section-label">DOWNLOADS</span><h2 id="downloads-title">Choose your platform</h2></div><span class="build-label" id="build-label">PeerBrush 0.26.0 · Stable</span></div>
-      <p class="download-intro">Free native builds from the same tested source. Includes GPL v3 source and third-party notices.</p>
+      <p class="download-intro">Free native downloads. Each release includes its matching GPL v3 source and third-party notices.</p>
       <div class="platform-list" id="platform-list">
+        <div class="platform-row"><div class="platform-info"><svg class="icon" aria-hidden="true"><use href="#windows"/></svg><div><h3><a href="windows.html">Windows</a></h3><p data-platform-description="windows">x64 · Version 0.25 available from Microsoft Store · Windows 0.26 update pending</p></div></div><span class="package-size" data-platform-size="windows">Version 0.25</span><a class="platform-download" data-download-platform="windows" href="https://apps.microsoft.com/detail/9PNR6T1Q2ZL9">Microsoft Store <svg class="icon" aria-hidden="true"><use href="#download"/></svg></a></div>
         <div class="platform-row"><div class="platform-info"><svg class="icon" aria-hidden="true"><use href="#linux"/></svg><div><h3>Linux</h3><p>x64 · Built on Ubuntu 24.04 · Unsigned</p></div></div><span class="package-size">31.1 MB</span><a class="platform-download" href="https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-Linux-x64.zip">Download <svg class="icon" aria-hidden="true"><use href="#download"/></svg></a></div>
         <div class="platform-row"><div class="platform-info"><svg class="icon" aria-hidden="true"><use href="#macos"/></svg><div><h3>macOS</h3><p>Apple silicon · arm64 · Developer ID signed, notarized and stapled</p></div></div><span class="package-size">27.4 MB</span><a class="platform-download" href="https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-macOS-arm64-apple-signed-r1.zip">Download <svg class="icon" aria-hidden="true"><use href="#download"/></svg></a></div>
       </div>
-      <p class="download-caution">macOS arm64 is Developer ID signed, notarized and stapled. Linux x64 is unsigned. Windows Store 0.26 delivery is pending; previous Windows downloads remain in version history. Manual macOS/Linux desktop interaction and fresh quarantined macOS download testing remain unverified. Unsupported Photoshop originals remain protected.</p>
+      <p class="download-caution">macOS arm64 is Developer ID signed, notarized and stapled. Linux x64 is unsigned. Windows 0.25 is available from Microsoft Store while the Windows 0.26 update is pending. Previous portable downloads remain in version history. Manual macOS/Linux desktop interaction and fresh quarantined macOS download testing remain unverified. Unsupported Photoshop originals remain protected.</p>
       <div class="download-links"><a class="text-link" id="release-link" href="https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0">Release notes <svg class="icon"><use href="#arrow"/></svg></a><a class="text-link" href="releases.html">All release notes &amp; documentation <svg class="icon"><use href="#arrow"/></svg></a></div>
       <noscript><p><a href="https://github.com/Deftr0y/PeerBrush/releases">View all download packages on GitHub Releases</a>. Enable JavaScript for operating-system suggestions.</p></noscript>
     </section>
