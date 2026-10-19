@@ -32,6 +32,8 @@ License collection uses exact notice filenames and explicitly declared license f
 
 Each run stages source, notices and the native ZIP in a fresh temporary directory. Final files are replaced only after validation and collection succeed. Existing extracted folders and unrelated output files are neither copied nor deleted. Failed input or notice checks preserve previous archives.
 
+Ubuntu 24.04 amd64 installation candidates use `scripts/package_deb.py` on the exact same source ZIP. The independently selected portable checksum is required before executable validation. The DEB retains corresponding source/notices and consent-based PSD/PSB desktop integration, with exact tar-header/content inspection and immutable outputs. APT/dpkg owns installation; no signed update repository is configured and receipts explicitly remain unreleased. See [Linux installation scope and native CI acceptance](linux-installation.md).
+
 ## Verification and publication
 
 `scripts/test_package.py` exercises tracked and untracked private canaries, stale output, exact nested source, all platform layouts, notice selection, invalid manifests, new compiler inputs, linked inputs and failed builds. `scripts/verify_release.py` requires the three-platform matrix, checks every selected source byte, portable files, recorded notices, executable/source checksums, architecture, macOS bundle identity and archive paths. Unexpected package entries fail inspection.
