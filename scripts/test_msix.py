@@ -107,6 +107,8 @@ class Msix(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'development'):
             msix.identity_values(self.identity)
         self.assertEqual(msix.identity_values(self.identity,True),self.identity)
+        with self.assertRaisesRegex(ValueError, 'exact local test identity'):
+            msix.identity_values(dict(self.identity, name='PeerBrush.OtherTest'), True)
         for name in ['CON','com1.app','PeerBrush.','xn--peerbrush','Peer.xn--brush']:
             with self.assertRaises(ValueError):msix.identity_values(dict(self.identity,name=name),True)
         bad=dict(self.identity,publisher='CN=Test, OID.2.25.311729368913984317654407730594956997722=1')
@@ -151,6 +153,29 @@ class Msix(unittest.TestCase):
             with self.assertRaises(ValueError):msix.package_version('0.2.0',explicit=explicit)
         for previous in ['1.2.0.0','1.3.0.0']:
             with self.assertRaises(ValueError):msix.package_version('0.2.0',previous=previous)
+
+    def test_development_version_requires_local_identity_and_keeps_source_version(self):
+        for name in ['Cargo.toml', 'Cargo.lock']:
+            path = self.root / name
+            path.write_text(path.read_text().replace('0.2.0', '0.30.0-dev.1'))
+        self.fixture.commit()
+        archive = self.fixture.build('Windows')
+        with self.assertRaisesRegex(ValueError, 'stable three-part'):
+            msix.stage_payload(self.root, archive, self.root/'store-stage', self.identity)
+        report = msix.stage_payload(self.root, archive, self.root/'dev-stage', self.identity, development=True)
+        self.assertEqual(report['version'], '0.30.0-dev.1')
+        root = ET.parse(self.root/'dev-stage/AppxManifest.xml').getroot()
+        self.assertEqual(root.find('f:Identity', msix.NS).attrib['Version'], '1.30.0.0')
+        self.assertEqual(root.find('f:Identity', msix.NS).attrib['Name'], 'PeerBrush.LocalTest')
+        self.assertEqual(msix.package_version('0.30.0-dev.1', development=True, previous='1.26.0.0'), '1.30.0.0')
+        with self.assertRaises(ValueError):
+            msix.package_version('0.30.0-dev.1', development=True, previous='1.30.0.0')
+        store = json.loads((ROOT/'packaging/msix/identity.store.json').read_text())
+        with self.assertRaisesRegex(ValueError, 'exact local test identity'):
+            msix.manifest_bytes(self.template, store, '0.30.0-dev.1', development=True)
+        for invalid in ['0.30.0-beta.1', '0.30.0-dev.01', '0.30.0-dev.1+build', '65535.0.0-dev.1']:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                msix.package_version(invalid, development=True)
 
     def test_optional_image_types_are_opt_in_and_only_supported_types(self):
         data=msix.manifest_bytes(self.template,self.identity,'0.2.0',['.png','.jpg','.png'])

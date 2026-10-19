@@ -1,6 +1,6 @@
 # PeerBrush development guide
 
-PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26 is unreleased; published downloads remain 0.25.
+PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store 0.26 remains pending. The active [v0.3 milestone](development-0.3.md) proposes the remaining backlog and installation/release foundations, with PB-108 first. Its approved application version is 0.30.0; development packages are unreleased.
 
 ## Branches and pull requests
 
@@ -14,6 +14,8 @@ PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu.
 | `site-content` | Reviewed public website output | Website deployment workflow |
 | `maintenance/archive-<checkpoint>` | Retained historical packaging corrections | No normal development promotion |
 | `maintenance/site-<topic>` | A reviewed website content change | `site-content` |
+
+The active `version/0.3` integration branch starts from synchronized `dev`/`main`. Use `feature/0.3/<topic>` or `fix/0.3/<topic>` targeting it; do not mix new development into published 0.26 artifacts. The installation/release foundations are explicitly proposed for v0.3 in its development queue, with PB-108 still first.
 
 The normal promotion order is **feature or fix → matching version → dev → main**. Use lowercase names and a descriptive topic, for example `fix/0.26/selection-coverage`. Never create a `codex/` branch, regardless of capitalization. `origin/` is the remote-tracking prefix, not part of a branch name. Git cannot hold both `version/0.26` and `version/0.26/selection-coverage`; feature and fix names use their own namespace.
 
