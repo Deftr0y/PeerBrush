@@ -59,6 +59,7 @@
     "docs/store-automation.md",
     "docs/ui-ember.md",
     "docs/unicode-filenames.md",
+    "docs/updates.md",
     "examples/brush_performance.rs",
     "examples/gpu16_effects.rs",
     "examples/gpu_effects.rs",
@@ -235,7 +236,10 @@
     "src/ui/tool_settings.rs",
     "src/ui/tool_settings_tests.rs",
     "src/ui/transform_snapping.rs",
+    "src/ui/updates.rs",
     "src/ui/view.rs",
+    "src/updates.rs",
+    "src/updates_tests.rs",
     "src/workspace.rs",
     "src/workspace/lifecycle.rs",
     "tests/adjustments.rs",
@@ -369,7 +373,8 @@
     "docs/layer-styles.md",
     "docs/release-0.25.md",
     "docs/release-0.26.md",
-    "docs/settings.md"
+    "docs/settings.md",
+    "docs/updates.md"
   ],
   "readme": "scripts/package-readme.md",
   "vendored": [

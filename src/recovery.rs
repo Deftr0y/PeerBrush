@@ -271,6 +271,13 @@ fn persist(
 /// Encoding runs outside the engine lock. Newer work stays dirty and is picked up
 /// by the next tick; a checkpoint never changes saved_revision or original files.
 pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Versions) {
+    let _operation = {
+        let state = workspace.lock().unwrap();
+        if state.exiting {
+            return;
+        }
+        server::FileOperation::track(state.file_operations.clone())
+    };
     let gate = gate(dir);
     let _guard = gate.lock().unwrap();
     let mut failures = workspace.lock().unwrap().recovery_failures.clone();

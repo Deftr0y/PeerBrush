@@ -36,6 +36,22 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("mcp") => return server::stdio(&state_dir),
+        Some("updates") => {
+            let channel = match args.as_slice() {
+                [_, action] if action == "check" => peerbrush::updates::Channel::Stable,
+                [_, action, option] if action == "check" && option == "--preview" => {
+                    peerbrush::updates::Channel::Preview
+                }
+                _ => return Err("Use updates check [--preview]".into()),
+            };
+            let report =
+                peerbrush::updates::check(channel, peerbrush::updates::Target::current()?, |_| {})?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+            return Ok(());
+        }
         Some("settings") => {
             let locations = peerbrush::settings::Locations::user()?;
             match args.get(1).and_then(|s| s.to_str()) {
@@ -109,7 +125,7 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("--help") => {
-            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
+            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
             return Ok(());
         }
         _ => {}

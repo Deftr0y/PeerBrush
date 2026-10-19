@@ -58,7 +58,7 @@ pub fn native_error_dialog(args: impl IntoIterator<Item = OsString>) -> bool {
                 args.next();
             }
             Some(
-                "mcp" | "cli" | "discover" | "settings" | "--version" | "-V" | "--help"
+                "mcp" | "cli" | "discover" | "settings" | "updates" | "--version" | "-V" | "--help"
                 | "--headless",
             ) => return false,
             _ => return true,
