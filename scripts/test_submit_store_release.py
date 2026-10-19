@@ -2,6 +2,8 @@
 import copy
 import hashlib
 import io
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -37,6 +39,13 @@ class FakeStore:
 
 
 class Tests(unittest.TestCase):
+    def setUp(self):
+        from store_release_state import Journal
+        directory = tempfile.TemporaryDirectory(prefix='peerbrush-store-submit-test-')
+        self.addCleanup(directory.cleanup)
+        self.journal = Journal(Path(directory.name) / 'receipt.json')
+        self.journal.bind('v0.26.0', fixture()[0], fixture()[2])
+
     def test_unexpected_exception_redacted(self):
         output = io.StringIO()
         with patch.object(s.sys, 'argv', ['submit', '--tag', 'v0.26']), patch.object(s, 'released_assets', return_value=fixture()), patch.object(s, 'Store', side_effect=ValueError('FAKE_SECRET')), patch.object(s.sys, 'stderr', output):
@@ -84,7 +93,7 @@ class Tests(unittest.TestCase):
         store = FakeStore()
         store.app['pendingApplicationSubmission'] = {'id': '456'}
         with self.assertRaises(ValueError):
-            s.submit(store, *fixture(), execute=True)
+            s.submit(store, *fixture(), execute=True, journal=self.journal)
         self.assertEqual(len(store.calls), 1)
 
     def test_live_duplicate_and_downgrade(self):
@@ -92,20 +101,20 @@ class Tests(unittest.TestCase):
             store = FakeStore()
             store.current['applicationPackages'][0]['version'] = current
             with self.assertRaises(ValueError):
-                s.submit(store, *fixture(), execute=True)
+                s.submit(store, *fixture(), execute=True, journal=self.journal)
             self.assertTrue(all(method == 'GET' for _, method, _ in store.calls))
 
     def test_identity(self):
         store = FakeStore()
         store.app['publisherName'] = 'other'
         with self.assertRaises(ValueError):
-            s.submit(store, *fixture(), execute=True)
+            s.submit(store, *fixture(), execute=True, journal=self.journal)
         self.assertEqual(len(store.calls), 1)
 
     @patch.object(s, 'request', return_value=b'')
     def test_preserve_metadata_and_upload_before_commit(self, upload):
         store = FakeStore()
-        s.submit(store, *fixture(), execute=True)
+        s.submit(store, *fixture(), execute=True, journal=self.journal)
         updated = next(data for _, method, data in store.calls if method == 'PUT')
         for key in ('listings', 'pricing', 'targetPublishMode'):
             self.assertEqual(updated[key], store.draft[key])
@@ -119,7 +128,7 @@ class Tests(unittest.TestCase):
     def test_upload_failure_leaves_draft_no_commit(self, upload):
         store = FakeStore()
         with self.assertRaises(RuntimeError):
-            s.submit(store, *fixture(), execute=True)
+            s.submit(store, *fixture(), execute=True, journal=self.journal)
         self.assertFalse(any(path.endswith('/commit') for path, _, _ in store.calls))
         self.assertFalse(any(method == 'DELETE' for _, method, _ in store.calls))
 
@@ -127,7 +136,7 @@ class Tests(unittest.TestCase):
         store = FakeStore()
         store.draft['applicationPackages'][0]['architecture'] = 'ARM64'
         with self.assertRaises(ValueError):
-            s.submit(store, *fixture(), execute=True)
+            s.submit(store, *fixture(), execute=True, journal=self.journal)
         self.assertFalse(any(method == 'PUT' for _, method, _ in store.calls))
 
 
