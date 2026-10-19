@@ -312,6 +312,7 @@ struct ParameterEdit {
     dirty: bool,
 }
 pub struct PeerBrush {
+    fonts: filename::FontSetup,
     shared: Shared,
     workspace_root: Shared,
     workspace: crate::workspace::Registry,
@@ -559,8 +560,7 @@ impl PeerBrush {
             egui::FontFamily::Name("semibold".into()),
             vec!["Ubuntu Sans Semibold".into()],
         );
-        filename::install_fallbacks(&mut fonts);
-        ctx.set_fonts(fonts);
+        let fonts = filename::FontSetup::new(ctx, fonts);
         let image = image::load_from_memory(include_bytes!("../assets/peerbrush-logo.png"))
             .unwrap()
             .to_rgba8();
@@ -663,6 +663,7 @@ impl PeerBrush {
             (e.project_id.clone(), e.doc.clone())
         };
         Self {
+            fonts,
             recovery: recovery::Browser::new(&connection.state_dir),
             saved_versions: None,
             open_file_warning: None,
@@ -4562,6 +4563,7 @@ impl PeerBrush {
     }
     fn draw(&mut self, ctx: &egui::Context) {
         self.updates_tick(ctx);
+        self.fonts.refresh(ctx);
         self.selection_commit_failed = false;
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
