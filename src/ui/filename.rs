@@ -410,6 +410,11 @@ fn layout(text: &str, size: f32) -> Option<Layout> {
         for (font, text) in fonts {
             let tree = tree(&text, font, size, rtl, fontdb())?;
             let bounds = tree.root().abs_bounding_box();
+            // Whitespace-only runs have an empty SVG root at the origin; it
+            // must not move the visible glyphs below a fixed-height UI row.
+            if bounds.width() == 0. || bounds.height() == 0. {
+                continue;
+            }
             result.top = result.top.min(bounds.top());
             result.bottom = result.bottom.max(bounds.bottom());
             result.pieces.push(Piece {
@@ -1028,6 +1033,34 @@ mod tests {
         }
         assert!(raster(&"漢".repeat(513), 12., 320., 1.).is_none());
         assert!(raster("שלום", f32::NAN, 320., 1.).is_none());
+    }
+    #[test]
+    fn empty_bidi_runs_leave_filename_ink_visible_in_tab_and_status_rows() {
+        catalog();
+        let whitespace = tree(" ", "Ubuntu Sans", 12., false, fontdb()).unwrap();
+        assert_eq!(whitespace.root().abs_bounding_box().width(), 0.);
+        assert_eq!(whitespace.root().abs_bounding_box().height(), 0.);
+        for name in [
+            "A\u{202b} \u{202c}B.psd",
+            "Open With שלום مرحبا हिन्दी 漢字 あいう 한글 with spaces.psd",
+            "שלום \u{202a} \u{202c}مرحبا.psd",
+        ] {
+            let shaped = layout(name, 12.).unwrap();
+            assert!(!glyphs(&shaped).is_empty(), "{name}");
+            for (size, row_height, width, scale) in [
+                (12., 30., 180., 1.),
+                (12., 30., 180., 2.),
+                (11., 28., 300., 1.5),
+            ] {
+                let rendered = raster(name, size, width, scale).unwrap();
+                let visible = rendered.pixels.pixels.iter().enumerate().filter(|(index, pixel)| {
+                    let y = (*index / rendered.pixels.size[0]) as f32;
+                    let row_y = (y + 0.5) / scale + (row_height - rendered.size.y) * 0.5;
+                    pixel.a() > 0 && (0. ..row_height).contains(&row_y)
+                }).count();
+                assert!(visible > 10, "Filename ink was outside its {row_height}px row: {name}");
+            }
+        }
     }
     fn glyphs(layout: &Layout) -> Vec<(String, u32, f32)> {
         let mut result = Vec::new();
