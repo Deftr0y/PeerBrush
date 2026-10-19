@@ -28,3 +28,23 @@ export function latestRelease(data) {
   if(Array.isArray(data?.history))return releaseHistory(data).find(r=>r.version===data.version && r.platforms.length>0) || null;
   return data;
 }
+
+export function safeAvailableDownload(platform) {
+  if (platform?.channel === 'microsoft-store') return platform.id === 'windows' && platform.url === 'https://apps.microsoft.com/detail/9PNR6T1Q2ZL9' && typeof platform.version === 'string' && /^\d+\.\d+(?:\.\d+)?$/.test(platform.version);
+  return safeDownloadUrl(platform?.url);
+}
+
+export function availableDownloads(data) {
+  const latest = latestRelease(data);
+  const downloads = Array.isArray(latest?.platforms) ? latest.platforms.map(platform => ({ ...platform, version: latest.version, releaseLabel: latest.label || latest.version })) : [];
+  const store = data?.windowsStore;
+  if (safeAvailableDownload(store) && store.channel === 'microsoft-store') {
+    return [{ ...store, releaseLabel: `PeerBrush ${store.version} · Microsoft Store` }, ...downloads.filter(platform => platform.id !== 'windows')];
+  }
+  if (!downloads.some(platform => platform.id === 'windows')) {
+    const previous = releaseHistory(data).find(release => release.platforms.some(platform => platform.id === 'windows'));
+    const windows = previous?.platforms.find(platform => platform.id === 'windows');
+    if (windows) downloads.unshift({ ...windows, version: previous.version, releaseLabel: previous.label || previous.version });
+  }
+  return downloads;
+}

@@ -1,4 +1,4 @@
-import { releaseHistory, latestRelease, safeDownloadUrl } from './platform.js?release=v0.26.0';
+import { releaseHistory, latestRelease, safeDownloadUrl } from './platform.js?release=v0.26.0&downloads=2';
 
 function historyDownloadLink(platform) {
   const link = document.createElement('a');
