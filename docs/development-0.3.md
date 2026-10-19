@@ -18,6 +18,8 @@ The existing future extensions for remote connections and plugin architecture al
 
 ## Implementation and review
 
+The milestone and branch namespace remain v0.3; the approved application release version is **0.30.0** because SemVer orders 0.3.0 below published 0.26.0. Development packages use 0.30.0-dev.1. Keep Windows package versions and updater comparisons monotonic; never present development candidates as published upgrades.
+
 `version/0.3` starts from synchronized `dev` and `main` history. Focused `feature/0.3` and `fix/0.3` branches target it under the [branch policy](development-guide.md#branches-and-pull-requests). The original planning commit from PR #32 is retained through a merge, without rewriting or duplicating its content. Existing local 0.26 work remains on its original branches; audit it against current shared code before porting anything.
 
 Use exact tested commits and applicable engine/codec/protocol checks plus native visual/hardware evidence for behavior changes, preserving native 16-bit words, current PSD/PSB composites, history and human work. Keep release publication, deployment, Store submission, protected signing approvals and destructive history operations subject to their own explicit authorization.
