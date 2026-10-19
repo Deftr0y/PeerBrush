@@ -23,8 +23,13 @@ fn main() {
     }
 }
 fn run() -> Result<(), String> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.len() == 1 && arguments[0] == "--build-info" {
+        println!("{}", peerbrush::build_info::json());
+        return Ok(());
+    }
     let (state_dir, args, local_preferences) = activation::storage_arguments(
-        std::env::args_os().skip(1),
+        arguments,
         peerbrush::packaged::default_state_dir(server::default_state_dir())?,
     )?;
     if !peerbrush::packaged::external_config_is_visible(&state_dir)? {
@@ -125,7 +130,7 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("--help") => {
-            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
+            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush --build-info\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
             return Ok(());
         }
         _ => {}

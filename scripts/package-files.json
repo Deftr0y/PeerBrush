@@ -1,11 +1,13 @@
 {
-  "version": 1,
+  "version": 2,
   "source": [
     ".github/human-contributors.json",
     ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
     "Cargo.lock",
     "Cargo.toml",
+    "build.rs",
+    "tests/build_info.rs",
     "LICENSE",
     "assets/fonts/LICENCE.txt",
     "assets/fonts/UbuntuSans-Medium.ttf",
@@ -66,6 +68,7 @@
     "src/bake.rs",
     "src/brush.rs",
     "src/brush_library.rs",
+    "src/build_info.rs",
     "src/capabilities.json",
     "src/clipboard.rs",
     "src/clipboard/windows.rs",
