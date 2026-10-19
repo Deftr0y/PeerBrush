@@ -25,6 +25,6 @@ export function releaseHistory(data) {
   return data.history.filter(r=>typeof r.version==='string' && ['stable','prerelease','development'].includes(r.kind) && /^[0-9a-f]{40}$/.test(r.commit) && Number.isFinite(Date.parse(r.publishedAt)) && safeReleaseUrl(r.releaseUrl) && Array.isArray(r.notes) && r.notes.every(n=>typeof n==='string') && Array.isArray(r.platforms) && r.platforms.length<=3 && new Set(r.platforms.map(p=>p.id)).size===r.platforms.length && r.platforms.every(p=>['windows','linux','macos'].includes(p.id) && ['x64','arm64'].includes(p.architecture) && safeDownloadUrl(p.url) && Number.isFinite(p.bytes) && p.bytes>0 && (p.sha256==null || /^[0-9a-f]{64}$/.test(p.sha256))));
 }
 export function latestRelease(data) {
-  if(Array.isArray(data?.history))return releaseHistory(data).find(r=>r.version===data.version && r.platforms.length===3) || null;
+  if(Array.isArray(data?.history))return releaseHistory(data).find(r=>r.version===data.version && r.platforms.length>0) || null;
   return data;
 }
