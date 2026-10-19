@@ -8,7 +8,7 @@ import plistlib
 import re
 import shutil
 import zipfile
-from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs
+from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources
 
 
 MACOS_SIGNING_FILES = frozenset({
@@ -112,11 +112,16 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
         notices = manifest.get('notice_files')
         if not isinstance(notices, dict) or not notices:
             raise ValueError('Missing notice inventory')
+        required_rust = {'licenses/rust-runtime/' + name for name in policy_from_sources(selected_sources)['rust_notices']}
+        if not required_rust <= set(notices):
+            raise ValueError('Missing required Rust runtime notices')
         for name, checksum in notices.items():
             if not isinstance(name, str) or not isinstance(checksum, str) or not re.fullmatch(r'[0-9a-f]{64}', checksum) or relative_path(name).parts[0] != 'licenses':
                 raise ValueError('Invalid notice inventory')
             if sha(archive.read(prefix + name)) != checksum:
                 raise ValueError('License notice checksum mismatch')
+            if name in required_rust and archive.getinfo(prefix + name).file_size == 0:
+                raise ValueError('Required Rust runtime notice is empty')
         expected_entries = set(expected_portable) | set(notices) | {'release.json', 'THIRD_PARTY_NOTICES.md', manifest['executable'], manifest['source']}
         if platform == 'Windows':
             expected_entries.add('Start PeerBrush.cmd')

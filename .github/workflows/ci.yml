@@ -59,7 +59,7 @@ jobs:
         run: python scripts/package.py --check-source
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-docs
       - name: Identify compiler cache
         id: compiler
         shell: bash

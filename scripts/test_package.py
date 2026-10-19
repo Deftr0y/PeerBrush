@@ -10,6 +10,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 import sys
 
@@ -55,6 +56,12 @@ class Packages(unittest.TestCase):
         for args in [('init', '-q'), ('add', '.'), ('-c', 'user.name=Package Tests', '-c', 'user.email=package-tests@example.invalid', 'commit', '-qm', 'Synthetic fixture')]:
             subprocess.run(['git', '-C', str(self.root), *args], check=True, capture_output=True)
         self.output = self.root / 'output'
+        self.compiler = tempfile.TemporaryDirectory(prefix='peerbrush synthetic compiler ')
+        self.addCleanup(self.compiler.cleanup)
+        self.rust_docs = pathlib.Path(self.compiler.name) / 'share' / 'doc' / 'rust'
+        self.rust_docs.mkdir(parents=True)
+        for name in self.policy['rust_notices']:
+            (self.rust_docs / name).write_text('Synthetic active compiler notice: ' + name, encoding='utf-8')
 
     def save_policy(self):
         (self.root / packaging.MANIFEST).write_text(json.dumps(self.policy), encoding='utf-8')
@@ -77,7 +84,7 @@ class Packages(unittest.TestCase):
         binary = self.root / 'synthetic-binary'
         binary.write_bytes(header)
         with contextlib.redirect_stdout(io.StringIO()):
-            return packaging.package(self.root, binary, self.output, self.root / 'registry', platform, verify_binary=False)
+            return packaging.package(self.root, binary, self.output, self.root / 'registry', platform, verify_binary=False, rust_docs=self.rust_docs)
 
     def test_platform_architecture_source_license_and_macos_bundle_match(self):
         sources = []
@@ -93,6 +100,10 @@ class Packages(unittest.TestCase):
                 self.assertEqual(manifest['architecture'], 'arm64' if platform == 'macOS' else 'x64')
                 self.assertIn('GPL-3.0-only', package.read(root + 'LICENSE').decode())
                 self.assertIn(root + 'licenses/ubuntu-sans/LICENCE.txt', package.namelist())
+                for name in self.policy['rust_notices']:
+                    notice = 'licenses/rust-runtime/' + name
+                    self.assertEqual(package.read(root + notice), (self.rust_docs / name).read_bytes())
+                    self.assertEqual(manifest['notice_files'][notice], packaging.digest(self.rust_docs / name))
                 self.assertEqual(package.getinfo(root + manifest['executable']).external_attr >> 16 & 0o777, 0o755)
                 sources.append(package.read(root + manifest['source']))
                 if platform == 'macOS':
@@ -251,7 +262,7 @@ class Packages(unittest.TestCase):
         with zipfile.ZipFile(archive) as bundle:
             prefix = archive.stem + '/'
             notices = json.loads(bundle.read(prefix + 'release.json'))['notice_files']
-            self.assertEqual(set(notices), {'licenses/dep-1.0.0/LICENSE-MIT', 'licenses/dep-1.0.0/legal/custom.txt', 'licenses/dep-1.0.0/fonts/NOTICE.txt', 'licenses/ubuntu-sans/LICENCE.txt'})
+            self.assertEqual(set(notices), {'licenses/dep-1.0.0/LICENSE-MIT', 'licenses/dep-1.0.0/legal/custom.txt', 'licenses/dep-1.0.0/fonts/NOTICE.txt', 'licenses/ubuntu-sans/LICENCE.txt'} | {'licenses/rust-runtime/' + name for name in self.policy['rust_notices']})
             self.assertTrue(all(b'PRIVATE_CANARY' not in bundle.read(n) for n in bundle.namelist()))
         original = archive.read_bytes()
         source = self.output / 'PeerBrush-0.2.0-source.zip'
@@ -305,7 +316,7 @@ class Packages(unittest.TestCase):
         self.build('Windows')
         binary = self.root / 'synthetic-binary'
         with contextlib.redirect_stdout(io.StringIO()):
-            archive_path = packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, binary_source_commit=original_commit)
+            archive_path = packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs, binary_source_commit=original_commit)
         with zipfile.ZipFile(archive_path) as archive:
             manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
             self.assertEqual(manifest['binary_source_commit'], original_commit)
@@ -315,6 +326,75 @@ class Packages(unittest.TestCase):
         self.commit()
         with self.assertRaisesRegex(ValueError, 'source inputs differ'):
             packaging.equivalent_build_inputs(self.root, packaging.source_files(self.root), original_commit)
+
+    def test_active_compiler_notice_path_uses_absolute_sysroot_with_spaces(self):
+        self.build('Windows')
+        stale = self.root / '.dev-tools' / 'rust' / 'share' / 'doc' / 'rust'
+        stale.mkdir(parents=True)
+        for name in self.policy['rust_notices']:
+            (stale / name).write_text('SYNTHETIC_STALE_COMPILER_NOTICE', encoding='utf-8')
+        real_check_output = packaging.subprocess.check_output
+        def compiler_output(command, *args, **kwargs):
+            if command == ['rustc', '--print', 'sysroot']:
+                return self.compiler.name + '\n'
+            return real_check_output(command, *args, **kwargs)
+        with mock.patch.object(packaging.subprocess, 'check_output', side_effect=compiler_output) as compiler:
+            with contextlib.redirect_stdout(io.StringIO()):
+                archive = packaging.package(self.root, self.root / 'synthetic-binary', self.output, self.root / 'registry', 'Windows', verify_binary=False)
+            compiler.assert_any_call(['rustc', '--print', 'sysroot'], text=True)
+            self.assertEqual(sum(call.args[0] == ['rustc', '--print', 'sysroot'] for call in compiler.call_args_list), 1)
+        with zipfile.ZipFile(archive) as bundle:
+            for name in self.policy['rust_notices']:
+                self.assertEqual(bundle.read(archive.stem + '/licenses/rust-runtime/' + name), (self.rust_docs / name).read_bytes())
+        for result in ['', '\n', 'relative/toolchain']:
+            with self.subTest(result=result), mock.patch.object(packaging.subprocess, 'check_output', return_value=result):
+                with self.assertRaisesRegex(ValueError, 'absolute sysroot'):
+                    packaging.active_rust_docs()
+        with mock.patch.object(packaging.subprocess, 'check_output', side_effect=subprocess.CalledProcessError(1, ['rustc'])):
+            with self.assertRaises(subprocess.CalledProcessError):
+                packaging.active_rust_docs()
+
+    def test_missing_or_empty_runtime_notice_preserves_previous_outputs(self):
+        self.build('Windows')
+        original = {path.name: path.read_bytes() for path in self.output.iterdir() if path.is_file()}
+        for name in self.policy['rust_notices']:
+            notice = self.rust_docs / name
+            data = notice.read_bytes()
+            for missing in [True, False]:
+                with self.subTest(name=name, missing=missing):
+                    if missing:
+                        notice.unlink()
+                    else:
+                        notice.write_bytes(b'')
+                    try:
+                        with self.assertRaisesRegex(ValueError, 'Rust runtime notice'):
+                            self.build('Windows')
+                        self.assertEqual(original, {path.name: path.read_bytes() for path in self.output.iterdir() if path.is_file()})
+                        self.assertFalse(list(self.output.glob('.peerbrush-package-*')))
+                    finally:
+                        notice.write_bytes(data)
+
+    def test_inspector_requires_runtime_notices_even_when_inventory_is_removed(self):
+        archive_path = self.build('Windows')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        prefix = archive_path.stem + '/'
+        with zipfile.ZipFile(archive_path) as archive:
+            original = [(i.filename, archive.read(i.filename), i.external_attr >> 16 & 0o777) for i in archive.infolist()]
+        for name in self.policy['rust_notices']:
+            notice = 'licenses/rust-runtime/' + name
+            manifest = json.loads(next(data for filename, data, _ in original if filename == prefix + 'release.json'))
+            del manifest['notice_files'][notice]
+            files = [(filename, json.dumps(manifest).encode() if filename == prefix + 'release.json' else data, mode)
+                     for filename, data, mode in original if filename != prefix + notice]
+            packaging.write_zip(archive_path, files, 1700000000)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'Missing required Rust runtime notices'):
+                verify_release.inspect_archive(archive_path, commit, '0.2.0', self.root)
+            manifest['notice_files'][notice] = verify_release.sha(b'')
+            files = [(filename, json.dumps(manifest).encode() if filename == prefix + 'release.json' else b'' if filename == prefix + notice else data, mode)
+                     for filename, data, mode in original]
+            packaging.write_zip(archive_path, files, 1700000000)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'Required Rust runtime notice is empty'):
+                verify_release.inspect_archive(archive_path, commit, '0.2.0', self.root)
 
     def test_embedded_font_notice_inventory_preserves_real_upstream_names(self):
         (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\nname="epaint_default_fonts"\nversion="0.31.1"\nsource="registry+https://example.invalid"\n')

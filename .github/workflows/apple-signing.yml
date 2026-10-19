@@ -61,7 +61,7 @@ jobs:
           python3 scripts/package.py --check-source
       - name: Test and build without Apple credentials
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy,rust-docs
           rustup default stable
           cargo fmt --all -- --check
           cargo test --locked
