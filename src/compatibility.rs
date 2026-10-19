@@ -33,6 +33,7 @@ pub enum LossCode {
     DisabledEffectsPrivate,
     EditableSourceRasterized,
     MaskStackBaked,
+    MaskLinkPrivate,
     TransformOriginalsPrivate,
     OpacityQuantized,
 }
@@ -252,6 +253,10 @@ pub fn report(doc: &Document) -> Result<SaveReport, String> {
         }
         if let Some(mask) = &layer.mask {
             sources.push("mask_stack");
+            sources.push("mask_link");
+            if !mask.linked {
+                loss(LossCode::MaskLinkPrivate, "The unlinked mask choice is retained in PeerBrush sources. Photoshop mask-link editing behavior is not written or verified; another editor may link the mask. Standard mask pixels and the current composite are preserved.");
+            }
             if mask.steps.len() > 1
                 || mask
                     .steps

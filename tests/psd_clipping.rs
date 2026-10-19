@@ -1299,6 +1299,40 @@ fn rendered(doc: &Document) -> Vec<u16> {
             .collect()
     }
 }
+#[test]
+fn supplementary_sources_cannot_override_changed_standard_canvas_dimensions() {
+    for depth in [8, 16] {
+        let mut doc = Document::new_depth(2, 4, depth).unwrap();
+        doc.layers[0]
+            .pixels
+            .set16(0, 0, [12347, 23459, 34571, 65535]);
+        doc.layers[0]
+            .pixels
+            .set16(1, 3, [54321, 32123, 11223, 65535]);
+        let original = doc.layers[0].pixels.rgba16();
+        for mut bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+            let editable = psd::decode(&bytes).unwrap();
+            assert!(!editable.read_only);
+            assert_eq!(editable.layers[0].pixels.rgba16(), original);
+            // Same number of samples: neither planar hashes nor unchanged layer
+            // records can identify this externally changed standard header.
+            bytes[14..18].copy_from_slice(&2u32.to_be_bytes());
+            bytes[18..22].copy_from_slice(&4u32.to_be_bytes());
+            let protected = psd::decode(&bytes).unwrap();
+            assert!(protected.read_only);
+            assert_eq!(
+                (protected.width, protected.height, protected.bit_depth),
+                (4, 2, depth)
+            );
+            assert!(protected
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("PeerBrush definitions were changed")));
+            assert!(psd::encode(&protected).is_err());
+            assert!(psd::encode_psb(&protected).is_err());
+        }
+    }
+}
 fn expected(specs: &[Spec], depth: u16, isolated: bool) -> Vec<u16> {
     let op = |a: [u16; 4], b: [u16; 4], t: f64, mode: &str| {
         if depth == 16 {
@@ -2699,6 +2733,84 @@ fn photoshop_overlay_blend_enum_import_uses_exact_native_composite_gate() {
 fn gradient_payload(reverse: bool, omit: Option<&str>, smoothness: f64) -> Vec<u8> {
     positioned_gradient_payload(reverse, omit, smoothness, 100., None)
 }
+
+#[test]
+fn photoshop_gradient_integer_grid_import_requires_exact_native_composite() {
+    for depth in [8, 16] {
+        for reverse in [false, true] {
+            let mut spec = Spec::paint("Synthetic integer-center gradient", SAVED);
+            spec.tags
+                .push((*b"lfx2", gradient_payload(reverse, None, 0.)));
+            let mut bytes = fixture(&[spec], depth);
+            // At integer x=0,1, center=1 and radius=1, the independent
+            // linear ramp samples 0 and 1/2 (1 and 1/2 when reversed).
+            let expected = [
+                [
+                    if reverse { 65535 } else { 0 },
+                    if reverse { 65535 } else { 0 },
+                    if reverse { 65535 } else { 0 },
+                    65535,
+                ],
+                [native(32768, depth); 4],
+            ];
+            let mut expected = expected;
+            expected[1][3] = 65535;
+            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+            for channel in 0..4 {
+                for pixel in expected {
+                    composite_sample(&mut bytes, pixel, channel, depth);
+                }
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{depth} {reverse}: {:?}", doc.warnings);
+            assert_eq!(doc.layers[0].effects[0].settings["pixel_grid"], true);
+            let source = SAVED.map(|p| p.map(|n| native(n, depth))).concat();
+            assert_eq!(doc.layers[0].pixels.rgba16(), source);
+            assert_eq!(rendered(&doc), expected.concat());
+            let current = doc.export_png().unwrap();
+            for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                assert_eq!(saved_composite(&output, depth), expected.concat());
+                let reopened = psd::decode(&output).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                assert_eq!(
+                    reopened.layers[0].effects[0].settings,
+                    doc.layers[0].effects[0].settings
+                );
+                assert_eq!(reopened.export_png().unwrap(), current);
+                assert_eq!(
+                    psd::decode(&ordinary(&output))
+                        .unwrap()
+                        .export_png()
+                        .unwrap(),
+                    current
+                );
+            }
+            let mut engine = Engine::new();
+            let layer = doc.layers[0].id.clone();
+            let effect = doc.layers[0].effects[0].id.clone();
+            engine.doc = doc;
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":false})],
+                    None,
+                    None,
+                    "Grid gradient bypass",
+                )
+                .unwrap();
+            assert_eq!(rendered(&engine.doc), source);
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.export_png().unwrap(), current);
+            // A one-word saved-composite discrepancy cannot authorize editing.
+            let at = bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+            bytes[at] ^= 1;
+            let protected = psd::decode(&bytes).unwrap();
+            assert!(protected.read_only);
+            assert!(protected.layers[0].effects.is_empty());
+        }
+    }
+}
 fn positioned_gradient_payload(
     reverse: bool,
     omit: Option<&str>,
@@ -2715,6 +2827,83 @@ fn positioned_gradient_payload(
         &[(0, 50, [0.; 3]), (4096, 50, [255.; 3])],
         Some(&[(0, 50, 100.), (4096, 50, 100.)]),
     )
+}
+
+#[test]
+fn photoshop_layer_aligned_gradient_preserves_transparent_sources_and_exact_saves() {
+    for depth in [8, 16] {
+        for enabled in [false, true] {
+            let source = [[12347, 23459, 34571, 0], [54321, 32123, 11223, 65535]]
+                .map(|p| p.map(|n| native(n, depth)));
+            let mut payload = gradient_payload(false, None, 0.);
+            for (key, value) in [(b"Algnbool", true), (b"enabbool", enabled)] {
+                let at = payload.windows(key.len()).position(|v| v == key).unwrap() + key.len();
+                payload[at] = u8::from(value);
+            }
+            let mut spec = Spec::paint("Synthetic layer-aligned gradient", source);
+            spec.tags.push((*b"lfx2", payload));
+            let mut bytes = fixture(&[spec], depth);
+            let visible = if enabled {
+                [
+                    native(32768, depth),
+                    native(32768, depth),
+                    native(32768, depth),
+                    65535,
+                ]
+            } else {
+                source[1]
+            };
+            let expected = [[0; 4], visible];
+            bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+            for channel in 0..4 {
+                for pixel in expected {
+                    composite_sample(&mut bytes, pixel, channel, depth);
+                }
+            }
+            let doc = psd::decode(&bytes).unwrap();
+            assert!(!doc.read_only, "{depth} {enabled}: {:?}", doc.warnings);
+            assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+            assert_eq!(doc.layers[0].effects[0].settings["align_layer"], true);
+            assert_eq!(doc.layers[0].effects[0].settings["pixel_grid"], true);
+            assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+            assert_eq!(rendered(&doc), expected.concat());
+            let current = doc.export_png().unwrap();
+            let mut standard = expected;
+            // Standard PSD merged RGB is white-matted; the rendered/exported
+            // transparent pixel has zero RGB, while the encoded RGB is white.
+            standard[0] = [65535, 65535, 65535, 0];
+            for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                let reopened = psd::decode(&output).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                assert_eq!(
+                    reopened.layers[0].effects[0].settings,
+                    doc.layers[0].effects[0].settings
+                );
+                assert_eq!(reopened.export_png().unwrap(), current);
+                assert_eq!(saved_composite(&output, depth), standard.concat());
+            }
+            let mut engine = Engine::new();
+            let layer = doc.layers[0].id.clone();
+            let effect = doc.layers[0].effects[0].id.clone();
+            engine.doc = doc;
+            engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Aligned gradient bypass").unwrap();
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+            assert_eq!(engine.doc.export_png().unwrap(), current);
+            let at = bytes.len() - 7 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+            bytes[at] ^= 1;
+            assert!(psd::decode(&bytes).unwrap().read_only);
+        }
+        for value in [2, 255] {
+            let mut payload = gradient_payload(false, None, 0.);
+            let at = payload.windows(8).position(|v| v == b"Algnbool").unwrap() + 8;
+            payload[at] = value;
+            let mut spec = Spec::paint("Synthetic invalid alignment", SAVED);
+            spec.tags.push((*b"lfx2", payload));
+            assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+        }
+    }
 }
 fn custom_gradient_payload(
     reverse: bool,
@@ -4791,6 +4980,259 @@ fn supported_photoshop_overlays_retain_raster_masks_and_layer_opacity_at_native_
     }
 }
 
+fn solid_stroke_payload(position: &str, enabled: bool, master: bool, variant: &str) -> Vec<u8> {
+    let unit = |unit: &[u8; 4], n: f64| [unit.to_vec(), n.to_be_bytes().to_vec()].concat();
+    let enumeration = |class: &str, value: &str| {
+        let mut out = vec![];
+        overlay_id(&mut out, class);
+        overlay_id(&mut out, value);
+        out
+    };
+    let mut fields = vec![
+        ("enab", b"bool", vec![u8::from(enabled)]),
+        ("present", b"bool", vec![u8::from(variant != "absent")]),
+        ("showInDialog", b"bool", vec![1]),
+        ("overprint", b"bool", vec![u8::from(variant == "overprint")]),
+        ("Styl", b"enum", enumeration("FStl", position)),
+        (
+            "PntT",
+            b"enum",
+            enumeration(
+                "FrFl",
+                if variant == "gradient" {
+                    "GrFl"
+                } else {
+                    "SClr"
+                },
+            ),
+        ),
+        (
+            "Md  ",
+            b"enum",
+            enumeration(
+                "BlnM",
+                if variant == "multiply" {
+                    "Mltp"
+                } else {
+                    "Nrml"
+                },
+            ),
+        ),
+        ("Opct", b"UntF", unit(b"#Prc", 100.)),
+        (
+            "Sz  ",
+            b"UntF",
+            unit(
+                if variant == "size_unit" {
+                    b"#Prc"
+                } else {
+                    b"#Pxl"
+                },
+                if variant == "fractional" {
+                    1.5
+                } else if position == "CtrF" {
+                    2.
+                } else {
+                    1.
+                },
+            ),
+        ),
+        (
+            "Clr ",
+            b"Objc",
+            overlay_descriptor(
+                "RGBC",
+                vec![
+                    ("Rd  ", b"doub", 255f64.to_be_bytes().to_vec()),
+                    ("Grn ", b"doub", 0f64.to_be_bytes().to_vec()),
+                    ("Bl  ", b"doub", 0f64.to_be_bytes().to_vec()),
+                ],
+            ),
+        ),
+    ];
+    if variant == "unknown" {
+        fields.push(("unsupportedStrokeProperty", b"bool", vec![0]));
+    }
+    if variant == "missing" {
+        fields.retain(|(key, _, _)| *key != "PntT");
+    }
+    if variant == "invalid_flag" {
+        fields[0].2 = vec![2];
+    }
+    let definition = overlay_descriptor("FrFX", fields);
+    let list = matches!(variant, "list" | "multiple" | "aliases");
+    let mut list_value = (if variant == "multiple" { 2u32 } else { 1 })
+        .to_be_bytes()
+        .to_vec();
+    list_value.extend(b"Objc");
+    list_value.extend(&definition);
+    if variant == "multiple" {
+        list_value.extend(b"Objc");
+        list_value.extend(&definition);
+    }
+    let mut items = vec![
+        ("masterFXSwitch", b"bool", vec![u8::from(master)]),
+        (
+            "Scl ",
+            b"UntF",
+            unit(b"#Prc", if variant == "scale" { 200. } else { 100. }),
+        ),
+        (
+            "numModifyingFX",
+            b"long",
+            (if variant == "count" {
+                2
+            } else {
+                i32::from(enabled)
+            })
+            .to_be_bytes()
+            .to_vec(),
+        ),
+        (
+            if list { "frameFXMulti" } else { "FrFX" },
+            if list { b"VlLs" } else { b"Objc" },
+            if list { list_value } else { definition.clone() },
+        ),
+    ];
+    if variant == "aliases" {
+        items.push(("FrFX", b"Objc", definition));
+    }
+    if variant == "mixed" {
+        items.push(("SoFi", b"Objc", overlay_descriptor("SoFi", vec![])));
+    }
+    [
+        0u32.to_be_bytes().to_vec(),
+        16u32.to_be_bytes().to_vec(),
+        overlay_descriptor("Lefx", items),
+    ]
+    .concat()
+}
+
+#[test]
+fn standalone_photoshop_solid_strokes_require_exact_composites_and_preserve_native_sources() {
+    for depth in [8, 16] {
+        for position in ["OutF", "InsF", "CtrF"] {
+            for (enabled, master, variant) in [
+                (true, true, ""),
+                (true, true, "list"),
+                (false, true, ""),
+                (true, false, ""),
+                (true, true, "absent"),
+            ] {
+                let active = enabled && master && variant != "absent";
+                let source = [[12347, 23459, 34571, 0], [54321, 32123, 11223, 65535]]
+                    .map(|p| p.map(|n| native(n, depth)));
+                // Each nearest edge is one pixel away. Size 1 (center size 2)
+                // gives half coverage, quantized once to native effect alpha.
+                let mut merged = [[0; 4], source[1]];
+                if active && position != "InsF" {
+                    merged[0] = [65535, 0, 0, native(32768, depth)];
+                }
+                if active && position != "OutF" {
+                    for (c, tint) in [65535u16, 0, 0].into_iter().enumerate() {
+                        merged[1][c] = native(
+                            ((f64::from(source[1][c]) * 32767. + f64::from(tint) * 32768.) / 65535.)
+                                .round() as u16,
+                            depth,
+                        );
+                    }
+                }
+                let mut spec = Spec::paint("Synthetic solid Stroke", source);
+                spec.tags.push((
+                    *b"lfx2",
+                    solid_stroke_payload(position, enabled, master, variant),
+                ));
+                let mut bytes = fixture(&[spec], depth);
+                bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                for c in 0..4 {
+                    for pixel in merged {
+                        composite_sample(&mut bytes, pixel, c, depth);
+                    }
+                }
+                let doc = psd::decode(&bytes).unwrap();
+                assert!(
+                    !doc.read_only,
+                    "{depth} {position} {enabled} {master} {variant}: {:?}",
+                    doc.warnings
+                );
+                assert_eq!(doc.layers[0].pixels.rgba16(), source.concat());
+                assert_eq!(doc.layers[0].effects.len(), 1);
+                assert_eq!(doc.layers[0].effects[0].kind, "stroke");
+                assert_eq!(doc.layers[0].effects[0].enabled, active);
+                assert_eq!(rendered(&doc), merged.concat());
+                let current = doc.export_png().unwrap();
+                let standard = saved_composite(&bytes, depth);
+                for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                    assert_eq!(saved_composite(&output, depth), standard);
+                    let reopened = psd::decode(&output).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
+                    assert_eq!(
+                        reopened.layers[0].effects[0].settings,
+                        doc.layers[0].effects[0].settings
+                    );
+                    assert_eq!(reopened.export_png().unwrap(), current);
+                }
+                let layer = doc.layers[0].id.clone();
+                let effect = doc.layers[0].effects[0].id.clone();
+                let mut engine = Engine::new();
+                engine.doc = doc;
+                engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!active})], None, None, "Stroke bypass").unwrap();
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
+                assert_eq!(engine.doc.export_png().unwrap(), current);
+                // Mutate opaque green, which cannot vanish in alpha-zero matting.
+                let at = bytes.len() - 5 * usize::from(depth / 8) + usize::from(depth == 16);
+                bytes[at] ^= 1;
+                let protected = psd::decode(&bytes).unwrap();
+                assert!(protected.read_only);
+                assert_eq!(protected.bit_depth, depth);
+                assert!(psd::encode(&protected).is_err());
+            }
+        }
+        for variant in [
+            "overprint",
+            "gradient",
+            "multiply",
+            "fractional",
+            "size_unit",
+            "unknown",
+            "missing",
+            "invalid_flag",
+            "multiple",
+            "aliases",
+            "scale",
+            "count",
+            "mixed",
+            "mask",
+            "clip",
+            "partial",
+        ] {
+            for enabled in [false, true] {
+                let mut spec = Spec::paint("Synthetic unsupported Stroke", SAVED);
+                spec.tags.push((
+                    *b"lfx2",
+                    solid_stroke_payload("OutF", enabled, true, variant),
+                ));
+                if variant == "mask" {
+                    spec.mask = Some([65535; 2]);
+                }
+                if variant == "clip" {
+                    spec.clipping = 1;
+                }
+                if variant == "partial" {
+                    spec.pixels[0][3] = 12347;
+                }
+                let doc = psd::decode(&fixture(&[spec], depth)).unwrap();
+                assert!(doc.read_only, "{depth} {variant} {enabled}");
+                assert_eq!(doc.bit_depth, depth);
+                assert!(doc.layers[0].effects.is_empty());
+                assert!(psd::encode(&doc).is_err());
+            }
+        }
+    }
+}
+
 fn axial_gradient_payload(degrees: f64, reflected: bool, reverse: bool) -> Vec<u8> {
     let mut payload = gradient_payload(reverse, None, 0.);
     let at = payload
@@ -4804,6 +5246,102 @@ fn axial_gradient_payload(degrees: f64, reflected: bool, reverse: bool) -> Vec<u
         payload[at..at + 4].copy_from_slice(b"Rflc");
     }
     payload
+}
+
+#[test]
+fn photoshop_nonaxial_gradient_shapes_keep_native_grid_sources_and_exact_composites() {
+    for depth in [8, 16] {
+        for (shape, name) in [
+            (b"Rdl ", "radial"),
+            (b"Angl", "angle"),
+            (b"Dmnd", "diamond"),
+        ] {
+            for degrees in [0., 90.] {
+                for reverse in [false, true] {
+                    for enabled in [false, true] {
+                        let mut payload = axial_gradient_payload(degrees, false, reverse);
+                        let at = payload.windows(4).position(|v| v == b"Lnr ").unwrap();
+                        payload[at..at + 4].copy_from_slice(shape);
+                        let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+                        payload[at] = u8::from(enabled);
+                        let mut spec =
+                            Spec::paint("Synthetic integer-center gradient shape", SAVED);
+                        spec.tags.push((*b"lfx2", payload));
+                        let mut bytes = fixture(&[spec], depth);
+                        // The 2x1 integer grid is centered at (1,0), radius 1.
+                        // Radius/Manhattan samples are 1 and 0. Angle's left
+                        // axis is 1/2 or 3/4; its singular center is 1/4.
+                        let positions = if name == "angle" {
+                            [if degrees == 0. { 0.5 } else { 0.75 }, 0.25]
+                        } else {
+                            [1., 0.]
+                        };
+                        let expected = std::array::from_fn::<_, 2, _>(|x| {
+                            if !enabled {
+                                return SAVED[x].map(|n| native(n, depth));
+                            }
+                            let t: f64 = if reverse {
+                                1. - positions[x]
+                            } else {
+                                positions[x]
+                            };
+                            let channel = native((t * 65535.).round() as u16, depth);
+                            [channel, channel, channel, 65535]
+                        });
+                        bytes.truncate(bytes.len() - 8 * usize::from(depth / 8));
+                        for channel in 0..4 {
+                            for pixel in expected {
+                                composite_sample(&mut bytes, pixel, channel, depth);
+                            }
+                        }
+                        let doc = psd::decode(&bytes).unwrap();
+                        assert!(
+                            !doc.read_only,
+                            "{depth} {name} {degrees} {reverse} {enabled}: {:?}",
+                            doc.warnings
+                        );
+                        assert_eq!(doc.layers[0].effects[0].settings["style"], name);
+                        assert_eq!(doc.layers[0].effects[0].settings["pixel_grid"], true);
+                        assert_eq!(doc.layers[0].effects[0].enabled, enabled);
+                        let source = SAVED.map(|p| p.map(|n| native(n, depth))).concat();
+                        assert_eq!(doc.layers[0].pixels.rgba16(), source);
+                        assert_eq!(rendered(&doc), expected.concat());
+                        let current = doc.export_png().unwrap();
+                        for output in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+                            let reopened = psd::decode(&output).unwrap();
+                            assert!(!reopened.read_only);
+                            assert_eq!(reopened.layers[0].pixels.rgba16(), source);
+                            assert_eq!(
+                                reopened.layers[0].effects[0].settings,
+                                doc.layers[0].effects[0].settings
+                            );
+                            assert_eq!(reopened.export_png().unwrap(), current);
+                            assert_eq!(saved_composite(&output, depth), expected.concat());
+                        }
+                        let mut engine = Engine::new();
+                        let layer = doc.layers[0].id.clone();
+                        let effect = doc.layers[0].effects[0].id.clone();
+                        engine.doc = doc;
+                        engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!enabled})], None, None, "Gradient shape bypass").unwrap();
+                        engine.undo("human").unwrap();
+                        assert_eq!(engine.doc.export_png().unwrap(), current);
+                        let at =
+                            bytes.len() - 8 * usize::from(depth / 8) + usize::from(depth / 8) - 1;
+                        bytes[at] ^= 1;
+                        assert!(psd::decode(&bytes).unwrap().read_only);
+                    }
+                }
+            }
+        }
+        let mut payload = axial_gradient_payload(0., false, false);
+        let at = payload.windows(4).position(|v| v == b"Lnr ").unwrap();
+        payload[at..at + 4].copy_from_slice(b"????");
+        let at = payload.windows(8).position(|v| v == b"enabbool").unwrap() + 8;
+        payload[at] = 0;
+        let mut spec = Spec::paint("Synthetic disabled unknown shape", SAVED);
+        spec.tags.push((*b"lfx2", payload));
+        assert!(psd::decode(&fixture(&[spec], depth)).unwrap().read_only);
+    }
 }
 #[test]
 fn photoshop_cardinal_and_reflected_gradients_keep_native_orientation_and_sources() {
@@ -4900,7 +5438,7 @@ fn photoshop_cardinal_and_reflected_gradients_keep_native_orientation_and_source
     }
 }
 #[test]
-fn arbitrary_gradient_rotation_and_shape_remain_protected_even_when_disabled() {
+fn arbitrary_gradient_rotation_and_unmatched_shapes_remain_protected() {
     for depth in [8, 16] {
         for degrees in [-181., -89., 45., 89., 181.] {
             let mut payload = axial_gradient_payload(degrees, true, false);

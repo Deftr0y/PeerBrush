@@ -1,0 +1,134 @@
+# PeerBrush 0.26 development
+
+Unreleased development on `version/0.26`, starting from the published 0.25 source and its documentation updates. Focused work uses `feature/0.26/<topic>` or `fix/0.26/<topic>` and follows the [development guide](development-guide.md). Published downloads remain 0.25. This queue supplements the acceptance criteria in [FOLLOWUPS.MD](../FOLLOWUPS.MD); an existing implementation is not evidence that outstanding acceptance work passed.
+
+Work proceeds in this priority order, updated after the 2026-10-15 responsiveness report:
+
+1. **PB-108 / PB-036 / PB-072:** investigate overall input-to-display delay first. Painting also lags on a blank canvas; the report describes a constant slight delay across the application, not just expensive brush tools. Measure input handling, preview replay/render, navigation and presentation separately. Physical pen-to-display and driver measurements require actual hardware.
+2. **PB-122 / PB-136:** expand conservative Photoshop style import, preserving native channels and requiring an exact match with the standard saved composite. Keep unsupported documents protected. First slice: connect the existing integer pixel-grid gradient renderer to bounded gradient import without changing previously accepted source placement.
+3. **PB-110:** investigate the reported selection recurrence and preserve selection coverage through copy/paste, transforms and cancellation.
+4. **PB-080 / PB-137 / PB-138:** complete remaining lifecycle and cross-platform native acceptance checks. The original reported incident's cause remains unverified.
+5. **PB-118 / PB-070:** receiving-application round trips and remaining Photoshop/color-profile fidelity, with actual application/version evidence.
+6. **PB-106 / PB-133:** close outstanding effects UI and native clipboard acceptance checks without replacing a populated human clipboard.
+7. **PB-007 / PB-042 / PB-036 / PB-061 / PB-076 / PB-081:** remaining visual feedback, performance paths and optional refinements after the higher-priority reliability work.
+8. **PB-141:** use installed system fonts for multilingual UI while preserving Ubuntu Sans, Unicode paths, shaping and document Text sources; verify missing-font cases and actual platform package reductions before removing bundled coverage.
+9. **PB-103 / PB-105:** signing and larger-document architecture remain dependent on signing access and bounded resource measurements; current size limits stay in force until the engine and codec support an increase.
+10. **PB-139:** historical-reference audit may proceed read-only. History rewrites, tag moves and deletion remain subject to the explicit owner-approval requirement recorded in the backlog.
+
+The existing GitHub Actions workflow runs engine, codec, protocol and UI regression tests, formatting, Clippy and package checks on every branch push, across Windows, macOS and Linux. Development checkpoints use that workflow for automated testing. A queued run is not a passed run: record the exact tested commit and outcome before closing acceptance work. Native workspace inspection remains separate from CI, as do physical hardware and receiving-application checks.
+
+CI caches Rust registry data and build outputs with the [official cache action](https://github.com/actions/cache), pinned to its verified Node.js 24 v5 commit. Keys separate runner image/architecture, stable compiler version, dependency manifests and release compiler flags. Tests and package verification still execute on every run; cached builds are not acceptance evidence. Runtime QA state, source-control metadata and credentials are outside the cached paths. Turnaround improvements remain to be measured after the first successful cache population.
+
+No release, website deployment, announcement or historical rewrite is part of starting this development branch.
+
+## PB-108 application responsiveness
+
+Investigation in progress. Canvas pan and zoom were applied after building the current frame's image mesh, producing a deterministic one-frame navigation delay. Navigation now precedes drawing and coordinate mapping, retaining modal, preview and tool-size gesture guards. The native graphics configuration requests one queued presentation frame instead of the library's default two; the driver may clamp this request.
+
+User acceptance of that first candidate failed: it felt about the same as published 0.25, including a trailing canvas cursor, lagging slider feedback and delayed tool selection. The CPU improvements below do not close this report. A further UI correction removes the range fill's extra 60 ms easing and the tool highlight's 100 ms fade. Toolbar clicks are resolved before painting either selection, so the clicked tool is fully highlighted in the click frame. AI numeric and canvas presentation retain their existing dedicated animation paths.
+
+The next isolated Windows candidate used `AutoNoVsync` with those control fixes. The user reported that both cursor and controls felt quicker. In a further comparison against normal vsync with the same control fixes, the user confirmed that the normal-vsync cursor felt slower. Initial native probe batches of 120 pointer-input UI updates had medians of 0.23–0.51 ms and p95 values of 0.34–1.89 ms, with a 20.03 ms outlier. Those timings cover UI processing, not physical display latency. Windows now requests `AutoNoVsync`, which uses immediate presentation when supported and a supported fallback otherwise; macOS/Linux keep the earlier vsync policy pending native verification. Immediate presentation may tear and consume more GPU time during input. This improvement does not close broader performance and hardware acceptance.
+
+Local verification of these changes passed 889 Rust checks, 18 packaging checks and six branch-policy checks. Eight optional Rust checks were ignored and one real OS clipboard transport check was excluded to preserve clipboard contents. Formatting and all-target Clippy passed with existing warnings. Focused regressions check that range fill follows its current value in the input frame and that only the clicked toolbar selection is fully painted in its click frame, without changing document pixels or history. The new native workspace was visually inspected; a separate fresh native16 run independently checked source samples, painting, exact undo and editable PSD save/reopen output. Diagnostic source, logs and executables remain outside tracked source.
+
+The first brush sample also unnecessarily discarded an exact prepared baseline when starting a new gesture key. The shared preview cache now transfers that baseline only when document identity, revision, layout and prepared keys match. Changed dimensions, isolation, masks and unsupported paths retain full-render guards. The first returned frame still requires a complete texture upload, since a preceding worker frame may not have reached the UI. Cancellation cannot reuse a draft as its committed baseline. Sources, precision, history and save rendering are unchanged.
+
+The navigation regression was reproduced before the change. `cargo run --locked --release --example input_performance` compares the previous full first-input strategy with retained rendering in the same warmed process, then measures 120 successive blank-canvas preview updates at native8/16, with and without smoothing. Sampled source rasters and display frames must equal full shared-engine replay. The relevant brush, preview, renderer and graphics-entry files were unchanged between published 0.25 and the 0.26 starting point.
+
+Paired local Windows release measurements, one paint layer, 18-pixel brush radius, no effects, 1536-pixel preview and smoothing disabled:
+
+| Canvas / depth | Full first input | Retained first input | Continuing median / p95 |
+| --- | --- | --- | --- |
+| 1024×768 / 8-bit | 3.13 ms | 0.72 ms | 0.75 / 1.04 ms |
+| 2048² / 8-bit | 7.27 ms | 1.68 ms | 1.50 / 1.88 ms |
+| 1024×768 / native16 | 6.60 ms | 0.78 ms | 0.73 / 1.00 ms |
+| 2048² / native16 | 15.49 ms | 2.02 ms | 1.62 / 2.99 ms |
+
+These are CPU replay/render observations, excluding OS input delivery, worker scheduling, texture upload, GPU presentation and physical display latency. Smoothing at 0.35 still increases continuing work: the measured native16 2048² p95 was 14.67 ms and maximum 17.57 ms. Broader stroke and startup profiling remain open; these measurements do not establish end-to-end responsiveness.
+
+Windows native8 and native16 artwork was rendered and captured in an isolated workspace. An independent PNG16 decoder verified every original low-bit source sample, exact undo and editable PSD save/reopen output. The saved-path ownership guard refused reopening the active project's file; an exact independent copy was used for the round trip. Physical pointer-to-display timing, native interactive navigation, macOS/Linux acceptance, final CI and user acceptance remain separate.
+
+## PB-122 integer-grid gradient import
+
+Implemented, acceptance pending. Existing supported gradient geometry is tried first. If its complete native composite differs, the decoder tries one alternate document with enabled Gradient Overlays using the existing integer-center pixel grid. Only an exact match of every standard white-matte RGB and alpha sample permits editable opening. Original native rasters and all existing descriptor/structure guards remain in force; rejected candidates use the protected saved composite. Mixed per-effect geometry combinations, smooth Photoshop gradients and broader unsupported style structures remain protected.
+
+The regression fixture supplies independent 8/16-bit integer-center ramp samples, reversed placement, editable PSD/PSB reopen, standard-only appearance, effect bypass/undo and one-word mismatch protection. The first checkpoint failed platform regression tests. Review found that the alternate document reused the first render's derived effect keys; the correction regenerates those keys through shared engine invalidation before rendering the candidate. GitHub Actions and fresh native workspace acceptance of the correction are pending; this slice does not close PB-122. CI now publishes bounded test names and counts in its job summary and failure annotations, retaining the original test exit status and excluding arbitrary log contents. Compilation failures can report bounded Rust diagnostic codes without publishing their free-form messages.
+
+## PB-122 layer-aligned gradients
+
+Implemented, acceptance pending. Bounded cardinal Linear/Reflected Gradient Overlays can retain an explicit `Algn=true` definition using the existing native integer grid and alpha-bound layer alignment. Document-aligned gradients keep their earlier first-choice placement. Dither, unsupported interpolation, malformed fields and other unsupported structures remain protected; every accepted import still requires an exact complete native composite match.
+
+The additional native8/16 fixture checks transparent hidden source RGB, enabled/disabled definitions, independent integer-center samples, editable PSD/PSB saves, effect bypass/undo and one-word mismatch protection. No new source format or rendering formula is introduced. Automated and native acceptance remain pending.
+
+## PB-122 additional gradient shapes
+
+Implemented, acceptance pending. Radial, Angle and Diamond descriptors now map to the existing integer-grid native renderer alongside Linear and Reflected. Their PSD IDs follow the [primary ag-psd descriptor codec](https://github.com/Agamnentzar/ag-psd/blob/master/src/descriptor.ts). Cardinal angle, native RGB stops, scale/offset, alpha-stop, descriptor and complete exact-composite guards continue to apply. Unknown shapes and unsupported rotation remain protected even when disabled. This is a bounded import extension, not full Photoshop gradient compatibility.
+
+Independent native8/16 fixtures cover radius/Manhattan coordinates, angle-axis and singular-center samples, reverse, enabled/disabled definitions, original sources, editable PSD/PSB reopening, effect bypass/undo and exact mismatch protection. Automated acceptance is pending.
+
+Sixteen independent offline 256Ã—160 fixtures cover native8/16 Linear, Radial, Angle and Diamond imports, with document or alpha-bound layer alignment. Every original channel (including transparent hidden RGB), editable PSD/PSB definition and rendered export survived save/reopen and exact bypass/undo. The rendered gradient, recovered source and additional shape images were inspected. The layer-alignment regression fixture's standard-composite expectation was corrected to distinguish white-matted PSD RGB from straight-alpha rendered RGB; no renderer or exact-match tolerance changed. Native workspace interaction and final combined CI acceptance remain pending.
+
+## PB-122 standalone solid Stroke
+
+Implemented, acceptance pending. One unscaled Normal solid-color `FrFX` definition, or one explicit `frameFXMulti` entry, can map to the existing native Inside/Outside/Center Stroke renderer. Whole-pixel sizes are bounded to 0â€“128 pixels. Original native8/16 raster channels remain intact; editable opening requires an exact complete standard composite match. Mixed stacks, multiple strokes, gradient/pattern paint, overprint, masks, clipping, partial source alpha and unsupported fields remain protected, including disabled definitions. Descriptor IDs follow the [primary ag-psd codec](https://github.com/Agamnentzar/ag-psd/blob/master/src/descriptor.ts).
+
+Regression coverage specifies independent half-coverage edge samples, master/present/enabled states, single/list aliases, native source retention, current standard PSD/PSB composites, editable reopening, bypass/undo and one-sample mismatch protection. Formatting and compile checking passed; automated and fresh native workspace acceptance remain pending. This does not establish general Photoshop Stroke equivalence or recover the broader representative styled document.
+
+Six independent 256Ã—160 Stroke fixtures opened in a fresh isolated native workspace as editable native8/16 at revision zero. Captures were inspected for Inside, Outside and Center placement and show the rendered outlines and native Stroke control over the retained checker source. Interaction and final CI acceptance remain separately pending.
+
+## CI checkpoints
+
+Commit `0b91a4c` passed all three native jobs and matching platform package inspection in [GitHub Actions](https://github.com/Deftr0y/PeerBrush/actions/runs/38275647900). Commit `197eac5` also has a [successful complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38285419164), while its other run failed an intermittent file-ownership regression. Later runs must be verified separately; a successful older checkpoint does not close the current development queue.
+
+The standalone Stroke checkpoint `4d09cc1` passed all three native jobs and package inspection in [this complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38289758916). Its [other run](https://github.com/Deftr0y/PeerBrush/actions/runs/38289766620) failed Linux save-safety retention at `tests/file_safety.rs:332`; that result remains separate from the style acceptance.
+
+## PB-137 ownership release hardening
+
+The [639a369 Linux run](https://github.com/Deftr0y/PeerBrush/actions/runs/38287773856) identified an ownership-busy failure at the first open after cancellation (`tests/file_ownership.rs:105`), while another run's Linux job passed. Final native ownership now explicitly unlocks its OS handles before closing them. [Rust's lock contract](https://doc.rust-lang.org/std/fs/struct.File.html#method.lock) allows duplicated or inherited descriptors to keep a lock alive after the original closes; a deterministic regression retains those descriptors across reacquisition and verifies that the new owner still blocks hard-link aliases. This addresses that lock-lifetime condition; the intermittent CI cause and broader original data-loss report are not yet proven resolved. Formatting and compile checking passed; cross-platform CI acceptance is pending.
+
+Save leases and previous-save quota guards now use the same explicit OS unlock on drop, including fallible lease preparation after acquisition. Additional deterministic coverage retains duplicate descriptors across reacquisition, verifies that the new lease still excludes competitors, and preserves original file bytes. CI adds bounded `SAVE_BUSY` and `BACKUP_STORAGE_FULL` failure categories without publishing arbitrary panic text. These changes address the lock-lifetime condition; the intermittent save-safety failure still requires CI verification.
+
+The save-lease checkpoint `d454414` passed all native jobs and package inspection in [this complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38292827304). A later Linux run still found ownership-busy during a repeated save in the previous-save chooser. On Unix, physical-identity locks now retain the source file handle as well as the OS lock, so an unlinked/replaced source inode cannot be reused by an unrelated file while its identity remains claimed. Staged identities are pinned through publication; retiring/releasing them drops those handles. The Unix regression checks original content after unlink, independent files, staged publication and release. Post-acquisition owner-record errors also use the explicit unlock guard.
+
+Native Windows QA found that retaining an existing source handle caused the current write-through replacement API to return Access denied. An isolated platform probe confirmed the failure with both read and metadata-only pins, while closing those handles permitted replacement. Windows therefore retains its existing short-lived source/staged identity reads and cooperative path/identity locks; the new inode pin is Unix-only. A cross-platform repeated-save regression keeps engine snapshots alive and verifies exact original low-bit native16 samples, saved revisions and duplicate-open protection. Formatting and compile checking passed; final CI and repeated native save acceptance are pending.
+
+The corrected Windows workspace opened independent native16 Stroke artwork and completed two guarded saves to the same new QA destination. Native PNG exports before/after the repeated save were byte-identical. The system-only multilingual layer row and blue AI feedback were visually inspected. This accepts that native replacement case; cross-platform final CI remains separate.
+
+## PB-080 workspace cache identity
+
+The registry cache now retains and checks the weak identity of its root engine, alongside the weak workspace. Closing the root can remove its registry handle while an engine snapshot keeps the registry alive. Previously its address-only key could then collide with a new root after allocation reuse. The weak root pins that allocation until cache retirement; identity validation also rejects a stale cache entry. A deterministic regression simulates the collision after close, preserves the old snapshot, and verifies independent project lookup and active identity. Formatting and compile checking passed; CI and native lifecycle acceptance remain pending. This is a separate isolation fix, not an established explanation for the original data-loss report.
+
+## PSD supplementary canvas identity
+
+Supplementary PeerBrush sources now require exact agreement with the standard header's width and height, in addition to existing depth, standard hashes, metadata and source validation. An external dimension swap can retain the same planar sample count and unchanged layer records; those hashes alone cannot establish the canvas identity. A mismatch keeps the saved standard appearance protected at its actual header dimensions and original precision. Native8/16 PSD/PSB regression coverage preserves the unchanged editable case and rejects conflicting sources/saves. Formatting and compile checking passed; CI and native acceptance are pending.
+
+Checkpoint `30fec72` passed all three native jobs and package inspection in [this complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38295016977). A fresh Windows workspace opened an independently modified 256Ã—160 supplementary-source PSD as a protected standard 160Ã—256 native16 composite. Its captured canvas/read-only status were inspected, and a guarded save to a new QA destination was refused without creating that file. Original synthetic source bytes were retained.
+
+## PB-141 installed-font discovery
+
+Implemented discovery and presentation selection; native macOS/Linux acceptance remains pending. The existing fontdb codec scans standard Windows, macOS and Linux font locations. Regular installed faces are selected only after checking representative complete Hebrew, Arabic, Devanagari, Han, kana and Hangul samples. Collection indices are retained. Ubuntu Sans stays primary. Both the replacement checkpoint and system-only source passed combined CI.
+
+Selected font bytes are snapshotted and shared by the filename shaper, with a 32 MiB per-file and 64 MiB retained-data bound. The presentation catalog neither retains font paths nor downloads missing fonts. Existing bidi/shaping and 64-entry/8 MiB texture bounds remain in force. Runtime font-family names are XML-escaped. Document Text definitions, logical filenames, original paths, history and pixels are unchanged. Additional coverage checks installed selection, absent/invalid/oversized fonts, complete script samples, collection indices and primary-font order. Missing coverage uses the primary font's missing-glyph sign; the forced missing-font fixture renders only Hindi characters so ASCII suffixes cannot hide invisible glyphs.
+
+A fresh isolated Windows workspace opened a synthetic mixed Hebrew/Arabic/Hindi/Han/kana/Hangul filename as editable native16 at revision zero. Its native capture was inspected for shaped status text and clipped RTL tab presentation. The source artwork and logical path were retained. A deterministic Ubuntu-only shaping database checks visible missing-glyph rendering for an absent Hindi font without rewriting the logical name. CI now reports measured source/platform archive sizes through bounded notices and job summaries. Measured system-only archive reductions are recorded below; native macOS/Linux acceptance remains pending.
+
+Complex-script layer-row names also use the shared presentation shaper, including AI/hidden-layer color tinting. Existing click targets and inline rename keep the original logical name. A native8/16 UI regression double-clicks the shaped name and checks exact selection, source document and history retention before editing. Latin row labels keep their existing font weights. A fresh Windows capture was inspected for the shaped compact row and blue AI feedback. Replacement checkpoint `647420f` passed all three test/build jobs and package inspection in [this complete run](https://github.com/Deftr0y/PeerBrush/actions/runs/38294077136). The four Noto binaries and two redundant notices (16,932,610 source bytes) are removed from current source/portable inventories; executable embedding is removed. Ubuntu assets and licenses remain. Final system-only CI and actual archive reductions are recorded below; native macOS/Linux verification remains pending.
+
+System-only Windows native presentation was inspected after removal, alongside the successful repeated native16 saves. The effect action menu uses ASCII dots covered by Ubuntu Sans, avoiding reliance on the removed math-symbol glyph. Current corresponding-source policy validation passed with 277 approved files. Actual source/platform archive byte counts remain tracked through CI; removed input bytes are not a measured archive reduction.
+
+The [system-only run at d51b981](https://github.com/Deftr0y/PeerBrush/actions/runs/38715384636) passed attribution, branch policy, all three native test/build jobs and matching package inspection. Actual ZIP sizes from the two runs' package notices are below. These checkpoints include other intervening development, so the measured change is not attributed exclusively to font removal. Actions artifacts remain development builds.
+
+| Archive | Replacement checkpoint bytes | System-only checkpoint bytes | Reduction |
+| --- | ---: | ---: | ---: |
+| Windows x64 | 83,376,773 | 28,170,809 | 66.2% |
+| macOS arm64 | 82,433,325 | 26,966,850 | 67.3% |
+| Linux x64 | 85,832,738 | 30,476,744 | 64.5% |
+| Corresponding source | 30,898,952 | 14,014,184 | 54.6% |
+
+Archive reductions and combined system-only CI are verified. Native macOS/Linux multilingual presentation and receiving-application acceptance remain open.
+
+## PB-152 mask linking
+
+Implemented and verified, unreleased. A shared boolean link state defaults to linked, participates in selective history and appears in observation/catalog output. The native chain control uses guarded shared commands. Linked and unlinked move/rotate/scale paths preserve original native samples; selection transforms use the same coverage and coherent gesture history. Unsupported procedural-mask combinations reject explicitly. Source format 29 retains link choices; unlinked saves disclose that external Photoshop link editing is not written or verified.
+
+All 41 focused native8/16 engine, codec, protocol and transform checks passed, including bounded work rejection before allocation and atomic failure. The input-frame check passed pointer, Space and Enter activation while retaining the selected target, channel, artwork and locked-layer guard. Native Windows captures show linked movement and independent Color/Mask movement, the compact chain state and blue AI feedback. Exact native16 undo/reopen passed. An independent standard PSD reader checked every original color/alpha word and three current merged composites, including partial native mask values. All 897 combined engine/codec/protocol/UI checks passed (eight opt-in checks ignored; one Windows clipboard-station check excluded), alongside formatting, Clippy with existing warnings, 18 packaging checks, six branch-policy checks and the 281-file source policy. Native8 independent mask rotation, exact undo/redo and editable PSB reopening were additionally verified. Real Photoshop link-state interchange and native macOS/Linux acceptance remain pending.

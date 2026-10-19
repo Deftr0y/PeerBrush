@@ -494,7 +494,7 @@ impl PeerBrush {
                         "AI has reserved this layer or a region; visibility stays available",
                     );
             }
-            let mask_width = if l.mask.is_some() { 35.0 } else { 0.0 };
+            let mask_width = if l.mask.is_some() { 60.0 } else { 0.0 };
             let summary = if l.kind == "group" {
                 let empty = FolderSummary::default();
                 let counts = tree.folders.get(&l.id).unwrap_or(&empty);
@@ -531,32 +531,27 @@ impl PeerBrush {
             {
                 self.inline_rename(ui, name_width);
             } else {
-                let name = ui
-                    .add_sized(
-                        [name_width, 30.0],
-                        egui::Label::new(
-                            RichText::new(&l.name)
-                                .size(12.0)
-                                .font(egui::FontId::new(
-                                    12.0,
-                                    if l.kind == "group" {
-                                        egui::FontFamily::Name("semibold".into())
-                                    } else {
-                                        egui::FontFamily::Proportional
-                                    },
-                                ))
-                                .color(if reserved {
-                                    AI_BLUE
-                                } else if l.visible {
-                                    Color32::WHITE
-                                } else {
-                                    MUTED
-                                }),
-                        )
-                        .truncate()
-                        .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text(tree.tooltip(l));
+                let name = filename::click_label(
+                    ui,
+                    &l.name,
+                    name_width,
+                    egui::FontId::new(
+                        12.,
+                        if l.kind == "group" {
+                            egui::FontFamily::Name("semibold".into())
+                        } else {
+                            egui::FontFamily::Proportional
+                        },
+                    ),
+                    if reserved {
+                        AI_BLUE
+                    } else if l.visible {
+                        Color32::WHITE
+                    } else {
+                        MUTED
+                    },
+                )
+                .on_hover_text(tree.tooltip(l));
                 if name.clicked() {
                     self.select_row(ui, doc, &l.id);
                     let time = ui.input(|i| i.time);
@@ -636,6 +631,7 @@ impl PeerBrush {
                 }
             }
             if l.mask.is_some() {
+                self.mask_link_button(ui, doc, l);
                 if self
                     .thumb_button(
                         ui,
@@ -667,6 +663,67 @@ impl PeerBrush {
             disclosure
         })
         .inner
+    }
+    pub(super) fn mask_link_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &Document,
+        layer: &Layer,
+    ) -> egui::Response {
+        let mut linked = layer.mask.as_ref().unwrap().linked;
+        let tip = if linked {
+            "Mask linked · transform Color and Mask together · Click to unlink"
+        } else {
+            "Mask unlinked · transform only the selected Color or Mask · Click to link"
+        };
+        let response = ui
+            .add_enabled_ui(
+                !doc.read_only && !self.busy && !layer.locked && !self.ai_reserved(&layer.id),
+                |ui| icons::small_button(ui, Icon::Connect, tip),
+            )
+            .inner;
+        if response.clicked() {
+            self.edit(vec![json!({"op":"mask.link","layer":layer.id,"linked":!linked,"document_id":doc.id,"source_revision":doc.revision})], if linked { "Unlink mask" } else { "Link mask" });
+            if let Some(mask) = self
+                .shared
+                .lock()
+                .unwrap()
+                .doc
+                .layers
+                .iter()
+                .find(|current| current.id == layer.id)
+                .and_then(|current| current.mask.as_ref())
+            {
+                linked = mask.linked;
+            }
+            ui.ctx().request_repaint();
+        }
+        if !linked {
+            ui.painter().line_segment(
+                [
+                    response.rect.left_bottom() + Vec2::new(2., -4.),
+                    response.rect.right_top() + Vec2::new(-2., 4.),
+                ],
+                Stroke::new(1.5, MUTED),
+            );
+        }
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                response.rect,
+                3,
+                Stroke::new(1., ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Checkbox,
+                response.enabled(),
+                linked,
+                "Link layer mask",
+            )
+        });
+        response
     }
     pub(super) fn layer_list(&mut self, ui: &mut egui::Ui, doc: &Document) {
         let mut context_menu = self
@@ -951,6 +1008,47 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("Missing visible {value}"))
+    }
+    #[test]
+    fn shaped_layer_names_keep_inline_rename_selection_and_native_work() {
+        for depth in [8, 16] {
+            let (mut app, ctx, ids, _) = fixture(depth);
+            let logical = "שלום مرحبا हिन्दी 漢字";
+            let (before, undo_count) = {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc.layers[2].name = logical.into();
+                engine.doc.selection = Some([1, 1, 6, 6]);
+                (
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    engine.undo.len(),
+                )
+            };
+            frame(&mut app, &ctx, vec![]);
+            let output = frame(&mut app, &ctx, vec![]);
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == logical)));
+            let row = app.layer_rects[&ids[2]];
+            let at = egui::pos2(row.right() - 80., row.center().y);
+            for _ in 0..2 {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(at), button(at, true)],
+                );
+                frame(&mut app, &ctx, vec![button(at, false)]);
+            }
+            let edit = app
+                .rename_edit
+                .as_ref()
+                .expect("Double-click shaped name must rename inline");
+            assert_eq!(edit.layer, ids[2]);
+            assert_eq!(edit.original, logical);
+            assert_eq!(edit.text, logical);
+            assert_eq!(app.selected, ids[2]);
+            let engine = app.shared.lock().unwrap();
+            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+            assert_eq!(engine.undo.len(), undo_count);
+            assert_eq!(engine.doc.bit_depth, depth);
+        }
     }
     #[test]
     fn collapsed_folder_selection_reveal_keeps_native_mask_target_and_other_folders() {

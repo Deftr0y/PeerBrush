@@ -17,6 +17,7 @@ fn fixture(depth: u16, effects: bool) -> (Engine, String) {
     let mut paint = Raster::new_depth(40, 32, depth);
     paint.set16(7, 9, [0, 0, 0, 65535]);
     root.mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: id(),
         steps: vec![
@@ -246,7 +247,7 @@ fn folder_rotation_keeps_native_pixels_hidden_children_masks_sources_and_one_und
         .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&source).unwrap()["format"],
-            9
+            29
         );
         let restored = psd::decode(&saved).unwrap();
         assert!(!restored.read_only);
@@ -328,15 +329,14 @@ fn folder_edits_are_atomic_for_locks_reservations_late_failures_and_selection_sc
         .edit("human", &[command.clone()], None, None, "Reserved tree")
         .is_err());
     e.leases.clear();
-    assert!(e
-        .edit(
-            "human",
-            &[json!({"op":"move","layer":root,"dx":1,"mask":true})],
-            None,
-            None,
-            "Unsupported folder mask transform"
-        )
-        .is_err());
+    let linked = serde_json::to_vec(&e.doc).unwrap();
+    edit(&mut e, json!({"op":"move","layer":root,"dx":1,"mask":true}));
+    e.undo("human").unwrap();
+    let mut restored = e.doc.clone();
+    restored.revision = serde_json::from_slice::<Document>(&linked)
+        .unwrap()
+        .revision;
+    assert_eq!(serde_json::to_vec(&restored).unwrap(), linked);
     let original = serde_json::to_vec(&e.doc).unwrap();
     e.doc.layers[3].x = 100000;
     let invalid = serde_json::to_vec(&e.doc).unwrap();
