@@ -1,11 +1,13 @@
 {
-  "version": 1,
+  "version": 2,
   "source": [
     ".github/human-contributors.json",
     ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
     "Cargo.lock",
     "Cargo.toml",
+    "build.rs",
+    "tests/build_info.rs",
     "LICENSE",
     "assets/fonts/LICENCE.txt",
     "assets/fonts/UbuntuSans-Medium.ttf",
@@ -66,6 +68,7 @@
     "src/bake.rs",
     "src/brush.rs",
     "src/brush_library.rs",
+    "src/build_info.rs",
     "src/capabilities.json",
     "src/clipboard.rs",
     "src/clipboard/windows.rs",
@@ -128,6 +131,8 @@
     "src/selection/refine.rs",
     "src/selection/system.rs",
     "src/server.rs",
+    "src/settings.rs",
+    "src/settings_tests.rs",
     "src/shaders/composite.wgsl",
     "src/shaders/effects.wgsl",
     "src/smart_mask.rs",
@@ -305,7 +310,12 @@
     "packaging/msix/product.store.json",
     "packaging/msix/Assets/Square150x150Logo.png",
     "packaging/msix/Assets/Square44x44Logo.png",
-    "packaging/msix/Assets/StoreLogo.png"
+    "packaging/msix/Assets/StoreLogo.png",
+    "docs/settings.md",
+    "src/updates.rs",
+    "src/updates_tests.rs",
+    "src/ui/updates.rs",
+    "docs/updates.md"
   ],
   "portable": [
     "LICENSE",
@@ -344,7 +354,9 @@
     "docs/production-export.md",
     "docs/layer-styles.md",
     "docs/release-0.25.md",
-    "docs/release-0.26.md"
+    "docs/release-0.26.md",
+    "docs/settings.md",
+    "docs/updates.md"
   ],
   "readme": "scripts/package-readme.md",
   "vendored": [

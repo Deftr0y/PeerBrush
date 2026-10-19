@@ -468,6 +468,8 @@ pub struct Engine {
     pub(crate) truncated_tasks: BTreeSet<(String, String)>,
     pub changes: Vec<(u64, Vec<Scope>)>,
     pub saved_revision: u64,
+    /// Runtime I/O survives engine clones; never serialized into project sources.
+    pub(crate) file_operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub feedback: BTreeMap<String, String>,
     pub path: Option<std::path::PathBuf>,
     pub status: String,
@@ -616,6 +618,7 @@ impl Engine {
             truncated_tasks: BTreeSet::new(),
             changes: vec![],
             saved_revision: 0,
+            file_operations: Default::default(),
             feedback: BTreeMap::new(),
             path: None,
             status: "Ready".into(),

@@ -93,6 +93,7 @@ pub fn start(
     existing: Existing,
     actor: &str,
 ) -> Result<State, String> {
+    let operation = crate::server::FileOperation::begin(shared)?;
     settings.validate()?;
     if actor.trim().is_empty() || actor.len() > 64 || actor.chars().any(char::is_control) {
         return Err("Use a readable export actor of up to 64 characters".into());
@@ -153,6 +154,7 @@ pub fn start(
     }
     let shared = shared.clone();
     std::thread::spawn(move || {
+        let _operation = operation;
         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<(),String> {
             let plan=super::plan(&doc,&targets,&settings,&control)?;
             {

@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import verify_release
-from build_release import release_environment
+from build_release import release_environment, source_input_state
 
 spec = importlib.util.spec_from_file_location('packaging', pathlib.Path(__file__).with_name('package.py'))
 packaging = importlib.util.module_from_spec(spec)
@@ -81,10 +81,137 @@ class Packages(unittest.TestCase):
             header[18:20] = struct.pack('<H', 62)
         else:
             header[:8] = b'\xcf\xfa\xed\xfe' + struct.pack('<I', 0x100000c)
+        if self.policy['version'] == 2:
+            header.extend(json.dumps(self.build_info(), separators=(',', ':')).encode())
         binary = self.root / 'synthetic-binary'
         binary.write_bytes(header)
         with contextlib.redirect_stdout(io.StringIO()):
             return packaging.package(self.root, binary, self.output, self.root / 'registry', platform, verify_binary=False, rust_docs=self.rust_docs)
+
+    def build_info(self, commit=None):
+        return {'format': 'PeerBrushBuildInfoV1', 'schema': 1, 'product': 'PeerBrush',
+                'version': '0.2.0', 'commit': commit or packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip(),
+                'tree': 'clean', 'end': 'PeerBrushBuildInfoEnd'}
+
+    def require_provenance(self):
+        for name in ['build.rs', 'src/build_info.rs']:
+            (self.root / name).write_text('// synthetic build metadata source\n')
+            self.policy['source'].append(name)
+        self.policy['version'] = 2
+        self.save_policy()
+        self.commit()
+
+    def test_embedded_provenance_rejects_missing_duplicate_dirty_unknown_and_malformed_labels(self):
+        info = self.build_info()
+        encoded = json.dumps(info, separators=(',', ':')).encode()
+        self.assertEqual(packaging.binary_build_info(b'native-header' + encoded, '0.2.0', info['commit']), info)
+        invalid = [b'no build label', encoded + encoded, encoded.replace(b'"tree":"clean"', b'"tree":"dirty"'),
+                   encoded.replace(info['commit'].encode(), b'unknown'), encoded.replace(b'"schema":1', b'"schema":true'),
+                   encoded.replace(b'"version":"0.2.0"', b'"version":"0.1.0"'), encoded[:-1],
+                   encoded.replace(b'"tree":"clean"', b'"tree":"' + b'x' * 513 + b'"')]
+        for record in invalid:
+            with self.subTest(record=record[:64]), self.assertRaisesRegex(ValueError, 'build provenance'):
+                packaging.binary_build_info(record, '0.2.0', info['commit'])
+
+    def test_new_policy_cannot_be_downgraded_or_skip_embedded_binary_checks(self):
+        self.require_provenance()
+        self.build('Windows')
+        binary = self.root / 'synthetic-binary'
+        binary.write_bytes(binary.read_bytes()[:128])
+        with self.assertRaisesRegex(ValueError, 'embedded build provenance'):
+            packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs)
+        self.policy['version'] = 1
+        self.save_policy()
+        self.commit()
+        with self.assertRaisesRegex(ValueError, 'requires package policy version 2'):
+            packaging.source_files(self.root)
+
+    def test_new_policy_embedded_records_are_inspected_without_execution_on_each_platform(self):
+        self.require_provenance()
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        for platform in ['Windows', 'Linux', 'macOS']:
+            archive = self.build(platform)
+            checked = verify_release.inspect_archive(archive, commit, '0.2.0', self.root)
+            self.assertEqual(checked['manifest']['build_info'], self.build_info())
+
+    def test_new_policy_detects_relabelled_same_version_binary_and_allows_explicit_matching_correction(self):
+        self.require_provenance()
+        original = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        self.build('Windows')
+        binary = self.root / 'synthetic-binary'
+        (self.root / 'docs/usage.md').write_text('Updated guide, unchanged application')
+        self.commit()
+        with self.assertRaisesRegex(ValueError, 'clean expected version/commit'):
+            packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            archive = packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs, binary_source_commit=original)
+        current = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        checked = verify_release.inspect_archive(archive, current, '0.2.0', self.root)
+        self.assertEqual(checked['manifest']['build_info']['commit'], original)
+        self.assertEqual(checked['record']['binary_source_commit'], original)
+
+    def test_inspector_rejects_forged_provenance_even_with_updated_executable_checksum(self):
+        self.require_provenance()
+        archive = self.build('Windows')
+        with zipfile.ZipFile(archive) as package:
+            files = [(i.filename, package.read(i.filename), i.external_attr >> 16 & 0o777) for i in package.infolist()]
+        binary_name = archive.stem + '/peerbrush.exe'
+        manifest_name = archive.stem + '/release.json'
+        forged = next(data for name, data, _ in files if name == binary_name).replace(b'"tree":"clean"', b'"tree":"dirty"')
+        manifest = json.loads(next(data for name, data, _ in files if name == manifest_name))
+        manifest['executable_sha256'] = verify_release.sha(forged)
+        packaging.write_zip(archive, [(name, forged if name == binary_name else json.dumps(manifest).encode() if name == manifest_name else data, mode) for name, data, mode in files], 1700000000)
+        with self.assertRaisesRegex(ValueError, 'build provenance'):
+            verify_release.inspect_archive(archive, manifest['commit'], '0.2.0', self.root)
+        manifest['executable_sha256'] = verify_release.sha(next(data for name, data, _ in files if name == binary_name))
+        manifest['build_info']['commit'] = '0' * 40
+        packaging.write_zip(archive, [(name, json.dumps(manifest).encode() if name == manifest_name else data, mode) for name, data, mode in files], 1700000000)
+        with self.assertRaisesRegex(ValueError, 'manifest differs from actual embedded'):
+            verify_release.inspect_archive(archive, manifest['commit'], '0.2.0', self.root)
+
+    def test_executed_build_info_must_match_the_actual_embedded_record(self):
+        self.require_provenance()
+        self.build('Windows')
+        real_check_output = packaging.subprocess.check_output
+        def executable_output(command, *args, **kwargs):
+            if command[-1] == '--version':
+                return 'PeerBrush 0.2.0\n'
+            if command[-1] == '--build-info':
+                return json.dumps(self.build_info('0' * 40), separators=(',', ':'))
+            return real_check_output(command, *args, **kwargs)
+        with mock.patch.object(packaging.subprocess, 'check_output', side_effect=executable_output), self.assertRaisesRegex(ValueError, '--build-info differs'):
+            packaging.package(self.root, self.root / 'synthetic-binary', self.output, self.root / 'registry', 'Windows', rust_docs=self.rust_docs)
+
+    def test_release_builder_invalidation_ignores_caller_fingerprint_and_detects_new_root_inputs(self):
+        original = source_input_state(self.root)
+        environment = release_environment(self.root, {'PEERBRUSH_BUILD_INPUT_STATE': 'caller-supplied-source-claim'})
+        self.assertEqual(environment['PEERBRUSH_BUILD_INPUT_STATE'], original)
+        self.assertRegex(original, r'^[0-9a-f]{64}$')
+        (self.root / 'new-root-input').write_text('new visible input')
+        self.assertNotEqual(source_input_state(self.root), original)
+        nested = self.root / 'extracted-source'
+        nested.mkdir()
+        self.assertEqual(source_input_state(nested), 'unknown')
+
+    def test_git_provenance_calls_ignore_inherited_repository_and_config_overrides(self):
+        actual = packaging.git(self.root, 'rev-parse', 'HEAD')
+        with mock.patch.dict(os.environ, {'GIT_DIR': str(self.root / 'nonexistent'), 'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'true'}):
+            self.assertEqual(packaging.git(self.root, 'rev-parse', 'HEAD'), actual)
+            self.assertRegex(source_input_state(self.root), r'^[0-9a-f]{64}$')
+
+    def test_policy_two_rejects_index_flags_hiding_changed_worktree_bytes(self):
+        self.require_provenance()
+        self.build('Windows')
+        path = self.root / 'src/lib.rs'
+        original = path.read_bytes()
+        for flag, clear in [('--assume-unchanged', '--no-assume-unchanged'), ('--skip-worktree', '--no-skip-worktree')]:
+            packaging.git(self.root, 'update-index', flag, 'src/lib.rs')
+            path.write_text('hidden different application bytes')
+            self.assertFalse(packaging.git(self.root, 'status', '--porcelain', '--untracked-files=no'))
+            with self.assertRaisesRegex(ValueError, 'Hidden index inputs'):
+                packaging.package(self.root, self.root / 'synthetic-binary', self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs)
+            packaging.git(self.root, 'update-index', clear, 'src/lib.rs')
+            path.write_bytes(original)
 
     def test_platform_architecture_source_license_and_macos_bundle_match(self):
         sources = []
@@ -414,6 +541,42 @@ class Packages(unittest.TestCase):
             manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
             self.assertTrue({'licenses/epaint_default_fonts-0.31.1/' + name for name in names} <= set(manifest['notice_files']))
             self.assertFalse(any(name.endswith('/private.txt') for name in archive.namelist()))
+
+    def test_tls_notices_include_ring_subcomponents_and_require_exact_checksums(self):
+        (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\nname="ring"\nversion="0.17.14"\nsource="registry+https://example.invalid"\n[[package]]\nname="rustls"\nversion="0.23.46"\nsource="registry+https://example.invalid"\n')
+        self.commit()
+        ring = self.root / 'registry/test/ring-0.17.14'
+        ring.mkdir(parents=True)
+        (ring / 'Cargo.toml').write_text('[package]\nname="ring"\nversion="0.17.14"\nlicense="Apache-2.0 AND ISC"\n')
+        (ring / 'LICENSE').write_text('Synthetic license index')
+        names = packaging.EXTRA_CRATE_NOTICES['ring']
+        for name in names:
+            path = ring / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('Synthetic component notice: ' + name)
+        (ring / 'LICENSE-private').write_text('SYNTHETIC_PRIVATE_CANARY')
+        checksums = {name: packaging.digest(ring / name) for name in names}
+        (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
+        rustls = self.root / 'registry/test/rustls-0.23.46'
+        rustls.mkdir(parents=True)
+        (rustls / 'Cargo.toml').write_text('[package]\nname="rustls"\nversion="0.23.46"\nlicense="Apache-2.0 OR ISC OR MIT"\n')
+        (rustls / 'LICENSE-ISC').write_text('Synthetic ISC alternative')
+        archive_path = self.build('Windows')
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
+            self.assertTrue({'licenses/ring-0.17.14/' + name for name in names} <= set(manifest['notice_files']))
+            self.assertIn('licenses/rustls-0.23.46/LICENSE-ISC', manifest['notice_files'])
+            self.assertFalse(any('LICENSE-private' in name for name in archive.namelist()))
+        notice = ring / 'LICENSE-other-bits'
+        original = notice.read_bytes()
+        notice.write_text('Tampered component notice')
+        with self.assertRaisesRegex(ValueError, 'notice checksum mismatch'):
+            self.build('Windows')
+        notice.write_bytes(original)
+        del checksums['LICENSE-other-bits']
+        (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
+        with self.assertRaisesRegex(ValueError, 'required dependency notice inventory'):
+            self.build('Windows')
 
     def test_dated_repack_names_preserve_internal_layout_and_require_matching_labels(self):
         commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()

@@ -24,10 +24,14 @@ MANIFEST = "scripts/package-files.json"
 NOTICE_NAMES = {
     "copying", "copyright", "license", "licence", "notice", "notices", "unlicense",
     "license-0bsd", "license-apache", "license-apache-2.0", "license-bsd",
-    "license-libm-mit", "license-mit", "license-unicode", "license-zlib",
+    "license-libm-mit", "license-mit", "license-isc", "license-unicode", "license-zlib",
     "license.apache", "license.mit",
 }
 EMBEDDED_FONT_NOTICES = {"epaint_default_fonts": {"fonts/Hack-Regular.txt", "fonts/OFL.txt", "fonts/UFL.txt", "fonts/emoji-icon-font-mit-license.txt"}}
+EXTRA_CRATE_NOTICES = {"ring": {
+    "LICENSE-BoringSSL", "LICENSE-other-bits", "src/polyfill/once_cell/LICENSE-APACHE",
+    "src/polyfill/once_cell/LICENSE-MIT", "third_party/fiat/LICENSE",
+}}
 NOTICE_NAMES |= {name + suffix for name in tuple(NOTICE_NAMES) for suffix in (".txt", ".md", ".rst")}
 
 
@@ -92,8 +96,17 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
             selected.add(meta["license-file"])
         # Embedded egui fonts have their own licenses; select checksum-listed notices.
         checksum_file = crate / ".cargo-checksum.json"
+        extra_notices = EXTRA_CRATE_NOTICES.get(package["name"], set())
+        if extra_notices and not checksum_file.exists():
+            raise ValueError("Missing dependency notice checksum inventory")
         if checksum_file.exists():
             checksums = json.loads(regular_file(crate, ".cargo-checksum.json").read_text(encoding="utf-8"))["files"]
+            if not extra_notices <= set(checksums):
+                raise ValueError("Missing required dependency notice inventory")
+            for name in extra_notices:
+                if digest(regular_file(crate, name)) != checksums[name]:
+                    raise ValueError("Dependency notice checksum mismatch")
+            selected.update(extra_notices)
             font_notices = EMBEDDED_FONT_NOTICES.get(package["name"], set())
             if not font_notices <= set(checksums):
                 raise ValueError("Missing embedded font notice inventory")
@@ -126,8 +139,13 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
     (bundle / "THIRD_PARTY_NOTICES.md").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
-def git(root, *args):
-    return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True).stdout
+def git(root, *args, input=None):
+    environment = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+    return subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(root), *args], env=environment, input=input, check=True, capture_output=True).stdout
+
+
+def hidden_index_inputs(root):
+    return any(row[:1].islower() or row[:1] == b'S' for row in git(root, 'ls-files', '-v', '-z').split(b'\0'))
 
 
 def digest(path):
@@ -191,7 +209,7 @@ def source_files(root, commit=None):
         if kind != b'blob' or mode not in [b'100644', b'100755']:
             raise ValueError('Package source must contain regular committed files')
         entries.append((name, object_id, int(mode, 8) & 0o777))
-    output = subprocess.check_output(['git', '-C', str(root), 'cat-file', '--batch'], input=b'\n'.join(obj for _, obj, _ in entries) + b'\n')
+    output = git(root, 'cat-file', '--batch', input=b'\n'.join(obj for _, obj, _ in entries) + b'\n')
     stream = io.BytesIO(output)
     files = []
     for name, object_id, mode in entries:
@@ -211,7 +229,7 @@ def source_files(root, commit=None):
 
 
 def validate_policy(policy, tree):
-    if not isinstance(policy, dict) or set(policy) != {'version', 'source', 'portable', 'readme', 'vendored', 'rust_notices'} or type(policy['version']) is not int or policy['version'] != 1:
+    if not isinstance(policy, dict) or set(policy) != {'version', 'source', 'portable', 'readme', 'vendored', 'rust_notices'} or type(policy['version']) is not int or policy['version'] not in (1, 2):
         raise ValueError('Unsupported package manifest')
     for group in ['source', 'portable', 'vendored', 'rust_notices']:
         values = policy[group]
@@ -224,6 +242,11 @@ def validate_policy(policy, tree):
     relative_path(policy['readme'])
     selected = set(policy['source'])
     required = {MANIFEST, policy['readme'], 'Cargo.toml', 'Cargo.lock', 'LICENSE', 'assets/fonts/LICENCE.txt', 'scripts/start-windows.cmd'}
+    provenance_inputs = {'build.rs', 'src/build_info.rs'}
+    if provenance_inputs & set(tree) and policy['version'] != 2:
+        raise ValueError('Build provenance source requires package policy version 2')
+    if policy['version'] == 2:
+        required |= provenance_inputs
     if not required <= selected or not set(policy['portable']) <= selected:
         raise ValueError('Required inputs and portable files must be in corresponding source')
     generated = {'readme.md', 'release.json', 'third_party_notices.md', 'peerbrush.exe', 'peerbrush', 'start peerbrush.cmd'}
@@ -266,6 +289,29 @@ def validate_binary(data):
         raise ValueError('Executable contains a credential marker or personal build path; rebuild with path remapping and review before packaging')
 
 
+def binary_build_info(data, version, commit):
+    """Check a public embedded label, not cryptographic proof of compilation."""
+    prefix = b'{"format":"PeerBrushBuildInfoV1",'
+    suffix = b'"end":"PeerBrushBuildInfoEnd"}'
+    if data.count(prefix) != 1:
+        raise ValueError('Missing or ambiguous embedded build provenance')
+    start = data.index(prefix)
+    record = data[start:start + 512]
+    end = record.find(suffix)
+    if end < 0:
+        raise ValueError('Malformed or oversized embedded build provenance')
+    record = record[:end + len(suffix)]
+    try:
+        info = json.loads(record)
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError('Malformed embedded build provenance') from None
+    expected = {'format': 'PeerBrushBuildInfoV1', 'schema': 1, 'product': 'PeerBrush',
+                'version': version, 'commit': commit, 'tree': 'clean', 'end': 'PeerBrushBuildInfoEnd'}
+    if info != expected or type(info.get('schema')) is not int or record != json.dumps(info, separators=(',', ':')).encode():
+        raise ValueError('Executable build provenance differs from the clean expected version/commit')
+    return info
+
+
 def add_notices(source_root, bundle, registry, policy, rust_docs=None):
     dependency_notices(source_root, bundle, registry, policy, rust_docs)
     return {p.relative_to(bundle).as_posix(): digest(p) for p in sorted((bundle / 'licenses').rglob('*')) if p.is_file()}
@@ -293,6 +339,10 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
     epoch = int(git(root, 'show', '-s', '--format=%ct', commit))
     sources = source_files(root, commit)
     policy = policy_from_sources(sources)
+    if policy['version'] == 2 and git(root, 'status', '--porcelain', '--untracked-files=normal').strip():
+        raise ValueError('Commit or remove untracked source inputs before release packaging')
+    if policy['version'] == 2 and hidden_index_inputs(root):
+        raise ValueError('Hidden index inputs cannot establish clean release provenance')
     binary_source_commit = binary_source_commit or commit
     if binary_source_commit != commit:
         equivalent_build_inputs(root, sources, binary_source_commit)
@@ -301,6 +351,7 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
     executable = binary.read_bytes()
     validate_binary(executable)
     architecture = architecture_from_stream(io.BytesIO(executable), platform)
+    build_info = binary_build_info(executable, version, binary_source_commit) if policy['version'] == 2 else None
     output.mkdir(parents=True, exist_ok=True)
     name = f'PeerBrush-{version}-{platform}-{architecture}'
     # Stage all outputs before replacing final files. Never reuse an old
@@ -331,6 +382,10 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             actual = subprocess.check_output([str(staged_binary.resolve()), '--version'], text=True, timeout=30).strip()
             if actual != f'PeerBrush {version}':
                 raise ValueError('Executable version does not match the committed source')
+            if build_info is not None:
+                actual = subprocess.check_output([str(staged_binary.resolve()), '--build-info'], text=True, timeout=30).strip()
+                if actual != json.dumps(build_info, separators=(',', ':')):
+                    raise ValueError('Executable --build-info differs from its embedded provenance')
         for filename, data, _ in portable_files(sources):
             destination = bundle / relative_path(filename)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -341,6 +396,8 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
         shutil.copy2(source, bundle / source.name)
         notices = add_notices(source_root, bundle, registry, policy, rust_docs)
         manifest = {'schema': 1, 'product': 'PeerBrush', 'version': version, 'commit': commit, 'binary_source_commit': binary_source_commit, 'platform': platform, 'architecture': architecture, 'executable': relative, 'executable_sha256': digest(staged_binary), 'source': source.name, 'source_sha256': digest(source), 'notice_files': notices, 'license': 'GPL-3.0-only', 'native_publisher_signing': 'not-configured', 'package_signature': 'See the matching external Sigstore bundle when supplied; this manifest alone is not a signature.'}
+        if build_info is not None:
+            manifest['build_info'] = build_info
         (bundle / 'release.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
         files = [(f'{name}/{p.relative_to(bundle).as_posix()}', p.read_bytes(), 0o755 if p == staged_binary else 0o644) for p in bundle.rglob('*') if p.is_file()]
         archive = stage / (name + '.zip')

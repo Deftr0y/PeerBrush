@@ -16,6 +16,31 @@ use std::{
 };
 
 pub type Shared = Arc<Mutex<Engine>>;
+
+pub(crate) struct FileOperation(pub(crate) Arc<std::sync::atomic::AtomicUsize>);
+impl FileOperation {
+    pub(crate) fn begin_workspace(workspace: &crate::workspace::Registry) -> Result<Self, String> {
+        let state = workspace.lock().unwrap();
+        if state.exiting {
+            return Err("Workspace is exiting; settings and recovery remain protected".into());
+        }
+        Ok(Self::track(state.file_operations.clone()))
+    }
+    pub(crate) fn begin(shared: &Shared) -> Result<Self, String> {
+        let engine = shared.lock().unwrap();
+        engine.ensure_open()?;
+        Ok(Self::track(engine.file_operations.clone()))
+    }
+    pub(crate) fn track(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+impl Drop for FileOperation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 #[cfg(test)]
 #[path = "save_safety_tests.rs"]
 mod save_safety_tests;
@@ -423,6 +448,7 @@ fn save_prepared(
     request: &Value,
     before_commit: impl FnOnce(),
 ) -> Result<(), String> {
+    let _operation = FileOperation::begin(shared)?;
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -562,6 +588,7 @@ pub(crate) fn export_derived_guarded(
     control: &crate::production_export::Control,
     encode: impl FnOnce(&crate::engine::Document) -> Result<Vec<u8>, String>,
 ) -> Result<bool, String> {
+    let _operation = FileOperation::begin(shared)?;
     control.check()?;
     if path
         .extension()
@@ -723,7 +750,7 @@ pub fn capabilities() -> Value {
         .as_array_mut()
         .unwrap()
         .push(json!({"op":"filter.add","preset":"posterize","settings":{"levels":5},"weight":0.6}));
-    result["filter_library"] = json!({"tool":"peerbrush_filters","actions":["list","thumbnail","preview","save","rename","delete","import","export"],"curated":15,"custom_limit":crate::filter_library::LIMIT,"file_limit":crate::filter_library::FILE_LIMIT,"scope":"Whole document; filter.add/update/delete/reorder run after the composite, independent of selected layer. Top runs last. Locks, reservations and revision guards apply.","precision":"Native 8/16-bit sources, effects and strength; previews project only for display.","preview":"Explicit current project/document/revision. Actual PNG/document_rect plus frozen commands; no shared edit or history. Thumbnails use filter_thumbnail reference coordinates.","storage":"Instance-local filters.json outside history; strict versioned import/export. Curated immutable, invalid or externally changed files preserved.","psd":"Format 15 editable sources plus current filtered standard raster/mask/composite; older readers remain protected.","cache_bytes":crate::filters::CACHE_BUDGET,"limits":"32 document filters; native derived output/scratch budgets apply. Liquify is a layer effect."});
+    result["filter_library"] = json!({"tool":"peerbrush_filters","actions":["list","thumbnail","preview","save","rename","delete","import","export"],"curated":15,"custom_limit":crate::filter_library::LIMIT,"file_limit":crate::filter_library::FILE_LIMIT,"scope":"Whole document; filter.add/update/delete/reorder run after the composite, independent of selected layer. Top runs last. Locks, reservations and revision guards apply.","precision":"Native 8/16-bit sources, effects and strength; previews project only for display.","preview":"Explicit current project/document/revision. Actual PNG/document_rect plus frozen commands; no shared edit or history. Thumbnails use filter_thumbnail reference coordinates.","storage":"Configured preferences directory filters.json outside history; strict versioned import/export. Curated immutable, invalid or externally changed files preserved.","psd":"Format 15 editable sources plus current filtered standard raster/mask/composite; older readers remain protected.","cache_bytes":crate::filters::CACHE_BUDGET,"limits":"32 document filters; native derived output/scratch budgets apply. Liquify is a layer effect."});
     result
 }
 
@@ -760,6 +787,18 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
+    let persistent = match method {
+        "brushes" => matches!(p["action"].as_str(), Some("save" | "delete")),
+        "tool_settings" => p["action"] == "set",
+        "filters" => matches!(
+            p["action"].as_str(),
+            Some("save" | "rename" | "delete" | "import")
+        ),
+        _ => false,
+    };
+    let _operation = persistent
+        .then(|| FileOperation::begin_workspace(&crate::workspace::attach(shared)))
+        .transpose()?;
     if method == "exports" {
         return crate::production_export::request(shared, p);
     }
@@ -796,7 +835,8 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                 Ok(result)
             }
             "discard" if p["actor"] == "human" => {
-                crate::recovery::discard(
+                crate::recovery::discard_in(
+                    &workspace,
                     &dir,
                     p["snapshot"]
                         .as_str()
@@ -1329,6 +1369,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "calibration",
                     "view",
                     "shortcuts",
+                    "updates",
                 ]
                 .contains(&name)
             }) {
@@ -2495,6 +2536,16 @@ fn handle_http(
 }
 
 pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
+    start_with_preferences(shared, state_dir.clone(), &state_dir, &state_dir)
+}
+
+/// Preferences/cache may be per-user while external discovery and recovery stay stable.
+pub fn start_with_preferences(
+    shared: Shared,
+    state_dir: PathBuf,
+    preferences: &Path,
+    cache: &Path,
+) -> Result<Connection, String> {
     fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
     let instance_lock = fs::OpenOptions::new()
         .create(true)
@@ -2504,24 +2555,24 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         .open(state_dir.join("instance.lock"))
         .map_err(|e| e.to_string())?;
     instance_lock.try_lock().map_err(|_|"PeerBrush is already running for this workspace. Use that window or a different --state-dir.".to_string())?;
-    crate::disk_cache::configure(&state_dir);
-    let library = crate::brush_library::Library::load(state_dir.join("brushes.json"));
+    crate::disk_cache::configure(cache);
+    let library = crate::brush_library::Library::load(preferences.join("brushes.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().brush_library.lock().unwrap() = library;
-    let preferences = crate::tool_settings::Store::load(state_dir.join("tool-settings.json"));
-    if let Some(error) = &preferences.error {
+    let tools = crate::tool_settings::Store::load(preferences.join("tool-settings.json"));
+    if let Some(error) = &tools.error {
         shared.lock().unwrap().status = error.clone();
     }
-    *shared.lock().unwrap().tool_settings.lock().unwrap() = preferences;
-    let library = crate::filter_library::Library::load(state_dir.join("filters.json"));
+    *shared.lock().unwrap().tool_settings.lock().unwrap() = tools;
+    let library = crate::filter_library::Library::load(preferences.join("filters.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().filter_library.lock().unwrap() = library;
     let library =
-        crate::production_export::library::Library::load(state_dir.join("export-presets.json"));
+        crate::production_export::library::Library::load(preferences.join("export-presets.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }

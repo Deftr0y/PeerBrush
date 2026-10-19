@@ -8,7 +8,7 @@ import plistlib
 import re
 import shutil
 import zipfile
-from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources
+from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, binary_build_info
 
 
 MACOS_SIGNING_FILES = frozenset({
@@ -153,6 +153,10 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             raise ValueError('Missing third-party license notices')
         executable = archive.read(prefix + manifest['executable'])
         validate_binary(executable)
+        if policy_from_sources(selected_sources)['version'] == 2:
+            info = binary_build_info(executable, version, original_commit)
+            if manifest.get('build_info') != info:
+                raise ValueError('Release manifest differs from actual embedded build provenance')
         if architecture_from_stream(io.BytesIO(executable), platform) != expected_arch[platform]:
             raise ValueError('Executable architecture does not match the release manifest')
         source = archive.read(prefix + manifest['source'])
