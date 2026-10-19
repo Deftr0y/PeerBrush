@@ -58,7 +58,7 @@ def check(package):
         # Include legacy explicit state and XDG preferences/document artwork.
         # Package lifecycle must not remove either, regardless of migration.
         preserved = [home / 'PeerBrush QA state/tool-settings.json',
-                     config / 'PeerBrush/settings.json', home / 'Artwork 作品.psd']
+                     config / 'peerbrush/settings-v1/tool-settings.json', home / 'Artwork 作品.psd']
         for path in preserved:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'SYNTHETIC_USER_OWNED_RETENTION_FIXTURE\n')
