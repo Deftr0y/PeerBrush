@@ -117,7 +117,11 @@ impl PeerBrush {
         });
         self.recovery.open = open && !later;
         if let Some(snapshot) = discard {
-            match crate::recovery::discard(&self.connection.state_dir, &snapshot) {
+            match crate::recovery::discard_in(
+                &self.workspace,
+                &self.connection.state_dir,
+                &snapshot,
+            ) {
                 Ok(()) => {
                     self.recovery = Browser::new(&self.connection.state_dir);
                     self.recovery.open = true;

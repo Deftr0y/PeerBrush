@@ -526,6 +526,9 @@ pub(crate) fn request_with_control(
     p: &serde_json::Value,
     control: &Control,
 ) -> Result<serde_json::Value, String> {
+    let _operation = matches!(p["action"].as_str(), Some("save_preset" | "delete_preset"))
+        .then(|| crate::server::FileOperation::begin_workspace(&crate::workspace::attach(root)))
+        .transpose()?;
     use serde_json::json;
     for key in ["actor", "preset", "action"] {
         if p.get(key).is_some_and(|v| !v.is_string()) {

@@ -1,6 +1,6 @@
 # PeerBrush development guide
 
-PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26 is unreleased; published downloads remain 0.25.
+PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store 0.26 remains pending. The active [v0.3 milestone](development-0.3.md) proposes the remaining backlog and installation/release foundations, with PB-108 first. Its approved application version is 0.30.0; development packages are unreleased.
 
 ## Branches and pull requests
 
@@ -8,12 +8,17 @@ PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu.
 | --- | --- | --- |
 | `main` | Production source | Receives `dev` |
 | `dev` | Final integration and release acceptance | `main` |
+| `version/0.3` | Active v0.3 milestone; application version 0.30.0 | `dev` |
+| `feature/0.3/<topic>` | One focused v0.3 feature or foundation | `version/0.3` |
+| `fix/0.3/<topic>` | One focused v0.3 bug fix | `version/0.3` |
 | `version/0.26` | Changes and acceptance work intended for 0.26 | `dev` |
 | `feature/0.26/<topic>` | One focused feature or documentation change | `version/0.26` |
 | `fix/0.26/<topic>` | One focused bug fix | `version/0.26` |
 | `site-content` | Reviewed public website output | Website deployment workflow |
 | `maintenance/archive-<checkpoint>` | Retained historical packaging corrections | No normal development promotion |
 | `maintenance/site-<topic>` | A reviewed website content change | `site-content` |
+
+The active `version/0.3` integration branch starts from synchronized `dev`/`main`. Use `feature/0.3/<topic>` or `fix/0.3/<topic>` targeting it; do not mix new development into published 0.26 artifacts. The installation/release foundations are explicitly proposed for v0.3 in its development queue, with PB-108 still first.
 
 The normal promotion order is **feature or fix → matching version → dev → main**. Use lowercase names and a descriptive topic, for example `fix/0.26/selection-coverage`. Never create a `codex/` branch, regardless of capitalization. `origin/` is the remote-tracking prefix, not part of a branch name. Git cannot hold both `version/0.26` and `version/0.26/selection-coverage`; feature and fix names use their own namespace.
 
@@ -63,6 +68,8 @@ Editing logic belongs in the engine; native UI, MCP and CLI must share commands,
 Use the Ember palette, compact unboxed controls and the connected Color/Mask selector. Preserve native16 samples, unsupported Photoshop protection and unrelated human edits. See [implementation notes](development.md), [Photoshop fidelity](photoshop-fidelity.md), [MCP](mcp.md), [packaging](packaging.md) and the [0.26 queue](development-0.26.md).
 
 Use only an approved human Git identity from `.github/human-contributors.json`. Never add an AI author, committer, co-author or contributor badge. Keep the README's AI-development disclosure. Do not commit credentials, runtime state, recovery files, local tools, QA captures or build output. Required bundled artwork, fonts and licenses belong in source and packages. Review the actual diff and package contents through the [privacy/security gate](release-maintenance.md#privacy-and-security-publication-gate).
+
+Default launches use the versioned [per-user preferences profile](settings.md). Explicit `--state-dir` development workspaces retain instance-local settings and cache; keep their MCP launch arguments unchanged. Never copy entire runtime directories into settings migration or package inputs: recovery files, discovery tokens, artwork and unknown private files have separate ownership.
 
 ## Release promotion and website
 
