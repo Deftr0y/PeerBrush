@@ -32,6 +32,14 @@ License collection uses exact notice filenames and explicitly declared license f
 
 Each run stages source, notices and the native ZIP in a fresh temporary directory. Final files are replaced only after validation and collection succeed. Existing extracted folders and unrelated output files are neither copied nor deleted. Failed input or notice checks preserve previous archives.
 
+## macOS DMG candidates
+
+`scripts/package_macos_dmg.py` prepares a compressed, read-only HFS+ DMG from an existing Developer ID signed, notarized and stapled ZIP. It requires the independently verified input SHA-256 and exact source checkout/version, reuses the ZIP/source inspector, and performs native app signature, ticket and Gatekeeper checks. It preserves every original app byte and file mode. The volume contains `PeerBrush.app`, an `Applications` shortcut and a `Documentation and source` folder containing the original GPL source, notices and support material. No installed files or application state are changed.
+
+The script verifies the image with `hdiutil`, mounts it read-only without opening Finder, compares the complete mounted file/directory/link inventory and original bytes/modes, verifies the mounted app again, then detaches it. Final candidate, SHA-256 and provenance receipt are exclusively created and never overwritten; choose a new revision after an existing or incomplete output. Failed work remains in a private temporary staging folder beneath the external output directory for inspection, especially if detachment fails. Do not remove that folder while its image remains mounted.
+
+These are explicitly named `-dmg-candidate-rN.dmg`, with `release_ready: false` and image signing/notarization reported as `not-performed`. They are not accepted by the existing public release ZIP inventory or website publishing flow. See [DMG signing and installation gates](macos-signing.md#dmg-preparation-and-remaining-release-gates) before distributing a DMG. Credential-free macOS CI mounts synthetic unsigned data to check image creation and payload preservation; that test does not establish signing, notarization or installation acceptance.
+
 ## Verification and publication
 
 `scripts/test_package.py` exercises tracked and untracked private canaries, stale output, exact nested source, all platform layouts, notice selection, invalid manifests, new compiler inputs, linked inputs and failed builds. `scripts/verify_release.py` requires the three-platform matrix, checks every selected source byte, portable files, recorded notices, executable/source checksums, architecture, macOS bundle identity and archive paths. Unexpected package entries fail inspection.

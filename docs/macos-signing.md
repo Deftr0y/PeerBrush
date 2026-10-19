@@ -81,7 +81,27 @@ After scripted checks, use a fresh user profile or clean Mac/VM to download the 
 
 Signing and notarization address unidentified-developer and unnotarized-software blocks; they cannot promise that macOS will never show a normal first-open confirmation, permission request, revocation warning or device-policy restriction. Publish only after the actual native evidence and separately authorized release steps in [release maintenance](release-maintenance.md) are complete.
 
-## Portable regression checks
+## DMG preparation and remaining release gates
+
+On an actual Mac, use `scripts/package_macos_dmg.py` with an already verified signed/notarized/stapled ZIP and the exact source checkout used by that ZIP:
+
+```sh
+python3 -B scripts/package_macos_dmg.py \
+  --archive /absolute/candidates/PeerBrush-VERSION-macOS-arm64-apple-signed-r1.zip \
+  --expected-sha256 VERIFIED_SIGNED_ZIP_SHA256 \
+  --commit FULL_SOURCE_SHA --version VERSION \
+  --output /absolute/dmg-candidates --revision 1
+```
+
+Output must be outside the checkout. The original signed ZIP/app remains unchanged. The DMG contains the app and drag-to-Applications shortcut, with original source, licenses and support files retained separately in `Documentation and source`. Its mounted app receives the same Developer ID/Team ID, hardened runtime, secure timestamp, entitlement, ticket and Gatekeeper verification as the original ZIP. The DMG itself is an **unsigned, unnotarized preparation candidate**, not a published installer; app notarization is not recorded as image notarization.
+
+Before a public DMG can become ready, extend the existing protected `sign_macos.py` flow with explicit image signing, timestamp, exact-image notarization with resumable submission state, accepted log/digest verification and DMG stapling/validation. Verify the final sealed image and mounted app, then compute new final checksums/provenance and independently verify public downloads. Do not rename this candidate as ready or reuse its pre-signing checksum after modifying the image. No second signing system, workflow pin, credentials, protected approval or publication setting is changed by candidate preparation.
+
+Native acceptance still requires a fresh quarantined browser download, Finder drag to Applications, first/offline launch, upgrade/replacement with unsaved-work protection, settings retention, MCP launch path and PSD/PSB opening. The current app's support files live beside it in the archive/DMG. Before relying on these files after dragging only the app, move required installed resources/notices into `Contents/Resources` **before future signing**, updating the source/package inspector and tests together. Never insert files into an already sealed app. Retaining source/notices on this candidate volume preserves the distribution, but does not establish the installed-support layout.
+
+`python3 -B scripts/test_macos_dmg.py` uses synthetic signed ZIP fixtures and mocked Apple commands. `python3 -B scripts/test_macos_dmg_native.py` runs actual image creation, verification and read-only mounting on macOS using synthetic unsigned bytes that are never executed. CI and release-candidate tests run the native smoke without credentials. Neither test claims a signed image or a completed installation.
+
+## Portable signing regression checks
 
 ```sh
 python3 -B scripts/test_package.py
