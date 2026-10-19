@@ -34,6 +34,8 @@ Each run stages source, notices and the native ZIP in a fresh temporary director
 
 ## Verification and publication
 
+[Sparkle preparation](sparkle-preparation.md) stages a precisely pinned framework outside the checkout and keeps it disabled. It does not add a framework to the application archive or broaden signing/file inventories; installed updater integration remains gated on feed/key, native lifecycle, compatibility and nested signing acceptance.
+
 `scripts/test_package.py` exercises tracked and untracked private canaries, stale output, exact nested source, all platform layouts, notice selection, invalid manifests, new compiler inputs, linked inputs and failed builds. `scripts/verify_release.py` requires the three-platform matrix, checks every selected source byte, portable files, recorded notices, executable/source checksums, architecture, macOS bundle identity and archive paths. Unexpected package entries fail inspection.
 
 Run a clean contributor build from the extracted source before publication. Follow [release maintenance](https://github.com/Deftr0y/PeerBrush/blob/main/docs/release-maintenance.md) for media/privacy review, signatures, native verification and authorized publication. Filtering new archives does not remove historical Git blobs or previously published downloads. Archive signatures do not replace Windows Authenticode or Apple signing/notarization.
