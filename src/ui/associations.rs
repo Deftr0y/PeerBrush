@@ -264,6 +264,7 @@ mod tests {
                 ..Default::default()
             };
             let mut calls = vec![];
+            frame(&mut choice, &ctx, os, vec![], &mut calls, false);
             let output = frame(&mut choice, &ctx, os, vec![], &mut calls, false);
             assert!(label(&output, "Open Windows Default apps").is_none());
             assert!(visible_text_contains(
