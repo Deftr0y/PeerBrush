@@ -1,4 +1,5 @@
 use crate::icons::{self, Icon};
+mod about;
 mod activation;
 mod animation;
 mod associations;
@@ -329,6 +330,7 @@ pub struct PeerBrush {
     canvas_input_region: Option<(Rect, egui::LayerId)>,
     jobs: HashSet<String>,
     updates: updates::Panel,
+    about: about::About,
     lifecycle: Option<lifecycle::Review>,
     recovery: recovery::Browser,
     saved_versions: Option<saved_versions::Browser>,
@@ -695,6 +697,7 @@ impl PeerBrush {
             shared,
             shortcuts: shortcuts::Shortcuts::load(&connection.state_dir),
             updates: updates::Panel::load(&connection.state_dir),
+            about: about::About::load(),
             connection,
             selection_layers: [selected.clone()].into_iter().collect(),
             selection_anchor: selected.clone(),
@@ -4563,6 +4566,7 @@ impl PeerBrush {
     }
     fn draw(&mut self, ctx: &egui::Context) {
         self.updates_tick(ctx);
+        self.about.dismiss_escape(ctx);
         self.fonts.refresh(ctx);
         self.selection_commit_failed = false;
         let drawn_generation = self.canvas_generation;
@@ -4627,6 +4631,7 @@ impl PeerBrush {
             self.show_view = panel == "view";
             self.shortcuts.open = panel == "shortcuts";
             self.updates.open = panel == "updates";
+            self.about.open = panel == "application_info";
             if panel == "solo_color" || panel == "solo_mask" {
                 self.mask = panel == "solo_mask";
                 let active = !self.mask
@@ -5059,6 +5064,7 @@ impl PeerBrush {
                             self.updates.open = true;
                             ui.close_menu();
                         }
+                        self.about.menu(ui);
                     });
                     ui.menu_button("View",|ui| self.canvas_view_menu(ui));
                     ui.menu_button("Image",|ui| {
@@ -5642,6 +5648,7 @@ impl PeerBrush {
         self.canvas_view_window(ctx);
         self.shortcuts_window(ctx);
         self.updates_dialog(ctx);
+        self.about.show(ctx);
         self.finish_capture(ctx, drawn_generation);
         self.sync_tool_profile(ctx);
         if self.tool_preferences_ai(ctx.input(|i| i.time)) {

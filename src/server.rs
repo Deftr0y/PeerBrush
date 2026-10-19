@@ -1370,6 +1370,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "view",
                     "shortcuts",
                     "updates",
+                    "application_info",
                 ]
                 .contains(&name)
             }) {

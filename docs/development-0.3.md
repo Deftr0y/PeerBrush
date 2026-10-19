@@ -22,6 +22,8 @@ The milestone and branch namespace remain v0.3; the approved application release
 
 `version/0.3` starts from synchronized `dev` and `main` history. Focused `feature/0.3` and `fix/0.3` branches target it under the [branch policy](development-guide.md#branches-and-pull-requests). The original planning commit from PR #32 is retained through a merge, without rewriting or duplicating its content. Audit earlier implementations against current shared code before porting anything.
 
+Current implementation is consolidated directly on `version/0.3`, preserving the focused development history. Complete and integrate the current source batch before its combined regression and native QA pass. Earlier focused results remain checkpoint evidence; they do not establish acceptance of later combined changes. Production promotion and publication gates remain in force.
+
 Use exact tested commits and applicable engine/codec/protocol checks plus native visual/hardware evidence for behavior changes, preserving native 16-bit words, current PSD/PSB composites, history and human work. Keep release publication, deployment, Store submission, protected signing approvals and destructive history operations subject to their own explicit authorization.
 
 ## Initial audit

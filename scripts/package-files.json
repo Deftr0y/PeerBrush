@@ -212,6 +212,7 @@
     "src/transform.rs",
     "src/tree.rs",
     "src/ui.rs",
+    "src/ui/about.rs",
     "src/ui/activation.rs",
     "src/ui/animation.rs",
     "src/ui/associations.rs",

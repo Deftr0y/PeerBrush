@@ -2,6 +2,8 @@
 
 Run the portable `peerbrush` executable. Open the File menu for new/open/import/export and Save As. Keyboard undo/redo works on shared edits. Rust is only needed to develop PeerBrush, not to run a packaged build.
 
+Unreleased: **File → About PeerBrush…** shows this running copy's version and source revision from its embedded build metadata. Development/prerelease, dirty local and unknown-source builds are identified. This information is independent of available downloads and does not check the network or change preferences, artwork or undo history.
+
 For the Windows 0.25 folder, double-click **Start PeerBrush.cmd**. It uses a separate `PeerBrush-0.25.0` workspace under Local AppData. Existing project files remain at their original locations; earlier workspaces and recovery files are not moved automatically. The macOS package contains **PeerBrush.app**; the Linux package contains an executable `peerbrush`. See [package verification](release-packages.md) for checksums, signing status and platform requirements.
 
 Unreleased PB-146: **File → PSD/PSB default editor…** explains how to choose PeerBrush for files opened from your file manager. On Windows, **Open Windows Default apps** opens the system's default-app settings; choose `.psd` and `.psb` separately. A portable copy does not register itself there: use a registered installation or Explorer's **Open with → Choose another app** to locate `peerbrush.exe`. See [Microsoft's Default apps guidance](https://learn.microsoft.com/en-us/windows/apps/develop/launch/launch-default-apps-settings).
