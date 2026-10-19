@@ -24,7 +24,11 @@ class DebianPackage(unittest.TestCase):
         self.fixture = test_package.Packages()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
-        self.root = self.fixture.root
+        # macOS exposes its temporary directory through the /var symlink.
+        # Select the real fixture root; production output still rejects links.
+        self.root = self.fixture.root.resolve()
+        self.fixture.root = self.root
+        self.fixture.output = self.fixture.output.resolve()
         for filename in [f'packaging/linux/{deb.APP_ID}.desktop', f'packaging/linux/{deb.APP_ID}.xml']:
             path = self.root / filename
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,7 +92,7 @@ class DebianPackage(unittest.TestCase):
 
     def test_uncommitted_templates_and_version_cannot_enter_candidate(self):
         desktop = f'packaging/linux/{deb.APP_ID}.desktop'
-        expected = (self.root / desktop).read_bytes()
+        expected = git(self.root, 'show', f'HEAD:{desktop}')
         (self.root / desktop).write_text('Exec=unreviewed\n')
         (self.root / 'Cargo.toml').write_text('[package]\nversion="99.0.0"\n')
         stage = self.root / 'pinned-stage'
