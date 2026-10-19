@@ -3,6 +3,10 @@
 //! never opened, copied or overwritten by these tests.
 use std::{ffi::c_void, ptr};
 type Handle = *mut c_void;
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetLastError(code: u32);
+}
 #[repr(C)]
 struct Message {
     window: Handle,
@@ -67,7 +71,11 @@ impl Station {
             Ok("1")
         );
         unsafe {
-            let station = CreateWindowStationW(ptr::null(), 0, 0x10000000, ptr::null_mut());
+            // NULL reuses a logon-derived name, including another test's clipboard.
+            let expected_name = format!("PeerBrushClipboardQa{}", uuid::Uuid::new_v4().simple());
+            let station_name = expected_name.encode_utf16().chain([0]).collect::<Vec<_>>();
+            let station =
+                CreateWindowStationW(station_name.as_ptr(), 1, 0x10000000, ptr::null_mut());
             assert!(
                 !station.is_null(),
                 "CreateWindowStation: {}",
@@ -80,6 +88,7 @@ impl Station {
                 0
             );
             let len = name.iter().position(|c| *c == 0).unwrap();
+            assert_eq!(String::from_utf16_lossy(&name[..len]), expected_name);
             assert_ne!(
                 String::from_utf16_lossy(&name[..len]).to_lowercase(),
                 "winsta0",
@@ -104,8 +113,10 @@ impl Station {
                 std::io::Error::last_os_error()
             );
             assert_ne!(SetThreadDesktop(desktop), 0);
-            assert!(
-                clipboard_win::count_formats().unwrap_or(0) == 0,
+            SetLastError(0);
+            assert_eq!(
+                clipboard_win::count_formats(),
+                Some(0),
                 "Refuse a nonempty noninteractive clipboard"
             );
             let class = "STATIC".encode_utf16().chain([0]).collect::<Vec<_>>();
@@ -175,7 +186,13 @@ pub fn child(test: &str) -> bool {
         return false;
     }
     let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            test,
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("PEERBRUSH_CLIPBOARD_TEST_STATION", "1")
         .output()
         .unwrap();
@@ -184,6 +201,10 @@ pub fn child(test: &str) -> bool {
         "Isolated clipboard child failed:\n{}\n{}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed; 0 ignored;"),
+        "The native clipboard child must execute its exact check"
     );
     true
 }

@@ -71,7 +71,8 @@
       "SVGZ"
     ],
     "export": [
-      "PNG"
+      "PNG",
+      "WebP"
     ]
   },
   "commands": [

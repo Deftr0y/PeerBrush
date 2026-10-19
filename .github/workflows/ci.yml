@@ -91,8 +91,12 @@ jobs:
         shell: bash
         run: |
           set +e
-          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/peerbrush-tests.log"
-          test_status=${PIPESTATUS[0]}
+          cargo test --locked > "$RUNNER_TEMP/peerbrush-tests.log" 2>&1
+          test_status=$?
+          if [[ "$RUNNER_OS" == "Windows" && "$test_status" -eq 0 ]]; then
+            cargo test --locked --test clipboard -- --ignored >> "$RUNNER_TEMP/peerbrush-tests.log" 2>&1
+            test_status=$?
+          fi
           python - "$RUNNER_TEMP/peerbrush-tests.log" "$GITHUB_STEP_SUMMARY" "$test_status" <<'PY'
           import re, sys
           from pathlib import Path

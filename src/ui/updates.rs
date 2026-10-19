@@ -214,6 +214,7 @@ impl PeerBrush {
             || self.save_loss_review.is_some()
             || self.pending_import.is_some()
             || self.pending_image_open.is_some()
+            || self.show_new
             || self.parameter_gesture.is_some()
             || self.live_gesture.is_some()
             || !self.points.is_empty()
@@ -461,6 +462,10 @@ mod tests {
             assert!(app.updates.open);
             app.updates.open = false;
             app.live_gesture = None;
+            app.show_new = true;
+            let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
+            assert!(!app.updates.open);
+            app.show_new = false;
             let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
             assert!(app.updates.open);
             let engine = app.shared.lock().unwrap();
@@ -486,6 +491,9 @@ mod tests {
                 )
             };
             assert!(app.update_restart_blocker().is_none());
+            app.show_new = true;
+            assert!(app.update_restart_blocker().is_some());
+            app.show_new = false;
             app.connecting = true;
             assert!(app.update_restart_blocker().is_some());
             app.connecting = false;

@@ -827,8 +827,8 @@ impl PeerBrush {
         let mut save_as = false;
         review.buttons = [None; 3];
         let modal = egui::Modal::new(egui::Id::new("project lifecycle")).show(ctx, |ui| {
-            ui.set_width(380.);
-            ui.heading(title);
+            dialogs::body(ui, 400.);
+            dialogs::heading(ui, title, current.as_ref().is_some_and(|row| row.conflicted));
             if let Some(row) = &current {
                 ui.label(RichText::new(&row.name).strong());
                 if row.conflicted { ui.label(RichText::new("The saved file changed outside this project. Save As preserves both versions. Don't Save closes only this project's in-memory copy.").color(ACCENT)); }
@@ -858,7 +858,7 @@ impl PeerBrush {
                 for (index, label) in ["Save", "Don't Save", "Cancel"].into_iter().enumerate() {
                     let response = ui.add_enabled(
                         !saving && (index == 2 || current.is_some()),
-                        egui::Button::new(label),
+                        if index == 0 { dialogs::primary(label) } else { egui::Button::new(label).min_size(Vec2::new(0., 28.)) },
                     );
                     review.buttons[index] = Some(response.rect);
                     if response.clicked() {

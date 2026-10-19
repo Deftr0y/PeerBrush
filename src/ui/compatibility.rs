@@ -75,12 +75,12 @@ impl PeerBrush {
         let mut cancelled = false;
         review.buttons = [None; 2];
         let modal = egui::Modal::new(egui::Id::new("PSD save loss review")).show(ctx, |ui| {
-            ui.set_max_width(540.);
-            ui.heading("Review PSD / PSB output");
+            dialogs::body(ui, 540.);
+            dialogs::heading(ui, "Review PSD / PSB output", true);
             ui.label(RichText::new(&review.name).strong());
             ui.label(format!("{} bit · {} standard layers/folders · current merged image", review.report.bit_depth, review.report.standard_layer_count));
             ui.label("The saved appearance and native channel depth are preserved. Some settings require PeerBrush sources to stay editable; other editors receive the standard rendered result.");
-            egui::ScrollArea::vertical().id_salt("save loss details").max_height(330.).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("save loss details").max_height((ctx.screen_rect().height() - 280.).clamp(80., 330.)).show(ui, |ui| {
                 for loss in &review.report.losses {
                     if let Some(layer) = loss.layer_id.as_ref().and_then(|id| review.report.layers.iter().find(|layer| &layer.id == id)) {
                         ui.label(RichText::new(&layer.name).strong());
@@ -91,7 +91,7 @@ impl PeerBrush {
             });
             if !ready { ui.label("Waiting for the current document operation…"); }
             ui.horizontal(|ui| {
-                let save = ui.add_enabled(ready, egui::Button::new("Save with these changes"));
+                let save = ui.add_enabled(ready, dialogs::primary("Save with these changes"));
                 review.buttons[0] = Some(save.rect);
                 accepted = save.clicked();
                 let cancel = ui.button("Cancel");

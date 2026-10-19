@@ -177,6 +177,7 @@ fn merged_copy_uses_composite_and_rejects_an_empty_selection() {
 mod isolated_clipboard;
 #[cfg(target_os = "windows")]
 #[test]
+#[ignore = "requires permission to create a private named Windows station; CI runs this explicitly"]
 fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_paste() {
     use std::{
         borrow::Cow,
@@ -193,6 +194,16 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     e.doc.selection = Some([4, 5, 8, 9]);
     let expected = Image::copy(&e.doc, &id, false, false).unwrap();
     let worker = clipboard::Worker::new(eframe::egui::Context::default());
+    let dimensions = |size| {
+        let sequence = clipboard_win::seq_num();
+        let reply = worker.image_dimensions().unwrap();
+        assert_eq!(station.receive(&reply).unwrap(), size);
+        assert_eq!(clipboard_win::seq_num(), sequence);
+    };
+    let sequence = clipboard_win::seq_num();
+    let empty = worker.image_dimensions().unwrap();
+    assert!(station.receive(&empty).is_err());
+    assert_eq!(clipboard_win::seq_num(), sequence);
     worker
         .request(clipboard::Request::Copy {
             doc: e.doc.clone(),
@@ -205,6 +216,8 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     let read = native.get_image().unwrap();
     assert_eq!((read.width, read.height), (4, 4));
     assert_eq!(read.bytes.as_ref(), expected.bytes);
+    dimensions([4, 4]);
+    assert_eq!(native.get_image().unwrap().bytes, read.bytes);
     // Emulate a picture copied in another application, with no accompanying text.
     let pixels = vec![
         120, 200, 20, 255, 30, 40, 50, 255, 230, 10, 100, 255, 25, 50, 70, 255, 10, 70, 90, 255,
@@ -217,6 +230,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
             bytes: Cow::Borrowed(&pixels),
         })
         .unwrap();
+    dimensions([3, 2]);
     let shared = Arc::new(Mutex::new(e));
     let document = shared.lock().unwrap().doc.id.clone();
     worker
@@ -283,6 +297,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
         dib.extend([0; 3]);
     }
     station.set_raw(clipboard_win::formats::CF_DIB, &dib);
+    dimensions([3, 2]);
     let reply = paste(&root);
     reply.result.unwrap();
     assert_eq!(
@@ -308,6 +323,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     ];
     let png = peerbrush::raster::png16(2, 2, &words).unwrap();
     station.set_raw(clipboard_win::register_format("PNG").unwrap().get(), &png);
+    dimensions([2, 2]);
     let reply = paste(&root);
     reply.result.unwrap();
     {
@@ -406,6 +422,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
         })
         .unwrap();
     station.receive(&worker.replies).result.unwrap();
+    dimensions([4, 4]);
     let reply = paste(&root);
     reply.result.unwrap();
     {
@@ -445,6 +462,124 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
             .map(|v| *v as u16 * 257)
             .collect::<Vec<_>>()
     );
+    drop(e);
+    native.set_text("synthetic private-station text").unwrap();
+    let sequence = clipboard_win::seq_num();
+    let reply = worker.image_dimensions().unwrap();
+    assert!(station.receive(&reply).is_err());
+    assert_eq!(clipboard_win::seq_num(), sequence);
+    assert_eq!(native.get_text().unwrap(), "synthetic private-station text");
+    native
+        .set_image(arboard::ImageData {
+            width: 3,
+            height: 2,
+            bytes: Cow::Borrowed(&pixels),
+        })
+        .unwrap();
+    let sequence = clipboard_win::seq_num();
+    {
+        let _open = clipboard_win::Clipboard::new().unwrap();
+        let reply = worker.image_dimensions().unwrap();
+        assert!(station.receive(&reply).is_err());
+    }
+    assert_eq!(clipboard_win::seq_num(), sequence);
+    dimensions([3, 2]);
+    assert_eq!(native.get_image().unwrap().bytes.as_ref(), pixels);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires permission to create a private named Windows station; CI runs this explicitly"]
+fn windows_clipboard_cut_keeps_native_sources_placement_and_separate_undo() {
+    use std::sync::{Arc, Mutex};
+    if isolated_clipboard::child(
+        "windows_clipboard_cut_keeps_native_sources_placement_and_separate_undo",
+    ) {
+        return;
+    }
+    let station = isolated_clipboard::Station::new();
+    let worker = clipboard::Worker::default();
+    for depth in [8, 16] {
+        let mut engine = Engine::new();
+        engine.doc = Document::new_depth(32, 24, depth).unwrap();
+        engine.doc.layers[0]
+            .pixels
+            .set16(5, 6, [12347, 23459, 34571, 40001]);
+        engine.doc.layers[0]
+            .pixels
+            .set16(20, 10, [54321, 32109, 10987, 65535]);
+        engine.doc.selection = Some([4, 5, 8, 9]);
+        let before = engine.doc.clone();
+        let target = before.layers[0].id.clone();
+        let expected = Image::copy(&before, &target, false, false).unwrap();
+        let shared = Arc::new(Mutex::new(engine));
+        worker
+            .request(clipboard::Request::Cut {
+                shared: shared.clone(),
+                doc: before.clone(),
+                target: target.clone(),
+                mask: false,
+                step: None,
+            })
+            .unwrap();
+        station.receive(&worker.replies).result.unwrap();
+        let revision = {
+            let engine = shared.lock().unwrap();
+            assert_eq!(engine.doc.layers[0].pixels.get16(5, 6), [0; 4]);
+            assert_eq!(
+                engine.doc.layers[0].pixels.get16(20, 10),
+                before.layers[0].pixels.get16(20, 10)
+            );
+            assert_eq!(engine.undo.len(), 1);
+            engine.doc.revision
+        };
+        let sequence = clipboard_win::seq_num();
+        let size = worker.image_dimensions().unwrap();
+        assert_eq!(station.receive(&size).unwrap(), [4, 4]);
+        assert_eq!(clipboard_win::seq_num(), sequence);
+        worker
+            .request(clipboard::Request::Paste {
+                shared: shared.clone(),
+                document: before.id.clone(),
+                target,
+                revision,
+            })
+            .unwrap();
+        let reply = station.receive(&worker.replies);
+        reply.result.unwrap();
+        let mut engine = shared.lock().unwrap();
+        let pasted = engine
+            .doc
+            .layers
+            .iter()
+            .find(|layer| Some(&layer.id) == reply.selected.as_ref())
+            .unwrap();
+        assert_eq!((pasted.x, pasted.y, pasted.pixels.depth), (4, 5, depth));
+        assert_eq!(pasted.pixels.rgba(), expected.bytes);
+        if depth == 16 {
+            assert_eq!(pasted.pixels.rgba16(), expected.samples16.unwrap());
+        }
+        assert_eq!(engine.undo.len(), 2);
+        let pasted_png = engine.doc.export_png().unwrap();
+        let reopened =
+            peerbrush::psd::decode(&peerbrush::psd::encode(&engine.doc).unwrap()).unwrap();
+        assert_eq!(reopened.export_png().unwrap(), pasted_png);
+        engine.undo("human").unwrap();
+        assert_eq!(engine.doc.layers.len(), 1);
+        assert_eq!(engine.doc.layers[0].pixels.get16(5, 6), [0; 4]);
+        engine.undo("human").unwrap();
+        assert_eq!(
+            serde_json::to_value(&engine.doc.layers).unwrap(),
+            serde_json::to_value(&before.layers).unwrap()
+        );
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            before.export_png().unwrap()
+        );
+        engine.redo("human").unwrap();
+        engine.redo("human").unwrap();
+        assert_eq!(engine.doc.export_png().unwrap(), pasted_png);
+    }
 }
 
 #[test]

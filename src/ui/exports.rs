@@ -1,7 +1,8 @@
 //! Production settings and preview remain outside document state and history.
 use super::*;
 use crate::production_export::{
-    self as export, jobs::Existing, Control, Crop, DuplicateNames, Resampling, Settings, Variant,
+    self as export, jobs::Existing, Control, Crop, DuplicateNames, Format, Resampling, Settings,
+    Variant,
 };
 use std::time::Instant;
 struct Pending {
@@ -191,7 +192,15 @@ impl PeerBrush {
         let mut cancel = false;
         egui::Window::new("Production export").id(egui::Id::new("production export")).open(&mut open).collapsible(false).default_width(800.).show(ctx,|ui| {
             ui.label(RichText::new(&doc.name).strong());
-            ui.label(format!("PNG · native {} bit · {}",doc.bit_depth,if doc.icc_profile.is_some()||doc.srgb_tagged {"ICC retained"} else {"untagged working RGB"}));
+            ui.horizontal(|ui| {
+                ui.label("Format");
+                ui.selectable_value(&mut editor.settings.format,Format::Png,"PNG");
+                ui.selectable_value(&mut editor.settings.format,Format::Webp,"WebP · lossless 8-bit");
+            });
+            ui.label(format!("{} · {}",match editor.settings.format {
+                Format::Png=>format!("Native {}-bit output",doc.bit_depth),
+                Format::Webp=>format!("8-bit output · {}-bit project unchanged",doc.bit_depth),
+            },if doc.icc_profile.is_some()||doc.srgb_tagged {"ICC retained"} else {"untagged working RGB"}));
             if !valid {
                 ui.label(RichText::new("The document source changed. Settings are retained; choose the current document before exporting.").color(ACCENT));
                 if ui.button("Use current document").clicked(){editor.document=doc.id.clone();editor.targets=self.selected_layer_ids(doc);editor.selected_only=false;}
@@ -276,7 +285,7 @@ impl PeerBrush {
                 });
                 let button=ui.add_enabled(valid&&!running&&!self.busy&&!editor.directory.trim().is_empty(),egui::Button::new("Export batch"));editor.start_rect=Some(button.rect);start=button.clicked();
                 cancel=ui.add_enabled(running,egui::Button::new("Cancel batch")).clicked();
-                ui.label(RichText::new("Completed PNGs are retained when a batch stops. Sources stay editable.").small().color(MUTED));
+                ui.label(RichText::new("Completed exports are retained when a batch stops. Sources stay editable.").small().color(MUTED));
             });
             if let Some(error)=&editor.error {ui.label(RichText::new(error).color(ACCENT));}
         });
@@ -385,9 +394,13 @@ impl PeerBrush {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn frame(app: &mut PeerBrush, ctx: &egui::Context, events: Vec<egui::Event>) {
+    fn frame(
+        app: &mut PeerBrush,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let doc = app.shared.lock().unwrap().doc.clone();
-        let _ = ctx.run(
+        ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
                 focused: true,
@@ -395,7 +408,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| app.exports_window(ctx, &doc),
-        );
+        )
     }
     fn click(app: &mut PeerBrush, ctx: &egui::Context, save: bool) {
         for _ in 0..4 {
@@ -580,5 +593,84 @@ mod tests {
         drop(app);
         drop(shared);
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn actual_webp_format_control_preview_preset_and_batch_keep_native_sources() {
+        for depth in [8, 16] {
+            let (mut app, ctx, shared, root) = fixture(depth);
+            let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+            frame(&mut app, &ctx, vec![]);
+            let output = frame(&mut app, &ctx, vec![]);
+            let point = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "WebP · lossless 8-bit" => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .expect("Actual WebP format control");
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+            assert_eq!(
+                app.export_editor.as_ref().unwrap().settings.format,
+                Format::Webp
+            );
+            app.export_editor.as_mut().unwrap().directory = root.to_string_lossy().into();
+            preview(&mut app, &ctx);
+            let output = app
+                .export_editor
+                .as_ref()
+                .unwrap()
+                .preview_output
+                .as_ref()
+                .unwrap();
+            assert_eq!(output.bit_depth, 8);
+            assert_eq!(output.native_source_depth, depth);
+            click(&mut app, &ctx, true);
+            let library = export::library::Library::load(root.join("presets.json"));
+            assert_eq!(library.snapshot().presets[0].settings.format, Format::Webp);
+            click(&mut app, &ctx, false);
+            let run = app.export_editor.as_ref().unwrap().run.as_deref().unwrap();
+            let library = shared.lock().unwrap().export_library.clone();
+            let mut state = export::jobs::state(&library, run).unwrap();
+            for _ in 0..400 {
+                if state.status != "running" {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+                state = export::jobs::state(&library, run).unwrap();
+            }
+            assert_eq!(state.status, "completed", "{:?}", state.error);
+            assert_eq!(state.outputs[0].output.format, Format::Webp);
+            let bytes = std::fs::read(&state.outputs[0].path).unwrap();
+            assert_eq!(&bytes[8..12], b"WEBP");
+            assert_eq!(
+                image::load_from_memory(&bytes).unwrap().color(),
+                image::ColorType::Rgba8
+            );
+            assert_eq!(
+                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                before
+            );
+            assert!(shared.lock().unwrap().undo.is_empty());
+            drop(app);
+            drop(shared);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

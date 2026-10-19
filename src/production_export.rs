@@ -1,4 +1,4 @@
-//! Native-depth production exports. Plans and renders never mutate editable sources.
+//! Flattened production exports. Plans and renders never mutate editable sources.
 pub mod jobs;
 pub mod library;
 use crate::engine::Document;
@@ -23,6 +23,34 @@ impl Control {
             Err("Export canceled · source remains unchanged".into())
         } else {
             Ok(())
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Format {
+    #[default]
+    Png,
+    Webp,
+}
+impl Format {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Webp => "webp",
+        }
+    }
+    pub fn from_path(path: &std::path::Path) -> Result<Self, String> {
+        match path.extension().and_then(|value| value.to_str()) {
+            Some(value) if value.eq_ignore_ascii_case("png") => Ok(Self::Png),
+            Some(value) if value.eq_ignore_ascii_case("webp") => Ok(Self::Webp),
+            _ => Err("Flattened exports require a .png or .webp destination".into()),
+        }
+    }
+    fn bit_depth(self, native: u16) -> u16 {
+        match self {
+            Self::Png => native,
+            Self::Webp => 8,
         }
     }
 }
@@ -56,6 +84,8 @@ pub struct Variant {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    #[serde(default)]
+    pub format: Format,
     pub template: String,
     pub crop: Crop,
     pub padding: u32,
@@ -66,6 +96,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            format: Format::Png,
             template: "{document}_{layer}_{variant}".into(),
             crop: Crop::Canvas,
             padding: 0,
@@ -130,6 +161,8 @@ pub struct Output {
     pub document_rect: [i32; 4],
     pub width: u32,
     pub height: u32,
+    pub format: Format,
+    pub native_source_depth: u16,
     pub bit_depth: u16,
     pub scale_xy: [f64; 2],
 }
@@ -174,15 +207,7 @@ pub fn safe_name(name: &str) -> String {
     name
 }
 fn size(width: u32, height: u32) -> Result<(), String> {
-    if width == 0
-        || height == 0
-        || width > 8192
-        || height > 8192
-        || u64::from(width) * u64::from(height) > 32_000_000
-    {
-        return Err("Export dimensions must fit the 8192-edge and 32 MP limits".into());
-    }
-    Ok(())
+    crate::raster::check_size(width, height)
 }
 fn target_document(doc: &Document, target: Option<&str>) -> Result<Document, String> {
     let Some(target) = target else {
@@ -246,6 +271,57 @@ struct Image {
     pixels: Pixels,
 }
 impl Image {
+    fn encode(
+        &self,
+        format: Format,
+        profile: Option<&[u8]>,
+        control: &Control,
+    ) -> Result<Vec<u8>, String> {
+        control.check()?;
+        let encoded = match format {
+            Format::Png => match &self.pixels {
+                Pixels::Eight(bytes) => {
+                    crate::raster::png_with_profile(self.width, self.height, bytes, profile)
+                }
+                Pixels::Sixteen(words) => {
+                    crate::raster::png16_with_profile(self.width, self.height, words, profile)
+                }
+            }?,
+            Format::Webp => {
+                use image::ImageEncoder;
+                let projected;
+                let rgba = match &self.pixels {
+                    Pixels::Eight(bytes) => bytes.as_slice(),
+                    Pixels::Sixteen(words) => {
+                        projected = words
+                            .iter()
+                            .copied()
+                            .map(crate::raster::project16)
+                            .collect::<Vec<_>>();
+                        projected.as_slice()
+                    }
+                };
+                let mut bytes = Vec::new();
+                let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+                if let Some(profile) = profile {
+                    encoder
+                        .set_icc_profile(profile.to_vec())
+                        .map_err(|e| e.to_string())?;
+                }
+                encoder
+                    .write_image(
+                        rgba,
+                        self.width,
+                        self.height,
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .map_err(|e| e.to_string())?;
+                bytes
+            }
+        };
+        control.check()?;
+        Ok(encoded)
+    }
     fn render(doc: &Document, target: Option<&str>, control: &Control) -> Result<Self, String> {
         control.check()?;
         let doc = target_document(doc, target)?;
@@ -260,7 +336,7 @@ impl Image {
             }
             Pixels::Eight(bytes)
         } else {
-            return Err("PNG exports require native 8/16-bit RGB channels".into());
+            return Err("Exports require native 8/16-bit RGB channels".into());
         };
         control.check()?;
         Ok(Self {
@@ -345,7 +421,7 @@ pub fn plan(
     settings.validate()?;
     size(doc.width, doc.height)?;
     if !matches!(doc.bit_depth, 8 | 16) {
-        return Err("PNG exports require native 8/16-bit RGB channels".into());
+        return Err("Exports require native 8/16-bit RGB channels".into());
     }
     control.check()?;
     if targets.len() > 1024 {
@@ -404,7 +480,8 @@ pub fn plan(
                     .replace("{layer}", &safe_name(target_name))
                     .replace("{variant}", &safe_name(&variant.name)),
             );
-            let mut filename = format!("{base}.png");
+            let extension = settings.format.extension();
+            let mut filename = format!("{base}.{extension}");
             let mut number = 2;
             while !names.insert(filename.to_lowercase()) {
                 if settings.duplicate_names == DuplicateNames::Error {
@@ -413,7 +490,7 @@ pub fn plan(
                             .into(),
                     );
                 }
-                filename = format!("{base}_{number}.png");
+                filename = format!("{base}_{number}.{extension}");
                 number += 1;
             }
             outputs.push(Output {
@@ -424,7 +501,9 @@ pub fn plan(
                 document_rect: rect,
                 width,
                 height,
-                bit_depth: doc.bit_depth,
+                format: settings.format,
+                native_source_depth: doc.bit_depth,
+                bit_depth: settings.format.bit_depth(doc.bit_depth),
                 scale_xy: [
                     f64::from(width) / f64::from(rw),
                     f64::from(height) / f64::from(rh),
@@ -448,8 +527,11 @@ pub fn render(
 ) -> Result<Vec<u8>, String> {
     settings.validate()?;
     size(output.width, output.height)?;
-    if output.bit_depth != doc.bit_depth {
-        return Err("Export cannot silently change native channel depth".into());
+    if output.format != settings.format
+        || output.native_source_depth != doc.bit_depth
+        || output.bit_depth != settings.format.bit_depth(doc.bit_depth)
+    {
+        return Err("Export format or channel depth differs from its source/settings".into());
     }
     let rect = output.document_rect;
     if rect[2] <= rect[0] || rect[3] <= rect[1] || rect.iter().any(|v| i64::from(*v).abs() > 16384)
@@ -465,16 +547,7 @@ pub fn render(
     if rect == [0, 0, doc.width as i32, doc.height as i32]
         && (output.width, output.height) == (doc.width, doc.height)
     {
-        let png = match &image.pixels {
-            Pixels::Eight(bytes) => {
-                crate::raster::png_with_profile(output.width, output.height, bytes, profile)
-            }
-            Pixels::Sixteen(words) => {
-                crate::raster::png16_with_profile(output.width, output.height, words, profile)
-            }
-        }?;
-        control.check()?;
-        return Ok(png);
+        return image.encode(settings.format, profile, control);
     }
     let (rw, rh) = (f64::from(rect[2] - rect[0]), f64::from(rect[3] - rect[1]));
     let count = output.width as usize * output.height as usize * 4;
@@ -505,13 +578,41 @@ pub fn render(
         }
     }
     control.check()?;
-    let png = if doc.bit_depth == 16 {
-        crate::raster::png16_with_profile(output.width, output.height, &words, profile)
-    } else {
-        crate::raster::png_with_profile(output.width, output.height, &bytes, profile)
-    }?;
-    control.check()?;
-    Ok(png)
+    Image {
+        width: output.width,
+        height: output.height,
+        pixels: if doc.bit_depth == 16 {
+            Pixels::Sixteen(words)
+        } else {
+            Pixels::Eight(bytes)
+        },
+    }
+    .encode(settings.format, profile, control)
+}
+
+pub(crate) fn render_document(
+    doc: &Document,
+    format: Format,
+    control: &Control,
+) -> Result<Vec<u8>, String> {
+    let settings = Settings {
+        format,
+        ..Default::default()
+    };
+    let plan = plan(doc, &[], &settings, control)?;
+    render(doc, &plan.outputs[0], &settings, control)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn export_dimensions_retain_the_full_shared_document_limit_without_allocating_pixels() {
+        assert_eq!(8192_u64 * 4096, crate::raster::MAX_PIXELS);
+        assert!(super::size(8192, 4096).is_ok());
+        for (width, height) in [(8192, 4097), (8193, 1), (0, 1)] {
+            assert!(super::size(width, height).is_err());
+        }
+    }
 }
 
 /// Native UI, MCP and CLI use this same preference/plan/publication surface.
@@ -668,7 +769,7 @@ pub(crate) fn request_with_control(
                     crate::depth16::display_pixel(words[at..at + 4].try_into().unwrap())
                 });
                 result["preview_only"] = json!(true);
-                result["images"] = json!([{"mime_type":"image/png","data":base64::engine::general_purpose::STANDARD.encode(crate::raster::png(w,h,&rgba)?),"width":w,"height":h,"document_rect":output.document_rect,"output_size":[output.width,output.height],"native_source_depth":doc.bit_depth,"display_managed":managed,"revision":doc.revision}]);
+                result["images"] = json!([{"mime_type":"image/png","data":base64::engine::general_purpose::STANDARD.encode(crate::raster::png(w,h,&rgba)?),"width":w,"height":h,"document_rect":output.document_rect,"output_size":[output.width,output.height],"output_format":output.format,"output_bit_depth":output.bit_depth,"native_source_depth":doc.bit_depth,"display_managed":managed,"revision":doc.revision}]);
             }
             {
                 let engine = shared.lock().unwrap();

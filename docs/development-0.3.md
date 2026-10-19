@@ -51,7 +51,7 @@ Exact-head Windows/macOS/Linux CI remains separate. Local MSIX tests passed 23 c
 
 ## Foundation implementation slices
 
-All work below is unreleased, in focused draft PRs targeting `version/0.3`. The acceptance branch combines reviewed slices for integration testing; it is not a production promotion.
+All work below is unreleased. Focused draft PRs targeted `version/0.3`; their reviewed slices and subsequent source work are now consolidated directly on that branch for combined verification. This is not a production promotion.
 
 | Item | Reviewable implementation | Evidence and remaining acceptance |
 | --- | --- | --- |
@@ -77,3 +77,11 @@ The latest full combined Windows build reached application/test linking but fail
 [PR #40](https://github.com/Deftr0y/PeerBrush/pull/40) fixes a demonstrated PB-110 gap: fractional selection transforms sampled scalar coverage as premultiplied RGBA, inflating soft edges. The shared transform now interpolates the scalar red channel. Analytic native8/16 color/mask/folder coverage, holes, hidden RGB, preview/history and PSD/PSB round-trip regressions are written and type-checked; execution and native rendering remain pending. See [the bounded audit](acceptance-0.3-photoshop-selection.md).
 
 PB-122's current and preserved earlier code retain strict styled-import descriptor/composite gates. No evidenced unsafe replacement was identified. Current fidelity prose was corrected to the calibrated Pattern → Gradient → Color order, preserving historical evidence. Wider Photoshop gradient/profile/source calibration and real receiving-application acceptance remain open.
+
+## Consolidated source acceptance
+
+The source batch following `b55fada` adds lossless WebP export (PB-144), connected main menus (PB-149), compact popup presentation (PB-150) and asynchronous clipboard canvas-size suggestions (PB-151). The UI and clipboard pieces selectively reuse the preserved workspace/acceptance branches, retaining their history and omitting obsolete version/completion claims. File → Export WebP explicitly labels the derived 8-bit output; PNG presets retain their previous default. WebP does not reduce native16 project samples or replace layered saves.
+
+New Canvas owns document shortcuts from the opening frame through dismissal, drops delayed suggestions after manual focus/edit or cancellation, and creates a blank project only after confirmation. Windows clipboard transport acceptance is explicit and runs inside fresh private window stations; inaccessible isolation fails closed. CI runs those ignored native checks only after ordinary regression tests pass. Source review has not executed these checks.
+
+This batch also includes the earlier About panel, bounded public website/download readback and empty bidi-run filename-bounds correction. Complete source integration and independent review precede one combined formatting, engine/codec/protocol, package and native QA phase. Record that phase's exact source commit and results separately; earlier passing checkpoints do not establish acceptance of the current batch. Signing, publishing, Store submission and automatic update installation remain disabled or approval-gated as documented.

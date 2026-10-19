@@ -1053,12 +1053,21 @@ mod tests {
                 (11., 28., 300., 1.5),
             ] {
                 let rendered = raster(name, size, width, scale).unwrap();
-                let visible = rendered.pixels.pixels.iter().enumerate().filter(|(index, pixel)| {
-                    let y = (*index / rendered.pixels.size[0]) as f32;
-                    let row_y = (y + 0.5) / scale + (row_height - rendered.size.y) * 0.5;
-                    pixel.a() > 0 && (0. ..row_height).contains(&row_y)
-                }).count();
-                assert!(visible > 10, "Filename ink was outside its {row_height}px row: {name}");
+                let visible = rendered
+                    .pixels
+                    .pixels
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, pixel)| {
+                        let y = (*index / rendered.pixels.size[0]) as f32;
+                        let row_y = (y + 0.5) / scale + (row_height - rendered.size.y) * 0.5;
+                        pixel.a() > 0 && (0. ..row_height).contains(&row_y)
+                    })
+                    .count();
+                assert!(
+                    visible > 10,
+                    "Filename ink was outside its {row_height}px row: {name}"
+                );
             }
         }
     }

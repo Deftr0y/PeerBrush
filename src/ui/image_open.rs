@@ -52,6 +52,7 @@ impl PeerBrush {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
+                dialogs::body(ui, 420.);
                 ui.label(
                     pending
                         .prepared
@@ -74,7 +75,7 @@ impl PeerBrush {
                     });
                 ui.horizontal(|ui| {
                     apply = ui
-                        .add_enabled(!self.busy, egui::Button::new("Open"))
+                        .add_enabled(!self.busy, dialogs::primary("Open"))
                         .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });

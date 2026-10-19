@@ -611,3 +611,66 @@ fn common_rgb_matrix_profiles_are_supported_and_profile_metadata_cannot_restore_
     assert_ne!(loaded.id, doc.id);
     assert_eq!(loaded.layers[0].name, "Saved PSD composite");
 }
+
+#[test]
+fn webp_preserves_original_icc_samples_and_reopens_through_existing_color_management() {
+    use peerbrush::production_export::{self as export, Control, Format, Settings};
+    let profile = linear_profile();
+    for depth in [8, 16] {
+        let doc = psd::decode(&fixture(&profile, depth)).unwrap();
+        assert!(doc.read_only);
+        let before = serde_json::to_value(&doc).unwrap();
+        let native = image::load_from_memory(&doc.export_png().unwrap())
+            .unwrap()
+            .into_rgba16();
+        let expected: Vec<_> = native
+            .into_raw()
+            .into_iter()
+            .map(peerbrush::raster::project16)
+            .collect();
+        let settings = Settings {
+            format: Format::Webp,
+            ..Default::default()
+        };
+        let plan = export::plan(&doc, &[], &settings, &Control::default()).unwrap();
+        let bytes = export::render(&doc, &plan.outputs[0], &settings, &Control::default()).unwrap();
+        let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(&bytes)).unwrap();
+        assert_eq!(
+            decoder.icc_profile().unwrap().as_deref(),
+            Some(profile.as_slice())
+        );
+        assert_eq!(
+            image::load_from_memory(&bytes)
+                .unwrap()
+                .into_rgba8()
+                .into_raw(),
+            expected
+        );
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-webp-icc-{}", peerbrush::engine::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("Original-profile.webp");
+        std::fs::write(&path, bytes).unwrap();
+        let reopened = Arc::new(Mutex::new(Engine::new()));
+        server::open(&reopened, &path).unwrap();
+        let engine = reopened.lock().unwrap();
+        assert_eq!(engine.doc.bit_depth, 8);
+        assert!(engine.doc.srgb_tagged);
+        assert!(engine.doc.icc_profile.is_none());
+        let managed = engine.doc.layers[0].pixels.rgba();
+        for (source, actual) in expected.chunks_exact(4).zip(managed.chunks_exact(4)) {
+            assert_eq!(actual[3], source[3]);
+            for channel in 0..3 {
+                assert!(
+                    actual[channel].abs_diff(peerbrush::raster::project16(srgb(
+                        u16::from(source[channel]) * 257
+                    ))) <= 1
+                );
+            }
+        }
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        drop(engine);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

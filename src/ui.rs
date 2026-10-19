@@ -10,6 +10,7 @@ mod calibration;
 mod color;
 mod compatibility;
 mod contour_points;
+mod dialogs;
 mod effect_color;
 mod effects;
 mod exports;
@@ -24,6 +25,7 @@ mod image_open;
 mod layers;
 mod lifecycle;
 mod liquify;
+mod new_canvas;
 mod pattern_source;
 mod pen;
 #[cfg(test)]
@@ -45,6 +47,8 @@ mod tool_settings_tests;
 mod transform_snapping;
 mod updates;
 mod view;
+#[cfg(test)]
+mod workspace_tests;
 use crate::{controls, thumbnails};
 use crate::{
     engine::Document,
@@ -462,6 +466,7 @@ pub struct PeerBrush {
     load_control: Option<crate::loading::Control>,
     load_preview: Option<TextureHandle>,
     show_new: bool,
+    new_size: new_canvas::Suggestion,
     associations: associations::Choice,
     read_only_info: Option<String>,
     read_only_patterns: Option<String>,
@@ -814,6 +819,7 @@ impl PeerBrush {
             load_control: None,
             load_preview: None,
             show_new: false,
+            new_size: Default::default(),
             associations: Default::default(),
             read_only_info: None,
             read_only_patterns: None,
@@ -1686,20 +1692,40 @@ impl PeerBrush {
             Ok("Photoshop document saved".into())
         });
     }
-    fn export(&mut self) {
+    fn export(&mut self, format: crate::production_export::Format) {
+        use crate::production_export::Format;
         let s = self.shared.clone();
         let document = self.doc_snapshot.id.clone();
         let revision = self.doc_snapshot.revision;
+        let depth = self.doc_snapshot.bit_depth;
         self.job(move || {
+            let (label, title) = match format {
+                Format::Png => ("PNG", format!("Export native {depth}-bit PNG")),
+                Format::Webp => (
+                    "WebP · lossless 8-bit",
+                    format!("Export 8-bit WebP · {depth}-bit project unchanged"),
+                ),
+            };
             let Some(path) = rfd::FileDialog::new()
-                .add_filter("PNG", &["png"])
-                .set_file_name("PeerBrush.png")
+                .add_filter(label, &[format.extension()])
+                .set_title(title)
+                .set_file_name(format!("PeerBrush.{}", format.extension()))
                 .save_file()
             else {
                 return Ok("Ready".into());
             };
+            if Format::from_path(&path)? != format {
+                return Err(format!(
+                    "Choose a .{} destination for this export",
+                    format.extension()
+                ));
+            }
             server::export_confirmed_source(&s, &path, &document, revision)?;
-            Ok("PNG exported".into())
+            Ok(match format {
+                Format::Png => "PNG exported",
+                Format::Webp => "8-bit WebP exported · working document unchanged",
+            }
+            .into())
         });
     }
     fn import(&mut self) {
@@ -4571,21 +4597,26 @@ impl PeerBrush {
         self.selection_commit_failed = false;
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
-        self.temporary_pen_tool(ctx);
-        self.lifecycle_frame = self.save_loss_review.is_some();
+        self.lifecycle_frame = self.save_loss_review.is_some() || self.show_new;
+        if !self.lifecycle_frame {
+            self.temporary_pen_tool(ctx);
+        }
         if let Some(warning) = self.workspace.lock().unwrap().open_warning.take() {
             self.open_file_warning = Some(warning);
         }
         if let Some(warning) = self.open_file_warning.clone() {
             egui::Window::new("File already open")
                 .id(egui::Id::new("duplicate_file_warning"))
+                .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.set_max_width(440.);
+                    dialogs::body(ui, 440.);
+                    dialogs::heading(ui, "File already open", true);
                     ui.label(warning);
-                    if ui.button("OK").clicked() {
+                    ui.add_space(3.);
+                    if ui.add(dialogs::primary("OK")).clicked() {
                         self.open_file_warning = None;
                     }
                 });
@@ -5015,9 +5046,12 @@ impl PeerBrush {
                     ui.disable();
                 }
                 ui.horizontal_centered(|ui| {
-                    ui.menu_button("File", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.;
+                    egui::menu::menu_custom_button(ui, egui::Button::new("File").corner_radius(egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 }), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.;
                         if ui.button("New canvas").clicked() {
-                            self.show_new = true;
+                            self.open_new_canvas();
                             ui.close_menu();
                         }
                         if ui.button("Open PSD/PSB").clicked() {
@@ -5051,7 +5085,11 @@ impl PeerBrush {
                             ui.close_menu();
                         }
                         if ui.button("Export PNG...").clicked() {
-                            self.export();
+                            self.export(crate::production_export::Format::Png);
+                            ui.close_menu();
+                        }
+                        if ui.button("Export WebP (8-bit)…").clicked() {
+                            self.export(crate::production_export::Format::Webp);
                             ui.close_menu();
                         }
                         if ui.button("Production export…").clicked() {
@@ -5066,15 +5104,17 @@ impl PeerBrush {
                         }
                         self.about.menu(ui);
                     });
-                    ui.menu_button("View",|ui| self.canvas_view_menu(ui));
-                    ui.menu_button("Image",|ui| {
+                    egui::menu::menu_custom_button(ui, egui::Button::new("View").corner_radius(egui::CornerRadius::same(0)),|ui| { ui.spacing_mut().item_spacing.x = 8.; self.canvas_view_menu(ui) });
+                    egui::menu::menu_custom_button(ui, egui::Button::new("Image").corner_radius(egui::CornerRadius::same(0)),|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.;
                         if ui.add_enabled(!doc.read_only&&!self.busy,egui::Button::new("Whole-image filters…")).clicked(){self.open_filters(&doc);ui.close_menu();}
                         if !doc.filters.is_empty(){ui.menu_button("Filter stack",|ui|self.document_filter_stack(ui,&doc));}
                         for (label,mode) in [("Crop…","crop"),("Canvas size…","canvas.resize"),("Image size…","image.resize")] {
                             if ui.add_enabled(!doc.read_only && !self.busy,egui::Button::new(label)).clicked() {self.open_geometry(&doc,mode);ui.close_menu();}
                         }
                     });
-                    ui.menu_button("Layer",|ui| {
+                    egui::menu::menu_custom_button(ui, egui::Button::new("Layer").corner_radius(egui::CornerRadius::same(0)),|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.;
                         if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Group layers").shortcut_text(if cfg!(target_os="macos") {"⌘ G"} else {"Ctrl+G"})).clicked(){self.create_folder(&doc);ui.close_menu();}
                         if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ G"} else {"Ctrl+Shift+G"})).clicked(){self.merge_layers(ctx,&doc);ui.close_menu();}
                         ui.separator();
@@ -5084,7 +5124,8 @@ impl PeerBrush {
                         }
                         if ui.add_enabled(!doc.read_only&&doc.layers.iter().any(|l|l.id==self.selected&&l.source.is_some()),egui::Button::new("Rasterize text/vector")).on_hover_text("Keep the current pixels and remove editable properties · Undo restores the source").clicked(){self.layer_cmd("source.rasterize",json!({}),"Rasterize text/vector");ui.close_menu();}
                     });
-                    ui.menu_button("Select",|ui| {
+                    egui::menu::menu_custom_button(ui, egui::Button::new("Select").corner_radius(egui::CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 }),|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.;
                         let learned = crate::segmentation::configured() && !doc.read_only && !self.busy;
                         if ui.add_enabled(learned, egui::Button::new("Select subject")).on_hover_text("Uses the externally configured local selection provider").clicked(){self.segment_subject(&doc,false);ui.close_menu();}
                         if ui.add_enabled(learned && doc.selection.is_some(), egui::Button::new("Select subject in region")).clicked(){self.segment_subject(&doc,true);ui.close_menu();}
@@ -5097,6 +5138,7 @@ impl PeerBrush {
                             if ui.add(button).clicked(){if op=="selection.clear" {self.deselect_area(&doc,false);}else{self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);}ui.close_menu();}
                         }
                         for (label,mode) in [("Expand by 1 px","expand"),("Contract by 1 px","contract")] {if ui.button(label).clicked(){self.edit(vec![json!({"op":"selection.modify","mode":mode,"radius":1})],label);ui.close_menu();}}
+                    });
                     });
                     if ui
                         .add_enabled_ui(!self.busy, |ui| {
@@ -5449,6 +5491,9 @@ impl PeerBrush {
             self.request_preview(ctx, &doc);
         }
         if self.lifecycle.is_some() || self.lifecycle_frame {
+            if self.lifecycle.is_none() && self.save_loss_review.is_none() {
+                self.new_canvas_window(ctx);
+            }
             self.finish_capture(ctx, drawn_generation);
             return;
         }
@@ -5516,59 +5561,7 @@ impl PeerBrush {
         self.patterns_window(ctx, &doc);
         self.compatibility_window(ctx, &doc);
         self.associations.show(ctx);
-        if self.show_new {
-            let mut open = true;
-            egui::Window::new("New canvas")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Width");
-                        controls::numeric(ui, &mut self.new_width, 16..=8192);
-                        ui.label("Height");
-                        controls::numeric(ui, &mut self.new_height, 16..=8192);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Color");
-                        ui.selectable_value(&mut self.new_bit_depth, 8, "8 bit");
-                        ui.selectable_value(&mut self.new_bit_depth, 16, "16 bit");
-                    });
-                    ui.label("Opens in a new project tab.");
-                    if ui.button("Create canvas").clicked() {
-                        let result = Document::new_depth(
-                            self.new_width,
-                            self.new_height,
-                            self.new_bit_depth,
-                        )
-                        .and_then(|d| {
-                            let mut e = crate::engine::Engine::new();
-                            e.doc = d;
-                            crate::workspace::register_in(
-                                &self.workspace,
-                                e,
-                                Some(&self.project_id),
-                            )
-                        });
-                        match result {
-                            Ok(_) => {
-                                self.texture = None;
-                                self.canvas_pixels = None;
-                                self.animation.cancel();
-                                self.show_new = false;
-                                self.pan = Vec2::ZERO;
-                                self.zoom = 1.0;
-                                self.view = view::View::default();
-                                self.last_preview = None;
-                            }
-                            Err(e) => self.message = e,
-                        }
-                    }
-                });
-            if !open {
-                self.show_new = false;
-            }
-        }
+        self.new_canvas_window(ctx);
         if self.show_connection {
             let mut open = true;
             egui::Window::new("AI connection settings").open(&mut open).default_width(550.0).show(ctx, |ui| {

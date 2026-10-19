@@ -1,4 +1,4 @@
-//! Cancellable per-output publication. Completed PNGs are receipts; originals stay editable.
+//! Cancellable per-output publication. Completed exports are receipts; originals stay editable.
 use super::{Control, Output, Settings};
 use crate::server::Shared;
 use serde::{Deserialize, Serialize};
