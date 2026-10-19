@@ -1,5 +1,5 @@
 name: PeerBrush reviewed Apple signing
-run-name: Apple signing for the reviewed PeerBrush 0.25.0 source
+run-name: Apple signing for the reviewed PeerBrush 0.26.0 source
 
 # This workflow must live on protected main. Create/protect the apple-signing
 # environment before activation. Commit the keychain patch first, then replace
@@ -24,8 +24,8 @@ defaults:
     shell: bash
 
 env:
-  REVIEWED_SOURCE_COMMIT: 3f8b615c6d3e6503e4a55cce3dc1bfc9b829f1c5
-  RELEASE_VERSION: '0.25.0'
+  REVIEWED_SOURCE_COMMIT: a00cf47accde87400fad3f0fcfc5fe96fc4f5be1
+  RELEASE_VERSION: '0.26.0'
   APPLE_TEAM: KU3Q7F9Q84
   APPLE_IDENTITY_SHA1: 144ED1E67A4AF3F374E830FFF429B46109BB53EE
   MACOSX_DEPLOYMENT_TARGET: '11.0'
@@ -61,7 +61,7 @@ jobs:
           python3 scripts/package.py --check-source
       - name: Test and build without Apple credentials
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy,rust-docs
           rustup default stable
           cargo fmt --all -- --check
           cargo test --locked
@@ -78,7 +78,7 @@ jobs:
           sys.path.insert(0, 'scripts')
           from package import digest
           from verify_release import inspect_archive
-          archive = pathlib.Path('dist/PeerBrush-0.25.0-macOS-arm64.zip')
+          archive = pathlib.Path('dist/PeerBrush-0.26.0-macOS-arm64.zip')
           inspected = inspect_archive(archive, os.environ['REVIEWED_SOURCE_COMMIT'], os.environ['RELEASE_VERSION'])
           assert inspected['record']['native_publisher_signing'] == 'not-configured'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
@@ -87,7 +87,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: apple-unsigned-${{ github.run_id }}
-          path: dist/PeerBrush-0.25.0-macOS-arm64.zip
+          path: dist/PeerBrush-0.26.0-macOS-arm64.zip
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -123,7 +123,7 @@ jobs:
           sys.path.insert(0, 'scripts')
           from package import digest
           from verify_release import inspect_archive
-          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-unsigned/PeerBrush-0.25.0-macOS-arm64.zip'
+          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-unsigned/PeerBrush-0.26.0-macOS-arm64.zip'
           expected = os.environ['UNSIGNED_SHA256']
           assert re.fullmatch('[0-9a-f]{64}', expected) and digest(archive) == expected
           inspect_archive(archive, os.environ['REVIEWED_SOURCE_COMMIT'], os.environ['RELEASE_VERSION'])
@@ -187,7 +187,7 @@ jobs:
           UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
         run: |
           python3 scripts/sign_macos.py \
-            --archive "$RUNNER_TEMP/apple-unsigned/PeerBrush-0.25.0-macOS-arm64.zip" \
+            --archive "$RUNNER_TEMP/apple-unsigned/PeerBrush-0.26.0-macOS-arm64.zip" \
             --output "$RUNNER_TEMP/apple-signed" --work "$RUNNER_TEMP/apple-work" \
             --commit "$REVIEWED_SOURCE_COMMIT" --version "$RELEASE_VERSION" \
             --expected-sha256 "$UNSIGNED_SHA256" --team-id "$APPLE_TEAM" \
@@ -217,9 +217,9 @@ jobs:
         with:
           name: apple-signed-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/apple-signed/PeerBrush-0.25.0-macOS-arm64-apple-signed-r1.zip
-            ${{ runner.temp }}/apple-signed/PeerBrush-0.25.0-macOS-arm64-apple-signed-r1.zip.sha256
-            ${{ runner.temp }}/apple-signed/PeerBrush-0.25.0-macOS-arm64-apple-signed-r1.zip.verification.json
+            ${{ runner.temp }}/apple-signed/PeerBrush-0.26.0-macOS-arm64-apple-signed-r1.zip
+            ${{ runner.temp }}/apple-signed/PeerBrush-0.26.0-macOS-arm64-apple-signed-r1.zip.sha256
+            ${{ runner.temp }}/apple-signed/PeerBrush-0.26.0-macOS-arm64-apple-signed-r1.zip.verification.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 0

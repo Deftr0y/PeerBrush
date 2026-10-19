@@ -52,7 +52,7 @@ jobs:
         run: python scripts/package.py --check-source
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-docs
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo fmt --all -- --check
