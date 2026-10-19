@@ -1,6 +1,6 @@
-import { detectPlatform, safeDownloadUrl, latestRelease } from './platform.js';
+import { detectPlatform, safeDownloadUrl, latestRelease } from './platform.js?release=v0.26.0';
 import './showcase.js';
-import { renderHistory } from './releases.js';
+import { renderHistory } from './releases.js?release=v0.26.0';
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 const views = {
@@ -58,7 +58,7 @@ function downloadLink(platform, className='text-link') {
   return link;
 }
 function renderDownloads(build) {
-  if (!Array.isArray(build.platforms) || build.platforms.length !== 3 || build.platforms.some(p => !platformDescriptions[p.id] || !safeDownloadUrl(p.url))) return false;
+  if (!Array.isArray(build.platforms) || !build.platforms.length || build.platforms.length > 3 || new Set(build.platforms.map(p => p.id)).size !== build.platforms.length || build.platforms.some(p => !platformDescriptions[p.id] || !safeDownloadUrl(p.url))) return false;
   const platforms = [...build.platforms].sort((a,b) => Number(b.id === detected)-Number(a.id === detected));
   const suggested = platforms.find(p => p.id === detected);
   if (suggested) {
@@ -66,6 +66,11 @@ function renderDownloads(build) {
     primaryDownload.querySelector('span').textContent = `Download for ${suggested.name}`;
     primaryDownload.setAttribute('aria-label', `Download PeerBrush for ${suggested.name}, ${suggested.architecture}`);
     document.querySelector('#download-meta').textContent = `${suggested.architecture === 'arm64' ? 'Apple silicon · ' : 'x64 · '}${(suggested.bytes/1e6).toFixed(1)} MB · ${build.label || build.version}`;
+  } else {
+    primaryDownload.href = '#downloads';
+    primaryDownload.querySelector('span').textContent = 'Choose a download';
+    primaryDownload.setAttribute('aria-label', 'Choose an available platform download');
+    document.querySelector('#download-meta').textContent = `${build.label || build.version} · Available for ${platforms.map(p => p.name).join(' and ')}`;
   }
   otherDownloads.replaceChildren();
   for (const platform of platforms.filter(p => p.id !== detected)) otherDownloads.append(downloadLink(platform));
@@ -118,7 +123,7 @@ async function loadDownloads() {
     const response = await fetch(feedUrl, { cache: 'no-store' });
     if (response.ok) {const data=await response.json();renderHistory(data);const build=latestRelease(data);if(build)loaded=renderDownloads(build);}
   } catch { /* Keep the verified static download links when the feed is unavailable. */ }
-  if (!loaded) document.querySelector('#build-label').textContent = 'PeerBrush 0.25 · Prerelease';
+  if (!loaded) document.querySelector('#build-label').textContent = 'PeerBrush 0.26.0 · Stable';
 }
 loadDownloads();
 
