@@ -142,6 +142,7 @@
     "src/tree.rs",
     "src/ui.rs",
     "src/ui/animation.rs",
+    "src/ui/associations.rs",
     "src/ui/brush.rs",
     "src/ui/calibration.rs",
     "src/ui/brush_toolbar_tests.rs",

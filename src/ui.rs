@@ -1,6 +1,7 @@
 use crate::icons::{self, Icon};
 mod activation;
 mod animation;
+mod associations;
 mod brush;
 #[cfg(test)]
 mod brush_toolbar_tests;
@@ -456,6 +457,7 @@ pub struct PeerBrush {
     load_control: Option<crate::loading::Control>,
     load_preview: Option<TextureHandle>,
     show_new: bool,
+    associations: associations::Choice,
     read_only_info: Option<String>,
     read_only_patterns: Option<String>,
     selection_commit_failed: bool,
@@ -802,6 +804,7 @@ impl PeerBrush {
             load_control: None,
             load_preview: None,
             show_new: false,
+            associations: Default::default(),
             read_only_info: None,
             read_only_patterns: None,
             selection_commit_failed: false,
@@ -5035,6 +5038,8 @@ impl PeerBrush {
                             self.open_exports(&doc);
                             ui.close_menu();
                         }
+                        ui.separator();
+                        self.associations.menu(ui);
                     });
                     ui.menu_button("View",|ui| self.canvas_view_menu(ui));
                     ui.menu_button("Image",|ui| {
@@ -5485,6 +5490,7 @@ impl PeerBrush {
         self.protection_window(ctx, &doc);
         self.patterns_window(ctx, &doc);
         self.compatibility_window(ctx, &doc);
+        self.associations.show(ctx);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")
