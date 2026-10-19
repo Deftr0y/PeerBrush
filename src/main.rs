@@ -23,7 +23,7 @@ fn main() {
     }
 }
 fn run() -> Result<(), String> {
-    let (state_dir, args) = activation::arguments(
+    let (state_dir, args, local_preferences) = activation::storage_arguments(
         std::env::args_os().skip(1),
         peerbrush::packaged::default_state_dir(server::default_state_dir())?,
     )?;
@@ -36,6 +36,44 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("mcp") => return server::stdio(&state_dir),
+        Some("updates") => {
+            let channel = match args.as_slice() {
+                [_, action] if action == "check" => peerbrush::updates::Channel::Stable,
+                [_, action, option] if action == "check" && option == "--preview" => {
+                    peerbrush::updates::Channel::Preview
+                }
+                _ => return Err("Use updates check [--preview]".into()),
+            };
+            let report =
+                peerbrush::updates::check(channel, peerbrush::updates::Target::current()?, |_| {})?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+            return Ok(());
+        }
+        Some("settings") => {
+            let locations = peerbrush::settings::Locations::user()?;
+            match args.get(1).and_then(|s| s.to_str()) {
+                Some("paths") if args.len() == 2 => {}
+                Some("migrate") if args.len() == 4 && args[2] == "--from" => {
+                    let source = std::path::absolute(std::path::PathBuf::from(&args[3]))
+                        .map_err(|e| e.to_string())?;
+                    let _profile =
+                        peerbrush::settings::Profile::migrate(locations.clone(), &source)?;
+                }
+                _ => {
+                    return Err(
+                        "Use settings paths or settings migrate --from LEGACY_STATE_DIR".into(),
+                    )
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&locations).map_err(|e| e.to_string())?
+            );
+            return Ok(());
+        }
         Some("discover") => {
             let manifest = peerbrush::discovery::discover()?;
             println!(
@@ -87,7 +125,7 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("--help") => {
-            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\nFiles open in independent project tabs, preserving existing work.");
+            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
             return Ok(());
         }
         _ => {}
@@ -97,6 +135,36 @@ fn run() -> Result<(), String> {
     if server::activate_existing(&state_dir, &files)? {
         return Ok(());
     }
+    let profile = if local_preferences {
+        None
+    } else {
+        match peerbrush::settings::Profile::open(
+            peerbrush::settings::Locations::user()?,
+            &state_dir,
+        ) {
+            Ok(profile) => Some(profile),
+            Err(error) => {
+                // A simultaneous default launch can own the profile before its
+                // listener is ready. File activation still reaches that window.
+                if error.starts_with("Settings are in use") {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while std::time::Instant::now() < deadline {
+                        if server::activate_existing(&state_dir, &files)? {
+                            return Ok(());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+                return Err(error);
+            }
+        }
+    };
+    let preferences = profile
+        .as_ref()
+        .map_or_else(|| state_dir.clone(), |p| p.locations.profile());
+    let cache = profile
+        .as_ref()
+        .map_or_else(|| state_dir.clone(), |p| p.locations.cache.clone());
     let shared = Arc::new(Mutex::new(Engine::new()));
     if !launch.headless {
         activation::enable(&shared);
@@ -104,7 +172,12 @@ fn run() -> Result<(), String> {
             activation::enqueue(&shared, files.clone())?;
         }
     }
-    let connection = match server::start(shared.clone(), state_dir.clone()) {
+    let connection = match server::start_with_preferences(
+        shared.clone(),
+        state_dir.clone(),
+        &preferences,
+        &cache,
+    ) {
         Ok(connection) => connection,
         Err(error) => {
             // Another Explorer launch can acquire the instance lock before its
@@ -156,7 +229,14 @@ fn run() -> Result<(), String> {
     eframe::run_native(
         "PeerBrush",
         options,
-        Box::new(move |cc| Ok(Box::new(PeerBrush::new(cc, shared, connection)))),
+        Box::new(move |cc| {
+            Ok(Box::new(PeerBrush::new_with_preferences(
+                cc,
+                shared,
+                connection,
+                &preferences,
+            )))
+        }),
     )
     .map_err(|e| e.to_string())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "peerbrush"
-version = "0.26.0"
+version = "0.30.0-dev.1"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "You and your AI. Same canvas."
@@ -25,12 +25,15 @@ flate2 = "1"
 base64 = "0.22"
 bytemuck = "1"
 tiny_http = "0.12"
-ureq = { version = "2.12", default-features = false, features = ["json"] }
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+semver = "1"
+url = "2.5"
 rfd = "0.15"
 ab_glyph = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
+windows = { version = "0.58", features = ["ApplicationModel"] }
 
 [profile.dev]
 opt-level = 1

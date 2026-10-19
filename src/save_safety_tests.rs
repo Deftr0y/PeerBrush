@@ -1,4 +1,37 @@
 use super::*;
+
+#[test]
+fn update_restart_is_blocked_during_unlocked_save_and_export_preparation() {
+    use crate::workspace::lifecycle::{finish_update_exit, update_readiness};
+    let directory = std::env::temp_dir().join(format!("pb-update-save-{}", engine::id()));
+    fs::create_dir(&directory).unwrap();
+    let mut engine = Engine::new();
+    engine.doc = crate::engine::Document::new(8, 8).unwrap();
+    let root = Arc::new(Mutex::new(engine));
+    let workspace = crate::workspace::attach(&root);
+    let reviewed = update_readiness(&workspace).unwrap();
+    save_prepared(&root, &directory.join("saved.psd"), &json!({}), || {
+        assert!(update_readiness(&workspace).is_err());
+        assert!(finish_update_exit(&workspace, &reviewed).is_err());
+        assert!(!root.lock().unwrap().closed);
+    })
+    .unwrap();
+    let reviewed = update_readiness(&workspace).unwrap();
+    export_derived_guarded(
+        &root,
+        &directory.join("export.png"),
+        &json!({}),
+        &crate::production_export::Control::default(),
+        |doc| {
+            assert!(finish_update_exit(&workspace, &reviewed).is_err());
+            doc.export_png()
+        },
+    )
+    .unwrap();
+    assert!(update_readiness(&workspace).is_ok());
+    assert!(!root.lock().unwrap().closed);
+    fs::remove_dir_all(directory).unwrap();
+}
 #[test]
 fn publication_readback_rejects_different_bytes_without_claiming_success() {
     let path = std::env::temp_dir().join(format!("pb-publication-check-{}", engine::id()));
