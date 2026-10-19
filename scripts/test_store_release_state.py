@@ -1,7 +1,9 @@
 """Offline Store journal/reconciliation tests; no authentication or mutations."""
 import copy
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -148,6 +150,56 @@ class Tests(unittest.TestCase):
         with self.assertRaises(submit.SafeError):
             state.Journal(self.path)
         self.assertIn('private', self.path.read_text())
+
+    def test_private_receipts_and_locks_cannot_enter_any_source_checkout(self):
+        for root in state.source_roots():
+            path = root / 'scripts' / 'synthetic-private-state.json'
+            self.assertFalse(path.exists())
+            with self.assertRaises(submit.SafeError):
+                state.Journal(path)
+            with self.assertRaises(submit.SafeError):
+                with state.locked(path):
+                    pass
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_name(path.name + '.lock').exists())
+
+    def test_symlink_or_junction_parent_is_rejected_before_lock_creation(self):
+        directory = self.path.parent / 'private'
+        directory.mkdir()
+        alias = self.path.parent / 'alias'
+        if os.name == 'nt':
+            subprocess.run(['cmd', '/c', 'mklink', '/J', str(alias), str(directory)], check=True, capture_output=True)
+        else:
+            alias.symlink_to(directory, target_is_directory=True)
+        try:
+            for path in [alias / 'receipt.json', alias / 'nested' / 'receipt.json']:
+                if path.parent.name == 'nested':
+                    (directory / 'nested').mkdir()
+                with self.assertRaises(submit.SafeError):
+                    state.Journal(path)
+                with self.assertRaises(submit.SafeError):
+                    with state.locked(path):
+                        pass
+            self.assertFalse(list(directory.glob('*.lock')))
+        finally:
+            alias.rmdir() if os.name == 'nt' else alias.unlink()
+
+    def test_receipt_fields_require_strings_and_canonical_bounded_identifiers(self):
+        original = self.path.read_bytes()
+        initial = json.loads(original)
+        for field, value in [('tag', 26), ('commit', 0), ('sha256', 0), ('package', 123),
+                             ('version', 12600), ('submission_id', 456),
+                             ('submission_id', '0456'), ('submission_id', '1' * 33),
+                             ('version', '1.026.0.0'), ('tag', 'v0.026.0'),
+                             ('phase', []), ('service_status', {})]:
+            altered = dict(initial, **{field: value})
+            if field == 'submission_id':
+                altered['phase'] = 'created'
+            self.path.write_text(json.dumps(altered))
+            with self.subTest(field=field, value=value), self.assertRaises(submit.SafeError):
+                state.Journal(self.path)
+            self.assertEqual(json.loads(self.path.read_text()), altered)
+        self.path.write_bytes(original)
 
     def test_submit_cli_requires_private_state_before_any_remote_access(self):
         with patch.object(submit.sys, 'argv', ['submit', '--tag', 'v0.26.0', '--submit']), patch.object(submit, 'released_assets') as remote:

@@ -15,17 +15,20 @@ def digest(path):
 
 def immutable(previous, current):
     if (not isinstance(previous, dict) or type(previous.get('schema')) is not int or previous['schema'] != 1
-            or not re.fullmatch('[0-9a-f]{40}', str(previous.get('commit')))
-            or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', str(previous.get('version')))):
+            or type(previous.get('commit')) is not str or not re.fullmatch('[0-9a-f]{40}', previous['commit'])
+            or type(previous.get('version')) is not str
+            or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', previous['version'])):
         raise ValueError('The retained published inventory must have a stable release version.')
     assets = previous.get('assets')
     if (not isinstance(assets, list) or not 1 <= len(assets) <= 64
             or any(not isinstance(a, dict) or not isinstance(a.get('file'), str)
                    or Path(a['file']).name != a['file'] or '\\' in a['file']
-                   or not re.fullmatch('[0-9a-f]{64}', str(a.get('sha256'))) for a in assets)
+                   or type(a.get('sha256')) is not str or not re.fullmatch('[0-9a-f]{64}', a['sha256']) for a in assets)
             or len({a['file'] for a in assets}) != len(assets)):
         raise ValueError('The retained inventory has invalid or duplicate immutable assets.')
-    if tuple(map(int, current['version'].split('-')[0].split('.'))) < tuple(map(int, previous['version'].split('.'))):
+    candidate = tuple(map(int, current['version'].split('-')[0].split('.')))
+    published = tuple(map(int, previous['version'].split('.')))
+    if candidate < published or (candidate == published and '-' in current['version']):
         raise ValueError('A production candidate cannot downgrade the published version.')
     if previous['version'] != current['version']:
         return

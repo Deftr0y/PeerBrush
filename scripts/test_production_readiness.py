@@ -67,6 +67,15 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.assess()
 
+    def test_stable_inventory_cannot_be_downgraded_to_its_prerelease(self):
+        previous = json.loads((self.directory / 'release-inventory.json').read_text())
+        candidate = dict(previous, version='0.2.0-dev.1')
+        with self.assertRaisesRegex(ValueError, 'downgrade'):
+            readiness.immutable(previous, candidate)
+        for bad in ['00.2.0', '0.02.0', '0.2.00']:
+            with self.subTest(version=bad), self.assertRaises(ValueError):
+                readiness.immutable(dict(previous, version=bad), candidate)
+
 
 if __name__ == '__main__':
     unittest.main()

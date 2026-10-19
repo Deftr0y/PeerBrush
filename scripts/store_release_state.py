@@ -1,10 +1,12 @@
 """Private, resumable Store receipts; read-only reconciliation never retries mutations."""
 from contextlib import contextmanager
+from functools import cache
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import tempfile
 import time
 
@@ -22,6 +24,43 @@ STATUSES = {
 }
 
 
+@cache
+def source_roots():
+    root = Path(__file__).resolve().parents[1]
+    roots = {root}
+    if (root / '.git').exists():
+        try:
+            worktrees = subprocess.check_output(['git', '-C', str(root), 'worktree', 'list', '--porcelain', '-z'], stderr=subprocess.DEVNULL).decode('utf-8')
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            raise SafeError('Cannot identify source checkouts before opening private Store state.') from None
+        roots.update(Path(record[9:]).resolve() for record in worktrees.split('\0') if record.startswith('worktree '))
+    return tuple(roots)
+
+
+def private_path(path):
+    path = Path(path)
+    if not path.is_absolute():
+        raise SafeError('Choose an absolute state file in an existing private directory.')
+    path = Path(os.path.abspath(path))
+    if any(path.is_relative_to(root) for root in source_roots()):
+        raise SafeError('Private Store state and locks must stay outside every source checkout.')
+    if not path.parent.is_dir():
+        raise SafeError('Choose an absolute state file in an existing private directory.')
+    for ancestor in [path, *path.parents]:
+        try:
+            metadata = ancestor.lstat()
+        except FileNotFoundError:
+            if ancestor == path:
+                continue
+            raise SafeError('Private Store state needs existing regular parent directories.') from None
+        if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, 'st_file_attributes', 0) & 0x400:
+            raise SafeError('Private Store state cannot use symbolic links, junctions or reparse ancestors.')
+    path = path.parent.resolve(strict=True) / path.name
+    if any(path.is_relative_to(root) for root in source_roots()):
+        raise SafeError('Private Store state and locks must stay outside every source checkout.')
+    return path
+
+
 def regular(path):
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or getattr(metadata, 'st_file_attributes', 0) & 0x400:
@@ -31,9 +70,7 @@ def regular(path):
 @contextmanager
 def locked(path):
     """OS lock releases on process failure; an interrupted receipt remains resumable."""
-    path = Path(path)
-    if not path.is_absolute() or not path.parent.is_dir():
-        raise SafeError('Choose an absolute state file in an existing private directory.')
+    path = private_path(path)
     lock = path.with_name(path.name + '.lock')
     if lock.exists() or lock.is_symlink():
         regular(lock)
@@ -65,32 +102,38 @@ def locked(path):
 
 class Journal:
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = private_path(path)
         self.state = None
         if self.path.exists() or self.path.is_symlink():
             regular(self.path)
             if self.path.stat().st_size > 8192:
                 raise SafeError('Store state exceeds its size limit.')
             self.state = json.loads(self.path.read_text(encoding='utf-8'))
-            fields = {'schema', 'tag', 'commit', 'package', 'sha256', 'version',
-                      'phase', 'submission_id', 'service_status'}
-            s = self.state
-            if (not isinstance(s, dict) or set(s) != fields or type(s['schema']) is not int or s['schema'] != 1
-                    or not re.fullmatch(r'v?[0-9]+\.[0-9]+(?:\.[0-9]+)?', str(s['tag']))
-                    or not re.fullmatch('[0-9a-f]{40}', str(s['commit']))
-                    or not re.fullmatch('[0-9a-f]{64}', str(s['sha256']))
-                    or not re.fullmatch(r'PeerBrush-[0-9.]+-Windows-x64\.msix', str(s['package']))
-                    or s['phase'] not in {'new', 'create-requested', 'created', 'commit-requested', 'committed'}
-                    or (s['submission_id'] is not None and not re.fullmatch('[0-9]+', str(s['submission_id'])))
-                    or s['service_status'] not in {None, *STATUSES}):
-                raise SafeError('Unsupported Store state; preserve it for manual recovery.')
-            version(s['version'])
-            if release_version(s['tag'])[1] != s['version'] or s['package'] != f"PeerBrush-{s['version']}-Windows-x64.msix":
-                raise SafeError('Store receipt tag, package and deployment version disagree.')
-            if s['phase'] in {'created', 'commit-requested', 'committed'} and s['submission_id'] is None:
-                raise SafeError('Incomplete Store state; preserve it for manual recovery.')
-            if s['phase'] in {'new', 'create-requested'} and s['submission_id'] is not None:
-                raise SafeError('Inconsistent Store creation state; preserve it for manual recovery.')
+            self.validate()
+
+    def validate(self):
+        fields = {'schema', 'tag', 'commit', 'package', 'sha256', 'version',
+                  'phase', 'submission_id', 'service_status'}
+        s = self.state
+        matches = lambda key, pattern: type(s[key]) is str and re.fullmatch(pattern, s[key]) is not None
+        if (not isinstance(s, dict) or set(s) != fields or type(s['schema']) is not int or s['schema'] != 1
+                or not matches('tag', r'v?(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})(?:\.(0|[1-9][0-9]{0,4}))?')
+                or not matches('commit', '[0-9a-f]{40}') or not matches('sha256', '[0-9a-f]{64}')
+                or not matches('package', r'PeerBrush-[0-9.]{7,23}-Windows-x64\.msix')
+                or not matches('version', r'[0-9.]{7,23}')
+                or type(s['phase']) is not str or s['phase'] not in {'new', 'create-requested', 'created', 'commit-requested', 'committed'}
+                or (s['submission_id'] is not None and not matches('submission_id', '[1-9][0-9]{0,31}'))
+                or (s['service_status'] is not None and (type(s['service_status']) is not str or s['service_status'] not in STATUSES))):
+            raise SafeError('Unsupported Store state; preserve it for manual recovery.')
+        version(s['version'])
+        if release_version(s['tag'])[1] != s['version'] or s['package'] != f"PeerBrush-{s['version']}-Windows-x64.msix":
+            raise SafeError('Store receipt tag, package and deployment version disagree.')
+        if s['phase'] in {'created', 'commit-requested', 'committed'} and s['submission_id'] is None:
+            raise SafeError('Incomplete Store state; preserve it for manual recovery.')
+        if s['phase'] in {'new', 'create-requested'} and s['submission_id'] is not None:
+            raise SafeError('Inconsistent Store creation state; preserve it for manual recovery.')
+        if s['service_status'] is not None and s['submission_id'] is None:
+            raise SafeError('Store service observation needs a recorded submission identity.')
 
     def bind(self, tag, name, report):
         expected = dict(schema=1, tag=tag, commit=report['commit'], package=name,
@@ -102,6 +145,8 @@ class Journal:
             raise SafeError('Store state is bound to different immutable release bytes.')
 
     def write(self):
+        private_path(self.path)
+        self.validate()
         name = None
         try:
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.path.parent,

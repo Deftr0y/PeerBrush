@@ -1,6 +1,6 @@
 # Production candidate and Store reconciliation — unreleased
 
-PB-154 now prepares tested, exact-source release candidates on a push to `main`, using the existing three-platform release workflow. A manual run still requires an exact source SHA matching its workflow ref. Every native job runs formatting, Rust tests, Clippy and packaging regressions before building. Inspection requires Windows x64, macOS arm64 and Linux x64 archives with identical corresponding source, version and executable source commit. These are Actions candidates; this workflow does not publish releases, deploy the website or submit to a store.
+After promotion, this PB-154 change prepares tested, exact-source release candidates on a push to `main`, using the existing three-platform release workflow. A manual run still requires an exact source SHA matching its workflow ref. Every native job runs formatting, Rust tests, Clippy and packaging regressions before building. Inspection requires Windows x64, macOS arm64 and Linux x64 archives with identical corresponding source, version and executable source commit. These are Actions candidates; this workflow does not publish releases, deploy the website or submit to a store. Execution of the revised main trigger remains to be verified.
 
 The final `production-readiness.json` report reopens and validates the real archives against committed source, checks the final inventory and `SHA256SUMS`, and rejects old-binary relabelling or packaging corrections. Each platform reports `candidate_verified`, native signing evidence, `ready: false` and `public_availability: unverified`. The existing archive inspector checks signing metadata and hashes; that alone cannot establish native signature or installation acceptance. The report deliberately has no path to `production_ready: true` until those missing verification and protected publication adapters exist. Sigstore signing remains an explicit manual candidate option; it does not replace native signing/notarization.
 
@@ -10,7 +10,7 @@ Pending gates are installed Windows distribution/signing, signed and notarized M
 
 ## Private Store submission state
 
-The existing MSIX writer still validates a published stable release, exact Store identity, package provenance and checksums, current published version and absence of a pending submission. Actual submission additionally requires an absolute `--state` file inside an existing durable private directory. The directory and receipt must stay outside public source, release packages and Actions artifacts.
+The existing MSIX writer still validates a published stable release, exact Store identity, package provenance and checksums, current published version and absence of a pending submission. Actual submission additionally requires an absolute `--state` file inside an existing durable private directory. The tool rejects state or lock paths inside any checkout of its source repository and rejects symbolic links, junctions and reparse points throughout the supplied path. The directory and receipt must stay outside public source, release packages and Actions artifacts.
 
 ```sh
 python scripts/submit_store_release.py --tag vVERSION --state /private/store-receipt.json
