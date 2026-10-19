@@ -20,6 +20,32 @@ import zipfile
 
 
 MANIFEST = "scripts/package-files.json"
+MACOS_RESOURCES = 'PeerBrush.app/Contents/Resources/'
+
+
+def macos_info(version):
+    numeric = r'(?:0|[1-9][0-9]*)'
+    parsed = re.fullmatch(r'(' + numeric + r'\.' + numeric + r'\.' + numeric + r')(-dev\.' + numeric + r')?', version)
+    if not parsed:
+        raise ValueError('macOS bundles require a stable A.B.C or canonical internal A.B.C-dev.N version')
+    info = {'CFBundleIdentifier': 'com.peerbrush.PeerBrush', 'CFBundleName': 'PeerBrush',
+            'CFBundleDisplayName': 'PeerBrush', 'CFBundleExecutable': 'peerbrush',
+            'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': parsed[1],
+            'CFBundleVersion': parsed[1], 'LSMinimumSystemVersion': '11.0',
+            'NSHighResolutionCapable': True, 'CFBundleIconFile': 'PeerBrush.icns',
+            'CFBundleDocumentTypes': [{'CFBundleTypeName': name, 'CFBundleTypeRole': 'Editor',
+                                      'LSHandlerRank': 'Alternate', 'CFBundleTypeIconFile': 'PeerBrush.icns',
+                                      'LSItemContentTypes': [uti]}
+                                     for name, uti in [('Photoshop PSD image', 'com.adobe.photoshop-image'),
+                                                       ('Photoshop PSB image', 'com.peerbrush.photoshop-large-document')]],
+            'UTImportedTypeDeclarations': [{'UTTypeIdentifier': 'com.peerbrush.photoshop-large-document',
+                                            'UTTypeConformsTo': ['public.image'],
+                                            'UTTypeDescription': 'Photoshop Large Document',
+                                            'UTTypeTagSpecification': {'public.filename-extension': ['psb'],
+                                                                       'public.mime-type': 'image/vnd.adobe.photoshop'}}]}
+    if parsed[2]:
+        info['PeerBrushDevelopmentVersion'] = version
+    return info
 # Exact upstream notice names, not a LICENSE* glob that could pick up local files.
 NOTICE_NAMES = {
     "copying", "copyright", "license", "licence", "notice", "notices", "unlicense",
@@ -323,7 +349,7 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             contents = bundle / 'PeerBrush.app' / 'Contents'
             (contents / 'MacOS').mkdir(parents=True)
             with (contents / 'Info.plist').open('wb') as stream:
-                plistlib.dump({'CFBundleIdentifier': 'com.peerbrush.PeerBrush', 'CFBundleName': 'PeerBrush', 'CFBundleDisplayName': 'PeerBrush', 'CFBundleExecutable': 'peerbrush', 'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version, 'CFBundleVersion': version, 'LSMinimumSystemVersion': '11.0', 'NSHighResolutionCapable': True}, stream)
+                plistlib.dump(macos_info(version), stream)
         staged_binary = bundle / relative
         staged_binary.write_bytes(executable)
         staged_binary.chmod(0o755)
@@ -341,6 +367,16 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
         shutil.copy2(source, bundle / source.name)
         notices = add_notices(source_root, bundle, registry, policy, rust_docs)
         manifest = {'schema': 1, 'product': 'PeerBrush', 'version': version, 'commit': commit, 'binary_source_commit': binary_source_commit, 'platform': platform, 'architecture': architecture, 'executable': relative, 'executable_sha256': digest(staged_binary), 'source': source.name, 'source_sha256': digest(source), 'notice_files': notices, 'license': 'GPL-3.0-only', 'native_publisher_signing': 'not-configured', 'package_signature': 'See the matching external Sigstore bundle when supplied; this manifest alone is not a signature.'}
+        if platform == 'macOS':
+            resources = bundle / MACOS_RESOURCES
+            resources.mkdir()
+            icon = next(data for name, data, _ in sources if name == 'assets/peerbrush.icns')
+            if icon[:4] != b'icns' or len(icon) < 16 or struct.unpack('>I', icon[4:8])[0] != len(icon):
+                raise ValueError('A valid committed macOS ICNS resource is required')
+            (resources / 'PeerBrush.icns').write_bytes(icon)
+            for filename in ['LICENSE', 'THIRD_PARTY_NOTICES.md', *notices]:
+                copy_file(bundle, filename, resources / filename)
+            manifest['macos_bundle_resources'] = 1
         (bundle / 'release.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
         files = [(f'{name}/{p.relative_to(bundle).as_posix()}', p.read_bytes(), 0o755 if p == staged_binary else 0o644) for p in bundle.rglob('*') if p.is_file()]
         archive = stage / (name + '.zip')

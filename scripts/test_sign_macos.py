@@ -147,6 +147,17 @@ class Signing(unittest.TestCase):
             self.sign()
         self.assertEqual(self.calls, [])
 
+    def test_prereleases_fail_before_any_provider_access_or_signing_work(self):
+        original = self.archive.read_bytes()
+        for version in ['0.30.0-dev.1', '0.30.0-beta.1', '0.30.0-rc.1', '0.30.0+build']:
+            for resume in [False, True]:
+                with self.subTest(version=version, resume=resume), self.assertRaisesRegex(ValueError, 'stable A.B.C release'):
+                    self.sign(version=version, resume=resume)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.archive.read_bytes(), original)
+        self.assertFalse(self.work.exists())
+        self.assertFalse(self.output.exists())
+
     def test_explicit_file_keychain_reaches_identity_signing_and_every_notary_command(self):
         keychain = self.base / 'synthetic signing.keychain-db'
         keychain.write_bytes(b'SYNTHETIC_NON_SECRET_KEYCHAIN')

@@ -2271,7 +2271,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "peerbrush"
-version = "0.26.0"
+version = "0.30.0-dev.1"
 dependencies = [
  "ab_glyph",
  "arboard",
@@ -2283,6 +2283,8 @@ dependencies = [
  "fontdb",
  "image",
  "moxcms",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
  "resvg",
  "rfd",
  "rhai",
