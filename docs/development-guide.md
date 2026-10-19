@@ -8,6 +8,9 @@ PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu.
 | --- | --- | --- |
 | `main` | Production source | Receives `dev` |
 | `dev` | Final integration and release acceptance | `main` |
+| `version/0.3` | Active v0.3 milestone; application version 0.30.0 | `dev` |
+| `feature/0.3/<topic>` | One focused v0.3 feature or foundation | `version/0.3` |
+| `fix/0.3/<topic>` | One focused v0.3 bug fix | `version/0.3` |
 | `version/0.26` | Changes and acceptance work intended for 0.26 | `dev` |
 | `feature/0.26/<topic>` | One focused feature or documentation change | `version/0.26` |
 | `fix/0.26/<topic>` | One focused bug fix | `version/0.26` |
