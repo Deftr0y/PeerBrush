@@ -20,6 +20,7 @@ fn selected_document() -> (Document, String) {
         }
     }
     layer.mask = Some(Mask {
+        linked: true,
         enabled: true,
         cache_key: engine::id(),
         steps: vec![MaskStep {

@@ -59,15 +59,121 @@ jobs:
         run: python scripts/package.py --check-source
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-docs
+      - name: Identify compiler cache
+        id: compiler
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, re, subprocess
+          from pathlib import Path
+          version = subprocess.check_output(['rustc', '--version'], text=True).split()[1]
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+              raise SystemExit('Unexpected stable compiler version')
+          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
+              output.write(f'version={version}\n')
+          PY
+      - name: Cache Rust dependencies and build outputs
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            target
+          key: peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py') }}
+          restore-keys: |
+            peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo fmt --all -- --check
-      - run: cargo test --locked
+      - name: Run regression tests and summarize failures
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/peerbrush-tests.log"
+          test_status=${PIPESTATUS[0]}
+          python - "$RUNNER_TEMP/peerbrush-tests.log" "$GITHUB_STEP_SUMMARY" "$test_status" <<'PY'
+          import re, sys
+          from pathlib import Path
+          log = Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
+          failures = re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$', log, re.M)
+          results = re.findall(r'^test result: (?:ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored;', log, re.M)
+          if failures:
+              print('::error title=Regression test failures::' + ', '.join(name[:128] for name in failures[:32]))
+              locations = re.findall(r"^thread '([A-Za-z0-9_:]+)' (?:\([0-9]+\) )?panicked at (?:[^\r\n]*?[/\\])?((?:tests|src)[/\\][A-Za-z0-9_./\\-]+):([0-9]+):([0-9]+)", log, re.M)
+              for name, path, line, column in locations[:32]:
+                  path = path.replace('\\', '/')
+                  if name in failures and '..' not in path.split('/'):
+                      print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Regression failure location::{name[:128]}')
+              sections = re.split(r'^---- ([A-Za-z0-9_:]+) stdout ----$', log, flags=re.M)
+              kinds = {
+                  'OWNERSHIP_BUSY': 'File already open',
+                  'SAVE_BUSY': 'Another PeerBrush save',
+                  'BACKUP_STORAGE_FULL': 'Previous-save storage is full',
+                  'PROJECT_HANDLE_MISSING': 'Missing or closed project ID',
+                  'PROJECT_SET_CHANGED': 'The open projects changed',
+                  'SOURCE_CHANGED': 'File changed while opening',
+                  'SOURCE_CONFLICT': 'Unsaved project: save first',
+              }
+              for index in range(1, len(sections) - 1, 2):
+                  name, body = sections[index:index + 2]
+                  if name in failures:
+                      matched = [code for code, marker in kinds.items() if marker in body]
+                      if matched:
+                          print('::error title=Regression failure category::' + name[:128] + ': ' + ', '.join(matched))
+          elif int(sys.argv[3]):
+              codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
+              detail = ', '.join(codes) if codes else 'No failing test identifier was reported'
+              print('::error title=Regression test run failed::' + detail)
+          # Publish only bounded test identifiers/counts, never arbitrary
+          # panic output, environment values, paths or fixture contents.
+          with Path(sys.argv[2]).open('a', encoding='utf-8') as summary:
+              summary.write('### Regression tests\n\n')
+              summary.write(f'Exit status: {int(sys.argv[3])}\n\n')
+              summary.writelines(f'- `{line}`\n' for line in results[:100])
+              if failures:
+                  summary.write('\nFailed tests:\n\n')
+                  summary.writelines(f'- `{name[:256]}`\n' for name in failures[:100])
+          PY
+          exit "$test_status"
       - run: cargo clippy --all-targets --locked
       - run: python scripts/test_package.py
+      - run: python scripts/test_msix.py
+      - run: python scripts/test_sign_macos.py
+      - run: python scripts/test_submit_store_release.py
       - run: python scripts/build_release.py
-      - run: python scripts/package.py
+      - run: python scripts/test_msix_runtime_tests.py
+      - name: Package and report archive sizes
+        shell: bash
+        run: |
+          python scripts/package.py
+          python - <<'PY'
+          import os, re
+          from pathlib import Path
+          rows = []
+          for archive in sorted(Path('dist').glob('PeerBrush-*.zip')):
+              if re.fullmatch(r'PeerBrush-[0-9A-Za-z.+-]{1,192}\.zip', archive.name):
+                  rows.append((archive.name, archive.stat().st_size))
+          for name, size in rows:
+              print(f'::notice title=Verified package archive bytes::{name}: {size}')
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as summary:
+              summary.write('\n### Package archive sizes\n\n')
+              summary.writelines(f'- `{name}`: {size:,} bytes\n' for name, size in rows)
+          PY
+      - name: Build unsigned MSIX with explicit local-test identity
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])'
+          python scripts/package_msix.py --portable "dist/PeerBrush-$version-Windows-x64.zip" --development-identity
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: MSIX-local-test
+          path: dist/msix/*
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: PeerBrush-${{ runner.os }}

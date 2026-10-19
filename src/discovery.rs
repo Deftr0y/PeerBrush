@@ -131,14 +131,39 @@ pub fn discover() -> Result<Manifest, String> {
         .map_err(|_| "PeerBrush discovery manifest is invalid; use Connect AI to refresh it".into())
 }
 pub fn connect(executable: &Path, state_dir: &Path) -> Result<Report, String> {
-    connect_at(executable, state_dir, &native_paths()?)
+    let mut paths = native_paths()?;
+    if !crate::packaged::external_config_is_visible(&paths.manifest)? {
+        return Err("The PeerBrush discovery folder redirects into package-isolated AppData. Use manual MCP configuration or move the discovery folder outside AppData.".into());
+    }
+    let mut manual = Vec::new();
+    for client in paths.clients.iter_mut().filter(|c| c.detected) {
+        if !crate::packaged::external_config_is_visible(&client.path)? {
+            client.detected = false;
+            manual.push(ClientResult {
+                client: client.kind.name().into(),
+                config: client.path.clone(),
+                server_name: "peerbrush".into(),
+                registered: false,
+                changed: false,
+                backup: None,
+                requires_attention: true,
+                message: "Windows package isolation would hide this configuration from the client. Copy the configuration from AI connection settings into the client manually; no client files were changed.".into(),
+                error: None,
+            });
+        }
+    }
+    let mut report = connect_at(executable, state_dir, &paths)?;
+    report.clients.extend(manual);
+    Ok(report)
 }
 pub fn connect_at(
     executable: &Path,
     state_dir: &Path,
     paths: &DiscoveryPaths,
 ) -> Result<Report, String> {
-    if !executable.is_absolute() || !executable.is_file() {
+    if !executable.is_absolute()
+        || !(executable.is_file() || crate::packaged::is_app_execution_alias(executable))
+    {
         return Err("PeerBrush executable must be an existing absolute file path".into());
     }
     if !state_dir.is_absolute() || !paths.manifest.is_absolute() {
@@ -237,7 +262,9 @@ fn owned(command: Option<&str>, args: Option<&Value>) -> bool {
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or("");
-    (base.eq_ignore_ascii_case("peerbrush") || base.eq_ignore_ascii_case("peerbrush.exe"))
+    (base.eq_ignore_ascii_case("peerbrush")
+        || base.eq_ignore_ascii_case("peerbrush.exe")
+        || base.eq_ignore_ascii_case(crate::packaged::MCP_ALIAS))
         && args
             .and_then(Value::as_array)
             .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("mcp")))

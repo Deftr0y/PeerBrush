@@ -802,7 +802,9 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc.layers.iter().any(|l| {
+        format: if doc.layers.iter().any(|layer| layer.mask.is_some()) {
+            29
+        } else if doc.layers.iter().any(|l| {
             l.effects
                 .iter()
                 .any(|e| crate::effects::gradient::smoothed(&e.kind, &e.settings))
@@ -1691,7 +1693,14 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=28).contains(&e.format)
+                if (1..=29).contains(&e.format)
+                    && (e.format >= 29
+                        || e.document
+                            .layers
+                            .iter()
+                            .all(|layer| layer.mask.as_ref().is_none_or(|mask| mask.linked)))
+                    && e.document.width == w
+                    && e.document.height == h
                     && e.document.bit_depth == depth
                     && (!high || e.format >= 5)
                     && e.standard_hash == hash(layer_section) ^ composite_hash
@@ -1956,6 +1965,9 @@ fn decode_parts(
                                             if effects.iter().any(|e| matches!(e.kind.as_str(), "drop_shadow" | "inner_shadow"))
                                                 && (!maskdata.is_empty() || clipping != 0) {
                                                 Err("Hard Photoshop shadows with masks or clipping remain protected".into())
+                                            } else if effects.iter().any(|e| e.kind == "stroke")
+                                                && (!maskdata.is_empty() || clipping != 0) {
+                                                Err("Photoshop strokes with masks or clipping remain protected".into())
                                             } else { Ok((effects, pattern)) }
                                         })
                                     } else { Err("Photoshop styles with folders, layer blending or duplicate blocks remain protected".into()) };
@@ -2117,6 +2129,7 @@ fn decode_parts(
                                     }
                                 }
                                 rec.layer.mask = Some(Mask {
+                                    linked: true,
                                     cache_key: crate::engine::id(),
                                     enabled: rec.mask_enabled,
                                     steps: vec![
@@ -2160,6 +2173,34 @@ fn decode_parts(
                         rec.layer.pixels = pixels;
                     } else if rec.layer.kind == "group" {
                         rec.layer.pixels = Raster::new_depth(w, h, depth);
+                    }
+                    if rec.layer.effects.iter().any(|e| e.kind == "stroke") {
+                        // Inspect existing sparse native tiles, without allocating
+                        // another full raster. Keep large-source scans cancellable.
+                        let mut partial = false;
+                        if high {
+                            for tile in rec.layer.pixels.samples16.values() {
+                                control.check()?;
+                                if tile.chunks_exact(4).any(|p| !matches!(p[3], 0 | 65535)) {
+                                    partial = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            for tile in rec.layer.pixels.tiles.values() {
+                                control.check()?;
+                                if tile.chunks_exact(4).any(|p| !matches!(p[3], 0 | 255)) {
+                                    partial = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if partial {
+                            warnings.push(
+                                "Photoshop strokes with partial source alpha remain protected"
+                                    .into(),
+                            );
+                        }
                     }
                 }
             }
@@ -2237,14 +2278,47 @@ fn decode_parts(
     // cannot be recovered after clamping and therefore never authorize editing.
     if warnings.is_empty() && doc.layers.iter().any(|l| !l.effects.is_empty()) {
         control.check()?;
-        let matches = if depth == 16 {
-            crate::depth16::render(&doc)
-                .map(|image| merged_white_valid && same_standard_composite(&image.words, &merged))
+        let matches = if merged_white_valid {
+            imported_style_composite_matches(&doc, &merged).and_then(|matches| {
+                if matches {
+                    return Ok(true);
+                }
+                control.check()?;
+                // Preserve already accepted placement. The bounded alternate
+                // uses the same integer-center renderer as native gradients,
+                // and is accepted only by the complete exact-composite gate.
+                // Try one document-wide candidate, never combinations of
+                // per-effect guesses or a pixel tolerance.
+                let mut candidate = doc.clone();
+                let mut changed = false;
+                for effect in candidate.layers.iter_mut().flat_map(|l| &mut l.effects) {
+                    if effect.kind == "gradient_overlay"
+                        && effect.enabled
+                        && effect.settings["pixel_grid"] != true
+                    {
+                        effect.settings["pixel_grid"] = serde_json::json!(true);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    // The first render has populated derived effect caches.
+                    // This alternate source must not reuse the clone's old
+                    // keys: both native8/native16 and ancestor projections
+                    // need fresh derived identities without a history edit.
+                    crate::effects::invalidate(
+                        &mut candidate,
+                        &[serde_json::json!({"op":"document.settings"})],
+                    );
+                }
+                if changed && imported_style_composite_matches(&candidate, &merged)? {
+                    doc = candidate;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
         } else {
-            doc.preview_native8(None, w.max(h), None, false)
-                .map(|(_, _, pixels, _)| {
-                    merged_white_valid && same_standard_composite(&pixels, &merged)
-                })
+            Ok(false)
         };
         match matches {
             Ok(true) => {},
@@ -2271,6 +2345,14 @@ fn decode_parts(
     }
     control.progress("Ready", 1, 1)?;
     Ok(doc)
+}
+fn imported_style_composite_matches(doc: &Document, saved: &Raster) -> Result<bool, String> {
+    if saved.is16() {
+        crate::depth16::render(doc).map(|image| same_standard_composite(&image.words, saved))
+    } else {
+        doc.preview_native8(None, doc.width.max(doc.height), None, false)
+            .map(|(_, _, pixels, _)| same_standard_composite(&pixels, saved))
+    }
 }
 fn same_standard_composite<T: Copy + Into<u32>>(actual: &[T], saved: &Raster) -> bool {
     if actual.len() != saved.width as usize * saved.height as usize * 4 {

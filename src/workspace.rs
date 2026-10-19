@@ -6,10 +6,13 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex, Weak};
-fn registry_cache() -> &'static Mutex<std::collections::HashMap<usize, Weak<Mutex<Workspace>>>> {
-    static CACHE: std::sync::OnceLock<
-        Mutex<std::collections::HashMap<usize, Weak<Mutex<Workspace>>>>,
-    > = std::sync::OnceLock::new();
+struct CachedWorkspace {
+    root: Weak<Mutex<Engine>>,
+    workspace: Weak<Mutex<Workspace>>,
+}
+fn registry_cache() -> &'static Mutex<std::collections::HashMap<usize, CachedWorkspace>> {
+    static CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, CachedWorkspace>>> =
+        std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -33,6 +36,7 @@ struct Entry {
     handle: Handle,
 }
 pub struct Workspace {
+    pub(crate) activation: crate::activation::Queue,
     pub(crate) open_warning: Option<String>,
     entries: Vec<Entry>,
     active: String,
@@ -84,19 +88,24 @@ pub fn attach(root: &Shared) -> Registry {
         .lock()
         .unwrap()
         .get(&key)
-        .and_then(Weak::upgrade)
+        .filter(|cached| cached.root.ptr_eq(&Arc::downgrade(root)))
+        .and_then(|cached| cached.workspace.upgrade())
     {
         return workspace;
     }
     let mut e = root.lock().unwrap();
     if let Some(workspace) = e.workspace.as_ref().and_then(Weak::upgrade) {
-        registry_cache()
-            .lock()
-            .unwrap()
-            .insert(key, Arc::downgrade(&workspace));
+        registry_cache().lock().unwrap().insert(
+            key,
+            CachedWorkspace {
+                root: Arc::downgrade(root),
+                workspace: Arc::downgrade(&workspace),
+            },
+        );
         return workspace;
     }
     let workspace = Arc::new(Mutex::new(Workspace {
+        activation: Default::default(),
         entries: vec![Entry {
             id: e.project_id.clone(),
             name: e.doc.name.clone(),
@@ -117,8 +126,16 @@ pub fn attach(root: &Shared) -> Registry {
     e.workspace = Some(Arc::downgrade(&workspace));
     e.workspace_owner = Some(workspace.clone());
     let mut cache = registry_cache().lock().unwrap();
-    cache.retain(|_, workspace| workspace.strong_count() > 0);
-    cache.insert(key, Arc::downgrade(&workspace));
+    // The weak root pins its allocation, preventing address reuse while the
+    // cached registry survives in an engine snapshot after the root tab closes.
+    cache.retain(|_, cached| cached.root.strong_count() > 0 && cached.workspace.strong_count() > 0);
+    cache.insert(
+        key,
+        CachedWorkspace {
+            root: Arc::downgrade(root),
+            workspace: Arc::downgrade(&workspace),
+        },
+    );
     workspace
 }
 pub fn handles(root: &Shared) -> Vec<Shared> {
@@ -544,4 +561,48 @@ pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Doc
         r.destination_task,
     )?;
     Ok(draft.doc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cached_workspace_cannot_attach_a_different_root_after_close() {
+        let old_root = Arc::new(Mutex::new(Engine::new()));
+        let old_workspace = attach(&old_root);
+        let snapshot = old_root.lock().unwrap().clone();
+        close(
+            &old_root,
+            &snapshot.project_id,
+            &snapshot.doc.id,
+            snapshot.doc.revision,
+            false,
+            "human",
+        )
+        .unwrap();
+        let old_identity = Arc::downgrade(&old_root);
+        drop(old_root);
+        assert!(old_identity.upgrade().is_none());
+        // A retained snapshot keeps the closed root's workspace alive. Model
+        // an address-only cache collision directly rather than depending on
+        // platform allocator timing to reuse the former root's address.
+        let fresh = Arc::new(Mutex::new(Engine::new()));
+        let project = fresh.lock().unwrap().project_id.clone();
+        registry_cache().lock().unwrap().insert(
+            Arc::as_ptr(&fresh) as usize,
+            CachedWorkspace {
+                root: old_identity,
+                workspace: Arc::downgrade(&old_workspace),
+            },
+        );
+        let current = attach(&fresh);
+        assert!(!Arc::ptr_eq(&current, &old_workspace));
+        assert!(Arc::ptr_eq(&current, &attach(&fresh)));
+        assert!(Arc::ptr_eq(&fresh, &get_in(&current, &project).unwrap()));
+        assert_eq!(active_id(&fresh), project);
+        assert!(get_in(&current, &snapshot.project_id).is_err());
+        assert!(get_in(&old_workspace, &project).is_err());
+        drop(snapshot);
+        assert!(Arc::ptr_eq(&fresh, &get_in(&current, &project).unwrap()));
+    }
 }

@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod adjustment;
 mod bake;
 pub mod brush;
@@ -32,6 +33,7 @@ pub mod liquify;
 pub mod loading;
 pub mod mask;
 pub mod merge;
+pub mod packaged;
 pub mod path;
 pub mod placement;
 pub mod preview;

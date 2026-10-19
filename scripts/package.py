@@ -63,6 +63,13 @@ def copy_file(base, relative, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
 
+def active_rust_docs():
+    """Use the same active compiler as the build, never a repository fallback."""
+    sysroot = subprocess.check_output(['rustc', '--print', 'sysroot'], text=True).strip()
+    if not sysroot or not pathlib.Path(sysroot).is_absolute():
+        raise ValueError('Active Rust compiler did not return an absolute sysroot')
+    return pathlib.Path(sysroot) / 'share' / 'doc' / 'rust'
+
 def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
     notices = bundle / "licenses"
     rows = ["# Third-party notices", "", "Dependencies retain their original licenses. Sources and checksums are pinned by Cargo.lock in the included project source archive. This list covers downloaded dependencies; not every crate is linked into this platform binary.", ""]
@@ -107,10 +114,15 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
                 copy_file(root, name, notices / key / path.name)
     copy_file(root, "assets/fonts/LICENCE.txt", notices / "ubuntu-sans" / "LICENCE.txt")
     # Include named compiler notices only, never all local compiler documentation.
-    rust_docs = rust_docs or root / ".dev-tools/rust/share/doc/rust"
+    rust_docs = rust_docs if rust_docs is not None else active_rust_docs()
     for name in manifest["rust_notices"]:
-        if (rust_docs / name).exists():
-            copy_file(rust_docs, name, notices / "rust-runtime" / relative_path(name))
+        try:
+            source = regular_file(rust_docs, name)
+        except FileNotFoundError:
+            raise ValueError('Missing required Rust runtime notice: ' + name + '; install rust-docs for the active compiler') from None
+        if source.stat().st_size == 0:
+            raise ValueError('Required Rust runtime notice is empty: ' + name)
+        copy_file(rust_docs, name, notices / "rust-runtime" / relative_path(name))
     (bundle / "THIRD_PARTY_NOTICES.md").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
@@ -327,7 +339,7 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             launcher = next(data for filename, data, _ in sources if filename == 'scripts/start-windows.cmd')
             (bundle / 'Start PeerBrush.cmd').write_bytes(launcher)
         shutil.copy2(source, bundle / source.name)
-        notices = add_notices(source_root, bundle, registry, policy, rust_docs or root / '.dev-tools/rust/share/doc/rust')
+        notices = add_notices(source_root, bundle, registry, policy, rust_docs)
         manifest = {'schema': 1, 'product': 'PeerBrush', 'version': version, 'commit': commit, 'binary_source_commit': binary_source_commit, 'platform': platform, 'architecture': architecture, 'executable': relative, 'executable_sha256': digest(staged_binary), 'source': source.name, 'source_sha256': digest(source), 'notice_files': notices, 'license': 'GPL-3.0-only', 'native_publisher_signing': 'not-configured', 'package_signature': 'See the matching external Sigstore bundle when supplied; this manifest alone is not a signature.'}
         (bundle / 'release.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
         files = [(f'{name}/{p.relative_to(bundle).as_posix()}', p.read_bytes(), 0o755 if p == staged_binary else 0o644) for p in bundle.rglob('*') if p.is_file()]

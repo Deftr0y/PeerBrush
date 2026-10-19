@@ -1,4 +1,5 @@
 use crate::icons::{self, Icon};
+mod activation;
 mod animation;
 mod brush;
 #[cfg(test)]
@@ -506,6 +507,7 @@ impl PeerBrush {
         Self::init(&cc.egui_ctx, shared, connection)
     }
     fn init(ctx: &egui::Context, shared: Shared, connection: Connection) -> Self {
+        crate::activation::enable(&shared);
         let mut fonts = egui::FontDefinitions::default();
         for (name, bytes) in [
             (
@@ -1401,7 +1403,7 @@ impl PeerBrush {
         if self.connecting {
             return;
         }
-        let executable = match std::env::current_exe() {
+        let executable = match crate::packaged::mcp_command() {
             Ok(path) => path,
             Err(error) => {
                 self.receive_connection(Err(format!("Could not locate PeerBrush: {error}")));
@@ -2665,6 +2667,9 @@ impl PeerBrush {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
                         self.channel_tabs(ui, doc, l.mask.is_some());
+                        if l.mask.is_some() {
+                            self.mask_link_button(ui, doc, &l);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .selectable_label(
@@ -3159,6 +3164,63 @@ impl PeerBrush {
             }
             self.frame_pending = false;
         }
+        let size_mode = [
+            Tool::Brush,
+            Tool::Eraser,
+            Tool::Smudge,
+            Tool::Clone,
+            Tool::Heal,
+            Tool::Liquify,
+        ]
+        .contains(&self.tool)
+            && !ui.ctx().wants_keyboard_input()
+            && !self.shortcuts.open
+            && self.points.is_empty()
+            && self.drag_start.is_none()
+            && self.gizmo_handle == 0
+            && ui.input(|i| self.shortcuts.size_held(i));
+        let navigate = self.lifecycle.is_none()
+            && !self.lifecycle_frame
+            && self.proposal_review.is_none()
+            && self.geometry.is_none()
+            && self.source_editor.is_none()
+            && self.filter_editor.is_none()
+            && !(self.brush_tool() && self.straight.cancelled)
+            && !(size_mode && response.hovered())
+            && self.size_drag.is_none();
+        let zoom_drag = navigate
+            && ui.input(|i| i.modifiers.alt)
+            && response.dragged_by(egui::PointerButton::Secondary);
+        let pan_drag = navigate
+            && !zoom_drag
+            && (response.dragged_by(egui::PointerButton::Middle)
+                || ((self.tool == Tool::Pan || ui.input(|i| i.key_down(egui::Key::Space)))
+                    && response.dragged()));
+        // Apply navigation before building the image mesh and document-coordinate mapping.
+        if navigate {
+            if response.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    let old = self.zoom;
+                    self.zoom = (self.zoom * (scroll * 0.002).exp()).clamp(0.01, 8192.0);
+                    if let Some(anchor) = ui.input(|i| i.pointer.hover_pos()) {
+                        self.pan +=
+                            (anchor - (available.center() + self.pan)) * (1.0 - self.zoom / old);
+                    }
+                }
+            }
+            if zoom_drag {
+                let delta = response.drag_delta();
+                let old = self.zoom;
+                self.zoom = (self.zoom * ((delta.x - delta.y) * 0.008).exp()).clamp(0.01, 8192.0);
+                if let Some(anchor) = response.interact_pointer_pos() {
+                    self.pan +=
+                        (anchor - (available.center() + self.pan)) * (1.0 - self.zoom / old);
+                }
+            } else if pan_drag {
+                self.pan += response.drag_delta();
+            }
+        }
         let scale = fit * self.zoom;
         let size = Vec2::new(canvas_width as f32 * scale, canvas_height as f32 * scale);
         let rect = Rect::from_center_size(available.center() + self.pan, size);
@@ -3234,21 +3296,6 @@ impl PeerBrush {
         }
         let to_screen = |p: [f32; 2]| view.point(p, rect, scale);
         let to_doc = |p: Pos2| view.document(p, rect, scale);
-        let size_mode = [
-            Tool::Brush,
-            Tool::Eraser,
-            Tool::Smudge,
-            Tool::Clone,
-            Tool::Heal,
-            Tool::Liquify,
-        ]
-        .contains(&self.tool)
-            && !ui.ctx().wants_keyboard_input()
-            && !self.shortcuts.open
-            && self.points.is_empty()
-            && self.drag_start.is_none()
-            && self.gizmo_handle == 0
-            && ui.input(|i| self.shortcuts.size_held(i));
         if size_mode && (response.hovered() || self.size_drag.is_some()) {
             if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
                 let (anchor, start, hardness) =
@@ -3333,14 +3380,6 @@ impl PeerBrush {
             }
         }
         if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                let old = self.zoom;
-                self.zoom = (self.zoom * (scroll * 0.002).exp()).clamp(0.01, 8192.0);
-                if let Some(anchor) = ui.input(|i| i.pointer.hover_pos()) {
-                    self.pan += (anchor - rect.center()) * (1.0 - self.zoom / old);
-                }
-            }
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                 if view.contains(p, rect, scale)
                     && ([
@@ -3358,21 +3397,11 @@ impl PeerBrush {
                 }
             }
         }
-        if ui.input(|i| i.modifiers.alt) && response.dragged_by(egui::PointerButton::Secondary) {
-            let delta = response.drag_delta();
-            let old = self.zoom;
-            self.zoom = (self.zoom * ((delta.x - delta.y) * 0.008).exp()).clamp(0.01, 8192.0);
-            if let Some(anchor) = response.interact_pointer_pos() {
-                self.pan += (anchor - rect.center()) * (1.0 - self.zoom / old);
-            }
+        if zoom_drag {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
             return;
         }
-        if response.dragged_by(egui::PointerButton::Middle)
-            || ((self.tool == Tool::Pan || ui.input(|i| i.key_down(egui::Key::Space)))
-                && response.dragged())
-        {
-            self.pan += response.drag_delta();
+        if pan_drag {
             return;
         }
         if [Tool::Clone, Tool::Heal].contains(&self.tool) {
@@ -4612,6 +4641,7 @@ impl PeerBrush {
             if let Ok(mut e) = self.workspace_root.try_lock() {
                 if e.focus_requested {
                     e.focus_requested = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
@@ -4822,6 +4852,7 @@ impl PeerBrush {
         if self.lifecycle.is_none() && !self.lifecycle_frame {
             self.import_dialog(ctx);
             self.image_open_dialog(ctx);
+            self.open_activated_file(ctx);
         }
         if self.rename_edit.as_ref().is_some_and(|edit| {
             edit.document != doc.id || !doc.layers.iter().any(|l| l.id == edit.layer)
@@ -5181,6 +5212,7 @@ impl PeerBrush {
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - 70.0).max(60.0))
                     .show(ui, |ui| {
+                        let mut buttons = Vec::with_capacity(15);
                         for (index, tool) in [
                             Tool::Brush,
                             Tool::Smudge,
@@ -5207,24 +5239,19 @@ impl PeerBrush {
                                 ui.add_space(4.0);
                             }
                             let r = ui
-                                .add_sized(
-                                    [42.0, 39.0],
-                                    egui::Button::new("")
-                                        .selected(self.tool == tool)
-                                        .frame(false),
-                                )
+                                .add_sized([42.0, 39.0], egui::Button::new("").frame(false))
                                 .on_hover_text(self.tool_caption(tool));
-                            let active = ui.ctx().animate_bool_with_time(
-                                r.id.with("selected"),
-                                self.tool == tool,
-                                0.1,
-                            );
-                            if active > 0.0 {
-                                ui.painter().rect_filled(
-                                    r.rect,
-                                    6,
-                                    Color32::from_rgb(74, 48, 71).gamma_multiply(active),
-                                );
+                            if r.clicked() {
+                                self.select_tool(tool);
+                                ui.ctx().request_repaint();
+                            }
+                            buttons.push((tool, r));
+                        }
+                        // Resolve input before painting either the old or new selection.
+                        for (tool, r) in buttons {
+                            if self.tool == tool {
+                                ui.painter()
+                                    .rect_filled(r.rect, 6, Color32::from_rgb(74, 48, 71));
                                 ui.painter().rect_filled(
                                     Rect::from_min_size(
                                         r.rect.left_top(),
@@ -5275,9 +5302,6 @@ impl PeerBrush {
                                     Color32::from_rgb(245, 242, 240)
                                 },
                             );
-                            if r.clicked() {
-                                self.select_tool(tool);
-                            }
                         }
                     });
                 ui.add_space((ui.available_height() - 64.0).max(0.0));
@@ -5505,14 +5529,17 @@ impl PeerBrush {
         if self.show_connection {
             let mut open = true;
             egui::Window::new("AI connection settings").open(&mut open).default_width(550.0).show(ctx, |ui| {
-                ui.label(RichText::new("MCP is ready").color(Color32::from_rgb(166, 215, 157)).strong());
                 ui.label("Connect AI handles discovery and installed clients. Manual configuration is available here for other clients.");
                 if !self.connect_feedback.is_empty() { ui.label(&self.connect_feedback); }
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.connection_codex, true, "Codex");
                     ui.selectable_value(&mut self.connection_codex, false, "Other clients");
                 });
-                let exe = std::env::current_exe().unwrap_or_default().to_string_lossy().into_owned();
+                let exe = match crate::packaged::mcp_command() {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(error) => { ui.label(error); return; }
+                };
+                ui.label(RichText::new("MCP is ready").color(Color32::from_rgb(166, 215, 157)).strong());
                 let state = self.connection.state_dir.to_string_lossy().into_owned();
                 let config = if self.connection_codex {
                     ui.label("Add to ~/.codex/config.toml, then restart Codex.");
@@ -7904,6 +7931,11 @@ mod tests {
             vec![egui::Event::PointerMoved(b)],
             Default::default(),
         );
+        assert_eq!(
+            app.view_rect.unwrap().center(),
+            b,
+            "pan must render in the input frame"
+        );
         frame(
             &mut app,
             &ctx,
@@ -7926,11 +7958,18 @@ mod tests {
             vec![button(a, egui::PointerButton::Secondary, true, alt)],
             alt,
         );
+        let before_zoom = app.view_rect.unwrap();
+        let old_zoom = app.zoom;
         frame(
             &mut app,
             &ctx,
             vec![egui::Event::PointerMoved(a + Vec2::new(50.0, 0.0))],
             alt,
+        );
+        assert!(
+            (app.view_rect.unwrap().width() / before_zoom.width() - app.zoom / old_zoom).abs()
+                < 0.001,
+            "zoom must render in the input frame"
         );
         frame(
             &mut app,
@@ -10404,6 +10443,171 @@ mod tests {
         app.shared.lock().unwrap().doc = doc;
         app.select_content(&id);
         (app, ctx)
+    }
+    #[test]
+    fn toolbar_selection_is_fully_painted_in_the_click_frame() {
+        let (mut app, ctx) = small_fixture();
+        let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+        let mut time = 0.;
+        let mut draw = |app: &mut PeerBrush, events| {
+            time += 1. / 240.;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == Color32::from_rgb(74, 48, 71)
+                            && rect.rect.left() < 60.
+                            && rect.rect.size() == Vec2::new(42., 39.) =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        draw(&mut app, vec![]);
+        let selected = draw(&mut app, vec![]);
+        assert_eq!(selected.len(), 1);
+        let brush = selected[0];
+        let eraser = brush.translate(Vec2::new(0., 5. * 43.));
+        for (tool, rect) in [(Tool::Eraser, eraser), (Tool::Brush, brush)] {
+            let pos = rect.center();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    button(pos, egui::PointerButton::Primary, true, Default::default()),
+                ],
+            );
+            let selected = draw(
+                &mut app,
+                vec![button(
+                    pos,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+            );
+            assert!(app.tool == tool);
+            assert_eq!(selected.len(), 1, "Only the current tool is highlighted");
+            assert!(
+                selected[0].contains(pos),
+                "The clicked tool is painted without a fade"
+            );
+        }
+        let engine = app.shared.lock().unwrap();
+        assert!(engine.undo.is_empty());
+        assert_eq!(engine.doc.export_png().unwrap(), before);
+    }
+    #[test]
+    fn mask_link_control_accepts_pointer_and_keyboard_without_changing_artwork_or_target() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = small_fixture();
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc.bit_depth = depth;
+                let id = engine.doc.layers[0].id.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":id})],
+                        None,
+                        None,
+                        "Mask",
+                    )
+                    .unwrap();
+                engine.undo.clear();
+            }
+            app.mask = true;
+            let selected = app.selected.clone();
+            let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+            let draw = |app: &mut PeerBrush, events| {
+                let doc = app.shared.lock().unwrap().doc.clone();
+                let mut response = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(300., 180.))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            response = Some(app.mask_link_button(ui, &doc, &doc.layers[0]));
+                        });
+                    },
+                );
+                response.unwrap()
+            };
+            let response = draw(&mut app, vec![]);
+            let pos = response.rect.center();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    button(pos, egui::PointerButton::Primary, true, Default::default()),
+                ],
+            );
+            draw(
+                &mut app,
+                vec![button(
+                    pos,
+                    egui::PointerButton::Primary,
+                    false,
+                    Default::default(),
+                )],
+            );
+            assert!(
+                !app.shared.lock().unwrap().doc.layers[0]
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .linked
+            );
+            assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
+            response.request_focus();
+            for key in [egui::Key::Space, egui::Key::Enter] {
+                let before = app.shared.lock().unwrap().doc.layers[0]
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .linked;
+                for pressed in [true, false] {
+                    draw(
+                        &mut app,
+                        vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                    );
+                }
+                assert_ne!(
+                    app.shared.lock().unwrap().doc.layers[0]
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .linked,
+                    before
+                );
+            }
+            assert_eq!(app.selected, selected);
+            assert!(app.mask);
+            assert_eq!(app.shared.lock().unwrap().doc.export_png().unwrap(), before);
+            app.shared.lock().unwrap().doc.layers[0].locked = true;
+            assert!(!draw(&mut app, vec![]).enabled());
+        }
     }
     #[test]
     fn magic_wand_selects_without_creating_or_changing_native_masks() {

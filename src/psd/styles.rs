@@ -375,6 +375,9 @@ pub(super) fn native_styles(
     let items = parsed["items"]
         .as_object()
         .ok_or("Invalid effects object")?;
+    if items.contains_key("FrFX") || items.contains_key("frameFXMulti") {
+        return Ok((vec![solid_stroke(items)?], None));
+    }
     if items.keys().any(|key| {
         !matches!(
             key.as_str(),
@@ -511,6 +514,104 @@ pub(super) fn native_styles(
         return Err("Photoshop modifying-effect count disagrees with its definitions".into());
     }
     Ok((effects, pattern_index))
+}
+// Single solid strokes follow ag-psd's EffectDescriptor, FStl and FrFl.
+// Mixed stacks need independently calibrated execution/casting order.
+fn solid_stroke(items: &Map<String, Value>) -> Result<crate::effects::Effect, String> {
+    if items.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "masterFXSwitch" | "Scl " | "numModifyingFX" | "FrFX" | "frameFXMulti"
+        )
+    }) || items.contains_key("FrFX") && items.contains_key("frameFXMulti")
+        || items.get("Scl ").is_some_and(|v| percent(v) != Ok(1.))
+    {
+        return Err("Only a standalone unscaled solid Photoshop Stroke can be imported".into());
+    }
+    let master = boolean(field(items, "masterFXSwitch")).ok_or("Missing stroke master switch")?;
+    let source = if let Some(source) = items.get("FrFX") {
+        source
+    } else {
+        let list = field(items, "frameFXMulti");
+        if list["type"] != "VlLs" {
+            return Err("Photoshop Stroke multi-effect key requires an explicit list".into());
+        }
+        &list["value"]
+            .as_array()
+            .filter(|list| list.len() == 1)
+            .ok_or("Only one Photoshop Stroke definition can be imported")?[0]
+    };
+    let fields = descriptor(source, "FrFX")?;
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "enab"
+                | "present"
+                | "showInDialog"
+                | "Styl"
+                | "PntT"
+                | "Md  "
+                | "Opct"
+                | "Sz  "
+                | "Clr "
+                | "overprint"
+        )
+    }) {
+        return Err("Unsupported Photoshop solid Stroke property".into());
+    }
+    let enabled = boolean(field(fields, "enab")).ok_or("Invalid stroke enabled flag")?;
+    let present = boolean(field(fields, "present")).ok_or("Invalid stroke present flag")?;
+    if fields
+        .get("showInDialog")
+        .is_some_and(|v| boolean(v).is_none())
+        || fields
+            .get("overprint")
+            .is_some_and(|v| boolean(v) != Some(false))
+    {
+        return Err("Invalid stroke dialog flag or unsupported overprint".into());
+    }
+    if let Some(count) = items.get("numModifyingFX") {
+        if count["type"] != "long" || count["value"].as_u64() != Some(u64::from(enabled)) {
+            return Err("Photoshop modifying-effect count disagrees with Stroke".into());
+        }
+    }
+    if field(fields, "PntT")["type"] != "enum"
+        || field(fields, "PntT")["value"] != json!(["FrFl", "SClr"])
+    {
+        return Err("Only plain solid-color Photoshop strokes can be imported".into());
+    }
+    let position = field(fields, "Styl");
+    if position["type"] != "enum" || position["value"][0] != "FStl" {
+        return Err("Invalid Photoshop Stroke position enum".into());
+    }
+    let position = match position["value"][1].as_str() {
+        Some("OutF") => "outside",
+        Some("InsF") => "inside",
+        Some("CtrF") => "center",
+        _ => return Err("Unsupported Photoshop Stroke position".into()),
+    };
+    let size = field(fields, "Sz  ");
+    let pixels = size["value"][1].as_f64().ok_or("Missing stroke size")?;
+    if size["type"] != "UntF"
+        || size["value"][0] != "#Pxl"
+        || !(0. ..=128.).contains(&pixels)
+        || pixels.fract() != 0.
+    {
+        return Err("Photoshop Stroke requires a bounded whole-pixel size".into());
+    }
+    let blend = overlay_blend(field(fields, "Md  "))?;
+    if blend != "normal" {
+        return Err("Independent Photoshop Stroke backdrop blends remain protected".into());
+    }
+    let settings = json!({"position":position,"size":pixels,"color":rgb_color(field(fields,"Clr "))?,"opacity":percent(field(fields,"Opct"))?,"blend":blend});
+    crate::effects::validate("stroke", &settings)?;
+    Ok(crate::effects::Effect {
+        id: crate::engine::id(),
+        kind: "stroke".into(),
+        enabled: master && enabled && present,
+        weight: 1.,
+        settings,
+    })
 }
 // Shadow fields follow psd-tools/api/effects.py and Krita's ASL serializer.
 // Validate each isolated shadow definition. The native stack builder keeps
@@ -856,9 +957,10 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
     {
         return Err("Invalid Gradient Overlay dialog flag".into());
     }
-    if required_bool("Dthr")? || required_bool("Algn")? {
-        return Err("Dithered or layer-aligned Photoshop gradients remain protected".into());
+    if required_bool("Dthr")? {
+        return Err("Dithered Photoshop gradients remain protected".into());
     }
+    let align_layer = required_bool("Algn")?;
     let blend = overlay_blend(field(fields, "Md  "))?;
     if field(fields, "Type")["type"] != "enum" || field(fields, "Type")["value"][0] != "GrdT" {
         return Err("Invalid Photoshop Gradient Overlay shape enumeration".into());
@@ -866,6 +968,9 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
     let style = match field(fields, "Type")["value"][1].as_str() {
         Some("Lnr ") => "linear",
         Some("Rflc") => "reflected",
+        Some("Rdl ") => "radial",
+        Some("Angl") => "angle",
+        Some("Dmnd") => "diamond",
         _ => return Err("Unsupported Photoshop Gradient Overlay shape".into()),
     };
     let angle = field(fields, "Angl");
@@ -905,6 +1010,15 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
         );
     }
     let mut settings = json!({"opacity":percent(field(fields, "Opct"))? ,"blend":blend,"angle":degrees,"scale":scale,"style":style,"reverse":required_bool("Rvrs")?});
+    if align_layer || matches!(style, "radial" | "angle" | "diamond") {
+        // Explicit alignment and the newly supported shapes use the existing
+        // native integer grid. Recognition never bypasses the caller's exact
+        // complete-composite gate. Shape IDs: ag-psd src/descriptor.ts, GrdT.
+        settings["pixel_grid"] = json!(true);
+    }
+    if align_layer {
+        settings["align_layer"] = json!(true);
+    }
     if let Some((x, y)) = offset {
         settings["offset_x"] = json!(x);
         settings["offset_y"] = json!(y);

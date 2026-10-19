@@ -9,6 +9,10 @@ use std::{
 
 struct Lock {
     _file: fs::File,
+    // Unix inode numbers can be reused after unlink while a logical lock lives.
+    // Pin those inodes. Windows replacement must close source/staged handles.
+    #[cfg(unix)]
+    _source: Option<fs::File>,
     project: String,
     key: String,
 }
@@ -63,7 +67,12 @@ fn directory() -> Result<PathBuf, String> {
     }
     Ok(dir)
 }
-fn claim(key: String, project: &str, reuse: bool) -> Result<Arc<Lock>, String> {
+fn claim(
+    key: String,
+    project: &str,
+    reuse: bool,
+    source: Option<fs::File>,
+) -> Result<Arc<Lock>, String> {
     let mut registry = locks().lock().unwrap();
     registry.retain(|_, v| v.strong_count() > 0);
     if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
@@ -106,6 +115,15 @@ fn claim(key: String, project: &str, reuse: bool) -> Result<Arc<Lock>, String> {
         };
         return Err(format!("File already open or opening in another PeerBrush instance{project}. Return to that instance; its work is preserved."));
     }
+    #[cfg(not(unix))]
+    drop(source);
+    let lock = Arc::new(Lock {
+        _file: file,
+        #[cfg(unix)]
+        _source: source,
+        project: project.into(),
+        key: key.clone(),
+    });
     if record.exists()
         && !fs::symlink_metadata(&record).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
     {
@@ -120,11 +138,6 @@ fn claim(key: String, project: &str, reuse: bool) -> Result<Arc<Lock>, String> {
     info.write_all(project.as_bytes())
         .map_err(|e| e.to_string())?;
     info.sync_all().map_err(|e| e.to_string())?;
-    let lock = Arc::new(Lock {
-        _file: file,
-        project: project.into(),
-        key: key.clone(),
-    });
     registry.insert(key, Arc::downgrade(&lock));
     Ok(lock)
 }
@@ -142,16 +155,18 @@ impl Ownership {
     }
     fn acquire(path: &Path, project: &str, reuse: bool) -> Result<Arc<Self>, String> {
         let path = crate::file_safety::canonical_destination(path)?;
-        let mut keys = vec![path_key(&path)];
+        let mut keys = vec![(path_key(&path), None)];
         if path.exists() {
-            keys.push(identity_key(crate::file_safety::identity(
-                &fs::File::open(&path).map_err(|e| e.to_string())?,
-            )?));
+            let source = fs::File::open(&path).map_err(|e| e.to_string())?;
+            keys.push((
+                identity_key(crate::file_safety::identity(&source)?),
+                Some(source),
+            ));
         }
-        keys.sort();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
         let files = keys
             .into_iter()
-            .map(|key| claim(key, project, reuse))
+            .map(|(key, source)| claim(key, project, reuse, source))
             .collect::<Result<_, _>>()?;
         Ok(Arc::new(Self {
             path,
@@ -161,10 +176,9 @@ impl Ownership {
     }
     /// Own the staged inode before it becomes visible under its destination name.
     pub(crate) fn prepare(&self, temporary: &Path) -> Result<(), String> {
-        let key = identity_key(crate::file_safety::identity(
-            &fs::File::open(temporary).map_err(|e| e.to_string())?,
-        )?);
-        let lock = claim(key, &self.project, true)?;
+        let source = fs::File::open(temporary).map_err(|e| e.to_string())?;
+        let key = identity_key(crate::file_safety::identity(&source)?);
+        let lock = claim(key, &self.project, true, Some(source))?;
         self.files
             .lock()
             .unwrap()
@@ -203,6 +217,73 @@ pub(crate) fn local_project(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn physical_identity_stays_pinned_after_external_unlink_and_staged_publication() {
+        let dir = std::env::temp_dir().join(format!("pb-pinned-owner-{}", crate::engine::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("Artwork.psd");
+        fs::write(&path, b"original source").unwrap();
+        let owner = Ownership::open(&path, "project").unwrap();
+        let pinned = {
+            let files = owner.files.lock().unwrap();
+            let source = files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find_map(|lock| lock._source.as_ref())
+                .unwrap();
+            source.try_clone().unwrap()
+        };
+        let original = crate::file_safety::identity(&pinned).unwrap();
+        fs::remove_file(&path).unwrap();
+        let other = dir.join("Unrelated.psd");
+        fs::write(&other, b"unrelated source").unwrap();
+        let other_identity =
+            crate::file_safety::identity(&fs::File::open(&other).unwrap()).unwrap();
+        assert_ne!(other_identity, original);
+        assert!(Ownership::open(&other, "other-project").is_ok());
+        let mut contents = String::new();
+        (&pinned).read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "original source");
+        drop(pinned);
+        // The logical owner still retains the unlinked source, even after the
+        // test's duplicate handle is closed.
+        assert_eq!(
+            owner
+                .files
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter_map(|lock| lock._source.as_ref())
+                .count(),
+            1
+        );
+        owner.release();
+        let owner = Ownership::save(&path, "project").unwrap();
+        let staged = dir.join("Staged.psd");
+        fs::write(&staged, b"new source").unwrap();
+        let identity = crate::file_safety::identity(&fs::File::open(&staged).unwrap()).unwrap();
+        owner.prepare(&staged).unwrap();
+        fs::rename(&staged, &path).unwrap();
+        owner.published(identity);
+        let pins = owner.files.lock().unwrap();
+        let sources = pins
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|lock| lock._source.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(crate::file_safety::identity(sources[0]).unwrap(), identity);
+        drop(pins);
+        assert!(Ownership::open(&path, "other-project").is_err());
+        owner.release();
+        assert!(Ownership::open(&path, "other-project").is_ok());
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn final_owner_releases_os_locks_even_with_duplicated_descriptors() {
         let dir = std::env::temp_dir().join(format!("pb-duplicated-owner-{}", crate::engine::id()));

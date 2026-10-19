@@ -709,6 +709,11 @@ pub fn capabilities() -> Value {
         json!({"op":"path.handle.move","layer":"PATH_ID","index":1,"handle":"out","point":[210,150]}),
         json!({"op":"path.to_selection","path":"PATH_ID","feather":1}),
     ]);
+    result["mask_link"] = json!({"command":{"op":"mask.link","layer":"LAYER_ID","linked":true},"default":true,"transforms":"Linked masks and Color move/rotate/scale together, including selected areas. Unlinked targets transform independently. Whole mask transforms include all paint steps; an explicit step selects one unlinked paint step. Independent Color and selected linked transforms require fill/paint mask steps; unsupported mask effects are refused without rasterization.","precision":"Native 8/16-bit rasters and retained originals; shared previews, reservations and undo.","psd":"Source format 29 retains link state. Standard mask pixels and composite remain current; external Photoshop link editing is not written or verified and appears in the save report."});
+    result["commands"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"op":"mask.link","layer":"LAYER_ID","linked":false}));
     result["effect_bake"] = json!({"commands":["effect.bake","mask.step.bake"],"scope":"Selected effect plus preceding stack; following effects remain editable. Folder Color flattens all children; editable Color sources rasterize. Mask keeps Color/hierarchy. Whole-target reservations, native 8/16-bit fidelity check and one undo. Inexact prefixes, backdrop-dependent adjustments and expanding styles that shift an attached mask frame are refused."});
     result["commands"].as_array_mut().unwrap().extend([
         json!({"op":"effect.bake","layer":"LAYER_ID","effect":"EFFECT_ID"}),
@@ -816,6 +821,7 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             | "tool_settings"
             | "image_info"
             | "focus"
+            | "native_open"
             | "client_state"
             | "capture_ui"
     ) {
@@ -1060,6 +1066,22 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
         "focus" => {
             shared.lock().unwrap().focus_requested = true;
             Ok(json!({"focused":true}))
+        }
+        "native_open" => {
+            let paths = p["paths"].as_array().ok_or("Missing activation paths")?;
+            if paths.len() > crate::activation::MAX_PENDING_FILES {
+                return Err("Too many files in this activation".into());
+            }
+            let paths = paths
+                .iter()
+                .map(|p| {
+                    p.as_str()
+                        .map(PathBuf::from)
+                        .ok_or("Invalid activation path")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let queued = crate::activation::enqueue(shared, paths)?;
+            Ok(json!({"queued":queued}))
         }
         "observe" => observation(shared, p),
         "code" => crate::code::dispatch(shared, actor, p),
@@ -2588,6 +2610,35 @@ pub fn focus_existing(state_dir: &Path) -> bool {
         std::time::Duration::from_millis(500),
     )
     .is_ok_and(|r| r["ok"] == true)
+}
+/// Forward files only after confirming a running listener. The same bearer-authenticated
+/// local endpoint is used; receiving a request never discards or replaces a project.
+pub fn activate_existing(state_dir: &Path, files: &[PathBuf]) -> Result<bool, String> {
+    if !focus_existing(state_dir) {
+        return Ok(false);
+    }
+    if files.is_empty() {
+        return Ok(true);
+    }
+    let paths = files
+        .iter()
+        .map(|p| p.to_str().ok_or("This file path cannot be sent to the existing window without changing its characters"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let reply = client_with_timeout(
+        state_dir,
+        "rpc",
+        &json!({"method":"native_open","params":{"paths":paths}}),
+        std::time::Duration::from_secs(5),
+    )?;
+    if reply["ok"] != true {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or(
+                "The running PeerBrush could not accept these files. Close it and try again.",
+            )
+            .into());
+    }
+    Ok(true)
 }
 fn client_with_timeout(
     state_dir: &Path,

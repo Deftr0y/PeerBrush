@@ -535,11 +535,12 @@ impl PeerBrush {
         index: usize,
         revision: u64,
     ) -> egui::Response {
-        let menu = egui::menu::menu_custom_button(ui, egui::Button::new("⋯").frame(false), |ui| {
-            self.effect_options(ui, l, mask, effect, index, revision);
-        })
-        .response
-        .on_hover_text("Effect actions · Top effects run last");
+        let menu =
+            egui::menu::menu_custom_button(ui, egui::Button::new("...").frame(false), |ui| {
+                self.effect_options(ui, l, mask, effect, index, revision);
+            })
+            .response
+            .on_hover_text("Effect actions · Top effects run last");
         menu.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Effect actions")
         });
@@ -1114,7 +1115,7 @@ mod tests {
             .shapes
             .iter()
             .filter_map(|s| match &s.shape {
-                egui::Shape::Text(text) if text.galley.job.text == "⋯" => {
+                egui::Shape::Text(text) if text.galley.job.text == "..." => {
                     Some(text.pos + Vec2::new(4., 4.))
                 }
                 _ => None,

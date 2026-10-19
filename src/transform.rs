@@ -7,6 +7,13 @@ pub const MOVE_SNAP: f64 = 8.0;
 pub const ANGLE_SNAP: f64 = 15.0;
 pub const SCALE_SNAP: f64 = 0.1;
 
+pub(crate) fn work_budget(width: u32, height: u32, rasters: usize) -> Result<(), String> {
+    if u64::from(width) * u64::from(height) * rasters as u64 > 128_000_000 {
+        return Err("Transform exceeds the 128-million-sample work budget".into());
+    }
+    Ok(())
+}
+
 /// Positive scale magnitudes and explicit reflection flags share one interpretation.
 pub fn scales(c: &Value) -> Result<(f64, f64), String> {
     let axis = |name: &str, mirror: &str| {
@@ -130,6 +137,12 @@ pub fn selection_with_polygon(
     polygon: &[[f32; 2]],
     c: &Value,
 ) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
+    if layer.mask.as_ref().is_some_and(|mask| mask.linked) {
+        return linked_selection(layer, polygon, c, None);
+    }
+    if c["mask"] == true && c["step"].is_null() {
+        return mask_selection(layer, polygon, c, None);
+    }
     selection_impl(layer, polygon, c, None)
 }
 pub fn selection_with_coverage(
@@ -140,12 +153,14 @@ pub fn selection_with_coverage(
     if coverage.bounds[0] >= coverage.bounds[2] {
         return Ok(coverage.clone());
     }
-    let (bounds, _) = selection_impl(
-        layer,
-        &crate::selection::rectangle(coverage.bounds),
-        c,
-        Some(coverage),
-    )?;
+    let polygon = crate::selection::rectangle(coverage.bounds);
+    let (bounds, _) = if layer.mask.as_ref().is_some_and(|mask| mask.linked) {
+        linked_selection(layer, &polygon, c, Some(coverage))?
+    } else if c["mask"] == true && c["step"].is_null() {
+        mask_selection(layer, &polygon, c, Some(coverage))?
+    } else {
+        selection_impl(layer, &polygon, c, Some(coverage))?
+    };
     let n = |k: &str, d: f32| c[k].as_f64().unwrap_or(d as f64) as f32;
     let moving = c["op"] == "move";
     let (dx, dy) = if moving {
@@ -254,6 +269,7 @@ fn selection_impl(
     let bottom = (oy + layer.pixels.height as i32).max(b[3]);
     let (w, h) = ((right - left) as u32, (bottom - top) as u32);
     check_size(w, h)?;
+    work_budget(w, h, 1 + layer.mask.as_ref().map_or(0, |m| m.steps.len()))?;
     let mask_step = if mask {
         let m = layer.mask.as_ref().ok_or("Layer has no mask")?;
         Some(
@@ -388,6 +404,106 @@ fn selection_impl(
         }
     }
     Ok((b, transformed))
+}
+
+fn linked_selection(
+    layer: &mut Layer,
+    polygon: &[[f32; 2]],
+    c: &Value,
+    coverage: Option<&crate::selection::Coverage>,
+) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
+    plain_mask(layer)?;
+    let mut color = layer.clone();
+    color.mask = None;
+    let mut command = c.clone();
+    command["mask"] = serde_json::json!(false);
+    let result = selection_impl(&mut color, polygon, &command, coverage)?;
+    let mut masked = layer.clone();
+    mask_selection(&mut masked, polygon, &command, coverage)?;
+    reframe_mask(
+        &mut masked,
+        color.x,
+        color.y,
+        color.pixels.width,
+        color.pixels.height,
+    )?;
+    color.mask = masked.mask;
+    *layer = color;
+    Ok(result)
+}
+
+fn mask_selection(
+    layer: &mut Layer,
+    polygon: &[[f32; 2]],
+    c: &Value,
+    coverage: Option<&crate::selection::Coverage>,
+) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
+    plain_mask(layer)?;
+    let steps = layer
+        .mask
+        .as_ref()
+        .ok_or("Layer has no mask")?
+        .steps
+        .iter()
+        .filter(|step| step.kind == "paint")
+        .map(|step| step.id.clone())
+        .collect::<Vec<_>>();
+    let work = steps.len() * (1 + layer.mask.as_ref().unwrap().steps.len());
+    work_budget(layer.pixels.width, layer.pixels.height, work)?;
+    let mut result = None;
+    for step in steps {
+        let mut command = c.clone();
+        command["mask"] = serde_json::json!(true);
+        command["step"] = serde_json::json!(step);
+        result = Some(selection_impl(layer, polygon, &command, coverage)?);
+        work_budget(layer.pixels.width, layer.pixels.height, work)?;
+    }
+    result.ok_or("Select a paint mask step to transform".into())
+}
+
+pub(crate) fn plain_mask(layer: &Layer) -> Result<(), String> {
+    if layer.mask.as_ref().is_some_and(|mask| {
+        mask.steps
+            .iter()
+            .any(|step| !matches!(step.kind.as_str(), "fill" | "paint"))
+    }) {
+        return Err("Independent or selected linked transforms require a fill/paint mask; mask effects are preserved unchanged. Unlink and choose a paint step for a mask-only transform.".into());
+    }
+    Ok(())
+}
+
+fn reframe_mask(layer: &mut Layer, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+    if (layer.x, layer.y) == (x, y)
+        && layer.mask.as_ref().is_none_or(|mask| {
+            mask.steps
+                .iter()
+                .all(|step| (step.pixels.width, step.pixels.height) == (width, height))
+        })
+    {
+        return Ok(());
+    }
+    if let Some(mask) = &mut layer.mask {
+        work_budget(width, height, mask.steps.len())?;
+        mask.cache_key = crate::engine::id();
+        for step in &mut mask.steps {
+            let mut original = crate::retained::Original::from(&step.pixels);
+            original.matrix = crate::retained::compose(
+                [
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    f64::from(layer.x - x),
+                    f64::from(layer.y - y),
+                ],
+                original.matrix,
+            );
+            step.pixels = original.render(width, height)?;
+        }
+    }
+    layer.x = x;
+    layer.y = y;
+    Ok(())
 }
 
 /// A tile writer avoids per-pixel tree mutation. Dense sources use contiguous reads.
@@ -637,8 +753,24 @@ fn sample_words16(words: &[u16], w: u32, h: u32, x: f32, y: f32) -> [u16; 4] {
 
 /// The shared whole-layer affine operation, including native mask sources.
 pub(crate) fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
-    if c["mask"] == true && c["op"] == "transform" {
+    if c["mask"] == true && layer.mask.as_ref().is_none_or(|mask| !mask.linked) {
         return crate::retained::mask(layer, c);
+    }
+    if layer.mask.as_ref().is_some_and(|mask| !mask.linked) {
+        plain_mask(layer)?;
+        let mut color = layer.clone();
+        color.mask = None;
+        crate::retained::layer(&mut color, c)?;
+        reframe_mask(
+            layer,
+            color.x,
+            color.y,
+            color.pixels.width,
+            color.pixels.height,
+        )?;
+        color.mask = layer.mask.take();
+        *layer = color;
+        return Ok(());
     }
     crate::retained::layer(layer, c)
 }
@@ -702,9 +834,6 @@ pub fn tree_bounds(doc: &Document, roots: &[String]) -> Option<[i32; 4]> {
 }
 pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), String> {
     if c["mask"] == true {
-        if c["op"] == "move" {
-            return Err("Select Color to move the folder and its children".into());
-        }
         if doc.selection.is_some() && c["selection_only"] != false {
             let coverage = crate::selection::current(doc).ok_or("Selection no longer exists")?;
             let node = doc

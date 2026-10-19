@@ -15,6 +15,7 @@ pub struct Cache {
     height: u32,
     bytes: Vec<u8>,
     previous: Option<[i32; 4]>,
+    full_upload: bool,
     stroke: Option<Stroke>,
     prepared8: Option<regions::Prepared8>,
     prepared16: Option<regions::Prepared16>,
@@ -112,11 +113,10 @@ impl Cache {
             return Engine::preview_edits(base, commands).map(|doc| (doc, None));
         }
         let command = &commands[0];
-        let rendered_baseline = self.stroke.is_none()
-            && self
-                .key
-                .as_ref()
-                .is_some_and(|key| key.0 == gesture && key.1 == base.id && key.2 == base.revision)
+        let rendered_baseline = self
+            .key
+            .as_ref()
+            .is_some_and(|key| key.1 == base.id && key.2 == base.revision)
             && if base.bit_depth == 16 {
                 self.prepared16
                     .as_ref()
@@ -245,6 +245,12 @@ impl Cache {
             crate::depth16::validate_budget(&doc)?;
         }
         crate::effects::invalidate(&mut doc, commands);
+        if reset && rendered_baseline {
+            // Transfer only an exact baseline; render still checks size, isolation and mask.
+            self.full_upload = self.key.as_ref().unwrap().0 != gesture;
+            self.key.as_mut().unwrap().0 = gesture.to_owned();
+            self.previous = None;
+        }
         Ok((doc, dirty))
     }
     /// `dirty` is the complete document-space bounds of the replayed paint stroke.
@@ -258,7 +264,13 @@ impl Cache {
         target: Option<&str>,
         mask: bool,
     ) -> Result<Rendered, String> {
-        let result = self.render_inner(doc, key, dirty, edge, target, mask);
+        let mut result = self.render_inner(doc, key, dirty, edge, target, mask);
+        if std::mem::take(&mut self.full_upload) {
+            if let Ok(frame) = &mut result {
+                // A worker's preceding baseline frame may never have reached the UI.
+                frame.dirty = None;
+            }
+        }
         if result.is_err() {
             self.clear();
         }
