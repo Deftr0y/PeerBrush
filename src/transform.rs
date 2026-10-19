@@ -197,7 +197,15 @@ pub fn selection_with_coverage(
             let ry = y as f32 + 0.5 - py - dy;
             let ux = (rx * cos + ry * sin) / sx + px - coverage.origin[0] as f32 - 0.5;
             let uy = (-rx * sin + ry * cos) / sy + py - coverage.origin[1] as f32 - 0.5;
-            let v = coverage.mask.sample(ux, uy)[0];
+            // Coverage is scalar; RGBA sampling would unpremultiply its edge values.
+            let (ix, iy) = (ux.floor() as i32, uy.floor() as i32);
+            let (fx, fy) = (ux - ix as f32, uy - iy as f32);
+            let at = |x, y| coverage.mask.get(x, y)[0] as f32;
+            let v = (at(ix, iy) * (1. - fx) * (1. - fy)
+                + at(ix + 1, iy) * fx * (1. - fy)
+                + at(ix, iy + 1) * (1. - fx) * fy
+                + at(ix + 1, iy + 1) * fx * fy)
+                .round() as u8;
             if v > 0 {
                 mask.set(x - bounds[0], y - bounds[1], [v; 4]);
             }

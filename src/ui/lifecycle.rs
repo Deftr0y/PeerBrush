@@ -379,6 +379,34 @@ mod tests {
         assert_eq!(app.project_id, other);
     }
     #[test]
+    fn clean_native_close_is_not_canceled_after_final_source_validation() {
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            for _ in 0..3 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let output = ctx.run(input, |ctx| app.draw(ctx));
+            assert!(app.exit_approved);
+            assert!(root.lock().unwrap().closed && second.lock().unwrap().closed);
+            // eframe cancels the original native close if this appears anywhere
+            // in the frame, even when a Close command is also present.
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose));
+        }
+    }
+
+    #[test]
     fn native_close_request_is_canceled_until_all_dirty_projects_are_reviewed() {
         let (mut app, ctx, root, second) = fixture(16);
         dirty(&root, "One");
@@ -689,7 +717,6 @@ impl PeerBrush {
             }
         }
         if ctx.input(|i| i.viewport().close_requested()) && !self.exit_approved {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.request_close(Intent::Exit);
         }
         if self.exit_approved {

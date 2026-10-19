@@ -43,6 +43,7 @@ class Packages(unittest.TestCase):
         for name, content in {'Cargo.toml': '[package]\nname="peerbrush"\nversion="0.2.0"\n', 'Cargo.lock': 'version=4\n[[package]]\nname="peerbrush"\nversion="0.2.0"\n', 'LICENSE': 'GNU GENERAL PUBLIC LICENSE\nGPL-3.0-only\n', 'README.md': 'Synthetic package fixture\n', 'FOLLOWUPS.MD': 'Synthetic backlog\n', 'assets/fonts/LICENCE.txt': 'Synthetic font license\n', 'assets/peerbrush-logo.png': 'Synthetic artwork\n', 'src/lib.rs': '// synthetic\n', 'scripts/start-windows.cmd': '@echo off\n', 'docs/usage.md': 'Synthetic instructions\n'}.items():
             (self.root / name).write_text(content, encoding='utf-8')
         (self.root / 'scripts/package-readme.md').write_text('Synthetic focused package README: {{SOURCE_ARCHIVE}}\n', encoding='utf-8')
+        (self.root / 'assets/peerbrush.icns').write_bytes((pathlib.Path(__file__).resolve().parents[1] / 'assets/peerbrush.icns').read_bytes())
         (self.root / '.gitignore').write_text('/output/\n/verified/\n/rejected/\n/registry/\n/synthetic-binary\n', encoding='utf-8')
         (self.root / 'integrations').mkdir()
         (self.root / 'integrations/segmentation_rembg.py').write_text('# Synthetic provider\n', encoding='utf-8')
@@ -110,8 +111,121 @@ class Packages(unittest.TestCase):
                     info = plistlib.loads(package.read(root + 'PeerBrush.app/Contents/Info.plist'))
                     self.assertEqual(info['CFBundleShortVersionString'], '0.2.0')
                     self.assertEqual(info['CFBundleExecutable'], 'peerbrush')
+                    self.assertEqual(info['CFBundleIconFile'], 'PeerBrush.icns')
+                    self.assertEqual({kind['LSHandlerRank'] for kind in info['CFBundleDocumentTypes']}, {'Alternate'})
+                    self.assertEqual({kind['CFBundleTypeRole'] for kind in info['CFBundleDocumentTypes']}, {'Editor'})
+                    resource = root + packaging.MACOS_RESOURCES
+                    self.assertEqual(package.read(resource + 'PeerBrush.icns'), (self.root / 'assets/peerbrush.icns').read_bytes())
+                    for name in ['LICENSE', 'THIRD_PARTY_NOTICES.md', *manifest['notice_files']]:
+                        self.assertEqual(package.read(resource + name), package.read(root + name))
         self.assertEqual(sources[0], sources[1])
         self.assertEqual(sources[0], sources[2])
+
+    def test_macos_installed_resources_and_consent_cannot_be_changed_or_removed(self):
+        path = self.build('macOS')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+        for target, expected in [('PeerBrush.icns', 'committed artwork'),
+                                 ('LICENSE', 'installed license/notices'),
+                                 ('THIRD_PARTY_NOTICES.md', 'installed license/notices'),
+                                 ('licenses/ubuntu-sans/LICENCE.txt', 'installed license/notices')]:
+            name = prefix + packaging.MACOS_RESOURCES + target
+            changed = [(n, data + b'tampered' if n == name else data, mode) for n, data, mode in original]
+            packaging.write_zip(path, changed, 1700000000)
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, expected):
+                verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+        changed = []
+        for name, data, mode in original:
+            if name == prefix + 'PeerBrush.app/Contents/Info.plist':
+                info = plistlib.loads(data)
+                info['CFBundleDocumentTypes'][0]['LSHandlerRank'] = 'Default'
+                data = plistlib.dumps(info)
+            changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        with self.assertRaisesRegex(ValueError, 'document consent'):
+            verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+        changed = []
+        for name, data, mode in original:
+            if name == prefix + 'release.json':
+                manifest = json.loads(data)
+                del manifest['macos_bundle_resources']
+                data = json.dumps(manifest).encode()
+            if not name.startswith(prefix + packaging.MACOS_RESOURCES):
+                changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        with self.assertRaisesRegex(ValueError, 'Missing required installed macOS resources'):
+            verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+
+    def test_macos_internal_development_mapping_retains_exact_cargo_version(self):
+        for name in ['Cargo.toml', 'Cargo.lock']:
+            path = self.root / name
+            path.write_text(path.read_text().replace('0.2.0', '0.30.0-dev.1'))
+        self.commit()
+        path = self.build('macOS')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+            info = plistlib.loads(archive.read(prefix + 'PeerBrush.app/Contents/Info.plist'))
+            self.assertEqual(info['CFBundleShortVersionString'], '0.30.0')
+            self.assertEqual(info['CFBundleVersion'], '0.30.0')
+            self.assertEqual(info['PeerBrushDevelopmentVersion'], '0.30.0-dev.1')
+            self.assertEqual(json.loads(archive.read(prefix + 'release.json'))['version'], '0.30.0-dev.1')
+        verify_release.inspect_archive(path, commit, '0.30.0-dev.1', self.root)
+        for key, changed in [('PeerBrushDevelopmentVersion', None), ('PeerBrushDevelopmentVersion', '0.30.0-dev.2'),
+                             ('CFBundleVersion', '0.30.0-dev.1'), ('CFBundleShortVersionString', '0.30.1')]:
+            altered = dict(info)
+            if changed is None:
+                del altered[key]
+            else:
+                altered[key] = changed
+            files = [(name, plistlib.dumps(altered) if name.endswith('/Info.plist') else data, mode)
+                     for name, data, mode in original]
+            packaging.write_zip(path, files, 1700000000)
+            with self.subTest(key=key, changed=changed), self.assertRaises(ValueError):
+                verify_release.inspect_archive(path, commit, '0.30.0-dev.1', self.root)
+        self.assertNotIn('PeerBrushDevelopmentVersion', packaging.macos_info('0.30.0'))
+        for version in ['0.30.0-beta.1', '0.30.0-dev.01', '0.30.0+build', '00.30.0-dev.1']:
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                packaging.macos_info(version)
+
+    def test_historical_macos_layout_remains_valid_for_its_matching_source(self):
+        path = self.build('macOS')
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+        # An earlier source revision had neither ICNS nor installed Resources.
+        (self.root / 'assets/peerbrush.icns').unlink()
+        self.policy['source'].remove('assets/peerbrush.icns')
+        self.save_policy()
+        self.commit()
+        self.build('Windows')
+        source = (self.output / 'PeerBrush-0.2.0-source.zip').read_bytes()
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        changed = []
+        for name, data, mode in original:
+            if name.startswith(prefix + packaging.MACOS_RESOURCES):
+                continue
+            if name == prefix + 'release.json':
+                manifest = json.loads(data)
+                del manifest['macos_bundle_resources']
+                manifest.update(commit=commit, binary_source_commit=commit, source_sha256=verify_release.sha(source))
+                data = json.dumps(manifest).encode()
+            elif name == prefix + 'PeerBrush-0.2.0-source.zip':
+                data = source
+            elif name == prefix + 'PeerBrush.app/Contents/Info.plist':
+                info = plistlib.loads(data)
+                for key in ['CFBundleIconFile', 'CFBundleDocumentTypes', 'UTImportedTypeDeclarations']:
+                    del info[key]
+                data = plistlib.dumps(info)
+            changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        verify_release.inspect_archive(path, commit, '0.2.0', self.root)
 
     def test_untracked_private_files_and_stale_output_never_enter_packages(self):
         (self.root / 'docs' / 'connection.json').write_text('private fixture, must be excluded')
@@ -414,6 +528,42 @@ class Packages(unittest.TestCase):
             manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
             self.assertTrue({'licenses/epaint_default_fonts-0.31.1/' + name for name in names} <= set(manifest['notice_files']))
             self.assertFalse(any(name.endswith('/private.txt') for name in archive.namelist()))
+
+    def test_tls_notices_include_ring_subcomponents_and_require_exact_checksums(self):
+        (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\nname="ring"\nversion="0.17.14"\nsource="registry+https://example.invalid"\n[[package]]\nname="rustls"\nversion="0.23.46"\nsource="registry+https://example.invalid"\n')
+        self.commit()
+        ring = self.root / 'registry/test/ring-0.17.14'
+        ring.mkdir(parents=True)
+        (ring / 'Cargo.toml').write_text('[package]\nname="ring"\nversion="0.17.14"\nlicense="Apache-2.0 AND ISC"\n')
+        (ring / 'LICENSE').write_text('Synthetic license index')
+        names = packaging.EXTRA_CRATE_NOTICES['ring']
+        for name in names:
+            path = ring / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('Synthetic component notice: ' + name)
+        (ring / 'LICENSE-private').write_text('SYNTHETIC_PRIVATE_CANARY')
+        checksums = {name: packaging.digest(ring / name) for name in names}
+        (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
+        rustls = self.root / 'registry/test/rustls-0.23.46'
+        rustls.mkdir(parents=True)
+        (rustls / 'Cargo.toml').write_text('[package]\nname="rustls"\nversion="0.23.46"\nlicense="Apache-2.0 OR ISC OR MIT"\n')
+        (rustls / 'LICENSE-ISC').write_text('Synthetic ISC alternative')
+        archive_path = self.build('Windows')
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
+            self.assertTrue({'licenses/ring-0.17.14/' + name for name in names} <= set(manifest['notice_files']))
+            self.assertIn('licenses/rustls-0.23.46/LICENSE-ISC', manifest['notice_files'])
+            self.assertFalse(any('LICENSE-private' in name for name in archive.namelist()))
+        notice = ring / 'LICENSE-other-bits'
+        original = notice.read_bytes()
+        notice.write_text('Tampered component notice')
+        with self.assertRaisesRegex(ValueError, 'notice checksum mismatch'):
+            self.build('Windows')
+        notice.write_bytes(original)
+        del checksums['LICENSE-other-bits']
+        (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
+        with self.assertRaisesRegex(ValueError, 'required dependency notice inventory'):
+            self.build('Windows')
 
     def test_dated_repack_names_preserve_internal_layout_and_require_matching_labels(self):
         commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()

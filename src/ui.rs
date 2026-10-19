@@ -1,6 +1,7 @@
 use crate::icons::{self, Icon};
 mod activation;
 mod animation;
+mod associations;
 mod brush;
 #[cfg(test)]
 mod brush_toolbar_tests;
@@ -33,6 +34,7 @@ mod retouch;
 mod saved_versions;
 mod selection;
 mod shortcuts;
+pub(crate) use shortcuts::validate_file as validate_shortcut_preferences;
 mod source;
 mod style_settings;
 mod tabs;
@@ -40,6 +42,7 @@ mod tool_settings;
 #[cfg(test)]
 mod tool_settings_tests;
 mod transform_snapping;
+mod updates;
 mod view;
 use crate::{controls, thumbnails};
 use crate::{
@@ -324,6 +327,7 @@ pub struct PeerBrush {
     canvas_press_document: Option<String>,
     canvas_input_region: Option<(Rect, egui::LayerId)>,
     jobs: HashSet<String>,
+    updates: updates::Panel,
     lifecycle: Option<lifecycle::Review>,
     recovery: recovery::Browser,
     saved_versions: Option<saved_versions::Browser>,
@@ -455,6 +459,7 @@ pub struct PeerBrush {
     load_control: Option<crate::loading::Control>,
     load_preview: Option<TextureHandle>,
     show_new: bool,
+    associations: associations::Choice,
     read_only_info: Option<String>,
     read_only_patterns: Option<String>,
     selection_commit_failed: bool,
@@ -500,7 +505,21 @@ pub struct PeerBrush {
     gizmo_bounds: Option<(String, u64, [i32; 4])>,
 }
 impl PeerBrush {
+    pub fn new_with_preferences(
+        cc: &eframe::CreationContext<'_>,
+        shared: Shared,
+        connection: Connection,
+        preferences: &Path,
+    ) -> Self {
+        let mut app = Self::new(cc, shared, connection);
+        app.shortcuts = shortcuts::Shortcuts::load(preferences);
+        app.updates = updates::Panel::load(preferences);
+        app
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, shared: Shared, connection: Connection) -> Self {
+        #[cfg(target_os = "macos")]
+        crate::activation::macos::repaint_with(&cc.egui_ctx);
         if let Some(state) = &cc.wgpu_render_state {
             let _ = crate::gpu::install(state);
         }
@@ -674,6 +693,7 @@ impl PeerBrush {
             transfer_rx,
             shared,
             shortcuts: shortcuts::Shortcuts::load(&connection.state_dir),
+            updates: updates::Panel::load(&connection.state_dir),
             connection,
             selection_layers: [selected.clone()].into_iter().collect(),
             selection_anchor: selected.clone(),
@@ -790,6 +810,7 @@ impl PeerBrush {
             load_control: None,
             load_preview: None,
             show_new: false,
+            associations: Default::default(),
             read_only_info: None,
             read_only_patterns: None,
             selection_commit_failed: false,
@@ -4540,6 +4561,7 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.updates_tick(ctx);
         self.selection_commit_failed = false;
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
@@ -4602,6 +4624,7 @@ impl PeerBrush {
             self.show_calibration = panel == "calibration";
             self.show_view = panel == "view";
             self.shortcuts.open = panel == "shortcuts";
+            self.updates.open = panel == "updates";
             if panel == "solo_color" || panel == "solo_mask" {
                 self.mask = panel == "solo_mask";
                 let active = !self.mask
@@ -4800,6 +4823,11 @@ impl PeerBrush {
             self.save_loss_dialog(ctx);
         } else {
             self.lifecycle_dialog(ctx);
+        }
+        // eframe treats any CancelClose as final for this native close frame.
+        // Validate all projects first; a clean approved exit needs no cancellation.
+        if ctx.input(|input| input.viewport().close_requested()) && !self.exit_approved {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         if self.exit_approved {
             return;
@@ -5021,6 +5049,12 @@ impl PeerBrush {
                         }
                         if ui.button("Production export…").clicked() {
                             self.open_exports(&doc);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        self.associations.menu(ui);
+                        if ui.button("Updates…").clicked() {
+                            self.updates.open = true;
                             ui.close_menu();
                         }
                     });
@@ -5473,6 +5507,7 @@ impl PeerBrush {
         self.protection_window(ctx, &doc);
         self.patterns_window(ctx, &doc);
         self.compatibility_window(ctx, &doc);
+        self.associations.show(ctx);
         if self.show_new {
             let mut open = true;
             egui::Window::new("New canvas")
@@ -5604,6 +5639,7 @@ impl PeerBrush {
         self.pressure_calibration(ctx);
         self.canvas_view_window(ctx);
         self.shortcuts_window(ctx);
+        self.updates_dialog(ctx);
         self.finish_capture(ctx, drawn_generation);
         self.sync_tool_profile(ctx);
         if self.tool_preferences_ai(ctx.input(|i| i.time)) {

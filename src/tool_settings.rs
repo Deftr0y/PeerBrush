@@ -136,7 +136,7 @@ impl Store {
             .ok_or_else(|| "Choose brush, eraser, smudge, clone, heal or liquify".into())
     }
     pub fn state(&self) -> Value {
-        json!({"tools":self.tools.iter().map(|(tool,snapshot)|(tool.clone(),snapshot.state(tool))).collect::<BTreeMap<_,_>>(),"persistence":if self.path.is_some(){"instance state directory"}else{"current instance"},"error":self.error,"save_error":self.save_error,"pending_save":self.dirty})
+        json!({"tools":self.tools.iter().map(|(tool,snapshot)|(tool.clone(),snapshot.state(tool))).collect::<BTreeMap<_,_>>(),"persistence":if self.path.is_some(){"configured preferences directory"}else{"current instance"},"error":self.error,"save_error":self.save_error,"pending_save":self.dirty})
     }
     pub fn set(
         &mut self,
@@ -307,6 +307,6 @@ impl Snapshot {
         } else {
             serde_json::to_value(self.profile.settings).unwrap()
         };
-        json!({"tool":tool,"profile":{"settings":settings,"preset":self.profile.preset},"revision":self.revision,"actor":self.actor,"persistence":if self.persistent{"instance state directory"}else{"current instance"}})
+        json!({"tool":tool,"profile":{"settings":settings,"preset":self.profile.preset},"revision":self.revision,"actor":self.actor,"persistence":if self.persistent{"configured preferences directory"}else{"current instance"}})
     }
 }

@@ -1,6 +1,8 @@
 name: PeerBrush release candidates
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       expected_commit:
@@ -38,12 +40,12 @@ jobs:
         os: [windows-2025, macos-26, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     env:
-      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.expected_commit }}
+          ref: ${{ inputs.expected_commit || github.sha }}
           persist-credentials: false
       - name: Check exact release source
         shell: bash
@@ -54,17 +56,48 @@ jobs:
         with:
           components: rustfmt, clippy, rust-docs
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked
+      - name: Verify native macOS document delivery and icon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo run --locked --example macos_activation
+          sips -s format png assets/peerbrush.icns --out "$RUNNER_TEMP/peerbrush-icon.png"
       - run: python scripts/test_package.py
       - run: python scripts/test_msix.py
       - run: python scripts/test_sign_macos.py
+      - run: python -B scripts/test_deb.py
+      - run: python -B scripts/test_macos_dmg.py
+      - run: python -B scripts/test_sign_macos_dmg.py
+      - name: Native DMG round trip with synthetic unsigned data
+        if: runner.os == 'macOS'
+        run: python3 -B scripts/test_macos_dmg_native.py
       - run: python scripts/test_submit_store_release.py
+      - run: python scripts/test_store_release_state.py
+      - run: python scripts/test_production_readiness.py
       - run: python scripts/build_release.py
       - run: python scripts/test_msix_runtime_tests.py
       - run: python scripts/package.py
+      - name: Build and test Ubuntu installation candidate in a disposable container
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          PORTABLE="dist/PeerBrush-$VERSION-Linux-x64.zip"
+          DIGEST=$(sha256sum "$PORTABLE" | cut -d ' ' -f 1)
+          python3 -B scripts/package_deb.py --portable "$PORTABLE" --portable-sha256 "$DIGEST" --output dist/deb --maintainer 'PeerBrush CI fixture <builds@example.invalid>'
+          docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
+            --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" ubuntu:24.04 \
+            bash -eu -c 'apt-get update; apt-get install -y python3 xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd; set -- /packages/*.deb; test "$#" -eq 1; python3 -B /checks/test_deb_installation.py --package "$1"'
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: DEB-installation-candidate
+          path: dist/deb/*
+          if-no-files-found: error
       - name: Prepare exact-identity Store MSIX candidate
         if: runner.os == 'Windows' && inputs.build_store_msix
         shell: pwsh
@@ -99,11 +132,11 @@ jobs:
     needs: native
     runs-on: ubuntu-24.04
     env:
-      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.expected_commit }}
+          ref: ${{ inputs.expected_commit || github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
@@ -115,6 +148,8 @@ jobs:
           python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
           python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
+          python scripts/production_readiness.py --directory dist --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist/production-readiness.json
+          echo 'Exact-source candidate archives verified. Production publication remains blocked pending native signing, installed acceptance, protected approval and public asset reconciliation.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: verified-release-candidate

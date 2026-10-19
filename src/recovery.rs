@@ -138,6 +138,14 @@ pub fn discard(dir: &Path, snapshot: &str) -> Result<(), String> {
         .ok_or("Recovery version no longer exists; refresh the list")?;
     remove(dir, &entry)
 }
+pub fn discard_in(
+    workspace: &workspace::Registry,
+    dir: &Path,
+    snapshot: &str,
+) -> Result<(), String> {
+    let _operation = server::FileOperation::begin_workspace(workspace)?;
+    discard(dir, snapshot)
+}
 fn discard_project(dir: &Path, project: &str) -> Result<(), String> {
     for entry in catalog(dir).into_iter().filter(|e| e.project_id == project) {
         remove(dir, &entry)?;
@@ -271,6 +279,13 @@ fn persist(
 /// Encoding runs outside the engine lock. Newer work stays dirty and is picked up
 /// by the next tick; a checkpoint never changes saved_revision or original files.
 pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Versions) {
+    let _operation = {
+        let state = workspace.lock().unwrap();
+        if state.exiting {
+            return;
+        }
+        server::FileOperation::track(state.file_operations.clone())
+    };
     let gate = gate(dir);
     let _guard = gate.lock().unwrap();
     let mut failures = workspace.lock().unwrap().recovery_failures.clone();

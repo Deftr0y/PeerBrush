@@ -3,6 +3,9 @@
 use crate::{server::Shared, workspace};
 use std::{collections::VecDeque, ffi::OsString, path::PathBuf};
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 pub const MAX_PENDING_FILES: usize = workspace::MAX_PROJECTS;
 
 /// Extract global options without consuming a filename passed after --open or --.
@@ -10,7 +13,16 @@ pub fn arguments(
     args: impl IntoIterator<Item = OsString>,
     default_state_dir: PathBuf,
 ) -> Result<(PathBuf, Vec<OsString>), String> {
+    storage_arguments(args, default_state_dir).map(|(state, args, _)| (state, args))
+}
+
+/// An explicit workspace keeps its existing instance-local preferences.
+pub fn storage_arguments(
+    args: impl IntoIterator<Item = OsString>,
+    default_state_dir: PathBuf,
+) -> Result<(PathBuf, Vec<OsString>, bool), String> {
     let mut state_dir = default_state_dir;
+    let mut local_preferences = false;
     let mut rest = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -28,11 +40,12 @@ pub fn arguments(
                 return Err("--state-dir needs a path".into());
             }
             state_dir = PathBuf::from(path);
+            local_preferences = true;
         } else {
             rest.push(arg);
         }
     }
-    Ok((state_dir, rest))
+    Ok((state_dir, rest, local_preferences))
 }
 
 /// Classify error presentation before parsing can fail. Broken MCP/headless
@@ -44,9 +57,10 @@ pub fn native_error_dialog(args: impl IntoIterator<Item = OsString>) -> bool {
             Some("--state-dir") => {
                 args.next();
             }
-            Some("mcp" | "cli" | "discover" | "--version" | "-V" | "--help" | "--headless") => {
-                return false
-            }
+            Some(
+                "mcp" | "cli" | "discover" | "settings" | "updates" | "--version" | "-V" | "--help"
+                | "--headless",
+            ) => return false,
             _ => return true,
         }
     }
