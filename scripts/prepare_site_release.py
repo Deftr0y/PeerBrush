@@ -3,6 +3,7 @@ import argparse
 import datetime
 import hashlib
 import html
+import http.client
 import io
 import json
 import os
@@ -27,6 +28,7 @@ REPOSITORY = 'Deftr0y/PeerBrush'
 API = 'https://api.github.com/repos/' + REPOSITORY + '/'
 DOWNLOAD = 'https://github.com/' + REPOSITORY + '/releases/download/'
 RELEASE = 'https://github.com/' + REPOSITORY + '/releases/tag/'
+WEBSITE = 'https://peerbrush.com/'
 SITE_FILES = ['downloads.json', 'index.html', 'main.js', 'platform.js',
               'releases.js', 'release-page.js', 'releases.html']
 NUMERIC = r'(?:0|[1-9][0-9]*)'
@@ -48,12 +50,31 @@ def file_sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def public_url(url, *, api=False, redirected=False):
+def inventory_sha(inventory):
+    return sha(json.dumps(inventory, sort_keys=True, separators=(',', ':')).encode())
+
+
+class Unavailable(ValueError):
+    """Public bytes were not available for verification; contains no remote URL."""
+
+
+def public_url(url, *, api=False, redirected=False, website=False):
     try:
         parsed = urllib.parse.urlsplit(url)
         if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.port
                 or parsed.fragment or any(ord(c) < 33 for c in url)):
             return False
+        if website:
+            if (len(url) > 512 or redirected or parsed.hostname != 'peerbrush.com'
+                    or parsed.path not in {'/', *('/' + name for name in SITE_FILES)}):
+                return False
+            pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
+            values = dict(pairs)
+            if pairs and (len(values) != len(pairs) or not set(values) <= {'release', 'layout'}
+                          or not re.fullmatch('v' + STABLE, values.get('release', ''))
+                          or ('layout' in values and not re.fullmatch(NUMERIC, values['layout']))):
+                return False
+            return url == WEBSITE[:-1] + parsed.path + ('?' + urllib.parse.urlencode(pairs) if pairs else '')
         if redirected:
             return parsed.hostname in {'release-assets.githubusercontent.com', 'objects.githubusercontent.com'}
         expected = API if api else DOWNLOAD
@@ -63,29 +84,33 @@ def public_url(url, *, api=False, redirected=False):
 
 
 class PublicRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, website=False):
+        self.website = website
+
     def redirect_request(self, request, response, code, message, headers, url):
-        if not public_url(url, redirected=True):
-            raise ValueError('Public asset redirect left the allowed HTTPS download hosts.')
+        if self.website or not public_url(url, redirected=True):
+            raise Unavailable('Public asset redirect left the allowed HTTPS download hosts.')
         return super().redirect_request(request, response, code, message, headers, url)
 
 
-def public_get(url, limit, *, api=False, destination=None):
+def public_get(url, limit, *, api=False, destination=None, website=False):
     """Unauthenticated GET only; no environment credentials or error URLs in logs."""
-    if not public_url(url, api=api) or type(limit) is not int or not 0 < limit <= 512 * 1024 * 1024:
+    if not public_url(url, api=api, website=website) or (api and website) or type(limit) is not int or not 0 < limit <= 512 * 1024 * 1024:
         raise ValueError('Unexpected public release URL.')
     if destination is None and limit > 2 * 1024 * 1024:
         raise ValueError('Large public assets require a temporary file destination.')
     headers = {'User-Agent': 'PeerBrush-public-release-verifier',
-               'Accept': 'application/vnd.github+json' if api else 'application/octet-stream'}
+               'Accept': 'application/vnd.github+json' if api else 'application/octet-stream',
+               'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
     try:
         deadline = time.monotonic() + 120
-        opener = urllib.request.build_opener(PublicRedirect())
+        opener = urllib.request.build_opener(PublicRedirect(website))
         with opener.open(urllib.request.Request(url, headers=headers), timeout=15) as response:
             # API calls must never redirect to a binary host.
-            if response.geturl() != url and (api or not public_url(response.geturl(), redirected=True)):
+            if response.geturl() != url and (api or website or not public_url(response.geturl(), redirected=True)):
                 raise ValueError('Unexpected final public release URL.')
             if response.status != 200:
-                raise ValueError('Public release GET did not return HTTP 200.')
+                raise Unavailable('Public release GET did not return HTTP 200.')
             size = response.headers.get('Content-Length')
             if size is not None and (not size.isdecimal() or int(size) > limit):
                 raise ValueError('Public release response exceeds its size budget.')
@@ -98,13 +123,13 @@ def public_get(url, limit, *, api=False, destination=None):
             with sink:
                 while True:
                     if time.monotonic() >= deadline:
-                        raise ValueError('Public release transfer exceeded its total deadline.')
+                        raise Unavailable('Public release transfer exceeded its total deadline.')
                     # HTTPResponse.read may fill the whole request across many
                     # socket reads. read1 returns available data so a dribbling
                     # body cannot indefinitely postpone the deadline check.
                     chunk = response.read1(min(64 * 1024, limit + 1 - total))
                     if time.monotonic() >= deadline:
-                        raise ValueError('Public release transfer exceeded its total deadline.')
+                        raise Unavailable('Public release transfer exceeded its total deadline.')
                     if not chunk:
                         break
                     total += len(chunk)
@@ -116,8 +141,8 @@ def public_get(url, limit, *, api=False, destination=None):
             if size is not None and total != int(size):
                 raise ValueError('Public release response is oversized or truncated.')
             return data if destination is None else destination
-    except (urllib.error.URLError, TimeoutError):
-        raise ValueError('Public release GET failed; no website update was prepared.') from None
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
+        raise Unavailable('Public release GET failed; no website update was prepared.') from None
 
 
 def recognize(name, version):
@@ -156,6 +181,13 @@ def validate_inventory(inventory, commit, version):
         if not isinstance(name, str) or str(relative_path(name)) != name or '/' in name or name in found:
             raise ValueError('Invalid or duplicate release inventory filename.')
         kind, platform = recognize(name, version)
+        fields = {'file', 'bytes', 'sha256'}
+        if platform is not None:
+            fields |= {'platform', 'architecture', 'binary_source_commit', 'source_sha256'}
+        if kind == 'zip':
+            fields |= {'executable_sha256', 'native_publisher_signing', 'signing_verification'}
+        if set(record) != fields:
+            raise ValueError('Final inventory permits only the reviewed public source/asset metadata fields.')
         if ((kind, platform) in kinds or type(record.get('bytes')) is not int
                 or not 0 < record['bytes'] <= 512 * 1024 * 1024
                 or not re.fullmatch('[0-9a-f]{64}', str(record.get('sha256')))):
@@ -418,6 +450,7 @@ def prepare(root, site_commit, inventory, tag, commit, notes, output, get=public
     report = dict(schema=1, version=tag, commit=commit, site_commit=site_commit,
                   site_update_prepared=bool(overlay), deployment_performed=False,
                   production_readiness='not-assessed', store_public_availability='unverified',
+                  release_inventory_sha256=inventory_sha(inventory),
                   excluded=excluded, files={name: sha(data) for name, data in overlay.items()})
     # Verification may involve several transfers. Recheck links/worktrees at
     # the point of use instead of relying on the earlier advisory path check.
