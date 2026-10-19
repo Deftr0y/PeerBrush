@@ -1,12 +1,27 @@
 """Build native release binaries without embedding personal checkout paths."""
 import argparse
+import hashlib
 import os
 import pathlib
 import subprocess
+from package import git
+
+
+def source_input_state(root):
+    """Cargo invalidation only; build.rs independently obtains the source label."""
+    try:
+        top = pathlib.Path(git(root, 'rev-parse', '--show-toplevel').decode().strip()).resolve()
+        if top != root.resolve():
+            return 'unknown'
+        parts = [git(root, *args) for args in [('rev-parse', 'HEAD'), ('status', '--porcelain=v1', '-z', '--untracked-files=normal'), ('ls-files', '-v', '-z')]]
+        return hashlib.sha256(b'\0'.join(parts)).hexdigest()
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return 'unknown'
 
 
 def release_environment(root, inherited=None):
     environment = dict(os.environ if inherited is None else inherited)
+    environment['PEERBRUSH_BUILD_INPUT_STATE'] = source_input_state(root)
     if environment.get('RUSTFLAGS') and not environment.get('CARGO_ENCODED_RUSTFLAGS'):
         raise ValueError('Use CARGO_ENCODED_RUSTFLAGS to preserve custom compiler options')
     home = pathlib.Path.home()
