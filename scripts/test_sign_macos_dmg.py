@@ -47,6 +47,20 @@ class DmgSigning(unittest.TestCase):
         self.verify_mock = self.verifier.start()
         self.addCleanup(self.verifier.stop)
 
+    def test_prereleases_fail_before_any_provider_or_preparation_calls(self):
+        original = self.archive.read_bytes()
+        with mock.patch.object(sign_macos, 'preflight') as provider, mock.patch.object(package_macos_dmg, 'prepare') as preparation:
+            for version in ['0.30.0-dev.1', '0.30.0-beta.1', '0.30.0-rc.1', '0.30.0+build']:
+                for resume in [False, True]:
+                    with self.subTest(version=version, resume=resume), self.assertRaisesRegex(ValueError, 'stable A.B.C release'):
+                        self.sign(version=version, resume=resume)
+            provider.assert_not_called()
+            preparation.assert_not_called()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.archive.read_bytes(), original)
+        self.assertFalse(self.work.exists())
+        self.assertFalse(self.output.exists())
+
     def fake_run(self, command, **kwargs):
         self.calls.append(command)
         if command[0] == '/usr/bin/codesign' and command[-1].endswith('.dmg'):

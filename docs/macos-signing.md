@@ -45,7 +45,7 @@ python3 -B scripts/sign_macos.py \
   --output "${SIGNED_OUTPUT:?select a separate directory outside the checkout}"
 ```
 
-The signer verifies the input against the exact committed source policy, then performs these steps:
+The signer accepts only a canonical stable `A.B.C` release version; every prerelease/internal development candidate fails before any provider access, signing or resumable work. It verifies the input against the exact committed source policy, then performs these steps. Unreleased v0.3 bundles include the icon, document declarations and installed license/notices described in [macOS integration](macos-integration.md) before sealing. Signing must preserve these bytes; do not add them to an already signed app. Historical 0.26 artifacts and protected signing workflow pins retain their existing source/layout.
 
 - Confirm a valid existing Developer ID Application identity belonging to the explicit team, and validate the existing notary profile's access.
 - Sign the `.app` with hardened runtime and a secure timestamp. Only the reviewed single-executable bundle is supported. There is no `--deep` signing and no entitlement exception such as debugger access, disabled library validation or unsigned executable memory.
@@ -95,7 +95,7 @@ python3 -B scripts/package_macos_dmg.py \
 
 Output must be outside the checkout. The original signed ZIP/app remains unchanged. The DMG contains the app and drag-to-Applications shortcut, with original source, licenses and support files retained separately in `Documentation and source`. Its mounted app receives the same Developer ID/Team ID, hardened runtime, secure timestamp, entitlement, ticket and Gatekeeper verification as the original ZIP. The DMG itself is an **unsigned, unnotarized preparation candidate**, not a published installer; app notarization is not recorded as image notarization.
 
-`sign_macos.py --format dmg` implements image signing and notarization through the same preflight, temporary-keychain selection, submission journal, accepted log/digest verification and resume logic as ZIP signing. ZIP remains the default. With separately authorized provider access, take the independently verified original signed ZIP as input:
+`sign_macos.py --format dmg` implements image signing and notarization through the same preflight, existing-keychain selection, submission journal, accepted log/digest verification and resume logic as ZIP signing. ZIP remains the default. Both formats reject prereleases before any provider call, including on resume. With separately authorized provider access, take the independently verified original signed ZIP as input:
 
 ```sh
 python3 -B scripts/sign_macos.py --format dmg \
@@ -113,7 +113,7 @@ Finalization staples a separate copy, verifies its Developer ID/Team ID, identif
 
 Signed image receipts still say `release_ready: false` while drag/install and quarantined-download acceptance remain open. A signed DMG is not automatically accepted by the existing ZIP-only release/website inventory. Public integration must verify the final signed image and checksums, actual platform acceptance and public downloads. Do not rename an unsigned preparation candidate as signed or reuse a pre-signing checksum.
 
-Native acceptance still requires a fresh quarantined browser download, Finder drag to Applications, first/offline launch, upgrade/replacement with unsaved-work protection, settings retention, MCP launch path and PSD/PSB opening. The current app's support files live beside it in the archive/DMG. Before relying on these files after dragging only the app, move required installed resources/notices into `Contents/Resources` **before future signing**, updating the source/package inspector and tests together. Never insert files into an already sealed app. Retaining source/notices on this candidate volume preserves the distribution, but does not establish the installed-support layout.
+Native acceptance still requires a fresh quarantined browser download, Finder drag to Applications, first/offline launch, upgrade/replacement with unsaved-work protection, settings retention, MCP launch path and PSD/PSB opening. Unreleased v0.3 includes the committed icon and verified installed license/notices in `Contents/Resources` before sealing; exact archive inspection requires and verifies them. Corresponding source and public support guides remain alongside the app in the distribution, as described in [installed integration](macos-integration.md). Historical 0.26 bundles retain their original layout. Never insert files into an already sealed app; source implementation and synthetic tests do not establish installed acceptance.
 
 `python3 -B scripts/test_macos_dmg.py` and `scripts/test_sign_macos_dmg.py` use synthetic signed ZIP fixtures and mocked Apple commands, including rejected/pending/interrupted notarization, hash/signature/payload failures, finalization retries and same-submission resume. `python3 -B scripts/test_macos_dmg_native.py` runs actual image creation, verification and read-only mounting on macOS using synthetic unsigned bytes that are never executed. CI and release-candidate tests run the native smoke without credentials. These tests do not claim a real signed image or a completed installation.
 
