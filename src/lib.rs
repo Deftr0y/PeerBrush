@@ -47,6 +47,7 @@ pub mod retouch;
 pub mod segmentation;
 pub mod selection;
 pub mod server;
+pub mod settings;
 pub mod smart_mask;
 pub mod smudge;
 pub mod source;

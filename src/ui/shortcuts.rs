@@ -104,6 +104,14 @@ pub(super) struct Shortcuts {
     pub message: String,
     temporary: Option<Tool>,
 }
+pub(crate) fn validate_file(path: &Path) -> Result<(), String> {
+    if let Some(bytes) = crate::tool_settings::read_owned(path)? {
+        let preferences =
+            serde_json::from_slice(&bytes).map_err(|e| format!("Unreadable shortcuts: {e}"))?;
+        Shortcuts::validate(&preferences)?;
+    }
+    Ok(())
+}
 impl Shortcuts {
     pub fn load(state: &Path) -> Self {
         let mut this = Self {
@@ -490,6 +498,25 @@ mod tests {
         shortcuts.apply(remapped.clone()).unwrap();
         let bytes = std::fs::read(root.join("shortcuts.json")).unwrap();
         assert!(Shortcuts::load(&root).preferences == remapped);
+        let user = root.join("per-user");
+        let locations = crate::settings::Locations {
+            config: user.join("config"),
+            data: user.join("data"),
+            cache: user.join("cache"),
+        };
+        let profile = crate::settings::Profile::migrate(locations, &root).unwrap();
+        assert!(Shortcuts::load(&profile.locations.profile()).preferences == remapped);
+        assert_eq!(
+            std::fs::read(
+                profile
+                    .locations
+                    .profile()
+                    .join("migration-backup/shortcuts.json")
+            )
+            .unwrap(),
+            bytes
+        );
+        drop(profile);
         let mut conflict = remapped.clone();
         conflict.bindings.get_mut("Brush").unwrap().key = "D".into();
         assert!(shortcuts.apply(conflict).is_err());
