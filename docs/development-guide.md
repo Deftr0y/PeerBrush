@@ -66,6 +66,8 @@ Use the Ember palette, compact unboxed controls and the connected Color/Mask sel
 
 Use only an approved human Git identity from `.github/human-contributors.json`. Never add an AI author, committer, co-author or contributor badge. Keep the README's AI-development disclosure. Do not commit credentials, runtime state, recovery files, local tools, QA captures or build output. Required bundled artwork, fonts and licenses belong in source and packages. Review the actual diff and package contents through the [privacy/security gate](release-maintenance.md#privacy-and-security-publication-gate).
 
+Default launches use the versioned [per-user preferences profile](settings.md). Explicit `--state-dir` development workspaces retain instance-local settings and cache; keep their MCP launch arguments unchanged. Never copy entire runtime directories into settings migration or package inputs: recovery files, discovery tokens, artwork and unknown private files have separate ownership.
+
 ## Release promotion and website
 
 Before version → dev, complete the intended scope and report unresolved acceptance work. Before dev → main, confirm the release version and notes, all required checks, native acceptance evidence and a clean reviewed release source. Production publication must use Windows, macOS and Linux packages built and verified from the exact same production commit and version; never relabel an older platform binary.

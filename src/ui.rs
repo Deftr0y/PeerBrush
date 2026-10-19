@@ -33,6 +33,7 @@ mod retouch;
 mod saved_versions;
 mod selection;
 mod shortcuts;
+pub(crate) use shortcuts::validate_file as validate_shortcut_preferences;
 mod source;
 mod style_settings;
 mod tabs;
@@ -500,6 +501,17 @@ pub struct PeerBrush {
     gizmo_bounds: Option<(String, u64, [i32; 4])>,
 }
 impl PeerBrush {
+    pub fn new_with_preferences(
+        cc: &eframe::CreationContext<'_>,
+        shared: Shared,
+        connection: Connection,
+        preferences: &Path,
+    ) -> Self {
+        let mut app = Self::new(cc, shared, connection);
+        app.shortcuts = shortcuts::Shortcuts::load(preferences);
+        app
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, shared: Shared, connection: Connection) -> Self {
         if let Some(state) = &cc.wgpu_render_state {
             let _ = crate::gpu::install(state);

@@ -723,7 +723,7 @@ pub fn capabilities() -> Value {
         .as_array_mut()
         .unwrap()
         .push(json!({"op":"filter.add","preset":"posterize","settings":{"levels":5},"weight":0.6}));
-    result["filter_library"] = json!({"tool":"peerbrush_filters","actions":["list","thumbnail","preview","save","rename","delete","import","export"],"curated":15,"custom_limit":crate::filter_library::LIMIT,"file_limit":crate::filter_library::FILE_LIMIT,"scope":"Whole document; filter.add/update/delete/reorder run after the composite, independent of selected layer. Top runs last. Locks, reservations and revision guards apply.","precision":"Native 8/16-bit sources, effects and strength; previews project only for display.","preview":"Explicit current project/document/revision. Actual PNG/document_rect plus frozen commands; no shared edit or history. Thumbnails use filter_thumbnail reference coordinates.","storage":"Instance-local filters.json outside history; strict versioned import/export. Curated immutable, invalid or externally changed files preserved.","psd":"Format 15 editable sources plus current filtered standard raster/mask/composite; older readers remain protected.","cache_bytes":crate::filters::CACHE_BUDGET,"limits":"32 document filters; native derived output/scratch budgets apply. Liquify is a layer effect."});
+    result["filter_library"] = json!({"tool":"peerbrush_filters","actions":["list","thumbnail","preview","save","rename","delete","import","export"],"curated":15,"custom_limit":crate::filter_library::LIMIT,"file_limit":crate::filter_library::FILE_LIMIT,"scope":"Whole document; filter.add/update/delete/reorder run after the composite, independent of selected layer. Top runs last. Locks, reservations and revision guards apply.","precision":"Native 8/16-bit sources, effects and strength; previews project only for display.","preview":"Explicit current project/document/revision. Actual PNG/document_rect plus frozen commands; no shared edit or history. Thumbnails use filter_thumbnail reference coordinates.","storage":"Configured preferences directory filters.json outside history; strict versioned import/export. Curated immutable, invalid or externally changed files preserved.","psd":"Format 15 editable sources plus current filtered standard raster/mask/composite; older readers remain protected.","cache_bytes":crate::filters::CACHE_BUDGET,"limits":"32 document filters; native derived output/scratch budgets apply. Liquify is a layer effect."});
     result
 }
 
@@ -2495,6 +2495,16 @@ fn handle_http(
 }
 
 pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
+    start_with_preferences(shared, state_dir.clone(), &state_dir, &state_dir)
+}
+
+/// Preferences/cache may be per-user while external discovery and recovery stay stable.
+pub fn start_with_preferences(
+    shared: Shared,
+    state_dir: PathBuf,
+    preferences: &Path,
+    cache: &Path,
+) -> Result<Connection, String> {
     fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
     let instance_lock = fs::OpenOptions::new()
         .create(true)
@@ -2504,24 +2514,24 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         .open(state_dir.join("instance.lock"))
         .map_err(|e| e.to_string())?;
     instance_lock.try_lock().map_err(|_|"PeerBrush is already running for this workspace. Use that window or a different --state-dir.".to_string())?;
-    crate::disk_cache::configure(&state_dir);
-    let library = crate::brush_library::Library::load(state_dir.join("brushes.json"));
+    crate::disk_cache::configure(cache);
+    let library = crate::brush_library::Library::load(preferences.join("brushes.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().brush_library.lock().unwrap() = library;
-    let preferences = crate::tool_settings::Store::load(state_dir.join("tool-settings.json"));
-    if let Some(error) = &preferences.error {
+    let tools = crate::tool_settings::Store::load(preferences.join("tool-settings.json"));
+    if let Some(error) = &tools.error {
         shared.lock().unwrap().status = error.clone();
     }
-    *shared.lock().unwrap().tool_settings.lock().unwrap() = preferences;
-    let library = crate::filter_library::Library::load(state_dir.join("filters.json"));
+    *shared.lock().unwrap().tool_settings.lock().unwrap() = tools;
+    let library = crate::filter_library::Library::load(preferences.join("filters.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().filter_library.lock().unwrap() = library;
     let library =
-        crate::production_export::library::Library::load(state_dir.join("export-presets.json"));
+        crate::production_export::library::Library::load(preferences.join("export-presets.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }
