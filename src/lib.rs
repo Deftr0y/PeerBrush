@@ -52,6 +52,7 @@ pub mod settings;
 pub mod smart_mask;
 pub mod smudge;
 pub mod source;
+pub mod sparkle;
 pub mod svg;
 pub mod thumbnails;
 pub mod tool_settings;

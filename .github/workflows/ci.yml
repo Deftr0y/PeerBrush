@@ -153,6 +153,14 @@ jobs:
       - name: Native DMG round trip with synthetic unsigned data
         if: runner.os == 'macOS'
         run: python3 -B scripts/test_macos_dmg_native.py
+      - run: python -B scripts/test_prepare_sparkle.py
+      - name: Verify disabled native Sparkle preparation
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/Sparkle-2.10.0.zip" 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip'
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --output "$RUNNER_TEMP/peerbrush-sparkle-preparation"
+          cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-preparation/Sparkle.framework"
       - run: python scripts/test_submit_store_release.py
       - run: python scripts/test_store_release_state.py
       - run: python scripts/test_production_readiness.py
