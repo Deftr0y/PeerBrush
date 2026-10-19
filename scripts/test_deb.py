@@ -4,6 +4,7 @@ import io
 import pathlib
 import os
 import sys
+import subprocess
 import tarfile
 import unittest
 from unittest import mock
@@ -186,6 +187,24 @@ class DebianPackage(unittest.TestCase):
 
 
 class TarInspection(unittest.TestCase):
+    def test_native_failures_keep_bounded_diagnostics_without_arguments_or_environment(self):
+        failure = subprocess.CalledProcessError(100, ['apt-get', 'SYNTHETIC_ARGUMENT_NOT_FOR_LOGS'],
+                                               output='progress\n' * 1000, stderr='E: synthetic unmet dependencies\x00\n')
+        with mock.patch.object(installation.subprocess, 'run', side_effect=failure):
+            with self.assertRaisesRegex(ValueError, 'apt-get exited 100') as caught:
+                installation.run(['apt-get', 'SYNTHETIC_ARGUMENT_NOT_FOR_LOGS'], env={'SYNTHETIC_PRIVATE_ENV': 'do not log'})
+        message = str(caught.exception)
+        self.assertIn('E: synthetic unmet dependencies', message)
+        self.assertNotIn('SYNTHETIC_ARGUMENT_NOT_FOR_LOGS', message)
+        self.assertNotIn('SYNTHETIC_PRIVATE_ENV', message)
+        self.assertNotIn('\x00', message)
+        self.assertLess(len(message), 4300)
+        timeout = subprocess.TimeoutExpired(['apt-get'], 600, stderr=b'synthetic timeout detail')
+        with mock.patch.object(installation.subprocess, 'run', side_effect=timeout):
+            with self.assertRaisesRegex(ValueError, 'apt-get timed out.*') as caught:
+                installation.run(['apt-get'])
+        self.assertIn('synthetic timeout detail', str(caught.exception))
+
     def test_installation_check_refuses_host_before_any_command_or_writes(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(installation, 'run') as native:
             with self.assertRaisesRegex(ValueError, 'never run on the host'):

@@ -22,7 +22,21 @@ def run(command, **kwargs):
     try:
         return subprocess.run(command, check=True, capture_output=True, text=True, timeout=600, **kwargs).stdout.strip()
     except (OSError, subprocess.SubprocessError) as error:
-        raise ValueError(f'{pathlib.Path(command[0]).name} failed in the disposable installation check') from error
+        # check() guards this disposable synthetic container before any command.
+        # Report bounded process diagnostics, never arguments or environment.
+        output = []
+        for stream in [getattr(error, 'stdout', None), getattr(error, 'stderr', None)]:
+            if isinstance(stream, bytes):
+                stream = stream.decode('utf-8', errors='replace')
+            if stream:
+                output.append(stream)
+        detail = '\n'.join('\n'.join(output).splitlines()[-24:])[-4096:]
+        detail = ''.join(char for char in detail if char.isprintable() or char == '\n')
+        status = (' timed out' if isinstance(error, subprocess.TimeoutExpired)
+                  else f' exited {error.returncode}' if isinstance(error, subprocess.CalledProcessError)
+                  else ' could not start')
+        raise ValueError(f'{pathlib.Path(command[0]).name}{status} in the disposable installation check'
+                         + (':\n' + detail if detail else '')) from error
 
 
 def require_disposable():
