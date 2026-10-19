@@ -33,6 +33,70 @@ pub fn request_close(
 /// engines in the same order as transfers, then checks the registry at commit.
 /// No engine is closed when any source, save, reservation or project set changed.
 pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), String> {
+    finish(workspace, reviewed, false)
+}
+
+/// Future verified native installers must use this path, never a discard-capable
+/// ordinary close. The native caller must also reject unfinished UI gestures.
+pub fn finish_update_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), String> {
+    finish(workspace, reviewed, true)
+}
+
+fn update_project_ready(e: &Engine) -> Result<(), String> {
+    if e.doc.revision != e.saved_revision
+        || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version)
+    {
+        return Err(format!(
+            "Save {} before restarting for an update",
+            e.doc.name
+        ));
+    }
+    if e.file_operations.load(std::sync::atomic::Ordering::Acquire) != 0
+        || e.loading.is_some()
+        || e.code_states()
+            .as_array()
+            .is_some_and(|jobs| jobs.iter().any(|job| job["running"] == true))
+    {
+        return Err(
+            "Finish the active file, loading or code operation before restarting for an update"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Read-only readiness inspection. The source-bound atomic exit checks again.
+pub fn update_readiness(workspace: &Registry) -> Result<Vec<Reviewed>, String> {
+    let mut reviewed = vec![];
+    for (project, _, shared) in entries_in(workspace) {
+        let e = shared
+            .try_lock()
+            .map_err(|_| "A project is still working")?;
+        e.ensure_open()?;
+        update_project_ready(&e)?;
+        reviewed.push(Reviewed {
+            project,
+            document: e.doc.id.clone(),
+            revision: e.doc.revision,
+            discard: false,
+        });
+    }
+    let state = workspace.lock().unwrap();
+    if state.exiting
+        || state
+            .file_operations
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
+        return Err(
+            "Finish the current workspace/recovery operation before restarting for an update"
+                .into(),
+        );
+    }
+    Ok(reviewed)
+}
+
+fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(), String> {
     let mut entries = entries_in(workspace);
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut reviewed: Vec<_> = reviewed.iter().collect();
@@ -56,6 +120,12 @@ pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), St
         .collect::<Result<_, _>>()?;
     for (e, r) in engines.iter_mut().zip(&reviewed) {
         guard(e, &r.document, r.revision)?;
+        if update {
+            if r.discard {
+                return Err("Update restart cannot discard unsaved work".into());
+            }
+            update_project_ready(e)?;
+        }
         if !r.discard
             && (e.doc.revision != e.saved_revision
                 || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version))
@@ -74,6 +144,16 @@ pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), St
         )?;
     }
     let mut registry = workspace.lock().unwrap();
+    if update
+        && registry
+            .file_operations
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    {
+        return Err(
+            "Finish the workspace/recovery operation before restarting for an update".into(),
+        );
+    }
     let mut live: Vec<_> = registry.entries.iter().map(|p| p.id.as_str()).collect();
     live.sort_unstable();
     if registry.exiting

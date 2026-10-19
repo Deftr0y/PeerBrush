@@ -41,6 +41,7 @@ mod tool_settings;
 #[cfg(test)]
 mod tool_settings_tests;
 mod transform_snapping;
+mod updates;
 mod view;
 use crate::{controls, thumbnails};
 use crate::{
@@ -325,6 +326,7 @@ pub struct PeerBrush {
     canvas_press_document: Option<String>,
     canvas_input_region: Option<(Rect, egui::LayerId)>,
     jobs: HashSet<String>,
+    updates: updates::Panel,
     lifecycle: Option<lifecycle::Review>,
     recovery: recovery::Browser,
     saved_versions: Option<saved_versions::Browser>,
@@ -509,6 +511,7 @@ impl PeerBrush {
     ) -> Self {
         let mut app = Self::new(cc, shared, connection);
         app.shortcuts = shortcuts::Shortcuts::load(preferences);
+        app.updates = updates::Panel::load(preferences);
         app
     }
 
@@ -686,6 +689,7 @@ impl PeerBrush {
             transfer_rx,
             shared,
             shortcuts: shortcuts::Shortcuts::load(&connection.state_dir),
+            updates: updates::Panel::load(&connection.state_dir),
             connection,
             selection_layers: [selected.clone()].into_iter().collect(),
             selection_anchor: selected.clone(),
@@ -4552,6 +4556,7 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.updates_tick(ctx);
         self.selection_commit_failed = false;
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
@@ -4614,6 +4619,7 @@ impl PeerBrush {
             self.show_calibration = panel == "calibration";
             self.show_view = panel == "view";
             self.shortcuts.open = panel == "shortcuts";
+            self.updates.open = panel == "updates";
             if panel == "solo_color" || panel == "solo_mask" {
                 self.mask = panel == "solo_mask";
                 let active = !self.mask
@@ -5033,6 +5039,10 @@ impl PeerBrush {
                         }
                         if ui.button("Production export…").clicked() {
                             self.open_exports(&doc);
+                            ui.close_menu();
+                        }
+                        if ui.button("Updates…").clicked() {
+                            self.updates.open = true;
                             ui.close_menu();
                         }
                     });
@@ -5616,6 +5626,7 @@ impl PeerBrush {
         self.pressure_calibration(ctx);
         self.canvas_view_window(ctx);
         self.shortcuts_window(ctx);
+        self.updates_dialog(ctx);
         self.finish_capture(ctx, drawn_generation);
         self.sync_tool_profile(ctx);
         if self.tool_preferences_ai(ctx.input(|i| i.time)) {

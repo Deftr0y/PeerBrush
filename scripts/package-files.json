@@ -308,7 +308,11 @@
     "packaging/msix/Assets/Square150x150Logo.png",
     "packaging/msix/Assets/Square44x44Logo.png",
     "packaging/msix/Assets/StoreLogo.png",
-    "docs/settings.md"
+    "docs/settings.md",
+    "src/updates.rs",
+    "src/updates_tests.rs",
+    "src/ui/updates.rs",
+    "docs/updates.md"
   ],
   "portable": [
     "LICENSE",
@@ -348,7 +352,8 @@
     "docs/layer-styles.md",
     "docs/release-0.25.md",
     "docs/release-0.26.md",
-    "docs/settings.md"
+    "docs/settings.md",
+    "docs/updates.md"
   ],
   "readme": "scripts/package-readme.md",
   "vendored": [

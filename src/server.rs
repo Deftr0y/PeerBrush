@@ -16,6 +16,24 @@ use std::{
 };
 
 pub type Shared = Arc<Mutex<Engine>>;
+
+pub(crate) struct FileOperation(pub(crate) Arc<std::sync::atomic::AtomicUsize>);
+impl FileOperation {
+    pub(crate) fn begin(shared: &Shared) -> Result<Self, String> {
+        let engine = shared.lock().unwrap();
+        engine.ensure_open()?;
+        Ok(Self::track(engine.file_operations.clone()))
+    }
+    pub(crate) fn track(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+impl Drop for FileOperation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 #[cfg(test)]
 #[path = "save_safety_tests.rs"]
 mod save_safety_tests;
@@ -423,6 +441,7 @@ fn save_prepared(
     request: &Value,
     before_commit: impl FnOnce(),
 ) -> Result<(), String> {
+    let _operation = FileOperation::begin(shared)?;
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -562,6 +581,7 @@ pub(crate) fn export_derived_guarded(
     control: &crate::production_export::Control,
     encode: impl FnOnce(&crate::engine::Document) -> Result<Vec<u8>, String>,
 ) -> Result<bool, String> {
+    let _operation = FileOperation::begin(shared)?;
     control.check()?;
     if path
         .extension()
@@ -1329,6 +1349,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "calibration",
                     "view",
                     "shortcuts",
+                    "updates",
                 ]
                 .contains(&name)
             }) {
