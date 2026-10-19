@@ -3,6 +3,9 @@
 use crate::{server::Shared, workspace};
 use std::{collections::VecDeque, ffi::OsString, path::PathBuf};
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 pub const MAX_PENDING_FILES: usize = workspace::MAX_PROJECTS;
 
 /// Extract global options without consuming a filename passed after --open or --.

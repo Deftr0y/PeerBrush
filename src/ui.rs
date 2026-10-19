@@ -515,6 +515,8 @@ impl PeerBrush {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, shared: Shared, connection: Connection) -> Self {
+        #[cfg(target_os = "macos")]
+        crate::activation::macos::repaint_with(&cc.egui_ctx);
         if let Some(state) = &cc.wgpu_render_state {
             let _ = crate::gpu::install(state);
         }

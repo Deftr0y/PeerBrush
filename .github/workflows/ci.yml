@@ -138,6 +138,12 @@ jobs:
           PY
           exit "$test_status"
       - run: cargo clippy --all-targets --locked
+      - name: Verify native macOS document delivery and icon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo run --locked --example macos_activation
+          sips -s format png assets/peerbrush.icns --out "$RUNNER_TEMP/peerbrush-icon.png"
       - run: python scripts/test_package.py
       - run: python scripts/test_msix.py
       - run: python scripts/test_sign_macos.py

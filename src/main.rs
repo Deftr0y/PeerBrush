@@ -183,6 +183,8 @@ fn run() -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
+    #[cfg(target_os = "macos")]
+    let _finder_activation = activation::macos::install(shared.clone())?;
     let options = eframe::NativeOptions {
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             present_mode: if cfg!(target_os = "windows") {
