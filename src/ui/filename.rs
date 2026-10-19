@@ -3,7 +3,7 @@ use super::*;
 use resvg::{tiny_skia, usvg};
 use std::{
     collections::VecDeque,
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, Once, OnceLock},
 };
 
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -71,6 +71,84 @@ struct FontCatalog {
     faces: Vec<SystemFace>,
     scripts: Vec<Option<usize>>,
 }
+struct CatalogLoader {
+    started: Once,
+    result: OnceLock<Option<FontCatalog>>,
+}
+impl CatalogLoader {
+    const fn new() -> Self {
+        Self {
+            started: Once::new(),
+            result: OnceLock::new(),
+        }
+    }
+    fn start(
+        &'static self,
+        ctx: egui::Context,
+        load: impl FnOnce() -> FontCatalog + Send + 'static,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        if self.result.get().is_some() {
+            return None;
+        }
+        let mut worker = None;
+        self.started.call_once(|| {
+            match std::thread::Builder::new()
+                .name("PeerBrush language fonts".into())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)).ok();
+                    let _ = self.result.set(result);
+                    ctx.request_repaint();
+                }) {
+                Ok(handle) => worker = Some(handle),
+                Err(_) => {
+                    let _ = self.result.set(None);
+                }
+            }
+        });
+        worker
+    }
+    fn get(&self) -> Option<&FontCatalog> {
+        self.result.get().and_then(Option::as_ref)
+    }
+    fn pending_message(&self) -> Option<&'static str> {
+        match self.result.get() {
+            None => Some("Loading language fonts…"),
+            Some(None) => Some("Language fonts unavailable"),
+            Some(Some(_)) => None,
+        }
+    }
+}
+static CATALOG: CatalogLoader = CatalogLoader::new();
+
+pub(super) struct FontSetup {
+    pending: Option<egui::FontDefinitions>,
+}
+impl FontSetup {
+    pub(super) fn new(ctx: &egui::Context, fonts: egui::FontDefinitions) -> Self {
+        let _ = CATALOG.start(ctx.clone(), build_catalog);
+        ctx.set_fonts(fonts.clone());
+        Self {
+            pending: Some(fonts),
+        }
+    }
+    pub(super) fn refresh(&mut self, ctx: &egui::Context) -> bool {
+        let Some(result) = CATALOG.result.get() else {
+            return false;
+        };
+        let Some(mut fonts) = self.pending.take() else {
+            return false;
+        };
+        if let Some(catalog) = result {
+            install_fallbacks(&mut fonts, catalog);
+            ctx.set_fonts(fonts);
+        }
+        ctx.data_mut(|data| {
+            data.remove::<Arc<Mutex<Cache>>>(egui::Id::new("shaped filename cache"));
+        });
+        ctx.request_repaint();
+        true
+    }
+}
 fn covers(bytes: &[u8], index: u32, sample: &str) -> bool {
     use ab_glyph::Font;
     ab_glyph::FontRef::try_from_slice_and_index(bytes, index).is_ok_and(|font| {
@@ -134,49 +212,49 @@ fn selected_system_face(
     }
     None
 }
-fn catalog() -> &'static FontCatalog {
-    static CATALOG: OnceLock<FontCatalog> = OnceLock::new();
-    CATALOG.get_or_init(|| {
-        let mut installed = fontdb::Database::new();
-        installed.load_system_fonts();
-        let mut faces: Vec<SystemFace> = Vec::new();
-        let mut scripts = Vec::new();
-        let mut retained = 0usize;
-        for (preferred, sample) in SCRIPTS {
-            let selected = selected_system_face(&installed, preferred, sample);
-            let index = selected.and_then(|selected| {
-                if let Some(index) = faces.iter().position(|face| face.id == selected.id) {
-                    return Some(index);
-                }
-                if retained + selected.bytes.len() > SYSTEM_FONT_BYTES {
-                    return None;
-                }
-                retained += selected.bytes.len();
-                faces.push(selected);
-                Some(faces.len() - 1)
-            });
-            scripts.push(index);
-        }
-        // Snapshot selected bytes into the shaping database. The catalog does
-        // not keep paths, reread files per label, or download missing fonts.
-        let mut db = usvg::fontdb::Database::new();
-        db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(
-            include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf").as_slice(),
-        )));
-        for face in &faces {
-            db.load_font_source(usvg::fontdb::Source::Binary(face.bytes.clone()));
-        }
-        db.set_sans_serif_family("Ubuntu Sans");
-        FontCatalog {
-            db: Arc::new(db),
-            faces,
-            scripts,
-        }
-    })
+fn base_fontdb() -> usvg::fontdb::Database {
+    let mut db = usvg::fontdb::Database::new();
+    db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(
+        include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf").as_slice(),
+    )));
+    db.set_sans_serif_family("Ubuntu Sans");
+    db
+}
+fn build_catalog() -> FontCatalog {
+    let mut installed = fontdb::Database::new();
+    installed.load_system_fonts();
+    let mut faces: Vec<SystemFace> = Vec::new();
+    let mut scripts = Vec::new();
+    let mut retained = 0usize;
+    for (preferred, sample) in SCRIPTS {
+        let selected = selected_system_face(&installed, preferred, sample);
+        let index = selected.and_then(|selected| {
+            if let Some(index) = faces.iter().position(|face| face.id == selected.id) {
+                return Some(index);
+            }
+            if retained + selected.bytes.len() > SYSTEM_FONT_BYTES {
+                return None;
+            }
+            retained += selected.bytes.len();
+            faces.push(selected);
+            Some(faces.len() - 1)
+        });
+        scripts.push(index);
+    }
+    // Snapshot selected bytes into the shaping database. The catalog does
+    // not keep paths, reread files per label, or download missing fonts.
+    let mut db = base_fontdb();
+    for face in &faces {
+        db.load_font_source(usvg::fontdb::Source::Binary(face.bytes.clone()));
+    }
+    FontCatalog {
+        db: Arc::new(db),
+        faces,
+        scripts,
+    }
 }
 
-pub(super) fn install_fallbacks(fonts: &mut egui::FontDefinitions) {
-    let catalog = catalog();
+fn install_fallbacks(fonts: &mut egui::FontDefinitions, catalog: &'static FontCatalog) {
     for (index, face) in catalog.faces.iter().enumerate() {
         let mut data = egui::FontData::from_static(face.bytes.as_slice());
         data.index = face.index;
@@ -198,11 +276,16 @@ pub(super) fn install_fallbacks(fonts: &mut egui::FontDefinitions) {
 }
 
 fn fontdb() -> Arc<usvg::fontdb::Database> {
-    catalog().db.clone()
+    if let Some(catalog) = CATALOG.get() {
+        return catalog.db.clone();
+    }
+    // This small bundled database never waits for installed-font discovery.
+    static BASE: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
+    BASE.get_or_init(|| Arc::new(base_fontdb())).clone()
 }
 
-fn script_font(c: char) -> &'static str {
-    let script = match c as u32 {
+fn script_index(c: char) -> Option<usize> {
+    Some(match c as u32 {
         0x0590..=0x05ff | 0xfb1d..=0xfb4f => 0,
         0x0600..=0x06ff | 0x0750..=0x077f | 0x08a0..=0x08ff | 0xfb50..=0xfdff | 0xfe70..=0xfeff => {
             1
@@ -211,9 +294,13 @@ fn script_font(c: char) -> &'static str {
         0x3040..=0x30ff | 0x31f0..=0x31ff | 0xff65..=0xff9f => 4,
         0x1100..=0x11ff | 0x3130..=0x318f | 0xa960..=0xa97f | 0xac00..=0xd7ff => 5,
         0x2e80..=0x9fff | 0xf900..=0xfaff | 0xff00..=0xffef | 0x20000..=0x3134f => 3,
-        _ => return "Ubuntu Sans",
+        _ => return None,
+    })
+}
+fn script_font(c: char) -> &'static str {
+    let Some((script, catalog)) = script_index(c).zip(CATALOG.get()) else {
+        return "Ubuntu Sans";
     };
-    let catalog = catalog();
     catalog.scripts[script].map_or("Ubuntu Sans", |index| catalog.faces[index].family.as_str())
 }
 
@@ -425,6 +512,11 @@ fn entry(ctx: &egui::Context, text: &str, size: f32, width: f32) -> Option<Entry
     if text.chars().all(|c| (c as u32) < 0x300) || width < 1. {
         return None;
     }
+    let text = if text.chars().any(|c| script_index(c).is_some()) {
+        CATALOG.pending_message().unwrap_or(text)
+    } else {
+        text
+    };
     let width = width.floor().clamp(1., 2048.);
     let scale = (ctx.pixels_per_point() * 1.5).clamp(1., 4.);
     let key = Key {
@@ -580,6 +672,124 @@ pub(super) fn project_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn catalog() -> &'static FontCatalog {
+        CATALOG
+            .result
+            .get_or_init(|| Some(build_catalog()))
+            .as_ref()
+            .unwrap()
+    }
+
+    #[test]
+    fn blocked_discovery_does_not_block_ui_and_handoff_clears_cached_labels() {
+        const CHILD: &str = "PEERBRUSH_FONT_HANDOFF_TEST";
+        let Some(mode) = std::env::var_os(CHILD) else {
+            for mode in ["ready", "failed"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "ui::filename::tests::blocked_discovery_does_not_block_ui_and_handoff_clears_cached_labels",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mode)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "Font handoff {mode} failed");
+            }
+            return;
+        };
+        let failed = mode == "failed";
+        let ctx = egui::Context::default();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = CATALOG
+            .start(ctx.clone(), move || {
+                wait.recv().unwrap();
+                if failed {
+                    panic!("Synthetic font discovery failure");
+                }
+                FontCatalog {
+                    db: Arc::new(base_fontdb()),
+                    faces: vec![],
+                    scripts: vec![None; SCRIPTS.len()],
+                }
+            })
+            .unwrap();
+        let (finished, draw) = std::sync::mpsc::channel();
+        let ui_ctx = ctx.clone();
+        let ui_thread = std::thread::spawn(move || {
+            let mut setup = FontSetup::new(&ui_ctx, egui::FontDefinitions::default());
+            assert!(!setup.refresh(&ui_ctx));
+            assert!(setup.pending.is_some());
+            assert_eq!(script_font('ש'), "Ubuntu Sans");
+            assert!(layout("Ω Ж.png", 12.).is_some());
+            let output = ui_ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    label(ui, "שלום.psd", 12., Color32::WHITE, 300.);
+                    click_label(
+                        ui,
+                        "漢字",
+                        300.,
+                        egui::FontId::proportional(12.),
+                        Color32::WHITE,
+                    );
+                    project_button(ui, "हिन्दी", false, Color32::WHITE);
+                });
+            });
+            assert!(!output.shapes.is_empty());
+            assert_eq!(
+                entry(&ui_ctx, "שלום.psd", 12., 300.).unwrap().key.text,
+                "Loading language fonts…"
+            );
+            finished.send(setup).unwrap();
+        });
+        // The release channel stays blocked until real UI controls finish. The
+        // timeout is a deadlock guard, not a performance threshold.
+        let setup = draw.recv_timeout(Duration::from_secs(10));
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        ui_thread.join().unwrap();
+        let mut setup = setup.expect("UI waited for installed-font discovery");
+        let previous = ctx
+            .data_mut(|data| {
+                data.get_temp::<Arc<Mutex<Cache>>>(egui::Id::new("shaped filename cache"))
+            })
+            .unwrap();
+        assert!(!previous.lock().unwrap().entries.is_empty());
+        assert!(setup.refresh(&ctx));
+        assert!(ctx
+            .data_mut(
+                |data| data.get_temp::<Arc<Mutex<Cache>>>(egui::Id::new("shaped filename cache"))
+            )
+            .is_none());
+        assert!(!setup.refresh(&ctx));
+        assert!(setup.pending.is_none());
+        assert!(CATALOG
+            .start(ctx.clone(), || panic!("Discovery must not restart"))
+            .is_none());
+        let _ = ctx.run(Default::default(), |_| {});
+        let after = entry(&ctx, "שלום.psd", 12., 300.).unwrap();
+        assert_eq!(
+            after.key.text,
+            if failed {
+                "Language fonts unavailable"
+            } else {
+                "שלום.psd"
+            }
+        );
+        assert_ne!(
+            after.texture.id(),
+            previous
+                .lock()
+                .unwrap()
+                .entries
+                .front()
+                .unwrap()
+                .texture
+                .id()
+        );
+    }
+
     #[test]
     #[ignore = "opt-in fresh-process font startup measurements; no timing threshold"]
     fn startup_system_fonts_diagnostic() {
@@ -603,13 +813,13 @@ mod tests {
         // Only this exact test runs in the child: no fixture can warm CATALOG.
         let mut first = egui::FontDefinitions::default();
         let started = std::time::Instant::now();
-        install_fallbacks(&mut first);
+        let catalog = catalog();
+        install_fallbacks(&mut first, catalog);
         let first_install_ms = started.elapsed().as_secs_f64() * 1000.;
         let mut repeat = egui::FontDefinitions::default();
         let started = std::time::Instant::now();
-        install_fallbacks(&mut repeat);
+        install_fallbacks(&mut repeat, catalog);
         let repeat_install_ms = started.elapsed().as_secs_f64() * 1000.;
-        let catalog = catalog();
         let fallback_bytes = catalog
             .faces
             .iter()
@@ -733,7 +943,7 @@ mod tests {
             .entry(egui::FontFamily::Proportional)
             .or_default()
             .insert(0, "Ubuntu Sans".into());
-        install_fallbacks(&mut fonts);
+        install_fallbacks(&mut fonts, catalog);
         assert_eq!(
             fonts.families[&egui::FontFamily::Proportional][0],
             "Ubuntu Sans"
@@ -775,6 +985,7 @@ mod tests {
     }
     #[test]
     fn shaped_filenames_have_glyphs_direction_and_bounded_density() {
+        catalog();
         for name in [
             "café Ω Ж.png",
             "שלום עולם.psd",
@@ -837,6 +1048,7 @@ mod tests {
     }
     #[test]
     fn arabic_joining_and_rtl_extensions_are_shaped_without_changing_logical_name() {
+        catalog();
         let joined = glyphs(&layout("لا.png", 12.).unwrap());
         let arabic: Vec<_> = joined
             .iter()
@@ -872,6 +1084,7 @@ mod tests {
     }
     #[test]
     fn filename_cache_is_bounded_and_color_is_presentation_only() {
+        catalog();
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |_| {});
         for i in 0..100 {
