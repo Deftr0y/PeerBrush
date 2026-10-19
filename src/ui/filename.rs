@@ -581,6 +581,107 @@ pub(super) fn project_button(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "opt-in fresh-process font startup measurements; no timing threshold"]
+    fn startup_system_fonts_diagnostic() {
+        const CHILD: &str = "PEERBRUSH_STARTUP_FONT_DIAGNOSTIC_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::filename::tests::startup_system_fonts_diagnostic",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "Fresh-process font diagnostic failed");
+            return;
+        }
+
+        // Only this exact test runs in the child: no fixture can warm CATALOG.
+        let mut first = egui::FontDefinitions::default();
+        let started = std::time::Instant::now();
+        install_fallbacks(&mut first);
+        let first_install_ms = started.elapsed().as_secs_f64() * 1000.;
+        let mut repeat = egui::FontDefinitions::default();
+        let started = std::time::Instant::now();
+        install_fallbacks(&mut repeat);
+        let repeat_install_ms = started.elapsed().as_secs_f64() * 1000.;
+        let catalog = catalog();
+        let fallback_bytes = catalog
+            .faces
+            .iter()
+            .map(|face| face.bytes.len())
+            .sum::<usize>();
+        assert!(fallback_bytes <= SYSTEM_FONT_BYTES);
+        for (index, face) in catalog.faces.iter().enumerate() {
+            let name = format!("Installed fallback {index}");
+            assert_eq!(first.font_data[&name].index, face.index);
+            assert_eq!(
+                first.font_data[&name].font.as_ptr(),
+                repeat.font_data[&name].font.as_ptr()
+            );
+        }
+        assert_eq!(first.families, repeat.families);
+        let definition_bytes = first
+            .font_data
+            .values()
+            .map(|font| font.font.len())
+            .sum::<usize>();
+        let definition_entries = first.font_data.len();
+
+        // set_fonts queues definitions. The first pass includes egui's deferred
+        // font setup; separate ASCII and script passes expose lazy glyph work.
+        let started = std::time::Instant::now();
+        let ctx = egui::Context::default();
+        ctx.set_fonts(first);
+        let context_setup_ms = started.elapsed().as_secs_f64() * 1000.;
+        let frame = |text: &str| {
+            let started = std::time::Instant::now();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(980., 640.))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.label(text);
+                    });
+                },
+            );
+            assert!(!output.shapes.is_empty());
+            started.elapsed().as_secs_f64() * 1000.
+        };
+        let first_ascii_frame_ms = frame("PeerBrush");
+        let first_script_frame_ms = frame("שלום مرحبا بالعالم हिन्दी 漢字 あいう 한글");
+        let repeat_script_frame_ms = frame("שלום مرحبا بالعالم हिन्दी 漢字 あいう 한글");
+        println!(
+            "PB108_FONT_STARTUP {}",
+            json!({
+                "os":std::env::consts::OS,
+                "arch":std::env::consts::ARCH,
+                "debug_assertions":cfg!(debug_assertions),
+                "first_install_ms":first_install_ms,
+                "repeat_install_ms":repeat_install_ms,
+                "selected_faces":catalog.faces.len(),
+                "covered_scripts":catalog.scripts.iter().flatten().count(),
+                "selected_payload_bytes":fallback_bytes,
+                "shaping_database_faces":catalog.db.faces().count(),
+                "font_definition_entries":definition_entries,
+                "font_definition_payload_bytes":definition_bytes,
+                "context_setup_ms":context_setup_ms,
+                "first_ascii_frame_ms":first_ascii_frame_ms,
+                "first_script_frame_ms":first_script_frame_ms,
+                "repeat_script_frame_ms":repeat_script_frame_ms,
+            "context_fonts":"egui defaults plus installed fallbacks",
+            "os_filesystem_cache_controlled":false
+            })
+        );
+    }
+
+    #[test]
     fn installed_face_selection_requires_coverage_and_bounded_owned_data() {
         let dir = std::env::temp_dir().join(format!("pb-ui-font-{}", crate::engine::id()));
         std::fs::create_dir(&dir).unwrap();
