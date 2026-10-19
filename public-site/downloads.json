@@ -1,27 +1,17 @@
 {
-  "version": "v0.25",
-  "label": "PeerBrush 0.25 · Prerelease",
-  "commit": "f5083d2e33a0158c9976db5de89549bd34ee7bc3",
-  "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.25",
-  "buildUrl": "https://github.com/Deftr0y/PeerBrush/actions/runs/38252533281",
+  "version": "v0.26.0",
+  "label": "PeerBrush 0.26.0 · Stable",
+  "commit": "a00cf47accde87400fad3f0fcfc5fe96fc4f5be1",
+  "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0",
+  "buildUrl": "https://github.com/Deftr0y/PeerBrush/actions/runs/39210918112",
   "platforms": [
-    {
-      "id": "windows",
-      "name": "Windows",
-      "architecture": "x64",
-      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.25/PeerBrush-0.25.0-Windows-x64.zip",
-      "bytes": 83321819,
-      "sha256": "bf7cf5fb6b25c4c3b3c4739d131c41f9d521d93177469fae46d4033d457187e9",
-      "nativeSigning": "unsigned",
-      "description": "x64 · Extract and run peerbrush.exe · Unsigned"
-    },
     {
       "id": "linux",
       "name": "Linux",
       "architecture": "x64",
-      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.25/PeerBrush-0.25.0-Linux-x64.zip",
-      "bytes": 85779199,
-      "sha256": "46455a3d292cce8c9002e9652ab8b679f3c8ebfe30a3ee899087094265552438",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-Linux-x64.zip",
+      "bytes": 31088822,
+      "sha256": "03292c5552b5a66bcb066423379dddd2661852ef9b5471350f35d278feb3efe2",
       "nativeSigning": "unsigned",
       "description": "x64 · Built on Ubuntu 24.04 · Unsigned"
     },
@@ -29,15 +19,55 @@
       "id": "macos",
       "name": "macOS",
       "architecture": "arm64",
-      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.25/PeerBrush-0.25.0-macOS-arm64.zip",
-      "bytes": 82391966,
-      "sha256": "a47043392a0ca47db6c36d58010d2f3a0412b84da6c74898d9bf02f661814a39",
-      "nativeSigning": "unsigned",
-      "description": "Apple silicon · arm64 · Open PeerBrush.app · Unsigned"
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-macOS-arm64-apple-signed-r1.zip",
+      "bytes": 27402539,
+      "sha256": "db59d281163e6c7223d924ee134bf149d3551d41f2fdcb2438d2f1332762f17c",
+      "nativeSigning": "developer-id-notarized",
+      "description": "Apple silicon · arm64 · Developer ID signed, notarized and stapled"
     }
   ],
   "schema": 2,
   "history": [
+    {
+      "version": "v0.26.0",
+      "label": "PeerBrush 0.26.0 · Stable",
+      "kind": "stable",
+      "publishedAt": "2026-10-19T10:25:22Z",
+      "commit": "a00cf47accde87400fad3f0fcfc5fe96fc4f5be1",
+      "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0",
+      "buildUrl": "https://github.com/Deftr0y/PeerBrush/actions/runs/39210918112",
+      "platforms": [
+        {
+          "id": "linux",
+          "name": "Linux",
+          "architecture": "x64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-Linux-x64.zip",
+          "bytes": 31088822,
+          "sha256": "03292c5552b5a66bcb066423379dddd2661852ef9b5471350f35d278feb3efe2",
+          "nativeSigning": "unsigned",
+          "description": "x64 · Built on Ubuntu 24.04 · Unsigned"
+        },
+        {
+          "id": "macos",
+          "name": "macOS",
+          "architecture": "arm64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-macOS-arm64-apple-signed-r1.zip",
+          "bytes": 27402539,
+          "sha256": "db59d281163e6c7223d924ee134bf149d3551d41f2fdcb2438d2f1332762f17c",
+          "nativeSigning": "developer-id-notarized",
+          "description": "Apple silicon · arm64 · Developer ID signed, notarized and stapled"
+        }
+      ],
+      "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-source.zip",
+      "checksumsUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/SHA256SUMS",
+      "caution": "macOS arm64 is Developer ID signed, notarized and stapled. Linux x64 is unsigned. Windows Store 0.26 delivery is pending; previous Windows downloads remain in version history. Manual macOS/Linux desktop interaction and fresh quarantined macOS download testing remain unverified. Unsupported Photoshop originals remain protected.",
+      "notes": [
+        "Linked layer masks, rendering improvements and packaging fixes, including complete Rust runtime license notices.",
+        "macOS Apple silicon (arm64) is Developer ID signed, notarization Accepted and stapled; signature and Gatekeeper checks passed in macOS CI.",
+        "Linux x64 passed automated build and package checks and is unsigned. Matching GPLv3 source and third-party notices are included.",
+        "Windows Store delivery is pending. Manual macOS/Linux desktop interaction and fresh quarantined macOS download testing remain unverified."
+      ]
+    },
     {
       "version": "v0.25",
       "label": "PeerBrush 0.25 · Prerelease",
@@ -257,7 +287,7 @@
       "caution": "Historical checkpoint. Rebuilt packages remain unsigned; Windows/macOS may show security warnings. Manual desktop verification of the rebuilt executables remains pending."
     }
   ],
-  "caution": "Experimental 0.25 prerelease. Packages are unsigned. Broader Photoshop layer-style compatibility is deferred and unsupported originals remain protected. Manual macOS/Linux desktop interaction and interactive clipboard transport acceptance remain unverified.",
-  "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.25/PeerBrush-0.25.0-source.zip",
-  "checksumsUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.25/SHA256SUMS"
+  "caution": "macOS arm64 is Developer ID signed, notarized and stapled. Linux x64 is unsigned. Windows Store 0.26 delivery is pending; previous Windows downloads remain in version history. Manual macOS/Linux desktop interaction and fresh quarantined macOS download testing remain unverified. Unsupported Photoshop originals remain protected.",
+  "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/PeerBrush-0.26.0-source.zip",
+  "checksumsUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.26.0/SHA256SUMS"
 }
