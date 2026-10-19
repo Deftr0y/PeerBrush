@@ -247,7 +247,7 @@ pub fn is_app_execution_alias(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn package_family() -> Result<Option<String>, String> {
+pub(crate) fn package_family() -> Result<Option<String>, String> {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentPackageFamilyName(length: *mut u32, name: *mut u16) -> i32;
