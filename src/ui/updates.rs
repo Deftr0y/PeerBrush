@@ -16,6 +16,7 @@ pub(super) struct Panel {
     message: String,
     next_auto: Instant,
     last_notification: Option<String>,
+    defer_current: bool,
 }
 impl Panel {
     pub fn load(directory: &Path) -> Self {
@@ -29,6 +30,7 @@ impl Panel {
             message: String::new(),
             next_auto: Instant::now() + Duration::from_secs(2),
             last_notification: None,
+            defer_current: false,
         }
     }
     fn start(&mut self, ctx: &egui::Context, manual: bool) {
@@ -65,6 +67,7 @@ impl Panel {
                 repaint.request_repaint();
             }) {
             Ok(_) => {
+                self.defer_current = false;
                 self.receiver = Some(receiver);
                 self.progress = Some(Progress {
                     stage: "Starting secure release check",
@@ -79,7 +82,7 @@ impl Panel {
             }
         }
     }
-    fn tick(&mut self, ctx: &egui::Context) {
+    fn tick(&mut self, ctx: &egui::Context, allow_notification: bool) {
         let events: Vec<_> = self
             .receiver
             .as_ref()
@@ -89,17 +92,23 @@ impl Panel {
             match event {
                 Event::Progress(progress) => self.progress = Some(progress),
                 Event::Complete(result) => {
-                    if let Ok(report) = &result {
-                        if let Some(version) = &report.release_version {
-                            if self.last_notification.as_ref() != Some(version) {
-                                self.open = true;
-                                self.last_notification = Some(version.clone());
-                            }
-                        }
-                    }
                     self.result = Some(result);
                     self.receiver = None;
                     self.progress = None;
+                }
+            }
+        }
+        if !self.defer_current {
+            if let Some(Ok(report)) = &self.result {
+                if let Some(version) = &report.release_version {
+                    if self.last_notification.as_ref() != Some(version) {
+                        if allow_notification {
+                            self.open = true;
+                            self.last_notification = Some(version.clone());
+                        } else {
+                            ctx.request_repaint_after(Duration::from_secs(1));
+                        }
+                    }
                 }
             }
         }
@@ -183,15 +192,21 @@ impl Panel {
                 if ui.button("Later").clicked() { later = true; }
             });
         self.open = open && !later;
+        if !self.open {
+            self.defer_current = true;
+        }
     }
 }
 
 impl PeerBrush {
     pub(super) fn updates_tick(&mut self, ctx: &egui::Context) {
-        self.updates.tick(ctx);
+        let idle = !self.update_interaction_active()
+            && !ctx.wants_keyboard_input()
+            && !ctx.input(|i| i.pointer.any_down() || !i.events.is_empty());
+        self.updates.tick(ctx, idle);
     }
-    fn update_restart_blocker(&self) -> Option<String> {
-        let interaction = self.busy
+    fn update_interaction_active(&self) -> bool {
+        self.busy
             || self.connecting
             || !self.jobs.is_empty()
             || self.load_control.is_some()
@@ -217,8 +232,10 @@ impl PeerBrush {
             || self.project_settings.is_some()
             || self.task_undo_review.is_some()
             || self.proposal_review.is_some()
-            || self.export_editor.is_some();
-        if interaction {
+            || self.export_editor.is_some()
+    }
+    fn update_restart_blocker(&self) -> Option<String> {
+        if self.update_interaction_active() {
             Some(
                 "Finish or cancel the current tool, edit or file operation before restarting."
                     .into(),
@@ -338,12 +355,17 @@ mod tests {
                 ),
             );
             assert_eq!(app.updates.store.preferences.channel, Channel::Preview);
+            let (sender, receiver) = mpsc::channel();
+            app.updates.receiver = Some(receiver);
             let output = frame(&mut app, vec![]);
             frame(
                 &mut app,
                 click(label(&output, "Later").expect("Actual Later button")),
             );
             assert!(!app.updates.open);
+            sender.send(Event::Complete(Ok(newer_report()))).unwrap();
+            app.updates.tick(&ctx, true);
+            assert!(!app.updates.open, "Later must defer an in-flight result");
             assert!(app.updates.receiver.is_none());
             let reloaded = updates::Store::load(&directory);
             assert!(reloaded.preferences.automatic_checks);
@@ -377,11 +399,77 @@ mod tests {
         sender
             .send(Event::Complete(Err("Offline · retry later".into())))
             .unwrap();
-        panel.tick(&egui::Context::default());
+        panel.tick(&egui::Context::default(), true);
         assert!(panel.receiver.is_none());
         assert!(matches!(panel.result, Some(Err(_))));
         assert!(!panel.open);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn newer_report() -> Report {
+        Report {
+            current_version: env!("CARGO_PKG_VERSION").into(),
+            channel: Channel::Stable,
+            target: updates::Target::current().unwrap(),
+            release_version: Some("999.0.0".into()),
+            release_url: None,
+            notes: "Synthetic published notes".into(),
+            assets: vec![],
+            checked_at: 1,
+        }
+    }
+
+    #[test]
+    fn background_notice_waits_for_native_input_and_gesture_without_requiring_saved_artwork() {
+        for depth in [8, 16] {
+            let directory =
+                std::env::temp_dir().join(format!("pb-update-defer-{}", crate::engine::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let (mut app, ctx) = super::super::tests::fixture();
+            app.updates = Panel::load(&directory);
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine.doc = Document::new_depth(16, 16, depth).unwrap();
+                let layer = engine.doc.layers[0].id.clone();
+                engine.edit("human", &[json!({"op":"paint","layer":layer,"points":[[8,8]],"radius":3,"color":[233,84,32,255]})], None, None, "Unsaved human stroke").unwrap();
+            }
+            let (before, history) = {
+                let engine = app.shared.lock().unwrap();
+                (
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    engine.undo.len(),
+                )
+            };
+            assert!(crate::workspace::lifecycle::update_readiness(&app.workspace).is_err());
+            let (sender, receiver) = mpsc::channel();
+            app.updates.receiver = Some(receiver);
+            sender.send(Event::Complete(Ok(newer_report()))).unwrap();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Text("typing".into())],
+                    ..Default::default()
+                },
+                |ctx| app.updates_tick(ctx),
+            );
+            assert!(!app.updates.open);
+            app.live_gesture = Some("unfinished native human stroke".into());
+            let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
+            assert!(!app.updates.open);
+            // Explicit native menu opening stays immediate while a gesture exists.
+            app.updates.open = true;
+            let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
+            assert!(app.updates.open);
+            app.updates.open = false;
+            app.live_gesture = None;
+            let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
+            assert!(app.updates.open);
+            let engine = app.shared.lock().unwrap();
+            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+            assert_eq!(engine.undo.len(), history);
+            assert!(!engine.closed);
+            drop(engine);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
