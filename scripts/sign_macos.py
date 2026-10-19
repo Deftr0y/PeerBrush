@@ -45,7 +45,9 @@ def parse_json(text, description):
     return result
 
 
-def validate_configuration(team_id, identity, profile, revision, keychain=None):
+def validate_configuration(team_id, identity, profile, revision, keychain=None, *, version):
+    if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version or ''):
+        raise ValueError('Developer ID signing requires a stable A.B.C release; internal development candidates cannot be signed')
     if sys.platform != 'darwin':
         raise ValueError('Developer ID signing requires an actual macOS runner')
     if not re.fullmatch(r'[A-Z0-9]{10}', team_id or ''):
@@ -164,7 +166,7 @@ def save_state(work, state):
 def sign_archive(archive, output, work, commit, version, expected_sha256,
                  team_id, identity, profile, revision, source_root=None, resume=False,
                  keychain=None, on_submission=None):
-    validate_configuration(team_id, identity, profile, revision, keychain)
+    validate_configuration(team_id, identity, profile, revision, keychain, version=version)
     credentials = notary_credentials(profile, keychain)
     identity = identity.upper()
     root = source_root or pathlib.Path(__file__).resolve().parents[1]

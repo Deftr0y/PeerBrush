@@ -24,10 +24,14 @@ MACOS_RESOURCES = 'PeerBrush.app/Contents/Resources/'
 
 
 def macos_info(version):
-    return {'CFBundleIdentifier': 'com.peerbrush.PeerBrush', 'CFBundleName': 'PeerBrush',
+    numeric = r'(?:0|[1-9][0-9]*)'
+    parsed = re.fullmatch(r'(' + numeric + r'\.' + numeric + r'\.' + numeric + r')(-dev\.' + numeric + r')?', version)
+    if not parsed:
+        raise ValueError('macOS bundles require a stable A.B.C or canonical internal A.B.C-dev.N version')
+    info = {'CFBundleIdentifier': 'com.peerbrush.PeerBrush', 'CFBundleName': 'PeerBrush',
             'CFBundleDisplayName': 'PeerBrush', 'CFBundleExecutable': 'peerbrush',
-            'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version,
-            'CFBundleVersion': version, 'LSMinimumSystemVersion': '11.0',
+            'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': parsed[1],
+            'CFBundleVersion': parsed[1], 'LSMinimumSystemVersion': '11.0',
             'NSHighResolutionCapable': True, 'CFBundleIconFile': 'PeerBrush.icns',
             'CFBundleDocumentTypes': [{'CFBundleTypeName': name, 'CFBundleTypeRole': 'Editor',
                                       'LSHandlerRank': 'Alternate', 'CFBundleTypeIconFile': 'PeerBrush.icns',
@@ -39,6 +43,9 @@ def macos_info(version):
                                             'UTTypeDescription': 'Photoshop Large Document',
                                             'UTTypeTagSpecification': {'public.filename-extension': ['psb'],
                                                                        'public.mime-type': 'image/vnd.adobe.photoshop'}}]}
+    if parsed[2]:
+        info['PeerBrushDevelopmentVersion'] = version
+    return info
 # Exact upstream notice names, not a LICENSE* glob that could pick up local files.
 NOTICE_NAMES = {
     "copying", "copyright", "license", "licence", "notice", "notices", "unlicense",

@@ -151,7 +151,8 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             raise ValueError('Missing executable permissions')
         if platform == 'macOS':
             info = plistlib.loads(archive.read(prefix + 'PeerBrush.app/Contents/Info.plist'))
-            if info.get('CFBundleShortVersionString') != version or info.get('CFBundleExecutable') != 'peerbrush' or info.get('CFBundleIdentifier') != 'com.peerbrush.PeerBrush' or info.get('CFBundlePackageType') != 'APPL':
+            short_version = macos_info(version)['CFBundleShortVersionString'] if manifest.get('macos_bundle_resources') == 1 else version
+            if info.get('CFBundleShortVersionString') != short_version or info.get('CFBundleExecutable') != 'peerbrush' or info.get('CFBundleIdentifier') != 'com.peerbrush.PeerBrush' or info.get('CFBundlePackageType') != 'APPL':
                 raise ValueError('macOS app bundle version or executable mismatch')
             if manifest.get('macos_bundle_resources') == 1:
                 if info != macos_info(version):

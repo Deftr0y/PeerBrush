@@ -159,6 +159,40 @@ class Packages(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Missing required installed macOS resources'):
             verify_release.inspect_archive(path, commit, '0.2.0', self.root)
 
+    def test_macos_internal_development_mapping_retains_exact_cargo_version(self):
+        for name in ['Cargo.toml', 'Cargo.lock']:
+            path = self.root / name
+            path.write_text(path.read_text().replace('0.2.0', '0.30.0-dev.1'))
+        self.commit()
+        path = self.build('macOS')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+            info = plistlib.loads(archive.read(prefix + 'PeerBrush.app/Contents/Info.plist'))
+            self.assertEqual(info['CFBundleShortVersionString'], '0.30.0')
+            self.assertEqual(info['CFBundleVersion'], '0.30.0')
+            self.assertEqual(info['PeerBrushDevelopmentVersion'], '0.30.0-dev.1')
+            self.assertEqual(json.loads(archive.read(prefix + 'release.json'))['version'], '0.30.0-dev.1')
+        verify_release.inspect_archive(path, commit, '0.30.0-dev.1', self.root)
+        for key, changed in [('PeerBrushDevelopmentVersion', None), ('PeerBrushDevelopmentVersion', '0.30.0-dev.2'),
+                             ('CFBundleVersion', '0.30.0-dev.1'), ('CFBundleShortVersionString', '0.30.1')]:
+            altered = dict(info)
+            if changed is None:
+                del altered[key]
+            else:
+                altered[key] = changed
+            files = [(name, plistlib.dumps(altered) if name.endswith('/Info.plist') else data, mode)
+                     for name, data, mode in original]
+            packaging.write_zip(path, files, 1700000000)
+            with self.subTest(key=key, changed=changed), self.assertRaises(ValueError):
+                verify_release.inspect_archive(path, commit, '0.30.0-dev.1', self.root)
+        self.assertNotIn('PeerBrushDevelopmentVersion', packaging.macos_info('0.30.0'))
+        for version in ['0.30.0-beta.1', '0.30.0-dev.01', '0.30.0+build', '00.30.0-dev.1']:
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                packaging.macos_info(version)
+
     def test_historical_macos_layout_remains_valid_for_its_matching_source(self):
         path = self.build('macOS')
         prefix = path.stem + '/'
