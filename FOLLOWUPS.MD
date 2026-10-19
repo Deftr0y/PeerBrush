@@ -23,6 +23,8 @@ These are one coordinated workstream, expanded from PB-145–147 rather than dup
 
 Unreleased implementation and native/CI evidence are tracked in the [v0.3 foundation slices](docs/development-0.3.md#foundation-implementation-slices): persistent settings (PR #34), Ubuntu installation (PR #35), Mac DMG preparation/signing (PR #36), and production candidates/Store reconciliation (PR #37). These draft slices leave each item's full acceptance criteria below open; candidates are never advertised as published installers.
 
+Further draft slices add Mac bundle/file delivery (PR #38), development-only MSIX version mapping (PR #39), OS-owned default-editor choices (PR #41), and authenticated update discovery/restart guards (PR #42). The combined offline package suite passed 109 checks with two platform skips; combined Rust/native acceptance is still running. Sparkle preparation remains disabled: no feed/key exists, and the proposed `peerbrush.com` feed is unpublished. Full automatic installation and production publication are not complete.
+
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
 | PB-145 | Installed PeerBrush and standard platform installers | High priority — planned foundation | Make installation the normal distribution experience: installed MSIX/Microsoft Store on Windows; a signed, notarized DMG with PeerBrush.app dragged to Applications on macOS; and a documented Linux installation decision (evaluate package/store integration, sandbox permissions and update ownership before selecting a format). The current signed Mac ZIP is not a DMG. Provide stable app identity, icons and MCP launch paths across upgrades. Verify fresh install, upgrade, portable-to-installed migration, uninstall/reinstall and clean-machine runtime dependencies. Preserve documents, settings and unrelated file associations; offer an explicit settings-removal choice on uninstall. Any retained portable option is secondary, not the default experience. Coordinate per-user state with PB-155 and consent-based file opening with PB-146. |
@@ -40,6 +42,8 @@ All other existing unfinished work belongs to this planned milestone. Earlier im
 PB-108 remains priority #1 for v0.3, followed by PB-122 at #2 and PB-110 at #3. This is the existing feature/reliability order; the high-priority foundations above remain a separate workstream.
 
 PB-108 v0.3 development: shared changed-tail brush replay now retains unaffected coverage instead of restarting a smoothed stroke. The focused 29-test set and all 923 local Rust checks pass, with eight opt-in checks ignored. Release CPU workloads show reduced replay time with exact native8/16 output. Native Windows rendered workspaces, exact original samples/undo/redo, editable PSD/PSB reopening and independently decoded current merged composites passed. Exact-head cross-platform CI, startup, navigation and physical input latency remain open. See [measurements and limits](docs/development-0.3.md#pb-108-changed-tail-replay). Earlier evidence below is preserved.
+
+PB-110 v0.3 development: PR #40 corrects fractional scalar selection-coverage interpolation, with analytic native8/16 color/mask/folder and history/save regression coverage written and type-checked. Runtime/native acceptance remains pending. The PB-122 audit retains existing strict styled-import protections and requires actual Photoshop calibration before widening editable support; see [the current audit](docs/acceptance-0.3-photoshop-selection.md).
 
 | Priority | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- | --- |
