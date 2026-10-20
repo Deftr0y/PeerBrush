@@ -513,3 +513,7 @@ Source inventory 1,866 and scoped current-byte/path privacy 1,883 passed; source
 ## Shared compact-range pointer focus (unreleased)
 
 The enabled compact range now explicitly requests focus on its real pointer click/down, following the existing angle-control policy. This repairs the demonstrated pre-keyboard focus failure; native integer steps/clamping remain in use. Click-to-focus still restores the original value, and a double-click's numeric editor takes focus later in the same frame. Disabled and provisional numeric-entry focus/value checks are added; the existing failing keyboard and native8/16 export acceptance assertions are unchanged. Parent and independent source review passed; combined runtime and native visual replay remain pending.
+
+## Direct-skew fixture visibility correction (unreleased)
+
+The cancellation fixture's sparse painted whole-target bounds placed both X handles beneath the floating controls. It now reads the actual Free Transform window and available canvas rectangles, asserts a free interval and pans presentation to expose those handles before the original real pointer gesture. Production hit-testing/math is unchanged. The helper still requires visible Background-layer geometry and actual Skew capture; native8/16 preview, reference-axis no-op, Escape/Delete cancellation and complete source/history assertions are retained. Parent and independent source review passed; combined/native replay remains pending.

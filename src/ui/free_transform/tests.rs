@@ -1606,6 +1606,21 @@ fn skew_mode_cancel_and_reference_axis_leave_native_history_exact() {
         editor
             .set_reference([(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5])
             .unwrap();
+        // Sparse whole-target content starts beneath the floating controls.
+        // Pan presentation into actual free canvas space; retain real hit tests.
+        let reference = editor.reference_point();
+        let rect = app.view_rect.unwrap();
+        let point = app
+            .view
+            .point(reference.map(|v| v as f32), rect, rect.width() / 32.);
+        let controls = ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("free transform")))
+            .unwrap();
+        let available = app.canvas_input_region.unwrap().0;
+        let left = controls.right().max(available.left()) + 16.;
+        let right = available.right() - 16.;
+        assert!(left < right, "The fixture needs unobscured canvas space");
+        app.pan.x += (left + right) * 0.5 - point.x;
         skew_edge_drag(&mut app, &ctx, 0);
         let output = settle(&mut app, &ctx);
         actual_preview(&app, &output);
