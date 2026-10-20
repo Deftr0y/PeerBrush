@@ -29,6 +29,10 @@ pub fn paths(event: &NSAppleEventDescriptor) -> Result<Vec<PathBuf>, String> {
     let list: Option<Retained<NSAppleEventDescriptor>> =
         unsafe { msg_send![event, paramDescriptorForKeyword: DIRECT] };
     let list = list.ok_or("Finder did not provide document files")?;
+    let kind: u32 = unsafe { msg_send![&*list, descriptorType] };
+    if kind != u32::from_be_bytes(*b"list") {
+        return Err("Finder document parameter is not a native file list".into());
+    }
     let count = list.numberOfItems();
     if !(1..=super::MAX_PENDING_FILES as isize).contains(&count) {
         return Err(format!(
@@ -41,6 +45,11 @@ pub fn paths(event: &NSAppleEventDescriptor) -> Result<Vec<PathBuf>, String> {
             let descriptor = list
                 .descriptorAtIndex(index)
                 .ok_or("Missing Finder document")?;
+            // fileURLValue coerces text; only native file URL descriptors belong here.
+            let kind: u32 = unsafe { msg_send![&*descriptor, descriptorType] };
+            if kind != u32::from_be_bytes(*b"furl") {
+                return Err("Finder document is not a native file URL".into());
+            }
             let url = descriptor
                 .fileURLValue()
                 .ok_or("Finder document is not a local file")?;

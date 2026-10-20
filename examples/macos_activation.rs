@@ -16,7 +16,7 @@ fn main() {
         sync::{Arc, Mutex},
     };
 
-    fn event(files: &[Retained<Descriptor>]) -> Retained<Descriptor> {
+    fn parameter_event(parameter: &Descriptor) -> Retained<Descriptor> {
         let target = Descriptor::currentProcessDescriptor();
         let event: Retained<Descriptor> = unsafe {
             msg_send![class!(NSAppleEventDescriptor),
@@ -24,14 +24,20 @@ fn main() {
             eventID: u32::from_be_bytes(*b"odoc"), targetDescriptor: &*target,
             returnID: -1_i16, transactionID: 0_i32]
         };
+        unsafe {
+            let _: () = msg_send![&*event, setParamDescriptor: parameter, forKeyword: u32::from_be_bytes(*b"----")];
+        }
+        event
+    }
+
+    fn event(files: &[Retained<Descriptor>]) -> Retained<Descriptor> {
         let list = Descriptor::listDescriptor();
         for (index, file) in files.iter().enumerate() {
             list.insertDescriptor_atIndex(file, (index + 1) as isize);
         }
-        unsafe {
-            let _: () = msg_send![&*event, setParamDescriptor: &*list, forKeyword: u32::from_be_bytes(*b"----")];
-        }
-        event
+        let kind: u32 = unsafe { msg_send![&*list, descriptorType] };
+        assert_eq!(kind, u32::from_be_bytes(*b"list"));
+        parameter_event(&list)
     }
 
     objc2::rc::autoreleasepool(|_| {
@@ -59,13 +65,32 @@ fn main() {
                 Descriptor::descriptorWithFileURL(&url)
             })
             .collect();
+        for file in &files {
+            let kind: u32 = unsafe { msg_send![&**file, descriptorType] };
+            assert_eq!(kind, u32::from_be_bytes(*b"furl"));
+        }
         let opened = event(&files);
         assert_eq!(activation::macos::paths(&opened).unwrap(), paths);
         assert!(activation::macos::paths(&event(&[])).is_err());
+        let record = Descriptor::recordDescriptor();
+        unsafe {
+            let _: () = msg_send![&*record, setDescriptor: &*files[0], forKeyword: u32::from_be_bytes(*b"file")];
+        }
+        for parameter in [&*record, &*files[0]] {
+            assert!(activation::macos::paths(&parameter_event(parameter)).is_err());
+        }
         let malformed = Descriptor::descriptorWithString(&NSString::from_str(
             "https://example.invalid/image.psd",
         ));
         assert!(activation::macos::paths(&event(&[files[0].clone(), malformed])).is_err());
+        for text in [
+            "file:///tmp/PeerBrush%20text.psd",
+            "/tmp/PeerBrush text.psd",
+        ] {
+            let descriptor = Descriptor::descriptorWithString(&NSString::from_str(text));
+            assert!(activation::macos::paths(&event(&[descriptor.clone()])).is_err());
+            assert!(activation::macos::paths(&event(&[files[0].clone(), descriptor])).is_err());
+        }
         assert!(activation::macos::paths(&event(&vec![
             files[0].clone();
             activation::MAX_PENDING_FILES + 1
