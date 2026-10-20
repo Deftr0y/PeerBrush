@@ -3,6 +3,7 @@ import copy
 import contextlib
 import io
 import json
+from pathlib import Path
 import sys
 import unittest
 from unittest import mock
@@ -181,6 +182,238 @@ class DebianQualification(unittest.TestCase):
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
                 readiness.main()
             self.assertEqual(caught.exception.code, 2)
+
+
+class DebianHandoff(unittest.TestCase):
+    def setUp(self):
+        self.fixture = test_deb.DebianPackage(methodName='runTest')
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.root = self.fixture.root
+        self.commit = git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        for platform in ['Windows', 'macOS']:
+            self.fixture.fixture.build(platform)
+        self.package = self.fixture.final_package()
+        self.package_sha256 = digest(self.package)
+        self.portable_sha256 = digest(self.fixture.archive)
+        self.directory = self.root / 'verified'
+        with contextlib.redirect_stdout(io.StringIO()):
+            verify(self.fixture.fixture.output, self.commit, '0.2.0', self.directory, self.root)
+        self.before = json.loads((self.directory / 'release-inventory.json').read_bytes())
+        self.output = self.root / 'with-deb'
+
+    def handoff(self, **overrides):
+        inputs = dict(package_sha256=self.package_sha256, portable_sha256=self.portable_sha256,
+                      maintainer=test_deb.MAINTAINER, source_root=self.root)
+        output = overrides.pop('output', self.output)
+        return readiness.handoff_deb(self.directory, self.package, output, self.commit, '0.2.0', **dict(inputs, **overrides))
+
+    def assess(self, **overrides):
+        inputs = dict(deb_sha256=self.package_sha256, linux_portable_sha256=self.portable_sha256,
+                      maintainer=test_deb.MAINTAINER)
+        return readiness.assess(self.output, self.commit, '0.2.0', source_root=self.root, **dict(inputs, **overrides))
+
+    def test_real_deb_handoff_preserves_records_bytes_and_does_not_copy_or_trust_private_reports(self):
+        portable_report = readiness.assess(self.directory, self.commit, '0.2.0', source_root=self.root)
+        originals = {asset['file']: (self.directory / asset['file']).read_bytes() for asset in self.before['assets']}
+        original_inventory = (self.directory / 'release-inventory.json').read_bytes()
+        for parent in [self.directory, self.package.parent]:
+            (parent / 'installation.json').write_text('SYNTHETIC_PRIVATE_RECEIPT_NEVER_COPY')
+            (parent / (self.package.name + '.qualification.json')).write_text('{"production_ready":true,"installation_checks":{"installation":"passed"}}')
+        result = self.handoff()
+        inventory = json.loads((self.output / 'release-inventory.json').read_bytes())
+        self.assertEqual(inventory['assets'][:-1], self.before['assets'])
+        self.assertEqual(inventory['assets'][-1]['file'], self.package.name)
+        self.assertEqual(inventory['assets'][-1]['sha256'], self.package_sha256)
+        self.assertEqual(inventory['assets'][-1]['source_sha256'], next(a['sha256'] for a in self.before['assets'] if 'platform' not in a))
+        self.assertEqual((self.output / 'SHA256SUMS').read_text(), ''.join(f"{a['sha256']}  {a['file']}\n" for a in inventory['assets']))
+        self.assertEqual({p.name for p in self.output.iterdir()}, {a['file'] for a in inventory['assets']} | {'release-inventory.json', 'SHA256SUMS', 'production-readiness.json'})
+        for name, data in originals.items():
+            self.assertEqual((self.directory / name).read_bytes(), data)
+            self.assertEqual((self.output / name).read_bytes(), data)
+        self.assertEqual((self.directory / 'release-inventory.json').read_bytes(), original_inventory)
+        self.assertEqual((self.output / self.package.name).read_bytes(), self.package.read_bytes())
+        self.assertEqual(result['platforms']['Linux'], portable_report['platforms']['Linux'])
+        installed = result['installed_candidates']['Linux']
+        self.assertTrue(installed['candidate_verified'])
+        self.assertFalse(installed['ready'])
+        self.assertEqual(installed['installed_acceptance'], 'not-established-by-aggregate')
+        self.assertEqual(installed['producer_provenance'], 'requires-successful-same-workflow-native-job')
+        self.assertFalse(result['production_ready'])
+        self.assertEqual(self.assess(), result)
+        (self.output / 'production-readiness.json').write_text('{"production_ready":true}')
+        self.assertFalse(self.assess()['production_ready'], 'Existing report JSON must never grant native authority')
+
+    def test_selected_hash_control_and_corresponding_source_fail_before_output(self):
+        for changes in [dict(package_sha256='a' * 64), dict(portable_sha256='a' * 64), dict(maintainer='Other <other@example.invalid>')]:
+            with self.subTest(inputs=changes), self.assertRaises(ValueError):
+                self.handoff(**changes)
+            self.assertFalse(self.output.exists())
+        payload = test_deb.tar_bytes(self.fixture.final_data)
+        control = self.fixture.final_control
+        test_deb.write_deb(self.package, payload, test_deb.tar_bytes([('.', 0o755, None), ('control', 0o644, control.replace('Architecture: amd64', 'Architecture: arm64').encode())]))
+        with self.assertRaises(ValueError):
+            self.handoff(package_sha256=digest(self.package))
+        self.assertFalse(self.output.exists())
+        changed = [(name, mode, b'wrong source' if name.endswith('-source.zip') else data) for name, mode, data in self.fixture.final_data]
+        test_deb.write_deb(self.package, test_deb.tar_bytes(changed), test_deb.tar_bytes([('.', 0o755, None), ('control', 0o644, control.encode())]))
+        with self.assertRaises(ValueError):
+            self.handoff(package_sha256=digest(self.package))
+        self.assertFalse(self.output.exists())
+
+    def test_private_inventory_fields_are_rejected_before_any_public_output(self):
+        path = self.directory / 'release-inventory.json'
+        original = path.read_bytes()
+        for target in ['root', 'source']:
+            changed = copy.deepcopy(self.before)
+            destination = changed if target == 'root' else next(asset for asset in changed['assets'] if 'platform' not in asset)
+            destination['private_note'] = 'SYNTHETIC_PRIVATE_METADATA_NEVER_COPY'
+            path.write_text(json.dumps(changed))
+            with self.subTest(target=target), self.assertRaises(ValueError) as caught:
+                self.handoff()
+            self.assertNotIn('SYNTHETIC_PRIVATE_METADATA_NEVER_COPY', str(caught.exception))
+            self.assertFalse(self.output.exists())
+        path.write_bytes(original)
+        for raw in [original.replace(b'"schema": 1', b'"schema": 1, "schema": 1'),
+                    original.replace(b'"bytes":', b'"bytes": 1, "bytes":', 1)]:
+            path.write_bytes(raw)
+            with self.subTest(duplicate=raw[:40]), self.assertRaisesRegex(ValueError, 'duplicate fields'):
+                self.handoff()
+            self.assertFalse(self.output.exists())
+        path.write_bytes(original)
+        poisoned = json.dumps(dict(self.before, private_note='SYNTHETIC_PRIVATE_METADATA_NEVER_COPY')).encode()
+        real_open = Path.open
+        reads = 0
+        def alternating_inventory(candidate, mode='r', *args, **kwargs):
+            nonlocal reads
+            if candidate == path and mode == 'rb':
+                reads += 1
+                return io.BytesIO(poisoned if reads % 2 else original)
+            return real_open(candidate, mode, *args, **kwargs)
+        with mock.patch.object(Path, 'open', autospec=True, side_effect=alternating_inventory), self.assertRaises(ValueError):
+            self.handoff()
+        self.assertFalse(self.output.exists(), 'Captured bytes themselves must be validated before any output')
+
+    def test_missing_or_foreign_source_row_rejects_before_opening_unlisted_source_bytes(self):
+        path = self.directory / 'release-inventory.json'
+        source = next(asset for asset in self.before['assets'] if 'platform' not in asset)
+        source_path = self.directory / source['file']
+        without = copy.deepcopy(self.before)
+        without['assets'] = [asset for asset in without['assets'] if asset['file'] != source['file']]
+        foreign = copy.deepcopy(self.before)
+        next(asset for asset in foreign['assets'] if asset['file'] == source['file'])['file'] = 'foreign-source.zip'
+        real_open = Path.open
+        def reject_unlisted_source(candidate, mode='r', *args, **kwargs):
+            if candidate == source_path:
+                self.fail('Unlisted source bytes were opened before the exact source row was established')
+            return real_open(candidate, mode, *args, **kwargs)
+        for changed in [without, foreign]:
+            path.write_text(json.dumps(changed))
+            with self.subTest(assets=len(changed['assets'])), \
+                    mock.patch.object(Path, 'open', autospec=True, side_effect=reject_unlisted_source), self.assertRaises(ValueError):
+                self.handoff()
+            self.assertFalse(self.output.exists())
+
+    def test_five_records_require_explicit_inputs_exact_linux_record_and_no_claim_fields(self):
+        self.handoff()
+        for missing in ['deb_sha256', 'linux_portable_sha256', 'maintainer']:
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, 'explicit DEB/portable'):
+                self.assess(**{missing: None})
+        with self.assertRaisesRegex(ValueError, 'Linux portable inventory'):
+            self.assess(linux_portable_sha256='a' * 64)
+        path = self.output / 'release-inventory.json'
+        inventory = json.loads(path.read_bytes())
+        variants = [dict(inventory, production_ready=True)]
+        for field, value in [('architecture', 'x64'), ('release_ready', True), ('source_sha256', 'a' * 64)]:
+            changed = copy.deepcopy(inventory)
+            changed['assets'][-1][field] = value
+            variants.append(changed)
+        wrong_linux = copy.deepcopy(inventory)
+        next(a for a in wrong_linux['assets'] if a.get('platform') == 'Linux' and a['file'].endswith('.zip'))['executable_sha256'] = 'a' * 64
+        variants.append(wrong_linux)
+        duplicate = copy.deepcopy(inventory)
+        duplicate['assets'][-1]['file'] = duplicate['assets'][0]['file'].upper()
+        variants.append(duplicate)
+        for index, changed in enumerate(variants):
+            with self.subTest(mutation=index):
+                path.write_text(json.dumps(changed))
+                with self.assertRaises(ValueError):
+                    self.assess()
+        path.write_text(json.dumps(inventory))
+        with self.assertRaisesRegex(ValueError, 'four-record candidates'):
+            readiness.assess(self.directory, self.commit, '0.2.0', source_root=self.root,
+                             deb_sha256=self.package_sha256, linux_portable_sha256=self.portable_sha256, maintainer=test_deb.MAINTAINER)
+
+    def test_previous_final_inventory_is_compared_after_addition_and_outputs_are_never_replaced(self):
+        self.handoff()
+        previous = json.loads((self.output / 'release-inventory.json').read_bytes())
+        result = self.handoff(output=self.root / 'with-previous', previous=previous)
+        self.assertEqual(result['immutable_version'], 'checked-against-supplied-inventory')
+        wrong = copy.deepcopy(previous)
+        wrong['assets'][-1]['sha256'] = 'a' * 64
+        refused = self.root / 'wrong-previous'
+        with self.assertRaisesRegex(ValueError, 'immutable'):
+            self.handoff(output=refused, previous=wrong)
+        self.assertFalse(refused.exists())
+        canary = self.root / 'canary'
+        canary.write_bytes(b'keep')
+        original = {p.name: p.read_bytes() for p in self.output.iterdir()}
+        for target in [self.output, self.directory, self.directory / 'inside', self.directory / '../verified/inside', canary]:
+            with self.subTest(target=target.name), self.assertRaisesRegex(ValueError, 'fresh, nonoverlapping'):
+                self.handoff(output=target)
+        self.assertEqual(canary.read_bytes(), b'keep')
+        self.assertEqual({p.name: p.read_bytes() for p in self.output.iterdir()}, original)
+        with mock.patch.object(Path, 'lstat') as metadata:
+            metadata.return_value.st_mode = 0o040755
+            metadata.return_value.st_file_attributes = 0x400
+            with self.assertRaisesRegex(ValueError, 'links or reparse'):
+                self.handoff(output=self.root / 'reparse')
+
+    def test_input_change_preserves_partial_output_without_success_report_or_automatic_retry(self):
+        linux = self.directory / self.fixture.archive.name
+        real_open = Path.open
+        changed = False
+        def open(path, mode='r', *args, **kwargs):
+            nonlocal changed
+            stream = real_open(path, mode, *args, **kwargs)
+            if path == linux and mode == 'rb' and self.output.exists() and not changed:
+                changed = True
+                with real_open(linux, 'ab') as mutate:
+                    mutate.write(b'changed-during-copy')
+            return stream
+        with mock.patch.object(Path, 'open', autospec=True, side_effect=open), self.assertRaisesRegex(ValueError, 'grew during handoff'):
+            self.handoff()
+        self.assertTrue(changed)
+        self.assertTrue(self.output.is_dir())
+        self.assertFalse((self.output / 'production-readiness.json').exists())
+        partial = {p.name: p.read_bytes() for p in self.output.iterdir()}
+        with self.assertRaisesRegex(ValueError, 'immutable'):
+            self.handoff()
+        self.assertEqual({p.name: p.read_bytes() for p in self.output.iterdir()}, partial)
+
+    def test_cli_handoff_selection_is_explicit_and_mixed_modes_fail_without_writes(self):
+        argv = ['production_readiness.py', '--directory', str(self.directory), '--include-deb', str(self.package),
+                '--deb-sha256', self.package_sha256, '--portable-sha256', self.portable_sha256,
+                '--maintainer', test_deb.MAINTAINER, '--commit', self.commit, '--version', '0.2.0',
+                '--output', str(self.output), '--require-ready']
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(readiness, 'handoff_deb', return_value={'production_ready': False}) as handoff, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(readiness.main(), 2)
+            handoff.assert_called_once()
+            self.assertEqual(handoff.call_args.args[:3], (self.directory, self.package, self.output))
+            self.assertEqual(handoff.call_args.kwargs['package_sha256'], self.package_sha256)
+            self.assertEqual(handoff.call_args.kwargs['portable_sha256'], self.portable_sha256)
+        invalid = [argv + ['--portable', str(self.fixture.archive)], argv + ['--installation-receipt', str(self.root / 'private.json')],
+                   argv + ['--deb', str(self.package)],
+                   argv[:argv.index('--maintainer')] + argv[argv.index('--maintainer') + 2:]]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), mock.patch.object(sys, 'argv', arguments), \
+                    mock.patch.object(readiness, 'handoff_deb') as handoff, contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as caught:
+                readiness.main()
+            self.assertEqual(caught.exception.code, 2)
+            handoff.assert_not_called()
+        self.assertFalse(self.output.exists())
 
 
 if __name__ == '__main__':

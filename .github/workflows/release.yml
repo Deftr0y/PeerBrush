@@ -168,13 +168,27 @@ jobs:
         with:
           pattern: candidate-*
           path: candidates
+      - name: Download the same-workflow Ubuntu candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: DEB-installation-candidate
+          path: deb-candidate
       - name: Inspect matching archives and checksums
         shell: bash
         run: |
           python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
-          python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
-          python scripts/production_readiness.py --directory dist --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist/production-readiness.json
+          python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output verified-portable
+          set -- deb-candidate/*.deb
+          test "$#" -eq 1
+          DEB="$1"
+          DEB_SHA=$(sha256sum "$DEB" | cut -d ' ' -f 1)
+          PORTABLE_SHA=$(sha256sum "verified-portable/PeerBrush-$VERSION-Linux-x64.zip" | cut -d ' ' -f 1)
+          # Job success supplies producer provenance; report JSON grants no authority.
+          python3 -B scripts/production_readiness.py --directory verified-portable --include-deb "$DEB" \
+            --deb-sha256 "$DEB_SHA" --portable-sha256 "$PORTABLE_SHA" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' \
+            --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
           echo 'Exact-source candidate archives verified. Production publication remains blocked pending native signing, installed acceptance, protected approval and public asset reconciliation.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
@@ -197,7 +211,7 @@ jobs:
       - name: Sign and verify packages, source and checksums
         uses: sigstore/gh-action-sigstore-python@a5caf349bc536fbef3668a10ed7f5cd309a4b53d # v3.2.0
         with:
-          inputs: dist/*.zip dist/SHA256SUMS dist/release-inventory.json
+          inputs: dist/*.zip dist/*.deb dist/SHA256SUMS dist/release-inventory.json
           verify: true
           verify-cert-identity: https://github.com/${{ github.workflow_ref }}
           verify-oidc-issuer: https://token.actions.githubusercontent.com
