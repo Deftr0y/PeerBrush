@@ -80,9 +80,16 @@ def bounded_file(path, limit, destination=None):
     flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
     with os.fdopen(os.open(path, flags), 'rb') as stream:
         metadata = os.fstat(stream.fileno())
-        identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_nlink)
+        # Windows Python 3.12 can expose creation time from lstat's ctime
+        # and last-write time from fstat's ctime. The shared file ID must still
+        # match; check each timestamp source for stability independently below.
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode,
+                                 info.st_nlink, getattr(info, 'st_birthtime_ns', None))
+        state = lambda info: (identity(info), info.st_ctime_ns)
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
-                or not 0 <= metadata.st_size <= limit or identity(before) != identity(metadata)):
+                or not 0 <= metadata.st_size <= limit or identity(before) != identity(metadata)
+                or (os.name == 'nt' and not metadata.st_ino)
+                or (os.name != 'nt' and before.st_ctime_ns != metadata.st_ctime_ns)):
             raise ValueError('DMG inspection input is not an unchanged bounded regular file')
         checksum, total = hashlib.sha256(), 0
         target = destination.open('xb') if destination is not None else None
@@ -98,8 +105,8 @@ def bounded_file(path, limit, destination=None):
             if target is not None:
                 target.close()
         inspection_path(path)
-        if (total != metadata.st_size or identity(os.fstat(stream.fileno())) != identity(metadata)
-                or identity(path.lstat()) != identity(metadata)):
+        if (total != metadata.st_size or state(os.fstat(stream.fileno())) != state(metadata)
+                or state(path.lstat()) != state(before)):
             raise ValueError('DMG inspection input changed during its bounded read')
     return checksum.hexdigest(), total
 

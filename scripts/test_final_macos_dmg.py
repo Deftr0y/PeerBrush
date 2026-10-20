@@ -37,6 +37,10 @@ class FinalImage(unittest.TestCase):
         self.mount, self.application_link = None, None
         self.damage, self.native_failure, self.after_detach = None, None, None
         self.link_override, self.reparse_override = None, None
+        self.mounted_modes = {}
+        if os.name == 'nt':
+            self.real_payload_inventory = dmg.payload_inventory
+            self.patch(dmg, 'payload_inventory', self.payload_inventory)
         self.real_lstat = pathlib.Path.lstat
         self.patch(pathlib.Path, 'lstat', lambda path, *args, **kwargs: self.lstat(path, *args, **kwargs))
         self.patch(pathlib.Path, 'is_mount', lambda path: self.mounted and path == self.mount)
@@ -57,6 +61,16 @@ class FinalImage(unittest.TestCase):
             from types import SimpleNamespace
             return SimpleNamespace(st_mode=metadata.st_mode, st_file_attributes=0x400)
         return metadata
+
+    def payload_inventory(self, root):
+        # Windows chmod cannot model Unix execute bits. Keep the real bounded
+        # walk/hash/link/identity checks, replacing only fake-mounted ZIP modes.
+        inventory = self.real_payload_inventory(root)
+        if root == self.mount:
+            for name, record in inventory.items():
+                if 'mode' in record and name in self.mounted_modes:
+                    record['mode'] = self.mounted_modes[name]
+        return inventory
 
     def native(self, command, **kwargs):
         if command[0] == 'git':
@@ -79,6 +93,7 @@ class FinalImage(unittest.TestCase):
                 # Simulate the exact producer layout independently of the
                 # consumer's computed expected inventory. No real symlink or
                 # OS mount is created in a portable test.
+                self.mounted_modes = {}
                 with zipfile.ZipFile(self.archive) as source:
                     prefix = 'PeerBrush-0.2.0-macOS-arm64/'
                     for entry in source.infolist():
@@ -86,7 +101,9 @@ class FinalImage(unittest.TestCase):
                         path = self.mount / relative if relative.parts[0] == dmg.APP else self.mount / dmg.SUPPORT / relative
                         path.parent.mkdir(parents=True, exist_ok=True)
                         path.write_bytes(source.read(entry))
-                        path.chmod(entry.external_attr >> 16 & 0o777)
+                        mode = entry.external_attr >> 16 & 0o777
+                        path.chmod(mode)
+                        self.mounted_modes[path.relative_to(self.mount).as_posix()] = mode
                 self.application_link = self.mount / 'Applications'
                 self.application_link.write_bytes(b'SYNTHETIC_LINK_PLACEHOLDER')
                 if self.damage == 'app':
@@ -95,6 +112,7 @@ class FinalImage(unittest.TestCase):
                     (self.mount / dmg.SUPPORT / 'PeerBrush-0.2.0-source.zip').write_bytes(b'CHANGED')
                 elif self.damage == 'mode':
                     (self.mount / dmg.APP / 'Contents/MacOS/peerbrush').chmod(0o644)
+                    self.mounted_modes[dmg.APP + '/Contents/MacOS/peerbrush'] = 0o644
                 elif self.damage == 'extra':
                     (self.mount / 'unexpected-private-sidecar.json').write_bytes(b'MUST_REJECT')
                 if self.native_failure == 'partial-attach':
