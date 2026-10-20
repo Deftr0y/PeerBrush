@@ -68,7 +68,7 @@ fn stamp(file: &fs::File) -> Result<(u64, u128), String> {
             .as_nanos(),
     ))
 }
-fn hash(bytes: &[u8], state: &mut [u64; 2]) {
+pub(crate) fn hash(bytes: &[u8], state: &mut [u64; 2]) {
     for &b in bytes {
         state[0] = (state[0] ^ b as u64).wrapping_mul(0x100000001b3);
         state[1] = (state[1] ^ b as u64).wrapping_mul(0x9e3779b185ebca87);
@@ -127,8 +127,16 @@ pub fn snapshot(path: &Path) -> Result<Option<Version>, String> {
 pub(crate) fn published_version(path: &Path, bytes: &[u8]) -> Result<Version, String> {
     let mut expected = [0xcbf29ce484222325, 0x84222325cbf29ce4];
     hash(bytes, &mut expected);
-    let actual = version(path)?;
-    if actual.bytes != bytes.len() as u64 || actual.fingerprint != expected {
+    verified_version(path, bytes.len() as u64, expected, || Ok(()))
+}
+pub(crate) fn verified_version(
+    path: &Path,
+    bytes: u64,
+    expected: [u64; 2],
+    check: impl Fn() -> Result<(), String>,
+) -> Result<Version, String> {
+    let actual = version_with_check(path, check)?;
+    if actual.bytes != bytes || actual.fingerprint != expected {
         return Err("Published file changed before verification. Current work remains open; inspect the destination and use Save As.".into());
     }
     Ok(actual)

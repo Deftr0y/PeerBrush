@@ -1,6 +1,7 @@
 //! Flattened production exports. Plans and renders never mutate editable sources.
 pub mod jobs;
 pub mod library;
+mod png;
 use crate::engine::Document;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -484,7 +485,11 @@ pub fn plan(
         // Validate target semantics even when no alpha scan is needed.
         target_document(doc, target.as_deref())?;
         let mut rect = if settings.crop == Crop::Alpha {
-            Image::render(doc, target.as_deref(), control)?.bounds(control)?
+            if settings.format == Format::Png {
+                png::bounds(doc, target.as_deref(), control)?
+            } else {
+                Image::render(doc, target.as_deref(), control)?.bounds(control)?
+            }
         } else {
             [0, 0, doc.width as i32, doc.height as i32]
         };
@@ -560,6 +565,11 @@ pub fn render(
     {
         return Err("Invalid export document rectangle".into());
     }
+    if settings.format == Format::Png {
+        let mut bytes = Vec::new();
+        png::write(doc, output, settings, control, &mut bytes)?;
+        return Ok(bytes);
+    }
     let image = Image::render(doc, output.target.as_deref(), control)?;
     let profile = doc
         .icc_profile
@@ -625,6 +635,50 @@ pub(crate) fn render_document(
     };
     let plan = plan(doc, &[], &settings, control)?;
     render(doc, &plan.outputs[0], &settings, control)
+}
+
+pub(crate) fn render_to(
+    doc: &Document,
+    output: &Output,
+    settings: &Settings,
+    control: &Control,
+    writer: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    if settings.format != Format::Png {
+        return writer
+            .write_all(&render(doc, output, settings, control)?)
+            .map_err(|e| e.to_string());
+    }
+    settings.validate()?;
+    size(output.width, output.height)?;
+    if output.format != settings.format
+        || output.native_source_depth != doc.bit_depth
+        || output.bit_depth != doc.bit_depth
+    {
+        return Err("Export format or channel depth differs from its source/settings".into());
+    }
+    let rect = output.document_rect;
+    if rect[2] <= rect[0] || rect[3] <= rect[1] || rect.iter().any(|v| i64::from(*v).abs() > 16384)
+    {
+        return Err("Invalid export document rectangle".into());
+    }
+    png::write(doc, output, settings, control, writer)
+}
+
+pub(crate) fn render_document_to(
+    doc: &Document,
+    format: Format,
+    jxl: crate::jpeg_xl::Options,
+    control: &Control,
+    writer: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    let settings = Settings {
+        format,
+        jxl,
+        ..Default::default()
+    };
+    let plan = plan(doc, &[], &settings, control)?;
+    render_to(doc, &plan.outputs[0], &settings, control, writer)
 }
 
 #[cfg(test)]

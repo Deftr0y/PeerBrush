@@ -43,6 +43,9 @@ impl Drop for FileOperation {
     }
 }
 #[cfg(test)]
+#[path = "png_export_tests.rs"]
+mod png_export_tests;
+#[cfg(test)]
 #[path = "save_safety_tests.rs"]
 mod save_safety_tests;
 pub struct Connection {
@@ -594,7 +597,7 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
         .unwrap_or_default();
     jxl.validate()?;
     let control = crate::production_export::Control::default();
-    export_derived_guarded(shared, path, request, &control, |doc| {
+    export_derived_to_guarded(shared, path, request, &control, |doc, writer| {
         if format == crate::production_export::Format::Jxl
             && request
                 .get("bit_depth")
@@ -604,10 +607,11 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
                 "JPEG XL export preserves the working document's native channel depth".into(),
             );
         }
-        crate::production_export::render_document(doc, format, jxl, &control)
+        crate::production_export::render_document_to(doc, format, jxl, &control, writer)
     })
     .map(|_| ())
 }
+#[cfg(test)]
 pub(crate) fn export_derived_guarded(
     shared: &Shared,
     path: &Path,
@@ -615,6 +619,19 @@ pub(crate) fn export_derived_guarded(
     control: &crate::production_export::Control,
     encode: impl FnOnce(&crate::engine::Document) -> Result<Vec<u8>, String>,
 ) -> Result<bool, String> {
+    export_derived_to_guarded(shared, path, request, control, |doc, writer| {
+        writer.write_all(&encode(doc)?).map_err(|e| e.to_string())
+    })
+    .map(|bytes| bytes.is_some())
+}
+
+pub(crate) fn export_derived_to_guarded(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    control: &crate::production_export::Control,
+    encode: impl FnOnce(&crate::engine::Document, &mut dyn Write) -> Result<(), String>,
+) -> Result<Option<usize>, String> {
     let _operation = FileOperation::begin(shared)?;
     control.check()?;
     let format = crate::production_export::Format::from_path(path)?;
@@ -651,11 +668,85 @@ pub(crate) fn export_derived_guarded(
     };
     // Protect sources owned by another project or application instance too.
     if lease.expected.is_some() && request["skip_existing"] == true {
-        return Ok(false);
+        return Ok(None);
     }
     let project = shared.lock().unwrap().project_id.clone();
     let _ownership = crate::file_ownership::Ownership::save(path, &project)?;
-    let bytes = encode(&doc)?;
+    // Keep the existing 256 MiB file-safety envelope while encoding directly to
+    // a private same-directory file outside the document lock.
+    struct Output<'a> {
+        file: &'a mut fs::File,
+        bytes: usize,
+        fingerprint: [u64; 2],
+        control: &'a crate::production_export::Control,
+    }
+    impl Write for Output<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.control.check().map_err(std::io::Error::other)?;
+            if self
+                .bytes
+                .checked_add(bytes.len())
+                .is_none_or(|n| n > 256 * 1024 * 1024)
+            {
+                return Err(std::io::Error::other(
+                    "Export exceeds the 256 MiB file safety limit",
+                ));
+            }
+            let n = self.file.write(bytes)?;
+            crate::file_safety::hash(&bytes[..n], &mut self.fingerprint);
+            self.bytes += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.control.check().map_err(std::io::Error::other)?;
+            self.file.flush()
+        }
+    }
+    struct Temporary(PathBuf);
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let temporary = Temporary(path.with_extension(format!("{}.tmp", engine::id())));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temporary.0)
+        .map_err(|e| e.to_string())?;
+    let identity = crate::file_safety::identity(&file)?;
+    if path.exists() {
+        crate::file_safety::preserve_permissions(path, &temporary.0)?;
+    }
+    let mut output = Output {
+        file: &mut file,
+        bytes: 0,
+        fingerprint: [0xcbf29ce484222325, 0x84222325cbf29ce4],
+        control,
+    };
+    encode(&doc, &mut output)?;
+    output.flush().map_err(|e| e.to_string())?;
+    let bytes = output.bytes;
+    let fingerprint = output.fingerprint;
+    drop(output);
+    file.sync_all().map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let stamp = (
+        metadata.len(),
+        metadata.modified().map_err(|e| e.to_string())?,
+    );
+    let named_metadata = fs::symlink_metadata(&temporary.0).map_err(|e| e.to_string())?;
+    if !named_metadata.is_file() || named_metadata.file_type().is_symlink() {
+        return Err("Export temporary path changed; destination retained".into());
+    }
+    let staged =
+        crate::file_safety::verified_version(&temporary.0, bytes as u64, fingerprint, || {
+            control.check()
+        })?;
+    if staged.identity != identity || staged.bytes != bytes as u64 {
+        return Err("Export temporary file changed; destination retained".into());
+    }
     control.check()?;
     let backup = lease.preserve()?;
     let e = shared.lock().unwrap();
@@ -664,15 +755,34 @@ pub(crate) fn export_derived_guarded(
         return Err("Project source changed before exporting".into());
     }
     lease.validate()?;
-    atomic_write_checked(path, &bytes, |_| {
-        control.check()?;
-        lease.validate()
-    })?;
-    crate::file_safety::published_version(path, &bytes)?;
+    control.check()?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let named_metadata = fs::symlink_metadata(&temporary.0).map_err(|e| e.to_string())?;
+    let named = fs::File::open(&temporary.0).map_err(|e| e.to_string())?;
+    if !named_metadata.is_file()
+        || named_metadata.file_type().is_symlink()
+        || (
+            metadata.len(),
+            metadata.modified().map_err(|e| e.to_string())?,
+        ) != stamp
+        || crate::file_safety::identity(&file)? != identity
+        || crate::file_safety::identity(&named)? != identity
+    {
+        return Err("Export temporary file changed; destination retained".into());
+    }
+    drop(named);
+    replace_file(&temporary.0, path)?;
+    sync_parent(path)?;
+    drop(e);
+    drop(file);
+    let published = crate::file_safety::version_with_check(path, || Ok(()))?;
+    if published != staged {
+        return Err("Published file changed before verification. Current work remains open; inspect the destination and use a new export path.".into());
+    }
     if let Some(backup) = backup {
         lease.prune(&backup);
     }
-    Ok(true)
+    Ok(Some(bytes))
 }
 
 pub fn tools() -> Value {

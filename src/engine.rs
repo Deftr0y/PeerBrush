@@ -382,23 +382,12 @@ impl Document {
         Ok((w, h, bytes, rect))
     }
     pub fn export_png(&self) -> Result<Vec<u8>, String> {
-        let profile = self
-            .icc_profile
-            .as_deref()
-            .map(Vec::as_slice)
-            .or_else(|| self.srgb_tagged.then(crate::color_profile::srgb_profile));
-        if self.bit_depth == 16 {
-            let image = crate::depth16::render(self)?;
-            return crate::raster::png16_with_profile(
-                image.width,
-                image.height,
-                &image.words,
-                profile,
-            );
-        }
-        let (w, h, bytes, _) =
-            self.preview_native8(None, self.width.max(self.height), None, false)?;
-        crate::raster::png_with_profile(w, h, &bytes, profile)
+        crate::production_export::render_document(
+            self,
+            crate::production_export::Format::Png,
+            crate::jpeg_xl::Options::default(),
+            &crate::production_export::Control::default(),
+        )
     }
 }
 
