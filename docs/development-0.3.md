@@ -346,3 +346,22 @@ PB-108 now retains one derived validated preview Result within the existing pend
 Five focused native8/16 methods prepare real held Wand controls, both panels and accepted canvas pixels; typed changes/identical commands; remote edits, engine identity/revision and contention; derived-display attribution and cached errors; Cancel, one-step Apply/undo/redo and new reservations rejecting a cached preview's commit. Parent and independent source reviews passed; formatting completed. Combined execution and comparable post-change CPU measurements remain pending. Actual changed-input calculation and original startup/physical latency acceptance remain open; no speedup is claimed before replay.
 
 The 99bb native run subsequently closed: Windows failed only the same selected-skew UI assertion at line591. All three native jobs are non-passing, with aggregate inspection skipped and no downstream installer or real portable-to-DEB acceptance reached.
+
+
+## Unchanged-control measurement checkpoint - 2026-10-20
+
+Clean 8064343318d7927d513892f79dafd24968774319 completed 90 local Rust targets: 1,080 passed, one new fixture failed, thirteen opt-in cases ignored and none interrupted. Three provider cases remained explicitly filtered locally; native CI is unfiltered. Four adapter units, seven offscreen GPU cases, actual Windows installed-font Source/PSD/PSB8/16, formatting and all-target Clippy with warnings passed. All previously failing selected-skew comparisons and their remaining native16/history assertions now passed. Python/qualified-SDK/fresh-runtime completed 323 distinct methods: 318 passed, no failures/errors and five platform/permission skips. Five headless runtime checks passed. Source stayed clean; runtime SHA-256 e2033133f18a6d05a60f91625e6aa407788bf0a2ee7f5b19864640cf91589e41. The 388-file source inventory and scoped 406-file current-byte/privacy/path scan passed; this is not a historical audit.
+
+Three fresh actual-egui diagnostic processes passed with exact accepted shared canvas pixels, native artwork and history unchanged. The same Windows x64/Rust 1.90 debug/test workload, 512x512 one-layer documents and 24 pooled samples per depth/control produced these milliseconds (median / nearest-rank p95):
+
+| Component | Native8 at 99bb | Native8 at 806 | Native16 at 99bb | Native16 at 806 |
+| --- | --- | --- | --- | --- |
+| Unchanged held Wand full frame | 20.8274 / 23.5443 | 0.2061 / 0.2720 | 21.9275 / 23.1128 | 0.2053 / 0.2838 |
+| Direct identical Wand engine preview | 20.6016 / 22.9820 | 20.3788 / 22.3846 | 21.2133 / 23.5407 | 21.1034 / 21.7860 |
+| Unchanged held opacity full frame | 0.1696 / 0.2642 | 0.1638 / 0.2226 | 0.1668 / 0.2536 | 0.1620 / 0.2330 |
+
+This removes approximately 99% of this measured unchanged-Wand frame cost; exact replay-count tests verify reuse. Changed Wand input remains 19.62-21.27 ms, and accepted canvas settlement measured 29.18-31.65 ms (including worker/poll timing). OS/font caches and background scheduling are uncontrolled; this is a component comparison, not release-mode performance, application first-present, physical latency or closure of the original regression. Native input remains held by the user.
+
+The sole local failure was the new typing fixture at parameter_preview_tests.rs:232: actual replay count 1 versus expected 2. The existing range control keeps text provisional until Enter/focus loss; Text 35 does not change its command. The reviewed test-only correction checks the stored and painted draft 35, exact unchanged command/counter/source/history and target cancellation. A second actual in-range Wand pointer move now proves different commands and exactly one additional validation before unchanged-frame reuse. No production numeric behavior or counter inequality changes; replay is pending.
+
+[Native CI39486118973](https://github.com/Deftr0y/PeerBrush/actions/runs/39486118973) checks merge f47068ebe0cef1e51e552bc34cd4609154d21cfe, matching tree 4ee80d8478e7ae13c25954109f9e6f52b12d168a. Policy/attribution passed; macOS and Ubuntu failed only the same typing fixture and skipped downstream installation/real-upgrade/package qualification. Windows remained running when recorded. This checkpoint is non-passing despite the measured component improvement.

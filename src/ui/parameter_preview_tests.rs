@@ -129,6 +129,23 @@ fn held_wand_reuses_validated_document_in_real_panels_and_preserves_canvas_histo
                 .expect("Actual held Wand control");
             let runs = edit.preview_runs;
             assert!(runs > 0);
+            let previous_commands = edit.commands.clone();
+            wand_control(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(at + Vec2::new(16., 0.))],
+            );
+            let edit = app.parameter_gesture.as_ref().unwrap();
+            assert_ne!(
+                edit.commands, previous_commands,
+                "The second real pointer movement must change the pending command"
+            );
+            assert_eq!(
+                edit.preview_runs,
+                runs + 1,
+                "A changed held command is validated exactly once"
+            );
+            let runs = edit.preview_runs;
             let commands = edit.commands.clone();
             let expected = Engine::preview_edits(before.clone(), &commands).unwrap();
             let output = settle(&mut app, &ctx);
@@ -204,7 +221,7 @@ fn held_wand_reuses_validated_document_in_real_panels_and_preserves_canvas_histo
 }
 
 #[test]
-fn typed_commands_rebuild_once_and_target_cancel_drops_derived_document_without_source_changes() {
+fn provisional_numeric_text_reuses_preview_and_target_cancel_preserves_source() {
     for depth in [8, 16] {
         let (mut app, ctx) = workspace::fixture(depth);
         let id = app.selected.clone();
@@ -227,13 +244,18 @@ fn typed_commands_rebuild_once_and_target_cancel_drops_derived_document_without_
         frame(&mut app, &ctx, vec![]);
         assert!(app.parameter_gesture.as_ref().unwrap().typing.is_some());
         let runs = app.parameter_gesture.as_ref().unwrap().preview_runs;
-        frame(&mut app, &ctx, vec![egui::Event::Text("35".into())]);
-        frame(&mut app, &ctx, vec![]);
+        let control = app.parameter_gesture.as_ref().unwrap().control;
+        let commands = app.parameter_gesture.as_ref().unwrap().commands.clone();
+        let output = frame(&mut app, &ctx, vec![egui::Event::Text("35".into())]);
         assert_eq!(
-            app.parameter_gesture.as_ref().unwrap().preview_runs,
-            runs + 1
+            ctx.data(|data| data.get_temp::<String>(control.with("number")))
+                .as_deref(),
+            Some("35")
         );
-        let runs = app.parameter_gesture.as_ref().unwrap().preview_runs;
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "35")), "The numeric editor must actually display its provisional text");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.parameter_gesture.as_ref().unwrap().preview_runs, runs);
+        assert_eq!(app.parameter_gesture.as_ref().unwrap().commands, commands);
         for _ in 0..4 {
             frame(&mut app, &ctx, vec![]);
         }
@@ -250,14 +272,21 @@ fn typed_commands_rebuild_once_and_target_cancel_drops_derived_document_without_
         assert_eq!(
             app.parameter_gesture.as_ref().unwrap().preview_runs,
             runs,
-            "Identical numeric input retains the same validated document"
+            "Provisional numeric text does not replay unchanged commands"
         );
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(control.with("number")))
+                .as_deref(),
+            Some("35")
+        );
+        assert_eq!(app.parameter_gesture.as_ref().unwrap().commands, commands);
         assert_eq!(workspace::source(&app), before);
         let effect = app.shared.lock().unwrap().doc.layers[0].effects[0]
             .id
             .clone();
         app.select_effect(&id, false, &effect);
         assert!(app.parameter_gesture.is_none());
+        assert!(!controls::number_editing(&ctx, control));
         assert_eq!(workspace::source(&app), before);
     }
 }
