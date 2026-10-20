@@ -1,5 +1,6 @@
 """Package a committed native build, matching GPL source and license notices."""
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -13,14 +14,21 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import tomllib
 import zipfile
+import zlib
 
 
 
 MANIFEST = "scripts/package-files.json"
 MACOS_RESOURCES = 'PeerBrush.app/Contents/Resources/'
+MAX_CRATE_COMPRESSED_BYTES = 64 * 1024 * 1024
+MAX_CRATE_DECODED_BYTES = 128 * 1024 * 1024
+MAX_CRATE_MEMBERS = 10000
+MAX_CRATE_NOTICE_BYTES = 4 * 1024 * 1024
+MAX_CRATE_NOTICES_BYTES = 16 * 1024 * 1024
 
 
 def macos_info(version):
@@ -100,6 +108,75 @@ def active_rust_docs():
         raise ValueError('Active Rust compiler did not return an absolute sysroot')
     return pathlib.Path(sysroot) / 'share' / 'doc' / 'rust'
 
+def cached_crate_notices(registry, crate, package, metadata):
+    """Read notices from a lock-verified Cargo cache, without extracting it."""
+    checksum = package.get('checksum')
+    if type(checksum) is not str or not re.fullmatch('[0-9a-f]{64}', checksum):
+        raise ValueError('Missing locked dependency archive checksum')
+    key = f"{package['name']}-{package['version']}"
+    relative_path(key)
+    meta = tomllib.loads(metadata.decode('utf-8'))['package']
+    if meta.get('name') != package['name'] or meta.get('version') != package['version']:
+        raise ValueError('Dependency metadata identity differs from its locked package')
+    required = (EXTRA_CRATE_NOTICES.get(package['name'], set())
+                | EMBEDDED_FONT_NOTICES.get(package['name'], set()))
+    if meta.get('license-file'):
+        required = required | {meta['license-file']}
+    for name in required:
+        relative_path(name)
+    try:
+        cache = regular_file(registry.parent / 'cache', crate.parent.name + '/' + key + '.crate')
+        with cache.open('rb') as stream:
+            compressed = stream.read(MAX_CRATE_COMPRESSED_BYTES + 1)
+        if len(compressed) > MAX_CRATE_COMPRESSED_BYTES:
+            raise ValueError('Dependency notice archive exceeds the compressed budget')
+        if hashlib.sha256(compressed).hexdigest() != checksum:
+            raise ValueError('Dependency archive differs from Cargo.lock checksum')
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
+            decoded = stream.read(MAX_CRATE_DECODED_BYTES + 1)
+        if len(decoded) > MAX_CRATE_DECODED_BYTES:
+            raise ValueError('Dependency notice archive exceeds the decoded budget')
+        seen, notices, found_metadata, total = set(), {}, False, 0
+        # Bound the decoded buffer before tar/PAX header parsing can read it.
+        with tarfile.open(fileobj=io.BytesIO(decoded), mode='r:') as archive:
+            for count, entry in enumerate(archive, 1):
+                path = relative_path(entry.name.rstrip('/') if entry.isdir() else entry.name)
+                if count > MAX_CRATE_MEMBERS or path.parts[0] != key or str(path).casefold() in seen:
+                    raise ValueError('Invalid dependency archive paths, duplicates or member count')
+                seen.add(str(path).casefold())
+                if entry.isdir():
+                    continue
+                if not entry.isfile() or len(path.parts) < 2 or not 0 <= entry.size <= MAX_CRATE_DECODED_BYTES:
+                    raise ValueError('Dependency archive must contain bounded regular files')
+                name = '/'.join(path.parts[1:])
+                selected = (name in required or (len(path.parts) == 2 and path.name.casefold() in NOTICE_NAMES)
+                            or (path.parts[1] == 'fonts' and path.name.casefold() in NOTICE_NAMES))
+                if name == 'Cargo.toml' or selected:
+                    if not 0 < entry.size <= MAX_CRATE_NOTICE_BYTES:
+                        raise ValueError('Dependency notice or metadata exceeds its file budget')
+                    with archive.extractfile(entry) as stream:
+                        data = stream.read(entry.size + 1)
+                    if len(data) != entry.size:
+                        raise ValueError('Truncated dependency notice archive')
+                    if name == 'Cargo.toml':
+                        if data != metadata:
+                            raise ValueError('Dependency metadata differs from the verified archive')
+                        found_metadata = True
+                    else:
+                        total += len(data)
+                        if total > MAX_CRATE_NOTICES_BYTES:
+                            raise ValueError('Dependency notices exceed the combined budget')
+                        notices[name] = data
+        if not found_metadata or not required <= set(notices):
+            raise ValueError('Missing required dependency notice inventory in verified archive')
+        for name, data in notices.items():
+            if digest(regular_file(crate, name)) != hashlib.sha256(data).hexdigest():
+                raise ValueError('Dependency notice checksum mismatch')
+        return notices
+    except (OSError, EOFError, tarfile.TarError, zlib.error):
+        raise ValueError('Could not read the required lock-verified dependency notice archive') from None
+
+
 def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
     notices = bundle / "licenses"
     rows = ["# Third-party notices", "", "Dependencies retain their original licenses. Sources and checksums are pinned by Cargo.lock in the included project source archive. This list covers downloaded dependencies; not every crate is linked into this platform binary.", ""]
@@ -115,7 +192,8 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
             raise ValueError("Ambiguous registry source; supply --registry for the build's registry")
         crate = matches[0]
         regular_file(registry, (crate / "Cargo.toml").relative_to(registry).as_posix())
-        meta = tomllib.loads(regular_file(crate, "Cargo.toml").read_text(encoding="utf-8"))["package"]
+        metadata = regular_file(crate, "Cargo.toml").read_bytes()
+        meta = tomllib.loads(metadata.decode('utf-8'))["package"]
         rows.append(f"- {key}: {meta.get('license', meta.get('license-file', 'See source license'))}")
         selected = {p.name for p in crate.iterdir() if p.name.casefold() in NOTICE_NAMES}
         if meta.get("license-file"):
@@ -123,9 +201,18 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
         # Embedded egui fonts have their own licenses; select checksum-listed notices.
         checksum_file = crate / ".cargo-checksum.json"
         extra_notices = EXTRA_CRATE_NOTICES.get(package["name"], set())
-        if extra_notices and not checksum_file.exists():
-            raise ValueError("Missing dependency notice checksum inventory")
-        if checksum_file.exists():
+        try:
+            checksum_file.lstat()
+            checksum_present = True
+        except FileNotFoundError:
+            checksum_present = False
+        if not checksum_present and (extra_notices or EMBEDDED_FONT_NOTICES.get(package['name'])):
+            for name, data in cached_crate_notices(registry, crate, package, metadata).items():
+                target = notices / key / relative_path(name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            continue
+        if checksum_present:
             checksums = json.loads(regular_file(crate, ".cargo-checksum.json").read_text(encoding="utf-8"))["files"]
             if not extra_notices <= set(checksums):
                 raise ValueError("Missing required dependency notice inventory")

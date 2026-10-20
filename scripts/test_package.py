@@ -1,5 +1,6 @@
 """Packaging regressions using isolated, synthetic committed repositories."""
 import contextlib
+import gzip
 import importlib.util
 import io
 import json
@@ -9,6 +10,7 @@ import plistlib
 import struct
 import subprocess
 import tempfile
+import tarfile
 import unittest
 from unittest import mock
 import zipfile
@@ -44,7 +46,7 @@ class Packages(unittest.TestCase):
             (self.root / name).write_text(content, encoding='utf-8')
         (self.root / 'scripts/package-readme.md').write_text('Synthetic focused package README: {{SOURCE_ARCHIVE}}\n', encoding='utf-8')
         (self.root / 'assets/peerbrush.icns').write_bytes((pathlib.Path(__file__).resolve().parents[1] / 'assets/peerbrush.icns').read_bytes())
-        (self.root / '.gitignore').write_text('/output/\n/verified/\n/rejected/\n/registry/\n/synthetic-binary\n', encoding='utf-8')
+        (self.root / '.gitignore').write_text('/output/\n/verified/\n/rejected/\n/registry/\n/cache/\n/synthetic-binary\n', encoding='utf-8')
         (self.root / 'integrations').mkdir()
         (self.root / 'integrations/segmentation_rembg.py').write_text('# Synthetic provider\n', encoding='utf-8')
         self.policy = {
@@ -691,6 +693,121 @@ class Packages(unittest.TestCase):
         (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
         with self.assertRaisesRegex(ValueError, 'required dependency notice inventory'):
             self.build('Windows')
+
+    def cached_notice_fixture(self, name='ring'):
+        version = '0.17.14' if name == 'ring' else '0.31.1'
+        key = name + '-' + version
+        self.cached_package = dict(name=name, version=version, source='registry+https://example.invalid')
+        self.cached_crate = self.root / 'registry/test' / key
+        self.cached_metadata = f'[package]\nname="{name}"\nversion="{version}"\nlicense="MIT"\nlicense-file="legal/custom.txt"\n'.encode()
+        self.cached_files = {'Cargo.toml': self.cached_metadata, 'LICENSE': b'Synthetic root license',
+                             'legal/custom.txt': b'Synthetic declared license', 'fonts/NOTICE.txt': b'Synthetic font notice',
+                             'LICENSE-private': b'SYNTHETIC_PRIVATE_CANARY', 'fonts/connection.txt': b'SYNTHETIC_PRIVATE_CANARY'}
+        for path in packaging.EXTRA_CRATE_NOTICES.get(name, set()) | packaging.EMBEDDED_FONT_NOTICES.get(name, set()):
+            self.cached_files[path] = b'Synthetic required notice: ' + path.encode()
+        for path, data in self.cached_files.items():
+            target = self.cached_crate / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        self.cached_archive = self.root / 'cache/test' / (key + '.crate')
+        self.cached_archive.parent.mkdir(parents=True, exist_ok=True)
+        self.write_cached_notice_archive()
+        (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\n' + ''.join(f'{key}="{value}"\n' for key, value in self.cached_package.items()))
+        self.commit()
+
+    def write_cached_notice_archive(self, mutation=None, extra=()):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode='w') as archive:
+            for name, data in [*self.cached_files.items(), *extra]:
+                entry = tarfile.TarInfo(self.cached_crate.name + '/' + name)
+                entry.size = len(data)
+                if mutation:
+                    mutation(entry)
+                if not entry.isfile():
+                    entry.size = 0
+                archive.addfile(entry, io.BytesIO(data) if entry.isfile() else None)
+        self.cached_archive.write_bytes(gzip.compress(raw.getvalue()))
+        self.cached_package['checksum'] = packaging.digest(self.cached_archive)
+
+    def cached_notices(self, metadata=None):
+        return packaging.cached_crate_notices(self.root / 'registry', self.cached_crate, self.cached_package,
+                                             self.cached_metadata if metadata is None else metadata)
+
+    def test_registry_cache_fallback_preserves_root_declared_component_and_embedded_font_notices(self):
+        for name in ['ring', 'epaint_default_fonts']:
+            self.cached_notice_fixture(name)
+            archive_path = self.build('Windows')
+            expected = {'LICENSE', 'legal/custom.txt', 'fonts/NOTICE.txt'} | packaging.EXTRA_CRATE_NOTICES.get(name, set()) | packaging.EMBEDDED_FONT_NOTICES.get(name, set())
+            with zipfile.ZipFile(archive_path) as archive:
+                prefix = archive_path.stem + '/licenses/' + self.cached_crate.name + '/'
+                self.assertEqual({path.removeprefix(prefix) for path in archive.namelist() if path.startswith(prefix)}, expected)
+                for path in expected:
+                    self.assertEqual(archive.read(prefix + path), self.cached_files[path])
+                self.assertFalse(any('LICENSE-private' in path or 'connection.txt' in path for path in archive.namelist()))
+
+    def test_registry_cache_requires_locked_bytes_and_matching_extracted_metadata_and_notices(self):
+        self.cached_notice_fixture()
+        original = self.cached_archive.read_bytes()
+        self.cached_archive.write_bytes(original + b'changed')
+        with self.assertRaisesRegex(ValueError, 'Cargo.lock checksum'):
+            self.cached_notices()
+        self.cached_archive.write_bytes(original)
+        checksum = self.cached_package.pop('checksum')
+        with self.assertRaisesRegex(ValueError, 'locked dependency archive checksum'):
+            self.cached_notices()
+        self.cached_package['checksum'] = checksum
+        with self.assertRaisesRegex(ValueError, 'metadata differs'):
+            self.cached_notices(self.cached_metadata + b'# changed extracted metadata\n')
+        notice = self.cached_crate / 'LICENSE-other-bits'
+        notice.write_bytes(b'Tampered notice')
+        with self.assertRaisesRegex(ValueError, 'notice checksum mismatch'):
+            self.cached_notices()
+        notice.write_bytes(self.cached_files['LICENSE-other-bits'])
+        (self.cached_crate / 'LICENSE').unlink()
+        with self.assertRaises(ValueError):
+            self.cached_notices()
+
+    def test_registry_cache_rejects_unsafe_members_and_missing_required_notices(self):
+        self.cached_notice_fixture()
+        for field, value in [('name', '../escape'), ('name', 'other-crate/LICENSE'),
+                             ('type', tarfile.SYMTYPE), ('type', tarfile.LNKTYPE), ('type', tarfile.FIFOTYPE)]:
+            def mutate(entry):
+                if entry.name.endswith('/LICENSE'):
+                    setattr(entry, field, value)
+            with self.subTest(field=field, value=value):
+                self.write_cached_notice_archive(mutate)
+                with self.assertRaises(ValueError):
+                    self.cached_notices()
+        for name in ['LICENSE', 'license']:
+            self.write_cached_notice_archive(extra=[(name, b'Duplicate')])
+            with self.assertRaisesRegex(ValueError, 'duplicates'):
+                self.cached_notices()
+        del self.cached_files['LICENSE-other-bits']
+        self.write_cached_notice_archive()
+        with self.assertRaisesRegex(ValueError, 'required dependency notice inventory'):
+            self.cached_notices()
+
+    def test_registry_cache_hard_budgets_fail_closed_before_unbounded_reads(self):
+        self.cached_notice_fixture()
+        for constant, limit in [('MAX_CRATE_COMPRESSED_BYTES', 8), ('MAX_CRATE_DECODED_BYTES', 512),
+                                ('MAX_CRATE_MEMBERS', 1), ('MAX_CRATE_NOTICE_BYTES', 8), ('MAX_CRATE_NOTICES_BYTES', 1)]:
+            with self.subTest(limit=constant), mock.patch.object(packaging, constant, limit):
+                with self.assertRaises(ValueError):
+                    self.cached_notices()
+        self.cached_archive.write_bytes(b'Not a gzip archive')
+        self.cached_package['checksum'] = packaging.digest(self.cached_archive)
+        with self.assertRaisesRegex(ValueError, 'lock-verified dependency notice archive'):
+            self.cached_notices()
+
+    def test_present_invalid_notice_inventory_never_uses_registry_cache_fallback(self):
+        for name in ['ring', 'epaint_default_fonts']:
+            self.cached_notice_fixture(name)
+            for data in ['{"files":{}}', 'not JSON']:
+                (self.cached_crate / '.cargo-checksum.json').write_text(data)
+                with mock.patch.object(packaging, 'cached_crate_notices') as cached:
+                    with self.assertRaises(ValueError):
+                        self.build('Windows')
+                    cached.assert_not_called()
 
     def test_dated_repack_names_preserve_internal_layout_and_require_matching_labels(self):
         commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
