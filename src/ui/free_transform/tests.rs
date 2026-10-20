@@ -1180,3 +1180,536 @@ fn proportional_zero_magnitude_preserves_the_other_axis_crossing_and_never_flips
         assert_eq!(workspace::source(&app), before);
     }
 }
+
+#[test]
+fn edge_skew_follows_the_actual_sheared_axes_and_reference_and_restores_exact_commands() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        open(&mut app, &ctx);
+        let before = workspace::source(&app);
+        for mirrored in [[false, false], [true, false], [false, true], [true, true]] {
+            for axis in [0, 1] {
+                for snap in [false, true] {
+                    let editor = app.free_transform.as_mut().unwrap();
+                    editor.reference = None;
+                    editor.values = Parameters {
+                        offset: [3., -2.],
+                        scale: [1.6, 0.8],
+                        angle: 30.,
+                        skew: [15., -15.],
+                        mirror: mirrored,
+                    };
+                    editor.snap = snap;
+                    editor.set_reference([5.25, 21.75]).unwrap();
+                    let start = editor.values.clone();
+                    let key = editor.key().unwrap();
+                    let b = editor.whole_bounds;
+                    let point = if axis == 0 {
+                        [(b[0] + b[2]) * 0.5, b[1]]
+                    } else {
+                        [b[2], (b[1] + b[3]) * 0.5]
+                    };
+                    let origin = editor.point(point);
+                    let center = editor.reference_point();
+                    let old = Editor::matrix(&editor.command("", snap).unwrap()).unwrap();
+                    let [a, b, c, d, tx, ty] = old;
+                    let det = a * d - b * c;
+                    // Independently recover the source point at the fixed reference.
+                    let anchor = [
+                        (d * (center[0] - tx) - c * (center[1] - ty)) / det,
+                        (-b * (center[0] - tx) + a * (center[1] - ty)) / det,
+                    ];
+                    let mut values = start.clone();
+                    values.skew[axis] = if axis == 0 { 30. } else { -30. };
+                    let (sin, cos) = values.angle.to_radians().sin_cos();
+                    let signed = [
+                        if mirrored[0] {
+                            -values.scale[0]
+                        } else {
+                            values.scale[0]
+                        },
+                        if mirrored[1] {
+                            -values.scale[1]
+                        } else {
+                            values.scale[1]
+                        },
+                    ];
+                    let [kx, ky] = values.skew.map(|angle| angle.to_radians().tan());
+                    let [mut u, mut v] = [point[0] - anchor[0], point[1] - anchor[1]];
+                    u += kx * v;
+                    v += ky * u;
+                    let target = [
+                        center[0] + cos * signed[0] * u - sin * signed[1] * v,
+                        center[1] + sin * signed[0] * u + cos * signed[1] * v,
+                    ];
+                    editor.drag = Some(Drag {
+                        origin,
+                        start: start.clone(),
+                        handle: Handle::Skew(axis),
+                    });
+                    editor.drag_to(target, false);
+                    assert!((editor.values.skew[axis] - values.skew[axis]).abs() < 1e-10);
+                    assert_eq!(editor.reference_point(), center);
+                    for i in 0..2 {
+                        assert!((editor.point(point)[i] - target[i]).abs() < 1e-7);
+                    }
+                    assert_eq!(editor.values.mirror, mirrored);
+                    assert_eq!(editor.values.scale, start.scale);
+                    editor.drag_to(origin, false);
+                    assert_eq!(
+                        editor.key().unwrap(),
+                        key,
+                        "Returning the handle restores exact pending commands"
+                    );
+                }
+            }
+        }
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.reference = None;
+        editor.values = Parameters::default();
+        editor.snap = false;
+        let [l, t, r, _] = editor.whole_bounds;
+        let origin = [(l + r) * 0.5, t];
+        let key = editor.key().unwrap();
+        editor.drag = Some(Drag {
+            origin,
+            start: editor.values.clone(),
+            handle: Handle::Skew(0),
+        });
+        let pivot = editor.reference_point();
+        editor.drag_to(
+            [
+                origin[0] + (origin[1] - pivot[1]) * 38_f64.to_radians().tan(),
+                origin[1],
+            ],
+            true,
+        );
+        assert_eq!(
+            editor.values.skew[0], 45.,
+            "Shift uses the shared fifteen-degree shear snap"
+        );
+        assert_eq!(editor.commands().unwrap()[0]["skew_x"], 45.);
+        editor.drag_to([origin[0] + 1e6, origin[1]], false);
+        assert_eq!(editor.values.skew[0].abs(), crate::transform::SKEW_LIMIT);
+        editor.drag_to(origin, false);
+        assert_eq!(editor.key().unwrap(), key);
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+fn skew_edge_drag(app: &mut PeerBrush, ctx: &egui::Context, axis: usize) {
+    let output = frame(app, ctx, vec![]);
+    workspace::click(app, ctx, SIZE, workspace::label(&output, "Skew"));
+    assert!(app.free_transform.as_ref().unwrap().skew_mode);
+    assert!(app.free_transform.as_ref().unwrap().mode().is_none());
+    let editor = app.free_transform.as_ref().unwrap();
+    let corners = editor.corners();
+    let rect = app.view_rect.unwrap();
+    let start = [axis, axis + 2]
+        .into_iter()
+        .map(|edge| {
+            let point = [
+                (corners[edge][0] + corners[(edge + 1) % 4][0]) * 0.5,
+                (corners[edge][1] + corners[(edge + 1) % 4][1]) * 0.5,
+            ];
+            app.view
+                .point(point.map(|v| v as f32), rect, rect.width() / 32.)
+        })
+        .find(|point| {
+            rect.contains(*point)
+                && ctx
+                    .layer_id_at(*point)
+                    .is_some_and(|layer| layer.order == egui::Order::Background)
+        })
+        .expect("An actual skew edge handle must be visible outside the floating controls");
+    let end = start
+        + if axis == 0 {
+            Vec2::new(18., 0.)
+        } else {
+            Vec2::new(0., 18.)
+        };
+    frame(
+        app,
+        ctx,
+        vec![egui::Event::PointerMoved(start), pointer(start, true)],
+    );
+    assert!(
+        matches!(app.free_transform.as_ref().unwrap().drag.as_ref().map(|drag| drag.handle), Some(Handle::Skew(value)) if value == axis)
+    );
+    frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+    frame(app, ctx, vec![pointer(end, false)]);
+    assert!(app.free_transform.as_ref().unwrap().drag.is_none());
+}
+
+fn skew_structure_eq(actual: &Document, expected: &Document) {
+    assert_eq!(actual.layers.len(), expected.layers.len());
+    for (actual, expected) in actual.layers.iter().zip(&expected.layers) {
+        assert_eq!(
+            (&actual.id, &actual.parent, actual.visible, &actual.kind),
+            (
+                &expected.id,
+                &expected.parent,
+                expected.visible,
+                &expected.kind
+            )
+        );
+        assert_eq!(actual.mask.is_some(), expected.mask.is_some());
+        if let (Some(actual), Some(expected)) = (&actual.mask, &expected.mask) {
+            assert_eq!(
+                (actual.enabled, actual.linked, actual.steps.len()),
+                (expected.enabled, expected.linked, expected.steps.len())
+            );
+            for (actual, expected) in actual.steps.iter().zip(&expected.steps) {
+                assert_eq!(
+                    (
+                        &actual.id,
+                        &actual.kind,
+                        actual.enabled,
+                        actual.weight.to_bits(),
+                        actual.value.to_bits(),
+                        &actual.settings
+                    ),
+                    (
+                        &expected.id,
+                        &expected.kind,
+                        expected.enabled,
+                        expected.weight.to_bits(),
+                        expected.value.to_bits(),
+                        &expected.settings
+                    )
+                );
+            }
+        }
+    }
+}
+fn skew_native_layers_eq(actual: &Document, expected: &Document) {
+    skew_structure_eq(actual, expected);
+    for (actual, expected) in actual.layers.iter().zip(&expected.layers) {
+        assert_eq!((actual.x, actual.y), (expected.x, expected.y));
+        assert_eq!(actual.pixels, expected.pixels);
+        assert_eq!(actual.source, expected.source);
+        if actual.mask.is_some() {
+            reference_mask_eq(&actual.mask, &expected.mask);
+        }
+    }
+}
+
+#[test]
+fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarded_undo() {
+    for depth in [8, 16] {
+        for target in [
+            "linked-color",
+            "unlinked-color",
+            "unlinked-mask",
+            "paint-step",
+            "folder",
+        ] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            let id = app.selected.clone();
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":id})],
+                        None,
+                        None,
+                        "Painted mask",
+                    )
+                    .unwrap();
+                let layer = &mut engine.doc.layers[0];
+                for y in 0..24 {
+                    for x in 0..32 {
+                        layer.pixels.set16(
+                            x,
+                            y,
+                            [
+                                10001 + x as u16 * 137,
+                                20003 + y as u16 * 193,
+                                40007,
+                                if (x + y) % 7 == 0 { 0 } else { 49157 },
+                            ],
+                        );
+                        let value = 12347 + x as u16 * 97 + y as u16 * 193;
+                        layer.mask.as_mut().unwrap().steps[1].pixels.set16(
+                            x,
+                            y,
+                            [value, value, value, 65535],
+                        );
+                    }
+                }
+                if target != "linked-color" && target != "folder" {
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"mask.link","layer":id,"linked":false})],
+                            None,
+                            None,
+                            "Unlink mask",
+                        )
+                        .unwrap();
+                }
+                if target == "folder" {
+                    let mut root = crate::engine::Layer::new("Skew folder", "group", 32, 24);
+                    root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
+                    let mut child = engine.doc.layers[0].clone();
+                    child.parent = Some(root.id.clone());
+                    let mut hidden = child.clone();
+                    hidden.id = crate::engine::id();
+                    hidden.name = "Hidden native child".into();
+                    hidden.visible = false;
+                    hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
+                    hidden.mask = None;
+                    app.selected = root.id.clone();
+                    engine.doc.layers = vec![root, child, hidden];
+                }
+                engine.edit("human", &[
+                    json!({"op":"selection","kind":"ellipse","rect":[4,4,26,21],"feather":2.}),
+                    json!({"op":"selection","kind":"rectangle","mode":"subtract","rect":[11,9,16,14]})
+                ], None, None, "Soft selection with hole").unwrap();
+            }
+            app.selection_layers = [app.selected.clone()].into_iter().collect();
+            app.mask = target == "unlinked-mask" || target == "paint-step";
+            if target == "paint-step" {
+                app.mask_step = Some(
+                    app.shared.lock().unwrap().doc.layers[0]
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .steps[1]
+                        .id
+                        .clone(),
+                );
+            }
+            let original = app.shared.lock().unwrap().doc.clone();
+            let unchanged = workspace::source(&app);
+            let history = app.shared.lock().unwrap().undo.len();
+            open(&mut app, &ctx);
+            settle(&mut app, &ctx);
+            skew_edge_drag(&mut app, &ctx, 0);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            assert_ne!(app.free_transform.as_ref().unwrap().values.skew[0], 0.);
+            skew_edge_drag(&mut app, &ctx, 1);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["selection_only"], true);
+            assert_eq!(commands[0]["mask"], app.mask);
+            assert_eq!(commands[0]["step"].as_str(), app.mask_step.as_deref());
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Move"));
+            assert!(!app.free_transform.as_ref().unwrap().skew_mode);
+            assert_eq!(
+                app.free_transform.as_ref().unwrap().mode(),
+                Some(Tool::Move)
+            );
+            assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+            assert_eq!(
+                workspace::source(&app),
+                unchanged,
+                "Modes and release retain the same pending source"
+            );
+            let expected =
+                crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+            skew_structure_eq(&expected, &original);
+            let output = settle(&mut app, &ctx);
+            if target == "linked-color" {
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "other",
+                        "Selection owner",
+                        vec![crate::engine::Scope::layer("@selection")],
+                    )
+                    .unwrap();
+                workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+                assert!(
+                    app.free_transform.is_some(),
+                    "Reserved Apply must preserve the actual pending session"
+                );
+                assert_eq!(workspace::source(&app), unchanged);
+                app.shared.lock().unwrap().leases.clear();
+            }
+            let output = settle(&mut app, &ctx);
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+            assert!(app.free_transform.is_none(), "{}", app.message);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            skew_native_layers_eq(&engine.doc, &expected);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                expected.export_png().unwrap()
+            );
+            for encoded in [
+                crate::psd::encode(&engine.doc).unwrap(),
+                crate::psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = crate::psd::decode(&encoded).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.bit_depth, depth);
+                assert_eq!(
+                    reopened.export_png().unwrap(),
+                    engine.doc.export_png().unwrap()
+                );
+                skew_native_layers_eq(&reopened, &engine.doc);
+            }
+            let applied = engine.doc.clone();
+            engine.undo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                original.export_png().unwrap()
+            );
+            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            skew_native_layers_eq(&engine.doc, &original);
+            engine.redo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                applied.export_png().unwrap()
+            );
+            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+            skew_native_layers_eq(&engine.doc, &applied);
+        }
+    }
+}
+
+#[test]
+fn skew_mode_cancel_and_reference_axis_leave_native_history_exact() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        let b = editor.whole_bounds;
+        let origin = [(b[0] + b[2]) * 0.5, b[1]];
+        editor.set_reference(origin).unwrap();
+        let key = editor.key().unwrap();
+        editor.drag = Some(Drag {
+            origin,
+            start: editor.values.clone(),
+            handle: Handle::Skew(0),
+        });
+        editor.drag_to([origin[0] + 20., origin[1]], false);
+        assert_eq!(
+            editor.key().unwrap(),
+            key,
+            "An edge on its reference axis cannot change that shear"
+        );
+        editor.drag = None;
+        editor
+            .set_reference([(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5])
+            .unwrap();
+        skew_edge_drag(&mut app, &ctx, 0);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::Escape, Default::default()),
+                key_event(egui::Key::Delete, Default::default()),
+            ],
+        );
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn skew_handles_keep_selected_source_protection_and_support_explicit_whole_source_preview() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let source = crate::source::Source {
+            width: 32,
+            height: 24,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: crate::source::Content::Shape {
+                shape: "rectangle".into(),
+                bounds: [4., 4., 26., 20.],
+                points: vec![],
+                closed: true,
+                fill: [12347, 33559, 51237, 49157],
+                stroke: [0; 4],
+                stroke_width: 0.,
+            },
+        };
+        {
+            let mut engine = app.shared.lock().unwrap();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"source.add","source":source})],
+                    None,
+                    None,
+                    "Editable source",
+                )
+                .unwrap();
+            app.selected = engine.doc.layers[0].id.clone();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"selection","rect":[4,4,26,20],"feather":1.})],
+                    None,
+                    None,
+                    "Source selection",
+                )
+                .unwrap();
+        }
+        app.selection_layers = [app.selected.clone()].into_iter().collect();
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        skew_edge_drag(&mut app, &ctx, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let output = loop {
+            let output = frame(&mut app, &ctx, vec![]);
+            if !app.pending && app.free_transform.as_ref().unwrap().error.is_some() {
+                break output;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Shared source protection did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(app
+            .free_transform
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("rasterize"));
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(
+            app.free_transform.is_some(),
+            "An unsupported selected-source preview cannot enable Apply"
+        );
+        assert_eq!(workspace::source(&app), before);
+        let output = frame(&mut app, &ctx, vec![]);
+        workspace::click(
+            &mut app,
+            &ctx,
+            SIZE,
+            workspace::label(&output, "Whole target (keep selection)"),
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert!(
+            !app.free_transform.as_ref().unwrap().commands().unwrap()[0]["selection_only"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(workspace::source(&app), before);
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Cancel"));
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}

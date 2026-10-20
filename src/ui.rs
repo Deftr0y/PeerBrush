@@ -1042,8 +1042,8 @@ impl PeerBrush {
                 let active = self
                     .free_transform
                     .as_ref()
-                    .map_or(self.tool, |editor| editor.mode())
-                    == tool;
+                    .map_or(Some(self.tool), |editor| editor.mode())
+                    == Some(tool);
                 if active || response.hovered() {
                     ui.painter().rect_filled(
                         response.rect,

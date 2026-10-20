@@ -25,6 +25,7 @@ enum Handle {
     Move,
     Rotate,
     Scale(bool, bool),
+    Skew(usize),
     Pivot,
 }
 struct Drag {
@@ -55,6 +56,7 @@ pub(super) struct Editor {
     reference: Option<Reference>,
     values: Parameters,
     mode: Tool,
+    skew_mode: bool,
     proportional: bool,
     snap: bool,
     prior_tool: Tool,
@@ -66,11 +68,12 @@ pub(super) struct Editor {
     inputs: [Option<Rect>; 9],
 }
 impl Editor {
-    pub(super) fn mode(&self) -> Tool {
-        self.mode
+    pub(super) fn mode(&self) -> Option<Tool> {
+        (!self.skew_mode).then_some(self.mode)
     }
     pub(super) fn set_mode(&mut self, mode: Tool) {
         self.mode = mode;
+        self.skew_mode = false;
         self.drag = None;
     }
     pub(super) fn live_key(&self) -> String {
@@ -323,6 +326,48 @@ impl Editor {
                     self.values.mirror[i] = start.mirror[i] ^ reflected[i];
                 }
             }
+            Handle::Skew(axis) => {
+                if p == origin && !shift {
+                    return;
+                }
+                let Ok(command) = self.command("", self.snap) else {
+                    return;
+                };
+                let (sx, sy) = crate::transform::scales(&command).unwrap();
+                let (sin, cos) = command["angle"].as_f64().unwrap().to_radians().sin_cos();
+                let center = self.reference_point();
+                let local = |point: [f64; 2]| {
+                    [
+                        (point[0] - center[0]) * cos + (point[1] - center[1]) * sin,
+                        -(point[0] - center[0]) * sin + (point[1] - center[1]) * cos,
+                    ]
+                };
+                let a = local(origin);
+                let b = local(p);
+                let ky = command["skew_y"].as_f64().unwrap().to_radians().tan();
+                // Derivative of R*Scale*Hy*Hx about the current reference.
+                // X moves along the already vertically sheared horizontal edge.
+                let direction = if axis == 0 {
+                    let v = a[1] / sy - ky * a[0] / sx;
+                    [sx * v, sy * ky * v]
+                } else {
+                    [0., sy * a[0] / sx]
+                };
+                let squared = direction[0] * direction[0] + direction[1] * direction[1];
+                if squared <= 1e-10 {
+                    return;
+                }
+                let tangent = command[if axis == 0 { "skew_x" } else { "skew_y" }]
+                    .as_f64()
+                    .unwrap()
+                    .to_radians()
+                    .tan()
+                    + ((b[0] - a[0]) * direction[0] + (b[1] - a[1]) * direction[1]) / squared;
+                self.values.skew[axis] = tangent
+                    .atan()
+                    .to_degrees()
+                    .clamp(-crate::transform::SKEW_LIMIT, crate::transform::SKEW_LIMIT);
+            }
         }
         if !matches!(handle, Handle::Pivot) {
             if let Ok(c) = crate::transform::resolve_command(&self.raw("", self.snap || shift)) {
@@ -336,6 +381,10 @@ impl Editor {
                         c["scale_y"].as_f64().unwrap(),
                     ];
                     self.values.angle = c["angle"].as_f64().unwrap();
+                    if matches!(handle, Handle::Skew(_)) {
+                        self.values.skew =
+                            [c["skew_x"].as_f64().unwrap(), c["skew_y"].as_f64().unwrap()];
+                    }
                 }
             }
         }
@@ -432,6 +481,7 @@ impl PeerBrush {
             reference: None,
             values: Parameters::default(),
             mode: Tool::Move,
+            skew_mode: false,
             proportional: true,
             snap: false,
             prior_tool,
@@ -520,8 +570,7 @@ impl PeerBrush {
                 ("Scale artwork", Tool::Scale),
             ] {
                 if ctx.input(|input| self.shortcuts.pressed(action, input)) {
-                    editor.mode = tool;
-                    editor.drag = None;
+                    editor.set_mode(tool);
                 }
             }
         }
@@ -579,6 +628,12 @@ impl PeerBrush {
                 if p.distance(rotation) < 10. {
                     return Some(Handle::Rotate);
                 }
+                if editor.skew_mode {
+                    return points[4..]
+                        .iter()
+                        .position(|point| p.distance(*point) < 9.)
+                        .map(|index| Handle::Skew(index % 2));
+                }
                 if editor.mode == Tool::Scale {
                     return points
                         .iter()
@@ -634,14 +689,27 @@ impl PeerBrush {
             corners.to_vec(),
             Stroke::new(1.25, ACCENT),
         ));
-        let mut handles = corners.to_vec();
-        if editor.mode == Tool::Scale {
+        let mut handles = if editor.skew_mode {
+            vec![]
+        } else {
+            corners.to_vec()
+        };
+        if editor.mode == Tool::Scale || editor.skew_mode {
             for i in 0..4 {
                 handles.push((corners[i] + corners[(i + 1) % 4].to_vec2()) * 0.5);
             }
         }
-        for p in handles {
+        for (index, p) in handles.into_iter().enumerate() {
             painter.rect_filled(Rect::from_center_size(p, Vec2::splat(7.)), 1., ACCENT);
+            if editor.skew_mode {
+                painter.text(
+                    p + Vec2::new(8., -5.),
+                    egui::Align2::LEFT_BOTTOM,
+                    if index % 2 == 0 { "X" } else { "Y" },
+                    egui::FontId::proportional(11.),
+                    ACCENT,
+                );
+            }
         }
         painter.circle_stroke(rotation, 5., Stroke::new(1.5, ACCENT));
         painter.line_segment([middle, rotation], Stroke::new(1., ACCENT));
@@ -679,12 +747,21 @@ impl PeerBrush {
                         (Tool::Rotate, "Rotate"),
                         (Tool::Scale, "Scale"),
                     ] {
-                        if ui.selectable_value(&mut editor.mode, mode, label).changed() {
-                            editor.drag = None;
+                        if ui.selectable_label(!editor.skew_mode && editor.mode == mode, label).clicked() {
+                            editor.set_mode(mode);
                         }
                     }
+                    if ui.selectable_label(editor.skew_mode, "Skew").clicked() {
+                        editor.skew_mode = true;
+                        editor.drag = None;
+                    }
                 });
-                ui.label("Drag handles or enter values. Release keeps the preview pending.");
+                if editor.skew_mode {
+                    ui.label("Top/bottom: X · Left/right: Y · Shift: 15° snap.")
+                        .on_hover_text("Drag an edge handle to shear the actual artwork. An edge on the reference axis stays fixed; drag the opposite edge or move the reference point. Release keeps the preview pending.");
+                } else {
+                    ui.label("Drag handles or enter values. Release keeps the preview pending.");
+                }
                 #[cfg(test)]
                 let mut input_index = 0;
                 #[cfg(test)]

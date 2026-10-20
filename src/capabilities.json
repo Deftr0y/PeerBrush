@@ -966,6 +966,7 @@
     "preview": "Actual shared-engine native8/16 result; Apply/Enter commits one undo only after the current preview is rendered. Handle release and mode changes remain pending.",
     "cancellation": "Cancel/Escape, focus loss, changed source or target cancel the draft without rebasing; Save/close/update restart require Apply or Cancel.",
     "reference_point": "Enter or drag before or after an adjustment. Moving only the reference preserves exact commands and rendered pixels; later affine values use the chosen document-space reference in one original-sampling command, with explicit fractional posttranslation when needed. User values snap before reference compensation; Reset clears the pending transform.",
+    "skew_handles": "The compact Skew mode exposes X handles at the top/bottom edge centers and Y handles at the left/right centers. Drag changes the corresponding shared horizontal-then-vertical shear about the current reference, including existing rotation, scale and mirrors. Shift uses fifteen-degree snapping. Release and switching back to Move/Rotate/Scale keep the same pending command and actual rendered preview; no new engine operation or source format.",
     "limits": "Selected raster skew follows the current selection by default; Whole target (keep selection) is explicit. No projective distort, perspective or control-grid Warp."
   },
   "editable_sources": {
