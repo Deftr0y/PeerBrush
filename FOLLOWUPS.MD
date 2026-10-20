@@ -326,3 +326,6 @@ PB-153 affine-skew slice (unreleased, tests pending): existing whole-target shar
 
 
 v0.3 `6d29186` checkpoint (unreleased, non-passing): 1,055 local Rust checks passed and one new skew-metadata comparison failed; three host-sensitive provider cases were explicitly filtered locally, while native CI remains unfiltered. Adapter, seven GPU, actual installed-font native8/16 codec checks and format/Clippy passed. Python/SDK/fresh-runtime ran 281 methods: 276 passed, no failures/errors and five skips. Exact sample/source/frame checks remain strict in the pending one-ULP fixture correction. See [checkpoint details and settings component measurements](docs/development-0.3.md#final-dmg-store-preflight-and-skew-checkpoint--2026-10-20); native input, signed installation and complete milestone acceptance remain open.
+
+
+PB-154 native-origin slice (unreleased, combined tests pending): optional pinned offline attestation verification is called by the real six-record aggregate after exact source/ZIP/DMG/report binding. Caller-supplied success JSON cannot authenticate execution; approved physical verifier/root/bundle/source/run inputs are required. Native job completion, installed acceptance and public/production readiness remain unverified. See [the setup contract](docs/production-automation.md#optional-offline-authentication-of-native-mac-origin-unreleased).

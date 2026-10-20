@@ -70,3 +70,24 @@ python -B scripts/production_readiness.py --source-root "$RELEASE_SOURCE" \
 All inputs are independently selected public values or private paths; no credential is accepted. Existing Mac ZIP selection cannot be silently replaced. Only the six listed assets, canonical inventory/checksums and sanitized readiness are copied; native signing journals and private receipts stay outside. Reinspection requires the same external hashes/Team and qualification inputs. A same-version published four/five-record set cannot gain a DMG through handoff or direct reinspection; select a new version. Matching complete six-record selections may be reconciled without publication.
 
 Strict schema and digest matching binds native claims to selected bytes, and does not authenticate a native job. Overall `candidate_verified:false`, `asset_binding_verified:true`, unverified native producer/availability and false readiness are deliberate. Protected trusted native-job consumption, actual installation/update acceptance, publication and website installed-download adapters remain required. `--require-ready` returns a failing readiness status. Neither handoff nor local [Store preflight](msix.md#local-store-candidate-preflight-unreleased) publishes or activates a hosted workflow.
+
+
+## Optional offline authentication of native Mac origin (unreleased)
+
+A matching qualification JSON binds bytes and cannot prove who ran Apple tools. Six-record assessment and DMG handoff can additionally authenticate the exact qualification through `verify_macos_qualification.py`. Independently select the qualification/bundle hashes, a reviewed public trusted-root JSONL snapshot/hash, a reviewed GitHub CLI 2.102.0 executable/hash, the exact main workflow/source commit and invocation run/attempt. No root, CLI, key or signing workflow is downloaded, installed or activated by this consumer. It currently runs on Linux x64; leave the options absent when approved trust inputs do not exist.
+
+Add all of these options together to the existing six-record inspection or handoff command:
+
+```sh
+  --native-attestation-bundle "$ATTESTATION_BUNDLE" --native-attestation-sha256 "$BUNDLE_SHA256" \
+  --native-trusted-root "$REVIEWED_PUBLIC_ROOT_JSONL" --native-trusted-root-sha256 "$ROOT_SHA256" \
+  --native-gh "$REVIEWED_GH_BINARY" --native-gh-sha256 "$GH_BINARY_SHA256" --native-gh-version 2.102.0 \
+  --native-workflow-commit "$RELEASE_COMMIT" --native-run-id "$QUALIFICATION_RUN_ID" \
+  --native-run-attempt "$QUALIFICATION_RUN_ATTEMPT" --native-verification-work "$FRESH_PRIVATE_WORK"
+```
+
+The aggregate itself calls the pinned verifier after source/image/ZIP/report binding. It never accepts a caller's success receipt. Fixed offline verification uses the supplied bundle/root, exact repository and main workflow identity, source/signer digests and hosted-runner policy. Only successful cryptographic output supplies certificate identities, the single report subject and observer timestamp. Numeric repository/owner identifiers also bind the origin. Private copies, originals and report are rehashed afterward; raw certificates, predicates, CLI output and local paths stay outside the public result. The explicitly selected workflow identity is `.github/workflows/macos-qualification.yml@refs/heads/main`; historical Apple signing remains separate.
+
+A verified origin still leaves `native_job_conclusion:not-service-reconciled`, installation unperformed, public availability unverified and every readiness flag false. A certificate supplies no macOS or job-success assertion: review the exact workflow source and reconcile its successful native completion separately. Offline roots cannot reveal later revocation/rotation; choose fresh roots through the approved trust process. No approved verifier/root/bundle or real cryptographic execution has been established by the unsigned fixture tests.
+
+See [offline artifact verification](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/verify-attestations-offline), [the CLI verification contract](https://cli.github.com/manual/gh_attestation_verify) and [the pinned CLI security release](https://github.com/cli/cli/releases/tag/v2.102.0). The initial prepared tests cover exact policy, rejected forged/malformed/stale claims, private immutable copies, subprocess interruption/output/time limits and the actual aggregate caller. Their combined execution remains pending.

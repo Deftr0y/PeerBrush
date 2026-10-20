@@ -76,7 +76,7 @@ def immutable(previous, current):
 def assess(directory, commit, version, previous=None, source_root=None, *,
            deb_sha256=None, linux_portable_sha256=None, maintainer=None, _inventory_bytes=None,
            dmg_sha256=None, macos_portable_sha256=None, dmg_qualification=None,
-           dmg_qualification_sha256=None, macos_team_id=None):
+           dmg_qualification_sha256=None, macos_team_id=None, dmg_trust=None):
     directory = Path(directory)
     if not re.fullmatch('[0-9a-f]{40}', commit) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?', version):
         raise ValueError('Expected an exact source SHA and Cargo release version.')
@@ -100,6 +100,10 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
     dmg_inputs = [dmg_sha256, macos_portable_sha256, dmg_qualification, dmg_qualification_sha256, macos_team_id]
     if (len(assets) == 6 and not all(dmg_inputs)) or (len(assets) != 6 and any(value is not None for value in dmg_inputs)):
         raise ValueError('Six-record candidates require explicit DMG/signed ZIP/qualification hashes, qualification bytes and publisher Team; other candidates cannot accept DMG inputs.')
+    if dmg_trust is not None and (len(assets) != 6 or not isinstance(dmg_trust, dict)
+            or set(dmg_trust) != {'bundle', 'bundle_sha256', 'trusted_root', 'trusted_root_sha256', 'cli',
+                                  'cli_sha256', 'cli_version', 'workflow_commit', 'run_id', 'run_attempt', 'work'}):
+        raise ValueError('Native provenance verification requires all independently reviewed inputs with six-record DMG inspection.')
     names = [a.get('file') for a in assets]
     if (any(not isinstance(name, str) or len(relative_path(name).parts) != 1 for name in names)
             or len({name.casefold() for name in names}) != len(assets)):
@@ -182,6 +186,11 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
                          qualification=dmg_qualification, qualification_sha256=dmg_qualification_sha256, team_id=macos_team_id)
         if bound['record'] != dmg:
             raise ValueError('Final DMG inventory differs from its selected bytes, source or strict public record.')
+        if dmg_trust is not None:
+            from verify_macos_qualification import authenticate
+            bound['native_origin'] = authenticate(dmg_qualification, qualification_sha256=dmg_qualification_sha256,
+                commit=commit, version=version, source_root=source_root or Path(__file__).resolve().parents[1], **dmg_trust)
+            bound['native_producer_authentication'] = bound['native_origin']['native_producer_authentication']
         installed['macOS'] = bound
     if previous is not None:
         immutable(previous, inventory)
@@ -201,7 +210,8 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
     if '-' in version:
         blockers.append('prerelease-version')
     if dmg is not None:
-        blockers.append('macos-native-job-provenance-unverified')
+        blockers.append('macos-native-job-provenance-unverified' if dmg_trust is None
+                        else 'macos-native-job-conclusion-not-service-reconciled')
     result = dict(schema=1, version=version, commit=commit,
                 candidate_verified=dmg is None, production_ready=False,
                 immutable_version='checked-against-supplied-inventory' if previous else 'unverified',
@@ -366,7 +376,7 @@ def read_dmg_qualification(path):
 
 def handoff_dmg(directory, image, qualification_path, output, commit, version, *, image_sha256,
                 archive_sha256, qualification_sha256, team_id, deb_sha256, linux_portable_sha256,
-                maintainer, previous=None, source_root=None):
+                maintainer, previous=None, source_root=None, dmg_trust=None):
     """Append the selected DMG; never swap an existing Mac ZIP or trust native claims."""
     root = source_root or Path(__file__).resolve().parents[1]
     directory, image, qualification_path = handoff_path(directory), handoff_path(image), handoff_path(qualification_path)
@@ -424,7 +434,8 @@ def handoff_dmg(directory, image, qualification_path, output, commit, version, *
     result = assess(output, commit, version, previous, root, deb_sha256=deb_sha256,
                     linux_portable_sha256=linux_portable_sha256, maintainer=maintainer,
                     dmg_sha256=image_sha256, macos_portable_sha256=archive_sha256,
-                    dmg_qualification=qualification, dmg_qualification_sha256=qualification_sha256, macos_team_id=team_id)
+                    dmg_qualification=qualification, dmg_qualification_sha256=qualification_sha256, macos_team_id=team_id,
+                    dmg_trust=dmg_trust)
     private_inspection_directory(output, root, fresh=False)
     with (output / 'production-readiness.json').open('x', encoding='utf-8', newline='\n') as stream:
         stream.write(json.dumps(result, indent=2, sort_keys=True) + '\n')
@@ -479,6 +490,11 @@ def main():
     parser.add_argument('--dmg-qualification', type=Path, help='External standalone native qualification; its JSON never authenticates native execution')
     parser.add_argument('--dmg-qualification-sha256')
     parser.add_argument('--macos-team-id')
+    for name in ['native-attestation-bundle', 'native-trusted-root', 'native-gh', 'native-verification-work']:
+        parser.add_argument('--' + name, type=Path)
+    for name in ['native-attestation-sha256', 'native-trusted-root-sha256', 'native-gh-sha256',
+                 'native-gh-version', 'native-workflow-commit', 'native-run-id', 'native-run-attempt']:
+        parser.add_argument('--' + name)
     parser.add_argument('--source-root', type=Path, help='Exact selected release source checkout; defaults to this script checkout')
     parser.add_argument('--deb-sha256')
     parser.add_argument('--portable', type=Path)
@@ -494,6 +510,18 @@ def main():
     root = args.source_root or Path(__file__).resolve().parents[1]
     dmg_inputs = [args.dmg_sha256, args.macos_portable_sha256, args.dmg_qualification,
                   args.dmg_qualification_sha256, args.macos_team_id]
+    native_values = [args.native_attestation_bundle, args.native_attestation_sha256,
+                     args.native_trusted_root, args.native_trusted_root_sha256,
+                     args.native_gh, args.native_gh_sha256, args.native_gh_version,
+                     args.native_workflow_commit, args.native_run_id, args.native_run_attempt,
+                     args.native_verification_work]
+    if any(value is not None for value in native_values) and (not all(native_values) or not all(dmg_inputs)):
+        parser.error('Native origin verification requires every reviewed verifier/root/bundle/source/run input and full DMG selection')
+    dmg_trust = dict(bundle=args.native_attestation_bundle, bundle_sha256=args.native_attestation_sha256,
+                     trusted_root=args.native_trusted_root, trusted_root_sha256=args.native_trusted_root_sha256,
+                     cli=args.native_gh, cli_sha256=args.native_gh_sha256, cli_version=args.native_gh_version,
+                     workflow_commit=args.native_workflow_commit, run_id=args.native_run_id,
+                     run_attempt=args.native_run_attempt, work=args.native_verification_work) if all(native_values) else None
     if (any(value is not None for value in dmg_inputs) and not all(dmg_inputs)):
         parser.error('DMG inputs require independent image/ZIP/qualification hashes, qualification path and publisher Team together')
     if (args.include_deb or args.deb) and (args.include_dmg is not None or any(value is not None for value in dmg_inputs)):
@@ -511,7 +539,7 @@ def main():
                                  image_sha256=args.dmg_sha256, archive_sha256=args.macos_portable_sha256,
                                  qualification_sha256=args.dmg_qualification_sha256, team_id=args.macos_team_id,
                                  deb_sha256=args.deb_sha256, linux_portable_sha256=args.portable_sha256,
-                                 maintainer=args.maintainer, previous=previous, source_root=root)
+                                 maintainer=args.maintainer, previous=previous, source_root=root, dmg_trust=dmg_trust)
         except Exception:
             parser.exit(1, 'Final DMG candidate handoff failed; preserve partial output for local inspection.\n')
         print('Six-record candidate byte binding verified; native job authentication and production publication remain blocked.')
@@ -549,7 +577,7 @@ def main():
                                 deb_sha256=args.deb_sha256, linux_portable_sha256=args.portable_sha256, maintainer=args.maintainer,
                                 dmg_sha256=args.dmg_sha256, macos_portable_sha256=args.macos_portable_sha256,
                                 dmg_qualification=evidence, dmg_qualification_sha256=args.dmg_qualification_sha256,
-                                macos_team_id=args.macos_team_id)
+                                macos_team_id=args.macos_team_id, dmg_trust=dmg_trust)
             except Exception:
                 parser.exit(1, 'Final DMG candidate inspection failed; no native authority or publication established.\n')
         else:

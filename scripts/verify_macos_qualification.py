@@ -1,0 +1,214 @@
+"""Authenticate a native qualification's origin using an explicitly reviewed offline verifier.
+
+No root, CLI, workflow permission or producer is configured by this consumer.
+"""
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import subprocess
+import sys
+import time
+
+from package_macos_dmg import bounded_file, private_inspection_directory
+from production_readiness import handoff_path, unique_fields
+
+REPOSITORY = 'Deftr0y/PeerBrush'
+REPOSITORY_URI = 'https://github.com/' + REPOSITORY
+REPOSITORY_ID = '1407648785'
+OWNER_ID = '21202494'
+ISSUER = 'https://token.actions.githubusercontent.com'
+WORKFLOW = '.github/workflows/macos-qualification.yml'
+IDENTITY = REPOSITORY_URI + '/' + WORKFLOW + '@refs/heads/main'
+CLI_VERSION = '2.102.0'
+PREDICATE = 'https://slsa.dev/provenance/v1'
+RESULT_MEDIA_TYPE = 'application/vnd.dev.sigstore.verificationresult+json;version=0.1'
+LIMITS = {'qualification': 8192, 'bundle': 2 * 1024 * 1024,
+          'trusted-root': 1024 * 1024, 'gh': 128 * 1024 * 1024}
+OUTPUT_LIMIT = 4 * 1024 * 1024
+
+
+def _command(executable, arguments, work, label):
+    """Only fixed built-in CLI commands; capture private output with a size/deadline guard."""
+    output, errors = work / (label + '.stdout'), work / (label + '.stderr')
+    environment = dict(PATH=os.defpath, HOME=str(work / 'home'), XDG_CACHE_HOME=str(work / 'cache'),
+                       GH_CONFIG_DIR=str(work / 'config'), GH_HOST='github.com',
+                       GH_PROMPT_DISABLED='1', GH_NO_UPDATE_NOTIFIER='1',
+                       GH_NO_EXTENSION_UPDATE_NOTIFIER='1', NO_COLOR='1', LANG='C.UTF-8', TZ='UTC')
+    with output.open('xb') as stdout, errors.open('xb') as stderr:
+        try:
+            child = subprocess.Popen([str(executable), *arguments], cwd=work, env=environment,
+                                     stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True)
+            try:
+                deadline = time.monotonic() + 60
+                while True:
+                    if (os.fstat(stdout.fileno()).st_size > OUTPUT_LIMIT
+                            or os.fstat(stderr.fileno()).st_size > OUTPUT_LIMIT
+                            or time.monotonic() >= deadline):
+                        raise ValueError('Native attestation verifier exceeded its output or time budget.')
+                    code = child.poll()
+                    if code is not None:
+                        if code != 0:
+                            raise ValueError('Native attestation cryptographic verification failed.')
+                        break
+                    time.sleep(0.05)
+            finally:
+                # An interruption must not enter Popen's unbounded context-manager wait.
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            raise ValueError('Native attestation verifier could not complete.') from None
+    if output.stat().st_size > OUTPUT_LIMIT or errors.stat().st_size > OUTPUT_LIMIT:
+        raise ValueError('Native attestation verifier exceeded its output budget.')
+    return output.read_bytes()
+
+
+def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt):
+    """Only inspect output from the successful, pinned cryptographic verifier process."""
+    if not isinstance(data, bytes) or not 0 < len(data) <= OUTPUT_LIMIT:
+        raise ValueError('Native attestation verifier returned unsupported output.')
+    try:
+        values = json.loads(data, object_pairs_hook=unique_fields)
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+            raise ValueError('shape')
+        result = values[0]['verificationResult']
+        if (not isinstance(result, dict) or result.get('mediaType') != RESULT_MEDIA_TYPE
+                or set(result) - {'mediaType', 'statement', 'signature', 'verifiedTimestamps', 'verifiedIdentity'}):
+            raise ValueError('result')
+        signature = result['signature']
+        if not isinstance(signature, dict) or set(signature) != {'certificate'}:
+            raise ValueError('signature')
+        certificate = signature['certificate']
+        expected = dict(subjectAlternativeName=IDENTITY, issuer=ISSUER,
+                        buildSignerURI=IDENTITY, buildSignerDigest=commit,
+                        runnerEnvironment='github-hosted', sourceRepositoryURI=REPOSITORY_URI,
+                        sourceRepositoryDigest=commit, sourceRepositoryRef='refs/heads/main',
+                        sourceRepositoryIdentifier=REPOSITORY_ID,
+                        sourceRepositoryOwnerURI='https://github.com/Deftr0y',
+                        sourceRepositoryOwnerIdentifier=OWNER_ID,
+                        buildConfigURI=IDENTITY, buildConfigDigest=commit,
+                        runInvocationURI=REPOSITORY_URI + '/actions/runs/' + run_id + '/attempts/' + run_attempt,
+                        sourceRepositoryVisibilityAtSigning='public')
+        allowed = set(expected) | {'certificateIssuer', 'buildTrigger', 'githubWorkflowTrigger',
+                                   'githubWorkflowSHA', 'githubWorkflowName',
+                                   'githubWorkflowRepository', 'githubWorkflowRef'}
+        if (not isinstance(certificate, dict) or set(certificate) - allowed
+                or any(type(value) is not str or len(value) > 2048 for value in certificate.values())
+                or any(certificate.get(key) != value for key, value in expected.items())
+                or certificate.get('buildTrigger') not in {'push', 'workflow_dispatch'}
+                or not certificate.get('certificateIssuer')):
+            raise ValueError('certificate')
+        for key, expected_value in dict(githubWorkflowTrigger=certificate['buildTrigger'],
+                                       githubWorkflowSHA=commit, githubWorkflowRepository=REPOSITORY,
+                                       githubWorkflowRef='refs/heads/main').items():
+            if key in certificate and certificate[key] != expected_value:
+                raise ValueError('legacy extension')
+        timestamps = result['verifiedTimestamps']
+        if not isinstance(timestamps, list) or not 1 <= len(timestamps) <= 16:
+            raise ValueError('timestamps')
+        for stamp in timestamps:
+            if (not isinstance(stamp, dict) or set(stamp) != {'type', 'uri', 'timestamp'}
+                    or stamp['type'] not in {'Tlog', 'TimestampAuthority'}
+                    or type(stamp['uri']) is not str or not 0 < len(stamp['uri']) <= 2048
+                    or type(stamp['timestamp']) is not str or len(stamp['timestamp']) > 40):
+                raise ValueError('timestamp')
+            if datetime.datetime.fromisoformat(stamp['timestamp']).tzinfo is None:
+                raise ValueError('timestamp zone')
+        statement = result['statement']
+        if (not isinstance(statement, dict) or set(statement) - {'_type', 'subject', 'predicateType', 'predicate'}
+                or statement.get('_type') != 'https://in-toto.io/Statement/v1'
+                or statement.get('predicateType') != PREDICATE
+                or statement.get('subject') != [{'name': 'dmg-qualification.json',
+                                               'digest': {'sha256': qualification_sha256}}]):
+            raise ValueError('subject')
+        # Predicate fields are workflow-controlled; no OS, trigger, repository
+        # identity, success or signature authority is obtained from them.
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError):
+        raise ValueError('Verified native attestation does not match the exact reviewed origin and report.') from None
+    return dict(repository_id=REPOSITORY_ID, owner_id=OWNER_ID, workflow=WORKFLOW,
+                workflow_commit=commit, source_ref='refs/heads/main', runner='github-hosted',
+                trigger=certificate['buildTrigger'], run_id=run_id, run_attempt=run_attempt,
+                certificate_and_observer_time='cryptographically-verified')
+
+
+def authenticate(qualification, *, qualification_sha256, commit, version, bundle, bundle_sha256,
+                 trusted_root, trusted_root_sha256, cli, cli_sha256, cli_version,
+                 workflow_commit, run_id, run_attempt, work, source_root):
+    """Explicit reviewed public trust inputs only; never fetch roots/bundles or use auth."""
+    selected = [qualification_sha256, bundle_sha256, trusted_root_sha256, cli_sha256]
+    if (not isinstance(qualification, bytes) or not 0 < len(qualification) <= LIMITS['qualification']
+            or any(type(value) is not str or not re.fullmatch('[0-9a-f]{64}', value) for value in selected)
+            or hashlib.sha256(qualification).hexdigest() != qualification_sha256
+            or type(commit) is not str or not re.fullmatch('[0-9a-f]{40}', commit)
+            or workflow_commit != commit or cli_version != CLI_VERSION
+            or type(version) is not str or len(version) > 32
+            or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
+            or type(run_id) is not str or not re.fullmatch('[1-9][0-9]{0,19}', run_id)
+            or type(run_attempt) is not str or not re.fullmatch('[1-9][0-9]{0,2}', run_attempt)):
+        raise ValueError('Native attestation requires independently reviewed exact source, verifier, trust and run selections.')
+    if sys.platform != 'linux' or platform.machine().lower() not in {'x86_64', 'amd64'}:
+        raise ValueError('The prepared native attestation consumer requires Linux x64 aggregate execution.')
+    # Confirm the exact artifact being authenticated belongs to the already
+    # selected version. The aggregate independently enforces its complete schema.
+    try:
+        report = json.loads(qualification, object_pairs_hook=unique_fields)
+        if (not isinstance(report, dict) or report.get('format') != 'PeerBrushDmgQualificationV1'
+                or report.get('commit') != commit or report.get('version') != version):
+            raise ValueError('report')
+    except (ValueError, UnicodeError, RecursionError):
+        raise ValueError('Native attestation artifact differs from the selected qualification.') from None
+    bundle, trusted_root, cli = map(handoff_path, [bundle, trusted_root, cli])
+    work = private_inspection_directory(work, source_root, fresh=True)
+    if any(work.is_relative_to(path.parent) for path in [bundle, trusted_root, cli]):
+        raise ValueError('Native attestation work must be separate from input directories.')
+    work.mkdir(mode=0o700)
+    os.chmod(work, 0o700)
+    private_inspection_directory(work, source_root, fresh=False)
+    copies = [(bundle, work / 'bundle.jsonl', bundle_sha256, LIMITS['bundle']),
+              (trusted_root, work / 'trusted_root.jsonl', trusted_root_sha256, LIMITS['trusted-root']),
+              (cli, work / 'gh', cli_sha256, LIMITS['gh'])]
+    for source, destination, expected, limit in copies:
+        actual, size = bounded_file(source, limit, destination)
+        if actual != expected or size == 0:
+            raise ValueError('Native attestation input differs from its independently reviewed SHA256.')
+        destination.chmod(0o500 if destination.name == 'gh' else 0o400)
+    # The pinned CLI consumes a newline-delimited trusted root file. No network
+    # fallback or implicit TUF trust is allowed by this consumer.
+    if not (work / 'trusted_root.jsonl').read_bytes().endswith(b'\n'):
+        raise ValueError('Reviewed offline trusted-root JSONL requires its final newline.')
+    artifact = work / 'dmg-qualification.json'
+    with artifact.open('xb') as stream:
+        stream.write(qualification)
+    artifact.chmod(0o400)
+    for name in ['home', 'cache', 'config']:
+        (work / name).mkdir(mode=0o700)
+    executable = work / 'gh'
+    version_output = _command(executable, ['--version'], work, 'version')
+    if not re.fullmatch(rb'gh version 2\.102\.0 \([0-9]{4}-[0-9]{2}-[0-9]{2}\)\r?\nhttps://github.com/cli/cli/releases/tag/v2\.102\.0\r?\n?', version_output):
+        raise ValueError('Native attestation requires the reviewed GitHub CLI 2.102.0 binary.')
+    arguments = ['attestation', 'verify', str(artifact), '--bundle', str(work / 'bundle.jsonl'),
+                 '--custom-trusted-root', str(work / 'trusted_root.jsonl'), '--repo', REPOSITORY,
+                 '--hostname', 'github.com', '--cert-identity', IDENTITY, '--cert-oidc-issuer', ISSUER,
+                 '--source-ref', 'refs/heads/main', '--source-digest', commit, '--signer-digest', workflow_commit,
+                 '--deny-self-hosted-runners', '--predicate-type', PREDICATE, '--digest-alg', 'sha256',
+                 '--format', 'json']
+    verified = _command(executable, arguments, work, 'verification')
+    claims = _verified_claims(verified, commit=commit, qualification_sha256=qualification_sha256,
+                              run_id=run_id, run_attempt=run_attempt)
+    private_inspection_directory(work, source_root, fresh=False)
+    for source, destination, expected, limit in copies:
+        if bounded_file(source, limit)[0] != expected or bounded_file(destination, limit)[0] != expected:
+            raise ValueError('Native attestation input changed during verification; preserve private work.')
+    if bounded_file(artifact, LIMITS['qualification'])[0] != qualification_sha256:
+        raise ValueError('Native qualification changed during verification.')
+    return dict(schema=1, format='PeerBrushMacosNativeOriginV1', version=version, commit=commit,
+                qualification_sha256=qualification_sha256, bundle_sha256=bundle_sha256,
+                verifier=dict(version=CLI_VERSION, sha256=cli_sha256), trusted_root_sha256=trusted_root_sha256,
+                native_producer_authentication='verified-pinned-workflow-oidc-attestation', origin=claims,
+                native_job_conclusion='not-service-reconciled', installed_acceptance='not-performed',
+                public_availability='unverified', candidate_verified=False, ready=False, production_ready=False)
+
