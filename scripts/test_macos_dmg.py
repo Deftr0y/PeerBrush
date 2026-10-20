@@ -78,7 +78,7 @@ class Preparation(unittest.TestCase):
 
     def test_linked_and_checkout_outputs_are_rejected_before_native_image(self):
         with self.assertRaisesRegex(ValueError, 'outside the source checkout'):
-            self.prepare(output=self.signing.fixture.root / 'output/dmg')
+            self.prepare(output=self.signing.fixture.root.resolve() / 'output/dmg')
         with mock.patch.object(pathlib.Path, 'is_symlink', return_value=True), self.assertRaises(ValueError):
             self.prepare()
         self.image_mock.assert_not_called()
