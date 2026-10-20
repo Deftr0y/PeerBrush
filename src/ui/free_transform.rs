@@ -685,6 +685,8 @@ impl PeerBrush {
                 ui.label("Drag handles or enter values. Release keeps the preview pending.");
                 #[cfg(test)]
                 let mut input_index = 0;
+                #[cfg(test)]
+                let mut inputs = [None; 9];
                 let number = |ui: &mut egui::Ui,
                               label: &str,
                               value: &mut f64,
@@ -697,7 +699,7 @@ impl PeerBrush {
                         .inner;
                     #[cfg(test)]
                     {
-                        editor.inputs[input_index] = Some(response.rect);
+                        inputs[input_index] = Some(response.rect);
                         input_index += 1;
                     }
                     response.changed()
@@ -758,6 +760,10 @@ impl PeerBrush {
                 let old_reference = reference;
                 number(ui, "Reference X", &mut reference[0], -100000. ..=100000.);
                 number(ui, "Reference Y", &mut reference[1], -100000. ..=100000.);
+                #[cfg(test)]
+                {
+                    editor.inputs = inputs;
+                }
                 if reference != old_reference {
                     if let Err(error) = editor.set_reference(reference) {
                         editor.error = Some(error);
