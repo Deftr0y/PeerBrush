@@ -258,7 +258,7 @@ fn number(app: &mut PeerBrush, ctx: &egui::Context, name: &str, old: &str, new: 
         .into_iter()
         .filter(|r| r.left() > name.right() && (r.center().y - name.center().y).abs() < 5.)
         .min_by(|a, b| a.left().total_cmp(&b.left()))
-        .expect("Visible adjacent number")
+        .unwrap_or_else(|| panic!("Visible {old} adjacent to {name:?}"))
         .center();
     click(app, ctx, at);
     click(app, ctx, at);
@@ -285,6 +285,14 @@ fn text_toolbar_canvas_draft_controls_render_native_pixels_then_apply_once() {
         assert!(app.tool == Tool::Text);
         let a = point(&app, [30., 30.]);
         let b = point(&app, [150., 110.]);
+        let rect = app.view_rect.unwrap();
+        let scale = rect.width() / app.shared.lock().unwrap().doc.width as f32;
+        let anchor = app.view.document(a, rect, scale);
+        let end = app.view.document(b, rect, scale);
+        let left = anchor[0].min(end[0]).floor();
+        let top = anchor[1].min(end[1]).floor();
+        let width = (anchor[0].max(end[0]).ceil() - left) as u32;
+        let height = (anchor[1].max(end[1]).ceil() - top) as u32;
         begin(&mut app, &ctx, a);
         draw(
             &mut app,
@@ -312,8 +320,11 @@ fn text_toolbar_canvas_draft_controls_render_native_pixels_then_apply_once() {
             Default::default(),
         );
         draw(&mut app, &ctx, vec![], Default::default());
-        number(&mut app, &ctx, "Field width", "120", "180");
-        number(&mut app, &ctx, "Height", "80", "96");
+        let editor = app.source_editor.as_ref().unwrap();
+        assert_eq!((editor.x, editor.y), (left as i32, top as i32));
+        assert_eq!((editor.source.width, editor.source.height), (width, height));
+        number(&mut app, &ctx, "Field width", &width.to_string(), "180");
+        number(&mut app, &ctx, "Height", &height.to_string(), "96");
         number(&mut app, &ctx, "Letter spacing", "0", "2.5");
         number(
             &mut app,

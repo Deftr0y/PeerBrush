@@ -5340,6 +5340,8 @@ impl PeerBrush {
                 ui.add_space(6.0);
                 ui.spacing_mut().item_spacing.y = 4.0;
                 egui::ScrollArea::vertical()
+                    // Tool clicks must not drag the strip when it overflows.
+                    .drag_to_scroll(false)
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - 70.0).max(60.0))
                     .show(ui, |ui| {
@@ -10720,7 +10722,8 @@ mod tests {
             assert_eq!(selected.len(), 1, "Only the current tool is highlighted");
             assert!(
                 selected[0].contains(pos),
-                "The clicked tool is painted without a fade"
+                "The clicked tool is painted without a fade: {pos:?} vs {:?}",
+                selected[0]
             );
         }
         let engine = app.shared.lock().unwrap();
