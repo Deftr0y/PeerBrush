@@ -24,6 +24,18 @@ require adding the VS ClangCL workload when a standalone reviewed clang-cl
 already exists. On Linux use clang-18/clang++-18 and Ninja. On macOS use the
 Xcode compiler/SDK and Ninja; retain MACOSX_DEPLOYMENT_TARGET=11.0. Standard
 Cargo builds need these process-local variables set before compilation.
+The Windows workflows capture the absolute clang-cl, CMake and Ninja executable
+paths before starting DevShell and pass all three with --selected-clang-cl,
+--selected-cmake and --selected-ninja. Qualification uses those exact files after
+the SDK changes PATH. Partial or relative selections are rejected. CC/CXX and
+CMAKE retain the selected executables; the process-local CMAKE_MAKE_PROGRAM is
+also passed as an explicit CMake cache definition by the vendored helper, so
+native build-tool discovery cannot select another Ninja. A later release-build
+qualification on every platform rechecks the complete exported CC/CXX, CMAKE
+and CMAKE_MAKE_PROGRAM tuple, including separate C and C++ compiler paths on
+Linux and macOS. Without a complete tuple, all tools are selected afresh through
+PATH; partial inherited values are never mixed with discovered selections.
+No version fallback is added.
 `python scripts/jxl_build.py` reports whether the installed tool versions are
 the reviewed versions. `python scripts/jxl_build.py -- run --locked -- --state-dir .runtime` selects them for a child
 Cargo command without changing the calling shell; use test/check/build/clippy

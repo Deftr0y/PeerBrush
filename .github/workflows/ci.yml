@@ -66,14 +66,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $nativeToolDirectories = @('ninja', 'clang-cl', 'cmake') | ForEach-Object { Split-Path (Get-Command $_ -CommandType Application -ErrorAction Stop).Source -Parent } | Select-Object -Unique
+          $nativeTools = @{}
+          foreach ($name in @('clang-cl', 'cmake', 'ninja')) {
+            $nativeTools[$name] = (Get-Command $name -CommandType Application -ErrorAction Stop).Source
+          }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Existing Visual Studio C++ tools unavailable' }
           $launch = Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1'
           & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
-          $env:PATH = ($nativeToolDirectories -join ';') + ';' + $env:PATH
-          python -B scripts/jxl_build.py --github-env
+          python -B scripts/jxl_build.py --github-env --selected-clang-cl ($nativeTools['clang-cl']) --selected-cmake ($nativeTools['cmake']) --selected-ninja ($nativeTools['ninja'])
           if ($LASTEXITCODE -ne 0) { throw 'Native codec tool qualification failed' }
       - if: runner.os != 'Windows'
         name: Select existing native codec tools

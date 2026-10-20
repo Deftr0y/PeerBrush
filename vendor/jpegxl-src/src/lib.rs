@@ -42,6 +42,12 @@ pub fn build() {
     );
 
     let mut config = cmake::Config::new(source);
+    println!("cargo:rerun-if-env-changed=CMAKE_MAKE_PROGRAM");
+    if env::var("CMAKE_GENERATOR").as_deref() == Ok("Ninja") {
+        if let Some(program) = env::var_os("CMAKE_MAKE_PROGRAM") {
+            config.define("CMAKE_MAKE_PROGRAM", program);
+        }
+    }
     config
         .define("BUILD_TESTING", "OFF")
         .define("BUILD_SHARED_LIBS", "OFF")

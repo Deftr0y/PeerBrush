@@ -1,6 +1,8 @@
 """Offline build-selection/privacy/source-notice regressions. No tool executes."""
 import importlib.util
 import os
+import runpy
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -36,6 +38,9 @@ class NativeJxlBuild(unittest.TestCase):
             for value in ['', 'synthetic external input']:
                 with self.subTest(name=name, empty=not value), self.assertRaisesRegex(ValueError, 'overrides'):
                     release_environment(Path('synthetic source'), {name: value})
+                with self.subTest(selection_override=name), self.assertRaisesRegex(ValueError, 'overrides'):
+                    jxl_build.configure({name: value},
+                        selected=dict.fromkeys(['clang-cl', 'cmake', 'ninja'], Path.cwd()))
 
     def test_native_remapping_preserves_existing_flags_and_rejects_line_injection(self):
         with mock.patch('build_release.source_input_state', return_value='unknown'):
@@ -122,45 +127,190 @@ class NativeJxlBuild(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'not configured'):
                 jxl_build.configure({})
 
-    def test_selected_ninja_stays_discoverable_when_other_tool_directories_shadow_it(self):
+    def test_exact_captured_tools_survive_sdk_and_reciprocal_path_shadowing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            ninja_directory, compiler_directory, cmake_directory = [root / name for name in
-                ['selected ninja', 'compiler tools', 'cmake tools']]
+            cmake_directory, ninja_directory, compiler_directory, sdk_directory = [
+                root / name for name in ['selected cmake', 'selected ninja', 'selected compiler', 'sdk tools']]
             suffix = '.exe' if os.name == 'nt' else ''
-            for directory in [ninja_directory, compiler_directory, cmake_directory]:
+            versions = {
+                cmake_directory: {'cmake': 'cmake version 4.4.4\n'},
+                ninja_directory: {'ninja': '1.13.2\n', 'cmake': 'cmake version 3.29.2\n'},
+                compiler_directory: {'clang-cl': 'clang version 21.1.8\n', 'ninja': '1.12.0\n'},
+                sdk_directory: {'clang-cl': 'clang version 19.0.0\n',
+                                'cmake': 'cmake version 3.29.2\n', 'ninja': '1.12.0\n'},
+            }
+            for directory, tools in versions.items():
                 directory.mkdir()
-                executable = directory / ('ninja' + suffix)
-                executable.write_text('1.13.2' if directory == ninja_directory else '1.12.0', encoding='utf-8')
-                executable.chmod(0o755)
-            selected = ninja_directory / ('ninja' + suffix)
-            cc, cmake = compiler_directory / ('clang-cl' + suffix), cmake_directory / ('cmake' + suffix)
-            original = os.pathsep.join(map(str, [ninja_directory, compiler_directory, cmake_directory]))
-            self.assertEqual(Path(jxl_build.shutil.which('ninja', path=original)), selected)
-            shadowed = os.pathsep.join(map(str, [compiler_directory, cmake_directory, ninja_directory]))
-            self.assertEqual(Path(jxl_build.shutil.which('ninja', path=shadowed)), compiler_directory / ('ninja' + suffix))
+                for name, version in tools.items():
+                    executable = directory / (name + suffix)
+                    executable.write_bytes(version.encode())
+                    executable.chmod(0o755)
+            original = os.pathsep.join(map(str, [cmake_directory, ninja_directory, compiler_directory]))
+            selected = {name: Path(jxl_build.shutil.which(name, path=original)).resolve()
+                        for name in ['clang-cl', 'cmake', 'ninja']}
+            self.assertEqual(selected, {'clang-cl': compiler_directory / ('clang-cl' + suffix),
+                                        'cmake': cmake_directory / ('cmake' + suffix),
+                                        'ninja': ninja_directory / ('ninja' + suffix)})
+            clang_first = os.pathsep.join(map(str, [compiler_directory, cmake_directory, ninja_directory]))
+            ninja_first = os.pathsep.join(map(str, [ninja_directory, compiler_directory, cmake_directory]))
+            self.assertNotEqual(Path(jxl_build.shutil.which('ninja', path=clang_first)), selected['ninja'])
+            self.assertNotEqual(Path(jxl_build.shutil.which('cmake', path=ninja_first)), selected['cmake'])
+            inherited = {'PATH': str(sdk_directory) + os.pathsep + original,
+                         'INCLUDE': 'synthetic headers', 'LIB': 'synthetic libraries'}
+            for name in selected:
+                self.assertEqual(Path(jxl_build.shutil.which(name, path=inherited['PATH'])),
+                                 sdk_directory / (name + suffix))
+            calls = []
+            def version(arguments, **options):
+                self.assertIn(Path(arguments[0]), selected.values())
+                self.assertEqual(arguments[1:], ['--version'])
+                self.assertEqual(set(options), {'env', 'capture_output', 'check', 'timeout'})
+                self.assertTrue(options['capture_output'])
+                self.assertTrue(options['check'])
+                self.assertEqual(options['timeout'], 10)
+                calls.append(arguments[0])
+                return subprocess.CompletedProcess(arguments, 0, Path(arguments[0]).read_bytes(), b'')
             with mock.patch.object(jxl_build.platform, 'system', return_value='Windows'), \
-                    mock.patch.object(jxl_build, 'tool', side_effect=[
-                        (str(cc), '20.1.8'), (str(cc), '20.1.8'),
-                        (str(cmake), '4.4.4'), (str(selected), '1.13.2')]), \
-                    mock.patch.object(jxl_build.subprocess, 'run', side_effect=AssertionError('No tool execution')):
-                environment, versions = jxl_build.configure({'PATH': original, 'INCLUDE': 'fixture', 'LIB': 'fixture'})
-            self.assertEqual(Path(jxl_build.shutil.which('ninja', path=environment['PATH'])), selected)
-            self.assertEqual(environment['CC'], str(cc))
-            self.assertEqual(environment['CXX'], str(cc))
-            self.assertEqual(environment['CMAKE'], str(cmake))
-            self.assertEqual(versions['ninja'], '1.13.2')
+                    mock.patch.object(jxl_build.subprocess, 'run', side_effect=version):
+                environment, qualified = jxl_build.configure(inherited, selected=selected)
+                arguments = [jxl_build.__file__]
+                for name, path in selected.items():
+                    arguments += ['--selected-' + name, str(path)]
+                with mock.patch.dict(os.environ, inherited, clear=True), \
+                        mock.patch.object(sys, 'argv', arguments), mock.patch('builtins.print'):
+                    cli = runpy.run_path(jxl_build.__file__, run_name='__main__')
+                self.assertEqual(cli['environment']['CMAKE_MAKE_PROGRAM'], str(selected['ninja']))
+                with mock.patch('build_release.source_input_state', return_value='unknown'):
+                    release = release_environment(root, environment)
+                repeated, repeated_versions = jxl_build.configure(release)
+            expected = [str(selected[name]) for name in ['clang-cl', 'clang-cl', 'cmake', 'ninja']]
+            self.assertEqual(calls, expected * 3)
+            self.assertEqual(qualified, {'compiler': '21.1.8', 'cmake': '4.4.4', 'ninja': '1.13.2'})
+            self.assertEqual(repeated_versions, qualified)
+            for configured in [environment, repeated]:
+                self.assertEqual(configured['CC'], str(selected['clang-cl']))
+                self.assertEqual(configured['CXX'], str(selected['clang-cl']))
+                self.assertEqual(configured['CMAKE'], str(selected['cmake']))
+                self.assertEqual(configured['CMAKE_MAKE_PROGRAM'], str(selected['ninja']))
+                self.assertEqual(Path(jxl_build.shutil.which('ninja', path=configured['PATH'])),
+                                 selected['ninja'])
+                # CMake is deliberately shadowed by Ninja's directory; only its exact binding is safe.
+                self.assertNotEqual(Path(jxl_build.shutil.which('cmake', path=configured['PATH'])),
+                                    selected['cmake'])
+
+    def test_repeated_qualification_keeps_separate_unix_compilers_and_all_exact_paths(self):
+        cases = [('Linux', 'clang-18', 'clang++-18', '18.1.3', '3.31.6'),
+                 ('Darwin', 'clang', 'clang++', '21.0.0', '4.4.4')]
+        for system, cc_name, cxx_name, compiler_version, cmake_version in cases:
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                cmake_directory, ninja_directory, compiler_directory, sdk_directory = [
+                    root / name for name in ['cmake', 'ninja', 'compiler', 'sdk']]
+                suffix = '.exe' if os.name == 'nt' else ''
+                versions = {
+                    cmake_directory: {'cmake': 'cmake version ' + cmake_version + '\n'},
+                    ninja_directory: {'ninja': '1.13.2\n', 'cmake': 'cmake version 3.29.2\n'},
+                    compiler_directory: {cc_name: 'clang version ' + compiler_version + '\n',
+                                         cxx_name: 'clang version ' + compiler_version + '\n',
+                                         'ninja': '1.12.0\n'},
+                    sdk_directory: {cc_name: 'clang version 19.0.0\n', cxx_name: 'clang version 19.0.0\n',
+                                    'cmake': 'cmake version 3.29.2\n', 'ninja': '1.12.0\n'},
+                }
+                for directory, tools in versions.items():
+                    directory.mkdir()
+                    for name, version in tools.items():
+                        path = directory / (name + suffix)
+                        path.write_bytes(version.encode())
+                        path.chmod(0o755)
+                original = os.pathsep.join(map(str, [cmake_directory, ninja_directory, compiler_directory]))
+                expected = [compiler_directory / (name + suffix) for name in [cc_name, cxx_name]]
+                expected += [cmake_directory / ('cmake' + suffix), ninja_directory / ('ninja' + suffix)]
+                self.assertEqual([Path(jxl_build.shutil.which(name, path=original)).resolve()
+                                  for name in [cc_name, cxx_name, 'cmake', 'ninja']], expected)
+                calls = []
+                def version(arguments, **options):
+                    self.assertIn(Path(arguments[0]), expected)
+                    self.assertEqual(arguments[1:], ['--version'])
+                    calls.append(arguments[0])
+                    return subprocess.CompletedProcess(arguments, 0, Path(arguments[0]).read_bytes(), b'')
+                with mock.patch.object(jxl_build.platform, 'system', return_value=system), \
+                        mock.patch.object(jxl_build.subprocess, 'run', side_effect=version):
+                    # A partial inherited selection must not be mixed with discovered tools.
+                    environment, qualified = jxl_build.configure({'PATH': original, 'CC': 'ignored partial'})
+                    environment['PATH'] = str(sdk_directory) + os.pathsep + environment['PATH']
+                    for name in [cc_name, cxx_name, 'cmake', 'ninja']:
+                        self.assertEqual(Path(jxl_build.shutil.which(name, path=environment['PATH'])),
+                                         sdk_directory / (name + suffix))
+                    with mock.patch('build_release.source_input_state', return_value='unknown'):
+                        repeated, repeated_versions = jxl_build.configure(release_environment(root, environment))
+                self.assertEqual(calls, list(map(str, expected)) * 2)
+                self.assertEqual(qualified, repeated_versions)
+                for key, path in zip(['CC', 'CXX', 'CMAKE', 'CMAKE_MAKE_PROGRAM'], expected):
+                    self.assertEqual(repeated[key], str(path))
+                self.assertNotEqual(repeated['CC'], repeated['CXX'])
+                self.assertEqual(Path(jxl_build.shutil.which('ninja', path=repeated['PATH'])), expected[3])
+
+    def test_explicit_tool_group_is_complete_absolute_windows_only_and_requalified(self):
+        with mock.patch.object(jxl_build.platform, 'system', return_value='Windows'), \
+                mock.patch.object(jxl_build.subprocess, 'run') as run:
+            for selected in [{}, {'clang-cl': Path('relative')},
+                             dict.fromkeys(['clang-cl', 'cmake', 'ninja']),
+                             {'clang-cl': None, 'cmake': Path.cwd(), 'ninja': Path.cwd()},
+                             {'clang-cl': Path.cwd(), 'cmake': Path.cwd(), 'unexpected': Path.cwd()},
+                             {'clang-cl': Path('relative'), 'cmake': Path.cwd(), 'ninja': Path.cwd()}]:
+                with self.subTest(selection=sorted(selected)), self.assertRaises(ValueError):
+                    jxl_build.configure({}, selected=selected)
+            with self.assertRaisesRegex(ValueError, 'absolute'):
+                jxl_build.configure({'CC': 'one', 'CXX': 'two', 'CMAKE': 'three',
+                                     'CMAKE_MAKE_PROGRAM': 'four'})
+            with self.assertRaisesRegex(ValueError, 'selections differ'):
+                jxl_build.configure({'CC': str(Path.cwd() / 'one.exe'),
+                                     'CXX': str(Path.cwd() / 'two.exe'),
+                                     'CMAKE': str(Path.cwd() / 'cmake.exe'),
+                                     'CMAKE_MAKE_PROGRAM': str(Path.cwd() / 'ninja.exe')})
+            run.assert_not_called()
+        with mock.patch.object(jxl_build.platform, 'system', return_value='Linux'), \
+                mock.patch.object(jxl_build.subprocess, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'Windows'):
+                jxl_build.configure({}, selected=dict.fromkeys(['clang-cl', 'cmake', 'ninja'], Path.cwd()))
+            run.assert_not_called()
+
+    def test_exact_tool_probe_failures_do_not_expose_private_paths_or_output(self):
+        sentinel = 'PRIVATE_SELECTED_TOOL_PATH_STDERR'
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / sentinel
+            executable.write_bytes(b'never executed')
+            errors = [FileNotFoundError(sentinel),
+                      subprocess.CalledProcessError(9, [str(executable)], stderr=sentinel),
+                      subprocess.TimeoutExpired([str(executable)], 10, output=sentinel)]
+            for error in errors:
+                with self.subTest(error=type(error).__name__), \
+                        mock.patch.object(jxl_build.subprocess, 'run', side_effect=error):
+                    with self.assertRaises(ValueError) as caught:
+                        jxl_build.tool('ninja', 'ninja', {'1.13.2'}, {}, selected=executable)
+                    self.assertEqual(str(caught.exception), 'Native JPEG XL build tool unavailable: ninja')
+                    self.assertNotIn(sentinel, str(caught.exception))
+            with mock.patch.object(jxl_build.subprocess, 'run',
+                                   return_value=subprocess.CompletedProcess([], 0, b'\xff', b'')):
+                with self.assertRaisesRegex(ValueError, '^Native build tool version output is not UTF-8: ninja$'):
+                    jxl_build.tool('ninja', 'ninja', {'1.13.2'}, {}, selected=executable)
+            with mock.patch.object(jxl_build.subprocess, 'run') as run:
+                with self.assertRaisesRegex(ValueError, '^Native JPEG XL build tool unavailable: ninja$'):
+                    jxl_build.tool('ninja', 'ninja', {'1.13.2'}, {}, selected=executable.parent)
+                run.assert_not_called()
 
     def test_github_export_contains_only_build_values_and_rejects_multiline(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(jxl_build.platform, 'system', return_value='Windows'):
             destination = Path(temporary) / 'step.env'
-            environment = {'CC': 'cc', 'CXX': 'cxx', 'CMAKE': 'cmake', 'PATH': 'fixture-path',
+            environment = {'CC': 'cc', 'CXX': 'cxx', 'CMAKE': 'cmake', 'CMAKE_MAKE_PROGRAM': 'selected ninja', 'PATH': 'fixture-path',
                            'INCLUDE': 'headers', 'LIB': 'libraries', 'LIBPATH': 'sdk',
                            'UNRELATED_FIXTURE': 'must not be exported'}
             jxl_build.write_github_environment(destination, environment)
             before = destination.read_bytes()
             self.assertNotIn(b'UNRELATED_FIXTURE', before)
             self.assertIn(b'INCLUDE=headers', before)
+            self.assertIn(b'CMAKE_MAKE_PROGRAM=selected ninja\n', before)
             environment['PATH'] = 'line\nINJECTED=1'
             with self.assertRaisesRegex(ValueError, 'multiline'):
                 jxl_build.write_github_environment(destination, environment)
@@ -205,7 +355,15 @@ class NativeJxlBuild(unittest.TestCase):
                 setup = text.index('scripts/jxl_build.py --github-env')
                 self.assertLess(setup, text.index('dtolnay/rust-toolchain@'))
                 self.assertIn('-Arch amd64 -HostArch amd64 -SkipAutomaticLocation', text)
-                self.assertIn("@('ninja', 'clang-cl', 'cmake')", text)
+                capture = text.index("$nativeTools = @{}")
+                sdk = text.index('& $launch -Arch amd64')
+                self.assertLess(capture, sdk)
+                self.assertLess(text.index("$nativeTools[$name] = (Get-Command $name -CommandType Application -ErrorAction Stop).Source"), sdk)
+                self.assertLess(sdk, setup)
+                self.assertIn("@('clang-cl', 'cmake', 'ninja')", text)
+                for name in ['clang-cl', 'cmake', 'ninja']:
+                    self.assertIn("--selected-" + name + " ($nativeTools['" + name + "'])", text)
+                self.assertNotIn('$nativeToolDirectories', text)
                 self.assertIn('b725eda525362e7cf34af9a7243cac1e3f01a7ec', text)
 
     def test_ordinary_cargo_graph_requires_vendored_source_and_explicit_msrv(self):
@@ -221,6 +379,10 @@ class NativeJxlBuild(unittest.TestCase):
         self.assertNotIn('DEP_JXL_PATH', helper)
         self.assertIn('Path::new(env!("CARGO_MANIFEST_DIR")).join("libjxl")', helper)
         self.assertIn('env::var("NUM_JOBS")', helper)
+        self.assertIn('cargo:rerun-if-env-changed=CMAKE_MAKE_PROGRAM', helper)
+        self.assertIn('if env::var("CMAKE_GENERATOR").as_deref() == Ok("Ninja")', helper)
+        self.assertIn('env::var_os("CMAKE_MAKE_PROGRAM")', helper)
+        self.assertIn('config.define("CMAKE_MAKE_PROGRAM", program)', helper)
 
     def test_headless_diagnostic_is_after_regressions_and_binds_exact_clean_source(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
