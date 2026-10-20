@@ -2693,53 +2693,18 @@ fn client_with_timeout(
     payload: &Value,
     timeout: std::time::Duration,
 ) -> Result<Value, String> {
-    let conn: Value = serde_json::from_slice(
-        &fs::read(state_dir.join("connection.json"))
-            .map_err(|_| "PeerBrush is not running. Open the application, then retry.")?,
-    )
-    .map_err(|_| "PeerBrush connection information is invalid. Reopen the application.")?;
-    let url = conn["url"]
-        .as_str()
-        .ok_or("Invalid PeerBrush connection information. Reopen the application.")?;
-    if !url.starts_with("http://127.0.0.1:") {
-        return Err("Connection must use the local PeerBrush endpoint".into());
-    }
-    let token = conn["token"]
-        .as_str()
-        .ok_or("Invalid PeerBrush connection token. Reopen the application.")?;
-    let bridge = endpoint == "mcp";
-    let endpoint = if bridge { "rpc" } else { endpoint };
-    let payload = if bridge {
-        json!({"method":"mcp","params":{"request":payload}})
-    } else {
-        payload.clone()
-    };
-    let response: Value = ureq::post(&format!("{url}/{endpoint}"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .timeout(timeout)
-        .send_json(payload)
-        .map_err(|error| match error {
-            ureq::Error::Transport(ref transport)
-                if transport.kind() == ureq::ErrorKind::ConnectionFailed =>
-            {
-                "PeerBrush is not running or cannot be reached. Open the application, then retry."
-                    .into()
-            }
-            ureq::Error::Transport(ref transport)
-                if transport.kind() == ureq::ErrorKind::Io =>
-            {
-                "The PeerBrush connection was interrupted or timed out. Check the application and observe the current document before retrying an edit."
-                    .into()
-            }
-            ureq::Error::Status(401, _) => {
-                "PeerBrush rejected stale connection information. Reopen the application, then retry."
-                    .into()
-            }
-            _ => error.to_string(),
-        })?
-        .into_json()
-        .map_err(|e| e.to_string())?;
-    if bridge {
+    let response = connection_request(state_dir, endpoint, payload, timeout)
+        .and_then(|response| {
+            serde_json::from_reader::<_, Value>(response.into_reader()).map_err(|error| {
+                ConnectionProbe::new(if error.is_io() {
+                    ConnectionCategory::ConnectionInterrupted
+                } else {
+                    ConnectionCategory::ResponseInvalid
+                })
+            })
+        })
+        .map_err(|failure| failure.message.to_owned())?;
+    if endpoint == "mcp" {
         if response["ok"] == true {
             Ok(response["result"].clone())
         } else {
@@ -2750,6 +2715,188 @@ fn client_with_timeout(
         }
     } else {
         Ok(response)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConnectionCategory {
+    Ready,
+    ConnectionMissing,
+    ConnectionUnreadable,
+    ConnectionInvalid,
+    ListenerUnreachable,
+    AuthenticationRejected,
+    ConnectionInterrupted,
+    ResponseRejected,
+    ResponseInvalid,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub(crate) struct ConnectionProbe {
+    pub category: ConnectionCategory,
+    pub message: &'static str,
+    pub recovery: &'static str,
+}
+impl ConnectionProbe {
+    fn new(category: ConnectionCategory) -> Self {
+        use ConnectionCategory::*;
+        let (message, recovery) = match category {
+            Ready => (
+                "PeerBrush's local MCP bridge is ready.",
+                "Use the exact stdio command and arguments from discovery.",
+            ),
+            ConnectionMissing => (
+                "PeerBrush connection information is missing. Open the application, then retry.",
+                "Open PeerBrush for the selected state directory; use Connect AI if setup is missing.",
+            ),
+            ConnectionUnreadable => (
+                "PeerBrush connection information cannot be read.",
+                "Check access to the selected state directory, then reopen the application.",
+            ),
+            ConnectionInvalid => (
+                "PeerBrush connection information is invalid. Reopen the application.",
+                "Reopen PeerBrush for the selected state directory to refresh its local connection information.",
+            ),
+            ListenerUnreachable => (
+                "PeerBrush's local listener cannot be reached. Open the application, allow it to finish starting, then retry.",
+                "Open PeerBrush for the selected state directory and allow startup to finish; if it is already open, reopen it.",
+            ),
+            AuthenticationRejected => (
+                "PeerBrush rejected stale connection information. Reopen the application, then retry.",
+                "Reopen PeerBrush to refresh the selected instance's local connection information.",
+            ),
+            ConnectionInterrupted => (
+                "The PeerBrush connection was interrupted or timed out. Check the application and observe the current document before retrying an edit.",
+                "Check PeerBrush and observe the current document before retrying any edit; a timed out edit may have completed.",
+            ),
+            ResponseRejected => (
+                "The local endpoint rejected or redirected the PeerBrush request.",
+                "Reopen PeerBrush to refresh the selected instance's local connection information, then retry.",
+            ),
+            ResponseInvalid => (
+                "The local endpoint returned an invalid PeerBrush response.",
+                "Reopen PeerBrush for the selected state directory, then retry.",
+            ),
+        };
+        Self {
+            category,
+            message,
+            recovery,
+        }
+    }
+}
+
+fn canonical_local_url(url: &str) -> bool {
+    url.strip_prefix("http://127.0.0.1:")
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some_and(|port| port != 0 && url == format!("http://127.0.0.1:{port}"))
+}
+
+fn connection_request(
+    state_dir: &Path,
+    endpoint: &str,
+    payload: &Value,
+    timeout: std::time::Duration,
+) -> Result<ureq::Response, ConnectionProbe> {
+    use ConnectionCategory::*;
+    if !matches!(endpoint, "rpc" | "mcp") {
+        return Err(ConnectionProbe::new(ConnectionInvalid));
+    }
+    let io_failure = |error: std::io::Error| {
+        ConnectionProbe::new(if error.kind() == std::io::ErrorKind::NotFound {
+            ConnectionMissing
+        } else {
+            ConnectionUnreadable
+        })
+    };
+    let path = state_dir.join("connection.json");
+    if !fs::metadata(&path).map_err(io_failure)?.is_file() {
+        return Err(ConnectionProbe::new(ConnectionUnreadable));
+    }
+    let file = fs::File::open(&path).map_err(io_failure)?;
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ConnectionProbe::new(ConnectionUnreadable))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(ConnectionProbe::new(ConnectionInvalid));
+    }
+    let conn: Value =
+        serde_json::from_slice(&bytes).map_err(|_| ConnectionProbe::new(ConnectionInvalid))?;
+    let url = conn["url"]
+        .as_str()
+        .filter(|url| canonical_local_url(url))
+        .ok_or_else(|| ConnectionProbe::new(ConnectionInvalid))?;
+    let token = conn["token"]
+        .as_str()
+        .filter(|token| {
+            !token.is_empty()
+                && token.len() <= 512
+                && token.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+        .ok_or_else(|| ConnectionProbe::new(ConnectionInvalid))?;
+    let bridge = endpoint == "mcp";
+    let endpoint = if bridge { "rpc" } else { endpoint };
+    let payload = if bridge {
+        json!({"method":"mcp","params":{"request":payload}})
+    } else {
+        payload.clone()
+    };
+    // Local authentication must never follow redirects or use an environment proxy.
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .build();
+    let response = agent
+        .post(&format!("{url}/{endpoint}"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(timeout)
+        .send_json(payload)
+        .map_err(|error| match error {
+            ureq::Error::Transport(ref transport)
+                if transport.kind() == ureq::ErrorKind::ConnectionFailed =>
+            {
+                ConnectionProbe::new(ListenerUnreachable)
+            }
+            ureq::Error::Transport(ref transport) if transport.kind() == ureq::ErrorKind::Io => {
+                ConnectionProbe::new(ConnectionInterrupted)
+            }
+            ureq::Error::Status(401, _) => ConnectionProbe::new(AuthenticationRejected),
+            _ => ConnectionProbe::new(ResponseRejected),
+        })?;
+    if response.status() != 200 {
+        return Err(ConnectionProbe::new(ResponseRejected));
+    }
+    Ok(response)
+}
+
+pub(crate) fn probe_connection(state_dir: &Path) -> ConnectionProbe {
+    let id = format!("discovery-probe-{}", engine::id());
+    let ping = json!({"jsonrpc":"2.0","id":id,"method":"ping","_client":id});
+    let response = connection_request(state_dir, "mcp", &ping, std::time::Duration::from_secs(1))
+        .and_then(|response| {
+            let mut bytes = Vec::new();
+            response
+                .into_reader()
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| ConnectionProbe::new(ConnectionCategory::ConnectionInterrupted))?;
+            if bytes.len() > 64 * 1024 {
+                return Err(ConnectionProbe::new(ConnectionCategory::ResponseInvalid));
+            }
+            serde_json::from_slice::<Value>(&bytes)
+                .map_err(|_| ConnectionProbe::new(ConnectionCategory::ResponseInvalid))
+        });
+    match response {
+        Ok(response)
+            if response["ok"] == true
+                && response["result"] == json!({"jsonrpc":"2.0","id":id,"result":{}}) =>
+        {
+            ConnectionProbe::new(ConnectionCategory::Ready)
+        }
+        Ok(_) => ConnectionProbe::new(ConnectionCategory::ResponseInvalid),
+        Err(failure) => failure,
     }
 }
 
@@ -3032,5 +3179,403 @@ mod save_loss_tests {
             drop(shared);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use std::{net::TcpListener, time::Duration};
+
+    const CANARY: &str = "SYNTHETIC_PRIVATE_CONNECTION_CANARY";
+
+    struct State(PathBuf);
+    impl State {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("peerbrush-probe-{}", engine::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn write(&self, url: &str) {
+            fs::write(
+                self.0.join("connection.json"),
+                json!({"url":url,"token":CANARY}).to_string(),
+            )
+            .unwrap();
+        }
+    }
+    impl Drop for State {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0.join("connection.json"));
+            let _ = fs::remove_dir(self.0.join("connection.json"));
+            let _ = fs::remove_file(self.0.join("linked-connection.json"));
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+    fn mock(
+        state: &State,
+        reply: impl FnOnce(tiny_http::Request, Value) + Send + 'static,
+    ) -> thread::JoinHandle<()> {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        state.write(&format!(
+            "http://127.0.0.1:{}",
+            server.server_addr().to_ip().unwrap().port()
+        ));
+        thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .expect("local probe request");
+            assert_eq!(request.method(), &tiny_http::Method::Post);
+            assert_eq!(request.url(), "/rpc");
+            assert!(request
+                .headers()
+                .iter()
+                .any(|header| header.field.equiv("Authorization")
+                    && header.value.as_str() == format!("Bearer {CANARY}")));
+            let body = serde_json::from_reader(request.as_reader()).unwrap();
+            reply(request, body);
+        })
+    }
+    fn check(probe: ConnectionProbe, expected: ConnectionCategory) {
+        assert_eq!(probe.category, expected);
+        let text = serde_json::to_string(&probe).unwrap();
+        assert!(!text.contains(CANARY));
+        assert!(!text.contains("http://"));
+    }
+
+    #[test]
+    fn canonical_loopback_origin_rejects_userinfo_and_other_url_components() {
+        for port in [1, 80, 65535] {
+            assert!(canonical_local_url(&format!("http://127.0.0.1:{port}")));
+        }
+        for url in [
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:00080",
+            "http://127.0.0.1:+80",
+            "http://127.0.0.1:80/",
+            "http://127.0.0.1:80/rpc",
+            "http://127.0.0.1:80?query",
+            "http://127.0.0.1:80#fragment",
+            "http://127.0.0.1:80@example.invalid",
+            "http://127.0.0.1:80\\@example.invalid",
+            "http://127.0.0.1:80\n",
+            " http://127.0.0.1:80",
+            "HTTP://127.0.0.1:80",
+            "https://127.0.0.1:80",
+            "http://localhost:80",
+            "http://127.1:80",
+            "http://[::1]:80",
+        ] {
+            assert!(!canonical_local_url(url), "must reject {url:?}");
+        }
+    }
+
+    #[test]
+    fn connection_metadata_failures_are_bounded_and_secret_free() {
+        use ConnectionCategory::*;
+        let state = State::new();
+        check(probe_connection(&state.0), ConnectionMissing);
+        let path = state.0.join("connection.json");
+        fs::create_dir(&path).unwrap();
+        check(probe_connection(&state.0), ConnectionUnreadable);
+        fs::remove_dir(&path).unwrap();
+        for bytes in [
+            format!("{{{CANARY}"),
+            CANARY.repeat(3000),
+            json!({"url":"http://127.0.0.1:1"}).to_string(),
+            json!({"url":"http://127.0.0.1:1","token":""}).to_string(),
+            json!({"url":"http://127.0.0.1:1","token":format!("{CANARY}\r\nHeader: value")})
+                .to_string(),
+            json!({"url":format!("http://127.0.0.1:1@{CANARY}.invalid"),"token":CANARY})
+                .to_string(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            check(probe_connection(&state.0), ConnectionInvalid);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        state.write(&format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        ));
+        drop(listener);
+        check(probe_connection(&state.0), ListenerUnreachable);
+    }
+
+    #[test]
+    fn invalid_routes_never_send_authorization() {
+        let state = State::new();
+        let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+        trap.set_nonblocking(true).unwrap();
+        let origin = format!("http://127.0.0.1:{}", trap.local_addr().unwrap().port());
+        for url in [
+            format!(
+                "http://127.0.0.1:1@127.0.0.1:{}",
+                trap.local_addr().unwrap().port()
+            ),
+            format!("{origin}/{CANARY}"),
+            format!("{origin}?{CANARY}"),
+            format!("{origin}#{CANARY}"),
+        ] {
+            state.write(&url);
+            check(
+                connection_request(&state.0, "rpc", &json!({}), Duration::from_millis(100))
+                    .unwrap_err(),
+                ConnectionCategory::ConnectionInvalid,
+            );
+        }
+        state.write(&origin);
+        check(
+            connection_request(
+                &state.0,
+                "rpc/other",
+                &json!({}),
+                Duration::from_millis(100),
+            )
+            .unwrap_err(),
+            ConnectionCategory::ConnectionInvalid,
+        );
+        assert_eq!(
+            trap.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn probe_ping_leaves_presence_focus_history_and_sources_unchanged() {
+        let state = State::new();
+        let shared = Arc::new(Mutex::new(Engine::new()));
+        shared
+            .lock()
+            .unwrap()
+            .mcp_clients
+            .insert("direct-mcp".into(), 123);
+        let snapshot = |engine: &Engine| {
+            json!({"doc":engine.doc,"clients":engine.mcp_clients,
+            "undo":engine.undo.len(),"redo":engine.redo.len(),"saved":engine.saved_revision,
+            "focus":engine.focus_requested,"activity":engine.activity,"status":engine.status})
+        };
+        let before = snapshot(&shared.lock().unwrap());
+        let engine = shared.clone();
+        let worker = mock(&state, move |request, body| {
+            assert_eq!(body["method"], "mcp");
+            let ping = &body["params"]["request"];
+            assert_eq!(ping["method"], "ping");
+            assert_eq!(ping["_client"], ping["id"]);
+            assert!(ping["_client"]
+                .as_str()
+                .unwrap()
+                .starts_with("discovery-probe-"));
+            let result = mcp(&engine, ping);
+            request
+                .respond(tiny_http::Response::from_string(
+                    json!({"ok":true,"result":result}).to_string(),
+                ))
+                .unwrap();
+        });
+        #[cfg(unix)]
+        {
+            fs::rename(
+                state.0.join("connection.json"),
+                state.0.join("linked-connection.json"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("linked-connection.json", state.0.join("connection.json"))
+                .unwrap();
+        }
+        let metadata = fs::read(state.0.join("connection.json")).unwrap();
+        check(probe_connection(&state.0), ConnectionCategory::Ready);
+        worker.join().unwrap();
+        assert_eq!(snapshot(&shared.lock().unwrap()), before);
+        assert_eq!(fs::read(state.0.join("connection.json")).unwrap(), metadata);
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(state.0.join("connection.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn probe_authentication_and_bad_replies_have_fixed_categories() {
+        use ConnectionCategory::*;
+        for (status, body, category) in [
+            (401, CANARY, AuthenticationRejected),
+            (500, CANARY, ResponseRejected),
+            (200, CANARY, ResponseInvalid),
+            (200, "{}", ResponseInvalid),
+            (
+                200,
+                r#"{"ok":true,"result":{"jsonrpc":"2.0","id":"wrong","result":{}}}"#,
+                ResponseInvalid,
+            ),
+        ] {
+            let state = State::new();
+            let worker = mock(&state, move |request, _| {
+                request
+                    .respond(tiny_http::Response::from_string(body).with_status_code(status))
+                    .unwrap();
+            });
+            check(probe_connection(&state.0), category);
+            worker.join().unwrap();
+        }
+        for field in ["jsonrpc", "result", "error"] {
+            let state = State::new();
+            let worker = mock(&state, move |request, body| {
+                let mut result =
+                    json!({"jsonrpc":"2.0","id":body["params"]["request"]["id"],"result":{}});
+                result[field] = json!(CANARY);
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"ok":true,"result":result}).to_string(),
+                    ))
+                    .unwrap();
+            });
+            check(probe_connection(&state.0), ResponseInvalid);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn local_redirects_are_rejected_without_following_them() {
+        let state = State::new();
+        let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+        trap.set_nonblocking(true).unwrap();
+        let target = format!(
+            "http://127.0.0.1:{}/{CANARY}",
+            trap.local_addr().unwrap().port()
+        );
+        let worker = mock(&state, move |request, _| {
+            let redirect = tiny_http::Response::empty(302)
+                .with_header(tiny_http::Header::from_bytes("Location", target).unwrap());
+            request.respond(redirect).unwrap();
+        });
+        check(
+            probe_connection(&state.0),
+            ConnectionCategory::ResponseRejected,
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            trap.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn public_client_preserves_actual_engine_and_mcp_errors() {
+        let message = "Project has unsaved changes; save or explicitly discard them";
+        for endpoint in ["rpc", "mcp"] {
+            let state = State::new();
+            let worker = mock(&state, move |request, _| {
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"ok":false,"error":message}).to_string(),
+                    ))
+                    .unwrap();
+            });
+            let result = client(&state.0, endpoint, &json!({"method":"document"}));
+            if endpoint == "mcp" {
+                assert_eq!(result.unwrap_err(), message);
+            } else {
+                assert_eq!(result.unwrap(), json!({"ok":false,"error":message}));
+            }
+            worker.join().unwrap();
+        }
+        let state = State::new();
+        let tool_error = json!({"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":message}]}});
+        let expected = tool_error.clone();
+        let worker = mock(&state, move |request, _| {
+            request
+                .respond(tiny_http::Response::from_string(
+                    json!({"ok":true,"result":tool_error}).to_string(),
+                ))
+                .unwrap();
+        });
+        assert_eq!(
+            client(&state.0, "mcp", &json!({"id":1,"method":"tools/call"})).unwrap(),
+            expected
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn probe_times_out_with_fixed_recovery_instead_of_hanging() {
+        let state = State::new();
+        let worker = mock(&state, |request, _| {
+            thread::sleep(Duration::from_millis(1250));
+            let _ = request.respond(tiny_http::Response::from_string(CANARY));
+        });
+        let started = std::time::Instant::now();
+        check(
+            probe_connection(&state.0),
+            ConnectionCategory::ConnectionInterrupted,
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn probe_response_budget_rejects_oversize_without_limiting_normal_client_replies() {
+        let state = State::new();
+        let worker = mock(&state, |request, body| {
+            let response = json!({"ok":true,"result":{"jsonrpc":"2.0",
+                "id":body["params"]["request"]["id"],"result":{}}})
+            .to_string()
+                + &" ".repeat(64 * 1024);
+            let _ = request.respond(tiny_http::Response::from_string(response));
+        });
+        check(
+            probe_connection(&state.0),
+            ConnectionCategory::ResponseInvalid,
+        );
+        worker.join().unwrap();
+        let worker = mock(&state, |request, _| {
+            let result = json!({"ok":true,"result":{"large":CANARY.repeat(3000)}});
+            request
+                .respond(tiny_http::Response::from_string(result.to_string()))
+                .unwrap();
+        });
+        let result = client(&state.0, "mcp", &json!({"method":"tools/call"})).unwrap();
+        assert_eq!(result["large"], CANARY.repeat(3000));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn interrupted_response_body_does_not_expose_content_or_claim_invalid_json() {
+        let state = State::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        state.write(&format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        ));
+        let worker = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "local interruption request"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("local interruption listener failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{{\"{CANARY}").as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+        check(
+            probe_connection(&state.0),
+            ConnectionCategory::ConnectionInterrupted,
+        );
+        worker.join().unwrap();
     }
 }

@@ -129,6 +129,81 @@ fn adapter_keeps_tools_available_with_a_closed_canvas_and_stale_connection() {
 }
 
 #[test]
+fn adapter_preserves_offline_tools_across_bad_metadata_and_authentication_then_recovers() {
+    const CANARY: &str = "SYNTHETIC_PRIVATE_STDIO_CONNECTION_CANARY";
+    let dir = isolated_dir();
+    let mut adapter = Adapter::start(dir.clone());
+    assert!(adapter
+        .send(&json!({"id":1,"method":"initialize"}))
+        .get("result")
+        .is_some());
+    for metadata in [
+        format!("{{{CANARY}"),
+        json!({"url":format!("http://127.0.0.1:1@{CANARY}.invalid"),"token":CANARY}).to_string(),
+    ] {
+        std::fs::write(dir.join("connection.json"), metadata).unwrap();
+        let failed = adapter.send(&json!({"id":2,"method":"tools/call","params":{"name":"peerbrush_observe","arguments":{"image":false}}}));
+        assert_eq!(failed["result"]["isError"], true);
+        let text = failed["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("connection information is invalid"));
+        assert!(text.contains("adapter remains ready"));
+        assert!(!failed.to_string().contains(CANARY));
+        assert_eq!(
+            adapter.send(&json!({"id":3,"method":"tools/list"}))["result"]["tools"],
+            server::tools()
+        );
+    }
+    let shared = Arc::new(Mutex::new(Engine::new()));
+    let connection = server::start(shared.clone(), dir.clone()).unwrap();
+    let path = dir.join("connection.json");
+    let original = std::fs::read(&path).unwrap();
+    let mut stale: Value = serde_json::from_slice(&original).unwrap();
+    stale["token"] = json!(CANARY);
+    std::fs::write(&path, stale.to_string()).unwrap();
+    let rejected = adapter.send(&json!({"id":4,"method":"tools/call","params":{"name":"peerbrush_observe","arguments":{"image":false}}}));
+    assert_eq!(rejected["result"]["isError"], true);
+    assert!(rejected["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("rejected stale connection information"));
+    assert!(!rejected.to_string().contains(CANARY));
+    assert!(shared.lock().unwrap().mcp_clients.is_empty());
+    std::fs::write(&path, original).unwrap();
+    let recovered = adapter.send(&json!({"id":5,"method":"tools/call","params":{"name":"peerbrush_observe","arguments":{"image":false}}}));
+    assert_eq!(recovered["result"]["isError"], false);
+    assert_eq!(shared.lock().unwrap().doc.revision, 0);
+    assert!(!shared.lock().unwrap().focus_requested);
+    adapter.stop();
+    assert!(shared.lock().unwrap().mcp_clients.is_empty());
+    drop(connection);
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_connection_metadata_is_rejected_without_opening_or_stalling_the_adapter() {
+    let dir = isolated_dir();
+    assert!(Command::new("mkfifo")
+        .arg(dir.join("connection.json"))
+        .status()
+        .expect("Unix acceptance requires the standard mkfifo utility")
+        .success());
+    // Adapter::reply has a deadline and Drop kills the child on assertion failure,
+    // so a regression to opening the FIFO cannot leave the test process blocked.
+    let mut adapter = Adapter::start(dir);
+    let failed = adapter.send(&json!({"id":1,"method":"tools/call","params":{"name":"peerbrush_observe","arguments":{"image":false}}}));
+    assert_eq!(failed["result"]["isError"], true);
+    assert!(failed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("connection information cannot be read"));
+    assert_eq!(
+        adapter.send(&json!({"id":2,"method":"tools/list"}))["result"]["tools"],
+        server::tools()
+    );
+    adapter.stop();
+}
+
+#[test]
 fn initialized_adapter_reconnects_when_canvas_opens_and_clears_presence_at_eof() {
     let dir = isolated_dir();
     let mut adapter = Adapter::start(dir.clone());
