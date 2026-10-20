@@ -69,25 +69,19 @@ use std::{
 const ACCENT: Color32 = Color32::from_rgb(233, 84, 32);
 const AI_BLUE: Color32 = Color32::from_rgb(90, 170, 255);
 const MUTED: Color32 = Color32::from_rgb(188, 183, 189);
-fn key_modifiers(input: &egui::InputState, key: egui::Key) -> egui::Modifiers {
-    input
-        .events
-        .iter()
-        .find_map(|event| match event {
-            egui::Event::Key {
-                key: k,
-                physical_key,
-                pressed: true,
-                modifiers,
-                ..
-            } if *k == key || *physical_key == Some(key) => Some(*modifiers),
-            _ => None,
-        })
-        .unwrap_or(input.modifiers)
+fn command_modifiers(input: &egui::InputState, key: egui::Key) -> Option<egui::Modifiers> {
+    input.events.iter().find_map(|event| match event {
+        egui::Event::Key {
+            key: k,
+            pressed: true,
+            modifiers,
+            ..
+        } if *k == key && (modifiers.command || modifiers.ctrl) => Some(*modifiers),
+        _ => None,
+    })
 }
 fn command_key(input: &egui::InputState, key: egui::Key) -> bool {
-    let mods = key_modifiers(input, key);
-    (mods.command || mods.ctrl) && input.key_pressed(key)
+    command_modifiers(input, key).is_some()
 }
 fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, color: Color32) {
     use crate::icons::{self, Icon};
@@ -4369,11 +4363,9 @@ impl PeerBrush {
                         key,
                         pressed: true,
                         modifiers,
-                        physical_key,
                         ..
                     } => {
                         shortcuts::Shortcuts::allowed(*key)
-                            || physical_key.is_some_and(shortcuts::Shortcuts::allowed)
                             || (*key == egui::Key::Delete
                                 && self.tool != Tool::Pen
                                 && !(self.tool == Tool::Selection
@@ -4560,12 +4552,14 @@ impl PeerBrush {
                     .unwrap_or_else(|e| e);
             }
             ctx.input(|i| {
-                if i.modifiers.alt && !i.modifiers.command && (i.key_pressed(egui::Key::B) || i.key_pressed(egui::Key::Backspace)) {
+                if i.events.iter().any(|event| matches!(event,
+                    egui::Event::Key { key: egui::Key::B | egui::Key::Backspace, pressed: true, modifiers, .. }
+                        if modifiers.alt && !modifiers.command)) {
                     let color=if self.mask {[self.mask_value,self.mask_value,self.mask_value,255]}else{self.color};
                     self.layer_cmd("paint.fill",json!({"color":color,"mask":self.mask,"step":self.mask_step}),"Fill foreground");
                 }
-                if command_key(i,egui::Key::Z) {
-                    let r = if key_modifiers(i,egui::Key::Z).shift {
+                if let Some(modifiers) = command_modifiers(i,egui::Key::Z) {
+                    let r = if modifiers.shift {
                         self.shared.lock().unwrap().redo("human")
                     } else {
                         self.shared.lock().unwrap().undo("human")
@@ -4575,8 +4569,8 @@ impl PeerBrush {
                     }
                     self.last_preview = None;
                 }
-                if command_key(i,egui::Key::S) {
-                    self.save(key_modifiers(i,egui::Key::S).shift);
+                if let Some(modifiers) = command_modifiers(i,egui::Key::S) {
+                    self.save(modifiers.shift);
                 }
                 if command_key(i,egui::Key::O) {
                     self.open();
@@ -4584,17 +4578,18 @@ impl PeerBrush {
                 if command_key(i,egui::Key::E) {
                     self.merge_layers(ctx, doc);
                 }
-                if command_key(i,egui::Key::G) {
-                    if key_modifiers(i,egui::Key::G).shift {
+                if let Some(modifiers) = command_modifiers(i,egui::Key::G) {
+                    if modifiers.shift {
                         self.merge_layers(ctx, doc);
                     } else {
                         self.create_folder(doc);
                     }
                 }
-                if i.key_pressed(egui::Key::Delete)
+                if i.events.iter().any(|event| matches!(event,
+                    egui::Event::Key { key: egui::Key::Delete, pressed: true, modifiers, .. }
+                        if !modifiers.any()))
                     && self.tool != Tool::Pen
                     && self.selection_path.is_empty()
-                    && !key_modifiers(i,egui::Key::Delete).any()
                 {
                     if doc.selection.is_some() {
                         self.edit(vec![json!({"op":"paint.clear_selection","layer":self.selected,"mask":self.mask,"step":self.mask_step,"document_id":doc.id,"source_revision":doc.revision})],"Clear selected pixels");
@@ -4602,8 +4597,7 @@ impl PeerBrush {
                         self.layer_cmd("layer.delete",json!({}),"Delete selected layers");
                     }
                 }
-                if command_key(i,egui::Key::D) {
-                    let mods = key_modifiers(i,egui::Key::D);
+                if let Some(mods) = command_modifiers(i,egui::Key::D) {
                     if mods.alt && !mods.shift {
                         self.edit(vec![json!({"op":"selection.reselect"})],"Reselect");
                     } else if mods.shift && !mods.alt {
@@ -4613,7 +4607,7 @@ impl PeerBrush {
                     }
                 }
                 if command_key(i,egui::Key::A) {self.edit(vec![json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})],"Select all");}
-                if command_key(i,egui::Key::I) && key_modifiers(i,egui::Key::I).shift && !key_modifiers(i,egui::Key::I).alt {
+                if command_modifiers(i,egui::Key::I).is_some_and(|mods| mods.shift && !mods.alt) {
                     self.edit(vec![json!({"op":"selection.invert"})],"Invert selection");
                 }
                 if command_key(i,egui::Key::J) && self.layer_clipboard {self.duplicate_layers(doc);}
@@ -7739,8 +7733,8 @@ mod tests {
             &mut app,
             &ctx,
             vec![egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: Some(egui::Key::W),
+                key: egui::Key::W,
+                physical_key: Some(egui::Key::Q),
                 pressed: true,
                 repeat: false,
                 modifiers: Default::default(),
@@ -12817,11 +12811,11 @@ mod tests {
                         "fill" => egui::Key::B,
                         "duplicate" => egui::Key::D,
                         // Exercise different logical/physical identities.
-                        _ => egui::Key::Z,
+                        _ => egui::Key::W,
                     };
                     let event = |pressed, repeat| egui::Event::Key {
                         key,
-                        physical_key: Some(if action == "move" { egui::Key::W } else { key }),
+                        physical_key: Some(if action == "move" { egui::Key::Z } else { key }),
                         pressed,
                         repeat,
                         modifiers,

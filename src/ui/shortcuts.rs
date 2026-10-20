@@ -37,9 +37,14 @@ impl Binding {
         let Some(key) = self.key() else {
             return false;
         };
-        let mods = key_modifiers(input, key);
-        !mods.command && !mods.ctrl && !mods.alt && mods.shift == self.shift &&
-            (input.key_pressed(key) || input.events.iter().any(|e| matches!(e, egui::Event::Key {physical_key:Some(k),pressed:true,..} if *k==key)))
+        // egui-winit resolves logical keys, with one physical fallback for
+        // non-Latin layouts. Matching both here would dispatch two actions.
+        input.events.iter().any(|event| {
+            matches!(event,
+            egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                if *k == key && !modifiers.command && !modifiers.ctrl && !modifiers.alt
+                    && modifiers.shift == self.shift)
+        })
     }
     fn held(&self, input: &egui::InputState) -> bool {
         !input.modifiers.command
@@ -292,17 +297,28 @@ impl Shortcuts {
             "Larger size" => (egui::Key::CloseBracket, "}"),
             _ => return false,
         };
-        let mods = key_modifiers(input, key);
+        let pressed_key = input.events.iter().any(|event| {
+            matches!(event,
+            egui::Event::Key { key: k, pressed: true, .. } if *k == key)
+        });
         self.preferences.bindings[action].key == key.symbol_or_name()
             && !self.preferences.bindings[action].shift
-            && !mods.command
-            && !mods.ctrl
-            && !mods.alt
-            && (input.key_pressed(key)
-                || input
-                    .events
-                    .iter()
-                    .any(|e| matches!(e,egui::Event::Text(t) if t==text)))
+            && input.events.iter().any(|event| match event {
+                egui::Event::Key {
+                    key: k,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => *k == key && !modifiers.command && !modifiers.ctrl && !modifiers.alt,
+                egui::Event::Text(t) => {
+                    !pressed_key
+                        && t == text
+                        && !input.modifiers.command
+                        && !input.modifiers.ctrl
+                        && !input.modifiers.alt
+                }
+                _ => false,
+            })
     }
     pub fn size_held(&self, input: &egui::InputState) -> bool {
         self.preferences.bindings["Size / hardness gesture"].held(input)
@@ -312,12 +328,11 @@ impl Shortcuts {
             egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => true,
             egui::Event::Key {
                 key,
-                physical_key,
                 pressed: true,
                 modifiers,
                 ..
             } => {
-                let is_key = |wanted| *key == wanted || *physical_key == Some(wanted);
+                let is_key = |wanted| *key == wanted;
                 if (modifiers.command || modifiers.ctrl)
                     && !modifiers.alt
                     && [egui::Key::C, egui::Key::X, egui::Key::V]
@@ -783,6 +798,325 @@ mod tests {
             pressed,
             repeat: false,
             modifiers: Default::default(),
+        }
+    }
+    #[test]
+    fn resolved_layout_keys_dispatch_one_binding_with_their_own_modifiers() {
+        let shortcuts = Shortcuts::load(Path::new(""));
+        for (logical, physical, shift, expected) in [
+            (egui::Key::W, egui::Key::Q, false, "Move"),
+            (egui::Key::X, egui::Key::B, false, "Swap colors"),
+            (egui::Key::R, egui::Key::E, true, "Rotate view right"),
+            (egui::Key::T, egui::Key::P, false, "Text"),
+            // Non-Latin native input has already selected its physical fallback.
+            (egui::Key::W, egui::Key::W, false, "Move"),
+        ] {
+            let ctx = egui::Context::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: logical,
+                        physical_key: Some(physical),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers {
+                            shift,
+                            ..Default::default()
+                        },
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input(|input| {
+                        let active = shortcuts
+                            .preferences
+                            .bindings
+                            .iter()
+                            .filter_map(|(name, binding)| {
+                                binding.pressed(input).then_some(name.as_str())
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(active, vec![expected]);
+                    })
+                },
+            );
+        }
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::W,
+                        physical_key: Some(egui::Key::Q),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::Key {
+                        key: egui::Key::Q,
+                        physical_key: Some(egui::Key::W),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.input(|input| {
+                    assert!(shortcuts.preferences.bindings["Move"].pressed(input));
+                    assert!(!shortcuts.preferences.bindings["Deselect"].pressed(input));
+                    assert!(command_key(input, egui::Key::Q));
+                    assert!(!command_key(input, egui::Key::W));
+                    assert!(!shortcuts.selection_dependent_event(&input.events[1]));
+                })
+            },
+        );
+        for reverse in [false, true] {
+            let ctx = egui::Context::default();
+            let modified = egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            };
+            let mut events = vec![
+                egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: Some(egui::Key::W),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+                egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: Some(egui::Key::W),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: modified,
+                },
+            ];
+            if reverse {
+                events.reverse();
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input(|input| {
+                        assert_eq!(command_modifiers(input, egui::Key::Z), Some(modified));
+                    })
+                },
+            );
+        }
+        let mut remapped = shortcuts.preferences.clone();
+        remapped.bindings.get_mut("Brush").unwrap().key = "O".into();
+        let mut shortcuts = shortcuts;
+        shortcuts.apply(remapped).unwrap();
+        for (logical, physical, expected) in [
+            (egui::Key::O, egui::Key::B, true),
+            (egui::Key::B, egui::Key::O, false),
+        ] {
+            let ctx = egui::Context::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: logical,
+                        physical_key: Some(physical),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input(|input| {
+                        assert_eq!(shortcuts.pressed("Brush", input), expected);
+                        assert!(!shortcuts.size_held(input));
+                    })
+                },
+            );
+        }
+    }
+    #[test]
+    fn alternate_latin_layouts_preserve_selection_colors_and_native_artwork() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = super::super::workspace_tests::fixture(depth);
+            app.shortcuts = Shortcuts::load(Path::new(""));
+            app.select_tool(Tool::Picker);
+            app.shared.lock().unwrap().doc.selection = Some([1, 1, 8, 8]);
+            frame(&mut app, &ctx, vec![], true);
+            let before = super::super::workspace_tests::source(&app);
+            let foreground = app.color;
+            let background = app.background;
+            for (logical, physical) in [(egui::Key::W, egui::Key::Q), (egui::Key::X, egui::Key::B)]
+            {
+                for pressed in [true, false] {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![egui::Event::Key {
+                            key: logical,
+                            physical_key: Some(physical),
+                            pressed,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                        true,
+                    );
+                }
+                assert!(
+                    app.tool == Tool::Move,
+                    "Physical position must not dispatch another tool"
+                );
+                assert_eq!(super::super::workspace_tests::source(&app), before);
+            }
+            assert_eq!((app.color, app.background), (background, foreground));
+        }
+    }
+    #[test]
+    fn default_brace_aliases_pair_modifiers_and_keep_text_only_fallback_bounded() {
+        let mut shortcuts = Shortcuts::load(Path::new(""));
+        for (action, key, text) in [
+            ("Smaller size", egui::Key::OpenBracket, "{"),
+            ("Larger size", egui::Key::CloseBracket, "}"),
+        ] {
+            let pressed = |modifiers| egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            for reverse in [false, true] {
+                let mut events = vec![
+                    pressed(egui::Modifiers::COMMAND),
+                    pressed(egui::Modifiers::SHIFT),
+                ];
+                if reverse {
+                    events.reverse();
+                }
+                let ctx = egui::Context::default();
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.input(|input| {
+                            assert!(shortcuts.pressed(action, input));
+                        })
+                    },
+                );
+            }
+            for (events, modifiers, expected) in [
+                (
+                    vec![egui::Event::Text(text.into())],
+                    egui::Modifiers::SHIFT,
+                    true,
+                ),
+                (
+                    vec![egui::Event::Text(text.into())],
+                    egui::Modifiers::COMMAND,
+                    false,
+                ),
+                (
+                    vec![
+                        pressed(egui::Modifiers::COMMAND),
+                        egui::Event::Text(text.into()),
+                    ],
+                    egui::Modifiers::NONE,
+                    false,
+                ),
+            ] {
+                let ctx = egui::Context::default();
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        modifiers,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.input(|input| {
+                            assert_eq!(shortcuts.pressed(action, input), expected);
+                        })
+                    },
+                );
+            }
+            let mut remapped = shortcuts.preferences.clone();
+            remapped.bindings.get_mut(action).unwrap().key =
+                if action == "Smaller size" { "1" } else { "2" }.into();
+            shortcuts.apply(remapped).unwrap();
+            let ctx = egui::Context::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        pressed(egui::Modifiers::SHIFT),
+                        egui::Event::Text(text.into()),
+                    ],
+                    ..Default::default()
+                },
+                |ctx| ctx.input(|input| assert!(!shortcuts.pressed(action, input))),
+            );
+        }
+    }
+    #[test]
+    fn editing_shortcuts_use_event_modifiers_before_later_modifier_changes() {
+        for depth in [8, 16] {
+            for reverse in [false, true] {
+                let (mut app, ctx) = super::super::workspace_tests::fixture(depth);
+                app.shortcuts = Shortcuts::load(Path::new(""));
+                app.shared.lock().unwrap().doc.selection = Some([1, 1, 8, 8]);
+                frame(&mut app, &ctx, vec![], true);
+                let before = super::super::workspace_tests::source(&app);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        time: Some(ctx.input(|i| i.time) + 0.1),
+                        modifiers: egui::Modifiers::ALT,
+                        events: vec![key(egui::Key::B, true)],
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                );
+                assert!(app.tool == Tool::Brush);
+                assert_eq!(
+                    super::super::workspace_tests::source(&app),
+                    before,
+                    "Alt pressed after B must not retroactively fill the artwork"
+                );
+                frame(&mut app, &ctx, vec![key(egui::Key::B, false)], true);
+                let doc = app.shared.lock().unwrap().doc.clone();
+                let expected = crate::engine::Engine::preview_edits(
+                    doc.clone(),
+                    &[json!({
+                        "op":"paint.clear_selection", "layer":app.selected, "mask":false
+                    })],
+                )
+                .unwrap();
+                let mut events = vec![
+                    egui::Event::Key {
+                        key: egui::Key::Delete,
+                        physical_key: Some(egui::Key::Delete),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                    key(egui::Key::Delete, true),
+                ];
+                if reverse {
+                    events.reverse();
+                }
+                frame(&mut app, &ctx, events, true);
+                let mut engine = app.shared.lock().unwrap();
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    expected.export_png().unwrap()
+                );
+                assert_eq!(engine.undo.len(), 1);
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.export_png().unwrap(), doc.export_png().unwrap());
+            }
         }
     }
     #[test]
