@@ -1087,6 +1087,7 @@ mod tests {
                 );
                 frame(&mut app, &ctx, vec![key(egui::Key::B, false)], true);
                 let doc = app.shared.lock().unwrap().doc.clone();
+                let prior_undo = app.shared.lock().unwrap().undo.len();
                 let expected = crate::engine::Engine::preview_edits(
                     doc.clone(),
                     &[json!({
@@ -1113,8 +1114,9 @@ mod tests {
                     engine.doc.export_png().unwrap(),
                     expected.export_png().unwrap()
                 );
-                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(engine.undo.len(), prior_undo + 1);
                 engine.undo("human").unwrap();
+                assert_eq!(engine.undo.len(), prior_undo);
                 assert_eq!(engine.doc.export_png().unwrap(), doc.export_png().unwrap());
             }
         }

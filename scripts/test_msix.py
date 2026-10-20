@@ -65,10 +65,11 @@ class Msix(unittest.TestCase):
 
     def rewrite_portable(self, change):
         with zipfile.ZipFile(self.archive) as archive:
-            files={n:archive.read(n) for n in archive.namelist()}
+            entries={entry.filename:entry for entry in archive.infolist()}
+            files={n:archive.read(n) for n in entries}
         change(files)
         with zipfile.ZipFile(self.archive,'w') as archive:
-            for n,data in files.items():archive.writestr(n,data)
+            for n,data in files.items():archive.writestr(entries.get(n,n),data)
 
     def test_manifest_retains_logo_alias_identity_and_scoped_permissions(self):
         report=self.stage()
@@ -217,12 +218,21 @@ class Msix(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'must be new'):self.stage()
 
     def test_staging_accepts_windows_crlf_notice_summary(self):
+        with zipfile.ZipFile(self.archive) as archive:
+            executable=next(entry for entry in archive.infolist() if entry.filename.endswith('/peerbrush.exe'))
+            executable_mode=executable.external_attr
         def use_crlf(files):
             name=next(n for n in files if n.endswith('/THIRD_PARTY_NOTICES.md'))
             text=files[name].decode('utf-8').replace('\r\n','\n')
             files[name]=text.replace('\n','\r\n').encode('utf-8')
         self.rewrite_portable(use_crlf)
+        with zipfile.ZipFile(self.archive) as archive:
+            self.assertEqual(archive.getinfo(executable.filename).external_attr,executable_mode)
+            self.assertTrue((executable_mode>>16)&0o111)
+            notice=archive.read(next(n for n in archive.namelist() if n.endswith('/THIRD_PARTY_NOTICES.md')))
+            self.assertIn(b'\r\n',notice)
         self.stage()
+        self.assertEqual((self.root/'stage/THIRD_PARTY_NOTICES.md').read_bytes(),notice)
 
     def test_staging_rejects_bare_carriage_return_notice_summary(self):
         def use_bare_cr(files):

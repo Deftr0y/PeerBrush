@@ -250,15 +250,20 @@ fn replace_text(app: &mut PeerBrush, ctx: &egui::Context, old: &str, new: &str) 
 
 fn number(app: &mut PeerBrush, ctx: &egui::Context, name: &str, old: &str, new: &str) {
     let output = draw(app, ctx, vec![], Default::default());
-    let name = labels(&output, name)
+    let values = labels(&output, old);
+    let at = labels(&output, name)
         .into_iter()
-        .next()
-        .expect("Number label");
-    let at = labels(&output, old)
-        .into_iter()
-        .filter(|r| r.left() > name.right() && (r.center().y - name.center().y).abs() < 5.)
-        .min_by(|a, b| a.left().total_cmp(&b.left()))
-        .unwrap_or_else(|| panic!("Visible {old} adjacent to {name:?}"))
+        .find_map(|label| {
+            values
+                .iter()
+                .filter(|r| {
+                    r.left() > label.right()
+                        && r.left() - label.right() < 80.
+                        && (r.center().y - label.center().y).abs() < 5.
+                })
+                .min_by(|a, b| a.left().total_cmp(&b.left()))
+        })
+        .unwrap_or_else(|| panic!("Visible {old} adjacent to {name}"))
         .center();
     click(app, ctx, at);
     click(app, ctx, at);
