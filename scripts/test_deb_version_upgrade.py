@@ -33,6 +33,46 @@ OLD_SOURCE = 'PeerBrush-0.26.0-source.zip'
 OLD_BYTES = 31088822
 OLD_SHA256 = '03292c5552b5a66bcb066423379dddd2661852ef9b5471350f35d278feb3efe2'
 PROJECT_SIZE = (32, 24)
+DIAGNOSTIC_SCRIPTS = frozenset({
+    'test_deb_version_upgrade.py', 'test_deb_installation.py', 'package.py',
+    'package_deb.py', 'package_macos_dmg.py', 'prepare_site_release.py',
+    'production_readiness.py', 'verify_release.py',
+})
+
+
+def failure_diagnostic(error):
+    """Fixed categories and reviewed source locations only, never exception text."""
+    kinds = {ValueError: 'ValueError', KeyError: 'KeyError', TypeError: 'TypeError',
+        FileNotFoundError: 'FileNotFoundError', FileExistsError: 'FileExistsError',
+        PermissionError: 'PermissionError', OSError: 'OSError', RuntimeError: 'RuntimeError',
+        subprocess.TimeoutExpired: 'TimeoutExpired', subprocess.CalledProcessError: 'CalledProcessError',
+        json.JSONDecodeError: 'JSONDecodeError', zipfile.BadZipFile: 'BadZipFile',
+        UnicodeDecodeError: 'UnicodeDecodeError'}
+    scripts = Path(__file__).resolve().parent
+    allowed = {os.path.normcase(str((scripts / name).resolve())): name for name in DIAGNOSTIC_SCRIPTS}
+    records, seen = [], set()
+    while error is not None and len(records) < 3 and id(error) not in seen:
+        seen.add(id(error))
+        record = kinds.get(type(error), 'OtherError')
+        current, location = error.__traceback__, None
+        for _ in range(64):
+            if current is None:
+                break
+            try:
+                name = allowed.get(os.path.normcase(str(Path(current.tb_frame.f_code.co_filename).resolve())))
+            except (OSError, ValueError, RuntimeError):
+                name = None
+            if name is not None and type(current.tb_lineno) is int and 1 <= current.tb_lineno <= 1000000:
+                location = name + ':' + str(current.tb_lineno)
+            current = current.tb_next
+        if location is not None:
+            record += ' at ' + location
+        if type(error) is subprocess.CalledProcessError and type(error.returncode) is int and -32768 <= error.returncode <= 32767:
+            record += ' exit=' + str(error.returncode)
+        records.append(record)
+        cause = error.__cause__
+        error = cause if cause is not None else None if error.__suppress_context__ else error.__context__
+    return 'Compatibility diagnostic: ' + ' <- '.join(records)
 
 
 def phase(name):
@@ -191,7 +231,9 @@ class Session:
         response = subprocess.run(self.command('cli', method, json.dumps(dict(actor='human', **parameters))),
             env=self.environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
         if response.returncode != 0:
-            raise ValueError('Fixture RPC failed in the disposable compatibility phase.')
+            # Preserve only the numeric status as a diagnostic cause; do not
+            # retain RPC arguments, output or connection details in this cause.
+            raise ValueError('Fixture RPC failed in the disposable compatibility phase.') from subprocess.CalledProcessError(response.returncode, 'fixture-rpc')
         data = response.stdout
         if len(data) > 2 * 1024 * 1024:
             raise ValueError('Fixture RPC response exceeds its budget.')
@@ -207,15 +249,18 @@ class Session:
                                             stdin=subprocess.DEVNULL, stdout=self.output, stderr=self.output,
                                             start_new_session=True)
             deadline = time.monotonic() + 30
+            last_error = None
             while time.monotonic() < deadline:
-                if self.process.poll() is not None:
-                    raise ValueError('Historical/current headless fixture could not start.')
+                status = self.process.poll()
+                if status is not None:
+                    raise ValueError('Historical/current headless fixture could not start.') from subprocess.CalledProcessError(status, 'fixture-headless')
                 try:
                     self.rpc('tool_settings', dict(action='get', tool='brush'))
                     return self
-                except (ValueError, OSError, subprocess.TimeoutExpired):
+                except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+                    last_error = error
                     time.sleep(0.1)
-            raise ValueError('Headless fixture did not become ready.')
+            raise ValueError('Headless fixture did not become ready.') from last_error
         except BaseException:
             self.__exit__(None, None, None)
             raise
@@ -399,6 +444,7 @@ if __name__ == '__main__':
     expected = {name: getattr(arguments, name) for name in ['version', 'commit', 'package_sha256', 'executable_sha256', 'source_sha256']}
     try:
         check(arguments.old_source_root, arguments.package, expected, arguments.output)
-    except Exception:
-        parser.exit(1, 'Real-version disposable compatibility failed; see the last printed phase.\n')
+    except Exception as error:
+        parser.exit(1, 'Real-version disposable compatibility failed; see the last printed phase.\n'
+                    + failure_diagnostic(error) + '\n')
     print('Actual historical-portable to DEB compatibility checked; installed GUI and release readiness remain unverified.')

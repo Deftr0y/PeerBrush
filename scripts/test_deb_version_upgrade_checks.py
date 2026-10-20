@@ -161,6 +161,65 @@ def png(depth=16, *, bad_filter=False):
 
 
 class FixtureContract(unittest.TestCase):
+    def test_failure_diagnostic_emits_only_fixed_types_allowlisted_locations_and_status(self):
+        secret = 'PRIVATE_TOKEN_AND_RPC_ARGUMENTS'
+        def captured(source, filename):
+            try:
+                exec(compile(source, str(filename), 'exec'), {'subprocess': subprocess})
+            except Exception as error:
+                return error
+            self.fail('Synthetic exception was not raised')
+        trusted = Path(upgrade.__file__).resolve()
+        error = captured("raise ValueError('" + secret + "')", trusted)
+        detail = upgrade.failure_diagnostic(error)
+        self.assertEqual(detail, 'Compatibility diagnostic: ValueError at test_deb_version_upgrade.py:1')
+        self.assertNotIn(secret, detail)
+        self.assertNotIn(str(trusted.parent), detail)
+        error = captured("raise KeyError('" + secret + "')", Path('/private') / secret / trusted.name)
+        self.assertEqual(upgrade.failure_diagnostic(error), 'Compatibility diagnostic: KeyError')
+        error = captured("raise subprocess.CalledProcessError(127, '" + secret + "', output=b'private', stderr=b'private')", trusted)
+        self.assertEqual(upgrade.failure_diagnostic(error), 'Compatibility diagnostic: CalledProcessError at test_deb_version_upgrade.py:1 exit=127')
+        unknown = type(secret, (Exception,), {})(secret)
+        self.assertEqual(upgrade.failure_diagnostic(unknown), 'Compatibility diagnostic: OtherError')
+        error = captured("raise ValueError('outer') from subprocess.CalledProcessError(1, '" + secret + "')", trusted)
+        detail = upgrade.failure_diagnostic(error)
+        self.assertEqual(detail, 'Compatibility diagnostic: ValueError at test_deb_version_upgrade.py:1 <- CalledProcessError exit=1')
+        self.assertNotIn(secret, detail)
+        error.__cause__ = error
+        self.assertLessEqual(len(upgrade.failure_diagnostic(error)), 256)
+
+    def test_nonzero_rpc_and_readiness_timeout_keep_sanitizable_causes(self):
+        session = upgrade.Session(Path('/bin/peerbrush'), {}, Path('/private'), None)
+        reply = subprocess.CompletedProcess([], 23, b'PRIVATE_RPC_REPLY', b'PRIVATE_STDERR')
+        with mock.patch.object(upgrade.subprocess, 'run', return_value=reply):
+            with self.assertRaises(ValueError) as caught:
+                session.rpc('observe', {'secret': 'PRIVATE_ARGUMENTS'})
+        cause = caught.exception.__cause__
+        self.assertIs(type(cause), subprocess.CalledProcessError)
+        self.assertEqual(cause.returncode, 23)
+        self.assertEqual(cause.cmd, 'fixture-rpc')
+        self.assertIsNone(cause.stdout)
+        self.assertIsNone(cause.stderr)
+        detail = upgrade.failure_diagnostic(caught.exception)
+        self.assertIn('CalledProcessError exit=23', detail)
+        self.assertNotIn('PRIVATE', detail)
+        with tempfile.TemporaryDirectory(prefix='peerbrush-readiness-') as temporary:
+            session = upgrade.Session(Path('/bin/peerbrush'), {}, Path(temporary).resolve(), None)
+            process = mock.Mock(pid=1234)
+            process.poll.return_value = None
+            process.wait.return_value = None
+            failed = ValueError('PRIVATE_READINESS_REASON')
+            with mock.patch.object(upgrade.subprocess, 'Popen', return_value=process), \
+                    mock.patch.object(session, 'rpc', side_effect=failed), \
+                    mock.patch.object(upgrade.time, 'monotonic', side_effect=[0, 0, 31]), \
+                    mock.patch.object(upgrade.time, 'sleep'), \
+                    mock.patch.object(os, 'killpg', create=True):
+                with self.assertRaises(ValueError) as caught:
+                    session.__enter__()
+            self.assertIs(caught.exception.__cause__, failed)
+            self.assertTrue(session.output.closed)
+            self.assertNotIn('PRIVATE', upgrade.failure_diagnostic(caught.exception))
+
     def test_native8_and16_png_samples_all_filters_and_invalid_rasters(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-png-') as temporary:
             path = Path(temporary).resolve() / 'fixture.png'
