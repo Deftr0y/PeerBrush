@@ -352,6 +352,7 @@ def published(root, inventory, tag, commit, notes, get=public_get):
                  publishedAt=release['published_at'], commit=commit, releaseUrl=release['html_url'],
                  platforms=platforms, sourceUrl=assets[source_name]['browser_download_url'],
                  checksumsUrl=assets['SHA256SUMS']['browser_download_url'],
+                 releaseInventorySha256=inventory_sha(inventory),
                  caution=notes['caution'], notes=notes['notes'])
     return entry, excluded
 
@@ -370,16 +371,31 @@ def render(previous, entry):
     history = data['history']
     if len({r.get('version') for r in history}) != len(history) or not entry['platforms']:
         raise ValueError('History versions must be unique and a new release needs a public selectable platform.')
-    old = [r for r in history if r['version'] == entry['version']]
-    if old:
-        if old != [entry]:
-            raise ValueError('Published history is immutable; an existing version entry cannot change.')
-    else:
-        history = [entry, *history]
     selected = next((r for r in data['history'] if r['version'] == data.get('version')), None)
-    latest_keys = {'version', 'label', 'commit', 'releaseUrl', 'buildUrl', 'platforms', 'caution', 'sourceUrl', 'checksumsUrl'}
+    latest_keys = {'version', 'label', 'commit', 'releaseUrl', 'buildUrl', 'platforms', 'caution', 'sourceUrl', 'checksumsUrl', 'releaseInventorySha256'}
     if selected is None or any(data.get(key) != selected.get(key) for key in latest_keys):
         raise ValueError('Existing website latest fields must match one retained history entry.')
+    old = next((r for r in history if r['version'] == entry['version']), None)
+    if old is not None:
+        if selected['version'] != entry['version']:
+            raise ValueError('Historical availability changes require separate exact-source latest-release verification.')
+        if old != entry:
+            # Late availability may select only bytes already in the pinned
+            # inventory. Notes, dates, source and existing download rows stay fixed.
+            unchanged = lambda row: {k: v for k, v in row.items() if k != 'platforms'}
+            rows = entry['platforms']
+            if (unchanged(old) != unchanged(entry) or old.get('kind') != 'stable'
+                    or not re.fullmatch('[0-9a-f]{64}', str(old.get('releaseInventorySha256')))
+                    or not isinstance(old.get('platforms'), list)
+                    or not len(old['platforms']) < len(rows) <= 3
+                    or any(not isinstance(p, dict) or type(p.get('id')) is not str
+                           or p['id'] not in {v[0] for v in PLATFORMS.values()} for p in rows)
+                    or len({p['id'] for p in rows}) != len(rows)
+                    or any(p not in rows for p in old['platforms'])):
+                raise ValueError('Published history permits only added platforms from its unchanged pinned inventory.')
+        history = [entry if r['version'] == entry['version'] else r for r in history]
+    else:
+        history = [entry, *history]
     for retained in data['history']:
         if retained.get('kind') == 'stable':
             old_version = retained['version'].removeprefix('v')
@@ -391,7 +407,10 @@ def render(previous, entry):
                            assets=[dict(file=urllib.parse.unquote(p['url'].rsplit('/', 1)[-1]), sha256=p['sha256']) for p in entry['platforms']]))
     result = dict(previous)
     latest = {key: value for key, value in entry.items() if key not in {'kind', 'publishedAt', 'notes'}}
-    result['downloads.json'] = encode(dict(latest, schema=2, history=history)).decode()
+    feed = encode(dict(latest, schema=2, history=history))
+    result['downloads.json'] = feed.decode()
+    # A delayed platform changes the feed without changing its release version.
+    cache = 'release=' + entry['version'] + '&layout=' + str(int(sha(feed)[:12], 16))
     escape = html.escape
     rows = []
     for p in entry['platforms']:
@@ -414,7 +433,8 @@ def render(previous, entry):
     cache_counts = {'index.html': 1, 'main.js': 2, 'platform.js': 0,
                     'releases.js': 1, 'release-page.js': 2, 'releases.html': 1}
     for name, count in cache_counts.items():
-        result[name] = replace(result[name], r'release=[^\s\'"&;]+', 'release=' + entry['version'], count)
+        result[name] = replace(result[name], r'release=[^\s\'"&;]+(?:(?:&amp;|&)layout=[0-9]+)?',
+                               escape(cache, quote=True) if name.endswith('.html') else cache, count)
     result['releases.html'], count = re.subn(r'(data-doc="([a-z0-9.-]+)"\s+href=")https://github.com/Deftr0y/PeerBrush/blob/[^/]+/docs/[^"]+',
                                            lambda m: m[1] + 'https://github.com/' + REPOSITORY + '/blob/' + entry['commit'] + '/docs/' + m[2], result['releases.html'])
     if count != 4:

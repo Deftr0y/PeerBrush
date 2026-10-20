@@ -92,7 +92,8 @@ def expected(directory):
             or type(entry.get('caution')) is not str or len(entry['caution']) > 4000
             or entry.get('releaseUrl') != RELEASE + report['version']
             or entry.get('sourceUrl') != DOWNLOAD + report['version'] + '/PeerBrush-' + report['version'][1:] + '-source.zip'
-            or entry.get('checksumsUrl') != DOWNLOAD + report['version'] + '/SHA256SUMS'):
+            or entry.get('checksumsUrl') != DOWNLOAD + report['version'] + '/SHA256SUMS'
+            or entry.get('releaseInventorySha256') != report['release_inventory_sha256']):
         raise ValueError('Expected release links/notes differ from the prepared contract.')
     # Check row types before the renderer reads them for immutability/layout.
     selected_platforms(entry, report['version'])

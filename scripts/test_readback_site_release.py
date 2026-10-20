@@ -89,8 +89,33 @@ class Readback(unittest.TestCase):
         self.assertLessEqual(len(result['website']['files']), 16)
         self.assertIn(site.WEBSITE, self.requests)
         self.assertTrue(any('downloads.json?release=v0.2.0' in url for url in self.requests))
-        self.assertTrue(any('main.js?release=v0.2.0&layout=2' in url for url in self.requests))
+        revision = str(int(site.sha(self.files['downloads.json'])[:12], 16))
+        self.assertTrue(any('main.js?release=v0.2.0&layout=' + revision in url for url in self.requests))
         self.independent(result)
+
+    def test_historical_target_cannot_skip_verification_of_latest_downloads(self):
+        newer = dict(self.entry, version='v0.30.0', label='PeerBrush 0.30.0 · Stable')
+        self.files = site.render({k: v.decode() for k, v in self.files.items()}, newer)
+        for name, raw in self.files.items():
+            (self.directory / 'public-site' / name).write_bytes(raw)
+        self.report['files'] = {name: site.sha(raw) for name, raw in self.files.items()}
+        self.save_report()
+        self.urls = readback.resource_urls(self.files)
+        result = self.check()
+        self.assertEqual(result['reason'], 'expected-overlay-or-source-unavailable')
+        self.assertEqual(json.loads(self.files['downloads.json'])['version'], 'v0.30.0')
+        self.assertEqual(self.requests, [])
+
+    def test_expected_history_must_pin_the_prepared_public_inventory(self):
+        data = json.loads(self.files['downloads.json'])
+        data['history'][0]['releaseInventorySha256'] = 'f' * 64
+        data['releaseInventorySha256'] = 'f' * 64
+        self.files['downloads.json'] = site.encode(data)
+        (self.directory / 'public-site/downloads.json').write_bytes(self.files['downloads.json'])
+        self.report['files']['downloads.json'] = site.sha(self.files['downloads.json'])
+        self.save_report()
+        self.assertEqual(self.check()['reason'], 'expected-overlay-or-source-unavailable')
+        self.assertEqual(self.requests, [])
 
     def test_stale_canonical_and_query_cached_files_are_independently_rejected(self):
         cached = next(url for url in self.urls if 'downloads.json?' in url)

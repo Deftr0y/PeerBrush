@@ -80,6 +80,35 @@ class Published(unittest.TestCase):
         self.assertEqual({p['id'] for p in entry['platforms']}, {'macos', 'linux'})
         self.assertIn(dict(file=name, reason='not-publicly-available'), excluded)
 
+    def test_delayed_public_bytes_add_platform_without_changing_release_facts(self):
+        name = 'PeerBrush-0.2.0-Windows-x64.zip'
+        delayed = self.assets.pop(name)
+        self.metadata()
+        partial, _ = self.published()
+        previous = json.loads((pathlib.Path(__file__).resolve().parents[1] / 'tests/fixtures/site-release-output.json').read_bytes())['files']
+        data = json.loads(previous['downloads.json'])
+        retained = dict(data['history'][0], version='v0.1.0', label='PeerBrush 0.1.0 · Stable')
+        data.update({k: v for k, v in retained.items() if k not in {'kind', 'notes', 'publishedAt'}})
+        data['history'] = [retained]
+        previous['downloads.json'] = json.dumps(data)
+        first = site.render(previous, partial)
+        self.assets[name] = delayed
+        self.metadata()
+        complete, excluded = self.published()
+        self.assertEqual(excluded, [])
+        self.assertEqual(partial['releaseInventorySha256'], complete['releaseInventorySha256'])
+        result = site.render({k: v.decode() for k, v in first.items()}, complete)
+        final = json.loads(result['downloads.json'])
+        self.assertEqual(final['history'], [complete, retained])
+        self.assertEqual(len(final['platforms']), 3)
+        self.assertEqual(site.render({k: v.decode() for k, v in result.items()}, complete), result)
+        # Rechecking availability is mandatory, including previously selected rows.
+        del self.assets['PeerBrush-0.2.0-Linux-x64.zip']
+        self.metadata()
+        unavailable, _ = self.published()
+        with self.assertRaises(ValueError):
+            site.render({k: v.decode() for k, v in result.items()}, unavailable)
+
     def test_draft_prerelease_unpublished_tag_commit_and_asset_state_fail(self):
         for key, value in [('draft', True), ('prerelease', True), ('published_at', None),
                            ('published_at', '2026-02-31T12:00:00Z'), ('tag_name', 'v0.2.1'), ('html_url', site.RELEASE + 'other')]:
@@ -235,7 +264,8 @@ class Rendering(unittest.TestCase):
         self.entry = copy.deepcopy(self.history[0])
         self.entry.update(version='v0.30.0', label='PeerBrush 0.30.0 · Stable', commit='b' * 40,
                           releaseUrl=site.RELEASE + 'v0.30.0', sourceUrl=site.DOWNLOAD + 'v0.30.0/source.zip',
-                          checksumsUrl=site.DOWNLOAD + 'v0.30.0/SHA256SUMS', caution='Limited <checked> & honest.', notes=['New public notes.'])
+                          checksumsUrl=site.DOWNLOAD + 'v0.30.0/SHA256SUMS', releaseInventorySha256='d' * 64,
+                          caution='Limited <checked> & honest.', notes=['New public notes.'])
         self.entry.pop('buildUrl', None)
         self.entry['platforms'] = [dict(id='windows', name='Windows', architecture='x64', url=site.DOWNLOAD + 'v0.30.0/final.zip',
                                         bytes=1234, sha256='c' * 64, nativeSigning='unverified', description='Portable ZIP · Trust unverified')]
@@ -256,6 +286,40 @@ class Rendering(unittest.TestCase):
         self.assertNotIn('PeerBrush-0.26.0-Linux-x64.zip', index)
         self.assertIn('/blob/' + 'b' * 40 + '/docs/', result['releases.html'].decode())
         self.assertEqual(site.render({k: v.decode() for k, v in result.items()}, self.entry), result)
+
+    def test_late_platforms_preserve_release_facts_and_cannot_demote_latest(self):
+        first = site.render(self.previous, self.entry)
+        added = dict(id='linux', name='Linux', architecture='x64', url=site.DOWNLOAD + 'v0.30.0/linux.zip',
+                     bytes=4567, sha256='e' * 64, nativeSigning='unsigned', description='Verified portable fixture')
+        amended = dict(self.entry, platforms=[*self.entry['platforms'], added])
+        current = site.render({k: v.decode() for k, v in first.items()}, amended)
+        self.assertEqual(json.loads(current['downloads.json'])['history'], [amended, *self.history])
+        self.assertNotEqual(first['main.js'], current['main.js'])
+        self.assertEqual(site.render({k: v.decode() for k, v in current.items()}, amended), current)
+        newer = dict(self.entry, version='v0.31.0', label='PeerBrush 0.31.0 · Stable')
+        promoted = site.render({k: v.decode() for k, v in first.items()}, newer)
+        with self.assertRaisesRegex(ValueError, 'latest-release verification'):
+            site.render({k: v.decode() for k, v in promoted.items()}, amended)
+
+    def test_availability_amendments_reject_replacement_or_unpinned_metadata(self):
+        first = site.render(self.previous, self.entry)
+        previous = {k: v.decode() for k, v in first.items()}
+        added = dict(self.entry['platforms'][0], id='linux')
+        valid = dict(self.entry, platforms=[*self.entry['platforms'], added])
+        for field, value in [('notes', ['changed']), ('publishedAt', '2026-10-20T00:00:00Z'),
+                             ('commit', 'f' * 40), ('sourceUrl', 'changed'), ('checksumsUrl', 'changed'),
+                             ('releaseInventorySha256', 'f' * 64)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                site.render(previous, dict(valid, **{field: value}))
+        for rows in [[added], [*valid['platforms'], added],
+                     [dict(self.entry['platforms'][0], sha256='f' * 64), added]]:
+            with self.subTest(rows=len(rows)), self.assertRaises(ValueError):
+                site.render(previous, dict(valid, platforms=rows))
+        unpinned = dict(self.entry)
+        del unpinned['releaseInventorySha256']
+        old = site.render(self.previous, unpinned)
+        with self.assertRaises(ValueError):
+            site.render({k: v.decode() for k, v in old.items()}, dict(unpinned, platforms=valid['platforms']))
 
     def test_history_replacement_downgrade_duplicate_and_unknown_layout_fail(self):
         for field, value in [('notes', ['changed']), ('commit', 'c' * 40), ('platforms', [])]:
