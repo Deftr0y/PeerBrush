@@ -7,7 +7,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{BufRead, Write},
+    io::{BufRead, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -446,6 +446,143 @@ pub fn save_accepted_source(
 fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     save_prepared(shared, path, request, || {})
 }
+// Working Save owns both files; neither becomes a loaded source until verified publication.
+struct SaveTemporary {
+    path: PathBuf,
+    file: fs::File,
+    identity: (u64, u64),
+    bytes: u64,
+    fingerprint: [u64; 2],
+    reading: bool,
+}
+impl SaveTemporary {
+    fn new(destination: &Path, spool: bool) -> Result<Self, String> {
+        let path = destination.with_extension(format!(
+            "{}.{}",
+            engine::id(),
+            if spool { "psd-spool" } else { "tmp" }
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        if spool {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|e| e.to_string())?;
+        let identity = crate::file_safety::identity(&file).map_err(|_| "Save temporary identity unavailable; an incomplete private file may remain beside the destination. Current work was not published.")?;
+        let temporary = Self {
+            path,
+            file,
+            identity,
+            bytes: 0,
+            fingerprint: [0xcbf29ce484222325, 0x84222325cbf29ce4],
+            reading: false,
+        };
+        temporary.check_path()?;
+        if !spool && destination.exists() {
+            crate::file_safety::preserve_permissions(destination, &temporary.path)?;
+        }
+        Ok(temporary)
+    }
+    fn check_path(&self) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err("Save temporary path is a link or reparse point".into());
+            }
+        }
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("Save temporary path is not a regular file".into());
+        }
+        let named = fs::File::open(&self.path).map_err(|e| e.to_string())?;
+        if crate::file_safety::identity(&self.file)? != self.identity
+            || crate::file_safety::identity(&named)? != self.identity
+        {
+            return Err("Save temporary file identity changed; destination retained".into());
+        }
+        Ok(())
+    }
+    fn stamp(&self) -> Result<(u64, std::time::SystemTime), String> {
+        let metadata = self.file.metadata().map_err(|e| e.to_string())?;
+        Ok((
+            metadata.len(),
+            metadata.modified().map_err(|e| e.to_string())?,
+        ))
+    }
+    fn verify(
+        &mut self,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<crate::file_safety::Version, String> {
+        self.file.flush().map_err(|e| e.to_string())?;
+        self.file.sync_all().map_err(|e| e.to_string())?;
+        self.check_path()?;
+        let before = self.stamp()?;
+        let version =
+            crate::file_safety::verified_version(&self.path, self.bytes, self.fingerprint, check)?;
+        self.check_path()?;
+        if version.identity != self.identity || self.stamp()? != before {
+            return Err("Save temporary file changed during verification".into());
+        }
+        Ok(version)
+    }
+    fn validate(&self, stamp: (u64, std::time::SystemTime)) -> Result<(), String> {
+        self.check_path()?;
+        if self.stamp()? != stamp {
+            return Err("Save temporary file changed before publication".into());
+        }
+        Ok(())
+    }
+    fn remove(&self) -> Result<(), String> {
+        self.check_path()?;
+        fs::remove_file(&self.path).map_err(|e| format!("Cannot remove completed save spool: {e}"))
+    }
+}
+impl Write for SaveTemporary {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.reading
+            || self.file.stream_position()? != self.bytes
+            || self
+                .bytes
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|n| n > 256 * 1024 * 1024)
+        {
+            return Err(std::io::Error::other(
+                "Save output is not sequential or exceeds the 256 MiB limit",
+            ));
+        }
+        self.check_path().map_err(std::io::Error::other)?;
+        let n = self.file.write(bytes)?;
+        self.bytes += n as u64;
+        crate::file_safety::hash(&bytes[..n], &mut self.fingerprint);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+impl Read for SaveTemporary {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.reading = true;
+        self.check_path().map_err(std::io::Error::other)?;
+        self.file.read(bytes)
+    }
+}
+impl Seek for SaveTemporary {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+impl Drop for SaveTemporary {
+    fn drop(&mut self) {
+        // A foreign replacement at our random name is never ours to remove.
+        if self.check_path().is_ok() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 fn save_prepared(
     shared: &Shared,
     path: &Path,
@@ -506,15 +643,43 @@ fn save_prepared(
     }
     crate::compatibility::authorize_save(&doc, request)?;
     let ownership = crate::file_ownership::Ownership::save(path, &project)?;
-    let bytes = if path
+    let mut output = SaveTemporary::new(path, false)?;
+    let mut spool = SaveTemporary::new(path, true)?;
+    #[cfg(test)]
+    let output_path = output.path.clone();
+    #[cfg(test)]
+    let spool_path = spool.path.clone();
+    let check = || {
+        let e = shared.lock().unwrap();
+        e.ensure_open()?;
+        if e.doc.id != doc.id
+            || e.doc.revision != doc.revision
+            || e.path != source_path
+            || e.file_version != source_version
+            || e.saved_revision != saved_revision
+        {
+            return Err("Project source changed while saving; current work preserved".into());
+        }
+        drop(e);
+        #[cfg(test)]
+        save_safety_tests::observe("encoding", &output_path, &spool_path)?;
+        Ok(())
+    };
+    if path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("psb"))
     {
-        psd::encode_psb(&doc)?
+        psd::encode_psb_to(&doc, &mut output, &mut spool, &check)?;
     } else {
-        psd::encode(&doc)?
-    };
+        psd::encode_to(&doc, &mut output, &mut spool, &check)?;
+    }
+    #[cfg(test)]
+    save_safety_tests::observe("encoded", &output_path, &spool_path)?;
+    spool.verify(&check)?;
+    let staged = output.verify(&check)?;
+    let spool_stamp = spool.stamp()?;
+    let output_stamp = output.stamp()?;
     // Preserve the previous exact file before touching its replacement.
     let backup = lease.preserve()?;
     before_commit();
@@ -529,11 +694,23 @@ fn save_prepared(
         return Err("Project source changed while saving; current work preserved".into());
     }
     lease.validate()?;
-    atomic_write_checked(path, &bytes, |temporary| {
-        ownership.prepare(temporary)?;
-        lease.validate()
-    })?;
-    let version = crate::file_safety::published_version(path, &bytes)?;
+    spool.validate(spool_stamp)?;
+    output.validate(output_stamp)?;
+    ownership.prepare(&output.path)?;
+    output.validate(output_stamp)?;
+    spool.validate(spool_stamp)?;
+    spool.remove()?;
+    lease.validate()?;
+    replace_file(&output.path, path)?;
+    sync_parent(path)?;
+    #[cfg(test)]
+    save_safety_tests::observe("published", path, &spool_path)?;
+    // The engine is already locked; never invoke the source-locking callback here.
+    let version =
+        crate::file_safety::verified_version(path, output.bytes, output.fingerprint, || Ok(()))?;
+    if version != staged {
+        return Err("Published save changed before verification; current work remains open and the previous version is retained".into());
+    }
     ownership.published(version.identity);
     if e.doc.id == doc.id {
         e.path = Some(path.into());

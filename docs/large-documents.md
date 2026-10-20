@@ -12,6 +12,12 @@ Disk entries live under the workspace state directory's `derived-cache`, in an i
 
 Limits remain **256 MiB encoded files, 8192 pixels per edge, 32×1024² canvas pixels and 512 MiB document raster sources**, including retained originals. Unreleased [PB-104](photoshop-fidelity.md) adds PSB v2 alongside PSD v1 under the same limits. The [PB-105 investigation](large-document-investigation.md) records practical save boundaries and a phased streaming/out-of-core proposal; larger limits are not implemented. Mask-channel buffers and private JSON restoration remain bounded in-memory paths; cancellation is checked between chunks/rows/sources rather than inside an individual JSON parse.
 
+## Standard PSD/PSB save transfer (unreleased)
+
+Working Save serializes native8/16 standard layer, mask and current merged-composite channels by row into an exclusively created same-directory spool. A fixed 16 KiB row plus a 64 KiB buffered transfer/copy bounds standard pixel-transfer scratch; the write buffer is dropped before copying. The original separate layer/composite checksums and supplementary source formats are unchanged. The final guarded file is assembled from the checked spool, which is removed before publication. Temporary files, overwritten originals, source/revision/saved-state checks, file ownership and actual published-byte verification retain their working-save protections.
+
+Both spool and final staging remain capped at 256 MiB; together they may temporarily require up to 512 MiB disk space, in addition to the destination and existing previous-save versions. Full render/effect/mask preparation, record metadata, compressed private source data and public Vec-returning codec APIs still allocate separately. Recovery and decoding remain unchanged. Row/chunk checks can reject stale or interrupted serialization, but this does not add a Save cancellation/progress endpoint or bound cancellation inside full preparation. It does not bound total RAM, enable 16000-square documents or complete PB-068. The focused stream/save regressions require integrated execution before release qualification.
+
 ## MCP / CLI
 
 Existing `document` action `open` remains synchronous. `open_async` returns immediately; observe `state.loading` (`stage`, `completed`, `total`) and `state.file_status`. `cancel_open` cancels the active loader. Opening still requires a saved document or explicit `discard:true`; `expected_revision` can guard the request. Replacement also checks the exact source document/revision captured when loading starts.

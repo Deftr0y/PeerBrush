@@ -7,7 +7,10 @@ use crate::{
 };
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, io::Read};
+use std::{
+    borrow::Cow,
+    io::{Read, Seek, SeekFrom, Write},
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Layout {
@@ -22,16 +25,13 @@ impl Layout {
         let n = cursor.length(self.large())?;
         cursor.bytes(n)
     }
-    fn length(self, out: &mut Vec<u8>, n: usize) {
+    fn write_length(self, out: &mut dyn Write, n: u64) -> Result<(), String> {
         if self.large() {
-            out.extend_from_slice(&(n as u64).to_be_bytes());
+            out.write_all(&n.to_be_bytes()).map_err(|e| e.to_string())
         } else {
-            u32b(out, n as u32);
+            let n = u32::try_from(n).map_err(|_| "PSD section length overflow")?;
+            out.write_all(&n.to_be_bytes()).map_err(|e| e.to_string())
         }
-    }
-    fn write_block(self, out: &mut Vec<u8>, data: &[u8]) {
-        self.length(out, data.len());
-        out.extend_from_slice(data);
     }
     fn tag_large(self, key: &[u8]) -> bool {
         self.large()
@@ -148,9 +148,14 @@ fn block(out: &mut Vec<u8>, v: &[u8]) {
     out.extend_from_slice(v);
 }
 fn hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ *b as u64).wrapping_mul(0x100000001b3)
-    })
+    let mut state = 0xcbf29ce484222325;
+    hash_part(&mut state, bytes);
+    state
+}
+fn hash_part(state: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *state = (*state ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
 }
 fn tag(out: &mut Vec<u8>, key: &[u8; 4], v: &[u8]) {
     out.extend_from_slice(b"8BIM");
@@ -462,13 +467,15 @@ struct Embedded {
     standard_hash: u64,
     document: Document,
 }
-struct BoundedWriter<W> {
+struct BoundedWriter<'a, W> {
     inner: W,
     written: usize,
     limit: usize,
+    check: &'a dyn Fn() -> Result<(), String>,
 }
-impl<W: std::io::Write> std::io::Write for BoundedWriter<W> {
+impl<W: Write> Write for BoundedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        (self.check)().map_err(std::io::Error::other)?;
         if self.written.saturating_add(bytes.len()) > self.limit {
             return Err(std::io::Error::other(
                 "Editable PSD source data exceeds its bounded serialization budget",
@@ -479,8 +486,76 @@ impl<W: std::io::Write> std::io::Write for BoundedWriter<W> {
         Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
+        (self.check)().map_err(std::io::Error::other)?;
         self.inner.flush()
     }
+}
+
+struct StandardWriter<'a, W> {
+    inner: W,
+    bytes: u64,
+    hash: u64,
+    check: &'a dyn Fn() -> Result<(), String>,
+}
+impl<'a, W: Write> StandardWriter<'a, W> {
+    fn new(inner: W, check: &'a dyn Fn() -> Result<(), String>) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            hash: 0xcbf29ce484222325,
+            check,
+        }
+    }
+}
+impl<W: Write> Write for StandardWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        (self.check)().map_err(std::io::Error::other)?;
+        if self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .is_none_or(|n| n > 256 * 1024 * 1024)
+        {
+            return Err(std::io::Error::other(
+                "Photoshop output exceeds the initial 256 MiB file limit",
+            ));
+        }
+        let n = self.inner.write(bytes)?;
+        self.bytes += n as u64;
+        hash_part(&mut self.hash, &bytes[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (self.check)().map_err(std::io::Error::other)?;
+        self.inner.flush()
+    }
+}
+fn copy_standard(
+    spool: &mut impl Read,
+    output: &mut dyn Write,
+    mut remaining: u64,
+    expected: u64,
+    buffer: &mut [u8],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut state = 0xcbf29ce484222325;
+    while remaining != 0 {
+        check()?;
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        let n = spool
+            .read(&mut buffer[..wanted])
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("Photoshop standard spool was truncated".into());
+        }
+        hash_part(&mut state, &buffer[..n]);
+        output.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
+        remaining -= n as u64;
+    }
+    check()?;
+    if state != expected {
+        return Err("Photoshop standard spool changed while copying".into());
+    }
+    Ok(())
 }
 
 pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
@@ -488,6 +563,22 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
 }
 pub fn encode_psb(doc: &Document) -> Result<Vec<u8>, String> {
     encode_layout(doc, Layout::Psb)
+}
+pub(crate) fn encode_to<S: Read + Write + Seek>(
+    doc: &Document,
+    output: &mut dyn Write,
+    spool: &mut S,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    encode_layout_to(doc, Layout::Psd, output, spool, check)
+}
+pub(crate) fn encode_psb_to<S: Read + Write + Seek>(
+    doc: &Document,
+    output: &mut dyn Write,
+    spool: &mut S,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    encode_layout_to(doc, Layout::Psb, output, spool, check)
 }
 fn check_output_size(doc: &Document, plan: &StandardPlan) -> Result<(), String> {
     // Validation bounds every frame and record count; u64 also covers their aggregate.
@@ -526,6 +617,24 @@ fn check_output_size(doc: &Document, plan: &StandardPlan) -> Result<(), String> 
     Ok(())
 }
 fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut spool = std::io::Cursor::new(Vec::new());
+    encode_layout_to(doc, layout, &mut output, &mut spool, &|| Ok(()))?;
+    Ok(output)
+}
+fn encode_layout_to<S: Read + Write + Seek>(
+    doc: &Document,
+    layout: Layout,
+    output: &mut dyn Write,
+    spool: &mut S,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    check()?;
+    if spool.stream_position().map_err(|e| e.to_string())? != 0
+        || spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != 0
+    {
+        return Err("Photoshop standard spool must be empty at position zero".into());
+    }
     if doc.read_only {
         return Err(
             "Cannot save an unsupported PSD without explicitly creating a compatible copy".into(),
@@ -567,6 +676,7 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     } else {
         None
     };
+    check()?;
     // Ordinary raster clipping remains standard, editable PSD layer data.
     // Adjustments and unsupported clipping units still need a standard bake.
     let baked = if plan.composite {
@@ -620,7 +730,7 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         return Err("Too many PSD layer records".into());
     }
     let mut records = vec![];
-    let mut channels = vec![];
+    let mut channel_bytes = 0u64;
     for (l, section) in &ordered {
         let [x, y, right, bottom] = standard_bounds(doc, l, *section);
         let (w, h) = ((right - x) as u32, (bottom - y) as u32);
@@ -636,72 +746,22 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
             (l.pixels.width, l.pixels.height, l.x, l.y)
         };
         let has_mask = mask.is_some() && *section != 3;
-        let prepared = if has_mask {
-            mask.and_then(|m| m.prepare(l.pixels.width, l.pixels.height))
-        } else {
-            None
-        };
-        let index = doc.layers.iter().position(|n| n.id == l.id);
-        let derived = index.and_then(|i| colors[i].as_ref());
-        let derived16 = index.and_then(|i| colors16.as_ref().and_then(|c| c[i].as_ref()));
-        let mask16 = index.and_then(|i| masks16.as_ref().and_then(|m| m[i].as_ref()));
         u16b(&mut records, if has_mask { 5 } else { 4 });
         for ch in [-1i16, 0, 1, 2]
             .into_iter()
             .chain(if has_mask { Some(-2) } else { None })
         {
-            let mut data = vec![];
-            u16b(&mut data, 0);
             let (cw, ch_height) = if ch == -2 { (mask_w, mask_h) } else { (w, h) };
-            for yy in 0..ch_height {
-                for xx in 0..cw {
-                    if high {
-                        let value = if ch == -2 {
-                            (crate::depth16::mask_value_prepared(
-                                l,
-                                xx as i32 + mask_x - l.x,
-                                yy as i32 + mask_y - l.y,
-                                mask16.map(|m| m.as_ref()),
-                                true,
-                            ) * 65535.)
-                                .round()
-                                .clamp(0., 65535.) as u16
-                        } else {
-                            let p = if let Some(image) = derived16 {
-                                image.get(xx as i32, yy as i32)
-                            } else if l.kind == "fill" {
-                                l.color.map(|v| v as u16 * 257)
-                            } else {
-                                l.pixels.get16(xx as i32, yy as i32)
-                            };
-                            p[if ch == -1 { 3 } else { ch as usize }]
-                        };
-                        u16b(&mut data, value);
-                    } else {
-                        data.push(if ch == -2 {
-                            (l.mask_value_prepared(
-                                xx as i32 + mask_x - l.x,
-                                yy as i32 + mask_y - l.y,
-                                prepared.as_deref(),
-                                true,
-                            ) * 255.)
-                                .round() as u8
-                        } else {
-                            let p = if let Some(image) = derived {
-                                image.get(xx as i32, yy as i32)
-                            } else if l.kind == "fill" {
-                                l.color
-                            } else {
-                                l.pixels.get(xx as i32, yy as i32)
-                            };
-                            p[if ch == -1 { 3 } else { ch as usize }]
-                        });
-                    }
-                }
-            }
+            let length = u64::from(cw)
+                .checked_mul(u64::from(ch_height))
+                .and_then(|n| n.checked_mul(u64::from(doc.bit_depth / 8)))
+                .and_then(|n| n.checked_add(2))
+                .ok_or("Photoshop channel length overflow")?;
             u16b(&mut records, ch as u16);
-            layout.length(&mut records, data.len());
-            channels.extend(data);
+            layout.write_length(&mut records, length)?;
+            channel_bytes = channel_bytes
+                .checked_add(length)
+                .ok_or("Photoshop channel length overflow")?;
         }
         records.extend_from_slice(b"8BIM");
         records.extend_from_slice(match l.blend.as_str() {
@@ -798,64 +858,190 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         }
         block(&mut records, &extra);
     }
-    let mut info = vec![];
-    // A negative count identifies the merged fourth channel as transparency.
-    u16b(&mut info, (-(ordered.len() as i16)) as u16);
-    info.extend(records);
-    info.extend(channels);
-    if info.len() % 2 != 0 {
-        info.push(0);
-    }
-    let mut layer_section = vec![];
+    let info_raw = (records.len() as u64)
+        .checked_add(channel_bytes)
+        .and_then(|n| n.checked_add(2))
+        .ok_or("Photoshop section length overflow")?;
+    let info_length = info_raw
+        .checked_add(info_raw % 2)
+        .ok_or("Photoshop section length overflow")?;
+    let mut prefix = vec![];
     if high {
-        layout.length(&mut layer_section, 0); // Primary8-bit layer information is empty.
+        layout.write_length(&mut prefix, 0)?; // Primary8-bit layer information is empty.
         block(
-            &mut layer_section,
+            &mut prefix,
             doc.psd_global_mask
                 .as_ref()
                 .map_or(&[], |mask| mask.data.as_slice()),
         );
-        layer_section.extend(b"8BIMLr16");
-        layout.write_block(&mut layer_section, &info);
-        layer_section.resize(layer_section.len() + (4 - info.len() % 4) % 4, 0);
-        layer_section.extend(b"8BIMMt16");
-        layout.length(&mut layer_section, 0);
+        prefix.extend(b"8BIMLr16");
+    }
+    layout.write_length(&mut prefix, info_length)?;
+    let mut standard = StandardWriter::new(
+        std::io::BufWriter::with_capacity(64 * 1024, &mut *spool),
+        check,
+    );
+    standard.write_all(&prefix).map_err(|e| e.to_string())?;
+    // A negative count identifies the merged fourth channel as transparency.
+    standard
+        .write_all(&(-(ordered.len() as i16)).to_be_bytes())
+        .map_err(|e| e.to_string())?;
+    standard.write_all(&records).map_err(|e| e.to_string())?;
+    drop(records);
+    let mut row = [0u8; crate::raster::MAX_EDGE as usize * 2];
+    for (l, section) in &ordered {
+        check()?;
+        let [x, y, right, bottom] = standard_bounds(doc, l, *section);
+        let (w, h) = ((right - x) as u32, (bottom - y) as u32);
+        let mask = l.mask.as_ref();
+        let (mask_w, mask_h, mask_x, mask_y) = if crate::effects::canvas_frame(l) {
+            (doc.width, doc.height, 0, 0)
+        } else {
+            (l.pixels.width, l.pixels.height, l.x, l.y)
+        };
+        let has_mask = mask.is_some() && *section != 3;
+        let prepared = if has_mask {
+            mask.and_then(|m| m.prepare(l.pixels.width, l.pixels.height))
+        } else {
+            None
+        };
+        let index = doc.layers.iter().position(|n| n.id == l.id);
+        let derived = index.and_then(|i| colors[i].as_ref());
+        let derived16 = index.and_then(|i| colors16.as_ref().and_then(|c| c[i].as_ref()));
+        let mask16 = index.and_then(|i| masks16.as_ref().and_then(|m| m[i].as_ref()));
+        for ch in [-1i16, 0, 1, 2]
+            .into_iter()
+            .chain(if has_mask { Some(-2) } else { None })
+        {
+            standard
+                .write_all(&0u16.to_be_bytes())
+                .map_err(|e| e.to_string())?;
+            let (cw, ch_height) = if ch == -2 { (mask_w, mask_h) } else { (w, h) };
+            for yy in 0..ch_height {
+                check()?;
+                for xx in 0..cw {
+                    if high {
+                        let value = if ch == -2 {
+                            (crate::depth16::mask_value_prepared(
+                                l,
+                                xx as i32 + mask_x - l.x,
+                                yy as i32 + mask_y - l.y,
+                                mask16.map(|m| m.as_ref()),
+                                true,
+                            ) * 65535.)
+                                .round()
+                                .clamp(0., 65535.) as u16
+                        } else {
+                            let p = if let Some(image) = derived16 {
+                                image.get(xx as i32, yy as i32)
+                            } else if l.kind == "fill" {
+                                l.color.map(|v| v as u16 * 257)
+                            } else {
+                                l.pixels.get16(xx as i32, yy as i32)
+                            };
+                            p[if ch == -1 { 3 } else { ch as usize }]
+                        };
+                        row[xx as usize * 2..xx as usize * 2 + 2]
+                            .copy_from_slice(&value.to_be_bytes());
+                    } else {
+                        row[xx as usize] = if ch == -2 {
+                            (l.mask_value_prepared(
+                                xx as i32 + mask_x - l.x,
+                                yy as i32 + mask_y - l.y,
+                                prepared.as_deref(),
+                                true,
+                            ) * 255.)
+                                .round() as u8
+                        } else {
+                            let p = if let Some(image) = derived {
+                                image.get(xx as i32, yy as i32)
+                            } else if l.kind == "fill" {
+                                l.color
+                            } else {
+                                l.pixels.get(xx as i32, yy as i32)
+                            };
+                            p[if ch == -1 { 3 } else { ch as usize }]
+                        };
+                    }
+                }
+                standard
+                    .write_all(&row[..cw as usize * usize::from(doc.bit_depth / 8)])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    if info_raw % 2 != 0 {
+        standard.write_all(&[0]).map_err(|e| e.to_string())?;
+    }
+    let mut suffix = vec![];
+    if high {
+        suffix.resize(((4 - info_length % 4) % 4) as usize, 0);
+        suffix.extend(b"8BIMMt16");
+        layout.write_length(&mut suffix, 0)?;
     } else {
-        layout.write_block(&mut layer_section, &info);
         block(
-            &mut layer_section,
+            &mut suffix,
             doc.psd_global_mask
                 .as_ref()
                 .map_or(&[], |mask| mask.data.as_slice()),
         );
     }
+    standard.write_all(&suffix).map_err(|e| e.to_string())?;
+    let layer_length = standard.bytes;
+    let layer_hash = standard.hash;
+    standard.hash = 0xcbf29ce484222325;
     let (w, h) = (doc.width, doc.height);
-    let mut composite = vec![];
-    u16b(&mut composite, 0);
+    standard
+        .write_all(&0u16.to_be_bytes())
+        .map_err(|e| e.to_string())?;
     if let Some(image) = &composite16 {
+        if image.width != w || image.height != h || image.words.len() != w as usize * h as usize * 4
+        {
+            return Err("Native PSD composite must match the full document dimensions".into());
+        }
         for c in 0..4 {
-            for p in image.words.chunks_exact(4) {
-                let value = if c < 3 {
-                    ((p[c] as u64 * p[3] as u64 + 65535 * (65535 - p[3] as u64) + 32767) / 65535)
-                        as u16
-                } else {
-                    p[3]
-                };
-                u16b(&mut composite, value);
+            for pixels in image.words.chunks_exact(w as usize * 4) {
+                check()?;
+                for (x, p) in pixels.chunks_exact(4).enumerate() {
+                    let value = if c < 3 {
+                        ((p[c] as u64 * p[3] as u64 + 65535 * (65535 - p[3] as u64) + 32767)
+                            / 65535) as u16
+                    } else {
+                        p[3]
+                    };
+                    row[x * 2..x * 2 + 2].copy_from_slice(&value.to_be_bytes());
+                }
+                standard
+                    .write_all(&row[..w as usize * 2])
+                    .map_err(|e| e.to_string())?;
             }
         }
     } else {
-        let (_, _, rgba, _) = doc.preview(None, w.max(h), None, false)?;
+        check()?;
+        let (rw, rh, rgba, _) = doc.preview(None, w.max(h), None, false)?;
+        if rw != w || rh != h || rgba.len() != w as usize * h as usize * 4 {
+            return Err("PSD composite must match the full document dimensions".into());
+        }
         for c in 0..4 {
-            for p in rgba.chunks_exact(4) {
-                composite.push(if c < 3 {
-                    ((p[c] as u32 * p[3] as u32 + 255 * (255 - p[3] as u32) + 127) / 255) as u8
-                } else {
-                    p[3]
-                });
+            for pixels in rgba.chunks_exact(w as usize * 4) {
+                check()?;
+                for (x, p) in pixels.chunks_exact(4).enumerate() {
+                    row[x] = if c < 3 {
+                        ((p[c] as u32 * p[3] as u32 + 255 * (255 - p[3] as u32) + 127) / 255) as u8
+                    } else {
+                        p[3]
+                    };
+                }
+                standard
+                    .write_all(&row[..w as usize])
+                    .map_err(|e| e.to_string())?;
             }
         }
     }
+    let composite_length = standard.bytes - layer_length;
+    let composite_hash = standard.hash;
+    standard.flush().map_err(|e| e.to_string())?;
+    drop(standard);
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
         format: if has_installed_fonts(doc) {
@@ -1030,7 +1216,7 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         } else {
             1
         },
-        standard_hash: hash(&layer_section) ^ hash(&composite),
+        standard_hash: layer_hash ^ composite_hash,
         document: doc.clone(),
     };
     let mut z = BoundedWriter {
@@ -1041,6 +1227,7 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         } else {
             128 * 1024 * 1024
         },
+        check,
     };
     serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
     let compressed = z.inner.finish().map_err(|e| e.to_string())?;
@@ -1056,15 +1243,15 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     if payload.len() % 2 != 0 {
         resources.push(0);
     }
-    let mut out = b"8BPS".to_vec();
-    u16b(&mut out, if layout.large() { 2 } else { 1 });
-    out.extend_from_slice(&[0; 6]);
-    u16b(&mut out, 4);
-    u32b(&mut out, h);
-    u32b(&mut out, w);
-    u16b(&mut out, doc.bit_depth);
-    u16b(&mut out, 3);
-    u32b(&mut out, 0);
+    let mut header = b"8BPS".to_vec();
+    u16b(&mut header, if layout.large() { 2 } else { 1 });
+    header.extend_from_slice(&[0; 6]);
+    u16b(&mut header, 4);
+    u32b(&mut header, h);
+    u32b(&mut header, w);
+    u16b(&mut header, doc.bit_depth);
+    u16b(&mut header, 3);
+    u32b(&mut header, 0);
     if doc.srgb_tagged {
         let profile = crate::color_profile::srgb_profile();
         resources.extend_from_slice(b"8BIM");
@@ -1075,13 +1262,35 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
             resources.push(0);
         }
     }
-    block(&mut out, &resources);
-    layout.write_block(&mut out, &layer_section);
-    out.extend(composite);
-    if out.len() > 256 * 1024 * 1024 {
-        return Err("Photoshop output exceeds the initial 256 MiB file limit".into());
+    let resource_length =
+        u32::try_from(resources.len()).map_err(|_| "PSD resource length overflow")?;
+    u32b(&mut header, resource_length);
+    let mut out = StandardWriter::new(output, check);
+    out.write_all(&header).map_err(|e| e.to_string())?;
+    out.write_all(&resources).map_err(|e| e.to_string())?;
+    layout.write_length(&mut out, layer_length)?;
+    let total = layer_length
+        .checked_add(composite_length)
+        .ok_or("Photoshop section length overflow")?;
+    if spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != total {
+        return Err("Photoshop standard spool length changed".into());
     }
-    Ok(out)
+    spool.rewind().map_err(|e| e.to_string())?;
+    let mut copy = [0u8; 64 * 1024];
+    copy_standard(spool, &mut out, layer_length, layer_hash, &mut copy, check)?;
+    copy_standard(
+        spool,
+        &mut out,
+        composite_length,
+        composite_hash,
+        &mut copy,
+        check,
+    )?;
+    if spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != total {
+        return Err("Photoshop standard spool length changed".into());
+    }
+    out.flush().map_err(|e| e.to_string())?;
+    check()
 }
 
 fn decode_channel(data: &[u8], w: u32, h: u32, layout: Layout) -> Result<Vec<u8>, String> {
@@ -2864,6 +3073,355 @@ pub fn validate(doc: &Document) -> Result<(), String> {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    fn streamed_fixture(depth: u16) -> Document {
+        let mut doc = Document::new_depth(2, 1, depth).unwrap();
+        let layer = &mut doc.layers[0];
+        layer.name = "X".into();
+        if depth == 16 {
+            layer.pixels.set16(0, 0, [12347, 23459, 34571, 0]);
+            layer.pixels.set16(1, 0, [50001, 30003, 10001, 32769]);
+        } else {
+            layer.pixels.set(0, 0, [17, 99, 201, 0]);
+            layer.pixels.set(1, 0, [222, 144, 33, 127]);
+        }
+        let mut mask = Raster::new_depth(2, 1, depth);
+        mask.set16(0, 0, [0, 0, 0, 65535]);
+        mask.set16(1, 0, [12345, 12345, 12345, 65535]);
+        layer.mask = Some(Mask {
+            linked: false,
+            enabled: false,
+            cache_key: id(),
+            steps: vec![MaskStep {
+                id: id(),
+                kind: "paint".into(),
+                enabled: true,
+                weight: 1.,
+                value: 0.,
+                pixels: mask,
+                settings: serde_json::Value::Null,
+            }],
+        });
+        doc
+    }
+    // Independent literal record structure: one 1/2x1 paint record, disabled mask and name X.
+    fn expected_standard(doc: &Document, large: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut record = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        record.extend(doc.width.to_be_bytes());
+        record.extend([0, 5]);
+        let length = 2 + u64::from(doc.width) * u64::from(doc.bit_depth / 8);
+        for channel in [-1i16, 0, 1, 2, -2] {
+            record.extend(channel.to_be_bytes());
+            if large {
+                record.extend(length.to_be_bytes());
+            } else {
+                record.extend((length as u32).to_be_bytes());
+            }
+        }
+        record.extend(b"8BIMnorm");
+        record.extend([255, 0, 0, 0]);
+        record.extend(50u32.to_be_bytes());
+        record.extend([0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        record.extend(doc.width.to_be_bytes());
+        record.extend([255, 2, 0, 0]);
+        record.extend([0, 0, 0, 0, 1, b'X', 0, 0]);
+        record.extend(b"8BIMluni");
+        record.extend([0, 0, 0, 6, 0, 0, 0, 1, 0, b'X']);
+        let mut info = (-1i16).to_be_bytes().to_vec();
+        info.extend(record);
+        for channel in [3usize, 0, 1, 2, 4] {
+            info.extend([0, 0]);
+            for x in 0..doc.width as i32 {
+                let value = if channel == 4 {
+                    doc.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .get16(x, 0)[0]
+                } else {
+                    doc.layers[0].pixels.get16(x, 0)[channel]
+                };
+                if doc.bit_depth == 16 {
+                    info.extend(value.to_be_bytes());
+                } else {
+                    info.push((value / 257) as u8);
+                }
+            }
+        }
+        if info.len() % 2 != 0 {
+            info.push(0);
+        }
+        let length = |out: &mut Vec<u8>, n: usize| {
+            if large {
+                out.extend((n as u64).to_be_bytes());
+            } else {
+                out.extend((n as u32).to_be_bytes());
+            }
+        };
+        let mut section = vec![];
+        if doc.bit_depth == 16 {
+            length(&mut section, 0);
+            section.extend([0; 4]);
+            section.extend(b"8BIMLr16");
+        }
+        length(&mut section, info.len());
+        section.extend(&info);
+        if doc.bit_depth == 16 {
+            section.resize(section.len() + (4 - info.len() % 4) % 4, 0);
+            section.extend(b"8BIMMt16");
+            length(&mut section, 0);
+        } else {
+            section.extend([0; 4]);
+        }
+        let rendered = image::load_from_memory(&doc.export_png().unwrap())
+            .unwrap()
+            .into_rgba16()
+            .into_raw();
+        let mut merged = vec![0, 0];
+        for c in 0..4 {
+            for p in rendered.chunks_exact(4) {
+                if doc.bit_depth == 16 {
+                    let v = if c < 3 {
+                        ((u64::from(p[c]) * u64::from(p[3])
+                            + 65535 * (65535 - u64::from(p[3]))
+                            + 32767)
+                            / 65535) as u16
+                    } else {
+                        p[3]
+                    };
+                    merged.extend(v.to_be_bytes());
+                } else {
+                    let (v, a) = (u32::from(p[c] / 257), u32::from(p[3] / 257));
+                    merged.push(if c < 3 {
+                        ((v * a + 255 * (255 - a) + 127) / 255) as u8
+                    } else {
+                        a as u8
+                    });
+                }
+            }
+        }
+        (section, merged)
+    }
+    #[test]
+    fn streamed_psd_and_psb_match_independent_standard_bytes_and_native_private_sources() {
+        for depth in [8, 16] {
+            for width in [1, 2] {
+                let mut doc = streamed_fixture(depth);
+                if width == 1 {
+                    doc.width = 1;
+                    let color = doc.layers[0].pixels.get16(0, 0);
+                    doc.layers[0].pixels = Raster::new_depth(1, 1, depth);
+                    doc.layers[0].pixels.set16(0, 0, color);
+                    let step = &mut doc.layers[0].mask.as_mut().unwrap().steps[0];
+                    let mask = step.pixels.get16(0, 0);
+                    step.pixels = Raster::new_depth(1, 1, depth);
+                    step.pixels.set16(0, 0, mask);
+                }
+                let before = serde_json::to_value(&doc).unwrap();
+                for layout in [Layout::Psd, Layout::Psb] {
+                    let mut spool = std::io::Cursor::new(Vec::new());
+                    let mut bytes = vec![];
+                    encode_layout_to(&doc, layout, &mut bytes, &mut spool, &|| Ok(())).unwrap();
+                    assert_eq!(bytes, encode_layout(&doc, layout).unwrap());
+                    let mut cursor = Cursor::new(&bytes);
+                    cursor.bytes(26).unwrap();
+                    cursor.block().unwrap();
+                    cursor.block().unwrap();
+                    let section = layout.block(&mut cursor).unwrap();
+                    let merged = &bytes[cursor.pos..];
+                    let expected = expected_standard(&doc, layout.large());
+                    assert_eq!(section, expected.0);
+                    assert_eq!(merged, expected.1);
+                    assert_eq!(spool.get_ref(), &[section, merged].concat());
+                    let loaded = decode(&bytes).unwrap();
+                    assert!(!loaded.read_only);
+                    assert_eq!(serde_json::to_value(&loaded).unwrap(), before);
+                    let mut standard = bytes[..30].to_vec();
+                    standard.extend([0; 4]);
+                    layout
+                        .write_length(&mut standard, section.len() as u64)
+                        .unwrap();
+                    standard.extend(section);
+                    standard.extend(merged);
+                    let ordinary = decode(&standard).unwrap();
+                    assert_eq!(ordinary.layers.len(), 1);
+                    assert_eq!(
+                        ordinary.layers[0].pixels.get16(0, 0),
+                        doc.layers[0].pixels.get16(0, 0)
+                    );
+                    assert_eq!(
+                        ordinary.layers[0].pixels.get16(1, 0),
+                        doc.layers[0].pixels.get16(1, 0)
+                    );
+                    assert!(!ordinary.layers[0].mask.as_ref().unwrap().enabled);
+                    assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+                }
+            }
+        }
+    }
+    #[test]
+    fn standard_transfer_is_bounded_and_spool_copy_rejects_corruption_and_interruption() {
+        struct ShortSpool {
+            data: std::io::Cursor<Vec<u8>>,
+            changed: bool,
+            largest: usize,
+        }
+        impl Write for ShortSpool {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.largest = self.largest.max(bytes.len());
+                self.data.write(&bytes[..bytes.len().min(997)])
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Read for ShortSpool {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.data.read(bytes)?;
+                if self.changed && n != 0 {
+                    bytes[0] ^= 1;
+                }
+                Ok(n)
+            }
+        }
+        impl Seek for ShortSpool {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(from)
+            }
+        }
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(127, 257, depth).unwrap();
+            doc.layers[0]
+                .pixels
+                .set16(5, 9, [12347, 23459, 34571, 45673]);
+            for changed in [false, true] {
+                let mut spool = ShortSpool {
+                    data: std::io::Cursor::new(vec![]),
+                    changed,
+                    largest: 0,
+                };
+                let result =
+                    encode_layout_to(&doc, Layout::Psb, &mut Vec::new(), &mut spool, &|| Ok(()));
+                assert!(
+                    spool.largest <= 64 * 1024,
+                    "Only the bounded buffered transfer reaches the spool"
+                );
+                if changed {
+                    assert!(result.unwrap_err().contains("spool changed"));
+                } else {
+                    result.unwrap();
+                }
+            }
+            let count = std::cell::Cell::new(0);
+            let mut spool = std::io::Cursor::new(vec![]);
+            let error = encode_layout_to(&doc, Layout::Psd, &mut Vec::new(), &mut spool, &|| {
+                count.set(count.get() + 1);
+                if count.get() == 40 {
+                    Err("Injected row cancellation".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert!(error.contains("Injected row cancellation"));
+            assert_eq!(count.get(), 40);
+            let mut occupied = std::io::Cursor::new(b"retain caller data".to_vec());
+            assert!(encode_layout_to(
+                &doc,
+                Layout::Psd,
+                &mut Vec::new(),
+                &mut occupied,
+                &|| Ok(())
+            )
+            .unwrap_err()
+            .contains("must be empty"));
+            assert_eq!(occupied.into_inner(), b"retain caller data");
+        }
+        let mut short = std::io::Cursor::new(vec![1, 2]);
+        let error = copy_standard(
+            &mut short,
+            &mut Vec::new(),
+            3,
+            hash(&[1, 2, 3]),
+            &mut [0; 2],
+            &|| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("truncated"));
+        let calls = std::cell::Cell::new(0);
+        let error = copy_standard(
+            &mut std::io::Cursor::new(vec![1, 2, 3, 4]),
+            &mut Vec::new(),
+            4,
+            hash(&[1, 2, 3, 4]),
+            &mut [0; 2],
+            &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    Err("Injected copy cancellation".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "Injected copy cancellation");
+    }
+    #[test]
+    fn streamed_channel_and_final_output_failures_never_return_a_complete_file() {
+        struct Failing {
+            data: std::io::Cursor<Vec<u8>>,
+            left: usize,
+        }
+        impl Write for Failing {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.left == 0 {
+                    return Err(std::io::Error::other("Injected disk write failure"));
+                }
+                let n = bytes.len().min(self.left);
+                self.left -= n;
+                self.data.write(&bytes[..n])
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Read for Failing {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.data.read(bytes)
+            }
+        }
+        impl Seek for Failing {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(from)
+            }
+        }
+        for depth in [8, 16] {
+            let doc = streamed_fixture(depth);
+            let original = serde_json::to_value(&doc).unwrap();
+            for layout in [Layout::Psd, Layout::Psb] {
+                let mut failing = Failing {
+                    data: std::io::Cursor::new(vec![]),
+                    left: 7,
+                };
+                let error =
+                    encode_layout_to(&doc, layout, &mut Vec::new(), &mut failing, &|| Ok(()))
+                        .unwrap_err();
+                assert!(error.contains("Injected disk write failure"));
+                let mut failing = Failing {
+                    data: std::io::Cursor::new(vec![]),
+                    left: 37,
+                };
+                let error = encode_layout_to(
+                    &doc,
+                    layout,
+                    &mut failing,
+                    &mut std::io::Cursor::new(vec![]),
+                    &|| Ok(()),
+                )
+                .unwrap_err();
+                assert!(error.contains("Injected disk write failure"));
+                assert_eq!(serde_json::to_value(&doc).unwrap(), original);
+            }
+        }
+    }
     #[test]
     fn output_preflight_counts_cropped_sources_masks_and_the_actual_standard_plan() {
         let mut doc = Document::new_depth(4, 4, 16).unwrap();
