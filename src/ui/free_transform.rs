@@ -552,24 +552,25 @@ impl PeerBrush {
                 ui.label("Drag handles or enter values. Release keeps the preview pending.");
                 #[cfg(test)]
                 let mut input_index = 0;
-                let mut number =
-                    |ui: &mut egui::Ui,
-                     label: &str,
-                     value: &mut f64,
-                     range: std::ops::RangeInclusive<f64>| {
-                        let response = ui
-                            .horizontal(|ui| {
-                                ui.add_sized([82., 20.], egui::Label::new(label));
-                                controls::numeric(ui, value, range)
-                            })
-                            .inner;
-                        #[cfg(test)]
-                        {
-                            editor.inputs[input_index] = Some(response.rect);
-                            input_index += 1;
-                        }
-                        response.changed()
-                    };
+                let number = |ui: &mut egui::Ui,
+                              label: &str,
+                              value: &mut f64,
+                              range: std::ops::RangeInclusive<f64>| {
+                    let response = ui
+                        .horizontal(|ui| {
+                            ui.add_sized([82., 20.], egui::Label::new(label));
+                            controls::numeric(ui, value, range)
+                        })
+                        .inner;
+                    #[cfg(test)]
+                    {
+                        editor.inputs[input_index] = Some(response.rect);
+                        input_index += 1;
+                    }
+                    response.changed()
+                };
+                #[cfg(test)]
+                let mut number = number;
                 number(
                     ui,
                     "Move X",

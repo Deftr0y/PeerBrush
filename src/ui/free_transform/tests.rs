@@ -30,7 +30,7 @@ fn open(app: &mut PeerBrush, ctx: &egui::Context) {
 fn settle(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let output = frame(app, ctx, vec![]);
+        frame(app, ctx, vec![]);
         let ready = app.free_transform.as_ref().is_some_and(|editor| {
             editor
                 .key()
@@ -207,13 +207,29 @@ fn actual_menu_cancel_and_held_pointer_escape_do_not_replay_brush_or_destructive
         actual_preview(&app, &output);
         let editor = app.free_transform.as_ref().unwrap();
         let point = editor.point([
-            (editor.bounds[0] + editor.bounds[2]) * 0.7,
-            (editor.bounds[1] + editor.bounds[3]) * 0.7,
+            editor.bounds[0] + (editor.bounds[2] - editor.bounds[0]) * 0.7,
+            editor.bounds[1] + (editor.bounds[3] - editor.bounds[1]) * 0.7,
         ]);
         let point = app.view.point(
             point.map(|v| v as f32),
             app.view_rect.unwrap(),
             app.view_rect.unwrap().width() / 32.,
+        );
+        let screen_bounds = Rect::from_points(&editor.corners().map(|corner| {
+            app.view.point(
+                corner.map(|value| value as f32),
+                app.view_rect.unwrap(),
+                app.view_rect.unwrap().width() / 32.,
+            )
+        }));
+        assert!(
+            screen_bounds.contains(point),
+            "Drag fixture must press inside the artwork"
+        );
+        assert_eq!(
+            ctx.layer_id_at(point).map(|layer| layer.order),
+            Some(egui::Order::Background),
+            "Drag fixture must choose visible canvas outside floating controls"
         );
         frame(
             &mut app,

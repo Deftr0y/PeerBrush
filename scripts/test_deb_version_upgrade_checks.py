@@ -14,12 +14,13 @@ import zipfile
 import zlib
 
 import test_deb_version_upgrade as upgrade
-from test_package import Packages, packaging
+import test_package
+from test_package import packaging
 
 
 class HistoricalAssets(unittest.TestCase):
     def setUp(self):
-        self.fixture = Packages('test_platform_architecture_source_license_and_macos_bundle_match')
+        self.fixture = test_package.Packages('test_platform_architecture_source_license_and_macos_bundle_match')
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.root = self.fixture.root.resolve()

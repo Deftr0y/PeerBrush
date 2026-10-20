@@ -180,10 +180,33 @@ fn combined_selected_translation_uses_one_original_soft_coverage_sample_and_pres
             legacy.doc.export_png().unwrap()
         );
         assert_eq!(combined.doc.selection, legacy.doc.selection);
-        assert_eq!(
-            serde_json::to_value(&combined.doc.selection_coverage).unwrap(),
-            serde_json::to_value(&legacy.doc.selection_coverage).unwrap()
-        );
+        let actual = combined.doc.selection_coverage.as_ref().unwrap();
+        let expected = legacy.doc.selection_coverage.as_ref().unwrap();
+        assert_eq!(actual.bounds, expected.bounds);
+        assert_eq!(actual.origin, expected.origin);
+        assert_eq!(actual.mask, expected.mask);
+        let canonical = |contours: &[Vec<[f32; 2]>]| {
+            let mut paths = contours
+                .iter()
+                .map(|points| {
+                    let mut path = points
+                        .iter()
+                        .map(|point| point.map(f32::to_bits))
+                        .collect::<Vec<_>>();
+                    let start = path
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, point)| **point)
+                        .map_or(0, |(index, _)| index);
+                    path.rotate_left(start);
+                    path
+                })
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        // Closed contour start/order is derived; preserve every vertex and winding.
+        assert_eq!(canonical(&actual.contours), canonical(&expected.contours));
     }
 }
 
