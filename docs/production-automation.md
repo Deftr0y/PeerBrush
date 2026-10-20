@@ -12,7 +12,7 @@ The Ubuntu native job additionally qualifies final DEB bytes and consumes its fr
 
 ## Private Store submission state
 
-The existing MSIX writer still validates a published stable release, exact Store identity, package provenance and checksums, current published version and absence of a pending submission. Actual submission additionally requires an absolute `--state` file inside an existing durable private directory. The tool rejects state or lock paths inside any checkout of its source repository and rejects symbolic links, junctions and reparse points throughout the supplied path. The directory and receipt must stay outside public source, release packages and Actions artifacts.
+The existing MSIX writer still validates a published stable release, exact Store identity, package provenance and checksums, current published version and absence of a pending submission. Actual submission additionally requires an absolute `--state` file inside an existing durable private directory. Before release downloads or authentication, the tool rejects supplied receipt paths inside any Git checkout, including independently cloned release-source inputs and worktrees identified by a `.git` file. It also rejects symbolic links, junctions and reparse points throughout the supplied path. Locking and receipt writes recheck these boundaries. The directory and receipt must stay outside public source, release packages and Actions artifacts.
 
 ```sh
 python scripts/submit_store_release.py --tag vVERSION \

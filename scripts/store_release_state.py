@@ -55,6 +55,13 @@ def private_path(path):
             raise SafeError('Private Store state needs existing regular parent directories.') from None
         if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, 'st_file_attributes', 0) & 0x400:
             raise SafeError('Private Store state cannot use symbolic links, junctions or reparse ancestors.')
+        if stat.S_ISDIR(metadata.st_mode):
+            try:
+                (ancestor / '.git').lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise SafeError('Private Store state and locks must stay outside Git checkouts.')
     path = path.parent.resolve(strict=True) / path.name
     if any(path.is_relative_to(root) for root in source_roots()):
         raise SafeError('Private Store state and locks must stay outside every source checkout.')

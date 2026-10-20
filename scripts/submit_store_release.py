@@ -310,6 +310,9 @@ def main():
     try:
         if args.submit and args.state is None:
             raise SafeError('Submission requires --state in durable private storage; hosted CI needs a reviewed persistence adapter before activation.')
+        if args.state is not None:
+            from store_release_state import private_path
+            args.state = private_path(args.state)
         name, package, report = released_assets(args.tag, args.source_root, args.portable_sha256, args.msix_sha256)
         if args.state is None:
             submit(Store(), name, package, report)

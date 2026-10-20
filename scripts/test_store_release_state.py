@@ -184,6 +184,52 @@ class Tests(unittest.TestCase):
         finally:
             alias.rmdir() if os.name == 'nt' else alias.unlink()
 
+    def test_independent_checkout_and_worktree_markers_reject_receipts_without_writing(self):
+        original = self.path.read_bytes()
+        for kind in ['clone', 'worktree']:
+            checkout = self.path.parent / kind
+            checkout.mkdir()
+            marker = checkout / '.git'
+            if kind == 'clone':
+                marker.mkdir()
+            else:
+                marker.write_text('gitdir: /synthetic/elsewhere\n')
+            nested = checkout / 'nested'
+            nested.mkdir()
+            path = nested / 'receipt.json'
+            path.write_bytes(original)
+            self.assertNotIn(checkout, state.source_roots())
+            for action in [state.private_path, state.Journal]:
+                with self.subTest(kind=kind, action=action.__name__), self.assertRaises(submit.SafeError):
+                    action(path)
+            with self.assertRaises(submit.SafeError):
+                with state.locked(path):
+                    self.fail('Receipt lock must not open in an independent checkout')
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(sorted(p.name for p in nested.iterdir()), ['receipt.json'])
+        private = self.path.parent / 'adjacent-private'
+        private.mkdir()
+        with state.locked(private / 'receipt.json') as journal:
+            journal.bind('v0.26.0', fixture()[0], fixture()[2])
+        self.assertEqual(state.Journal(private / 'receipt.json').state['phase'], 'new')
+
+    def test_submit_rejects_selected_source_state_before_download_or_authentication(self):
+        selected = self.path.parent / 'selected-release-source'
+        selected.mkdir()
+        (selected / '.git').mkdir()
+        nested = selected / 'private'
+        nested.mkdir()
+        path = nested / 'receipt.json'
+        for execute in [False, True]:
+            args = ['submit', '--tag', 'v0.26.0', '--source-root', str(selected), '--state', str(path)]
+            if execute:
+                args.append('--submit')
+            with patch.object(submit.sys, 'argv', args), patch.object(submit, 'released_assets') as remote, patch.object(submit, 'Store') as authentication:
+                self.assertEqual(submit.main(), 1)
+                remote.assert_not_called()
+                authentication.assert_not_called()
+            self.assertEqual(list(nested.iterdir()), [])
+
     def test_receipt_fields_require_strings_and_canonical_bounded_identifiers(self):
         original = self.path.read_bytes()
         initial = json.loads(original)
