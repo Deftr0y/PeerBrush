@@ -17,7 +17,7 @@ enum Request {
     Prepare {
         font: TextFont,
     },
-    Refresh,
+    Refresh {},
 }
 fn page_size() -> usize {
     32
@@ -77,7 +77,7 @@ pub(super) fn request(value: &Value) -> Result<Value, String> {
                 }
             })
         }
-        Request::Refresh => match fonts::refresh() {
+        Request::Refresh {} => match fonts::refresh() {
             Ok(()) => Ok(json!({"schema":1,"status":"loading"})),
             Err(error) => Ok(json!({"schema":1,"status":error,"message":error.to_string()})),
         },

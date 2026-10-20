@@ -461,8 +461,10 @@ fn exact_test_responses_are_scoped_and_count_resolutions() {
 #[test]
 #[ignore = "Read-only native installed-font enumeration; select explicitly in native CI"]
 fn native_enumeration_reports_exact_selectable_faces_without_paths() {
-    let service = Service::start(native_faces);
-    let catalog = wait_catalog_for(&service, std::time::Duration::from_secs(30));
+    // Keep exact-key fixture overrides out of this real native service case.
+    let _fixtures = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let service = super::service();
+    let catalog = wait_catalog_for(service, std::time::Duration::from_secs(30));
     assert_eq!(catalog.status, CatalogStatus::Ready);
     assert!(!catalog.faces.is_empty());
     let font = catalog
@@ -480,7 +482,7 @@ fn native_enumeration_reports_exact_selectable_faces_without_paths() {
         }
     }
     assert_eq!(service.snapshot(&font).unwrap_err(), FontError::Loading);
-    let data = wait_snapshot(&service, &font)
+    let data = wait_snapshot(service, &font)
         .expect("Native selected face could not load its pinned bytes");
     assert_eq!(sha256(data.font_data()), font.sha256);
     metrics(&data).unwrap();
@@ -494,4 +496,118 @@ fn native_enumeration_reports_exact_selectable_faces_without_paths() {
         std::ptr::eq(data.font_data().as_ptr(), cached.font_data().as_ptr()),
         "Cache did not retain the owned snapshot"
     );
+
+    // Use a real native snapshot through the shared source renderer and codec.
+    // The bounded search does not assume the first installed face has Latin glyphs.
+    let (native_font, native_data) = catalog
+        .faces
+        .iter()
+        .filter_map(|face| face.font.as_ref())
+        .take(64)
+        .find_map(|font| {
+            let data = wait_snapshot(service, font).ok()?;
+            let glyph = data.glyph_id('A');
+            (glyph.0 != 0 && data.outline(glyph).is_some() && data.glyph_id(' ').0 != 0)
+                .then(|| (font.clone(), data))
+        })
+        .expect(
+            "Native machine needs a supported plain Latin outline face among its first64 faces",
+        );
+    assert_eq!(sha256(native_data.font_data()), native_font.sha256);
+    struct RestoreStatus<'a> {
+        service: &'a Service,
+        generation: u64,
+        previous: CatalogStatus,
+    }
+    impl Drop for RestoreStatus<'_> {
+        fn drop(&mut self) {
+            let mut state = self
+                .service
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if state.catalog.generation == self.generation {
+                state.catalog.status = self.previous.clone();
+            }
+        }
+    }
+    for depth in [8, 16] {
+        let mut engine = crate::engine::Engine::new();
+        engine.doc = crate::engine::Document::new_depth(96, 64, depth).unwrap();
+        let source = crate::source::Source {
+            width: 80,
+            height: 40,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: crate::source::Content::Text {
+                text: "A A".into(),
+                font: TextFont::Installed(native_font.clone()),
+                size: 28.,
+                line_height: 1.2,
+                letter_spacing: 0.5,
+                align: "left".into(),
+                color: [60001, 12347, 35569, 65535],
+            },
+        };
+        engine
+            .edit(
+                "human",
+                &[serde_json::json!({"op":"source.add","source":source,"x":2,"y":3})],
+                None,
+                None,
+                "Native installed font",
+            )
+            .unwrap();
+        assert_eq!(engine.undo.len(), 1);
+        let before = engine.doc.clone();
+        let words = before.layers[0].pixels.rgba16();
+        assert!(words.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        if depth == 16 {
+            assert!(words
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] > 0 && pixel[..3].iter().any(|word| word % 257 != 0)));
+        }
+        // Temporarily unavailable derived state must never re-render saved artwork.
+        // This changes only this test process's service, never native font registration.
+        let restore = {
+            let mut state = service.state.lock().unwrap();
+            assert_eq!(state.catalog.status, CatalogStatus::Ready);
+            assert!(state.pending.is_empty());
+            let generation = state.catalog.generation;
+            let previous = std::mem::replace(
+                &mut state.catalog.status,
+                CatalogStatus::Unavailable(FontError::Missing),
+            );
+            RestoreStatus {
+                service,
+                generation,
+                previous,
+            }
+        };
+        assert_eq!(
+            source
+                .render(source.width, source.height, depth)
+                .unwrap_err(),
+            FontError::Missing.to_string()
+        );
+        for encoded in [
+            crate::psd::encode(&before).unwrap(),
+            crate::psd::encode_psb(&before).unwrap(),
+        ] {
+            let decoded = crate::psd::decode(&encoded).unwrap();
+            assert!(!decoded.read_only);
+            assert_eq!(decoded.bit_depth, depth);
+            assert_eq!(decoded.layers[0].source, before.layers[0].source);
+            assert_eq!(decoded.layers[0].pixels.rgba16(), words);
+            assert_eq!(decoded.export_png().unwrap(), before.export_png().unwrap());
+        }
+        drop(restore);
+        assert_eq!(service.catalog().status, CatalogStatus::Ready);
+        assert_eq!(
+            source
+                .render(source.width, source.height, depth)
+                .unwrap()
+                .rgba16(),
+            words
+        );
+    }
 }

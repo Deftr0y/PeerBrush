@@ -188,7 +188,13 @@ fn installed_text_format_31_retains_native_standard_channels_masks_composite_and
         for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
             let embedded = editable_record(&bytes);
             assert_eq!(embedded["format"], 31);
-            assert_eq!(embedded["document"]["layers"][0]["source"], json!(source));
+            assert_eq!(
+                serde_json::from_value::<peerbrush::source::Source>(
+                    embedded["document"]["layers"][0]["source"].clone()
+                )
+                .unwrap(),
+                source
+            );
             assert!(
                 embedded["document"]["layers"][0]["source"]["content"]["font"]
                     .get("path")
