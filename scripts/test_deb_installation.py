@@ -6,12 +6,18 @@ acceptance. No signed repository, update service or public package is created.
 """
 import argparse
 import hashlib
+import json
 import os
 import pathlib
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+
+from package import digest
+from package_deb import deb_version
 
 
 APP_ID = 'com.peerbrush.PeerBrush'
@@ -48,13 +54,78 @@ def require_disposable():
         raise ValueError('Installation acceptance is bounded to Ubuntu 24.04')
 
 
-def check(package):
+def validate_expected(expected):
+    if (not isinstance(expected, dict)
+            or set(expected) != {'version', 'commit', 'package_sha256', 'executable_sha256', 'source_sha256'}
+            or type(expected['version']) is not str):
+        raise ValueError('Supply exact independently selected candidate metadata')
+    deb_version(expected['version'])
+    for name, size in [('commit', 40), ('package_sha256', 64), ('executable_sha256', 64), ('source_sha256', 64)]:
+        if type(expected[name]) is not str or not re.fullmatch('[0-9a-f]{' + str(size) + '}', expected[name]):
+            raise ValueError('Supply exact independently selected candidate metadata')
+
+
+def selected_package(package, expected):
+    validate_expected(expected)
+    if (package.name != f'peerbrush_{deb_version(expected["version"])}_amd64.deb'
+            or package.is_symlink() or not package.is_file() or digest(package) != expected['package_sha256']):
+        raise ValueError('DEB filename or bytes differ from the selected candidate')
+    for field, value in [('Package', 'peerbrush'), ('Architecture', 'amd64'), ('Version', deb_version(expected['version']))]:
+        if run(['dpkg-deb', '--field', str(package), field]) != value:
+            raise ValueError('DEB identity, architecture or version differs from the selected candidate')
+
+
+def installed_identity(expected, user, package_version):
+    binary = pathlib.Path('/usr/bin/peerbrush')
+    source = pathlib.Path('/usr/share/doc/peerbrush') / f'PeerBrush-{expected["version"]}-source.zip'
+    for path, checksum in [(binary, expected['executable_sha256']), (source, expected['source_sha256'])]:
+        if path.is_symlink() or not path.is_file() or digest(path) != checksum:
+            raise ValueError('Installed executable or corresponding source differs from the selected candidate')
+    for field, value in [('Package', 'peerbrush'), ('Architecture', 'amd64'), ('Version', package_version)]:
+        if run(['dpkg-query', '--showformat=${' + field + '}', '--show', 'peerbrush']) != value:
+            raise ValueError('Installed package identity differs from the selected candidate')
+    if user([str(binary), '--version']) != 'PeerBrush ' + expected['version']:
+        raise ValueError('Installed application version differs from the selected candidate')
+    info = dict(format='PeerBrushBuildInfoV1', schema=1, product='PeerBrush', version=expected['version'],
+                commit=expected['commit'], tree='clean', end='PeerBrushBuildInfoEnd')
+    if user([str(binary), '--build-info']) != json.dumps(info, separators=(',', ':')):
+        raise ValueError('Installed build provenance differs from the clean selected source')
+
+
+def receipt_path(output):
+    output = output.absolute()
+    if output.exists() or output.is_symlink() or not output.parent.is_dir():
+        raise ValueError('Choose a new receipt under an existing private output directory')
+    if any(path.is_symlink() for path in output.parents):
+        raise ValueError('Receipt output directories must not use symbolic links')
+    if os.name == 'posix' and stat.S_IMODE(output.parent.stat().st_mode) & 0o077:
+        raise ValueError('Receipt output parent must be private')
+    return output
+
+
+def write_receipt(output, receipt):
+    output = receipt_path(output)
+    with output.open('x', encoding='utf-8', newline='\n') as stream:
+        # The runner supplies a private parent; keep a container-root-owned file
+        # readable by its host owner without granting broader directory access.
+        output.chmod(0o644)
+        stream.write(json.dumps(receipt, sort_keys=True, separators=(',', ':')) + '\n')
+
+
+def check(package, expected, output):
     require_disposable()  # Must precede user creation, package changes or fixture writes.
-    package = package.resolve(strict=True)
-    if run(['dpkg-deb', '--field', str(package), 'Package']) != 'peerbrush':
-        raise ValueError('Expected the PeerBrush installation candidate')
+    validate_expected(expected)
+    output = receipt_path(output)
+    package = package.absolute()
+    if package.is_symlink() or not package.is_file() or digest(package) != expected['package_sha256']:
+        raise ValueError('DEB bytes differ from the selected candidate')
     with tempfile.TemporaryDirectory(prefix='peerbrush-install-qa-') as temporary:
         work = pathlib.Path(temporary)
+        # Host-mounted input can change independently of the container. Install
+        # only a byte-verified copy under this private disposable test directory.
+        selected = work / package.name
+        shutil.copyfile(package, selected)
+        selected_package(selected, expected)
         run(['useradd', '--create-home', '--shell', '/bin/sh', 'peerbrush-qa'])
         home = pathlib.Path('/home/peerbrush-qa')
         environment = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
@@ -78,16 +149,16 @@ def check(package):
             path.write_bytes(b'SYNTHETIC_USER_OWNED_RETENTION_FIXTURE\n')
         run(['chown', '-R', 'peerbrush-qa:peerbrush-qa', str(home)])
         original = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in [defaults, existing, *preserved]}
-        original_package = hashlib.sha256(package.read_bytes()).hexdigest()
+        original_package = expected['package_sha256']
         def retained():
             for path, checksum in original.items():
                 if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
                     raise ValueError('Installation lifecycle changed user defaults, settings or artwork')
             if user(['xdg-mime', 'query', 'default', MIME]) != existing.name:
                 raise ValueError('Installation lifecycle changed the existing default editor')
-        def installed():
+        def installed(package_version):
             retained()
-            user(['/usr/bin/peerbrush', '--state-dir', str(home / 'PeerBrush QA state'), '--version'])
+            installed_identity(expected, user, package_version)
             if not pathlib.Path(f'/usr/share/applications/{APP_ID}.desktop').is_file():
                 raise ValueError('Installed Open With desktop entry is missing')
             cache = pathlib.Path('/usr/share/applications/mimeinfo.cache').read_text()
@@ -111,14 +182,14 @@ def check(package):
             if APP_ID + '.desktop' in cache or pathlib.Path(f'/usr/share/mime/packages/{APP_ID}.xml').exists():
                 raise ValueError('Package-owned MIME integration was not removed')
         retained()
-        run(['apt-get', 'install', '-y', str(package)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
-        installed()
+        run(['apt-get', 'install', '-y', str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+        installed(deb_version(expected['version']))
         # Private higher-revision fixture validates dpkg upgrade semantics while
         # retaining exact executable bytes. Never upload it as a release file.
         unpacked = work / 'upgrade'
-        run(['dpkg-deb', '--raw-extract', str(package), str(unpacked)])
+        run(['dpkg-deb', '--raw-extract', str(selected), str(unpacked)])
         control = unpacked / 'DEBIAN/control'
-        current = run(['dpkg-deb', '--field', str(package), 'Version'])
+        current = deb_version(expected['version'])
         later = current + '+qa1'
         run(['dpkg', '--compare-versions', later, 'gt', current])
         control.write_text(control.read_text().replace('Version: ' + current + '\n', 'Version: ' + later + '\n'))
@@ -127,27 +198,45 @@ def check(package):
         run(['dpkg', '--install', str(upgrade)])
         if run(['dpkg-query', '--showformat=${Version}', '--show', 'peerbrush']) != later:
             raise ValueError('The private higher-revision upgrade was not installed')
-        installed()
+        installed(later)
         run(['apt-get', 'remove', '-y', 'peerbrush'])
         removed()
         run(['apt-get', 'purge', '-y', 'peerbrush'])
         removed()
-        run(['apt-get', 'install', '-y', str(package)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
-        installed()
+        run(['apt-get', 'install', '-y', str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+        installed(current)
         run(['apt-get', 'purge', '-y', 'peerbrush'])
         removed()
-        if hashlib.sha256(package.read_bytes()).hexdigest() != original_package:
+        if digest(package) != original_package or digest(selected) != original_package:
             raise ValueError('Installation tests changed the original candidate')
-    return {'installation': 'passed', 'same-binary-package-upgrade': 'passed',
-            'remove-purge-reinstall-retention': 'passed', 'mime-and-default-consent': 'passed',
-            'native-gui-and-real-version-migration': 'not-performed'}
+    receipt = dict(schema=1, format='PeerBrushDebInstallationV1', product='PeerBrush',
+                   version=expected['version'], commit=expected['commit'],
+                   package=dict(file=package.name, sha256=original_package),
+                   executable_sha256=expected['executable_sha256'], source_sha256=expected['source_sha256'],
+                   target='Ubuntu 24.04 amd64', architecture='amd64',
+                   checks={'installation': 'passed', 'installed-build-identity': 'passed',
+                           'same-binary-package-upgrade': 'passed', 'remove-purge-reinstall-retention': 'passed',
+                           'mime-and-default-consent': 'passed'},
+                   limits={'native-gui': 'not-performed', 'real-application-version-migration': 'not-performed',
+                           'unsaved-work-and-update-interruption': 'not-performed',
+                           'publisher-signature': 'not-performed', 'update-repository': 'not-configured',
+                           'public-availability': 'not-assessed'},
+                   release_ready=False, production_readiness='not-assessed')
+    write_receipt(output, receipt)
+    return receipt
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--package', required=True, type=pathlib.Path)
+    for name in ['package-sha256', 'commit', 'version', 'executable-sha256', 'source-sha256']:
+        parser.add_argument('--' + name, required=True)
+    parser.add_argument('--output', required=True, type=pathlib.Path)
     args = parser.parse_args()
     try:
-        print(check(args.package))
-    except ValueError as error:
-        parser.exit(1, str(error) + '\n')
+        expected = {name: getattr(args, name) for name in ['version', 'commit', 'package_sha256', 'executable_sha256', 'source_sha256']}
+        check(args.package, expected, args.output)
+        print('Source-bound disposable DEB checks passed; release readiness is not established.')
+    except (ValueError, OSError) as error:
+        message = str(error) if isinstance(error, ValueError) else 'Installation evidence I/O failed; acceptance was not established'
+        parser.exit(1, message + '\n')

@@ -203,9 +203,18 @@ jobs:
           PORTABLE="dist/PeerBrush-$VERSION-Linux-x64.zip"
           DIGEST=$(sha256sum "$PORTABLE" | cut -d ' ' -f 1)
           python3 -B scripts/package_deb.py --portable "$PORTABLE" --portable-sha256 "$DIGEST" --output dist/deb --maintainer 'PeerBrush CI fixture <builds@example.invalid>'
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          HASHES=$(python3 -c 'import pathlib,sys; sys.path.insert(0,"scripts"); from verify_release import inspect_archive; record=inspect_archive(pathlib.Path(sys.argv[1]),sys.argv[2],sys.argv[3])["manifest"]; print(record["executable_sha256"],record["source_sha256"])' "$PORTABLE" "$SOURCE_COMMIT" "$VERSION")
+          read -r EXECUTABLE_SHA SOURCE_SHA <<< "$HASHES"
+          set -- dist/deb/*.deb
+          test "$#" -eq 1
+          DEB="$1"
+          DEB_SHA=$(sha256sum "$DEB" | cut -d ' ' -f 1)
+          EVIDENCE=$(mktemp -d "$RUNNER_TEMP/peerbrush-deb-acceptance.XXXXXX")
           docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
-            --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" ubuntu:24.04 \
-            bash -eu -c 'apt-get update; apt-get install -y python3 xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd; set -- /packages/*.deb; test "$#" -eq 1; python3 -B /checks/test_deb_installation.py --package "$1"'
+            --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
+            bash -eu -c 'apt-get update; apt-get install -y python3 xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd; python3 -B /checks/test_deb_installation.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installation.json' \
+            peerbrush-deb-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:

@@ -35,4 +35,21 @@ APT/dpkg removal or purge removes package-owned binaries and desktop/MIME integr
 
 CI builds the real candidate, then invokes `scripts/test_deb_installation.py` inside a fresh Ubuntu 24.04 Docker container. The script refuses host execution: it requires Linux, root inside Docker and `PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1`. Only this disposable container is installed into. It runs the installed executable as a non-root fixture user, verifies PSD/PSB MIME caches/Open With registration, preserves an existing default editor, and exercises upgrade, remove, purge and reinstall while checking user-owned settings/document/default bytes.
 
+The installation check requires the explicitly selected final DEB SHA-256, exact source commit and application version, executable SHA-256 and corresponding-source SHA-256. Both CI callers obtain the executable/source hashes by inspecting the verified portable input against the selected source; they do not take readiness or source claims from the DEB receipt. Before user creation or APT changes, the check verifies the final candidate's bytes, filename, package identity, amd64 architecture and Debian version. It installs a verified copy in the disposable test directory, preserving the read-only host input. Each install, same-binary package upgrade and reinstall must retain the exact executable and corresponding-source bytes, installed package identity, actual `--version` output and canonical clean `--build-info` for that source commit. The original DEB must remain unchanged throughout.
+
+On complete success, the check exclusively creates a canonical `PeerBrushDebInstallationV1` JSON receipt under a fresh private runner-temporary directory. The receipt binds the final package hash, version/source commit, executable/source hashes and completed checks. It retains `release_ready: false`, production readiness unassessed, and explicit unperformed desktop, real application-version migration, unsaved-work/update interruption, publisher-signature and public-availability checks. Existing evidence is never overwritten; failure cannot produce a successful receipt. CI does not upload this operational receipt with the DEB candidate or add it to public release inventory. These are results of the trusted exact-source test job, not independent cryptographic attestation or authority to enable website downloads.
+
+For an already authorized disposable container, the explicit invocation is:
+
+```sh
+python3 -B /checks/test_deb_installation.py \
+  --package /packages/peerbrush_VERSION-1_amd64.deb \
+  --package-sha256 SELECTED_DEB_SHA256 --commit EXACT_SOURCE_COMMIT \
+  --version EXACT_APPLICATION_VERSION --executable-sha256 VERIFIED_EXECUTABLE_SHA256 \
+  --source-sha256 VERIFIED_CORRESPONDING_SOURCE_SHA256 \
+  --output /private-test-evidence/installation.json
+```
+
+The output parent must already exist and be private, with no symbolic-link parents. The workflow uses a private `mktemp` directory mounted separately from read-only package/source inputs. The receipt file is readable by the runner through that private parent even when the container creates it as root. No host package state or installed application is used for these checks.
+
 The upgrade fixture increases the Debian package revision while retaining the same executable. It is private test data, never uploaded. It establishes package lifecycle behavior; it does not establish a real previous-application-version migration, native desktop launch, GPU rendering, dialogs, clipboard, unsaved-project/update interruption protection or a signed update feed. These checks remain explicit gates before installed Linux release readiness. Windows portable tests verify source/staging/tar inspection and skip no native acceptance into a success claim.

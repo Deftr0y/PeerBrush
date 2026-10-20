@@ -1,11 +1,13 @@
 """DEB staging checks with synthetic committed source, never real installation."""
 import hashlib
 import io
+import json
 import pathlib
 import os
 import sys
 import subprocess
 import tarfile
+import tempfile
 import unittest
 from unittest import mock
 import xml.etree.ElementTree as ET
@@ -208,7 +210,7 @@ class TarInspection(unittest.TestCase):
     def test_installation_check_refuses_host_before_any_command_or_writes(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(installation, 'run') as native:
             with self.assertRaisesRegex(ValueError, 'never run on the host'):
-                installation.check(pathlib.Path('not-an-installed-package.deb'))
+                installation.check(pathlib.Path('not-an-installed-package.deb'), {}, pathlib.Path('no-receipt.json'))
             native.assert_not_called()
 
     def make_tar(self, mutation=None):
@@ -242,6 +244,110 @@ class TarInspection(unittest.TestCase):
             deb.verify_tar(self.make_tar(), expected | {'unexpected': {'mode': 0o644, 'sha256': '0' * 64}})
         with self.assertRaises(ValueError):
             deb.verify_tar(self.make_tar(), expected | {'usr/bin/peerbrush': {'mode': 0o755, 'sha256': '0' * 64}})
+
+
+class InstallationEvidence(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix='peerbrush-bound-install-fixture-')
+        self.addCleanup(self.directory.cleanup)
+        self.root = pathlib.Path(self.directory.name).resolve()
+        self.package = self.root / 'peerbrush_0.30.0~dev.1-1_amd64.deb'
+        self.package.write_bytes(b'SYNTHETIC_PACKAGE_NEVER_INSTALLED')
+        self.output = self.root / 'installation.json'
+        self.expected = dict(version='0.30.0-dev.1', commit='a' * 40, package_sha256=digest(self.package),
+                             executable_sha256='b' * 64, source_sha256='c' * 64)
+        self.fields = dict(Package='peerbrush', Architecture='amd64', Version='0.30.0~dev.1-1')
+        self.info = dict(format='PeerBrushBuildInfoV1', schema=1, product='PeerBrush',
+                         version=self.expected['version'], commit=self.expected['commit'], tree='clean',
+                         end='PeerBrushBuildInfoEnd')
+
+    def test_explicit_selection_checks_all_identity_fields_without_installing(self):
+        with mock.patch.object(installation, 'run', side_effect=lambda command: self.fields[command[-1]]) as native:
+            installation.selected_package(self.package, self.expected)
+        self.assertEqual([call.args[0][-1] for call in native.call_args_list], ['Package', 'Architecture', 'Version'])
+        self.assertTrue(all(call.args[0][:2] == ['dpkg-deb', '--field'] for call in native.call_args_list))
+        self.assertFalse(self.output.exists())
+
+    def test_changed_hash_invalid_metadata_and_wrong_package_identity_fail_before_mutation(self):
+        for field, value in [('package_sha256', 'd' * 64), ('commit', 'not-a-source'),
+                             ('version', '0.30.0+unsupported'), ('source_sha256', True),
+                             ('executable_sha256', 'B' * 64), ('release_ready', True)]:
+            expected = dict(self.expected, **{field: value})
+            with self.subTest(field=field), mock.patch.object(installation, 'require_disposable'), \
+                    mock.patch.object(installation, 'run') as native:
+                with self.assertRaises(ValueError):
+                    installation.check(self.package, expected, self.output)
+                native.assert_not_called()
+            self.assertFalse(self.output.exists())
+        for field, value in [('Package', 'another-app'), ('Architecture', 'arm64'), ('Version', '0.26.0-1')]:
+            fields = dict(self.fields, **{field: value})
+            with self.subTest(field=field), mock.patch.object(installation, 'require_disposable'), \
+                    mock.patch.object(installation, 'run', side_effect=lambda command: fields[command[-1]]) as native:
+                with self.assertRaisesRegex(ValueError, 'identity, architecture or version'):
+                    installation.check(self.package, self.expected, self.output)
+                self.assertTrue(all(call.args[0][:2] == ['dpkg-deb', '--field'] for call in native.call_args_list))
+            self.assertFalse(self.output.exists())
+        renamed = self.package.with_name('other.deb')
+        renamed.write_bytes(self.package.read_bytes())
+        with mock.patch.object(installation, 'run') as native:
+            with self.assertRaisesRegex(ValueError, 'filename or bytes'):
+                installation.selected_package(renamed, self.expected)
+            native.assert_not_called()
+
+    def verify_installed(self, *, hashes=None, fields=None, version=None, info=None, package_version=None):
+        hashes = hashes or dict(peerbrush=self.expected['executable_sha256'], source=self.expected['source_sha256'])
+        fields = fields or self.fields
+        self.user = mock.Mock(side_effect=lambda command: {
+            '--version': version if version is not None else 'PeerBrush ' + self.expected['version'],
+            '--build-info': json.dumps(info if info is not None else self.info, separators=(',', ':')),
+        }[command[-1]])
+        with mock.patch.object(pathlib.Path, 'is_symlink', return_value=False), \
+                mock.patch.object(pathlib.Path, 'is_file', return_value=True), \
+                mock.patch.object(installation, 'digest', side_effect=lambda path: hashes['peerbrush' if path.name == 'peerbrush' else 'source']), \
+                mock.patch.object(installation, 'run', side_effect=lambda command: fields[command[1].removeprefix('--showformat=${').removesuffix('}')]):
+            installation.installed_identity(self.expected, self.user, package_version or self.fields['Version'])
+
+    def test_installed_identity_keeps_original_build_labels_during_private_package_upgrade(self):
+        for version in [self.fields['Version'], self.fields['Version'] + '+qa1', self.fields['Version']]:
+            self.verify_installed(fields=dict(self.fields, Version=version), package_version=version)
+            self.assertEqual([call.args[0][-1] for call in self.user.call_args_list], ['--version', '--build-info'])
+
+    def test_installed_hashes_and_cli_labels_must_match_before_acceptance(self):
+        for name in ['peerbrush', 'source']:
+            hashes = dict(peerbrush=self.expected['executable_sha256'], source=self.expected['source_sha256'])
+            hashes[name] = 'd' * 64
+            with self.subTest(hash=name), self.assertRaisesRegex(ValueError, 'Installed executable or corresponding source'):
+                self.verify_installed(hashes=hashes)
+            self.user.assert_not_called()
+        for field, value in [('Package', 'another-app'), ('Architecture', 'arm64'), ('Version', '0.26.0-1')]:
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'Installed package identity'):
+                self.verify_installed(fields=dict(self.fields, **{field: value}))
+            self.user.assert_not_called()
+        with self.assertRaisesRegex(ValueError, 'application version'):
+            self.verify_installed(version='PeerBrush 0.26.0')
+        for field, value in [('tree', 'dirty'), ('tree', 'unknown'), ('commit', 'd' * 40),
+                             ('version', '0.26.0'), ('schema', True), ('unexpected', 'not accepted')]:
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'build provenance'):
+                self.verify_installed(info=dict(self.info, **{field: value}))
+
+    def test_receipts_are_canonical_exclusive_and_cannot_replace_previous_evidence(self):
+        if os.name == 'posix':
+            shared = self.root / 'shared'
+            shared.mkdir()
+            shared.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, 'parent must be private'):
+                installation.receipt_path(shared / 'not-private.json')
+        receipt = dict(schema=1, release_ready=False, production_readiness='not-assessed', checks={'installation': 'passed'})
+        installation.write_receipt(self.output, receipt)
+        before = self.output.read_bytes()
+        self.assertEqual(before, (json.dumps(receipt, sort_keys=True, separators=(',', ':')) + '\n').encode())
+        with self.assertRaisesRegex(ValueError, 'new receipt'):
+            installation.write_receipt(self.output, dict(receipt, checks={}))
+        self.assertEqual(self.output.read_bytes(), before)
+        with mock.patch.object(installation, 'require_disposable'), mock.patch.object(installation, 'run') as native:
+            with self.assertRaisesRegex(ValueError, 'new receipt'):
+                installation.check(self.package, self.expected, self.output)
+            native.assert_not_called()
 
 
 if __name__ == '__main__':
