@@ -16,17 +16,17 @@ pub(super) fn draw(
         |ctx| app.draw(ctx),
     )
 }
+#[track_caller]
 pub(super) fn label(output: &egui::FullOutput, expected: &str) -> Pos2 {
-    output
-        .shapes
-        .iter()
-        .find_map(|shape| match &shape.shape {
-            egui::Shape::Text(text) if text.galley.job.text == expected => {
-                Some(text.pos + text.galley.size() * 0.5)
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("Missing visible label: {expected}"))
+    match output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text == expected => {
+            Some(text.pos + text.galley.size() * 0.5)
+        }
+        _ => None,
+    }) {
+        Some(position) => position,
+        None => panic!("Missing visible label: {expected}"),
+    }
 }
 pub(super) fn click(app: &mut PeerBrush, ctx: &egui::Context, size: Vec2, at: Pos2) {
     for pressed in [true, false] {
