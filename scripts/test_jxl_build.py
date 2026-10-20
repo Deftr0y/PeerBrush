@@ -122,6 +122,35 @@ class NativeJxlBuild(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'not configured'):
                 jxl_build.configure({})
 
+    def test_selected_ninja_stays_discoverable_when_other_tool_directories_shadow_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            ninja_directory, compiler_directory, cmake_directory = [root / name for name in
+                ['selected ninja', 'compiler tools', 'cmake tools']]
+            suffix = '.exe' if os.name == 'nt' else ''
+            for directory in [ninja_directory, compiler_directory, cmake_directory]:
+                directory.mkdir()
+                executable = directory / ('ninja' + suffix)
+                executable.write_text('1.13.2' if directory == ninja_directory else '1.12.0', encoding='utf-8')
+                executable.chmod(0o755)
+            selected = ninja_directory / ('ninja' + suffix)
+            cc, cmake = compiler_directory / ('clang-cl' + suffix), cmake_directory / ('cmake' + suffix)
+            original = os.pathsep.join(map(str, [ninja_directory, compiler_directory, cmake_directory]))
+            self.assertEqual(Path(jxl_build.shutil.which('ninja', path=original)), selected)
+            shadowed = os.pathsep.join(map(str, [compiler_directory, cmake_directory, ninja_directory]))
+            self.assertEqual(Path(jxl_build.shutil.which('ninja', path=shadowed)), compiler_directory / ('ninja' + suffix))
+            with mock.patch.object(jxl_build.platform, 'system', return_value='Windows'), \
+                    mock.patch.object(jxl_build, 'tool', side_effect=[
+                        (str(cc), '20.1.8'), (str(cc), '20.1.8'),
+                        (str(cmake), '4.4.4'), (str(selected), '1.13.2')]), \
+                    mock.patch.object(jxl_build.subprocess, 'run', side_effect=AssertionError('No tool execution')):
+                environment, versions = jxl_build.configure({'PATH': original, 'INCLUDE': 'fixture', 'LIB': 'fixture'})
+            self.assertEqual(Path(jxl_build.shutil.which('ninja', path=environment['PATH'])), selected)
+            self.assertEqual(environment['CC'], str(cc))
+            self.assertEqual(environment['CXX'], str(cc))
+            self.assertEqual(environment['CMAKE'], str(cmake))
+            self.assertEqual(versions['ninja'], '1.13.2')
+
     def test_github_export_contains_only_build_values_and_rejects_multiline(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(jxl_build.platform, 'system', return_value='Windows'):
             destination = Path(temporary) / 'step.env'
@@ -176,6 +205,7 @@ class NativeJxlBuild(unittest.TestCase):
                 setup = text.index('scripts/jxl_build.py --github-env')
                 self.assertLess(setup, text.index('dtolnay/rust-toolchain@'))
                 self.assertIn('-Arch amd64 -HostArch amd64 -SkipAutomaticLocation', text)
+                self.assertIn("@('ninja', 'clang-cl', 'cmake')", text)
                 self.assertIn('b725eda525362e7cf34af9a7243cac1e3f01a7ec', text)
 
     def test_ordinary_cargo_graph_requires_vendored_source_and_explicit_msrv(self):

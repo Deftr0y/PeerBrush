@@ -63,7 +63,7 @@ def configure(inherited=None):
     ninja, ninja_version = tool('ninja', 'ninja', {'1.13.2'}, environment)
     if system == 'Windows' and not all(environment.get(key) for key in ['INCLUDE', 'LIB']):
         raise ValueError('Initialize the existing MSVC/SDK developer environment first')
-    path = os.pathsep.join(dict.fromkeys([str(Path(n).parent) for n in [cc, cmake, ninja]]))
+    path = os.pathsep.join(dict.fromkeys([str(Path(n).parent) for n in [ninja, cc, cmake]]))
     environment.update(CC=cc, CXX=cxx, CMAKE=cmake, CMAKE_GENERATOR='Ninja',
                        CARGO_BUILD_JOBS='2', CMAKE_BUILD_PARALLEL_LEVEL='2',
                        PATH=path + os.pathsep + environment.get('PATH', ''))
