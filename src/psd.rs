@@ -257,6 +257,13 @@ pub(crate) fn standard_bounds(doc: &Document, layer: &Layer, section: u32) -> [i
     }
 }
 
+fn has_letter_spacing(doc: &Document) -> bool {
+    doc.layers.iter().any(|layer| {
+        matches!(layer.source.as_ref().map(|source| &source.content),
+            Some(crate::source::Content::Text { letter_spacing, .. }) if *letter_spacing != 0.)
+    })
+}
+
 fn default_blending_ranges(bytes: &[u8], channels: u16) -> bool {
     bytes.is_empty()
         // Photoshop may include transparency/mask channel pairs in addition to
@@ -802,7 +809,9 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if doc.layers.iter().any(|layer| layer.mask.is_some()) {
+        format: if has_letter_spacing(doc) {
+            30
+        } else if doc.layers.iter().any(|layer| layer.mask.is_some()) {
             29
         } else if doc.layers.iter().any(|l| {
             l.effects
@@ -1693,7 +1702,8 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=29).contains(&e.format)
+                if (1..=30).contains(&e.format)
+                    && (e.format >= 30 || !has_letter_spacing(&e.document))
                     && (e.format >= 29
                         || e.document
                             .layers

@@ -480,7 +480,13 @@ pub(crate) fn plain_mask(layer: &Layer) -> Result<(), String> {
     Ok(())
 }
 
-fn reframe_mask(layer: &mut Layer, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+pub(crate) fn reframe_mask(
+    layer: &mut Layer,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
     if (layer.x, layer.y) == (x, y)
         && layer.mask.as_ref().is_none_or(|mask| {
             mask.steps

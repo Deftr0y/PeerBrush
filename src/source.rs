@@ -10,6 +10,9 @@ use serde_json::Value;
 fn identity() -> [f32; 6] {
     [1., 0., 0., 1., 0., 0.]
 }
+fn zero(value: &f32) -> bool {
+    *value == 0.
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
@@ -34,6 +37,8 @@ pub enum Content {
         font: String,
         size: f32,
         line_height: f32,
+        #[serde(default, skip_serializing_if = "zero")]
+        letter_spacing: f32,
         align: String,
         color: [u16; 4],
     },
@@ -120,6 +125,7 @@ impl Source {
                 font: name,
                 size,
                 line_height,
+                letter_spacing,
                 align,
                 ..
             } => {
@@ -130,9 +136,13 @@ impl Source {
                     || !(1. ..=1024.).contains(size)
                     || !line_height.is_finite()
                     || !(0.5..=4.).contains(line_height)
+                    || !letter_spacing.is_finite()
+                    || !(-1024. ..=1024.).contains(letter_spacing)
                     || !["left", "center", "right"].contains(&align.as_str())
                 {
-                    return Err("Invalid text length, size, line spacing or alignment".into());
+                    return Err(
+                        "Invalid text length, size, line/letter spacing or alignment".into(),
+                    );
                 }
                 let f = font(name)?;
                 for ch in text.chars().filter(|c| *c != '\n') {
@@ -236,6 +246,7 @@ impl Source {
                 font: name,
                 size,
                 line_height,
+                letter_spacing,
                 align,
                 color,
             } => {
@@ -249,6 +260,7 @@ impl Source {
                         let g = scaled.glyph_id(ch);
                         if let Some(p) = previous {
                             advance += scaled.kern(p, g);
+                            advance += *letter_spacing;
                         }
                         advance += scaled.h_advance(g);
                         previous = Some(g);
@@ -265,6 +277,7 @@ impl Source {
                         let gid = scaled.glyph_id(ch);
                         if let Some(p) = previous {
                             x += scaled.kern(p, gid);
+                            x += *letter_spacing;
                         }
                         let g = gid.with_scale_and_position(*size, point(x, y));
                         if let Some(outline) = f.outline_glyph(g) {
@@ -497,9 +510,72 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
         .source
         .as_ref()
         .ok_or("This layer has no editable text/vector source")?;
-    let source = parse(c)?;
+    let mut source = parse(c)?;
     if (source.width, source.height) != (old.width, old.height) {
-        return Err("Use image resize to change source dimensions; edit text/vector properties within their existing frame".into());
+        if !matches!(old.content, Content::Text { .. })
+            || !matches!(source.content, Content::Text { .. })
+        {
+            return Err("Only editable text fields can change source dimensions".into());
+        }
+        source.validate()?;
+        let [a, b, c, d, tx, ty] = source.matrix.map(f64::from);
+        let corners = [
+            [0., 0.],
+            [f64::from(source.width), 0.],
+            [f64::from(source.width), f64::from(source.height)],
+            [0., f64::from(source.height)],
+        ]
+        .map(|[x, y]| [a * x + c * y + tx, b * x + d * y + ty]);
+        // Keep the old projection frame so resizing never crops attached mask sources.
+        let left = corners.iter().map(|p| p[0]).fold(0., f64::min).floor();
+        let top = corners.iter().map(|p| p[1]).fold(0., f64::min).floor();
+        let right = corners
+            .iter()
+            .map(|p| p[0])
+            .fold(f64::from(layer.pixels.width), f64::max)
+            .ceil();
+        let bottom = corners
+            .iter()
+            .map(|p| p[1])
+            .fold(f64::from(layer.pixels.height), f64::max)
+            .ceil();
+        let x = f64::from(layer.x) + left;
+        let y = f64::from(layer.y) + top;
+        if [left, top, right, bottom, x, y]
+            .iter()
+            .any(|v| !v.is_finite() || v.abs() > 100000.)
+        {
+            return Err("Text field projection exceeds coordinate limits".into());
+        }
+        let (width, height) = ((right - left) as u32, (bottom - top) as u32);
+        check_size(width, height)?;
+        crate::transform::work_budget(
+            width,
+            height,
+            1 + layer.mask.as_ref().map_or(0, |mask| mask.steps.len()),
+        )?;
+        source.matrix[4] = (tx - left) as f32;
+        source.matrix[5] = (ty - top) as f32;
+        let mut replacement = layer.clone();
+        crate::transform::reframe_mask(&mut replacement, x as i32, y as i32, width, height)?;
+        if left != 0. || top != 0. {
+            for effect in &mut replacement.effects {
+                if effect.kind == "liquify" {
+                    crate::geometry::map_effect(
+                        &effect.kind,
+                        &mut effect.settings,
+                        [1., 1.],
+                        [-left as i32, -top as i32],
+                        true,
+                    )?;
+                }
+            }
+        }
+        replacement.pixels = source.render(width, height, layer.pixels.depth)?;
+        replacement.source = Some(source);
+        replacement.effect_key = id();
+        *layer = replacement;
+        return Ok(());
     }
     let pixels = source.render(layer.pixels.width, layer.pixels.height, layer.pixels.depth)?;
     layer.source = Some(source);
