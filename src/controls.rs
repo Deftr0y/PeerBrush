@@ -60,16 +60,18 @@ pub fn range_with_color(
                     widget.bg_stroke = Stroke::NONE;
                     widget.fg_stroke.color = Color32::TRANSPARENT;
                 }
-                ui.add(
-                    egui::Slider::new(value, limits.clone())
-                        // Preserve display-only fractional animation; clamp/round on an actual edit.
-                        .clamping(egui::SliderClamping::Edits)
-                        .show_value(false)
-                        // The custom bar has no handle: use its full width for native input mapping.
-                        .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.0 })
-                        .logarithmic(logarithmic)
-                        .max_decimals(decimals),
-                )
+                let mut slider = egui::Slider::new(value, limits.clone())
+                    // Preserve display-only fractional animation; clamp/round on an actual edit.
+                    .clamping(egui::SliderClamping::Edits)
+                    .show_value(false)
+                    // The custom bar has no handle: use its full width for native input mapping.
+                    .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.0 })
+                    .logarithmic(logarithmic)
+                    .max_decimals(decimals);
+                if decimals == 0 && limits.start().fract() == 0. && limits.end().fract() == 0. {
+                    slider = slider.step_by(1.);
+                }
+                ui.add(slider)
             })
             .inner
             .interact(egui::Sense::click_and_drag());
@@ -316,6 +318,214 @@ pub fn angle(
 #[cfg(test)]
 mod range_tests {
     use super::*;
+
+    fn range_frame(
+        ctx: &egui::Context,
+        value: &mut f32,
+        limits: RangeInclusive<f32>,
+        logarithmic: bool,
+        events: Vec<egui::Event>,
+    ) -> egui::Response {
+        let mut response = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(400., 180.))),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    response = Some(range(
+                        ui,
+                        "integer input",
+                        value,
+                        limits.clone(),
+                        95.,
+                        "",
+                        0,
+                        logarithmic,
+                    ));
+                });
+            },
+        );
+        response.unwrap()
+    }
+    fn range_pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+    fn range_key(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat,
+            modifiers: Default::default(),
+        }
+    }
+    #[test]
+    fn integer_ranges_focus_by_pointer_then_accumulate_keys_and_clamp() {
+        for (limits, initial, logarithmic) in [
+            (1.0..=9., 3., false),
+            (0.0..=4096., 37., false),
+            (-180.0..=180., -30., false),
+            (1.0..=1024., 64., true),
+        ] {
+            let ctx = egui::Context::default();
+            let mut value = initial;
+            let response = range_frame(&ctx, &mut value, limits.clone(), logarithmic, vec![]);
+            let pos = response.rect.center();
+            for pressed in [true, false] {
+                range_frame(
+                    &ctx,
+                    &mut value,
+                    limits.clone(),
+                    logarithmic,
+                    vec![egui::Event::PointerMoved(pos), range_pointer(pos, pressed)],
+                );
+                assert_eq!(value, initial, "Focusing an integer range must not edit it");
+            }
+            assert!(
+                response.has_focus(),
+                "The actual pointer click must focus the range"
+            );
+            for repeat in [false, true] {
+                let response = range_frame(
+                    &ctx,
+                    &mut value,
+                    limits.clone(),
+                    logarithmic,
+                    vec![range_key(egui::Key::ArrowRight, true, repeat)],
+                );
+                assert!(response.has_focus() && response.changed());
+                assert_eq!(value, initial + if repeat { 2. } else { 1. });
+            }
+            range_frame(
+                &ctx,
+                &mut value,
+                limits.clone(),
+                logarithmic,
+                vec![
+                    range_key(egui::Key::ArrowRight, false, false),
+                    range_key(egui::Key::ArrowLeft, true, false),
+                ],
+            );
+            assert_eq!(value, initial + 1.);
+            range_frame(
+                &ctx,
+                &mut value,
+                limits.clone(),
+                logarithmic,
+                vec![range_key(egui::Key::ArrowLeft, false, false)],
+            );
+            value = *limits.end();
+            let response = range_frame(
+                &ctx,
+                &mut value,
+                limits.clone(),
+                logarithmic,
+                vec![range_key(egui::Key::ArrowRight, true, false)],
+            );
+            assert_eq!(value, *limits.end());
+            assert!(!response.changed());
+            value = *limits.start();
+            range_frame(
+                &ctx,
+                &mut value,
+                limits.clone(),
+                logarithmic,
+                vec![
+                    range_key(egui::Key::ArrowRight, false, false),
+                    range_key(egui::Key::ArrowLeft, true, false),
+                ],
+            );
+            assert_eq!(value, *limits.start());
+            range_frame(
+                &ctx,
+                &mut value,
+                limits.clone(),
+                logarithmic,
+                vec![range_key(egui::Key::ArrowLeft, false, false)],
+            );
+            ctx.memory_mut(|memory| memory.surrender_focus(response.id));
+            range_frame(
+                &ctx,
+                &mut value,
+                limits.clone(),
+                logarithmic,
+                vec![range_key(egui::Key::ArrowRight, true, false)],
+            );
+            assert_eq!(
+                value,
+                *limits.start(),
+                "Unfocused ranges must not consume keyboard edits"
+            );
+        }
+    }
+    #[test]
+    fn integer_pointer_mapping_and_fractional_bounds_and_idle_values_are_preserved() {
+        for (limits, initial, fraction, expected) in [
+            (1.0..=9., 3., 0.75, 7.),
+            (-8.0..=0., -6., 0.5, -4.),
+            (0.5..=2.5, 2., 0.25, 1.),
+        ] {
+            let ctx = egui::Context::default();
+            let mut value = initial;
+            let response = range_frame(&ctx, &mut value, limits.clone(), false, vec![]);
+            let start = egui::pos2(
+                response.rect.left() + response.rect.width() * 0.1,
+                response.rect.center().y,
+            );
+            let target = egui::pos2(
+                response.rect.left() + response.rect.width() * fraction,
+                start.y,
+            );
+            range_frame(
+                &ctx,
+                &mut value,
+                limits.clone(),
+                false,
+                vec![egui::Event::PointerMoved(start), range_pointer(start, true)],
+            );
+            assert_eq!(value, initial);
+            let response = range_frame(
+                &ctx,
+                &mut value,
+                limits.clone(),
+                false,
+                vec![egui::Event::PointerMoved(target)],
+            );
+            assert!(response.dragged() && response.changed());
+            assert_eq!(value, expected);
+            range_frame(
+                &ctx,
+                &mut value,
+                limits,
+                false,
+                vec![range_pointer(target, false)],
+            );
+            assert_eq!(value, expected);
+        }
+        for logarithmic in [false, true] {
+            let ctx = egui::Context::default();
+            let mut value = 3.125_f32;
+            let before = value.to_bits();
+            for _ in 0..3 {
+                let response = range_frame(&ctx, &mut value, 1.0..=9., logarithmic, vec![]);
+                assert_eq!(
+                    value.to_bits(),
+                    before,
+                    "A presentation-only fractional value must stay exact"
+                );
+                assert!(!response.changed());
+            }
+        }
+    }
 
     #[test]
     fn range_fill_tracks_the_current_value_in_the_input_frame() {
