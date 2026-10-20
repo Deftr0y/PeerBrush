@@ -14,6 +14,7 @@ pub const CHECK_INTERVAL: u64 = 24 * 60 * 60;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub enum Owner {
     MicrosoftStore,
+    WindowsAppInstaller,
     WindowsPackage,
     LinuxPackage,
     Direct,
@@ -23,12 +24,14 @@ impl Owner {
     pub fn current() -> Self {
         #[cfg(windows)]
         {
-            use windows::ApplicationModel::{Package, PackageSignatureKind};
+            use windows::ApplicationModel::Package;
             match crate::packaged::package_family() {
                 Ok(None) => Self::Direct,
-                Ok(Some(_)) => match Package::Current().and_then(|p| p.SignatureKind()) {
-                    Ok(PackageSignatureKind::Store) => Self::MicrosoftStore,
-                    Ok(_) => Self::WindowsPackage,
+                Ok(Some(_)) => match Package::Current() {
+                    Ok(package) => windows_package_owner(package.SignatureKind(), || {
+                        // Association only; never read/expose its potentially private URI.
+                        package.GetAppInstallerInfo().is_ok()
+                    }),
                     Err(_) => Self::Unknown,
                 },
                 Err(_) => Self::Unknown,
@@ -62,11 +65,32 @@ impl Owner {
     pub fn description(self) -> &'static str {
         match self {
             Self::MicrosoftStore => "Microsoft Store manages this installation's updates.",
+            Self::WindowsAppInstaller => "Windows App Installer is associated with this installation. Its update settings and availability have not been verified.",
             Self::WindowsPackage => "Windows package installation; Store origin is not established. Use its installation provider for updates.",
             Self::LinuxPackage => "System/package-managed installation. Use its package manager; an automatic-update repository may not be configured.",
             Self::Direct => "Direct distribution or local build. Automatic installation is not configured.",
             Self::Unknown => "Installation owner could not be verified. Automatic installation is unavailable.",
         }
+    }
+}
+
+#[cfg(windows)]
+fn windows_package_owner(
+    signature: windows::core::Result<windows::ApplicationModel::PackageSignatureKind>,
+    app_installer_associated: impl FnOnce() -> bool,
+) -> Owner {
+    use windows::ApplicationModel::PackageSignatureKind;
+    match signature {
+        Ok(PackageSignatureKind::Store) => Owner::MicrosoftStore,
+        Ok(PackageSignatureKind::Developer | PackageSignatureKind::Enterprise) => {
+            if app_installer_associated() {
+                Owner::WindowsAppInstaller
+            } else {
+                Owner::WindowsPackage
+            }
+        }
+        Ok(_) => Owner::WindowsPackage,
+        Err(_) => Owner::Unknown,
     }
 }
 

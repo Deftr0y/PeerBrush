@@ -5,6 +5,47 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(windows)]
+#[test]
+fn windows_ownership_keeps_store_priority_and_queries_association_only_for_supported_signatures() {
+    use windows::ApplicationModel::PackageSignatureKind as Signature;
+    for (signature, expected) in [
+        (Ok(Signature::Store), Owner::MicrosoftStore),
+        (Ok(Signature::None), Owner::WindowsPackage),
+        (Ok(Signature::System), Owner::WindowsPackage),
+        (Ok(Signature(i32::MAX)), Owner::WindowsPackage),
+        (
+            Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                0x80004005_u32 as i32,
+            ))),
+            Owner::Unknown,
+        ),
+    ] {
+        assert_eq!(
+            windows_package_owner(signature, || panic!("association lookup must not run")),
+            expected
+        );
+    }
+    for signature in [Signature::Developer, Signature::Enterprise] {
+        for associated in [false, true] {
+            let mut queries = 0;
+            let owner = windows_package_owner(Ok(signature), || {
+                queries += 1;
+                associated
+            });
+            assert_eq!(queries, 1);
+            assert_eq!(
+                owner,
+                if associated {
+                    Owner::WindowsAppInstaller
+                } else {
+                    Owner::WindowsPackage
+                }
+            );
+        }
+    }
+}
+
 fn release(version: &str, filename: &str) -> Value {
     json!({"draft":false,"prerelease":false,"tag_name":format!("v{version}"),
         "html_url":format!("https://github.com/Deftr0y/PeerBrush/releases/tag/v{version}"),

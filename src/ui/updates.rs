@@ -285,13 +285,14 @@ mod tests {
 
     #[test]
     fn actual_menu_preference_channel_and_later_clicks_persist_without_changing_artwork() {
-        for depth in [8, 16] {
+        for (depth, owner) in [(8, Owner::Direct), (16, Owner::WindowsAppInstaller)] {
             let directory =
                 std::env::temp_dir().join(format!("pb-update-controls-{}", crate::engine::id()));
             std::fs::create_dir(&directory).unwrap();
             let (mut app, ctx) = super::super::tests::fixture();
             app.recovery.open = false;
             app.updates = Panel::load(&directory);
+            app.updates.owner = owner;
             // A recent manual attempt prevents this input test from making a network request.
             app.updates
                 .store
@@ -334,6 +335,16 @@ mod tests {
             assert!(app.updates.open);
             frame(&mut app, vec![]);
             let output = frame(&mut app, vec![]);
+            assert!(label(&output, owner.description()).is_some());
+            assert_eq!(
+                label(&output, "Public release notes do not establish your Store or package provider's update availability.").is_some(),
+                owner != Owner::Direct,
+            );
+            assert!(label(
+                &output,
+                "Automatic installation and restart are not available in this development build."
+            )
+            .is_some());
             frame(
                 &mut app,
                 click(
