@@ -415,6 +415,46 @@ fn basic(info: &JxlBasicInfo) -> Result<Info, String> {
     sample_count(result)?;
     Ok(result)
 }
+unsafe fn icc_profile(
+    raw: *const JxlDecoder,
+    target: JxlColorProfileTarget,
+) -> Result<Vec<u8>, String> {
+    let mut size = 0;
+    unsafe {
+        dec(JxlDecoderGetICCProfileSize(raw, target, &mut size))?;
+    }
+    if size == 0 || size > crate::color_profile::MAX_PROFILE_BYTES {
+        return Err("JPEG XL ICC profile exceeds the supported 4 MiB limit".into());
+    }
+    let mut bytes = vec![0; size];
+    unsafe {
+        dec(JxlDecoderGetColorAsICCProfile(
+            raw,
+            target,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+        ))?;
+    }
+    Ok(bytes)
+}
+fn validate_original_profile(cms: &mut Cms, bytes: &[u8]) -> Result<(), String> {
+    crate::color_profile::supported(bytes)?;
+    // Raw ICC headers may not expose structured fields. Preserve the RGB,
+    // CMYK and HDR checks formerly reached through the output-profile setter.
+    let mut color = MaybeUninit::<JxlColorEncoding>::uninit();
+    let mut cmyk = JxlBool::False;
+    if cms_fields(
+        ptr::from_mut(cms).cast(),
+        bytes.as_ptr(),
+        bytes.len(),
+        color.as_mut_ptr(),
+        &mut cmyk,
+    ) != JxlBool::True
+    {
+        return Err("HDR or non-RGB JPEG XL color encodings are not supported".into());
+    }
+    Ok(())
+}
 unsafe fn profile(decoder: &mut Decoder) -> Result<Vec<u8>, String> {
     let mut color = MaybeUninit::<JxlColorEncoding>::uninit();
     if unsafe {
@@ -428,62 +468,30 @@ unsafe fn profile(decoder: &mut Decoder) -> Result<Vec<u8>, String> {
     {
         return Err("HDR or non-RGB JPEG XL color encodings are not supported".into());
     }
-    let mut size = 0;
-    unsafe {
-        dec(JxlDecoderGetICCProfileSize(
-            decoder.raw,
-            JxlColorProfileTarget::Original,
-            &mut size,
-        ))?;
-    }
-    if size == 0 || size > crate::color_profile::MAX_PROFILE_BYTES {
-        return Err("JPEG XL ICC profile exceeds the supported 4 MiB limit".into());
-    }
-    let mut bytes = vec![0; size];
-    unsafe {
-        dec(JxlDecoderGetColorAsICCProfile(
-            decoder.raw,
-            JxlColorProfileTarget::Original,
-            bytes.as_mut_ptr(),
-            bytes.len(),
-        ))?;
-    }
-    crate::color_profile::supported(&bytes)?;
+    let original = unsafe { icc_profile(decoder.raw, JxlColorProfileTarget::Original)? };
+    validate_original_profile(&mut decoder.cms, &original)?;
     decoder.cms.authorized = true;
-    // Explicit output profile selection keeps lossy XYB data and the returned
-    // profile in agreement, rather than attaching Original ICC to default sRGB.
+    let data = unsafe { icc_profile(decoder.raw, JxlColorProfileTarget::Data)? };
+    // Pinned libjxl 0.12 already uses Original for non-XYB samples. Reapplying
+    // a valid raw ICC with an unknown structured transfer function can fail.
+    if data == original {
+        return Ok(original);
+    }
+    drop(data);
+    // XYB defaults can differ from Original. Select representable SDR sRGB,
+    // then return the profile of the actual output, never relabel its samples.
     unsafe {
+        JxlColorEncodingSetToSRGB(color.as_mut_ptr(), JxlBool::False);
         dec(JxlDecoderSetOutputColorProfile(
             decoder.raw,
+            color.as_ptr(),
             ptr::null(),
-            bytes.as_ptr(),
-            bytes.len(),
+            0,
         ))?;
     }
-    let mut data_size = 0;
-    unsafe {
-        dec(JxlDecoderGetICCProfileSize(
-            decoder.raw,
-            JxlColorProfileTarget::Data,
-            &mut data_size,
-        ))?;
-    }
-    if data_size != bytes.len() {
-        return Err("JPEG XL output profile does not match its samples".into());
-    }
-    let mut data = vec![0; data_size];
-    unsafe {
-        dec(JxlDecoderGetColorAsICCProfile(
-            decoder.raw,
-            JxlColorProfileTarget::Data,
-            data.as_mut_ptr(),
-            data.len(),
-        ))?;
-    }
-    if data != bytes {
-        return Err("JPEG XL output profile does not match its samples".into());
-    }
-    Ok(bytes)
+    let data = unsafe { icc_profile(decoder.raw, JxlColorProfileTarget::Data)? };
+    crate::color_profile::supported(&data)?;
+    Ok(data)
 }
 fn read(
     bytes: &[u8],
@@ -783,6 +791,42 @@ mod tests {
             JxlBool::False
         );
         assert!(cms_init(ptr::null_mut(), 1, 1, ptr::null(), ptr::null(), 255.).is_null());
+    }
+    #[test]
+    fn raw_original_profile_guard_rejects_hdr_cmyk_and_non_rgb_before_bypass() {
+        extern "C-unwind" fn fields(
+            opaque: *mut c_void,
+            _: *const u8,
+            _: usize,
+            color: *mut JxlColorEncoding,
+            cmyk: *mut JxlBool,
+        ) -> JxlBool {
+            unsafe {
+                JxlColorEncodingSetToSRGB(color, JxlBool::False);
+                *cmyk = JxlBool::False;
+                match *opaque.cast::<u8>() {
+                    0 => (*color).transfer_function = JxlTransferFunction::Unknown,
+                    1 => (*color).transfer_function = JxlTransferFunction::PQ,
+                    2 => (*color).transfer_function = JxlTransferFunction::HLG,
+                    3 => *cmyk = JxlBool::True,
+                    4 => (*color).color_space = JxlColorSpace::Gray,
+                    _ => return JxlBool::False,
+                }
+            }
+            JxlBool::True
+        }
+        let mut cms = Cms::new().unwrap();
+        let mut variant = 0_u8;
+        cms.native.set_fields_data = ptr::from_mut(&mut variant).cast();
+        cms.native.set_fields_from_icc = fields;
+        let profile = crate::color_profile::srgb_profile();
+        assert!(validate_original_profile(&mut cms, profile).is_ok());
+        for rejected in 1..=5 {
+            variant = rejected;
+            assert!(validate_original_profile(&mut cms, profile).is_err());
+        }
+        assert!(!cms.authorized);
+        assert_eq!(variant, 5);
     }
     #[test]
     fn metadata_rejects_unsupported_precision_features_and_preserves_alpha_depth() {

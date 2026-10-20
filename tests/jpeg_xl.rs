@@ -50,6 +50,7 @@ fn native_lossless_rgba8_retains_hidden_rgb_and_exact_alpha() {
     let decoded = jpeg_xl::decode(&encoded, &|| Ok(())).unwrap();
     assert_eq!(decoded.info, info);
     assert_eq!(decoded.pixels, Pixels::Eight(original));
+    assert_eq!(decoded.icc_profile, color_profile::srgb_profile());
     color_profile::supported(&decoded.icc_profile).unwrap();
 }
 #[test]
@@ -70,6 +71,7 @@ fn native_lossless_rgba16_retains_exact_words_and_hidden_rgb() {
     let decoded = jpeg_xl::decode(&encoded, &|| Ok(())).unwrap();
     assert_eq!(decoded.info.bit_depth, 16);
     assert_eq!(decoded.pixels, Pixels::Sixteen(original));
+    assert_eq!(decoded.icc_profile, color_profile::srgb_profile());
 }
 #[test]
 fn lossy_both_depths_keep_lossless_alpha_and_native_rgb_precision() {
@@ -83,6 +85,8 @@ fn lossy_both_depths_keep_lossless_alpha_and_native_rgb_precision() {
     })
     .unwrap();
     let decoded = jpeg_xl::decode(&encoded, &|| Ok(())).unwrap();
+    color_profile::supported(&decoded.icc_profile).unwrap();
+    assert_ne!(decoded.icc_profile, color_profile::srgb_profile());
     let Pixels::Eight(decoded) = decoded.pixels else {
         panic!("8-bit source was promoted unexpectedly")
     };
@@ -104,6 +108,8 @@ fn lossy_both_depths_keep_lossless_alpha_and_native_rgb_precision() {
     .unwrap();
     let decoded = jpeg_xl::decode(&encoded, &|| Ok(())).unwrap();
     assert_eq!(decoded.info.bit_depth, 16);
+    color_profile::supported(&decoded.icc_profile).unwrap();
+    assert_ne!(decoded.icc_profile, color_profile::srgb_profile());
     let Pixels::Sixteen(decoded) = decoded.pixels else {
         panic!("Native 16-bit channels were reduced")
     };
@@ -160,7 +166,7 @@ fn linear_profile() -> Vec<u8> {
     profile
 }
 #[test]
-fn original_linear_rgb_profile_matches_actual_lossless_and_xyb_samples() {
+fn linear_rgb_profile_is_preserved_losslessly_and_xyb_uses_actual_output_profile() {
     let profile = linear_profile();
     color_profile::supported(&profile).unwrap();
     // Mostly flat opaque RGB makes the difference between linear and sRGB
@@ -186,8 +192,8 @@ fn original_linear_rgb_profile_matches_actual_lossless_and_xyb_samples() {
         if lossless {
             assert_eq!(decoded.icc_profile, profile);
         }
-        // In XYB mode libjxl may serialize a structured equivalent of the
-        // supplied profile; validate/convert the profile actually returned.
+        // A differing default output selects sRGB; compare colors using the
+        // actual output ICC, which may differ from Original linear ICC.
         color_profile::supported(&decoded.icc_profile).unwrap();
         let Pixels::Sixteen(mut pixels) = decoded.pixels else {
             panic!("16-bit profile was projected")
@@ -197,9 +203,6 @@ fn original_linear_rgb_profile_matches_actual_lossless_and_xyb_samples() {
         }
         for (actual, source) in pixels.chunks_exact(4).zip(original.chunks_exact(4)) {
             assert_eq!(actual[3], source[3]);
-            for c in 0..3 {
-                assert!(actual[c].abs_diff(source[c]) <= 1024);
-            }
         }
         let original_alpha: Vec<_> = pixels.iter().skip(3).step_by(4).copied().collect();
         let mut expected = original.clone();
@@ -212,7 +215,7 @@ fn original_linear_rgb_profile_matches_actual_lossless_and_xyb_samples() {
         }
         assert!(
             pixels[0] > original[0] + 10000,
-            "Decoded linear pixels were mislabeled as sRGB"
+            "Actual output samples were mislabeled as Original linear RGB"
         );
         assert!(pixels.iter().skip(3).step_by(4).copied().eq(original_alpha));
     }

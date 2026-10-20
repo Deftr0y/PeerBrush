@@ -784,7 +784,7 @@ pub(crate) fn request_with_control(
                         }
                         crate::jpeg_xl::Pixels::Sixteen(words) => words,
                     };
-                    // Lossy output can carry a structured equivalent profile;
+                    // Use the actual decoded profile; XYB output can differ from Original.
                     // display the decoded samples in their actual returned ICC.
                     crate::color_profile::convert16(&decoded.icc_profile, &mut words)?;
                     managed = true;
