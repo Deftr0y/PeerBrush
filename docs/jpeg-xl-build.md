@@ -64,3 +64,16 @@ licenses remain. BUILD_TESTING and native tools are disabled. Exact omissions:
 Integration codec tests launch the application worker in the matching Cargo profile directory. Run `python scripts/jxl_build.py -- build --locked --bin peerbrush` before the corresponding test command. The development test helper and all current native CI callers do so. Installed launches use their exact current executable, including renamed installations; no PATH-selected or configurable worker executable is accepted.
 
 The reviewed hosted-tool versions come from GitHub's official [Windows 2025](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md), [Ubuntu 24.04](https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md) and [macOS 26](https://github.com/actions/runner-images/blob/main/images/macos/macos-26-Readme.md) inventories. Their presence is not a successful PeerBrush native build; CI must establish that separately.
+
+[Candidate run 39495431220](https://github.com/Deftr0y/PeerBrush/actions/runs/39495431220)
+used Windows VS2026 image `20261007.264.1` and macOS ARM64 image `20261013.0424.1`.
+Their fixed official inventories ([Windows](https://github.com/actions/runner-images/blob/aee0669dd04510a11756664eb77f5630debabed3/images/windows/Windows2025-VS2026-Readme.md),
+[macOS](https://github.com/actions/runner-images/blob/49bfbe040355338053d9ef330e4e7a1190c59714/images/macos/macos-26-arm64-Readme.md))
+list CMake `4.4.4` and Ninja `1.13.2`, with LLVM `20.1.8` on Windows and
+Clang/LLVM `21.0.0` on macOS. Both platform selectors include that exact CMake
+version alongside previously reviewed versions. Both jobs stopped during tool
+qualification before compiling PeerBrush; their errors did not report the selected
+numeric version. Rejected versions now report only a bounded numeric candidate,
+with no tool path or raw output. A subsequent native run must confirm the selected
+versions and successful compilation and acceptance tests; the inventories alone
+do not establish build compatibility.

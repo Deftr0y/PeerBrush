@@ -10,9 +10,9 @@ import subprocess
 # Official hosted-image inventories plus the privately tested Windows tools.
 # A changed image needs an explicit reviewed adjustment, never a latest fetch.
 VERSIONS = {
-    'Windows': {'clang': {'20.1.8', '21.1.8'}, 'cmake': {'3.31.6', '3.31.12'}},
+    'Windows': {'clang': {'20.1.8', '21.1.8'}, 'cmake': {'3.31.6', '3.31.12', '4.4.4'}},
     'Linux': {'clang': {'18.1.3'}, 'cmake': {'3.31.6'}},
-    'Darwin': {'clang': {'21.0.0'}, 'cmake': {'4.4.2'}},
+    'Darwin': {'clang': {'21.0.0'}, 'cmake': {'4.4.2', '4.4.4'}},
 }
 
 
@@ -39,7 +39,10 @@ def tool(name, kind, allowed, environment):
                'ninja': r'^([0-9]+\.[0-9]+\.[0-9]+)\s*$'}[kind]
     match = re.search(pattern, output)
     if not match or match[1] not in allowed:
-        raise ValueError('Unqualified native JPEG XL build tool version: ' + name)
+        prefix = {'clang': r'(?:Apple )?clang version ', 'cmake': r'^cmake version ', 'ninja': r'^'}[kind]
+        candidate = re.search(prefix + r'([0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5})(?![0-9.])', output)
+        numeric = candidate[1] if candidate else 'unparsed'
+        raise ValueError('Unqualified native JPEG XL build tool version: ' + name + ' (numeric=' + numeric + ')')
     return str(path), match[1]
 
 

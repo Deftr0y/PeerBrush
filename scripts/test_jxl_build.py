@@ -71,6 +71,39 @@ class NativeJxlBuild(unittest.TestCase):
                     jxl_build.tool('clang-cl', 'clang', {'21.1.8'}, {})
                 run.assert_not_called()
 
+    def test_numeric_version_diagnostic_is_bounded_private_and_does_not_relax_suffixes(self):
+        secret = 'PRIVATE_TOOL_PATH_OUTPUT_AND_STDERR'
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / secret
+            executable.write_text('fixture never executed', encoding='utf-8')
+            response = subprocess.CompletedProcess([], 0, b'cmake version 4.4.4\n', secret.encode())
+            with mock.patch.object(jxl_build.shutil, 'which', return_value=str(executable)), \
+                    mock.patch.object(jxl_build.subprocess, 'run', return_value=response):
+                for system in ['Windows', 'Darwin']:
+                    with self.subTest(platform=system):
+                        self.assertEqual(jxl_build.tool('cmake', 'cmake', jxl_build.VERSIONS[system]['cmake'], {}),
+                                         (str(executable.resolve()), '4.4.4'))
+                allowed = jxl_build.VERSIONS['Windows']['cmake']
+                cases = [
+                    ('cmake', 'cmake', allowed, b'cmake version 4.4.3\n', '4.4.3'),
+                    ('cmake', 'cmake', allowed, b'cmake version 4.4.4-msvc\n', '4.4.4'),
+                    ('cmake', 'cmake', allowed, b'cmake version 3.31.6-msvc\n', '3.31.6'),
+                    ('cmake', 'cmake', allowed, b'cmake version 4.4.4', '4.4.4'),
+                    ('cmake', 'cmake', allowed, b'cmake version 123456.4.4\n', 'unparsed'),
+                    ('cmake', 'cmake', allowed, secret.encode(), 'unparsed'),
+                    ('ninja', 'ninja', {'1.13.2'}, b'1.13.3 ' + secret.encode(), '1.13.3'),
+                    ('clang-cl', 'clang', {'21.1.8'}, b'clang version 22.0.0 ' + secret.encode(), '22.0.0'),
+                ]
+                for name, kind, versions, output, numeric in cases:
+                    response.stdout = output
+                    with self.subTest(tool=name, numeric=numeric), self.assertRaises(ValueError) as caught:
+                        jxl_build.tool(name, kind, versions, {})
+                    self.assertEqual(str(caught.exception),
+                        'Unqualified native JPEG XL build tool version: ' + name + ' (numeric=' + numeric + ')')
+                    self.assertNotIn(secret, str(caught.exception))
+                    self.assertNotIn(str(executable), str(caught.exception))
+                    self.assertLess(len(str(caught.exception)), 100)
+
     def test_configure_selects_two_jobs_and_matching_native_compilers(self):
         with mock.patch.object(jxl_build.platform, 'system', return_value='Windows'), mock.patch.object(jxl_build, 'tool', side_effect=[
                 ('C:/fixture/clang-cl.exe', '21.1.8'), ('C:/fixture/clang-cl.exe', '21.1.8'),
