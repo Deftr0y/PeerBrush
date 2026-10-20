@@ -146,8 +146,11 @@ impl Station {
             }
         }
     }
+    pub fn open(&self) -> clipboard_win::Clipboard {
+        clipboard_win::Clipboard::new_for(self.window).unwrap()
+    }
     pub fn set_raw(&self, format: u32, bytes: &[u8]) {
-        let _open = clipboard_win::Clipboard::new_for(self.window).unwrap();
+        let _open = self.open();
         clipboard_win::raw::set(format, bytes).unwrap();
     }
     pub fn receive<T>(&self, receiver: &std::sync::mpsc::Receiver<T>) -> T {

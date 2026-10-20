@@ -478,7 +478,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
         .unwrap();
     let sequence = clipboard_win::seq_num();
     {
-        let _open = clipboard_win::Clipboard::new().unwrap();
+        let _open = station.open();
         let reply = worker.image_dimensions().unwrap();
         assert!(station.receive(&reply).is_err());
     }
