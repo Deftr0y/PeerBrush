@@ -3521,7 +3521,7 @@ mod connection_tests {
             let response = json!({"ok":true,"result":{"jsonrpc":"2.0",
                 "id":body["params"]["request"]["id"],"result":{}}})
             .to_string()
-                + &" ".repeat(64 * 1024);
+                + " ".repeat(64 * 1024).as_str();
             let _ = request.respond(tiny_http::Response::from_string(response));
         });
         check(
