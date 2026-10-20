@@ -140,10 +140,8 @@ pub(super) fn worker() -> Result<(), String> {
                 return Err(ERROR.into());
             }
         }
-        #[cfg(target_os = "macos")]
-        // RLIMIT_AS aliases advisory RLIMIT_RSS on Darwin. Parent samples the
-        // physical footprint; do not claim setrlimit is a hard allocation cap.
-        limit!(libc::RLIMIT_RSS, MEMORY);
+        // Darwin RSS aliases virtual AS, not physical footprint. Preserve its
+        // inherited AS policy; the parent enforces the physical watchdog.
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return Err(ERROR.into());
     }

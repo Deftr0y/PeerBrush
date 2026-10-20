@@ -39,6 +39,19 @@ class Diagnostics(unittest.TestCase):
         self.assertIn('file=src/source.rs,line=12,col=3', output)
         self.assertNotIn('Regression test run failed', output)
 
+    def test_worker_timeout_category_is_anchored_allowlisted_and_private(self):
+        name = 'jpeg_xl::tests::abnormal_exit_abort_protocol_damage_and_timeout_preserve_parent_native_work'
+        for code in ['FAILED', 'PROTOCOL', 'RESOURCE', 'OTHER']:
+            output = self.summarize(
+                'test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n'
+                'thread \'' + name + '\' panicked at src/jpeg_xl/tests.rs:365:9:\n'
+                'JXL_TIMEOUT_ERROR_' + code + '\n' + PRIVATE)
+            self.assertIn(name + ': JXL_WORKER_' + code, output)
+        for marker in ['JXL_TIMEOUT_ERROR_' + PRIVATE, 'JXL_TIMEOUT_ERROR_RESOURCE ' + PRIVATE,
+                       PRIVATE + ' JXL_TIMEOUT_ERROR_RESOURCE']:
+            output = self.summarize('test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n' + marker)
+            self.assertNotIn('Regression failure category', output)
+
     def test_unknown_output_never_turns_warning_locations_into_compiler_errors(self):
         output = self.summarize('warning: example\n  --> src/gpu.rs:8:2\n' + PRIVATE)
         self.assertIn('UNKNOWN', output)

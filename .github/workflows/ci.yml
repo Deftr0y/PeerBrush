@@ -152,6 +152,7 @@ jobs:
                   name, body = sections[index:index + 2]
                   if name in failures:
                       matched = [code for code, marker in kinds.items() if marker in body]
+                      matched += ['JXL_WORKER_' + code for code in sorted(set(re.findall(r'^JXL_TIMEOUT_ERROR_(FAILED|PROTOCOL|RESOURCE|OTHER)$', body, re.M)))]
                       if matched:
                           print('::error title=Regression failure category::' + name[:128] + ': ' + ', '.join(matched))
           elif int(sys.argv[3]):

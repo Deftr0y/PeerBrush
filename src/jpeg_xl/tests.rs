@@ -22,6 +22,81 @@ pub(super) fn read_test_ready(input: &mut impl Read) -> Result<Response, String>
     }
     Err(PROTOCOL.into())
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type NativeLimits = [(libc::rlim_t, libc::rlim_t); 3];
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn native_limits() -> Result<NativeLimits, String> {
+    let read = |resource| {
+        let mut value = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        if unsafe { libc::getrlimit(resource, value.as_mut_ptr()) } != 0 {
+            return Err(PROTOCOL.to_string());
+        }
+        let value = unsafe { value.assume_init() };
+        Ok((value.rlim_cur, value.rlim_max))
+    };
+    Ok([
+        read(libc::RLIMIT_CORE)?,
+        read(libc::RLIMIT_CPU)?,
+        read(libc::RLIMIT_AS)?,
+    ])
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_child_limits(inherited: NativeLimits) -> Result<(), String> {
+    let address_space = if cfg!(target_os = "linux") {
+        let budget = 1536 * 1024 * 1024;
+        (inherited[2].0.min(budget), inherited[2].1.min(budget))
+    } else {
+        inherited[2]
+    };
+    let expected = [
+        (0, 0),
+        (inherited[1].0.min(120), inherited[1].1.min(120)),
+        address_space,
+    ];
+    if native_limits()? != expected {
+        return Err("JPEG XL fixture child resource policy mismatch".into());
+    }
+    Ok(())
+}
+
+fn timeout_category(error: &str) -> &'static str {
+    match error {
+        FAILED => "FAILED",
+        PROTOCOL => "PROTOCOL",
+        "JPEG XL worker resource protection is unavailable or exceeded" => "RESOURCE",
+        _ => "OTHER",
+    }
+}
+
+#[test]
+fn timeout_diagnostic_exposes_only_fixed_worker_categories() {
+    for (error, expected) in [
+        (FAILED, "FAILED"),
+        (PROTOCOL, "PROTOCOL"),
+        (
+            "JPEG XL worker resource protection is unavailable or exceeded",
+            "RESOURCE",
+        ),
+        ("PRIVATE_WORKER_DETAIL_OR_PATH", "OTHER"),
+    ] {
+        assert_eq!(timeout_category(error), expected);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn completed_native_workers_apply_child_limits_and_preserve_parent_policy() {
+    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    let inherited = native_limits().unwrap();
+    for depth in [8, 16] {
+        // The exact known child verifies actual OS limits after successful native work.
+        healthy_child(depth);
+    }
+    assert_eq!(native_limits().unwrap(), inherited);
+}
+
 fn fault() -> String {
     std::env::var("PEERBRUSH_JXL_TEST_FAULT").unwrap_or_default()
 }
@@ -109,7 +184,15 @@ fn worker_entry() {
     if std::env::var("PEERBRUSH_JXL_TEST_ENTRY").ok().as_deref() != Some("1") {
         return;
     }
-    std::process::exit(if worker().is_ok() { 0 } else { 2 });
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let inherited = match native_limits() {
+        Ok(value) => value,
+        Err(_) => std::process::exit(3),
+    };
+    let result = worker();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let result = result.and_then(|()| verify_child_limits(inherited));
+    std::process::exit(if result.is_ok() { 0 } else { 2 });
 }
 pub(super) fn runtime(
     fault: &str,
@@ -362,7 +445,11 @@ fn abnormal_exit_abort_protocol_damage_and_timeout_preserve_parent_native_work()
         )
         .err()
         .unwrap();
-        assert!(error.contains("timed out"));
+        assert!(
+            error.contains("timed out"),
+            "JXL_TIMEOUT_ERROR_{}",
+            timeout_category(&error)
+        );
         assert_eq!(serde_json::to_value(&doc).unwrap(), before);
     }
 }
