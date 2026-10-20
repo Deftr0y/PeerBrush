@@ -319,6 +319,44 @@ class Msix(unittest.TestCase):
         path,stage=self.synthetic_msix(change)
         with self.assertRaisesRegex(ValueError,'block hash'):msix.verify_packed(path,stage)
 
+    def test_native_sdk_whole_file_hash_is_verified_without_ignoring_other_children(self):
+        expected = {'large.bin': bytes(range(256)) * 256 + b'last',
+                    'one-block.bin': bytes(range(256)) * 256, 'empty.bin': b''}
+        def extension(files, case='valid'):
+            root = ET.fromstring(files['AppxBlockMap.xml'])
+            root.set('xmlns:b4', 'http://schemas.microsoft.com/appx/2021/blockmap')
+            root.set('IgnorableNamespaces', 'b4')
+            nodes = {node.get('Name'): node for node in root}
+            name = 'one-block.bin' if case == 'small' else 'empty.bin' if case == 'empty' else 'large.bin'
+            node = nodes[name]
+            digest = base64.b64encode(hashlib.sha256(expected[name]).digest()).decode()
+            file_hash = ET.SubElement(node, 'b4:FileHash', Hash=digest)
+            if case == 'wrong-hash':
+                file_hash.set('Hash', base64.b64encode(hashlib.sha256(b'different').digest()).decode())
+            elif case == 'duplicate':
+                ET.SubElement(node, 'b4:FileHash', Hash=digest)
+            elif case == 'unknown-namespace':
+                root.set('xmlns:b4', 'http://schemas.microsoft.com/appx/2099/blockmap')
+            elif case == 'unknown-attribute':
+                file_hash.set('Size', str(len(expected[name])))
+            elif case == 'text':
+                file_hash.text = 'unexpected'
+            elif case == 'nested':
+                ET.SubElement(file_hash, 'Ignored')
+            elif case == 'misordered':
+                node.remove(file_hash)
+                node.insert(0, file_hash)
+            elif case == 'wrong-block':
+                node[0].set('Hash', 'invalid')
+            files['AppxBlockMap.xml'] = ET.tostring(root)
+        msix.verify_payload(io.BytesIO(synthetic_package(expected)), expected)
+        msix.verify_payload(io.BytesIO(synthetic_package(expected, extension)), expected)
+        for case in ['wrong-hash', 'duplicate', 'unknown-namespace', 'unknown-attribute',
+                     'text', 'nested', 'misordered', 'small', 'empty', 'wrong-block']:
+            package = synthetic_package(expected, lambda files: extension(files, case))
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                msix.verify_payload(io.BytesIO(package), expected)
+
     def test_source_derived_payload_rejects_repacked_changed_executable(self):
         expected, _ = msix.expected_payload(self.root, self.archive, self.identity)
         package = synthetic_package(expected)

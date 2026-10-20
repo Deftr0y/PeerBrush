@@ -422,7 +422,8 @@ def verify_payload(package_path, expected):
                 or content_types['AppxBlockMap.xml'] != 'application/vnd.ms-appx.blockmap+xml'):
             raise ValueError('Unexpected MSIX manifest or block-map content type')
         blocks = ET.fromstring(package.read('AppxBlockMap.xml'))
-        ns = {'b': 'http://schemas.microsoft.com/appx/2010/blockmap'}
+        ns = {'b': 'http://schemas.microsoft.com/appx/2010/blockmap',
+              'b4': 'http://schemas.microsoft.com/appx/2021/blockmap'}
         if blocks.tag != '{'+ns['b']+'}BlockMap' or blocks.get('HashMethod') != 'http://www.w3.org/2001/04/xmlenc#sha256':
             raise ValueError('Unexpected block-map hash algorithm')
         block_files = blocks.findall('b:File',ns)
@@ -439,9 +440,21 @@ def verify_payload(package_path, expected):
                 raise ValueError('Invalid MSIX local file header')
             header_size = 30 + sum(struct.unpack_from('<HH', header, 26))
             children = node.findall('b:Block',ns)
+            file_hashes = node.findall('b4:FileHash', ns)
+            if len(file_hashes) > 1 or len(node) != len(children) + len(file_hashes):
+                raise ValueError('Unexpected MSIX block-map file child')
+            if file_hashes:
+                file_hash = file_hashes[0]
+                # The SDK's 2021 extension follows all blocks for files >64KiB.
+                if (len(data) <= 65536 or node[-1] is not file_hash
+                        or set(file_hash.attrib) != {'Hash'} or len(file_hash)
+                        or (file_hash.text or '').strip()):
+                    raise ValueError('Invalid MSIX whole-file hash metadata')
+                if file_hash.get('Hash') != base64.b64encode(hashlib.sha256(data).digest()).decode():
+                    raise ValueError('MSIX whole-file hash mismatch')
             hashes = [n.get('Hash') for n in children]
             actual = [base64.b64encode(hashlib.sha256(data[i:i+65536]).digest()).decode() for i in range(0,len(data),65536)]
-            if (set(node.attrib) != {'Name', 'Size', 'LfhSize'} or len(node) != len(children)
+            if (set(node.attrib) != {'Name', 'Size', 'LfhSize'}
                     or node.get('Size') != str(len(data)) or node.get('LfhSize') != str(header_size)
                     or hashes != actual):
                 raise ValueError('MSIX block hash mismatch')
