@@ -65,6 +65,8 @@ pub fn range_with_color(
                         // Preserve display-only fractional animation; clamp/round on an actual edit.
                         .clamping(egui::SliderClamping::Edits)
                         .show_value(false)
+                        // The custom bar has no handle: use its full width for native input mapping.
+                        .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.0 })
                         .logarithmic(logarithmic)
                         .max_decimals(decimals),
                 )
