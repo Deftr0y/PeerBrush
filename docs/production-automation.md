@@ -51,3 +51,22 @@ Offline checks are `scripts/test_store_release_state.py`, `scripts/test_producti
 
 
 Unreleased final-DMG verification now has an independent native consumer, `qualify_macos_dmg.py`, described in [Mac signing](macos-signing.md#independent-final-dmg-qualification-unreleased). It reconstructs expected content from independently selected signed ZIP/source bytes and repeats actual native trust, read-only mount and whole-device cleanup checks rather than accepting a signer receipt. Fresh exclusive sanitized qualification stays false for installation/production readiness. Final DMG/MSIX aggregate handoff, protected native-job authentication, signing activation and public website eligibility remain separate unfinished adapters; this addition cannot make a missing package ready.
+
+## Final-DMG candidate handoff (unreleased)
+
+Before the first publication, select the signed/stapled Mac ZIP together with Windows/Linux portable archives, and build their exact-source four-record seed with `verify_release.py`. Add the independently inspected final DEB through the existing handoff. Then append the independently selected final DMG to a fresh external directory:
+
+```sh
+python -B scripts/production_readiness.py --source-root "$RELEASE_SOURCE" \
+  --directory "$FIVE_RECORD_CANDIDATE" --include-dmg "$FINAL_DMG" \
+  --dmg-sha256 "$DMG_SHA256" --macos-portable-sha256 "$SIGNED_ZIP_SHA256" \
+  --dmg-qualification "$NATIVE_QUALIFICATION" --dmg-qualification-sha256 "$QUALIFICATION_SHA256" \
+  --macos-team-id "$PUBLIC_TEAM_ID" --deb-sha256 "$DEB_SHA256" \
+  --portable-sha256 "$LINUX_ZIP_SHA256" --maintainer "$PUBLIC_MAINTAINER" \
+  --commit "$RELEASE_COMMIT" --version "$RELEASE_VERSION" \
+  --previous-inventory "$PREVIOUS_PUBLISHED_INVENTORY" --output "$FRESH_FINAL_CANDIDATE"
+```
+
+All inputs are independently selected public values or private paths; no credential is accepted. Existing Mac ZIP selection cannot be silently replaced. Only the six listed assets, canonical inventory/checksums and sanitized readiness are copied; native signing journals and private receipts stay outside. Reinspection requires the same external hashes/Team and qualification inputs. A same-version published four/five-record set cannot gain a DMG through handoff or direct reinspection; select a new version. Matching complete six-record selections may be reconciled without publication.
+
+Strict schema and digest matching binds native claims to selected bytes, and does not authenticate a native job. Overall `candidate_verified:false`, `asset_binding_verified:true`, unverified native producer/availability and false readiness are deliberate. Protected trusted native-job consumption, actual installation/update acceptance, publication and website installed-download adapters remain required. `--require-ready` returns a failing readiness status. Neither handoff nor local [Store preflight](msix.md#local-store-candidate-preflight-unreleased) publishes or activates a hosted workflow.

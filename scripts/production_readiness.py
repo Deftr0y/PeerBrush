@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -9,6 +10,7 @@ import stat
 from verify_release import inspect_archive
 from package import regular_file, relative_path
 from package_deb import inspect_final
+from package_macos_dmg import bounded_file, private_inspection_directory
 
 
 DEB_INSTALLATION_CHECKS = {'installation': 'passed', 'installed-build-identity': 'passed',
@@ -19,6 +21,7 @@ DEB_INSTALLATION_LIMITS = {'native-gui': 'not-performed', 'real-application-vers
                            'publisher-signature': 'not-performed', 'update-repository': 'not-configured',
                            'public-availability': 'not-assessed'}
 MAX_INSTALLATION_RECEIPT_BYTES = 64 * 1024
+MAX_DMG_QUALIFICATION_BYTES = 8192
 
 
 def unique_fields(pairs):
@@ -71,7 +74,9 @@ def immutable(previous, current):
 
 
 def assess(directory, commit, version, previous=None, source_root=None, *,
-           deb_sha256=None, linux_portable_sha256=None, maintainer=None, _inventory_bytes=None):
+           deb_sha256=None, linux_portable_sha256=None, maintainer=None, _inventory_bytes=None,
+           dmg_sha256=None, macos_portable_sha256=None, dmg_qualification=None,
+           dmg_qualification_sha256=None, macos_team_id=None):
     directory = Path(directory)
     if not re.fullmatch('[0-9a-f]{40}', commit) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?', version):
         raise ValueError('Expected an exact source SHA and Cargo release version.')
@@ -87,11 +92,14 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
             or inventory.get('packaging_correction') is not None):
         raise ValueError('Production requires one exact source commit, without relabelled older binaries.')
     assets = inventory.get('assets')
-    if not isinstance(assets, list) or len(assets) not in (4, 5) or any(not isinstance(a, dict) for a in assets):
-        raise ValueError('Candidates require three portable platforms, matching source and at most one final DEB.')
+    if not isinstance(assets, list) or len(assets) not in (4, 5, 6) or any(not isinstance(a, dict) for a in assets):
+        raise ValueError('Candidates require three portable platforms, source, optional DEB and final DMG.')
     deb_inputs = [deb_sha256, linux_portable_sha256, maintainer]
-    if (len(assets) == 5 and not all(deb_inputs)) or (len(assets) == 4 and any(value is not None for value in deb_inputs)):
-        raise ValueError('Five-record candidates require explicit DEB/portable hashes and public maintainer; four-record candidates do not accept DEB inputs.')
+    if (len(assets) >= 5 and not all(deb_inputs)) or (len(assets) == 4 and any(value is not None for value in deb_inputs)):
+        raise ValueError('Five/six-record candidates require explicit DEB/portable hashes and public maintainer; four-record candidates do not accept DEB inputs.')
+    dmg_inputs = [dmg_sha256, macos_portable_sha256, dmg_qualification, dmg_qualification_sha256, macos_team_id]
+    if (len(assets) == 6 and not all(dmg_inputs)) or (len(assets) != 6 and any(value is not None for value in dmg_inputs)):
+        raise ValueError('Six-record candidates require explicit DMG/signed ZIP/qualification hashes, qualification bytes and publisher Team; other candidates cannot accept DMG inputs.')
     names = [a.get('file') for a in assets]
     if (any(not isinstance(name, str) or len(relative_path(name).parts) != 1 for name in names)
             or len({name.casefold() for name in names}) != len(assets)):
@@ -119,15 +127,22 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
         raise ValueError('Corresponding source changed during inspection.')
     deb = None
     linux = None
+    dmg = None
+    macos = None
     for asset in assets:
         if 'platform' not in asset:
             if set(asset) != {'file', 'bytes', 'sha256'} or asset['file'] != source_name:
                 raise ValueError('Unexpected corresponding-source filename.')
             continue
         if asset['file'].endswith('.deb'):
-            if len(assets) != 5 or deb is not None:
+            if len(assets) < 5 or deb is not None:
                 raise ValueError('Expected exactly one final DEB beside the portable candidates.')
             deb = asset
+            continue
+        if asset['file'].endswith('.dmg'):
+            if len(assets) != 6 or dmg is not None:
+                raise ValueError('Expected exactly one selected final DMG in six-record candidates.')
+            dmg = asset
             continue
         inspected = inspect_archive(directory / asset['file'], commit, version, source_root)
         if inspected['record'] != asset or inspected['source'] != source:
@@ -135,6 +150,8 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
         platform = asset['platform']
         if platform == 'Linux':
             linux = asset
+        if platform == 'macOS':
+            macos = asset
         if platform in platforms:
             raise ValueError('Duplicate platform candidate.')
         platforms[platform] = dict(file=asset['file'], sha256=asset['sha256'],
@@ -145,7 +162,7 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
     if set(platforms) != {'Windows', 'macOS', 'Linux'}:
         raise ValueError('All three exact-source platform candidates are required.')
     installed = None
-    if len(assets) == 5:
+    if len(assets) >= 5:
         if deb is None or linux['sha256'] != linux_portable_sha256:
             raise ValueError('Final DEB selection differs from the exact Linux portable inventory record.')
         inspected = inspect_final(source_root or Path(__file__).resolve().parents[1], directory / linux['file'],
@@ -157,8 +174,21 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
                                     content_checks=inspected['content_checks'], native_signatures='not-verified',
                                     installed_acceptance='not-established-by-aggregate',
                                     producer_provenance='requires-successful-same-workflow-native-job'))
+    if len(assets) == 6:
+        if dmg is None or macos['sha256'] != macos_portable_sha256:
+            raise ValueError('Final DMG selection differs from the selected signed Mac portable record.')
+        bound = bind_dmg(source_root or Path(__file__).resolve().parents[1], directory / macos['file'], directory / dmg['file'],
+                         commit=commit, version=version, archive_sha256=macos_portable_sha256, image_sha256=dmg_sha256,
+                         qualification=dmg_qualification, qualification_sha256=dmg_qualification_sha256, team_id=macos_team_id)
+        if bound['record'] != dmg:
+            raise ValueError('Final DMG inventory differs from its selected bytes, source or strict public record.')
+        installed['macOS'] = bound
     if previous is not None:
         immutable(previous, inventory)
+        if (dmg is not None and previous['version'] == version
+                and {asset['file']: asset['sha256'] for asset in previous['assets']}
+                != {asset['file']: asset['sha256'] for asset in inventory['assets']}):
+            raise ValueError('A published version cannot gain or replace final inventory assets; select a new version.')
     # Existing ZIP inspection is real evidence, but cannot establish installed-
     # package acceptance, trusted native signatures, or protected approval.
     blockers = ['protected-publication-approval-not-configured',
@@ -170,13 +200,75 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
         blockers.append('published-version-immutability-not-reconciled')
     if '-' in version:
         blockers.append('prerelease-version')
+    if dmg is not None:
+        blockers.append('macos-native-job-provenance-unverified')
     result = dict(schema=1, version=version, commit=commit,
-                candidate_verified=True, production_ready=False,
+                candidate_verified=dmg is None, production_ready=False,
                 immutable_version='checked-against-supplied-inventory' if previous else 'unverified',
                 platforms=platforms, blockers=blockers)
     if installed is not None:
         result['installed_candidates'] = installed
+    if dmg is not None:
+        result['asset_binding_verified'] = True
     return result
+
+
+def bind_dmg(root, archive, image, *, commit, version, archive_sha256, image_sha256,
+             qualification, qualification_sha256, team_id):
+    """Bind independently selected native claims to bytes; JSON cannot authenticate execution."""
+    if (not isinstance(version, str) or len(version) > 32
+            or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
+            or not isinstance(commit, str) or not re.fullmatch('[0-9a-f]{40}', commit)
+            or not isinstance(team_id, str) or not re.fullmatch('[A-Z0-9]{10}', team_id)
+            or any(not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value)
+                   for value in [archive_sha256, image_sha256, qualification_sha256])
+            or not isinstance(qualification, bytes) or not 0 < len(qualification) <= MAX_DMG_QUALIFICATION_BYTES
+            or hashlib.sha256(qualification).hexdigest() != qualification_sha256):
+        raise ValueError('Final DMG binding requires explicit stable source, independent hashes and bounded qualification bytes.')
+    archive, image = handoff_path(archive), handoff_path(image)
+    if (not re.fullmatch('PeerBrush-' + re.escape(version) + r'-macOS-arm64-apple-signed-r[1-9][0-9]*\.zip', archive.name)
+            or not re.fullmatch(re.escape(archive.stem) + r'-dmg-signed-r[1-9][0-9]*\.dmg', image.name)
+            or bounded_file(archive, 512 * 1024 * 1024)[0] != archive_sha256):
+        raise ValueError('Final DMG requires the explicitly selected signed ZIP, not an unsigned replacement.')
+    image_hash, image_bytes = bounded_file(image, 512 * 1024 * 1024)
+    if image_hash != image_sha256 or image_bytes == 0:
+        raise ValueError('Final DMG bytes differ from the independently selected SHA256.')
+    checked = inspect_archive(archive, commit, version, root)
+    manifest = checked['manifest']
+    if (checked['packaging_correction'] or checked['record']['binary_source_commit'] != commit
+            or checked['record']['sha256'] != archive_sha256 or manifest['platform'] != 'macOS'
+            or manifest['architecture'] != 'arm64' or not checked['signing_suffix']
+            or manifest['native_publisher_signing'] != 'developer-id-notarized'
+            or manifest['macos_signing']['team_id'] != team_id):
+        raise ValueError('Signed ZIP source or publisher metadata differs from the selected candidate.')
+    record = dict(file=image.name, bytes=image_bytes, sha256=image_sha256, platform='macOS', architecture='arm64',
+                  binary_source_commit=commit, source_sha256=manifest['source_sha256'])
+    expected = dict(schema=1, format='PeerBrushDmgQualificationV1', version=version, commit=commit,
+                    record=record, signed_zip=dict(file=archive.name, sha256=archive_sha256),
+                    executable_sha256=manifest['executable_sha256'], publisher_team_id=team_id,
+                    candidate_verified=True, ready=False, production_ready=False, public_availability='unverified',
+                    content_checks=['exact-source-signed-zip-and-corresponding-source', 'exact-mounted-files-modes-and-Applications-link'],
+                    native_checks=['Developer-ID-publisher-and-secure-timestamps', 'app-hardened-runtime-and-empty-entitlements',
+                                   'image-and-app-stapled-tickets-and-Gatekeeper', 'hdiutil-integrity-and-read-only-mount'],
+                    limits={'drag-to-Applications-and-launch': 'not-performed', 'fresh-quarantined-download': 'not-performed',
+                            'upgrade-settings-and-unsaved-work': 'not-performed', 'public-availability': 'not-assessed'},
+                    native_job_provenance='requires-trusted-native-job-at-consumption')
+    try:
+        actual = json.loads(qualification.decode('utf-8'), object_pairs_hook=unique_fields)
+        # Canonical serialization distinguishes bool/int/float, unlike Python
+        # equality. Only this exact bounded producer schema is supported.
+        if json.dumps(actual, sort_keys=True, allow_nan=False) != json.dumps(expected, sort_keys=True):
+            raise ValueError('mismatch')
+    except (ValueError, UnicodeError, RecursionError):
+        raise ValueError('DMG qualification differs from the exact selected bytes, source, schema or limits.') from None
+    if bounded_file(archive, 512 * 1024 * 1024)[0] != archive_sha256 or bounded_file(image, 512 * 1024 * 1024)[0] != image_sha256:
+        raise ValueError('DMG or signed ZIP changed during qualification binding.')
+    return dict(record=record, bytes_verified=True, candidate_verified=False, ready=False, public_availability='unverified',
+                signed_zip=dict(file=archive.name, sha256=archive_sha256), qualification_sha256=qualification_sha256,
+                qualification_binding='exact-schema-and-independent-digest-matched',
+                native_verification='not-performed-by-aggregate',
+                native_producer_authentication='unverified-requires-trusted-native-job',
+                installed_acceptance='not-established-by-aggregate')
 
 
 def handoff_path(path, new=False):
@@ -254,6 +346,91 @@ def handoff_deb(directory, package, output, commit, version, *, package_sha256,
     return result
 
 
+def read_previous_inventory(path):
+    path = handoff_path(path)
+    with regular_file(path.parent, path.name).open('rb') as stream:
+        data = stream.read(64 * 1024 + 1)
+    if len(data) > 64 * 1024:
+        raise ValueError('Previous inventory exceeds its byte budget.')
+    return json.loads(data, object_pairs_hook=unique_fields)
+
+
+def read_dmg_qualification(path):
+    path = handoff_path(path)
+    with regular_file(path.parent, path.name).open('rb') as stream:
+        data = stream.read(MAX_DMG_QUALIFICATION_BYTES + 1)
+    if not 0 < len(data) <= MAX_DMG_QUALIFICATION_BYTES:
+        raise ValueError('DMG qualification exceeds its bounded report contract.')
+    return data
+
+
+def handoff_dmg(directory, image, qualification_path, output, commit, version, *, image_sha256,
+                archive_sha256, qualification_sha256, team_id, deb_sha256, linux_portable_sha256,
+                maintainer, previous=None, source_root=None):
+    """Append the selected DMG; never swap an existing Mac ZIP or trust native claims."""
+    root = source_root or Path(__file__).resolve().parents[1]
+    directory, image, qualification_path = handoff_path(directory), handoff_path(image), handoff_path(qualification_path)
+    output = private_inspection_directory(output, root, fresh=True)
+    if (output.is_relative_to(directory) or directory.is_relative_to(output)
+            or any(output.is_relative_to(path.parent) for path in [image, qualification_path])):
+        raise ValueError('DMG handoff requires fresh output separate from candidate and native evidence directories.')
+    inventory_bytes = read_inventory(directory)
+    assess(directory, commit, version, source_root=root, deb_sha256=deb_sha256,
+           linux_portable_sha256=linux_portable_sha256, maintainer=maintainer, _inventory_bytes=inventory_bytes)
+    inventory = json.loads(inventory_bytes, object_pairs_hook=unique_fields)
+    if len(inventory['assets']) != 5:
+        raise ValueError('DMG handoff requires a five-record candidate already selecting its signed Mac ZIP and DEB.')
+    macos = next(asset for asset in inventory['assets'] if asset.get('platform') == 'macOS')
+    if macos['sha256'] != archive_sha256:
+        raise ValueError('Selected signed ZIP hash differs from the existing immutable Mac inventory record.')
+    qualification = read_dmg_qualification(qualification_path)
+    bound = bind_dmg(root, directory / macos['file'], image, commit=commit, version=version,
+                     archive_sha256=archive_sha256, image_sha256=image_sha256,
+                     qualification=qualification, qualification_sha256=qualification_sha256, team_id=team_id)
+    if image.name.casefold() in {asset['file'].casefold() for asset in inventory['assets']}:
+        raise ValueError('Final DMG collides with an existing immutable candidate file.')
+    final = dict(schema=1, version=version, commit=commit, binary_source_commit=commit,
+                 packaging_correction=None, assets=[*inventory['assets'], bound['record']])
+    if previous is not None:
+        immutable(previous, final)
+        if (previous['version'] == version
+                and {asset['file']: asset['sha256'] for asset in previous['assets']}
+                != {asset['file']: asset['sha256'] for asset in final['assets']}):
+            raise ValueError('A published version cannot gain or replace final inventory assets; select a new version.')
+    if read_inventory(directory) != inventory_bytes or read_dmg_qualification(qualification_path) != qualification:
+        raise ValueError('Candidate inventory or qualification changed before handoff.')
+    private_inspection_directory(output, root, fresh=True)
+    output.mkdir(mode=0o700)
+    os.chmod(output, 0o700)
+    # No producer report, signing journal, private receipt or unlisted sidecar is
+    # copied. Every selected byte is bounded and checked during exclusive copy.
+    for asset in final['assets']:
+        private_inspection_directory(output, root, fresh=False)
+        source = image if asset['file'] == image.name else regular_file(directory, asset['file'])
+        checksum, size = bounded_file(source, 512 * 1024 * 1024, output / asset['file'])
+        if size != asset['bytes'] or checksum != asset['sha256']:
+            raise ValueError('Selected input changed during DMG handoff; preserve partial output.')
+    if read_inventory(directory) != inventory_bytes or read_dmg_qualification(qualification_path) != qualification:
+        raise ValueError('Candidate inventory or qualification changed during DMG handoff; preserve partial output.')
+    for asset in final['assets']:
+        source = image if asset['file'] == image.name else regular_file(directory, asset['file'])
+        if bounded_file(source, 512 * 1024 * 1024) != (asset['sha256'], asset['bytes']):
+            raise ValueError('Selected input changed after DMG handoff; preserve partial output.')
+    private_inspection_directory(output, root, fresh=False)
+    with (output / 'release-inventory.json').open('x', encoding='utf-8', newline='\n') as stream:
+        stream.write(json.dumps(final, indent=2) + '\n')
+    with (output / 'SHA256SUMS').open('x', encoding='utf-8', newline='\n') as stream:
+        stream.write(''.join(f"{asset['sha256']}  {asset['file']}\n" for asset in final['assets']))
+    result = assess(output, commit, version, previous, root, deb_sha256=deb_sha256,
+                    linux_portable_sha256=linux_portable_sha256, maintainer=maintainer,
+                    dmg_sha256=image_sha256, macos_portable_sha256=archive_sha256,
+                    dmg_qualification=qualification, dmg_qualification_sha256=qualification_sha256, macos_team_id=team_id)
+    private_inspection_directory(output, root, fresh=False)
+    with (output / 'production-readiness.json').open('x', encoding='utf-8', newline='\n') as stream:
+        stream.write(json.dumps(result, indent=2, sort_keys=True) + '\n')
+    return result
+
+
 def assess_deb(root, portable, package, *, commit, version, portable_sha256, package_sha256,
                maintainer, installation_receipt):
     """Bind private same-job evidence to inspected bytes, without authenticating its producer.
@@ -296,6 +473,13 @@ def main():
     mode.add_argument('--directory', type=Path)
     mode.add_argument('--deb', type=Path)
     parser.add_argument('--include-deb', type=Path, help='With --directory, assemble a fresh five-record candidate; --output then names a new directory')
+    parser.add_argument('--include-dmg', type=Path, help='Append a selected final DMG to a five-record signed-ZIP/DEB candidate; output is a fresh external directory')
+    parser.add_argument('--dmg-sha256')
+    parser.add_argument('--macos-portable-sha256')
+    parser.add_argument('--dmg-qualification', type=Path, help='External standalone native qualification; its JSON never authenticates native execution')
+    parser.add_argument('--dmg-qualification-sha256')
+    parser.add_argument('--macos-team-id')
+    parser.add_argument('--source-root', type=Path, help='Exact selected release source checkout; defaults to this script checkout')
     parser.add_argument('--deb-sha256')
     parser.add_argument('--portable', type=Path)
     parser.add_argument('--portable-sha256')
@@ -304,27 +488,51 @@ def main():
     parser.add_argument('--commit', required=True)
     parser.add_argument('--version', required=True)
     parser.add_argument('--previous-inventory', type=Path)
-    parser.add_argument('--output', type=Path, required=True, help='Readiness JSON file, or a fresh candidate directory only with --include-deb')
+    parser.add_argument('--output', type=Path, required=True, help='Readiness JSON file, or a fresh candidate directory with --include-deb/--include-dmg')
     parser.add_argument('--require-ready', action='store_true')
     args = parser.parse_args()
+    root = args.source_root or Path(__file__).resolve().parents[1]
+    dmg_inputs = [args.dmg_sha256, args.macos_portable_sha256, args.dmg_qualification,
+                  args.dmg_qualification_sha256, args.macos_team_id]
+    if (any(value is not None for value in dmg_inputs) and not all(dmg_inputs)):
+        parser.error('DMG inputs require independent image/ZIP/qualification hashes, qualification path and publisher Team together')
+    if (args.include_deb or args.deb) and (args.include_dmg is not None or any(value is not None for value in dmg_inputs)):
+        parser.error('DMG handoff/inspection cannot be mixed with DEB construction or qualification mode')
     deb_inputs = [args.deb_sha256, args.portable, args.portable_sha256, args.maintainer, args.installation_receipt]
-    if args.deb:
+    if all(dmg_inputs) and not all([args.deb_sha256, args.portable_sha256, args.maintainer]):
+        parser.error('Six-record inspection/handoff requires explicit DEB/portable hashes and maintainer')
+    if args.include_dmg:
+        if (not all(dmg_inputs) or not all([args.deb_sha256, args.portable_sha256, args.maintainer])
+                or args.portable is not None or args.installation_receipt is not None):
+            parser.error('--include-dmg requires --directory, all DMG inputs and DEB/portable hashes/maintainer; no portable path or private installation receipt')
+        try:
+            previous = read_previous_inventory(args.previous_inventory) if args.previous_inventory else None
+            result = handoff_dmg(args.directory, args.include_dmg, args.dmg_qualification, args.output, args.commit, args.version,
+                                 image_sha256=args.dmg_sha256, archive_sha256=args.macos_portable_sha256,
+                                 qualification_sha256=args.dmg_qualification_sha256, team_id=args.macos_team_id,
+                                 deb_sha256=args.deb_sha256, linux_portable_sha256=args.portable_sha256,
+                                 maintainer=args.maintainer, previous=previous, source_root=root)
+        except Exception:
+            parser.exit(1, 'Final DMG candidate handoff failed; preserve partial output for local inspection.\n')
+        print('Six-record candidate byte binding verified; native job authentication and production publication remain blocked.')
+        return 2 if args.require_ready and not result['production_ready'] else 0
+    elif args.deb:
         if not all(deb_inputs) or args.previous_inventory or args.include_deb:
             parser.error('--deb requires --deb-sha256, --portable, --portable-sha256, --maintainer and --installation-receipt; no previous inventory')
         receipt = regular_file(args.installation_receipt.absolute().parent, args.installation_receipt.name)
         with receipt.open('rb') as stream:
             evidence = stream.read(MAX_INSTALLATION_RECEIPT_BYTES + 1)
-        result = assess_deb(Path(__file__).resolve().parents[1], args.portable, args.deb,
+        result = assess_deb(root, args.portable, args.deb,
                             commit=args.commit, version=args.version, portable_sha256=args.portable_sha256,
                             package_sha256=args.deb_sha256, maintainer=args.maintainer, installation_receipt=evidence)
     elif args.include_deb:
         if (not all([args.deb_sha256, args.portable_sha256, args.maintainer])
                 or args.portable is not None or args.installation_receipt is not None):
             parser.error('--include-deb requires --directory, explicit DEB/portable hashes and maintainer; no portable path or private receipt')
-        previous = json.loads(args.previous_inventory.read_text(encoding='utf-8'), object_pairs_hook=unique_fields) if args.previous_inventory else None
+        previous = read_previous_inventory(args.previous_inventory) if args.previous_inventory else None
         result = handoff_deb(args.directory, args.include_deb, args.output, args.commit, args.version,
                              package_sha256=args.deb_sha256, portable_sha256=args.portable_sha256,
-                             maintainer=args.maintainer, previous=previous)
+                             maintainer=args.maintainer, previous=previous, source_root=root)
         print('Five-record candidate content verified; native authority and production publication remain blocked.')
         return 2 if args.require_ready and not result['production_ready'] else 0
     else:
@@ -333,9 +541,21 @@ def main():
         selected = [args.deb_sha256, args.portable_sha256, args.maintainer]
         if any(value is not None for value in selected) and not all(selected):
             parser.error('Five-record inspection requires explicit DEB/portable hashes and maintainer together')
-        previous = json.loads(args.previous_inventory.read_text(encoding='utf-8'), object_pairs_hook=unique_fields) if args.previous_inventory else None
-        result = assess(args.directory, args.commit, args.version, previous, deb_sha256=args.deb_sha256,
-                        linux_portable_sha256=args.portable_sha256, maintainer=args.maintainer)
+        if all(dmg_inputs):
+            try:
+                previous = read_previous_inventory(args.previous_inventory) if args.previous_inventory else None
+                evidence = read_dmg_qualification(args.dmg_qualification)
+                result = assess(args.directory, args.commit, args.version, previous, root,
+                                deb_sha256=args.deb_sha256, linux_portable_sha256=args.portable_sha256, maintainer=args.maintainer,
+                                dmg_sha256=args.dmg_sha256, macos_portable_sha256=args.macos_portable_sha256,
+                                dmg_qualification=evidence, dmg_qualification_sha256=args.dmg_qualification_sha256,
+                                macos_team_id=args.macos_team_id)
+            except Exception:
+                parser.exit(1, 'Final DMG candidate inspection failed; no native authority or publication established.\n')
+        else:
+            previous = read_previous_inventory(args.previous_inventory) if args.previous_inventory else None
+            result = assess(args.directory, args.commit, args.version, previous, root, deb_sha256=args.deb_sha256,
+                            linux_portable_sha256=args.portable_sha256, maintainer=args.maintainer)
     # Candidate reports are immutable too; an interrupted rerun can reuse only
     # byte-identical output, never replace a prior readiness decision silently.
     data = (json.dumps(result, indent=2, sort_keys=True) + '\n').encode()

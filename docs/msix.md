@@ -108,3 +108,20 @@ Perform these in an authorized disposable Windows test profile/VM, after the pac
 - [File association schema](https://learn.microsoft.com/en-us/uwp/schemas/appxpackage/uapmanifestschema/element-uap3-filetypeassociation)
 - [Inherited standard handles](https://learn.microsoft.com/en-us/windows/console/getstdhandle)
 - [Unsigned test packages and their separate identity constraints](https://learn.microsoft.com/en-us/windows/msix/package/unsigned-package)
+
+## Local Store candidate preflight (unreleased)
+
+Use the existing stable-version mapping and configured public Store identity; independently select the portable, final unsigned MSIX and exact producer-report hashes before authentication:
+
+```sh
+python -B scripts/qualify_store_msix.py --source-root "$RELEASE_SOURCE" \
+  --portable "$WINDOWS_ZIP" --portable-sha256 "$WINDOWS_ZIP_SHA256" \
+  --package "$STORE_MSIX" --package-sha256 "$MSIX_SHA256" \
+  --report "$MSIX_PRODUCER_REPORT" --report-sha256 "$PRODUCER_REPORT_SHA256" \
+  --commit "$RELEASE_COMMIT" --version "$RELEASE_VERSION" \
+  --previous-version "$PREVIOUS_STORE_VERSION" --output "$FRESH_PRIVATE_REPORT_DIRECTORY"
+```
+
+The local consumer reuses the actual Store-submission validator: exact committed source and embedded build, source-derived manifest/assets/notices, configured identity/family, complete payload/block/whole-file hashes and strict report consistency. Inputs are bounded identity-checked snapshots and are rechecked after validation. It accepts stable mapped versions above the initial Store baseline and a strictly newer version than the selected previous package. The previous version remains operator-selected until actual service reconciliation.
+
+The exclusive sanitized report stays outside Git checkouts. It confirms content consistency; it does not authenticate SDK execution or its native producer, establish installation or signed direct-download trust, submit a package or verify public availability. Readiness remains false. Native SDK validation belongs to the trusted build job, even when the producer report contains its expected validation label. Actual Store submission retains its separate protected approval and durable private receipt. No account access, authentication, installation, upload or Windows trust change is performed by preflight.
