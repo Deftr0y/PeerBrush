@@ -75,6 +75,9 @@ pub fn range_with_color(
             })
             .inner
             .interact(egui::Sense::click_and_drag());
+        if ui.is_enabled() && (response.clicked() || response.is_pointer_button_down_on()) {
+            response.request_focus();
+        }
         // A click focuses the control; actual pointer movement edits it. This
         // avoids changing the value/history while opening the numeric editor.
         if (response.is_pointer_button_down_on() && !response.dragged())
@@ -326,6 +329,16 @@ mod range_tests {
         logarithmic: bool,
         events: Vec<egui::Event>,
     ) -> egui::Response {
+        range_frame_enabled(ctx, value, limits, logarithmic, true, events)
+    }
+    fn range_frame_enabled(
+        ctx: &egui::Context,
+        value: &mut f32,
+        limits: RangeInclusive<f32>,
+        logarithmic: bool,
+        enabled: bool,
+        events: Vec<egui::Event>,
+    ) -> egui::Response {
         let mut response = None;
         let _ = ctx.run(
             egui::RawInput {
@@ -336,6 +349,9 @@ mod range_tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    if !enabled {
+                        ui.disable();
+                    }
                     response = Some(range(
                         ui,
                         "integer input",
@@ -525,6 +541,97 @@ mod range_tests {
                 assert!(!response.changed());
             }
         }
+    }
+
+    #[test]
+    fn disabled_ranges_do_not_take_focus_or_change_values() {
+        let ctx = egui::Context::default();
+        let mut value = 3.;
+        let response = range_frame_enabled(&ctx, &mut value, 1.0..=9., false, false, vec![]);
+        let pos = response.rect.center();
+        for events in [
+            vec![egui::Event::PointerMoved(pos), range_pointer(pos, true)],
+            vec![range_pointer(pos, false)],
+            vec![range_key(egui::Key::ArrowRight, true, false)],
+        ] {
+            let response = range_frame_enabled(&ctx, &mut value, 1.0..=9., false, false, events);
+            assert!(!response.enabled() && !response.has_focus() && !response.changed());
+            assert_eq!(value, 3.);
+        }
+    }
+
+    #[test]
+    fn double_clicked_range_keeps_numeric_editor_focus_and_provisional_value() {
+        let ctx = egui::Context::default();
+        let mut value = 3.;
+        let response = range_frame(&ctx, &mut value, 1.0..=9., false, vec![]);
+        let pos = response.rect.center();
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                range_frame(
+                    &ctx,
+                    &mut value,
+                    1.0..=9.,
+                    false,
+                    vec![egui::Event::PointerMoved(pos), range_pointer(pos, pressed)],
+                );
+                assert_eq!(
+                    value, 3.,
+                    "Focus and numeric entry must not change the value"
+                );
+            }
+        }
+        let editor = response.id.with("number");
+        assert!(number_editing(&ctx, response.id));
+        assert!(ctx.memory(|memory| memory.has_focus(editor)));
+        range_frame(
+            &ctx,
+            &mut value,
+            1.0..=9.,
+            false,
+            vec![egui::Event::Text("7".into())],
+        );
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(editor)).as_deref(),
+            Some("7")
+        );
+        assert_eq!(value, 3.);
+        for pressed in [true, false] {
+            range_frame(
+                &ctx,
+                &mut value,
+                1.0..=9.,
+                false,
+                vec![egui::Event::PointerMoved(pos), range_pointer(pos, pressed)],
+            );
+            assert!(
+                ctx.memory(|memory| memory.has_focus(editor)),
+                "The range must not steal its text editor's focus"
+            );
+            assert_eq!(value, 3.);
+        }
+        range_frame(
+            &ctx,
+            &mut value,
+            1.0..=9.,
+            false,
+            vec![range_key(egui::Key::ArrowRight, true, false)],
+        );
+        assert!(ctx.memory(|memory| memory.has_focus(editor)));
+        assert_eq!(
+            value, 3.,
+            "Text cursor movement must not edit the underlying slider"
+        );
+        let accepted = range_frame(
+            &ctx,
+            &mut value,
+            1.0..=9.,
+            false,
+            vec![range_key(egui::Key::Enter, true, false)],
+        );
+        assert!(accepted.changed());
+        assert_eq!(value, 7.);
+        assert!(!number_editing(&ctx, response.id));
     }
 
     #[test]
