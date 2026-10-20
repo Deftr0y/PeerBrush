@@ -103,8 +103,9 @@ pub fn install(root: Shared) -> Result<Registration, String> {
     }
     let handler = OpenDocuments::alloc(marker).set_ivars(root);
     let handler: Retained<OpenDocuments> = unsafe { msg_send![super(handler), init] };
+    let manager = NSAppleEventManager::sharedAppleEventManager();
     unsafe {
-        let _: () = msg_send![NSAppleEventManager::sharedAppleEventManager(), setEventHandler: &*handler,
+        let _: () = msg_send![&*manager, setEventHandler: &*handler,
             andSelector: sel!(handleOpenDocuments:withReplyEvent:), forEventClass: CORE, andEventID: OPEN];
     }
     Ok(Registration(handler))
@@ -113,8 +114,9 @@ pub fn install(root: Shared) -> Result<Registration, String> {
 impl Drop for Registration {
     fn drop(&mut self) {
         let _ = &self.0; // Retain the callback owner until after unregistration.
+        let manager = NSAppleEventManager::sharedAppleEventManager();
         unsafe {
-            let _: () = msg_send![NSAppleEventManager::sharedAppleEventManager(), removeEventHandlerForEventClass: CORE, andEventID: OPEN];
+            let _: () = msg_send![&*manager, removeEventHandlerForEventClass: CORE, andEventID: OPEN];
         }
     }
 }

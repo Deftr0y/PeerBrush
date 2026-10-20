@@ -131,6 +131,11 @@ jobs:
               codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
               detail = ', '.join(codes) if codes else 'No failing test identifier was reported'
               print('::error title=Regression test run failed::' + detail)
+              locations = re.findall(r'^\s*(?:-->|:::)\s+((?:src|tests|examples|vendor)[/\\][A-Za-z0-9_./\\-]+|build\.rs):([0-9]+):([0-9]+)\s*$', log, re.M)
+              for path, line, column in locations[:32]:
+                  path = path.replace('\\', '/')
+                  if '..' not in path.split('/'):
+                      print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Compiler diagnostic location::See the reported compiler error codes')
           # Publish only bounded test identifiers/counts, never arbitrary
           # panic output, environment values, paths or fixture contents.
           with Path(sys.argv[2]).open('a', encoding='utf-8') as summary:

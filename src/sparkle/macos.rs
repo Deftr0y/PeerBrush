@@ -168,8 +168,11 @@ define_class!(
         }
 
         #[unsafe(method(updater:shouldProceedWithUpdate:updateCheck:error:))]
-        fn may_proceed(&self, updater: &AnyObject, _item: &AnyObject, kind: isize, error: *mut *mut NSError) -> Bool {
-            self.may_check(updater, kind, error)
+        fn may_proceed(&self, _updater: &AnyObject, _item: &AnyObject, _kind: isize, error: *mut *mut NSError) -> Bool {
+            if !error.is_null() {
+                unsafe { *error = Retained::as_ptr(self.ivars()).cast_mut(); }
+            }
+            Bool::NO
         }
 
         #[unsafe(method(updaterShouldRelaunchApplication:))]
