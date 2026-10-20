@@ -207,7 +207,75 @@ fn combined_skew_scale_reflection_rotation_matches_order_and_explicit_zero_is_le
             edit(&mut ordered, transform);
         }
         assert_eq!(combined.undo.len(), 1);
-        assert_eq!(combined.doc.layers[0].pixels, ordered.doc.layers[0].pixels);
+        let actual = &combined.doc.layers[0];
+        let expected = &ordered.doc.layers[0];
+        assert_eq!(
+            (
+                actual.x,
+                actual.y,
+                actual.pixels.width,
+                actual.pixels.height
+            ),
+            (
+                expected.x,
+                expected.y,
+                expected.pixels.width,
+                expected.pixels.height
+            )
+        );
+        assert_eq!(
+            (
+                actual.x,
+                actual.y,
+                actual.pixels.width,
+                actual.pixels.height,
+                actual.pixels.depth
+            ),
+            (0, -43, 6, 45, depth)
+        );
+        assert_eq!(actual.pixels.rgba16(), expected.pixels.rgba16());
+        let mut actual_projection = actual.pixels.clone();
+        let mut expected_projection = expected.pixels.clone();
+        actual_projection.retained = None;
+        expected_projection.retained = None;
+        assert!(
+            actual_projection == expected_projection,
+            "Native projection metadata or samples differ"
+        );
+        let actual_source = actual.pixels.retained.as_ref().unwrap();
+        let expected_source = expected.pixels.retained.as_ref().unwrap();
+        assert_eq!(
+            actual_source.pixels.rgba16(),
+            expected_source.pixels.rgba16()
+        );
+        assert!(
+            actual_source.pixels == expected_source.pixels,
+            "Retained original metadata or samples differ"
+        );
+        // tan(45deg) can compose to an adjacent f64 in one combined delta.
+        // Projections and original native samples above must still be exact.
+        for (actual, expected) in actual_source.matrix.iter().zip(expected_source.matrix) {
+            assert!(
+                actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= 1e-12,
+                "Combined/ordered affine differs: {} versus {}",
+                actual,
+                expected
+            );
+        }
+        // R90 * diag(-2, .5) * Hy(-45) * Hx(45) is
+        // [.5,-2,0,-2]; pivot [0,.5] gives world translation [0,1.5].
+        // The 12x10 original bounds become [0,-43,6,2], hence local ty=44.5.
+        let analytic = [0.5, -2., 0., -2., 0., 44.5];
+        for matrix in [&actual_source.matrix, &expected_source.matrix] {
+            for (actual, expected) in matrix.iter().zip(analytic) {
+                assert!(
+                    actual.is_finite() && (actual - expected).abs() <= 1e-12,
+                    "Affine coefficient differs from analytic placement: {} versus {}",
+                    actual,
+                    expected
+                );
+            }
+        }
         assert_eq!(
             combined.doc.export_png().unwrap(),
             ordered.doc.export_png().unwrap()
