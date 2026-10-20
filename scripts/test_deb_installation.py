@@ -193,6 +193,7 @@ def check(package, expected, output):
         # source/notices for these commands; retain the mandatory installed hashes.
         apt_options = [argument for option in DOCUMENTATION_OPTIONS
                        for argument in ['-o', 'Dpkg::Options::=' + option]]
+        print('DEB lifecycle: fresh installation', flush=True)
         run(['apt-get', 'install', '-y', *apt_options, str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
         installed(deb_version(expected['version']))
         # Private higher-revision fixture validates dpkg upgrade semantics while
@@ -206,16 +207,26 @@ def check(package, expected, output):
         control.write_text(control.read_text().replace('Version: ' + current + '\n', 'Version: ' + later + '\n'))
         upgrade = work / 'private-upgrade-fixture.deb'
         run(['dpkg-deb', '--root-owner-group', '--build', str(unpacked), str(upgrade)])
+        print('DEB lifecycle: same-binary package revision upgrade', flush=True)
         run(['dpkg', *DOCUMENTATION_OPTIONS, '--install', str(upgrade)])
         if run(['dpkg-query', '--showformat=${Version}', '--show', 'peerbrush']) != later:
             raise ValueError('The private higher-revision upgrade was not installed')
         installed(later)
+        print('DEB lifecycle: remove', flush=True)
         run(['apt-get', 'remove', '-y', 'peerbrush'])
         removed()
-        run(['apt-get', 'purge', '-y', 'peerbrush'])
-        removed()
+        # With no conffiles or repository, APT cannot resolve an already removed
+        # package by name. Exercise purge while installed, then verify reinstall.
+        print('DEB lifecycle: reinstall after remove', flush=True)
         run(['apt-get', 'install', '-y', *apt_options, str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
         installed(current)
+        print('DEB lifecycle: purge', flush=True)
+        run(['apt-get', 'purge', '-y', 'peerbrush'])
+        removed()
+        print('DEB lifecycle: reinstall after purge', flush=True)
+        run(['apt-get', 'install', '-y', *apt_options, str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+        installed(current)
+        print('DEB lifecycle: final purge', flush=True)
         run(['apt-get', 'purge', '-y', 'peerbrush'])
         removed()
         if digest(package) != original_package or digest(selected) != original_package:
