@@ -400,3 +400,7 @@ PB-153 direct-skew slice (unreleased, tests pending): local Free Transform Skew 
 Store handoff fixture correction (unreleased, tests pending): inherited package/report and selected/common/SDK candidates now stay under the existing ignored fixture output before/later packaging. All eighteen methods retain their assertions and add full initial source-clean checks; production gates and ignore rules are unchanged. Parent and independent review passed; combined replay remains required.
 
 Direct-skew fixture compilation correction (unreleased): clean ac9cb59 library compile-only preflight stopped at E0277 before execution. The exact Move-variant assertion now uses matches without requiring production Tool Debug; parent and independent source review passed. Combined/native acceptance remains pending.
+
+Native tool regression registration (unreleased): all three native candidate workflows now run the existing tool-selection/real Windows argv suite after qualification and before compilation. Existing ordering coverage requires one call per workflow; permissions, pinned tools and the fixture's 20-second limit are unchanged. Combined/native execution remains pending.
+
+Native CI39508203097 final result: all three main/worker builds passed, followed by the same test-only crossing E0689 on Windows/macOS/Linux. The correction is committed; no named regression, child-policy or downstream package/upgrade acceptance ran in that CI source.

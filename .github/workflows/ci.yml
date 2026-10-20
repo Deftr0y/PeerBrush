@@ -80,6 +80,8 @@ jobs:
       - if: runner.os != 'Windows'
         name: Select existing native codec tools
         run: python3 -B scripts/jxl_build.py --github-env
+      - name: Verify native codec tool selection regressions
+        run: python -B scripts/test_jxl_build.py
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
         with:
           toolchain: 1.92.0

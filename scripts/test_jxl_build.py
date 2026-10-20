@@ -412,6 +412,10 @@ exit $LASTEXITCODE
                 self.assertNotIn('toolchain: stable', text)
                 setup = text.index('scripts/jxl_build.py --github-env')
                 self.assertLess(setup, text.index('dtolnay/rust-toolchain@'))
+                fixture = 'run: python -B scripts/test_jxl_build.py'
+                self.assertEqual(text.count(fixture), 1)
+                self.assertLess(text.index('run: python3 -B scripts/jxl_build.py --github-env'), text.index(fixture))
+                self.assertLess(text.index(fixture), text.index('dtolnay/rust-toolchain@'))
                 self.assertIn('-Arch amd64 -HostArch amd64 -SkipAutomaticLocation', text)
                 capture = text.index("$nativeTools = @{}")
                 sdk = text.index('& $launch -Arch amd64')

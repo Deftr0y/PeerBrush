@@ -489,3 +489,9 @@ The Store test fixture now moves inherited synthetic MSIX/report files into its 
 ## Direct-skew compile-only correction (unreleased)
 
 Clean ac9cb598572850bbfe1424a11ae2770e79fe03c0 stopped the library compile-only preflight at E0277: the new mode assertion required Debug on the production Tool enum. The independently reviewed fixture now matches the same exact Some(Tool::Move) variant without adding a production trait. No assertions executed in that preflight; combined and native acceptance remain pending.
+
+## Native tool fixture registration (unreleased)
+
+CI, release candidates and the read-only macOS qualification gate now explicitly run scripts/test_jxl_build.py after native tool selection and before Rust setup/compilation. The existing workflow-order check requires exactly one invocation in each workflow. This includes the real Windows duplicate-application discovery and Python argv fixture; its Windows-only requirement and 20-second bound are unchanged. Parent and independent source review passed; no execution is claimed for this registration.
+
+Native CI39508203097 subsequently finished with regression compilation failure on all three platforms at the same crossing-fixture E0689 corrected by d6c5253. All three source-matched main/worker builds passed; Windows qualified Clang20.1.8/CMake4.4.4/Ninja1.13.2 through the corrected scalar discovery. No named regression assertions, macOS child-policy assertions or downstream package/upgrade acceptance executed. This is a terminal failure, not a passing or cancelled run.
