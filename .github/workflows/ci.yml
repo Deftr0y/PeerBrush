@@ -11,6 +11,8 @@ jobs:
           persist-credentials: false
       - name: Verify branch-policy regressions
         run: python scripts/test_branch_policy.py
+      - name: Verify bounded CI failure diagnostics
+        run: python -B scripts/test_ci_diagnostics.py
       - name: Enforce branch names and PR destinations
         shell: bash
         run: python scripts/check_branch_policy.py --event "$GITHUB_EVENT_PATH" --ref "$GITHUB_REF"
@@ -104,6 +106,7 @@ jobs:
           log = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', log)
           failures = re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$', log, re.M)
           results = re.findall(r'^test result: (?:ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored;', log, re.M)
+          detail = ''
           if failures:
               print('::error title=Regression test failures::' + ', '.join(name[:128] for name in failures[:32]))
               locations = re.findall(r"^thread '([A-Za-z0-9_:]+)' (?:\([0-9]+\) )?panicked at (?:[^\r\n]*?[/\\])?((?:tests|src)[/\\][A-Za-z0-9_./\\-]+):([0-9]+):([0-9]+)", log, re.M)
@@ -129,18 +132,41 @@ jobs:
                           print('::error title=Regression failure category::' + name[:128] + ': ' + ', '.join(matched))
           elif int(sys.argv[3]):
               codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
-              detail = ', '.join(codes) if codes else 'No failing test identifier was reported'
+              categories = []
+              if not codes:
+                  kinds = {
+                      'CARGO_TEST_FAILURE': r'^error: test failed(?:,|$)',
+                      'CARGO_BUILD_FAILURE': r'^error: could not compile\b',
+                      'BUILD_SCRIPT_FAILURE': r'^error: failed to run custom build command\b',
+                      'LINKER_FAILURE': r'^error: linking with [^\r\n]{0,4096} failed:',
+                      'COMPILER_PANIC': r"^(?:error: (?:the compiler unexpectedly panicked|internal compiler error)|thread 'rustc' panicked)",
+                      'OUT_OF_MEMORY_DIAGNOSTIC': r'^(?:error: |LLVM ERROR: |fatal runtime error: )?(?:out of memory|memory allocation of [0-9]+ bytes failed)\b',
+                      'DISK_FULL_DIAGNOSTIC': r'^(?:error:|fatal error:|LLVM ERROR:)[^\r\n]{0,4096}(?:No space left on device|os error 28\b|os error 112\b)',
+                  }
+                  categories = [name for name, pattern in kinds.items() if re.search(pattern, log, re.M)]
+                  # Report termination evidence, never infer a cause from SIGKILL.
+                  endings = re.findall(r"^  process didn't exit successfully: [^\r\n]{1,8192} \((signal|exit status|exit code): (0x[0-9a-fA-F]{1,8}|[0-9]{1,10})(?:, [^\r\n)]{0,512})?\)[ \t]*$", log, re.M)
+                  for kind, value in endings[:8]:
+                      number = int(value, 16 if value.startswith('0x') else 10)
+                      if kind == 'signal' and value.isdecimal() and 1 <= number <= 127:
+                          categories.append(f'CHILD_SIGNAL_{number}')
+                      elif kind != 'signal' and 1 <= number <= 0xffffffff:
+                          categories.append(f'CHILD_EXIT_{number}')
+              detail = ', '.join(codes[:32] or list(dict.fromkeys(categories)) or ['UNKNOWN'])
               print('::error title=Regression test run failed::' + detail)
-              locations = re.findall(r'^\s*(?:-->|:::)\s+((?:src|tests|examples|vendor)[/\\][A-Za-z0-9_./\\-]+|build\.rs):([0-9]+):([0-9]+)\s*$', log, re.M)
-              for path, line, column in locations[:32]:
-                  path = path.replace('\\', '/')
-                  if '..' not in path.split('/'):
-                      print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Compiler diagnostic location::See the reported compiler error codes')
+              if codes:
+                  locations = re.findall(r'^\s*(?:-->|:::)\s+((?:src|tests|examples|vendor)[/\\][A-Za-z0-9_./\\-]+|build\.rs):([0-9]+):([0-9]+)\s*$', log, re.M)
+                  for path, line, column in locations[:32]:
+                      path = path.replace('\\', '/')
+                      if '..' not in path.split('/'):
+                          print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Compiler diagnostic location::See the reported compiler error codes')
           # Publish only bounded test identifiers/counts, never arbitrary
           # panic output, environment values, paths or fixture contents.
           with Path(sys.argv[2]).open('a', encoding='utf-8') as summary:
               summary.write('### Regression tests\n\n')
               summary.write(f'Exit status: {int(sys.argv[3])}\n\n')
+              if detail:
+                  summary.write(f'Failure classification: `{detail}`\n\n')
               summary.writelines(f'- `{line}`\n' for line in results[:100])
               if failures:
                   summary.write('\nFailed tests:\n\n')
@@ -162,6 +188,7 @@ jobs:
       - run: python scripts/test_sign_macos.py
       - run: python -B scripts/test_deb.py
       - run: python -B scripts/test_macos_dmg.py
+      - run: python -B scripts/test_final_macos_dmg.py
       - run: python -B scripts/test_sign_macos_dmg.py
       - name: Native DMG round trip with synthetic unsigned data
         if: runner.os == 'macOS'

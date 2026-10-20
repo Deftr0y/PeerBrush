@@ -133,3 +133,20 @@ These cover exact archive/source preservation, narrow signed inventories, hashes
 - [Migrating to the latest notarization tool](https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool)
 - [Code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
 - [Apple DTS: resolving Gatekeeper problems and checking the submission SHA-256](https://developer.apple.com/forums/thread/706379)
+
+
+## Independent final-DMG qualification (unreleased)
+
+After an explicitly approved signing job produces a signed/notarized/stapled ZIP and final DMG, a separate native consumer can qualify those exact files without signing, submitting, installing or running the app. Independently select the stable source SHA/version, both file SHA256 values and public publisher Team ID. Use absolute paths and a private owned parent outside every Git checkout for fresh work/report directories:
+
+```sh
+python scripts/qualify_macos_dmg.py --source-root "$REVIEWED_SOURCE" \
+  --archive "$SELECTED_SIGNED_ZIP" --image "$SELECTED_FINAL_DMG" \
+  --archive-sha256 "$VERIFIED_ZIP_SHA256" --image-sha256 "$VERIFIED_DMG_SHA256" \
+  --commit "$REVIEWED_COMMIT" --version "$STABLE_VERSION" --team-id "$PUBLIC_TEAM_ID" \
+  --work "$PRIVATE_PARENT/check-NEW" --output "$PRIVATE_PARENT/report-NEW"
+```
+
+The consumer checks committed corresponding source and embedded executable identity, reconstructs every expected app/support file, mode and Applications shortcut directly from the selected ZIP, then rechecks actual app/image publisher trust, timestamps, hardened runtime, tickets and Gatekeeper. Read-only image mounting must expose exactly one selected volume. Cleanup binds the entire BSD device to that exact image, detaches it and confirms removal. Ambiguous/extra volumes or failed cleanup fail qualification and retain work; do not recursively delete unresolved mounts. Both original and private input copies are hashed again after native inspection.
+
+The exclusive `dmg-qualification.json` contains a strict sanitized asset record and factual check results, with installation/public/production readiness still false or unverified. It contains no local paths, private signing information or arbitrary signer-sidecar fields. Native execution authority still needs a successful trusted native job when consumed; matching JSON alone does not authenticate a producer. This leaf consumer is not yet wired into the aggregate/website final-installer adapter. Select the verified signed ZIP as the Mac portable asset before first publication; existing published files remain immutable. No existing Apple workflow source pin or activation setting is changed.

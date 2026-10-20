@@ -115,7 +115,7 @@ class ImageRoundTrip(unittest.TestCase):
     def test_partial_attach_failure_detaches_and_detach_failure_is_not_hidden(self):
         for detach_failure in [False, True]:
             with self.subTest(detach_failure=detach_failure), tempfile.TemporaryDirectory() as temporary:
-                root = pathlib.Path(temporary)
+                root = pathlib.Path(temporary).resolve()
                 payload, image, mount = root / 'payload', root / 'test.dmg', root / 'mount'
                 payload.mkdir()
                 mounted = False
@@ -123,6 +123,9 @@ class ImageRoundTrip(unittest.TestCase):
                 def run(command, **kwargs):
                     nonlocal mounted
                     calls.append(command[1])
+                    if command[1] == 'info':
+                        images = [{'image-path': str(image), 'system-entities': [{'dev-entry': '/dev/disk98'}, {'dev-entry': '/dev/disk98s1', 'mount-point': str(mount)}]}] if mounted else []
+                        return subprocess.CompletedProcess(command, 0, stdout=plistlib.dumps({'images': images}).decode())
                     if command[1] == 'attach':
                         mounted = True
                         raise ValueError('attach failed after mounting')
@@ -134,13 +137,13 @@ class ImageRoundTrip(unittest.TestCase):
                 with mock.patch.object(dmg.sys, 'platform', 'darwin'), mock.patch.object(dmg, 'run', side_effect=run), mock.patch.object(dmg, 'payload_inventory', return_value={}), mock.patch.object(pathlib.Path, 'is_mount', side_effect=lambda: mounted):
                     with self.assertRaisesRegex(ValueError, 'detach failed' if detach_failure else 'attach failed'):
                         dmg.create_image(payload, image, mount, 'Synthetic')
-                self.assertEqual(calls, ['create', 'verify', 'attach', 'detach'])
+                self.assertEqual(calls, ['create', 'verify', 'info', 'attach', 'info', 'detach'] + ([] if detach_failure else ['info']))
                 self.assertEqual(mounted, detach_failure)
 
     def test_native_commands_compare_mounted_payload_and_always_detach(self):
         for tampered, signature_failure in [(False, False), (True, False), (False, True)]:
             with self.subTest(tampered=tampered, signature_failure=signature_failure), tempfile.TemporaryDirectory() as temporary:
-                root = pathlib.Path(temporary)
+                root = pathlib.Path(temporary).resolve()
                 payload, image, mount = root / 'payload', root / 'test.dmg', root / 'mount'
                 payload.mkdir()
                 mounted = False
@@ -148,6 +151,9 @@ class ImageRoundTrip(unittest.TestCase):
                 def run(command, **kwargs):
                     nonlocal mounted
                     calls.append(command)
+                    if command[1] == 'info':
+                        images = [{'image-path': str(image), 'system-entities': [{'dev-entry': '/dev/disk98'}, {'dev-entry': '/dev/disk98s1', 'mount-point': str(mount)}]}] if mounted else []
+                        return subprocess.CompletedProcess(command, 0, stdout=plistlib.dumps({'images': images}).decode())
                     if command[1] == 'create':
                         image.write_bytes(b'SYNTHETIC')
                     if command[1] == 'attach':
@@ -167,13 +173,15 @@ class ImageRoundTrip(unittest.TestCase):
                         dmg.create_image(payload, image, mount, 'Synthetic', verify)
                         verify.assert_called_once_with(mount / dmg.APP)
                 self.assertFalse(mounted)
-                self.assertEqual([command[1] for command in calls], ['create', 'verify', 'attach', 'detach'])
-                self.assertIn('-readonly', calls[2])
-                self.assertIn('-nobrowse', calls[2])
+                self.assertEqual([command[1] for command in calls], ['create', 'verify', 'info', 'attach', 'info', 'detach', 'info'])
+                attach = next(command for command in calls if command[1] == 'attach')
+                self.assertIn('-readonly', attach)
+                self.assertIn('-nobrowse', attach)
+                self.assertEqual(next(command[-1] for command in calls if command[1] == 'detach'), '/dev/disk98')
 
     def test_payload_rejects_missing_shortcut_and_additional_links(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
+            root = pathlib.Path(temporary).resolve()
             (root / 'regular').write_bytes(b'original')
             with self.assertRaisesRegex(ValueError, 'Applications shortcut'):
                 dmg.payload_inventory(root)
