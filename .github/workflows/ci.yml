@@ -147,6 +147,7 @@ jobs:
                   summary.writelines(f'- `{name[:256]}`\n' for name in failures[:100])
           PY
           exit "$test_status"
+      - run: cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
       - run: cargo clippy --all-targets --locked
       - name: Verify native macOS document delivery and icon
         if: runner.os == 'macOS'
@@ -215,6 +216,10 @@ jobs:
             --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
             bash -eu -c 'apt-get update; apt-get install -y python3 xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd; python3 -B /checks/test_deb_installation.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installation.json' \
             peerbrush-deb-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
+          python3 -B scripts/production_readiness.py --deb "$DEB" --deb-sha256 "$DEB_SHA" \
+            --portable "$PORTABLE" --portable-sha256 "$DIGEST" \
+            --installation-receipt "$EVIDENCE/installation.json" --commit "$SOURCE_COMMIT" --version "$VERSION" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' --output "$DEB.qualification.json"
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:

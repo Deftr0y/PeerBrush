@@ -59,6 +59,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
+      - run: cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
       - if: runner.os == 'Windows'
         run: cargo test --locked --test clipboard -- --ignored
       - run: cargo clippy --all-targets --locked
@@ -113,6 +114,10 @@ jobs:
             --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
             bash -eu -c 'apt-get update; apt-get install -y python3 xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd; python3 -B /checks/test_deb_installation.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installation.json' \
             peerbrush-deb-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
+          python3 -B scripts/production_readiness.py --deb "$DEB" --deb-sha256 "$DEB_SHA" \
+            --portable "$PORTABLE" --portable-sha256 "$DIGEST" \
+            --installation-receipt "$EVIDENCE/installation.json" --commit "$SOURCE_COMMIT" --version "$VERSION" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' --output "$DEB.qualification.json"
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:

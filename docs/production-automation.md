@@ -6,14 +6,20 @@ The final `production-readiness.json` report reopens and validates the real arch
 
 `--previous-inventory` compares against a retained publication inventory: an already published version must keep its exact source SHA and every existing asset filename/hash. Without that reconciled input, version immutability is explicitly unverified. `--require-ready` exits unsuccessfully while production gates remain blocked. Existing output reports cannot be replaced with a different decision. No tag, release file or history entry is overwritten.
 
-Pending gates are installed Windows distribution/signing, signed and notarized Mac DMG installation, the chosen installed Linux format/update owner, protected publication approval, and public asset/website readback. The existing reviewed Apple signing workflow retains its source pin and protected environment; this change neither repoints nor activates it. Windows Store automation retains its existing disabled variable. No credential, environment or branch-protection setting changes are part of this implementation.
+Pending gates are installed Windows distribution/signing, signed and notarized Mac DMG installation, final installed Ubuntu qualification and authenticated update delivery, protected publication approval, and public asset/website readback. The existing reviewed Apple signing workflow retains its source pin and protected environment; this change neither repoints nor activates it. Windows Store automation retains its existing disabled variable. No credential, environment or branch-protection setting changes are part of this implementation.
+
+The Ubuntu native job additionally qualifies final DEB bytes and consumes its freshly produced private installation receipt before uploading the candidate. This uses the selected portable/source inputs rather than trusting the package's report. Its separate public qualification report retains false readiness and explicit desktop, real-version migration, interrupted-update, signing, repository and publication limits. Receipt matching is a binding check; native execution provenance comes from the immediately preceding successful test in the same trusted job. Final installers remain outside the portable-only aggregate readiness inventory until their complete release adapters exist.
 
 ## Private Store submission state
 
 The existing MSIX writer still validates a published stable release, exact Store identity, package provenance and checksums, current published version and absence of a pending submission. Actual submission additionally requires an absolute `--state` file inside an existing durable private directory. The tool rejects state or lock paths inside any checkout of its source repository and rejects symbolic links, junctions and reparse points throughout the supplied path. The directory and receipt must stay outside public source, release packages and Actions artifacts.
 
 ```sh
-python scripts/submit_store_release.py --tag vVERSION --state /private/store-receipt.json
+python scripts/submit_store_release.py --tag vVERSION \
+  --source-root /absolute/reviewed-release-source \
+  --portable-sha256 VERIFIED_WINDOWS_PORTABLE_SHA256 \
+  --msix-sha256 VERIFIED_FINAL_SDK_VALIDATED_MSIX_SHA256 \
+  --state /private/store-receipt.json
 # Add --submit only after explicit authorization and Store preflight review.
 ```
 
@@ -31,7 +37,7 @@ Certification, rejection, publication pending, publishing, service Published and
 
 The [documented Store statuses](https://learn.microsoft.com/en-us/windows/uwp/monetize/get-status-for-an-app-submission) and [submission process](https://learn.microsoft.com/en-us/windows/uwp/monetize/manage-app-submissions) are the basis for this mapping. Commit acceptance starts ingestion; it is not public availability.
 
-The hosted Store workflow remains disabled. Even if its variable were later enabled, submitting without a durable private receipt fails before release download or authentication. A reviewed private state persistence adapter and explicit activation approval are still required; uploading the receipt to this public repository's Actions artifacts is not a substitute.
+The hosted Store workflow remains disabled. Manual/reusable callers must independently select the exact source SHA, Windows portable hash and final SDK-validated MSIX hash; the workflow checks out trusted automation separately from release-source data. Its release-event listener cannot yet select those inputs and stops before authentication. Even if its variable were later enabled, submitting without a durable private receipt fails before release download or authentication. A reviewed final-inventory adapter, private state persistence adapter and explicit activation approval are still required; uploading the receipt to this public repository's Actions artifacts is not a substitute.
 
 ## Website boundary and verification
 
