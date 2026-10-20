@@ -9,8 +9,8 @@ use std::{
 };
 
 pub const EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp", "ico", "pbm", "pgm", "ppm", "pam",
-    "pnm", "tga", "qoi", "svg", "svgz",
+    "png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp", "jxl", "ico", "pbm", "pgm", "ppm",
+    "pam", "pnm", "tga", "qoi", "svg", "svgz",
 ];
 pub const BUDGET: usize = 256 * 1024 * 1024;
 const ENCODED_LIMIT: usize = 128 * 1024 * 1024;
@@ -35,9 +35,15 @@ pub struct Info {
     pub count: usize,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Codec {
+    Image(ImageFormat),
+    Jxl,
+}
+
 pub struct Encoded {
     bytes: Vec<u8>,
-    format: ImageFormat,
+    format: Codec,
     pub info: Info,
     offsets: Vec<usize>,
     source: Option<crate::source::Source>,
@@ -268,6 +274,62 @@ fn tiff_offsets(bytes: &[u8]) -> Result<Vec<usize>, String> {
 }
 
 impl Encoded {
+    fn jxl(bytes: Vec<u8>) -> Result<Self, String> {
+        let info = crate::jpeg_xl::inspect(&bytes, &|| Ok(()))?;
+        Ok(Self {
+            bytes,
+            format: Codec::Jxl,
+            source: None,
+            offsets: Vec::new(),
+            info: Info {
+                format: "JPEG XL".into(),
+                width: info.width,
+                height: info.height,
+                bit_depth: info.bit_depth,
+                choice: None,
+                count: 1,
+            },
+        })
+    }
+    fn decode_jxl(&self, command: &Value, budget: usize) -> Result<Raster, String> {
+        if ["frame", "page", "variant"]
+            .iter()
+            .any(|key| command.get(*key).is_some())
+        {
+            return Err("Static JPEG XL does not accept frame/page/variant choices".into());
+        }
+        check_budget(
+            self.info.width,
+            self.info.height,
+            self.info.bit_depth,
+            budget,
+        )?;
+        let decoded = crate::jpeg_xl::decode(&self.bytes, &|| Ok(()))?;
+        if (
+            decoded.info.width,
+            decoded.info.height,
+            decoded.info.bit_depth,
+        ) != (self.info.width, self.info.height, self.info.bit_depth)
+        {
+            return Err("JPEG XL decoded metadata differs from its inspected source".into());
+        }
+        let profile = &decoded.icc_profile;
+        let convert = !crate::color_profile::is_srgb_profile(profile);
+        match decoded.pixels {
+            crate::jpeg_xl::Pixels::Eight(mut pixels) => {
+                if convert {
+                    crate::color_profile::convert8(profile, &mut pixels)?;
+                }
+                Raster::from_rgba(decoded.info.width, decoded.info.height, &pixels)
+            }
+            crate::jpeg_xl::Pixels::Sixteen(mut pixels) => {
+                if convert {
+                    crate::color_profile::convert16(profile, &mut pixels)?;
+                }
+                Raster::from_rgba16(decoded.info.width, decoded.info.height, &pixels)
+            }
+        }
+    }
     pub fn encoded_len(&self) -> usize {
         self.bytes.len()
     }
@@ -325,7 +387,7 @@ impl Encoded {
             };
             return Ok(Self {
                 bytes,
-                format: ImageFormat::Png,
+                format: Codec::Image(ImageFormat::Png),
                 info: Info {
                     format: "SVG".into(),
                     width,
@@ -337,6 +399,9 @@ impl Encoded {
                 offsets: Vec::new(),
                 source: Some(source),
             });
+        }
+        if ext == "jxl" {
+            return Self::jxl(bytes);
         }
         let guessed = image::guess_format(&bytes).ok();
         let expected = ImageFormat::from_extension(&ext).ok_or("Unsupported image extension")?;
@@ -434,7 +499,7 @@ impl Encoded {
         drop(decoder);
         Ok(Self {
             bytes,
-            format,
+            format: Codec::Image(format),
             source: None,
             info: Info {
                 format: format!("{format:?}"),
@@ -448,6 +513,9 @@ impl Encoded {
         })
     }
     pub fn decode(&self, command: &Value, budget: usize) -> Result<Raster, String> {
+        let Codec::Image(format) = self.format else {
+            return self.decode_jxl(command, budget);
+        };
         if let Some(source) = &self.source {
             if ["frame", "page", "variant"]
                 .iter()
@@ -461,7 +529,7 @@ impl Encoded {
         let mut index = None;
         for key in ["frame", "page", "variant"] {
             if let Some(value) = command.get(key) {
-                let expected = self.info.choice.unwrap_or(match self.format {
+                let expected = self.info.choice.unwrap_or(match format {
                     ImageFormat::Tiff => "page",
                     ImageFormat::Ico => "variant",
                     _ => "frame",
@@ -486,7 +554,7 @@ impl Encoded {
             ));
         }
         let index = index.unwrap_or(0);
-        if self.format == ImageFormat::Ico {
+        if format == ImageFormat::Ico {
             let entry = bytes_at(&self.bytes, 6 + index * 16, 16)?;
             let len = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
             let at = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
@@ -506,7 +574,7 @@ impl Encoded {
             }
         }
         let mut patched = None;
-        if self.format == ImageFormat::Tiff && index != 0 {
+        if format == ImageFormat::Tiff && index != 0 {
             let mut bytes = self.bytes.clone();
             let little = &bytes[..2] == b"II";
             let magic = if little {
@@ -528,7 +596,7 @@ impl Encoded {
                 &encoded[8 - pointer..]
             });
             patched = Some(bytes);
-        } else if self.format == ImageFormat::Ico {
+        } else if format == ImageFormat::Ico {
             let mut bytes = self.bytes.clone();
             let entry = bytes[6 + index * 16..22 + index * 16].to_vec();
             bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
@@ -536,7 +604,7 @@ impl Encoded {
             patched = Some(bytes);
         }
         let bytes = patched.as_deref().unwrap_or(&self.bytes);
-        let mut reader = image::ImageReader::with_format(Cursor::new(bytes), self.format);
+        let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
         reader.limits(limits());
         let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
         validate_color(&decoder)?;
@@ -561,7 +629,7 @@ impl Encoded {
                 return Err("Animation decoding work exceeds the import budget; export the selected frame separately".into());
             }
             drop(decoder);
-            match self.format {
+            match format {
                 ImageFormat::Gif => {
                     let mut d = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
                         .map_err(|e| e.to_string())?;

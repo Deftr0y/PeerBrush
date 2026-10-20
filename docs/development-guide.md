@@ -39,13 +39,14 @@ The CI branch-policy check rejects forbidden names and incorrect PR destinations
 
 ## Build and verification
 
-Install stable Rust and the native platform prerequisites. Linux CI installs `libxkbcommon-dev`, `libwayland-dev`, `libxcb-shape0-dev` and `libxcb-xfixes0-dev`. Windows development can use the ignored toolchain prepared by `scripts/dev.ps1`; it does not modify persistent PATH.
+Use the committed Rust 1.92.0 toolchain and [native JPEG XL build prerequisites](jpeg-xl-build.md). Linux CI installs `libxkbcommon-dev`, `libwayland-dev`, `libxcb-shape0-dev` and `libxcb-xfixes0-dev`. On Windows, start in an existing MSVC/SDK developer shell with the reviewed Clang/CMake/Ninja on PATH. The command wrapper selects these tools only for its child; the older ignored GNU bootstrap is no longer selected.
 
 ```sh
-cargo run --locked
+python scripts/jxl_build.py -- run --locked -- --state-dir .runtime
 cargo fmt --all -- --check
-cargo test --locked
-cargo clippy --all-targets --locked
+python scripts/jxl_build.py -- build --locked --bin peerbrush
+python scripts/jxl_build.py -- test --locked
+python scripts/jxl_build.py -- clippy --all-targets --locked
 python scripts/test_package.py
 ```
 
@@ -78,3 +79,7 @@ Before version → dev, complete the intended scope and report unresolved accept
 The intended automated production sequence is **main → exact-source tests/builds → verified packages → versioned GitHub release → matching website release information and deployment**. The existing CI builds and inspects all three platforms. Currently `release.yml` prepares candidates through manual dispatch, and `pages.yml` deploys a specifically reviewed `site-content` commit through manual dispatch from `main`. The `github-pages` environment restricts eligible deployment branches; preserve that protection. Merging application source into `main` does not currently publish a release or synchronize website release data. Do not describe the complete production sequence as active until it is configured and verified.
 
 Follow the [release-maintenance playbook](release-maintenance.md) for actual publication, checksums, version history and read-back verification. Keep the site's development-guide link pointed at a published branch or a verified source commit containing this guide. Keep unreleased version queues separate from published downloads. Website content changes use `maintenance/site-<topic>` based on `site-content`; review the public diff before promoting the result to `site-content`, then dispatch the website workflow from an eligible branch with its exact site commit. Confirm the deployed content, not just workflow completion. Do not merge the website output branch into application source or delete it while the deployment workflow uses it.
+
+JPEG XL builds require the committed Rust 1.92 toolchain and native CMake/Ninja/Clang prerequisites. See [JPEG XL build inputs](jpeg-xl-build.md); do not install a global toolchain or workload to bypass an unqualified compiler.
+
+Integration codec tests launch the application worker in the matching Cargo profile directory. Build that source-matched main before running tests; the development test helper and all current native CI callers do so. Installed application launches use their exact current executable, including renamed installations; no PATH-selected worker or configurable executable is accepted.

@@ -72,15 +72,34 @@ jobs:
         run: python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
       - name: Check committed package source
         run: python scripts/package.py --check-source
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - if: runner.os == 'Windows'
+        name: Initialize existing MSVC SDK for native codec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeToolDirectories = @('clang-cl', 'cmake', 'ninja') | ForEach-Object { Split-Path (Get-Command $_ -CommandType Application -ErrorAction Stop).Source -Parent } | Select-Object -Unique
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Existing Visual Studio C++ tools unavailable' }
+          $launch = Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1'
+          & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          $env:PATH = ($nativeToolDirectories -join ';') + ';' + $env:PATH
+          python -B scripts/jxl_build.py --github-env
+          if ($LASTEXITCODE -ne 0) { throw 'Native codec tool qualification failed' }
+      - if: runner.os != 'Windows'
+        name: Select existing native codec tools
+        run: python3 -B scripts/jxl_build.py --github-env
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
         with:
-          toolchain: stable
+          toolchain: 1.92.0
           components: rustfmt, clippy, rust-docs
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
       - run: python -B scripts/test_ci_diagnostics.py
       - run: python -B scripts/test_release_source_guard.py
       - run: cargo fmt --all -- --check
+      - name: Build source-matched JPEG XL worker for integration tests
+        run: cargo build --locked --bin peerbrush
       - run: cargo test --locked
       - name: Verify native installed-font inventory without registration
         run: cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact

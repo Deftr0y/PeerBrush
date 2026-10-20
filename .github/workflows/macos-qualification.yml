@@ -106,13 +106,31 @@ jobs:
             --archive-name "$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" \
             --image-name "$IMAGE_NAME" --image-sha256 "$IMAGE_SHA256" --team-id "$SELECTED_TEAM"
           python3 -B scripts/package.py --check-source
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - if: runner.os == 'Windows'
+        name: Initialize existing MSVC SDK for native codec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeToolDirectories = @('clang-cl', 'cmake', 'ninja') | ForEach-Object { Split-Path (Get-Command $_ -CommandType Application -ErrorAction Stop).Source -Parent } | Select-Object -Unique
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Existing Visual Studio C++ tools unavailable' }
+          $launch = Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1'
+          & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          $env:PATH = ($nativeToolDirectories -join ';') + ';' + $env:PATH
+          python -B scripts/jxl_build.py --github-env
+          if ($LASTEXITCODE -ne 0) { throw 'Native codec tool qualification failed' }
+      - if: runner.os != 'Windows'
+        name: Select existing native codec tools
+        run: python3 -B scripts/jxl_build.py --github-env
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
         with:
-          toolchain: stable
+          toolchain: 1.92.0
           components: rustfmt, clippy, rust-docs
       - name: Test exact source without native attestation authority
         run: |
           cargo fmt --all -- --check
+          cargo build --locked --bin peerbrush
           cargo test --locked --all-targets
           cargo clippy --locked --all-targets
           python3 -B -m unittest discover -s scripts -p 'test_*.py'

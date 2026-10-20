@@ -715,6 +715,10 @@ fn old_presets_default_to_png_and_webp_presets_use_the_same_guarded_library() {
     std::fs::create_dir(&root).unwrap();
     let path = root.join("export-presets.json");
     let mut old_settings = serde_json::to_value(Settings::default()).unwrap();
+    assert!(
+        old_settings.get("jxl").is_none(),
+        "Default PNG settings remain readable by the prior preset schema"
+    );
     old_settings.as_object_mut().unwrap().remove("format");
     let old = serde_json::to_vec(&json!({"version":1,"revision":7,"presets":[{"id":"export-original","name":"Original PNG","settings":old_settings}]})).unwrap();
     std::fs::write(&path, &old).unwrap();
@@ -725,6 +729,10 @@ fn old_presets_default_to_png_and_webp_presets_use_the_same_guarded_library() {
         Format::Png
     );
     assert_eq!(std::fs::read(&path).unwrap(), old);
+    assert_eq!(
+        library.get("export-original").unwrap().settings.jxl,
+        peerbrush::jpeg_xl::Options::default()
+    );
     let preset = library
         .save(
             None,
@@ -742,6 +750,34 @@ fn old_presets_default_to_png_and_webp_presets_use_the_same_guarded_library() {
         loaded.get(&preset.id).unwrap().settings.format,
         Format::Webp
     );
+    assert!(
+        serde_json::to_value(&loaded.get(&preset.id).unwrap().settings)
+            .unwrap()
+            .get("jxl")
+            .is_none()
+    );
+    assert_eq!(
+        loaded.get("export-original").unwrap().settings.format,
+        Format::Png
+    );
+    let custom = Settings {
+        format: Format::Jxl,
+        jxl: peerbrush::jpeg_xl::Options {
+            lossless: false,
+            distance: 0.5,
+            effort: 4,
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&custom).unwrap()["jxl"],
+        json!({"lossless":false,"distance":0.5,"effort":4})
+    );
+    let preset = library
+        .save(None, "JPEG XL", custom.clone(), 8, "human")
+        .unwrap();
+    let loaded = Library::load(path.clone());
+    assert_eq!(loaded.get(&preset.id).unwrap().settings, custom);
     assert_eq!(
         loaded.get("export-original").unwrap().settings.format,
         Format::Png
@@ -852,7 +888,7 @@ fn webp_shared_protocol_preview_batch_and_reopening_keep_the_original_project() 
             .unwrap();
         assert_eq!(
             tool["inputSchema"]["properties"]["settings"]["properties"]["format"]["enum"],
-            json!(["png", "webp"])
+            json!(["png", "webp", "jxl"])
         );
         let mcp = server::mcp(
             &shared,

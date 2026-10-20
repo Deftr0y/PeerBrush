@@ -30,6 +30,7 @@ pub mod history;
 pub mod icons;
 pub mod image_import;
 pub mod image_open;
+pub mod jpeg_xl;
 pub mod layer_clipboard;
 pub mod liquify;
 pub mod loading;

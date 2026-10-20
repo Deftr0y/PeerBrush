@@ -581,9 +581,30 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
     {
         return Err("WebP output supports only 8-bit channels; the working document stays at its native depth".into());
     }
+    if format != crate::production_export::Format::Jxl && request.get("jxl").is_some() {
+        return Err("JPEG XL options require a .jxl export destination".into());
+    }
+    let jxl: crate::jpeg_xl::Options = request
+        .get("jxl")
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|e| format!("Invalid JPEG XL options: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    jxl.validate()?;
     let control = crate::production_export::Control::default();
     export_derived_guarded(shared, path, request, &control, |doc| {
-        crate::production_export::render_document(doc, format, &control)
+        if format == crate::production_export::Format::Jxl
+            && request
+                .get("bit_depth")
+                .is_some_and(|depth| depth.as_u64() != Some(u64::from(doc.bit_depth)))
+        {
+            return Err(
+                "JPEG XL export preserves the working document's native channel depth".into(),
+            );
+        }
+        crate::production_export::render_document(doc, format, jxl, &control)
     })
     .map(|_| ())
 }
@@ -600,7 +621,7 @@ pub(crate) fn export_derived_guarded(
     let lease = crate::file_safety::Lease::acquire(path)?;
     let path = lease.path.as_path();
     if crate::production_export::Format::from_path(path)? != format {
-        return Err("Export alias must resolve to the same PNG or WebP format".into());
+        return Err("Export alias must resolve to the same PNG, WebP or JPEG XL format".into());
     }
     if lease.expected.is_some() && request["overwrite"] != true && request["skip_existing"] != true
     {
@@ -660,7 +681,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_proposal","description":"Create and render frozen proposed edits for explicit human review. create needs observed document_id/expected_revision and ordinary engine commands; the shared project and history stay unchanged. preview returns actual PNG pixels with document coordinates. Only actor human can accept; agents can list, preview or reject their proposals. A changed project or ended/expired/taken-over task invalidates its draft. Never silently reacquire a task. Direct edits remain available when already authorized.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","preview","accept","reject"]},"actor":{"type":"string"},"proposal":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"task":{"type":"string"},"label":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"feedback":{"type":"string","enum":["batch","request"]}},"required":["action"],"additionalProperties":false}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status","recovery"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
-        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export flattened PNG/WebP selected by destination extension. PNG keeps native 8/16-bit channels; lossless WebP is explicitly 8-bit output only, including from native16 sources. Both retain alpha and ICC; exporting never changes the editable document's precision. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Working saves remain PSD/PSB under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. pattern_sources inspects protected raw RGB pattern assets; it requires observed document_id/expected_revision. Optional pattern_index returns native PNG content in pattern_asset coordinates, without interpreting Photoshop color handling or style placement. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_report","export","compatible_copy","pattern_sources"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"pattern_index":{"type":"integer","minimum":0,"maximum":15},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
+        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export flattened PNG/WebP/JPEG XL selected by destination extension. PNG and JPEG XL keep native 8/16-bit channels; lossless WebP is explicitly 8-bit output only, including from native16 sources. All retain alpha and supported color handling; JPEG XL assigns untagged RGB to sRGB and defaults to lossless, with optional jxl lossless/distance/effort settings; exporting never changes the editable document's precision. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Working saves remain PSD/PSB under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. pattern_sources inspects protected raw RGB pattern assets; it requires observed document_id/expected_revision. Optional pattern_index returns native PNG content in pattern_asset coordinates, without interpreting Photoshop color handling or style placement. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_report","export","compatible_copy","pattern_sources"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"pattern_index":{"type":"integer","minimum":0,"maximum":15},"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply a supported absolute local image path or base64 PNG. SVG/SVGZ placement creates rendered pixels; image.import retains editable vector markup. Use image_info and explicit frame/page/variant for animations, multipage TIFF and icons. Supply an exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
@@ -670,7 +691,7 @@ pub fn tools() -> Value {
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_recovery","description":"List complete instance-local autosave versions and failures. Restore an explicit snapshot into a new independent unsaved project, retaining original files and recovery versions. Returns actual image content with coordinates. Only human input may discard an explicit version; never discard to hide an autosave failure.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","restore","discard"]},"snapshot":{"type":"string"},"actor":{"type":"string"}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_filters","description":"Browse whole-image filter presets; thumbnail renders a standard reference image, preview renders the explicitly targeted current project without history and returns frozen commands. Apply with peerbrush_edit filter.add/update; edit settings, strength, bypass, delete and reorder non-destructively. Top filters run last after the composite. Save/rename/delete/import/export validated instance-local custom presets outside history. Curated presets are immutable. Preview requires current project_id/document_id/expected_revision; original 8/16-bit sources stay editable.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","thumbnail","preview","save","rename","delete","import","export"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"kind":{"type":"string"},"settings":{"type":"object"},"weight":{"type":"number","minimum":0,"maximum":1},"data":{"type":"object"},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_code","description":"Run bounded Rhai code against a frozen native 8/16-bit project, then commit shared commands atomically. start requires explicit project/document/revision, a named AI actor, active owned task, description and declared scopes. Code cannot bypass locks/reservations or read files/network. Returns run ID immediately; status returns completion and actual PNG with document coordinates. cancel or human takeover discards unfinished work. read_pixel, begin_pixels, write_pixel, commit_pixels and edit are documented in capabilities. One undo step; source changes reject the whole run.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","cancel"]},"actor":{"type":"string"},"task":{"type":"string"},"run":{"type":"string"},"description":{"type":"string","maxLength":240},"scopes":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}},"additionalProperties":false}},"script":{"type":"string","maxLength":65536},"max_edge":{"type":"integer","minimum":32,"maximum":1024}},"required":["action","project_id","document_id"],"additionalProperties":false}}));
-    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_exports","description":"Flattened PNG/WebP production presets and selected layer/folder batches. list returns instance-local preset revision; save_preset/delete_preset require expected_library_revision and never enter document history. plan/preview/start require observed project_id/document_id/expected_revision. Targets are isolated selected roots with their masks/effects and internal clipping; ancestor folders and document filters are excluded. An empty target list exports the current composite with document filters. Standalone adjustments/clipped layers and protected-source layers require their containing folder/composite. Presets define format (png by default), portable filenames, explicit numbered duplicates, canvas/alpha bounds, transparent padding and named scale variants. PNG preserves native 8/16-bit channels. Lossless WebP has explicit 8-bit output; native16 working sources remain unchanged. Both retain alpha and ICC without implicit profile conversion. Plan/receipts report output format/bit_depth and native_source_depth. preview returns actual output pixels as PNG with document coordinates. start requires an existing output directory and explicit existing-file policy (error by default, skip, or replace); status reports each written/skipped/failed/not-written output. cancel preserves completed exports and editable sources. Loaded sources, file ownership, concurrent edits and destination conflicts remain guarded.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","save_preset","delete_preset","plan","preview","start","status","cancel"]},"preset":{"type":"string"},"name":{"type":"string"},"actor":{"type":"string"},"expected_library_revision":{"type":"integer","minimum":0},"targets":{"type":"array","maxItems":1024,"items":{"type":"string"}},"directory":{"type":"string"},"existing":{"type":"string","enum":["error","skip","replace"]},"run":{"type":"string"},"output_index":{"type":"integer","minimum":0,"maximum":63},"max_edge":{"type":"integer","minimum":32,"maximum":1024},"settings":{"type":"object","properties":{"format":{"type":"string","enum":["png","webp"],"default":"png"},"template":{"type":"string","maxLength":160},"crop":{"type":"string","enum":["canvas","alpha"]},"padding":{"type":"integer","minimum":0,"maximum":4096},"resampling":{"type":"string","enum":["nearest","bilinear"]},"duplicate_names":{"type":"string","enum":["error","number"]},"variants":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":48},"scale":{"type":"number","minimum":0.01,"maximum":8}},"required":["name","scale"],"additionalProperties":false}}},"required":["template","crop","padding","resampling","duplicate_names","variants"],"additionalProperties":false}},"required":["action"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_exports","description":"Flattened PNG/WebP/JPEG XL production presets and selected layer/folder batches. list returns instance-local preset revision; save_preset/delete_preset require expected_library_revision and never enter document history. plan/preview/start require observed project_id/document_id/expected_revision. Targets are isolated selected roots with their masks/effects and internal clipping; ancestor folders and document filters are excluded. An empty target list exports the current composite with document filters. Standalone adjustments/clipped layers and protected-source layers require their containing folder/composite. Presets define format (png by default), portable filenames, explicit numbered duplicates, canvas/alpha bounds, transparent padding and named scale variants. PNG and JPEG XL preserve native 8/16-bit channels. JPEG XL defaults to lossless; jxl options select lossless/distance/effort, retaining alpha losslessly. Lossy JPEG XL can carry a structured equivalent profile. Lossless WebP has explicit 8-bit output; native16 working sources remain unchanged. All retain alpha and supported color handling without changing the working document. Plan/receipts report output format/bit_depth and native_source_depth. preview returns actual output pixels as PNG with document coordinates. start requires an existing output directory and explicit existing-file policy (error by default, skip, or replace); status reports each written/skipped/failed/not-written output. cancel preserves completed exports and editable sources. Loaded sources, file ownership, concurrent edits and destination conflicts remain guarded.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","save_preset","delete_preset","plan","preview","start","status","cancel"]},"preset":{"type":"string"},"name":{"type":"string"},"actor":{"type":"string"},"expected_library_revision":{"type":"integer","minimum":0},"targets":{"type":"array","maxItems":1024,"items":{"type":"string"}},"directory":{"type":"string"},"existing":{"type":"string","enum":["error","skip","replace"]},"run":{"type":"string"},"output_index":{"type":"integer","minimum":0,"maximum":63},"max_edge":{"type":"integer","minimum":32,"maximum":1024},"settings":{"type":"object","properties":{"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"format":{"type":"string","enum":["png","webp","jxl"],"default":"png"},"template":{"type":"string","maxLength":160},"crop":{"type":"string","enum":["canvas","alpha"]},"padding":{"type":"integer","minimum":0,"maximum":4096},"resampling":{"type":"string","enum":["nearest","bilinear"]},"duplicate_names":{"type":"string","enum":["error","number"]},"variants":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":48},"scale":{"type":"number","minimum":0.01,"maximum":8}},"required":["name","scale"],"additionalProperties":false}}},"required":["template","crop","padding","resampling","duplicate_names","variants"],"additionalProperties":false}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(fonts::tool());
     for tool in tools.as_array_mut().unwrap() {
         // Project/source properties are added consistently below.
@@ -718,8 +739,8 @@ pub fn capabilities() -> Value {
     result["segmentation"]["configured"] = json!(crate::segmentation::configured());
     result["photoshop_files"] = json!({"formats":["PSD v1","PSB v2"],"native_depths":[8,16],"mode":"RGB","file_limit_bytes":256*1024*1024,"max_edge":8192,"max_pixels":32*1024*1024,"protection":"Unsupported structures remain read-only; explicit compatible copies retain original precision. Both formats write current standard raster/masks and merged composites."});
     result["projects"] = json!({"tool":"peerbrush_projects","max_open":crate::workspace::MAX_PROJECTS,"targeting":"Use project_id, document_id and expected_revision for every background AI mutation. Switching or reordering tabs never changes a project's engine. Human-only reorder requires the complete expected_order and new order.","transfer":"Editable trees, masks, effects and native16 sources; copy changes destination, move is atomic with one undo step per project."});
-    result["image_import"] = json!({"extensions":crate::image_import::EXTENSIONS,"inspect_tool":"peerbrush_image_info","choices":"Explicit zero-based frame/page/variant when image_info reports choice; never silently flatten animations or multipage files.","precision":"Raster imports retain native 8/16-bit RGB and gray. Supported embedded RGB ICC is converted to sRGB at original depth. Float, CMYK and PNG16 animation are rejected. Static supported SVG/SVGZ retains editable markup; its colors and coverage project through RGBA8 and promote in native16 projects without quantizing existing raster channels. image.place and external image-file paste rasterize SVG."});
-    result["production_exports"] = json!({"tool":"peerbrush_exports","formats":["png","webp"],"default_format":"png","precision":"PNG retains native8/16. Lossless WebP produces8-bit RGBA from the rendered output only; native16 working channels are never replaced.","color":"Alpha and original ICC retained without implicit profile conversion.","preview":"Actual encoded output returned as display PNG with document coordinates; output format/bit_depth and native_source_depth are distinct.","publication":"Existing guarded atomic writes, source revision/ownership checks, cancellation and exact previous-file preservation apply to both formats."});
+    result["image_import"] = json!({"extensions":crate::image_import::EXTENSIONS,"inspect_tool":"peerbrush_image_info","choices":"Explicit zero-based frame/page/variant when image_info reports choice; never silently flatten animations or multipage files.","precision":"Raster imports retain native 8/16-bit RGB and gray. Supported embedded RGB ICC is converted to sRGB at original depth. Float, CMYK and PNG16 animation are rejected. JPEG XL accepts static SDR RGB with optional straight alpha at native8/16; animation, gray, associated alpha and extra channels reject. Static supported SVG/SVGZ retains editable markup; its colors and coverage project through RGBA8 and promote in native16 projects without quantizing existing raster channels. image.place and external image-file paste rasterize SVG."});
+    result["production_exports"] = json!({"tool":"peerbrush_exports","formats":["png","webp","jxl"],"default_format":"png","precision":"PNG and JPEG XL retain native8/16. Lossless WebP produces8-bit RGBA from the rendered output only; native16 working channels are never replaced.","color":"Alpha and supported ICC retained; lossy JPEG XL may serialize a structured equivalent. Untagged RGB is assigned sRGB for JPEG XL. Previews use the actual decoded output profile.","preview":"Actual encoded output returned as display PNG with document coordinates; output format/bit_depth and native_source_depth are distinct.","publication":"Existing guarded atomic writes, source revision/ownership checks, cancellation and exact previous-file preservation apply to every format."});
     result["effect_catalog"] = crate::effects::catalog::discovery();
     result["custom_contours"] = json!({"effects":["contour","bevel_emboss","inner_shadow","inner_glow","satin","outer_glow","drop_shadow"],"settings":{"contour":"custom","contour_points":"2–16 objects: position and value, each finite 0–1; positions strictly increase with fixed 0/1 endpoints"},"rendering":"Piecewise linear native contour mapping; original sources remain intact. Shared previews, history, reservations and document coordinates apply.","limits":"Unknown fields, missing points, duplicate positions and points on preset contours reject. Native contours do not establish Photoshop contour/style equivalence.","source_format":21});
     result["bevel_channels"] = json!({"effect":"bevel_emboss","settings":{"highlight_opacity":"0–1, default 1; multiplies common opacity","shadow_opacity":"0–1, default 1; multiplies common opacity","highlight_blend":"shared blend key or inherit (default)","shadow_blend":"shared blend key or inherit (default)"},"limits":"Native alpha-field relief; independent channels do not establish Photoshop bevel technique or backdrop equivalence. Shared previews, reservations, history and original native sources apply.","source_format":22});
@@ -3012,26 +3033,27 @@ mod save_loss_tests {
     use crate::engine::Document;
 
     #[test]
-    fn webp_failure_cancellation_and_later_human_work_preserve_the_destination() {
+    fn derived_format_failure_cancellation_and_later_human_work_preserve_the_destination() {
         use crate::production_export::{self, Control, Format};
-        for depth in [8, 16] {
-            for failure in ["encode", "cancel", "source"] {
-                let root =
-                    std::env::temp_dir().join(format!("peerbrush-webp-race-{}", engine::id()));
-                std::fs::create_dir(&root).unwrap();
-                let path = root.join("Original.webp");
-                let mut engine = Engine::new();
-                engine.doc = Document::new_depth(8, 6, depth).unwrap();
-                let shared = Arc::new(Mutex::new(engine));
-                export(&shared, &path).unwrap();
-                let original = std::fs::read(&path).unwrap();
-                let source = shared.lock().unwrap().doc.clone();
-                let before = serde_json::to_value(&source).unwrap();
-                let control = Control::default();
-                let error = export_derived_guarded(&shared, &path,
+        for format in [Format::Webp, Format::Jxl] {
+            for depth in [8, 16] {
+                for failure in ["encode", "cancel", "source"] {
+                    let root =
+                        std::env::temp_dir().join(format!("peerbrush-webp-race-{}", engine::id()));
+                    std::fs::create_dir(&root).unwrap();
+                    let path = root.join(format!("Original.{}", format.extension()));
+                    let mut engine = Engine::new();
+                    engine.doc = Document::new_depth(8, 6, depth).unwrap();
+                    let shared = Arc::new(Mutex::new(engine));
+                    export(&shared, &path).unwrap();
+                    let original = std::fs::read(&path).unwrap();
+                    let source = shared.lock().unwrap().doc.clone();
+                    let before = serde_json::to_value(&source).unwrap();
+                    let control = Control::default();
+                    let error = export_derived_guarded(&shared, &path,
                     &json!({"document_id":source.id,"expected_revision":source.revision,"overwrite":true}),
                     &control, |doc| {
-                        let bytes = production_export::render_document(doc, Format::Webp, &control)?;
+                        let bytes = production_export::render_document(doc, format, crate::jpeg_xl::Options::default(), &control)?;
                         match failure {
                             "encode" => return Err("Injected encoder failure before publication".into()),
                             "cancel" => control.cancel(),
@@ -3044,60 +3066,70 @@ mod save_loss_tests {
                         }
                         Ok(bytes)
                     }).unwrap_err();
-                assert!(
-                    error.contains(match failure {
-                        "encode" => "encoder failure",
-                        "cancel" => "canceled",
-                        _ => "source changed",
-                    }),
-                    "{error}"
-                );
-                assert_eq!(std::fs::read(&path).unwrap(), original);
-                let engine = shared.lock().unwrap();
-                assert_eq!(engine.doc.bit_depth, depth);
-                assert_eq!(engine.saved_revision, 0);
-                if failure == "source" {
-                    assert_eq!(
-                        engine.doc.layers[0].pixels.get16(1, 2),
-                        [53 * 257, 97 * 257, 173 * 257, 65535]
+                    assert!(
+                        error.contains(match failure {
+                            "encode" => "encoder failure",
+                            "cancel" => "canceled",
+                            _ => "source changed",
+                        }),
+                        "{error}"
                     );
-                    assert_eq!(engine.undo.len(), 1);
-                } else {
-                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-                    assert!(engine.undo.is_empty());
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                    let engine = shared.lock().unwrap();
+                    assert_eq!(engine.doc.bit_depth, depth);
+                    assert_eq!(engine.saved_revision, 0);
+                    if failure == "source" {
+                        assert_eq!(
+                            engine.doc.layers[0].pixels.get16(1, 2),
+                            [53 * 257, 97 * 257, 173 * 257, 65535]
+                        );
+                        assert_eq!(engine.undo.len(), 1);
+                    } else {
+                        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                        assert!(engine.undo.is_empty());
+                    }
+                    assert_eq!(
+                        std::fs::read_dir(&root)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|entry| entry.file_type().unwrap().is_file())
+                            .count(),
+                        1
+                    );
+                    drop(engine);
+                    drop(shared);
+                    std::fs::remove_dir_all(root).unwrap();
                 }
-                assert_eq!(
-                    std::fs::read_dir(&root)
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .filter(|entry| entry.file_type().unwrap().is_file())
-                        .count(),
-                    1
-                );
-                drop(engine);
-                drop(shared);
-                std::fs::remove_dir_all(root).unwrap();
             }
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn webp_alias_cannot_change_the_resolved_output_format() {
-        let root = std::env::temp_dir().join(format!("peerbrush-webp-alias-{}", engine::id()));
-        std::fs::create_dir(&root).unwrap();
-        let original = root.join("Original.png");
-        std::fs::write(&original, b"Exact original PNG").unwrap();
-        let alias = root.join("Alias.webp");
-        std::os::unix::fs::symlink(&original, &alias).unwrap();
-        let shared = Arc::new(Mutex::new(Engine::new()));
-        let doc = shared.lock().unwrap().doc.clone();
-        let error = export_confirmed_source(&shared, &alias, &doc.id, doc.revision).unwrap_err();
-        assert!(error.contains("same PNG or WebP format"), "{error}");
-        assert_eq!(std::fs::read(&original).unwrap(), b"Exact original PNG");
-        assert!(shared.lock().unwrap().undo.is_empty());
-        drop(shared);
-        std::fs::remove_dir_all(root).unwrap();
+    fn derived_format_alias_cannot_change_the_resolved_output_format() {
+        for format in [
+            crate::production_export::Format::Webp,
+            crate::production_export::Format::Jxl,
+        ] {
+            let root = std::env::temp_dir().join(format!("peerbrush-webp-alias-{}", engine::id()));
+            std::fs::create_dir(&root).unwrap();
+            let original = root.join("Original.png");
+            std::fs::write(&original, b"Exact original PNG").unwrap();
+            let alias = root.join(format!("Alias.{}", format.extension()));
+            std::os::unix::fs::symlink(&original, &alias).unwrap();
+            let shared = Arc::new(Mutex::new(Engine::new()));
+            let doc = shared.lock().unwrap().doc.clone();
+            let error =
+                export_confirmed_source(&shared, &alias, &doc.id, doc.revision).unwrap_err();
+            assert!(
+                error.contains("same PNG, WebP or JPEG XL format"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&original).unwrap(), b"Exact original PNG");
+            assert!(shared.lock().unwrap().undo.is_empty());
+            drop(shared);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

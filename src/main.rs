@@ -4,6 +4,9 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    if let Some(code) = peerbrush::jpeg_xl::main_entry() {
+        std::process::exit(code);
+    }
     if let Err(error) = run() {
         eprintln!("PeerBrush: {error}");
         // File-association launches have no console. Keep failures visible without

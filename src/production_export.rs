@@ -32,24 +32,27 @@ pub enum Format {
     #[default]
     Png,
     Webp,
+    Jxl,
 }
 impl Format {
     pub fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Webp => "webp",
+            Self::Jxl => "jxl",
         }
     }
     pub fn from_path(path: &std::path::Path) -> Result<Self, String> {
         match path.extension().and_then(|value| value.to_str()) {
             Some(value) if value.eq_ignore_ascii_case("png") => Ok(Self::Png),
             Some(value) if value.eq_ignore_ascii_case("webp") => Ok(Self::Webp),
-            _ => Err("Flattened exports require a .png or .webp destination".into()),
+            Some(value) if value.eq_ignore_ascii_case("jxl") => Ok(Self::Jxl),
+            _ => Err("Flattened exports require a .png, .webp or .jxl destination".into()),
         }
     }
     fn bit_depth(self, native: u16) -> u16 {
         match self {
-            Self::Png => native,
+            Self::Png | Self::Jxl => native,
             Self::Webp => 8,
         }
     }
@@ -86,6 +89,8 @@ pub struct Variant {
 pub struct Settings {
     #[serde(default)]
     pub format: Format,
+    #[serde(default, skip_serializing_if = "default_jxl")]
+    pub jxl: crate::jpeg_xl::Options,
     pub template: String,
     pub crop: Crop,
     pub padding: u32,
@@ -93,10 +98,14 @@ pub struct Settings {
     pub duplicate_names: DuplicateNames,
     pub variants: Vec<Variant>,
 }
+fn default_jxl(value: &crate::jpeg_xl::Options) -> bool {
+    *value == crate::jpeg_xl::Options::default()
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
             format: Format::Png,
+            jxl: crate::jpeg_xl::Options::default(),
             template: "{document}_{layer}_{variant}".into(),
             crop: Crop::Canvas,
             padding: 0,
@@ -111,6 +120,7 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
+        self.jxl.validate()?;
         if self.template.trim().is_empty()
             || self.template.len() > 160
             || self
@@ -274,6 +284,7 @@ impl Image {
     fn encode(
         &self,
         format: Format,
+        jxl: crate::jpeg_xl::Options,
         profile: Option<&[u8]>,
         control: &Control,
     ) -> Result<Vec<u8>, String> {
@@ -287,6 +298,17 @@ impl Image {
                     crate::raster::png16_with_profile(self.width, self.height, words, profile)
                 }
             }?,
+            Format::Jxl => crate::jpeg_xl::encode(
+                self.width,
+                self.height,
+                match &self.pixels {
+                    Pixels::Eight(bytes) => crate::jpeg_xl::PixelsRef::Eight(bytes),
+                    Pixels::Sixteen(words) => crate::jpeg_xl::PixelsRef::Sixteen(words),
+                },
+                profile,
+                jxl,
+                &|| control.check(),
+            )?,
             Format::Webp => {
                 use image::ImageEncoder;
                 let projected;
@@ -547,7 +569,7 @@ pub fn render(
     if rect == [0, 0, doc.width as i32, doc.height as i32]
         && (output.width, output.height) == (doc.width, doc.height)
     {
-        return image.encode(settings.format, profile, control);
+        return image.encode(settings.format, settings.jxl, profile, control);
     }
     let (rw, rh) = (f64::from(rect[2] - rect[0]), f64::from(rect[3] - rect[1]));
     let count = output.width as usize * output.height as usize * 4;
@@ -587,16 +609,18 @@ pub fn render(
             Pixels::Eight(bytes)
         },
     }
-    .encode(settings.format, profile, control)
+    .encode(settings.format, settings.jxl, profile, control)
 }
 
 pub(crate) fn render_document(
     doc: &Document,
     format: Format,
+    jxl: crate::jpeg_xl::Options,
     control: &Control,
 ) -> Result<Vec<u8>, String> {
     let settings = Settings {
         format,
+        jxl,
         ..Default::default()
     };
     let plan = plan(doc, &[], &settings, control)?;
@@ -743,13 +767,40 @@ pub(crate) fn request_with_control(
                     .get(index)
                     .ok_or("Export preview output is missing")?;
                 let bytes = render(&doc, output, &settings, control)?;
-                let image = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
-                let mut words = image.into_rgba16().into_raw();
                 let mut managed = false;
-                if let Some(profile) = doc.icc_profile.as_deref() {
-                    if crate::color_profile::supported(profile).is_ok() {
-                        crate::color_profile::convert16(profile, &mut words)?;
-                        managed = true;
+                let mut words = if output.format == Format::Jxl {
+                    let decoded = crate::jpeg_xl::decode(&bytes, &|| control.check())?;
+                    if (
+                        decoded.info.width,
+                        decoded.info.height,
+                        decoded.info.bit_depth,
+                    ) != (output.width, output.height, output.bit_depth)
+                    {
+                        return Err("JPEG XL preview differs from the planned output".into());
+                    }
+                    let mut words = match decoded.pixels {
+                        crate::jpeg_xl::Pixels::Eight(bytes) => {
+                            bytes.into_iter().map(|v| u16::from(v) * 257).collect()
+                        }
+                        crate::jpeg_xl::Pixels::Sixteen(words) => words,
+                    };
+                    // Lossy output can carry a structured equivalent profile;
+                    // display the decoded samples in their actual returned ICC.
+                    crate::color_profile::convert16(&decoded.icc_profile, &mut words)?;
+                    managed = true;
+                    words
+                } else {
+                    image::load_from_memory(&bytes)
+                        .map_err(|e| e.to_string())?
+                        .into_rgba16()
+                        .into_raw()
+                };
+                if output.format != Format::Jxl {
+                    if let Some(profile) = doc.icc_profile.as_deref() {
+                        if crate::color_profile::supported(profile).is_ok() {
+                            crate::color_profile::convert16(profile, &mut words)?;
+                            managed = true;
+                        }
                     }
                 }
                 let edge = p["max_edge"].as_u64().unwrap_or(512).clamp(32, 1024) as f64;

@@ -5,6 +5,7 @@ import os
 import pathlib
 import subprocess
 from package import git
+from jxl_build import configure, reject_overrides
 
 
 def source_input_state(root):
@@ -21,6 +22,7 @@ def source_input_state(root):
 
 def release_environment(root, inherited=None):
     environment = dict(os.environ if inherited is None else inherited)
+    reject_overrides(environment)
     environment['PEERBRUSH_BUILD_INPUT_STATE'] = source_input_state(root)
     if environment.get('RUSTFLAGS') and not environment.get('CARGO_ENCODED_RUSTFLAGS'):
         raise ValueError('Use CARGO_ENCODED_RUSTFLAGS to preserve custom compiler options')
@@ -35,6 +37,16 @@ def release_environment(root, inherited=None):
         for spelling in dict.fromkeys([str(prefix), prefix.as_posix()]):
             flags.append(f'--remap-path-prefix={spelling}={replacement}')
     environment['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
+    # Keep native source/macro paths subject to the same package privacy gate.
+    for key in ['CFLAGS', 'CXXFLAGS']:
+        native = [environment[key]] if environment.get(key) else []
+        for prefix, replacement in prefixes:
+            for spelling in dict.fromkeys([str(prefix), prefix.as_posix()]):
+                if any(c in spelling for c in ['\"', '\r', '\n', '\0']):
+                    raise ValueError('Native path remapping contains an unsupported character')
+                flag = '-ffile-prefix-map=' + spelling + '=' + replacement
+                native.append('\"' + ('/clang:' if os.name == 'nt' else '') + flag + '\"')
+        environment[key] = ' '.join(native)
     return environment
 
 
@@ -52,4 +64,5 @@ if __name__ == '__main__':
         command += ['--offline']
     if args.jobs:
         command += ['--jobs', str(args.jobs)]
-    subprocess.run(command, cwd=root, env=release_environment(root), check=True)
+    environment, _ = configure(release_environment(root))
+    subprocess.run(command, cwd=root, env=environment, check=True)

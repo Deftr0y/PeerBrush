@@ -238,6 +238,18 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
             path = relative_path(name)
             if str(path.parent) == directory and path.name.casefold() in NOTICE_NAMES:
                 copy_file(root, name, notices / key / path.name)
+        if meta['name'] == 'jpegxl-src':
+            # Exact compiled native components; all bytes must be committed source.
+            native_notices = ['libjxl/LICENSE', 'libjxl/third_party/highway/LICENSE',
+                              'libjxl/third_party/highway/LICENSE-BSD3',
+                              'libjxl/third_party/brotli/LICENSE',
+                              'libjxl/third_party/skcms/LICENSE']
+            for native in native_notices:
+                selected = directory + '/' + native
+                if selected not in manifest['source']:
+                    raise ValueError('Missing committed JPEG XL native notice')
+                copy_file(root, selected, notices / key / native)
+            copy_file(root, 'LICENSE', notices / key / 'GPL-3.0.txt')
     copy_file(root, "assets/fonts/LICENCE.txt", notices / "ubuntu-sans" / "LICENCE.txt")
     # Include named compiler notices only, never all local compiler documentation.
     rust_docs = rust_docs if rust_docs is not None else active_rust_docs()
@@ -377,7 +389,7 @@ def validate_policy(policy, tree):
     if not actual <= selected:
         missing = ', '.join(sorted(actual - selected))
         raise ValueError('Compiler input inventory changed; review scripts/package-files.json: ' + missing)
-    if any(n in tree and n not in selected for n in ['build.rs', '.cargo/config', '.cargo/config.toml']):
+    if any(n in tree and n not in selected for n in ['build.rs', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml']):
         raise ValueError('Unlisted build configuration; review the package manifest')
 
 
@@ -434,9 +446,9 @@ def equivalent_build_inputs(root, sources, original_commit):
     if not re.fullmatch(r'[0-9a-f]{40}', original_commit):
         raise ValueError('Expected full executable source commit')
     compiler_roots = {'src', 'tests', 'examples', 'integrations', 'vendor'}
-    selected = {name: data for name, data, _ in sources if relative_path(name).parts[0] in compiler_roots or name.startswith('assets/') or name in ['Cargo.toml', 'Cargo.lock', 'build.rs', '.cargo/config', '.cargo/config.toml']}
+    selected = {name: data for name, data, _ in sources if relative_path(name).parts[0] in compiler_roots or name.startswith('assets/') or name in ['Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml']}
     original_names = set(git(root, 'ls-tree', '-r', '--name-only', original_commit).decode().splitlines())
-    original_compiler = {name for name in original_names if relative_path(name).parts[0] in compiler_roots or name in ['Cargo.toml', 'Cargo.lock', 'build.rs', '.cargo/config', '.cargo/config.toml']}
+    original_compiler = {name for name in original_names if relative_path(name).parts[0] in compiler_roots or name in ['Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml']}
     if original_compiler != {name for name in selected if not name.startswith('assets/')}:
         raise ValueError('Executable source compiler inventory differs from package source')
     for name, data in selected.items():

@@ -39,7 +39,7 @@ class Packages(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='peerbrush-package-test-')
         self.addCleanup(self.temporary.cleanup)
-        self.root = pathlib.Path(self.temporary.name)
+        self.root = pathlib.Path(self.temporary.name).resolve()
         for name in ['vendor', 'docs', 'assets/fonts', 'src', 'scripts']:
             (self.root / name).mkdir(parents=True, exist_ok=True)
         for name, content in {'Cargo.toml': '[package]\nname="peerbrush"\nversion="0.2.0"\n', 'Cargo.lock': 'version=4\n[[package]]\nname="peerbrush"\nversion="0.2.0"\n', 'LICENSE': 'GNU GENERAL PUBLIC LICENSE\nGPL-3.0-only\n', 'README.md': 'Synthetic package fixture\n', 'FOLLOWUPS.MD': 'Synthetic backlog\n', 'assets/fonts/LICENCE.txt': 'Synthetic font license\n', 'assets/peerbrush-logo.png': 'Synthetic artwork\n', 'src/lib.rs': '// synthetic\n', 'scripts/start-windows.cmd': '@echo off\n', 'docs/usage.md': 'Synthetic instructions\n'}.items():
@@ -831,6 +831,26 @@ class Packages(unittest.TestCase):
         for name in ['docs/tab\t.txt', 'docs/newline\n.txt']:
             with self.assertRaises(ValueError):
                 packaging.relative_path(name)
+
+
+    def test_toolchain_is_a_required_listed_root_compiler_input_and_source_equivalence_input(self):
+        toolchain = self.root / 'rust-toolchain.toml'
+        toolchain.write_text('[toolchain]\nchannel="1.92.0"\n', encoding='utf-8')
+        self.commit()
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        with self.assertRaisesRegex(ValueError, 'Unlisted build configuration'):
+            packaging.source_files(self.root, commit)
+        self.policy['source'].append('rust-toolchain.toml')
+        self.save_policy()
+        self.commit()
+        original = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        sources = packaging.source_files(self.root, original)
+        self.assertEqual(next(data for name, data, _ in sources if name == 'rust-toolchain.toml'), toolchain.read_bytes())
+        toolchain.write_text('[toolchain]\nchannel="1.93.0"\n', encoding='utf-8')
+        self.commit()
+        current = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        with self.assertRaisesRegex(ValueError, 'Executable source inputs differ'):
+            packaging.equivalent_build_inputs(self.root, packaging.source_files(self.root, current), original)
 
 
 if __name__ == '__main__':

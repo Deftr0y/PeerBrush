@@ -1822,6 +1822,10 @@ impl PeerBrush {
         self.job(move || {
             let (label, title) = match format {
                 Format::Png => ("PNG", format!("Export native {depth}-bit PNG")),
+                Format::Jxl => (
+                    "JPEG XL",
+                    format!("Export lossless native {depth}-bit JPEG XL"),
+                ),
                 Format::Webp => (
                     "WebP · lossless 8-bit",
                     format!("Export 8-bit WebP · {depth}-bit project unchanged"),
@@ -1844,6 +1848,7 @@ impl PeerBrush {
             server::export_confirmed_source(&s, &path, &document, revision)?;
             Ok(match format {
                 Format::Png => "PNG exported",
+                Format::Jxl => "Lossless JPEG XL exported",
                 Format::Webp => "8-bit WebP exported · working document unchanged",
             }
             .into())
@@ -5294,6 +5299,10 @@ impl PeerBrush {
                         }
                         if ui.button("Export WebP (8-bit)…").clicked() {
                             self.export(crate::production_export::Format::Webp);
+                            ui.close_menu();
+                        }
+                        if ui.button("Export JPEG XL (lossless)…").clicked() {
+                            self.export(crate::production_export::Format::Jxl);
                             ui.close_menu();
                         }
                         if ui.button("Production export…").clicked() {

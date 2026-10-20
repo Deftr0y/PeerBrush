@@ -61,9 +61,26 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check committed package source
         run: python scripts/package.py --check-source
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - if: runner.os == 'Windows'
+        name: Initialize existing MSVC SDK for native codec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeToolDirectories = @('clang-cl', 'cmake', 'ninja') | ForEach-Object { Split-Path (Get-Command $_ -CommandType Application -ErrorAction Stop).Source -Parent } | Select-Object -Unique
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Existing Visual Studio C++ tools unavailable' }
+          $launch = Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1'
+          & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          $env:PATH = ($nativeToolDirectories -join ';') + ';' + $env:PATH
+          python -B scripts/jxl_build.py --github-env
+          if ($LASTEXITCODE -ne 0) { throw 'Native codec tool qualification failed' }
+      - if: runner.os != 'Windows'
+        name: Select existing native codec tools
+        run: python3 -B scripts/jxl_build.py --github-env
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
         with:
-          toolchain: stable
+          toolchain: 1.92.0
           components: rustfmt, clippy, rust-docs
       - name: Identify compiler cache
         id: compiler
@@ -92,6 +109,8 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
       - run: cargo fmt --all -- --check
+      - name: Build source-matched JPEG XL worker for integration tests
+        run: cargo build --locked --bin peerbrush
       - name: Run regression tests and summarize failures
         shell: bash
         run: |
@@ -176,6 +195,29 @@ jobs:
                   summary.writelines(f'- `{name[:256]}`\n' for name in failures[:100])
           PY
           exit "$test_status"
+      - name: Record headless workspace CPU component baseline
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --lib ui::input_performance_diagnostic::actual_workspace_control_and_navigation_components -- --exact --ignored --nocapture --test-threads=1 > "$RUNNER_TEMP/peerbrush-ui-cpu.log" 2>&1
+          diagnostic_status=$?
+          python - "$RUNNER_TEMP/peerbrush-ui-cpu.log" "$(git rev-parse HEAD)" "$diagnostic_status" <<'PY'
+          import json, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          if int(sys.argv[3]) or path.stat().st_size > 2 * 1024 * 1024:
+              raise SystemExit('Headless workspace CPU diagnostic failed; no timing comparison established')
+          rows = []
+          for line in path.read_text(encoding='utf-8', errors='strict').splitlines():
+              if line.startswith('{'):
+                  value = json.loads(line)
+                  if isinstance(value, dict) and value.get('format') == 'PeerBrushUiCpuDiagnosticV1':
+                      rows.append(value)
+          if len(rows) != 1 or rows[0].get('build', {}).get('commit') != sys.argv[2] or rows[0]['build'].get('tree') != 'clean' or rows[0].get('native_window') is not False:
+              raise SystemExit('CPU diagnostic does not match exact clean source/headless scope')
+          print('CPU component metrics only; caches/scheduling uncontrolled; compiler/platform changes are not controlled before/after comparisons.')
+          print(json.dumps(rows[0], sort_keys=True, separators=(',', ':')))
+          PY
       - name: Verify native installed-font inventory without registration
         run: cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact
       - run: cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
