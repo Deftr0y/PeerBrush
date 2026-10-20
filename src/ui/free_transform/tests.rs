@@ -1002,6 +1002,7 @@ fn scale_crossing_uses_signed_axes_about_the_reference_with_rotation_skew_and_pr
         open(&mut app, &ctx);
         for mirrors in [[false, false], [true, false], [false, true], [true, true]] {
             for (input, proportional, shift, axes, expected) in cases {
+                let expected: [f64; 2] = expected;
                 let editor = app.free_transform.as_mut().unwrap();
                 editor.reference = None;
                 editor.values = Parameters {
