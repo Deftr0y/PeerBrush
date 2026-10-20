@@ -1008,8 +1008,11 @@ impl Engine {
         if ["move", "transform"].contains(&op) && c["selection_only"] != false {
             if let Some(b) = self.doc.selection {
                 let moving = op == "move";
-                let dx = if moving { num(c, "dx", 0.).round() } else { 0. };
-                let dy = if moving { num(c, "dy", 0.).round() } else { 0. };
+                let [dx, dy] = if moving {
+                    [num(c, "dx", 0.).round(), num(c, "dy", 0.).round()]
+                } else {
+                    crate::transform::translation(c).unwrap_or([0., 0.])
+                };
                 let angle = if moving {
                     0.
                 } else {

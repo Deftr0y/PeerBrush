@@ -18,6 +18,7 @@ mod file_drop;
 mod file_ownership;
 mod filename;
 mod filters;
+mod free_transform;
 mod geometry;
 mod gradient_stops;
 mod history;
@@ -371,6 +372,9 @@ pub struct PeerBrush {
     selection_shortcut_keys: HashSet<egui::Key>,
     project_settings: Option<(u32, u32, u16)>,
     geometry: Option<geometry::Editor>,
+    free_transform: Option<free_transform::Editor>,
+    free_transform_frame: bool,
+    free_transform_cancelled_pointer: bool,
     source_editor: Option<source::Editor>,
     pen: pen::State,
     straight: brush::Straight,
@@ -725,6 +729,9 @@ impl PeerBrush {
             selection_shortcut_keys: HashSet::new(),
             project_settings: None,
             geometry: None,
+            free_transform: None,
+            free_transform_frame: false,
+            free_transform_cancelled_pointer: false,
             source_editor: None,
             pen: pen::State::default(),
             straight: brush::Straight::default(),
@@ -875,6 +882,7 @@ impl PeerBrush {
         self.try_edit(commands, label);
     }
     fn try_edit(&mut self, commands: Vec<Value>, label: &str) -> bool {
+        self.cancel_free_transform();
         self.close_proposal();
         let selection_edit = commands.iter().any(|command| {
             command["op"]
@@ -911,6 +919,13 @@ impl PeerBrush {
         }
     }
     fn select_tool(&mut self, tool: Tool) {
+        if let Some(editor) = &mut self.free_transform {
+            if matches!(tool, Tool::Move | Tool::Rotate | Tool::Scale) {
+                editor.set_mode(tool);
+                return;
+            }
+            self.cancel_free_transform();
+        }
         if self
             .source_editor
             .as_ref()
@@ -975,7 +990,11 @@ impl PeerBrush {
                 let key = self.shortcuts.tool_label(tool).replace("Shift+", "⇧");
                 let response = response.on_hover_text(self.tool_caption(tool));
                 self.transform_rects[index] = Some(response.rect);
-                let active = self.tool == tool;
+                let active = self
+                    .free_transform
+                    .as_ref()
+                    .map_or(self.tool, |editor| editor.mode())
+                    == tool;
                 if active || response.hovered() {
                     ui.painter().rect_filled(
                         response.rect,
@@ -1639,6 +1658,10 @@ impl PeerBrush {
         });
     }
     fn save(&mut self, save_as: bool) {
+        if self.free_transform.is_some() {
+            self.message = "Apply or cancel Free Transform before saving.".into();
+            return;
+        }
         if self.busy {
             self.message = "Finish the current file operation before saving".into();
             return;
@@ -1978,6 +2001,9 @@ impl PeerBrush {
         )
     }
     fn live_key(&self) -> String {
+        if let Some(editor) = &self.free_transform {
+            return editor.live_key();
+        }
         if let Some(edit) = &self.parameter_gesture {
             return format!(
                 "parameter:{}:{}:{}",
@@ -2056,6 +2082,7 @@ impl PeerBrush {
     }
     fn request_preview(&mut self, ctx: &egui::Context, _doc: &Document) {
         let current = self.shared.lock().unwrap().doc.clone();
+        self.sync_free_transform(ctx, &current);
         if self
             .filter_editor
             .as_ref()
@@ -2129,9 +2156,18 @@ impl PeerBrush {
                 && p.revision == doc.revision
                 && (p.target == variant || (!live.is_empty() && p.live == live))
                 && p.mask == preview_mask
+                && (self.free_transform.is_none() || (p.target == variant && p.live == live))
                 && ((self.source_editor.is_none() && self.filter_editor.is_none())
                     || p.live == live)
             {
+                if let Some(editor) = &mut self.free_transform {
+                    editor.error = p.error.clone();
+                    editor.rendered = if !p.coarse && p.error.is_none() && !p.bytes.is_empty() {
+                        editor.key().ok()
+                    } else {
+                        None
+                    };
+                }
                 if let Some(editor) = &mut self.geometry {
                     editor.error = p.error.clone();
                 }
@@ -3157,6 +3193,9 @@ impl PeerBrush {
             self.message = "Image changed during retouch · stroke cancelled".into();
         }
         self.transient.clear();
+        if let Some(editor) = &self.free_transform {
+            self.transient.extend(editor.commands().unwrap_or_default());
+        }
         if let Some(editor) = &self.geometry {
             self.transient.push(editor.command());
         }
@@ -3347,6 +3386,23 @@ impl PeerBrush {
                 ui.ctx().request_repaint();
             }
             return;
+        }
+        if self.free_transform.is_some() {
+            self.free_transform_canvas(ui, doc, rect, scale, available);
+            return;
+        }
+        if self.free_transform_frame {
+            return;
+        }
+        if self.free_transform_cancelled_pointer {
+            if ui.input(|input| input.pointer.primary_pressed()) {
+                self.free_transform_cancelled_pointer = false;
+            } else {
+                if !ui.input(|input| input.pointer.primary_down()) {
+                    self.free_transform_cancelled_pointer = false;
+                }
+                return;
+            }
         }
         if self.tool == Tool::Text
             && !zoom_drag
@@ -3811,6 +3867,7 @@ impl PeerBrush {
         if id == self.project_id {
             return;
         }
+        self.cancel_free_transform();
         let Some((_, _, shared)) = crate::workspace::entries_in(&self.workspace)
             .into_iter()
             .find(|(project, _, _)| project == id)
@@ -4394,6 +4451,13 @@ impl PeerBrush {
         })
     }
     fn document_shortcuts(&mut self, ctx: &egui::Context, doc: &Document) {
+        if self.free_transform.is_some() {
+            self.free_transform_keys(ctx, doc);
+            return;
+        }
+        if self.free_transform_frame {
+            return;
+        }
         let stale_selection = self.selection_gesture_stale(doc);
         if ctx.input(|i| {
             !i.focused
@@ -4444,6 +4508,16 @@ impl PeerBrush {
                 .memory(|m| m.focused())
                 .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
         if !typing {
+            if ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(event,
+                egui::Event::Key {key:egui::Key::T,pressed:true,repeat:false,modifiers,..}
+                    if (modifiers.command||modifiers.ctrl)&&!modifiers.alt&&!modifiers.shift)
+                })
+            }) {
+                self.open_free_transform(ctx, doc);
+                return;
+            }
             // A held key may keep producing OS repeats after selection
             // completion. Those are not an explicit retry. Track both logical
             // and physical identities; a release or new non-repeat press ends
@@ -4632,6 +4706,7 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.free_transform_frame = self.free_transform.is_some();
         self.updates_tick(ctx);
         self.about.dismiss_escape(ctx);
         self.fonts.refresh(ctx);
@@ -4639,7 +4714,7 @@ impl PeerBrush {
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
         self.lifecycle_frame = self.save_loss_review.is_some() || self.show_new;
-        if !self.lifecycle_frame {
+        if !self.lifecycle_frame && self.free_transform.is_none() {
             self.temporary_pen_tool(ctx);
         }
         if let Some(warning) = self.workspace.lock().unwrap().open_warning.take() {
@@ -4956,6 +5031,7 @@ impl PeerBrush {
             (e.doc.clone(), e.ai_change.clone())
         };
         self.doc_snapshot = doc.clone();
+        self.sync_free_transform(ctx, &doc);
         if self.lifecycle.is_none() && !self.lifecycle_frame {
             self.import_dialog(ctx);
             self.image_open_dialog(ctx);
@@ -5156,6 +5232,7 @@ impl PeerBrush {
                     });
                     egui::menu::menu_custom_button(ui, egui::Button::new("Layer").corner_radius(egui::CornerRadius::same(0)),|ui| {
                         ui.spacing_mut().item_spacing.x = 8.;
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Free Transform...").shortcut_text(if cfg!(target_os="macos") {"Cmd+T"}else{"Ctrl+T"})).clicked(){self.open_free_transform(ctx,&doc);ui.close_menu();}
                         if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Group layers").shortcut_text(if cfg!(target_os="macos") {"⌘ G"} else {"Ctrl+G"})).clicked(){self.create_folder(&doc);ui.close_menu();}
                         if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ G"} else {"Ctrl+Shift+G"})).clicked(){self.merge_layers(ctx,&doc);ui.close_menu();}
                         ui.separator();
@@ -5600,6 +5677,7 @@ impl PeerBrush {
         self.proposal_window(ctx, &doc);
         self.refinement_window(ctx, &doc);
         self.geometry_window(ctx, &doc);
+        self.free_transform_window(ctx, &doc, drawn_generation);
         self.source_window(ctx, &doc);
         self.filters_window(ctx, &doc);
         self.exports_window(ctx, &doc);

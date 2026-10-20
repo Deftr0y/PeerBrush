@@ -123,9 +123,12 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     if !px.is_finite() || !py.is_finite() || px.abs() > 100000. || py.abs() > 100000. {
         return Err("Invalid transform pivot".into());
     }
+    let [dx, dy] = crate::transform::translation(c)?;
     if angle.rem_euclid(360.) == 0.
         && sx == 1.
         && sy == 1.
+        && dx == 0.
+        && dy == 0.
         && crate::transform::skewed([1., 0., 0., 1.], c)? == [1., 0., 0., 1.]
     {
         return Ok(());
@@ -140,7 +143,7 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         ],
         c,
     )?;
-    let delta = [
+    let mut delta = [
         a,
         b,
         cc,
@@ -148,6 +151,12 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         px + a * (layer.x as f64 - px) + cc * (layer.y as f64 - py),
         py + b * (layer.x as f64 - px) + d * (layer.y as f64 - py),
     ];
+    if dx != 0. {
+        delta[4] += dx;
+    }
+    if dy != 0. {
+        delta[5] += dy;
+    }
     let world = ["group", "adjustment"].contains(&layer.kind.as_str());
     if world && layer.mask.is_none() {
         return Ok(());
@@ -296,15 +305,13 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
     } else {
         c["angle"].as_f64().unwrap_or(0.)
     };
-    let dx = if moving {
-        c["dx"].as_f64().unwrap_or(0.).round()
+    let [dx, dy] = if moving {
+        [
+            c["dx"].as_f64().unwrap_or(0.).round(),
+            c["dy"].as_f64().unwrap_or(0.).round(),
+        ]
     } else {
-        0.
-    };
-    let dy = if moving {
-        c["dy"].as_f64().unwrap_or(0.).round()
-    } else {
-        0.
+        crate::transform::translation(c)?
     };
     let px = c["pivot"][0]
         .as_f64()

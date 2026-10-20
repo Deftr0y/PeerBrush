@@ -288,7 +288,7 @@ impl Shortcuts {
         self.preferences = prefs;
         Ok(())
     }
-    fn pressed(&self, action: &str, input: &egui::InputState) -> bool {
+    pub(super) fn pressed(&self, action: &str, input: &egui::InputState) -> bool {
         if self.preferences.bindings[action].pressed(input) {
             return true;
         }

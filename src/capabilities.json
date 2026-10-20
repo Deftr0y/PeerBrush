@@ -940,6 +940,13 @@
     "psd": "Supplementary format 9 retains originals alongside current standard raster/mask channels and merged composite. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
     "limits": "Current plus original tiles count against 512 MiB document memory. 8192 per edge, 32 MP, 128 million output samples per layer command; singular/nonfinite/out-of-range/nested sources refused atomically.",
     "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists.",
+    "translation": {
+      "fields": ["dx", "dy"],
+      "pixels": [-100000, 100000],
+      "default": 0,
+      "rounding": "Round to whole document pixels; snap:true uses the existing 8-pixel grid.",
+      "behavior": "Translation follows the affine placement in the same source-sampling pass, including selected coverage, masks and editable sources; no separate selected-pixel cut."
+    },
     "skew": {
       "fields": ["skew_x", "skew_y"],
       "degrees": [-80, 80],
@@ -949,8 +956,17 @@
       "targets": "Whole layer/folder and whole independent mask; current linked/unlinked and editable-source restrictions apply.",
       "selection_pixels": false,
       "selection": "Nonzero skew of selected pixels rejects atomically. Use selection_only:false to transform the whole target and leave selection geometry unchanged.",
-      "limits": "Affine engine slice only; no Ctrl/Cmd+T session, perspective/distort or control-grid Warp UI."
+      "limits": "Affine placement only; selected-pixel skew, perspective/distort and control-grid Warp are unavailable."
     }
+  },
+  "free_transform": {
+    "native_ui": "Layer > Free Transform or Ctrl/Cmd+T",
+    "modes": ["move", "scale", "rotate", "skew", "mirror"],
+    "commands": "One guarded shared transform per target combines affine values and dx/dy. Pure movement stays move, including saved text with unavailable fonts.",
+    "preview": "Actual shared-engine native8/16 result; Apply/Enter commits one undo only after the current preview is rendered. Handle release and mode changes remain pending.",
+    "cancellation": "Cancel/Escape, focus loss, changed source or target cancel the draft without rebasing; Save/close/update restart require Apply or Cancel.",
+    "reference_point": "Set or drag before an adjustment; Reset transform makes it editable again without stacking/re-cutting selected pixels.",
+    "limits": "Selected-pixel skew requires explicit Whole target (keep selection). No projective distort, perspective or control-grid Warp."
   },
   "editable_sources": {
     "commands": [

@@ -205,7 +205,7 @@ impl PeerBrush {
             && !ctx.input(|i| i.pointer.any_down() || !i.events.is_empty());
         self.updates.tick(ctx, idle);
     }
-    fn update_interaction_active(&self) -> bool {
+    pub(super) fn update_interaction_active(&self) -> bool {
         self.busy
             || self.connecting
             || !self.jobs.is_empty()
@@ -224,6 +224,7 @@ impl PeerBrush {
             || self.eye_sweep.is_some()
             || self.tab_transfer.is_some()
             || self.tab_transfer_committing
+            || self.free_transform.is_some()
             || self.geometry.is_some()
             || self.source_editor.is_some()
             || self.filter_editor.is_some()
@@ -235,7 +236,7 @@ impl PeerBrush {
             || self.proposal_review.is_some()
             || self.export_editor.is_some()
     }
-    fn update_restart_blocker(&self) -> Option<String> {
+    pub(super) fn update_restart_blocker(&self) -> Option<String> {
         if self.update_interaction_active() {
             Some(
                 "Finish or cancel the current tool, edit or file operation before restarting."

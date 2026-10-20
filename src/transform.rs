@@ -8,6 +8,23 @@ pub const ANGLE_SNAP: f64 = 15.0;
 pub const SCALE_SNAP: f64 = 0.1;
 pub const SKEW_LIMIT: f64 = 80.0;
 
+/// Translation after the affine placement, in rounded document pixels.
+pub(crate) fn translation(c: &Value) -> Result<[f64; 2], String> {
+    let mut delta = [0.; 2];
+    for (index, name) in ["dx", "dy"].into_iter().enumerate() {
+        let value = c.get(name).map_or(Ok(0.), |value| {
+            value
+                .as_f64()
+                .ok_or("Transform translation must be a number")
+        })?;
+        if !value.is_finite() || value.abs() > 100000. {
+            return Err("Transform translation must be between -100000 and 100000 pixels".into());
+        }
+        delta[index] = value.round();
+    }
+    Ok(delta)
+}
+
 fn skew_angles(c: &Value) -> Result<[f64; 2], String> {
     let mut angles = [0.; 2];
     if c["op"] == "move" {
@@ -41,6 +58,9 @@ pub(crate) fn skewed([a, b, c, d]: [f64; 4], command: &Value) -> Result<[f64; 4]
 }
 
 fn selected_skew(c: &Value) -> Result<(), String> {
+    if c["op"] != "move" {
+        translation(c)?;
+    }
     if skew_angles(c)? != [0., 0.] {
         return Err("Skew does not support selected pixels yet. Use selection_only:false for the whole target; the selection stays unchanged.".into());
     }
@@ -80,6 +100,7 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
     if command["op"] == "transform" {
         scales(command)?;
         skew_angles(command)?;
+        translation(command)?;
     }
     let Some(snap) = command.get("snap") else {
         return Ok(command.clone());
@@ -104,6 +125,11 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
         ]
     };
     if command["op"] == "transform" {
+        for name in ["dx", "dy"] {
+            if command.get(name).is_some() {
+                fields.push((name, 0., MOVE_SNAP, -100000., 100000.));
+            }
+        }
         for name in ["skew_x", "skew_y"] {
             if command.get(name).is_some() {
                 fields.push((name, 0., ANGLE_SNAP, -SKEW_LIMIT, SKEW_LIMIT));
@@ -128,6 +154,7 @@ pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> 
         if command["op"] == "transform" {
             scales(command)?;
             skew_angles(command)?;
+            translation(command)?;
         }
         if command.get("snap").is_some()
             && matches!(command["op"].as_str(), Some("move" | "transform"))
@@ -217,7 +244,8 @@ pub fn selection_with_coverage(
     let (dx, dy) = if moving {
         (n("dx", 0.).round(), n("dy", 0.).round())
     } else {
-        (0., 0.)
+        let [dx, dy] = translation(c)?;
+        (dx as f32, dy as f32)
     };
     let (sx, sy) = if moving {
         (1., 1.)
@@ -279,7 +307,8 @@ fn selection_impl(
     let (dx, dy) = if move_only {
         (n("dx", 0.0).round(), n("dy", 0.0).round())
     } else {
-        (0.0, 0.0)
+        let [dx, dy] = translation(c)?;
+        (dx as f32, dy as f32)
     };
     let angle = if move_only { 0.0 } else { n("angle", 0.0) };
     let (sx, sy) = if move_only {

@@ -708,14 +708,22 @@ pub fn transformed(before: &Layer, after: &mut Layer, c: &Value) -> Result<(), S
     let [a, b, cc, d] =
         crate::transform::skewed([cos * sx, sin * sx, -sin * sy, cos * sy].map(f64::from), c)?
             .map(|value| value as f32);
-    source.prepend([
+    let [dx, dy] = crate::transform::translation(c)?.map(|value| value as f32);
+    let mut delta = [
         a,
         b,
         cc,
         d,
         px + a * (before.x as f32 - px) + cc * (before.y as f32 - py) - after.x as f32,
         py + b * (before.x as f32 - px) + d * (before.y as f32 - py) - after.y as f32,
-    ]);
+    ];
+    if dx != 0. {
+        delta[4] += dx;
+    }
+    if dy != 0. {
+        delta[5] += dy;
+    }
+    source.prepend(delta);
     after.pixels = source.render(after.pixels.width, after.pixels.height, after.pixels.depth)?;
     after.source = Some(source);
     Ok(())
@@ -893,6 +901,7 @@ mod tests {
                 json!({"op":"source.update","layer":id,"source":updated}),
                 json!({"op":"source.update","layer":id,"source":resized}),
                 json!({"op":"transform","layer":id,"angle":17.,"selection_only":false}),
+                json!({"op":"transform","layer":id,"angle":17.,"dx":8.,"dy":-4.,"selection_only":false}),
                 json!({"op":"transform","layer":id,"scale_x":1.2,"scale_y":1.2,"selection_only":false}),
                 json!({"op":"transform","layer":id,"skew_x":15.,"skew_y":-10.,"selection_only":false}),
                 json!({"op":"image.resize","width":220,"height":132}),

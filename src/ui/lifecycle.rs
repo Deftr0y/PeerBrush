@@ -540,7 +540,8 @@ impl PeerBrush {
         let affects_active =
             intent == Intent::Exit || matches!(&intent,Intent::Close(id) if id == &self.project_id);
         if affects_active
-            && (self.geometry.is_some()
+            && (self.free_transform.is_some()
+                || self.geometry.is_some()
                 || self.source_editor.is_some()
                 || self.filter_editor.is_some()
                 || self.refinement.is_some()
