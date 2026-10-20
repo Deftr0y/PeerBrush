@@ -477,6 +477,42 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
 pub fn encode_psb(doc: &Document) -> Result<Vec<u8>, String> {
     encode_layout(doc, Layout::Psb)
 }
+fn check_output_size(doc: &Document, plan: &StandardPlan) -> Result<(), String> {
+    // Validation bounds every frame and record count; u64 also covers their aggregate.
+    let bytes = u64::from(doc.bit_depth / 8);
+    let canvas = u64::from(doc.width) * u64::from(doc.height);
+    let mut minimum = 40 + 4 * canvas * bytes;
+    let mut records = usize::from(plan.composite);
+    if plan.composite {
+        minimum += 4 * canvas * bytes + 8;
+    }
+    if !plan.composite || plan.hidden_sources {
+        for (layer, section) in standard_order(doc) {
+            records += 1;
+            let [x, y, right, bottom] = standard_bounds(doc, layer, section);
+            minimum +=
+                4 * (u64::from((right - x) as u32) * u64::from((bottom - y) as u32) * bytes + 2);
+            if layer.mask.is_some() && section != 3 {
+                let pixels = if crate::effects::canvas_frame(layer) {
+                    canvas
+                } else {
+                    u64::from(layer.pixels.width) * u64::from(layer.pixels.height)
+                };
+                minimum += pixels * bytes + 2;
+            }
+        }
+    }
+    if records == 0 {
+        minimum += 4 * canvas * bytes + 8;
+    }
+    if records > 200 {
+        return Err("Too many PSD layer records".into());
+    }
+    if minimum > 256 * 1024 * 1024 {
+        return Err("Uncompressed Photoshop channels alone exceed the 256 MiB file limit; use a smaller canvas or fewer full-frame layers".into());
+    }
+    Ok(())
+}
 fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     if doc.read_only {
         return Err(
@@ -484,6 +520,8 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
         );
     }
     validate(doc)?;
+    let plan = standard_plan(doc);
+    check_output_size(doc, &plan)?;
     let high = doc.bit_depth == 16;
     let masks = if high {
         vec![None; doc.layers.len()]
@@ -519,7 +557,6 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     };
     // Ordinary raster clipping remains standard, editable PSD layer data.
     // Adjustments and unsupported clipping units still need a standard bake.
-    let plan = standard_plan(doc);
     let baked = if plan.composite {
         let mut layer = Layer::new(
             "PeerBrush composite · editable sources in PeerBrush",
@@ -2812,6 +2849,80 @@ pub fn validate(doc: &Document) -> Result<(), String> {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    #[test]
+    fn output_preflight_counts_cropped_sources_masks_and_the_actual_standard_plan() {
+        let mut doc = Document::new_depth(4, 4, 16).unwrap();
+        doc.layers[0].pixels = Raster::new_depth(8192, 3277, 16);
+        validate(&doc).unwrap();
+        check_output_size(&doc, &standard_plan(&doc)).unwrap();
+        doc.layers[0].mask = Some(Mask {
+            enabled: true,
+            linked: false,
+            cache_key: id(),
+            steps: vec![MaskStep {
+                id: id(),
+                kind: "paint".into(),
+                enabled: true,
+                weight: 1.,
+                value: 255.,
+                pixels: Raster::new_depth(8192, 3277, 16),
+                settings: serde_json::json!({}),
+            }],
+        });
+        validate(&doc).unwrap();
+        assert!(check_output_size(&doc, &standard_plan(&doc))
+            .unwrap_err()
+            .contains("Uncompressed Photoshop channels alone"));
+        doc.layers[0].mask = None;
+        doc.layers[0].pixels = Raster::new_depth(8192, 4096, 16);
+        assert!(check_output_size(&doc, &standard_plan(&doc)).is_err());
+
+        // An adjustment-only standard bake stores the tiny current canvas;
+        // the large sparse editable sources remain in supplementary data.
+        let mut adjustment = Layer::new("Adjustment", "adjustment", 4, 4);
+        adjustment.pixels = Raster::new_depth(4, 4, 16);
+        doc.layers.insert(0, adjustment);
+        validate(&doc).unwrap();
+        check_output_size(&doc, &standard_plan(&doc)).unwrap();
+        let bytes = encode(&doc).unwrap();
+        assert_eq!(decode(&bytes).unwrap().layers[1].pixels.width, 8192);
+        doc.filters.push(crate::effects::Effect {
+            id: id(),
+            kind: "invert".into(),
+            enabled: false,
+            weight: 1.,
+            settings: serde_json::json!({}),
+        });
+        validate(&doc).unwrap();
+        // Whole-document filters additionally retain standard source records.
+        assert!(check_output_size(&doc, &standard_plan(&doc)).is_err());
+
+        let mut empty = Document::new_depth(8192, 4096, 8).unwrap();
+        empty.layers.clear();
+        assert!(
+            check_output_size(&empty, &standard_plan(&empty)).is_err(),
+            "Empty documents still write a full Canvas raster and composite"
+        );
+    }
+    #[test]
+    fn output_record_preflight_counts_group_dividers_and_a_filtered_bake() {
+        let mut doc = Document::new(4, 4).unwrap();
+        doc.layers = (0..100)
+            .map(|_| Layer::new("Folder", "group", 4, 4))
+            .collect();
+        validate(&doc).unwrap();
+        check_output_size(&doc, &standard_plan(&doc)).unwrap();
+        doc.filters.push(crate::effects::Effect {
+            id: id(),
+            kind: "invert".into(),
+            enabled: false,
+            weight: 1.,
+            settings: serde_json::json!({}),
+        });
+        validate(&doc).unwrap();
+        assert_eq!(encode(&doc).unwrap_err(), "Too many PSD layer records");
+        assert_eq!(encode_psb(&doc).unwrap_err(), "Too many PSD layer records");
+    }
     #[test]
     fn style_gate_compares_exact_standard_matte_and_alpha_without_straight_rgb_tolerance() {
         let mut saved = Raster::new_depth(1, 1, 8);
