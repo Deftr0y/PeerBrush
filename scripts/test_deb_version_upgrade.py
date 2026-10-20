@@ -289,7 +289,7 @@ class Session:
         return False
 
     def guarded(self, action, **parameters):
-        state = self.rpc('observe', dict(max_edge=32))
+        state = self.rpc('observe', dict(max_edge=32))['state']
         return self.rpc('document', dict(action=action, document_id=state['document']['id'],
             expected_revision=state['document']['revision'], **parameters))
 
@@ -355,7 +355,7 @@ def check(old_source_root, package, expected, output):
                     bounds=[2., 3., 22., 18.], points=[], closed=True,
                     fill=[10001, 20003, 30007, 65535], stroke=[0, 0, 0, 0], stroke_width=0.))
                 old_session.rpc('edit', dict(commands=[dict(op='source.add', source=source)], feedback='request'))
-                definition = editable_snapshot(old_session.rpc('observe', dict(max_edge=32)))
+                definition = editable_snapshot(old_session.rpc('observe', dict(max_edge=32))['state'])
                 if definition['document']['bit_depth'] != depth:
                     raise ValueError('Historical fixture did not create the selected native document depth.')
                 for extension in ['psd', 'psb']:
@@ -388,7 +388,7 @@ def check(old_source_root, package, expected, output):
                 state = session.guarded('open', path=str(project))
                 if state['document']['read_only']:
                     raise ValueError('Supported historical fixture unexpectedly became protected.')
-                if editable_snapshot(session.rpc('observe', dict(max_edge=32))) != definitions[project.name]:
+                if editable_snapshot(session.rpc('observe', dict(max_edge=32))['state']) != definitions[project.name]:
                     raise ValueError('Current readback changed native depth, bounds, layer kind or editable Shape source.')
                 exported = folders['artwork'] / (phase + '-' + project.name + '.png')
                 session.guarded('export', path=str(exported))

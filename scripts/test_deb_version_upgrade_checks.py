@@ -274,10 +274,31 @@ class FixtureContract(unittest.TestCase):
             self.assertEqual(json.loads(command[-1]), dict(actor='human', action='get', tool='brush'))
             self.assertEqual(run.call_args.kwargs['timeout'], 10)
             self.assertEqual(run.call_args.kwargs['stdin'], subprocess.DEVNULL)
-        with mock.patch.object(session, 'rpc', side_effect=[{'document': {'id': 'doc', 'revision': 7}}, {'saved': True}]) as rpc:
+        observation = {'state': {'document': {'id': 'doc', 'revision': 7}}, 'revision': 7, 'images': []}
+        with mock.patch.object(session, 'rpc', side_effect=[observation, {'saved': True}]) as rpc:
             session.guarded('save', path='/artwork/file.psd', accept_editability_loss=True)
             self.assertEqual(rpc.call_args.args, ('document', dict(action='save', document_id='doc',
                 expected_revision=7, path='/artwork/file.psd', accept_editability_loss=True)))
+
+    def test_published_and_current_observation_envelopes_keep_native_snapshot_and_top_level_revision(self):
+        # a00cf47 server.rs:730 and 34f9b9a server.rs:775 both return this envelope.
+        for depth in [8, 16]:
+            state = dict(document=dict(id='doc', revision=7, width=32, height=24, bit_depth=depth, read_only=False),
+                layers=[dict(kind='paint', bounds=[0, 0, 32, 24], source=dict(width=32, height=24,
+                    matrix=[1., 0., 0., 1., 0., 0.], content=dict(kind='shape', shape='rectangle',
+                        bounds=[2., 3., 22., 18.], points=[], closed=True, fill=[10001, 20003, 30007, 65535],
+                        stroke=[0, 0, 0, 0], stroke_width=0.)))])
+            observed = dict(state=state, revision=7, images=[])
+            before = copy.deepcopy(observed)
+            with self.assertRaises(ValueError):
+                upgrade.editable_snapshot(observed)
+            self.assertEqual(upgrade.editable_snapshot(observed['state'])['document']['bit_depth'], depth)
+            session = upgrade.Session(Path('/bin/peerbrush'), {}, Path('/private'), None)
+            with mock.patch.object(session, 'rpc', side_effect=[observed, {'saved': True}]) as rpc:
+                self.assertEqual(session.guarded('save_report'), {'saved': True})
+                self.assertEqual(rpc.call_args.args, ('document', dict(action='save_report', document_id='doc', expected_revision=7)))
+            self.assertEqual(observed, before)
+            self.assertEqual(observed['revision'], 7)
 
 
     def test_editable_shape_snapshot_preserves_depth_bounds_kind_and_definition(self):
