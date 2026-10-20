@@ -2,6 +2,7 @@
 import hashlib
 import io
 import json
+import lzma
 import pathlib
 import os
 import sys
@@ -20,6 +21,36 @@ from package import digest, git
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+MAINTAINER = 'Synthetic CI <builds@example.invalid>'
+
+
+def tar_bytes(entries):
+    data = io.BytesIO()
+    with tarfile.open(fileobj=data, mode='w', format=tarfile.USTAR_FORMAT) as archive:
+        for name, mode, content in entries:
+            entry = tarfile.TarInfo('./' if name == '.' else './' + name)
+            entry.uid = entry.gid = 0
+            entry.mode = mode
+            entry.type = tarfile.DIRTYPE if content is None else tarfile.REGTYPE
+            entry.size = 0 if content is None else len(content)
+            archive.addfile(entry, None if content is None else io.BytesIO(content))
+    return data.getvalue()
+
+
+def ar_bytes(members):
+    result = bytearray(b'!<arch>\n')
+    for name, data in members:
+        header = f'{name + "/":<16}{0:<12}{0:<6}{0:<6}{"100644":<8}{len(data):<10}`\n'.encode('ascii')
+        if len(header) != 60:
+            raise ValueError('Invalid synthetic ar member')
+        result.extend(header + data + (b'\n' if len(data) % 2 else b''))
+    return bytes(result)
+
+
+def write_deb(path, data, control):
+    path.write_bytes(ar_bytes([('debian-binary', b'2.0\n'),
+                               ('control.tar.xz', lzma.compress(control)),
+                               ('data.tar.xz', lzma.compress(data))]))
 
 
 class DebianPackage(unittest.TestCase):
@@ -43,6 +74,102 @@ class DebianPackage(unittest.TestCase):
 
     def stage(self, stage, **overrides):
         return deb.stage_payload(self.root, self.archive, stage, overrides.get('expected_sha256', digest(self.archive)))
+
+    def final_package(self):
+        stage = self.root / 'final-deb-stage'
+        self.stage(stage)
+        self.final_data = [('.', 0o755, None)]
+        for path in sorted(stage.rglob('*')):
+            name = path.relative_to(stage).as_posix()
+            self.final_data.append((name, 0o755 if path.is_dir() or name == 'usr/bin/peerbrush' else 0o644,
+                                    None if path.is_dir() else path.read_bytes()))
+        size = (sum(len(content) for _, _, content in self.final_data if content is not None) + 1023) // 1024
+        self.final_control = deb.control('0.2.0', 'libc6 (>= 2.34), ' + ', '.join(deb.RUNTIME), size, MAINTAINER)
+        self.package = self.root / 'peerbrush_0.2.0-1_amd64.deb'
+        write_deb(self.package, tar_bytes(self.final_data), tar_bytes([('.', 0o755, None), ('control', 0o644, self.final_control.encode())]))
+        return self.package
+
+    def inspect(self, **overrides):
+        selected = dict(commit=git(self.root, 'rev-parse', 'HEAD').decode().strip(), version='0.2.0',
+                        portable_sha256=digest(self.archive), package_sha256=digest(self.package), maintainer=MAINTAINER)
+        return deb.inspect_final(self.root, self.archive, self.package, **dict(selected, **overrides))
+
+    def test_final_deb_inspection_binds_actual_payload_source_control_and_selected_hashes(self):
+        self.final_package()
+        original = self.package.read_bytes()
+        with mock.patch.object(deb, 'run') as native:
+            inspected = self.inspect()
+            native.assert_not_called()
+        self.assertEqual(self.package.read_bytes(), original)
+        self.assertEqual(inspected['record'], dict(file=self.package.name, bytes=len(original), sha256=digest(self.package),
+                         platform='Linux', architecture='amd64', binary_source_commit=git(self.root, 'rev-parse', 'HEAD').decode().strip(),
+                         source_sha256=digest(self.root / 'final-deb-stage/usr/share/doc/peerbrush/PeerBrush-0.2.0-source.zip')))
+        self.assertEqual(inspected['executable_sha256'], digest(self.root / 'final-deb-stage/usr/bin/peerbrush'))
+        self.assertEqual(inspected['portable_sha256'], digest(self.archive))
+        for changes in [dict(package_sha256='0' * 64), dict(portable_sha256='0' * 64),
+                        dict(commit='0' * 40), dict(version='0.30.0'), dict(maintainer='Other <other@example.invalid>')]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.inspect(**changes)
+        (self.package.with_name(self.package.name + '.json')).write_text('{"release_ready":true}')
+        self.assertEqual(self.inspect(), inspected, 'Builder sidecars must never grant content qualification')
+
+    def test_final_deb_rejects_missing_extra_changed_and_wrong_mode_payload(self):
+        self.final_package()
+        controls = tar_bytes([('.', 0o755, None), ('control', 0o644, self.final_control.encode())])
+        variants = [self.final_data + [('usr/share/unexpected', 0o644, b'extra')],
+                    [entry for entry in self.final_data if entry[0] != 'usr/bin/peerbrush'],
+                    [(name, 0o644 if name == 'usr/bin/peerbrush' else mode, content) for name, mode, content in self.final_data],
+                    [(name, mode, b'changed' if name.endswith('.desktop') else content) for name, mode, content in self.final_data],
+                    [(name, mode, b'wrong source' if name.endswith('-source.zip') else content) for name, mode, content in self.final_data]]
+        for index, entries in enumerate(variants):
+            with self.subTest(mutation=index):
+                write_deb(self.package, tar_bytes(entries), controls)
+                with self.assertRaisesRegex(ValueError, 'bytes or modes'):
+                    self.inspect()
+
+    def test_final_deb_rejects_scripts_unapproved_control_and_missing_runtime_dependencies(self):
+        self.final_package()
+        payload = tar_bytes(self.final_data)
+        variants = [self.final_control.replace('Architecture: amd64', 'Architecture: arm64'),
+                    self.final_control.replace('Installed-Size: ', 'Installed-Size: 999'),
+                    self.final_control.replace('Version: 0.2.0-1', 'Version: 0.26.0-1'),
+                    self.final_control.replace(', libegl1', ''),
+                    self.final_control.replace('libc6 (>= 2.34)', 'libc6 [amd64]'),
+                    self.final_control + 'Conflicts: another-editor\n',
+                    self.final_control + 'Depends: libc6\n']
+        for text in variants:
+            with self.subTest(control=text):
+                write_deb(self.package, payload, tar_bytes([('.', 0o755, None), ('control', 0o644, text.encode())]))
+                with self.assertRaises(ValueError):
+                    self.inspect()
+        for name in ['postinst', 'conffiles', 'triggers']:
+            with self.subTest(extra=name):
+                write_deb(self.package, payload, tar_bytes([('.', 0o755, None), ('control', 0o644, self.final_control.encode()),
+                                                           (name, 0o755, b'#!/bin/sh\nexit 0\n')]))
+                with self.assertRaisesRegex(ValueError, 'only the exact control'):
+                    self.inspect()
+
+    def test_final_deb_rechecks_both_selected_inputs_and_requires_matching_checkout(self):
+        self.final_package()
+        for changed in [self.package, self.archive]:
+            calls = 0
+            def changing_digest(path):
+                nonlocal calls
+                if path == changed:
+                    calls += 1
+                    if calls > 1:
+                        return '0' * 64
+                return digest(path)
+            with self.subTest(changed=changed.name), mock.patch.object(deb, 'digest', side_effect=changing_digest), \
+                    self.assertRaisesRegex(ValueError, 'changed during inspection'):
+                self.inspect()
+        selected = git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        (self.root / 'docs/usage.md').write_text('Different committed source')
+        self.fixture.commit()
+        with self.assertRaisesRegex(ValueError, 'selected commit'):
+            self.inspect(commit=selected)
+        with self.assertRaises(ValueError):
+            self.inspect()
 
     def test_exact_staging_preserves_binary_source_notices_and_consent(self):
         original = self.archive.read_bytes()
@@ -136,7 +263,7 @@ class DebianPackage(unittest.TestCase):
                 return ''
             if command[0] == 'dpkg-shlibdeps':
                 return 'shlibs:Depends=libc6 (>= 2.34)'
-            if command[:3] == ['dpkg-deb', '--root-owner-group', '--build']:
+            if command[:5] == ['dpkg-deb', '--root-owner-group', '-Zxz', '--uniform-compression', '--build']:
                 stage = pathlib.Path(command[-2])
                 pathlib.Path(command[-1]).write_bytes(b'SYNTHETIC_DEB_BYTES')
                 return ''
@@ -189,6 +316,60 @@ class DebianPackage(unittest.TestCase):
 
 
 class TarInspection(unittest.TestCase):
+    def test_final_ar_requires_exact_members_compression_owners_and_complete_bounded_streams(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-ar-fixture-') as temporary:
+            package = pathlib.Path(temporary) / 'synthetic.deb'
+            tar = tar_bytes([('.', 0o755, None), ('control', 0o644, b'synthetic')])
+            members = [('debian-binary', b'2.0\n'), ('control.tar.xz', lzma.compress(tar)), ('data.tar.xz', lzma.compress(tar))]
+            package.write_bytes(ar_bytes(members))
+            self.assertEqual(deb.deb_archives(package), {'control.tar.xz': tar, 'data.tar.xz': tar})
+            variants = [b'not-ar', ar_bytes(members)[:-1], ar_bytes(members) + b'extra',
+                        ar_bytes(members + [('extra', b'bad')]), ar_bytes([members[0], members[2], members[1]]),
+                        ar_bytes([('debian-binary', b'1.0\n'), *members[1:]]),
+                        ar_bytes([members[0], ('control.tar.gz', members[1][1]), members[2]]),
+                        ar_bytes([members[0], ('control.tar.xz', members[1][1] + lzma.compress(b'extra')), members[2]]),
+                        ar_bytes([members[0], ('control.tar.xz', b'not-xz'), members[2]])]
+            # ar uid is a fixed-width field in its first member header.
+            owner = bytearray(ar_bytes(members))
+            owner[8 + 28:8 + 34] = b'1000  '
+            variants.append(bytes(owner))
+            for index, data in enumerate(variants):
+                with self.subTest(mutation=index):
+                    package.write_bytes(data)
+                    with self.assertRaises(ValueError):
+                        deb.deb_archives(package)
+            package.write_bytes(ar_bytes(members))
+            with mock.patch.object(deb, 'MAX_CONTROL_BYTES', 1024), self.assertRaisesRegex(ValueError, 'decoded-byte budget'):
+                deb.deb_archives(package)
+            with mock.patch.object(deb, 'MAX_DEB_BYTES', 64), self.assertRaisesRegex(ValueError, 'compressed-byte budget'):
+                deb.deb_archives(package)
+
+    def test_tar_rejects_extended_headers_hidden_trailing_bytes_and_resource_excess(self):
+        original = tar_bytes([('.', 0o755, None), ('regular', 0o644, b'original')])
+        for kind in [tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_SPARSE,
+                     tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE]:
+            entry = tarfile.TarInfo('extended')
+            entry.type = kind
+            entry.mode = 0o644
+            with self.subTest(type=kind), self.assertRaises(ValueError):
+                deb.tar_entries(entry.tobuf() + b'\0' * 1024)
+        with self.assertRaisesRegex(ValueError, 'trailing content'):
+            deb.tar_entries(original + b'x' + b'\0' * 511)
+        with self.assertRaisesRegex(ValueError, 'terminator'):
+            deb.tar_entries(original[:1536])
+        with self.assertRaisesRegex(ValueError, 'byte budget'):
+            deb.tar_entries(original, limit=1024)
+        with mock.patch.object(deb, 'MAX_TAR_MEMBERS', 1), self.assertRaisesRegex(ValueError, 'member budget'):
+            deb.tar_entries(original)
+        invalid_header = bytearray(original)
+        invalid_header[0] ^= 1
+        with self.assertRaisesRegex(ValueError, 'invalid tar header'):
+            deb.tar_entries(bytes(invalid_header))
+        directory_alias = tarfile.TarInfo('regular/')
+        directory_alias.mode = 0o644
+        with self.assertRaisesRegex(ValueError, 'directory path aliases'):
+            deb.tar_entries(directory_alias.tobuf() + b'\0' * 1024)
+
     def test_native_failures_keep_bounded_diagnostics_without_arguments_or_environment(self):
         failure = subprocess.CalledProcessError(100, ['apt-get', 'SYNTHETIC_ARGUMENT_NOT_FOR_LOGS'],
                                                output='progress\n' * 1000, stderr='E: synthetic unmet dependencies\x00\n')
@@ -234,7 +415,7 @@ class TarInspection(unittest.TestCase):
         deb.verify_tar(self.make_tar(), expected)
         def change(field, value):
             return lambda entry: setattr(entry, field, value) if entry.name.endswith('peerbrush') else None
-        for mutation in [change('uid', 1000), change('gid', 1000), change('mode', 0o644),
+        for mutation in [change('uid', 1000), change('gid', 1000), change('uname', 'daemon'), change('gname', 'daemon'), change('mode', 0o644),
                          change('name', '../../escape'), change('name', './usr/bin'),
                          change('type', tarfile.SYMTYPE), change('type', tarfile.LNKTYPE),
                          change('type', tarfile.FIFOTYPE)]:

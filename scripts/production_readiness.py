@@ -6,6 +6,18 @@ from pathlib import Path
 import re
 
 from verify_release import inspect_archive
+from package import regular_file
+from package_deb import inspect_final
+
+
+DEB_INSTALLATION_CHECKS = {'installation': 'passed', 'installed-build-identity': 'passed',
+                           'same-binary-package-upgrade': 'passed', 'remove-purge-reinstall-retention': 'passed',
+                           'mime-and-default-consent': 'passed'}
+DEB_INSTALLATION_LIMITS = {'native-gui': 'not-performed', 'real-application-version-migration': 'not-performed',
+                           'unsaved-work-and-update-interruption': 'not-performed',
+                           'publisher-signature': 'not-performed', 'update-repository': 'not-configured',
+                           'public-availability': 'not-assessed'}
+MAX_INSTALLATION_RECEIPT_BYTES = 64 * 1024
 
 
 def digest(path):
@@ -103,17 +115,80 @@ def assess(directory, commit, version, previous=None, source_root=None):
                 platforms=platforms, blockers=blockers)
 
 
+def assess_deb(root, portable, package, *, commit, version, portable_sha256, package_sha256,
+               maintainer, installation_receipt):
+    """Bind private same-job evidence to inspected bytes, without authenticating its producer.
+
+    The workflow must run the disposable installation check immediately before
+    this consumer. Matching JSON alone cannot prove that native checks occurred.
+    """
+    if not isinstance(installation_receipt, bytes) or not 0 < len(installation_receipt) <= MAX_INSTALLATION_RECEIPT_BYTES:
+        raise ValueError('Expected a bounded private DEB installation receipt')
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('DEB installation receipt contains duplicate fields')
+            result[key] = value
+        return result
+    try:
+        receipt = json.loads(installation_receipt.decode('utf-8'), object_pairs_hook=unique_fields)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError('DEB installation receipt is not bounded valid JSON') from error
+    inspected = inspect_final(root, portable, package, commit=commit, version=version,
+                              portable_sha256=portable_sha256, package_sha256=package_sha256, maintainer=maintainer)
+    record = inspected['record']
+    expected = dict(schema=1, format='PeerBrushDebInstallationV1', product='PeerBrush', version=version, commit=commit,
+                    package=dict(file=record['file'], sha256=record['sha256']),
+                    executable_sha256=inspected['executable_sha256'], source_sha256=record['source_sha256'],
+                    target='Ubuntu 24.04 amd64', architecture='amd64', checks=DEB_INSTALLATION_CHECKS,
+                    limits=DEB_INSTALLATION_LIMITS, release_ready=False, production_readiness='not-assessed')
+    if (not isinstance(receipt, dict) or type(receipt.get('schema')) is not int
+            or receipt.get('release_ready') is not False or receipt != expected):
+        raise ValueError('DEB installation receipt differs from the selected package, source, checks or explicit limits')
+    return dict(schema=1, format='PeerBrushDebQualificationV1', version=version, commit=commit,
+                record=record, candidate_verified=True, installation_receipt_binding='verified',
+                installation_receipt_provenance='requires-trusted-same-job-producer',
+                installation_checks=dict(DEB_INSTALLATION_CHECKS), content_checks=inspected['content_checks'],
+                public_availability='unverified', ready=False, production_ready=False,
+                limits=dict(DEB_INSTALLATION_LIMITS), native_dependencies='syntax-and-required-runtime-only',
+                blockers=['protected-publication-approval-not-configured', 'native-gui-not-verified',
+                          'real-version-migration-and-interrupted-update-not-verified',
+                          'native-shlibdeps-requires-trusted-native-build', 'publisher-signature-not-verified',
+                          'update-repository-not-configured', 'published-assets-and-website-readback-not-configured'])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--directory', type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--directory', type=Path)
+    mode.add_argument('--deb', type=Path)
+    parser.add_argument('--deb-sha256')
+    parser.add_argument('--portable', type=Path)
+    parser.add_argument('--portable-sha256')
+    parser.add_argument('--maintainer', help='Approved public package-maintainer name <email>')
+    parser.add_argument('--installation-receipt', type=Path, help='Private receipt produced immediately beforehand in the same trusted native job')
     parser.add_argument('--commit', required=True)
     parser.add_argument('--version', required=True)
     parser.add_argument('--previous-inventory', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--require-ready', action='store_true')
     args = parser.parse_args()
-    previous = json.loads(args.previous_inventory.read_text(encoding='utf-8')) if args.previous_inventory else None
-    result = assess(args.directory, args.commit, args.version, previous)
+    deb_inputs = [args.deb_sha256, args.portable, args.portable_sha256, args.maintainer, args.installation_receipt]
+    if args.deb:
+        if not all(deb_inputs) or args.previous_inventory:
+            parser.error('--deb requires --deb-sha256, --portable, --portable-sha256, --maintainer and --installation-receipt; no previous inventory')
+        receipt = regular_file(args.installation_receipt.absolute().parent, args.installation_receipt.name)
+        with receipt.open('rb') as stream:
+            evidence = stream.read(MAX_INSTALLATION_RECEIPT_BYTES + 1)
+        result = assess_deb(Path(__file__).resolve().parents[1], args.portable, args.deb,
+                            commit=args.commit, version=args.version, portable_sha256=args.portable_sha256,
+                            package_sha256=args.deb_sha256, maintainer=args.maintainer, installation_receipt=evidence)
+    else:
+        if any(value is not None for value in deb_inputs):
+            parser.error('DEB qualification inputs require --deb')
+        previous = json.loads(args.previous_inventory.read_text(encoding='utf-8')) if args.previous_inventory else None
+        result = assess(args.directory, args.commit, args.version, previous)
     # Candidate reports are immutable too; an interrupted rerun can reuse only
     # byte-identical output, never replace a prior readiness decision silently.
     data = (json.dumps(result, indent=2, sort_keys=True) + '\n').encode()
