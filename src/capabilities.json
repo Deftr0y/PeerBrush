@@ -944,7 +944,7 @@
       "fields": ["dx", "dy"],
       "pixels": [-100000, 100000],
       "default": 0,
-      "rounding": "Round to whole document pixels; snap:true uses the existing 8-pixel grid.",
+      "rounding": "Round to whole document pixels by default; snap:true uses the existing 8-pixel grid. A strict boolean fractional_translation:true opts transform commands into fractional dx/dy within the same bounds; absent/false preserves legacy arithmetic and move remains integer.",
       "behavior": "Translation follows the affine placement in the same source-sampling pass, including selected coverage, masks and editable sources; no separate selected-pixel cut."
     },
     "skew": {
@@ -965,7 +965,7 @@
     "commands": "One guarded shared transform per target combines affine values and dx/dy. Pure movement stays move, including saved text with unavailable fonts.",
     "preview": "Actual shared-engine native8/16 result; Apply/Enter commits one undo only after the current preview is rendered. Handle release and mode changes remain pending.",
     "cancellation": "Cancel/Escape, focus loss, changed source or target cancel the draft without rebasing; Save/close/update restart require Apply or Cancel.",
-    "reference_point": "Set or drag before an adjustment; Reset transform makes it editable again without stacking/re-cutting selected pixels.",
+    "reference_point": "Enter or drag before or after an adjustment. Moving only the reference preserves exact commands and rendered pixels; later affine values use the chosen document-space reference in one original-sampling command, with explicit fractional posttranslation when needed. User values snap before reference compensation; Reset clears the pending transform.",
     "limits": "Selected raster skew follows the current selection by default; Whole target (keep selection) is explicit. No projective distort, perspective or control-grid Warp."
   },
   "editable_sources": {

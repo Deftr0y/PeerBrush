@@ -693,3 +693,292 @@ fn selected_skew_numeric_control_previews_native_result_then_applies_once_and_un
         ));
     }
 }
+
+fn enter_reference_value(app: &mut PeerBrush, ctx: &egui::Context, index: usize, text: &str) {
+    let at = app.free_transform.as_ref().unwrap().inputs[index]
+        .unwrap()
+        .center();
+    workspace::click(app, ctx, SIZE, at);
+    workspace::click(app, ctx, SIZE, at);
+    frame(
+        app,
+        ctx,
+        vec![
+            key_event(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text(text.into()),
+        ],
+    );
+    frame(
+        app,
+        ctx,
+        vec![key_event(egui::Key::Enter, Default::default())],
+    );
+    assert!(app.free_transform.is_some(), "Numeric Enter must not Apply");
+}
+
+fn reference_mask_eq(actual: &Option<crate::engine::Mask>, expected: &Option<crate::engine::Mask>) {
+    let (actual, expected) = (actual.as_ref().unwrap(), expected.as_ref().unwrap());
+    assert_eq!(
+        (actual.enabled, actual.linked),
+        (expected.enabled, expected.linked)
+    );
+    assert_eq!(actual.steps.len(), expected.steps.len());
+    for (a, b) in actual.steps.iter().zip(&expected.steps) {
+        assert_eq!(
+            (
+                &a.id,
+                &a.kind,
+                a.enabled,
+                a.weight.to_bits(),
+                a.value.to_bits(),
+                &a.settings
+            ),
+            (
+                &b.id,
+                &b.kind,
+                b.enabled,
+                b.weight.to_bits(),
+                b.value.to_bits(),
+                &b.settings
+            )
+        );
+        assert_eq!(a.pixels, b.pixels);
+    }
+}
+
+#[test]
+fn moved_reference_preserves_exact_command_then_anchors_the_next_affine_change() {
+    let (mut app, ctx) = workspace::fixture(16);
+    open(&mut app, &ctx);
+    let editor = app.free_transform.as_mut().unwrap();
+    editor.pivot = [0., 0.];
+    editor.values.scale = [2., 1.];
+    let original = editor.commands().unwrap();
+    let point = editor.point([3.25, 4.5]);
+    editor.set_reference([0.5, 0.5]).unwrap();
+    assert_eq!(editor.commands().unwrap(), original);
+    assert_eq!(
+        editor.point([3.25, 4.5]).map(f64::to_bits),
+        point.map(f64::to_bits)
+    );
+    editor.values.scale = [1., 1.];
+    let command = editor.commands().unwrap().pop().unwrap();
+    assert_eq!(
+        command["op"], "transform",
+        "Identity plus fractional placement is not an integer Move"
+    );
+    assert_eq!(command["fractional_translation"], true);
+    assert_eq!(command["dx"], 0.25);
+    assert_eq!(command["dy"], 0.);
+    assert_eq!(editor.point([0.25, 0.5]), [0.5, 0.5]);
+
+    editor.reference = None;
+    editor.pivot = [13., 9.];
+    editor.values = Parameters {
+        offset: [4., -2.],
+        scale: [1.3, 0.8],
+        angle: 27.,
+        skew: [9., -4.],
+        mirror: [true, false],
+    };
+    for reference in [[9.125, 11.5], [12.25, 7.75]] {
+        let commands = editor.commands().unwrap();
+        let key = editor.key().unwrap();
+        let points = [[-3., 8.], [0., 0.], [24., 20.]].map(|p| editor.point(p).map(f64::to_bits));
+        editor.set_reference(reference).unwrap();
+        assert_eq!(editor.commands().unwrap(), commands);
+        assert_eq!(editor.key().unwrap(), key);
+        assert_eq!(
+            [[-3., 8.], [0., 0.], [24., 20.]].map(|p| editor.point(p).map(f64::to_bits)),
+            points
+        );
+    }
+    let anchor = editor.reference.as_ref().unwrap();
+    let [a, b, c, d, tx, ty] = anchor.matrix;
+    let [qx, qy] = anchor.point;
+    let det = a * d - b * c;
+    let source = [
+        (d * (qx - tx) - c * (qy - ty)) / det,
+        (-b * (qx - tx) + a * (qy - ty)) / det,
+    ];
+    editor.values.angle += 19.;
+    editor.values.scale = [0.7, 1.6];
+    let mapped = editor.point(source);
+    assert!((mapped[0] - qx).abs() < 1e-10 && (mapped[1] - qy).abs() < 1e-10);
+    assert_eq!(editor.commands().unwrap().len(), 1);
+    editor.values.offset[0] += 3.;
+    assert_eq!(editor.reference_point(), [qx + 3., qy]);
+    let commands = editor.commands().unwrap();
+    assert!(editor.set_reference([100001., 0.]).is_err());
+    assert_eq!(editor.commands().unwrap(), commands);
+}
+
+#[test]
+fn actual_reference_fields_keep_painted_result_then_rotate_once_with_native_masks_and_selection() {
+    for depth in [8, 16] {
+        for selected in [false, true] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            {
+                let mut engine = app.shared.lock().unwrap();
+                let id = app.selected.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":id})],
+                        None,
+                        None,
+                        "Mask",
+                    )
+                    .unwrap();
+                engine.doc.layers[0].mask.as_mut().unwrap().steps[1]
+                    .pixels
+                    .set16(8, 8, [23459, 23459, 23459, 65535]);
+                if selected {
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"selection","rect":[4,4,13,13],"feather":1.})],
+                            None,
+                            None,
+                            "Soft selection",
+                        )
+                        .unwrap();
+                }
+            }
+            let before = workspace::source(&app);
+            let original = app.shared.lock().unwrap().doc.clone();
+            let history = app.shared.lock().unwrap().undo.len();
+            open(&mut app, &ctx);
+            app.free_transform.as_mut().unwrap().values.scale = [1.2, 0.9];
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            let pixels = app.canvas_pixels.clone();
+            let generation = app.canvas_generation;
+            enter_reference_value(&mut app, &ctx, 7, "12.25");
+            enter_reference_value(&mut app, &ctx, 8, "12.5");
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let editor = app.free_transform.as_ref().unwrap();
+            assert_eq!(editor.reference_point(), [12.25, 12.5]);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert_eq!(editor.key().unwrap(), key);
+            assert_eq!(editor.rendered.as_ref(), Some(&key));
+            assert_eq!(app.canvas_pixels, pixels);
+            assert_eq!(app.canvas_generation, generation);
+            assert_eq!(workspace::source(&app), before);
+            let [a, b, c, d, tx, ty] = Editor::matrix(&commands[0]).unwrap();
+            let det = a * d - b * c;
+            let [qx, qy] = [12.25, 12.5];
+            let source = [
+                (d * (qx - tx) - c * (qy - ty)) / det,
+                (-b * (qx - tx) + a * (qy - ty)) / det,
+            ];
+            enter_reference_value(&mut app, &ctx, 4, "23");
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let editor = app.free_transform.as_ref().unwrap();
+            let point = editor.point(source);
+            assert!((point[0] - qx).abs() < 1e-10 && (point[1] - qy).abs() < 1e-10);
+            let commands = editor.commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["selection_only"], selected);
+            assert_eq!(commands[0]["fractional_translation"], true);
+            assert_eq!(workspace::source(&app), before);
+            let expected =
+                crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+            assert!(app.free_transform.is_none(), "{}", app.message);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            assert_eq!(engine.doc.bit_depth, depth);
+            assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+            reference_mask_eq(&engine.doc.layers[0].mask, &expected.layers[0].mask);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                expected.export_png().unwrap()
+            );
+            let applied = engine.doc.clone();
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels, original.layers[0].pixels);
+            reference_mask_eq(&engine.doc.layers[0].mask, &original.layers[0].mask);
+            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                original.export_png().unwrap()
+            );
+            engine.redo("human").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels, applied.layers[0].pixels);
+            reference_mask_eq(&engine.doc.layers[0].mask, &applied.layers[0].mask);
+            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+        }
+    }
+}
+
+#[test]
+fn actual_reference_handle_after_affine_is_presentation_only_and_escape_preserves_human_work() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        app.free_transform.as_mut().unwrap().values.angle = 15.;
+        settle(&mut app, &ctx);
+        // The reference may be outside the artwork; choose visible, unoccluded canvas.
+        let rect = app.view_rect.unwrap();
+        let scale = rect.width() / 32.;
+        let start_doc = [24., 18.];
+        app.free_transform
+            .as_mut()
+            .unwrap()
+            .set_reference(start_doc)
+            .unwrap();
+        settle(&mut app, &ctx);
+        let start = app.view.point(start_doc.map(|v| v as f32), rect, scale);
+        let end = app.view.point([25., 19.], rect, scale);
+        assert!(rect.contains(start) && rect.contains(end));
+        assert_eq!(
+            ctx.layer_id_at(start).map(|layer| layer.order),
+            Some(egui::Order::Background)
+        );
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let pixels = app.canvas_pixels.clone();
+        let generation = app.canvas_generation;
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), pointer(start, true)],
+        );
+        assert!(matches!(
+            app.free_transform
+                .as_ref()
+                .unwrap()
+                .drag
+                .as_ref()
+                .map(|drag| drag.handle),
+            Some(Handle::Pivot)
+        ));
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        let editor = app.free_transform.as_ref().unwrap();
+        assert_eq!(editor.reference_point(), [25., 19.]);
+        assert_eq!(editor.commands().unwrap(), commands);
+        assert_eq!(app.canvas_pixels, pixels);
+        assert_eq!(app.canvas_generation, generation);
+        assert_eq!(workspace::source(&app), before);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::Escape, Default::default()),
+                key_event(egui::Key::Delete, Default::default()),
+            ],
+        );
+        assert!(app.free_transform.is_none());
+        frame(&mut app, &ctx, vec![pointer(end, false)]);
+        assert_eq!(workspace::source(&app), before);
+    }
+}

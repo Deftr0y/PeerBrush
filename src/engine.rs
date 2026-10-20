@@ -1055,7 +1055,7 @@ impl Engine {
                         out[3].max(y.ceil() as i32),
                     ];
                 }
-                if shear != [0., 0.] {
+                if shear != [0., 0.] || c["fractional_translation"] == true {
                     let (mut sin, mut cos) = (num(c, "angle", 0.) as f32).to_radians().sin_cos();
                     if sin.abs() < 0.000001 {
                         sin = 0.;

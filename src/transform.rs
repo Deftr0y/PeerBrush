@@ -8,8 +8,22 @@ pub const ANGLE_SNAP: f64 = 15.0;
 pub const SCALE_SNAP: f64 = 0.1;
 pub const SKEW_LIMIT: f64 = 80.0;
 
-/// Translation after the affine placement, in rounded document pixels.
+pub(crate) fn fractional_translation(c: &Value) -> Result<bool, String> {
+    let enabled = c.get("fractional_translation").map_or(Ok(false), |value| {
+        value
+            .as_bool()
+            .ok_or("Transform fractional_translation must be true or false")
+    })?;
+    if enabled && c["op"] != "transform" {
+        return Err(
+            "Fractional translation requires a transform command; move stays integer".into(),
+        );
+    }
+    Ok(enabled)
+}
+/// Translation after affine placement; legacy commands keep rounded pixels.
 pub(crate) fn translation(c: &Value) -> Result<[f64; 2], String> {
+    let fractional = fractional_translation(c)?;
     let mut delta = [0.; 2];
     for (index, name) in ["dx", "dy"].into_iter().enumerate() {
         let value = c.get(name).map_or(Ok(0.), |value| {
@@ -20,7 +34,7 @@ pub(crate) fn translation(c: &Value) -> Result<[f64; 2], String> {
         if !value.is_finite() || value.abs() > 100000. {
             return Err("Transform translation must be between -100000 and 100000 pixels".into());
         }
-        delta[index] = value.round();
+        delta[index] = if fractional { value } else { value.round() };
     }
     Ok(delta)
 }
@@ -58,13 +72,14 @@ pub(crate) fn skewed([a, b, c, d]: [f64; 4], command: &Value) -> Result<[f64; 4]
 }
 
 pub(crate) fn selected_shear(c: &Value) -> Result<[f32; 2], String> {
+    fractional_translation(c)?;
     if c["op"] != "move" {
         translation(c)?;
     }
     Ok(skew_angles(c)?.map(|angle| angle.to_radians().tan() as f32))
 }
 
-/// The nonzero selected shear map is also used to enclose actual f32 scope bounds.
+/// Selected forward geometry also encloses actual f32 shear/fractional scope bounds.
 pub(crate) fn selected_point(
     [x, y]: [f32; 2],
     [px, py]: [f32; 2],
@@ -73,6 +88,12 @@ pub(crate) fn selected_point(
     [sin, cos]: [f32; 2],
     [kx, ky]: [f32; 2],
 ) -> [f32; 2] {
+    if [kx, ky] == [0., 0.] {
+        return [
+            px + (x - px) * sx * cos - (y - py) * sy * sin + dx,
+            py + (x - px) * sx * sin + (y - py) * sy * cos + dy,
+        ];
+    }
     let (mut u, mut v) = (x - px, y - py);
     u += kx * v;
     v += ky * u;
@@ -112,6 +133,7 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
     if !matches!(command["op"].as_str(), Some("move" | "transform")) {
         return Ok(command.clone());
     }
+    fractional_translation(command)?;
     if command["op"] == "transform" {
         scales(command)?;
         skew_angles(command)?;
@@ -166,6 +188,9 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
 }
 pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> {
     for command in &mut commands {
+        if matches!(command["op"].as_str(), Some("move" | "transform")) {
+            fractional_translation(command)?;
+        }
         if command["op"] == "transform" {
             scales(command)?;
             skew_angles(command)?;
@@ -916,6 +941,7 @@ pub(crate) fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     crate::retained::layer(layer, c)
 }
 pub(crate) fn move_layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    fractional_translation(c)?;
     let nx = layer.x as f64 + c["dx"].as_f64().unwrap_or(0.);
     let ny = layer.y as f64 + c["dy"].as_f64().unwrap_or(0.);
     if !nx.is_finite() || !ny.is_finite() || nx.abs() > 100000. || ny.abs() > 100000. {

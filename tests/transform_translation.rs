@@ -437,3 +437,302 @@ fn explicit_zero_translation_preserves_legacy_retained_words_frames_and_metadata
         }
     }
 }
+
+#[test]
+fn fractional_opt_in_false_is_exactly_legacy_for_whole_selected_and_independent_masks() {
+    for depth in [8, 16] {
+        for selected in [false, true] {
+            for mask_only in [false, true] {
+                let mut legacy = fixture(depth, selected);
+                if mask_only {
+                    let id = legacy.doc.layers[0].id.clone();
+                    edit(
+                        &mut legacy,
+                        json!({"op":"mask.link","layer":id,"linked":false}),
+                    );
+                }
+                let mut explicit = legacy.clone();
+                let original = command(
+                    &legacy,
+                    json!({"angle":17.,"scale_x":1.2,"scale_y":0.9,"skew_x":7.,"dx":0.25,"dy":-1.5,"mask":mask_only}),
+                );
+                let mut disabled = original.clone();
+                disabled["fractional_translation"] = json!(false);
+                edit(&mut legacy, original);
+                edit(&mut explicit, disabled);
+                let (a, b) = (&legacy.doc.layers[0], &explicit.doc.layers[0]);
+                assert_eq!(
+                    (a.x, a.y, a.pixels.width, a.pixels.height),
+                    (b.x, b.y, b.pixels.width, b.pixels.height)
+                );
+                assert_eq!(a.pixels, b.pixels);
+                assert_eq!(a.source, b.source);
+                for (a, b) in a
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .steps
+                    .iter()
+                    .zip(&b.mask.as_ref().unwrap().steps)
+                {
+                    assert_eq!(a.pixels, b.pixels);
+                }
+                assert_eq!(
+                    legacy.doc.export_png().unwrap(),
+                    explicit.doc.export_png().unwrap()
+                );
+                assert_eq!(legacy.doc.selection, explicit.doc.selection);
+                if let (Some(a), Some(b)) = (
+                    &legacy.doc.selection_coverage,
+                    &explicit.doc.selection_coverage,
+                ) {
+                    assert_eq!((&a.mask, a.bounds, a.origin), (&b.mask, b.bounds, b.origin));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn opt_in_quarter_pixel_placement_retains_native_masks_scalar_coverage_history_and_standard_saves()
+{
+    for depth in [8, 16] {
+        for selected in [false, true] {
+            for mask_only in [false, true] {
+                let mut engine = fixture(depth, selected);
+                if mask_only {
+                    let id = engine.doc.layers[0].id.clone();
+                    edit(
+                        &mut engine,
+                        json!({"op":"mask.link","layer":id,"linked":false}),
+                    );
+                    engine.undo.clear();
+                }
+                let before = engine.doc.clone();
+                let c = command(
+                    &engine,
+                    json!({"fractional_translation":true,"dx":0.25,"dy":0.5,"mask":mask_only}),
+                );
+                let expected = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
+                edit(&mut engine, c);
+                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(engine.doc.bit_depth, depth);
+                assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    expected.export_png().unwrap()
+                );
+                if !selected {
+                    let sample = |r: &Raster| {
+                        if depth == 16 {
+                            r.sample16(3.75, 4.5)
+                        } else {
+                            r.sample(3.75, 4.5).map(|v| u16::from(v) * 257)
+                        }
+                    };
+                    if mask_only {
+                        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+                    } else {
+                        assert_eq!(color(&engine, 4, 5), sample(&before.layers[0].pixels));
+                    }
+                    assert_eq!(
+                        mask(&engine, 4, 5),
+                        sample(&before.layers[0].mask.as_ref().unwrap().steps[1].pixels)
+                    );
+                } else {
+                    let old = before.selection_coverage.as_ref().unwrap();
+                    let actual = engine.doc.selection_coverage.as_ref().unwrap();
+                    let at = |x, y| old.mask.get(x - old.origin[0], y - old.origin[1])[0] as f64;
+                    for y in 3..10 {
+                        for x in 3..10 {
+                            let value = (at(x - 1, y - 1) * 0.125
+                                + at(x, y - 1) * 0.375
+                                + at(x - 1, y) * 0.125
+                                + at(x, y) * 0.375)
+                                .round() as u8;
+                            assert_eq!(actual.value(x, y), f32::from(value) / 255.);
+                        }
+                    }
+                    assert_eq!(
+                        color(&engine, 15, 13),
+                        before.layers[0].pixels.get16(15, 13)
+                    );
+                    assert_eq!(
+                        mask(&engine, 15, 13),
+                        before.layers[0].mask.as_ref().unwrap().steps[1]
+                            .pixels
+                            .get16(15, 13)
+                    );
+                }
+                for bytes in [
+                    psd::encode(&engine.doc).unwrap(),
+                    psd::encode_psb(&engine.doc).unwrap(),
+                ] {
+                    let reopened = psd::decode(&bytes).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.bit_depth, depth);
+                    assert_eq!(reopened.layers[0].pixels, engine.doc.layers[0].pixels);
+                    for (a, b) in reopened.layers[0]
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .steps
+                        .iter()
+                        .zip(&engine.doc.layers[0].mask.as_ref().unwrap().steps)
+                    {
+                        assert_eq!(a.pixels, b.pixels);
+                    }
+                    assert_eq!(
+                        reopened.export_png().unwrap(),
+                        engine.doc.export_png().unwrap()
+                    );
+                }
+                let applied = engine.doc.clone();
+                engine.undo("human").unwrap();
+                assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+                assert_eq!(engine.doc.selection_coverage, before.selection_coverage);
+                for (a, b) in engine.doc.layers[0]
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .steps
+                    .iter()
+                    .zip(&before.layers[0].mask.as_ref().unwrap().steps)
+                {
+                    assert_eq!(a.pixels, b.pixels);
+                }
+                engine.redo("human").unwrap();
+                assert_eq!(engine.doc.layers[0].pixels, applied.layers[0].pixels);
+                assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+            }
+        }
+    }
+}
+
+#[test]
+fn fractional_scope_encloses_actual_f32_vertices_and_new_destination_reservations_are_atomic() {
+    let mut analytic = fixture(16, false);
+    analytic.doc.selection = Some([7000, 4000, 7001, 4020]);
+    let c = command(
+        &analytic,
+        json!({"fractional_translation":true,"angle":31.2,"scale_x":1.8,"scale_y":0.7,"dx":0.125,"dy":-0.375,"pivot":[100000.,-100000.]}),
+    );
+    let scope = analytic
+        .scopes(&c)
+        .into_iter()
+        .find(|s| s.target.as_deref() == Some(analytic.doc.layers[0].id.as_str()))
+        .unwrap()
+        .rect
+        .unwrap();
+    let (sin, cos) = 31.2f32.to_radians().sin_cos();
+    for [x, y] in selection::rectangle(analytic.doc.selection.unwrap()) {
+        let px = 100000f32 + (x - 100000.) * 1.8 * cos - (y + 100000.) * 0.7 * sin + 0.125;
+        let py = -100000f32 + (x - 100000.) * 1.8 * sin + (y + 100000.) * 0.7 * cos - 0.375;
+        assert!(
+            scope[0] <= px.floor() as i32
+                && scope[1] <= py.floor() as i32
+                && scope[2] >= px.ceil() as i32
+                && scope[3] >= py.ceil() as i32
+        );
+    }
+    for depth in [8, 16] {
+        let mut engine = fixture(depth, true);
+        let id = engine.doc.layers[0].id.clone();
+        let b = engine.doc.selection.unwrap();
+        let c = command(&engine, json!({"fractional_translation":true,"dx":0.25}));
+        engine
+            .reserve(
+                "other",
+                "Fractional destination",
+                vec![Scope {
+                    target: Some(id),
+                    rect: Some([b[2], b[1], b[2] + 1, b[3]]),
+                }],
+            )
+            .unwrap();
+        let before = state(&engine);
+        assert!(engine
+            .edit("human", &[c.clone()], None, None, "Reserved")
+            .is_err());
+        assert_eq!(state(&engine), before);
+        engine.leases.clear();
+        for invalid in [json!(null), json!(1), json!("true"), json!([])] {
+            let mut invalid_command = c.clone();
+            invalid_command["fractional_translation"] = invalid;
+            assert!(Engine::preview_edits(engine.doc.clone(), &[invalid_command.clone()]).is_err());
+            assert!(engine
+                .edit("human", &[invalid_command], None, None, "Invalid flag")
+                .is_err());
+            assert_eq!(state(&engine), before);
+        }
+        let moved = json!({"op":"move","layer":engine.doc.layers[0].id,"dx":0.25,"fractional_translation":true});
+        assert!(Engine::preview_edits(engine.doc.clone(), &[moved.clone()]).is_err());
+        assert!(engine
+            .edit("human", &[moved], None, None, "Fractional move")
+            .is_err());
+        assert_eq!(state(&engine), before);
+    }
+}
+
+#[test]
+fn fractional_editable_source_uses_existing_matrix_format_and_protocol_native_preview() {
+    for depth in [8, 16] {
+        let mut engine = Engine::new();
+        engine.doc = Document::new_depth(64, 48, depth).unwrap();
+        let source = Source {
+            width: 24,
+            height: 16,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: Content::Shape {
+                shape: "rectangle".into(),
+                bounds: [2., 3., 12., 13.],
+                points: vec![],
+                closed: true,
+                fill: [12347, 23459, 34571, 65535],
+                stroke: [0; 4],
+                stroke_width: 0.,
+            },
+        };
+        edit(&mut engine, json!({"op":"source.add","source":source}));
+        engine.undo.clear();
+        let before = engine.doc.clone();
+        let c = command(
+            &engine,
+            json!({"fractional_translation":true,"dx":0.25,"dy":0.5,"pivot":[0.,0.],"selection_only":false}),
+        );
+        let expected = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(engine));
+        let response = peerbrush::server::mcp(
+            &shared,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"peerbrush_edit","arguments":{"actor":"human","commands":[c],"expected_revision":before.revision,"feedback":"always"}}}),
+        );
+        assert_eq!(response["result"]["isError"], false);
+        assert!(response["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["type"] == "image" && v["mimeType"] == "image/png"));
+        let engine = shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(
+            engine.doc.layers[0].source.as_ref().unwrap().matrix,
+            [1., 0., 0., 1., 0.25, 0.5]
+        );
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            expected.export_png().unwrap()
+        );
+        for bytes in [
+            psd::encode(&engine.doc).unwrap(),
+            psd::encode_psb(&engine.doc).unwrap(),
+        ] {
+            let reopened = psd::decode(&bytes).unwrap();
+            assert!(!reopened.read_only);
+            assert_eq!(reopened.layers[0].source, engine.doc.layers[0].source);
+            assert_eq!(
+                reopened.export_png().unwrap(),
+                engine.doc.export_png().unwrap()
+            );
+        }
+    }
+}

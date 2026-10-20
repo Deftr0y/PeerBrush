@@ -32,6 +32,14 @@ struct Drag {
     start: Parameters,
     handle: Handle,
 }
+struct Reference {
+    point: [f64; 2],
+    values: Parameters,
+    snap: bool,
+    command: Value,
+    matrix: [f64; 6],
+    offset: [f64; 2],
+}
 
 pub(super) struct Editor {
     pub document: String,
@@ -44,6 +52,7 @@ pub(super) struct Editor {
     bounds: [f64; 4],
     whole_bounds: [f64; 4],
     pivot: [f64; 2],
+    reference: Option<Reference>,
     values: Parameters,
     mode: Tool,
     proportional: bool,
@@ -85,13 +94,132 @@ impl Editor {
             "snap":snap,"mask":self.mask,"step":if self.roots.len()==1 {self.step.clone()}else{None},
             "selection_only":self.selected&&!self.whole,"document_id":self.document,"source_revision":self.revision})
     }
+    fn matrix(command: &Value) -> Result<[f64; 6], String> {
+        let [dx, dy] = crate::transform::translation(command)?;
+        if command["op"] == "move" {
+            return Ok([1., 0., 0., 1., dx, dy]);
+        }
+        let (sx, sy) = crate::transform::scales(command)?;
+        let (sin, cos) = command["angle"]
+            .as_f64()
+            .unwrap_or(0.)
+            .to_radians()
+            .sin_cos();
+        let [a, b, c, d] =
+            crate::transform::skewed([cos * sx, sin * sx, -sin * sy, cos * sy], command)?;
+        let [px, py] = [
+            command["pivot"][0].as_f64().unwrap_or(0.),
+            command["pivot"][1].as_f64().unwrap_or(0.),
+        ];
+        Ok([
+            a,
+            b,
+            c,
+            d,
+            px - a * px - c * py + dx,
+            py - b * px - d * py + dy,
+        ])
+    }
+    fn command(&self, id: &str, snap: bool) -> Result<Value, String> {
+        let mut command = crate::transform::resolve_command(&self.raw(id, snap))?;
+        let Some(reference) = &self.reference else {
+            return Ok(command);
+        };
+        if self.values == reference.values && snap == reference.snap {
+            // Reference movement is presentation only, including exact command bytes.
+            let mut frozen = reference.command.clone();
+            frozen["layer"] = json!(id);
+            frozen["selection_only"] = json!(self.selected && !self.whole);
+            return Ok(frozen);
+        }
+        let offset = crate::transform::translation(&command)?;
+        let [a, b, c, d, _, _] = Self::matrix(&command)?;
+        let [e, f, g, h, tx, ty] = reference.matrix;
+        let det = e * h - f * g;
+        let [u, v, w, z] = [
+            (a * h - c * f) / det,
+            (b * h - d * f) / det,
+            (-a * g + c * e) / det,
+            (-b * g + d * e) / det,
+        ];
+        let [qx, qy] = reference.point;
+        let [px, py] = self.pivot;
+        let delta = if [a, b, c, d] == [e, f, g, h] {
+            let old = crate::transform::translation(&reference.command)?;
+            [
+                old[0] + offset[0] - reference.offset[0],
+                old[1] + offset[1] - reference.offset[1],
+            ]
+        } else {
+            [
+                qx + u * (tx - qx) + w * (ty - qy) + offset[0] - reference.offset[0] - px
+                    + a * px
+                    + c * py,
+                qy + v * (tx - qx) + z * (ty - qy) + offset[1] - reference.offset[1] - py
+                    + b * px
+                    + d * py,
+            ]
+        };
+        command["dx"] = json!(delta[0]);
+        command["dy"] = json!(delta[1]);
+        if delta.iter().any(|value| value.fract() != 0.) {
+            command["op"] = json!("transform");
+            command["fractional_translation"] = json!(true);
+        }
+        // User values were snapped above; never round the reference compensation.
+        command["snap"] = json!(false);
+        crate::transform::resolve_command(&command)
+    }
+    fn reference_point(&self) -> [f64; 2] {
+        let offset = crate::transform::resolve_command(&self.raw("", self.snap))
+            .and_then(|command| crate::transform::translation(&command))
+            .unwrap_or([0.; 2]);
+        if let Some(reference) = &self.reference {
+            [
+                reference.point[0] + offset[0] - reference.offset[0],
+                reference.point[1] + offset[1] - reference.offset[1],
+            ]
+        } else {
+            [self.pivot[0] + offset[0], self.pivot[1] + offset[1]]
+        }
+    }
+    fn set_reference(&mut self, point: [f64; 2]) -> Result<(), String> {
+        if point
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 100000.)
+        {
+            return Err("Reference point is outside the coordinate limits".into());
+        }
+        if point == self.reference_point() {
+            return Ok(());
+        }
+        if self.reference.is_none() && self.values == Parameters::default() {
+            self.pivot = point;
+            return Ok(());
+        }
+        let command = self.command("", self.snap)?;
+        let matrix = Self::matrix(&command)?;
+        let offset = crate::transform::translation(&crate::transform::resolve_command(
+            &self.raw("", self.snap),
+        )?)?;
+        self.reference = Some(Reference {
+            point,
+            values: self.values.clone(),
+            snap: self.snap,
+            command,
+            matrix,
+            offset,
+        });
+        Ok(())
+    }
     pub(super) fn commands(&self) -> Result<Vec<Value>, String> {
-        if !self.affine() && self.values.offset.iter().all(|value| value.round() == 0.) {
+        let command = self.command("", self.snap)?;
+        if command["op"] == "move" && crate::transform::translation(&command)? == [0.; 2] {
             return Ok(vec![]);
         }
         self.roots
             .iter()
-            .map(|id| crate::transform::resolve_command(&self.raw(id, self.snap)))
+            .map(|id| self.command(id, self.snap))
             .collect()
     }
     pub(super) fn key(&self) -> Result<String, String> {
@@ -99,7 +227,7 @@ impl Editor {
             .map(|commands| serde_json::to_string(&commands).unwrap())
     }
     fn point(&self, p: [f64; 2]) -> [f64; 2] {
-        let Ok(c) = crate::transform::resolve_command(&self.raw("", self.snap)) else {
+        let Ok(c) = self.command("", self.snap) else {
             return p;
         };
         let (sx, sy) = crate::transform::scales(&c).unwrap_or((1., 1.));
@@ -140,7 +268,13 @@ impl Editor {
         let handle = drag.handle;
         self.values = start.clone();
         match handle {
-            Handle::Pivot => self.pivot = p.map(|value| value.clamp(-100000., 100000.)),
+            Handle::Pivot => {
+                if let Err(error) =
+                    self.set_reference(p.map(|value| value.clamp(-100000., 100000.)))
+                {
+                    self.error = Some(error);
+                }
+            }
             Handle::Move => {
                 for i in 0..2 {
                     self.values.offset[i] =
@@ -148,10 +282,7 @@ impl Editor {
                 }
             }
             Handle::Rotate => {
-                let center = [
-                    self.pivot[0] + start.offset[0],
-                    self.pivot[1] + start.offset[1],
-                ];
+                let center = self.reference_point();
                 self.values.angle = (start.angle
                     + ((p[1] - center[1]).atan2(p[0] - center[0])
                         - (origin[1] - center[1]).atan2(origin[0] - center[0]))
@@ -160,9 +291,10 @@ impl Editor {
             }
             Handle::Scale(x, y) => {
                 let (sin, cos) = start.angle.to_radians().sin_cos();
+                let center = self.reference_point();
                 let local = |point: [f64; 2]| {
-                    let dx = point[0] - self.pivot[0] - start.offset[0];
-                    let dy = point[1] - self.pivot[1] - start.offset[1];
+                    let dx = point[0] - center[0];
+                    let dy = point[1] - center[1];
                     [dx * cos + dy * sin, -dx * sin + dy * cos]
                 };
                 let a = local(origin);
@@ -295,6 +427,7 @@ impl PeerBrush {
             bounds: b,
             whole_bounds,
             pivot: [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5],
+            reference: None,
             values: Parameters::default(),
             mode: Tool::Move,
             proportional: true,
@@ -404,12 +537,12 @@ impl PeerBrush {
             return;
         };
         let before = editor.values.clone();
-        let old_pivot = editor.pivot;
+        let old_reference = editor.reference_point();
         let view = self.view;
         let screen = |p: [f64; 2]| view.point(p.map(|v| v as f32), rect, scale);
         let corners = editor.corners().map(screen);
         let middle = (corners[0] + corners[1].to_vec2()) * 0.5;
-        let center = screen(editor.point(editor.pivot));
+        let center = screen(editor.reference_point());
         let rotation = middle + (middle - center).normalized() * 26.;
         let points = [
             corners[0],
@@ -438,7 +571,7 @@ impl PeerBrush {
                     && ui.ctx().layer_id_at(*p) == Some(ui.layer_id())
             })
             .and_then(|p| {
-                if editor.values == Parameters::default() && p.distance(center) < 9. {
+                if p.distance(center) < 9. {
                     return Some(Handle::Pivot);
                 }
                 if p.distance(rotation) < 10. {
@@ -483,14 +616,17 @@ impl PeerBrush {
         if ui.input(|i| i.pointer.primary_released()) {
             editor.drag = None;
         }
-        if before != editor.values || old_pivot != editor.pivot {
+        if before != editor.values {
             editor.changed();
             self.last_preview = None;
+        }
+        if old_reference != editor.reference_point() {
+            ui.ctx().request_repaint();
         }
         let painter = ui.painter().with_clip_rect(available);
         let corners = editor.corners().map(screen);
         let middle = (corners[0] + corners[1].to_vec2()) * 0.5;
-        let center = screen(editor.point(editor.pivot));
+        let center = screen(editor.reference_point());
         let rotation = middle + (middle - center).normalized() * 26.;
         painter.add(egui::Shape::closed_line(
             corners.to_vec(),
@@ -618,15 +754,21 @@ impl PeerBrush {
                 if editor.selected {
                     ui.checkbox(&mut editor.whole, "Whole target (keep selection)");
                 }
-                let pivot_editable = editor.values == Parameters::default();
-                ui.add_enabled_ui(pivot_editable, |ui| {
-                    number(ui, "Reference X", &mut editor.pivot[0], -100000. ..=100000.);
-                    number(ui, "Reference Y", &mut editor.pivot[1], -100000. ..=100000.);
-                });
-                if !pivot_editable {
-                    ui.label("Reset transform to move the reference point.");
+                let mut reference = editor.reference_point();
+                let old_reference = reference;
+                number(ui, "Reference X", &mut reference[0], -100000. ..=100000.);
+                number(ui, "Reference Y", &mut reference[1], -100000. ..=100000.);
+                if reference != old_reference {
+                    if let Err(error) = editor.set_reference(reference) {
+                        editor.error = Some(error);
+                    }
+                    ctx.request_repaint();
                 }
                 if ui.button("Reset transform").clicked() {
+                    if editor.reference.is_some() {
+                        editor.pivot = editor.reference_point();
+                    }
+                    editor.reference = None;
                     editor.values = Parameters::default();
                     editor.drag = None;
                     editor.changed();
