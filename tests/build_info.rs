@@ -1,5 +1,15 @@
 #[test]
 fn build_info_matches_the_embedded_record_without_opening_a_workspace() {
+    let prefix = b"{\"format\":\"PeerBrushBuildInfoV1\",";
+    assert_eq!(
+        std::fs::read(env!("CARGO_BIN_EXE_peerbrush"))
+            .unwrap()
+            .windows(prefix.len())
+            .filter(|bytes| *bytes == prefix)
+            .count(),
+        1,
+        "About and CLI must share one embedded provenance record"
+    );
     let unused = std::env::temp_dir().join(format!(
         "peerbrush-build-info-unused-{}",
         peerbrush::engine::id()

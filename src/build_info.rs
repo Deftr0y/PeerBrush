@@ -1,6 +1,11 @@
 //! Public build labels; trusted exact-source builds and signing remain separate.
+// One storage address and accessor prevent ThinLTO from duplicating About/CLI labels.
+static JSON: [u8; include_bytes!(concat!(env!("OUT_DIR"), "/build-info.json")).len()] =
+    *include_bytes!(concat!(env!("OUT_DIR"), "/build-info.json"));
+
+#[inline(never)]
 pub fn json() -> &'static str {
-    include_str!(concat!(env!("OUT_DIR"), "/build-info.json"))
+    std::str::from_utf8(&JSON).expect("Build metadata must be UTF-8")
 }
 
 #[cfg(test)]
