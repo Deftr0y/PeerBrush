@@ -485,3 +485,7 @@ Four prepared methods include 32 analytic rotation/skew/mirror/reference/Snap ca
 ## Store fixture clean-source correction (unreleased)
 
 The Store test fixture now moves inherited synthetic MSIX/report files into its already-ignored output directory before building the macOS/Linux portable archives. Selected/common candidates are created afterward beneath the same output parent; the later native SDK case also uses that parent. Every shared setup asserts a completely clean synthetic source, including untracked files, and the SDK case checks it again after building. Existing hashes, report bytes, filenames, all eighteen acceptance methods and strict production source/ignore/SDK policies are unchanged. Parent and independent source reviews passed; execution follows in the next combined batch.
+
+## Direct-skew compile-only correction (unreleased)
+
+Clean ac9cb598572850bbfe1424a11ae2770e79fe03c0 stopped the library compile-only preflight at E0277: the new mode assertion required Debug on the production Tool enum. The independently reviewed fixture now matches the same exact Some(Tool::Move) variant without adding a production trait. No assertions executed in that preflight; combined and native acceptance remain pending.

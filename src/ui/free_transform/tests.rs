@@ -1501,10 +1501,10 @@ fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarde
             let key = app.free_transform.as_ref().unwrap().key().unwrap();
             workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Move"));
             assert!(!app.free_transform.as_ref().unwrap().skew_mode);
-            assert_eq!(
+            assert!(matches!(
                 app.free_transform.as_ref().unwrap().mode(),
                 Some(Tool::Move)
-            );
+            ));
             assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
             assert_eq!(
                 workspace::source(&app),
