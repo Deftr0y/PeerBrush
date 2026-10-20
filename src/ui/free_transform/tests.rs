@@ -391,6 +391,10 @@ fn stale_preview_focus_target_source_and_reserved_apply_keep_exact_human_work() 
         app.pending = true;
         app.preview_tx
             .send(Preview {
+                job: app.preview_job,
+                parameter: None,
+                parameter_document: None,
+                parameter_replayed: false,
                 coarse: false,
                 error: None,
                 live,

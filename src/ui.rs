@@ -171,6 +171,11 @@ impl Tool {
     }
 }
 struct Preview {
+    job: u64,
+    parameter: Option<ParameterRequest>,
+    parameter_document: Option<Result<Document, String>>,
+    #[cfg(test)]
+    parameter_replayed: bool,
     coarse: bool,
     error: Option<String>,
     live: String,
@@ -309,6 +314,26 @@ struct EyeSweep {
     revision: u64,
     visible: bool,
     ids: HashSet<String>,
+}
+#[derive(Clone)]
+struct ParameterRequest {
+    engine: std::sync::Weak<std::sync::Mutex<crate::engine::Engine>>,
+    document: String,
+    revision: u64,
+    gesture: String,
+    commands: Vec<Value>,
+}
+impl ParameterRequest {
+    fn matches(&self, edit: &ParameterEdit, shared: &Shared, source: &Document) -> bool {
+        self.engine.as_ptr() == Arc::as_ptr(shared)
+            && edit.engine.as_ptr() == self.engine.as_ptr()
+            && self.document == source.id
+            && self.revision == source.revision
+            && self.document == edit.document
+            && self.revision == edit.revision
+            && self.gesture == edit.gesture
+            && self.commands == edit.commands
+    }
 }
 struct ParameterEdit {
     control: egui::Id,
@@ -450,6 +475,12 @@ pub struct PeerBrush {
     preview_rx: mpsc::Receiver<Preview>,
     preview_tx: mpsc::Sender<Preview>,
     pending: bool,
+    preview_epoch: Arc<std::sync::atomic::AtomicU64>,
+    preview_job: u64,
+    #[cfg(test)]
+    parameter_worker_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
+    #[cfg(test)]
+    parameter_worker_runs: Arc<std::sync::atomic::AtomicUsize>,
     preview_cache: Arc<std::sync::Mutex<crate::preview::Cache>>,
     last_preview: Option<(String, u64, String, bool)>,
     thumbs: HashMap<String, (u64, TextureHandle)>,
@@ -809,6 +840,12 @@ impl PeerBrush {
             preview_rx,
             preview_tx,
             pending: false,
+            preview_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            preview_job: 0,
+            #[cfg(test)]
+            parameter_worker_gate: None,
+            #[cfg(test)]
+            parameter_worker_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             preview_cache: Arc::new(std::sync::Mutex::new(crate::preview::Cache::default())),
             last_preview: None,
             thumbs: HashMap::new(),
@@ -1300,7 +1337,7 @@ impl PeerBrush {
             edit.preview = None;
             return None;
         }
-        let source = {
+        {
             let Ok(engine) = self.shared.try_lock() else {
                 ctx.request_repaint_after(Duration::from_millis(16));
                 return None;
@@ -1309,16 +1346,13 @@ impl PeerBrush {
                 edit.preview = None;
                 return None;
             }
-            edit.preview.is_none().then(|| engine.doc.clone())
-        };
-        if let Some(source) = source {
-            #[cfg(test)]
-            {
-                edit.preview_runs += 1;
-            }
-            edit.preview = Some(crate::engine::Engine::preview_edits(source, &edit.commands));
         }
         edit.preview.as_ref()?.as_ref().ok().cloned()
+    }
+    fn invalidate_parameter_preview(&mut self) {
+        self.preview_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.last_preview = None;
     }
     fn finish_parameter(&mut self, cancel: bool) {
         let Some(edit) = self.parameter_gesture.take() else {
@@ -1327,7 +1361,7 @@ impl PeerBrush {
         if cancel {
             self.cancelled_parameter = Some(edit.control);
         }
-        self.last_preview = None;
+        self.invalidate_parameter_preview();
         if let Some(ctx) = &edit.typing {
             controls::cancel_number_edit(ctx, edit.control);
         }
@@ -1430,6 +1464,7 @@ impl PeerBrush {
                 dirty: response.changed(),
             });
             self.animation.cancel();
+            self.invalidate_parameter_preview();
             return;
         }
         if self
@@ -1444,7 +1479,7 @@ impl PeerBrush {
                     edit.preview = None;
                 }
                 edit.dirty = true;
-                self.last_preview = None;
+                self.invalidate_parameter_preview();
                 if !controls::number_editing(&response.ctx, response.id) {
                     self.finish_parameter(false);
                 }
@@ -1469,55 +1504,45 @@ impl PeerBrush {
                 command["document_id"] = json!(document);
                 command["source_revision"] = json!(revision);
             }
-            let cached = self
-                .parameter_gesture
-                .as_mut()
-                .filter(|edit| {
-                    edit.engine.as_ptr() == Arc::as_ptr(&self.shared)
-                        && edit.control == response.id
-                        && edit.document == doc.id
-                        && edit.revision == doc.revision
-                        && edit.commands == commands
-                })
-                .and_then(|edit| edit.preview.take());
-            #[cfg(test)]
-            let preview_runs = self
-                .parameter_gesture
-                .as_ref()
-                .map_or(0, |edit| edit.preview_runs)
-                + usize::from(cached.is_none());
-            match cached.unwrap_or_else(|| crate::engine::Engine::preview_edits(doc, &commands)) {
-                Ok(preview) => {
-                    let gesture = self
+            let unchanged = self.parameter_gesture.as_ref().is_some_and(|edit| {
+                edit.engine.as_ptr() == Arc::as_ptr(&self.shared)
+                    && edit.control == response.id
+                    && edit.document == doc.id
+                    && edit.revision == doc.revision
+                    && edit.commands == commands
+            });
+            if unchanged {
+                let edit = self.parameter_gesture.as_mut().unwrap();
+                edit.dirty |= response.changed();
+            } else {
+                let gesture = self
+                    .parameter_gesture
+                    .as_ref()
+                    .map(|edit| edit.gesture.clone())
+                    .unwrap_or_else(crate::engine::id);
+                self.parameter_gesture = Some(ParameterEdit {
+                    control: response.id,
+                    gesture,
+                    engine: Arc::downgrade(&self.shared),
+                    document,
+                    revision,
+                    commands,
+                    preview: None,
+                    #[cfg(test)]
+                    preview_runs: self
                         .parameter_gesture
                         .as_ref()
-                        .map(|edit| edit.gesture.clone())
-                        .unwrap_or_else(crate::engine::id);
-                    self.parameter_gesture = Some(ParameterEdit {
-                        control: response.id,
-                        gesture,
-                        engine: Arc::downgrade(&self.shared),
-                        document,
-                        revision,
-                        commands,
-                        preview: Some(Ok(preview)),
-                        #[cfg(test)]
-                        preview_runs,
-                        label: label.into(),
-                        typing: None,
-                        dirty: response.changed()
-                            || self
-                                .parameter_gesture
-                                .as_ref()
-                                .is_some_and(|edit| edit.dirty),
-                    });
-                    self.animation.cancel();
-                }
-                Err(error) => {
-                    self.parameter_gesture = None;
-                    self.cancelled_parameter = Some(response.id);
-                    self.message = error;
-                }
+                        .map_or(0, |edit| edit.preview_runs),
+                    label: label.into(),
+                    typing: None,
+                    dirty: response.changed()
+                        || self
+                            .parameter_gesture
+                            .as_ref()
+                            .is_some_and(|edit| edit.dirty),
+                });
+                self.animation.cancel();
+                self.invalidate_parameter_preview();
             }
         } else {
             self.finish_parameter(true);
@@ -2174,6 +2199,14 @@ impl PeerBrush {
     }
     fn request_preview(&mut self, ctx: &egui::Context, _doc: &Document) {
         let current = self.shared.lock().unwrap().doc.clone();
+        if self.parameter_gesture.as_ref().is_some_and(|edit| {
+            edit.engine.as_ptr() != Arc::as_ptr(&self.shared)
+                || edit.document != current.id
+                || edit.revision != current.revision
+        }) {
+            self.finish_parameter(true);
+            self.message = "Image changed during parameter edit · preview cancelled".into();
+        }
         self.sync_free_transform(ctx, &current);
         if self
             .filter_editor
@@ -2237,16 +2270,57 @@ impl PeerBrush {
                 live = format!("{ai}:{}:{}:{}", self.selected, self.mask, self.isolate);
             }
         }
-        while let Ok(p) = self.preview_rx.try_recv() {
-            if p.doc_id != doc.id {
+        while let Ok(mut p) = self.preview_rx.try_recv() {
+            if p.job != self.preview_job {
                 continue;
             }
             if !p.coarse {
                 self.pending = false;
             }
-            if p.doc_id == doc.id
+            if p.job
+                != self
+                    .preview_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.last_preview = None;
+                continue;
+            }
+            let parameter_matches = match &p.parameter {
+                Some(request) => self
+                    .parameter_gesture
+                    .as_ref()
+                    .is_some_and(|edit| request.matches(edit, &self.shared, doc)),
+                None => self.parameter_gesture.is_none(),
+            };
+            if parameter_matches
+                && p.doc_id == doc.id
+                && p.revision == doc.revision
+                && p.parameter.is_some()
+                && !p.coarse
+            {
+                #[cfg(test)]
+                if p.parameter_replayed {
+                    self.parameter_gesture.as_mut().unwrap().preview_runs += 1;
+                }
+                if let Some(preview) = p.parameter_document.take() {
+                    match preview {
+                        Ok(preview) => {
+                            self.parameter_gesture.as_mut().unwrap().preview = Some(Ok(preview));
+                        }
+                        Err(error) => {
+                            self.finish_parameter(true);
+                            self.message = error;
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                }
+            }
+            if parameter_matches
+                && p.doc_id == doc.id
                 && p.revision == doc.revision
                 && (p.target == variant || (!live.is_empty() && p.live == live))
+                && (p.parameter.is_none() || p.target == variant)
                 && p.mask == preview_mask
                 && (self.free_transform.is_none() || (p.target == variant && p.live == live))
                 && ((self.source_editor.is_none() && self.filter_editor.is_none())
@@ -2311,7 +2385,29 @@ impl PeerBrush {
         if !self.pending && self.last_preview.as_ref() != Some(&key) {
             self.pending = true;
             self.last_preview = Some(key);
-            let mut doc = proposal_doc.unwrap_or_else(|| self.animation.document(doc, time, true));
+            let job = self
+                .preview_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
+            self.preview_job = job;
+            let epoch = self.preview_epoch.clone();
+            let parameter = self
+                .parameter_gesture
+                .as_ref()
+                .map(|edit| ParameterRequest {
+                    engine: edit.engine.clone(),
+                    document: edit.document.clone(),
+                    revision: edit.revision,
+                    gesture: edit.gesture.clone(),
+                    commands: edit.commands.clone(),
+                });
+            let mut doc = proposal_doc.unwrap_or_else(|| {
+                if parameter.is_some() {
+                    current.clone()
+                } else {
+                    self.animation.document(doc, time, true)
+                }
+            });
             doc.revision = current.revision;
             let mut commands = self.transient.clone();
             if let Some(edit) = &self.parameter_gesture {
@@ -2348,6 +2444,28 @@ impl PeerBrush {
             if self.proposal_review.is_some() {
                 commands.clear();
             }
+            // Only a pure parameter result can be reused by either parameter panel.
+            // Mixed tool/hover/transient previews keep their existing command order.
+            let parameter_only = parameter.as_ref().is_some_and(|p| p.commands == commands);
+            if parameter_only {
+                if let Some(Ok(preview)) = self
+                    .parameter_gesture
+                    .as_ref()
+                    .and_then(|e| e.preview.as_ref())
+                {
+                    doc = preview.clone();
+                    commands.clear();
+                }
+            }
+            #[cfg(test)]
+            let parameter_replayed = parameter.is_some() && !commands.is_empty();
+            #[cfg(test)]
+            let worker_gate = self
+                .parameter_worker_gate
+                .clone()
+                .filter(|_| parameter_replayed);
+            #[cfg(test)]
+            let worker_runs = self.parameter_worker_runs.clone();
             let dirty = if !live.is_empty()
                 && commands.len() == 1
                 && matches!(commands[0]["op"].as_str(), Some("paint" | "smudge"))
@@ -2387,19 +2505,45 @@ impl PeerBrush {
             std::thread::spawn(move || {
                 let id = doc.id.clone();
                 let revision = doc.revision;
+                let mut parameter_document = None;
+                let check = || {
+                    if epoch.load(std::sync::atomic::Ordering::Relaxed) == job {
+                        Ok(())
+                    } else {
+                        Err("Preview superseded".to_string())
+                    }
+                };
                 let output = (|| {
+                    #[cfg(test)]
+                    if let Some(gate) = &worker_gate {
+                        let (lock, ready) = &**gate;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = ready.wait(released).unwrap();
+                        }
+                    }
+                    check()?;
                     let mut dirty = dirty;
                     // A replay delta belongs to these retained pixels. Keep
                     // worker replay/render together across project switches.
                     let mut cache = cache
                         .lock()
                         .map_err(|_| "Preview worker cache unavailable")?;
+                    check()?;
                     if !commands.is_empty() {
+                        #[cfg(test)]
+                        if parameter_replayed {
+                            worker_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if dirty.is_some() && commands.len() == 1 && commands[0]["op"] == "paint" {
                             (doc, dirty) = cache.edit_with_region(doc, &commands, &live)?;
                         } else {
                             doc = cache.edit(doc, &commands, &live)?;
                         }
+                    }
+                    check()?;
+                    if parameter_only {
+                        parameter_document = Some(doc.clone());
                     }
                     // A coarse shared-engine frame reaches the canvas before detailed sampling.
                     // Derived only: no source changes, history, or 16-bit conversion.
@@ -2411,6 +2555,11 @@ impl PeerBrush {
                         if let Ok((w, h, bytes, _)) = doc.preview(None, 256, layer.as_deref(), mask)
                         {
                             let _ = tx.send(Preview {
+                                job,
+                                parameter: parameter.clone(),
+                                parameter_document: None,
+                                #[cfg(test)]
+                                parameter_replayed: false,
                                 coarse: true,
                                 error: None,
                                 live: live.clone(),
@@ -2450,6 +2599,7 @@ impl PeerBrush {
                             rendered.dirty = None;
                         }
                     }
+                    check()?;
                     Ok::<_, String>((
                         rendered.width,
                         rendered.height,
@@ -2464,6 +2614,18 @@ impl PeerBrush {
                 let (w, h, bytes, dirty, selection, selection_polygon, selection_coverage) =
                     output.unwrap_or((0, 0, vec![], None, None, None, None));
                 let _ = tx.send(Preview {
+                    job,
+                    parameter,
+                    parameter_document: if parameter_only {
+                        parameter_document
+                            .map(Ok)
+                            .filter(|_| error.is_none())
+                            .or_else(|| error.as_ref().map(|error| Err(error.clone())))
+                    } else {
+                        None
+                    },
+                    #[cfg(test)]
+                    parameter_replayed,
                     coarse: false,
                     error,
                     live,
@@ -4045,6 +4207,8 @@ impl PeerBrush {
         self.canvas_selection = None;
         self.last_preview = None;
         self.pending = false;
+        self.preview_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.preview_cache = Arc::new(std::sync::Mutex::new(crate::preview::Cache::default()));
         self.thumbs.clear();
         self.thumb_pending.clear();
@@ -9689,6 +9853,10 @@ mod tests {
         app.points.push([30.0, 10.0]);
         app.preview_tx
             .send(Preview {
+                job: app.preview_job,
+                parameter: None,
+                parameter_document: None,
+                parameter_replayed: false,
                 coarse: false,
                 error: None,
                 live,
@@ -15892,6 +16060,10 @@ mod tests {
             app.pending = true;
             app.preview_tx
                 .send(Preview {
+                    job: app.preview_job,
+                    parameter: None,
+                    parameter_document: None,
+                    parameter_replayed: false,
                     coarse: false,
                     error: None,
                     live: String::new(),
