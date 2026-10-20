@@ -21,6 +21,7 @@ import zipfile
 from xml.sax.saxutils import escape
 
 import package as portable
+from verify_release import inspect_archive
 
 NS = {
     'f': 'http://schemas.microsoft.com/appx/manifest/foundation/windows10',
@@ -40,6 +41,9 @@ ASSETS = {'Square44x44Logo.png': 44, 'Square150x150Logo.png': 150, 'StoreLogo.pn
 PROJECT_TYPES = ['.psd', '.psb']
 # Only add these with the maintainer's explicit choice; never change UserChoice.
 OPTIONAL_TYPES = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff', '.svg'}
+PACKAGE_LIMIT = 512 * 1024 * 1024
+FOOTPRINT_LIMIT = 4 * 1024 * 1024
+VALIDATION = 'MakeAppx schema/semantic validation and byte/block-hash verification'
 
 
 def sha(data):
@@ -206,8 +210,10 @@ def validate_manifest(data, identity, version, extra_types=(), msix_version=None
         raise ValueError('Package virtualization must remain enabled without exclusions')
 
 
-def verified_portable(root, archive_path):
+def verified_portable(root, archive_path, require_provenance=False):
     """Validate exact source, allowlisted payload, PE architecture and all hashes."""
+    if pathlib.Path(archive_path).stat().st_size > PACKAGE_LIMIT:
+        raise ValueError('Portable archive exceeds the inspection budget')
     if portable.git(root, 'status', '--porcelain', '--untracked-files=no').strip():
         raise ValueError('Commit tracked changes before creating an MSIX')
     commit = portable.git(root, 'rev-parse', 'HEAD').decode().strip()
@@ -248,6 +254,8 @@ def verified_portable(root, archive_path):
     # the explicitly selected input archive hash as the upstream trust boundary.
     required_notices = {'licenses/ubuntu-sans/LICENCE.txt': expected_source['assets/fonts/LICENCE.txt']}
     policy = portable.policy_from_sources(sources)
+    if require_provenance and policy['version'] != 2:
+        raise ValueError('Store candidates require current embedded build provenance')
     for directory in policy['vendored']:
         meta = tomllib.loads(expected_source[directory + '/Cargo.toml'].decode())['package']
         key = f"{meta['name']}-{meta['version']}"
@@ -271,6 +279,9 @@ def verified_portable(root, archive_path):
             raise ValueError('Corresponding source exceeds inspection budget')
         if source.testzip() is not None or len(source.namelist()) != len(set(source.namelist())) or set(source.namelist()) != set(expected_source) or any(source.read(n) != d for n,d in expected_source.items()):
             raise ValueError('Corresponding source differs from selected commit')
+    # Keep the common release checks, including actual embedded build metadata
+    # and required compiler notices, at both packaging and submission boundaries.
+    inspect_archive(archive_path, commit, version, root, sources)
     return files, expected_source, release
 
 
@@ -295,9 +306,20 @@ def validate_casefold_paths(paths):
             seen[folded] = spelling
 
 
-def stage_payload(root, archive, destination, identity, extra_types=(), msix_version=None, development=False):
-    files, sources, release = verified_portable(root, archive)
-    validate_casefold_paths([*files, 'AppxManifest.xml', *['MsixAssets/'+name for name in ASSETS]])
+def expected_payload(root, archive, identity, extra_types=(), msix_version=None, development=False, require_provenance=False):
+    files, sources, release = verified_portable(root, archive, require_provenance)
+    validate_casefold_paths([*files, 'AppxManifest.xml', 'AppxBlockMap.xml', '[Content_Types].xml',
+                             'AppxSignature.p7x', *['MsixAssets/'+name for name in ASSETS]])
+    files['AppxManifest.xml'] = manifest_bytes(sources['packaging/msix/AppxManifest.xml.in'], identity, release['version'], extra_types, msix_version, development)
+    for name, size in ASSETS.items():
+        data = sources['packaging/msix/Assets/'+name]
+        if len(data) < 24 or data[:8] != b'\x89PNG\r\n\x1a\n' or struct.unpack('>II', data[16:24]) != (size,size):
+            raise ValueError('Missing or incorrectly sized MSIX image')
+        files['MsixAssets/'+name] = data
+    return files, release
+
+
+def _write_payload(files, destination):
     if destination.exists():
         raise ValueError('MSIX staging destination must be new')
     destination.mkdir(parents=True)
@@ -306,14 +328,11 @@ def stage_payload(root, archive, destination, identity, extra_types=(), msix_ver
         target = destination / portable.relative_path(name)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-    manifest = manifest_bytes(sources['packaging/msix/AppxManifest.xml.in'], identity, release['version'], extra_types, msix_version, development)
-    (destination/'AppxManifest.xml').write_bytes(manifest)
-    (destination/'MsixAssets').mkdir()
-    for name, size in ASSETS.items():
-        data = sources['packaging/msix/Assets/'+name]
-        if data[:8] != b'\x89PNG\r\n\x1a\n' or struct.unpack('>II', data[16:24]) != (size,size):
-            raise ValueError('Missing or incorrectly sized MSIX image')
-        (destination/'MsixAssets'/name).write_bytes(data)
+
+
+def stage_payload(root, archive, destination, identity, extra_types=(), msix_version=None, development=False):
+    files, release = expected_payload(root, archive, identity, extra_types, msix_version, development)
+    _write_payload(files, destination)
     return release
 
 
@@ -338,33 +357,104 @@ def opc_name(name):
     return quote(name, safe='/~.-_')
 
 
-def verify_packed(package_path, staged):
-    expected = {p.relative_to(staged).as_posix(): p.read_bytes() for p in staged.rglob('*') if p.is_file()}
+def verify_payload(package_path, expected):
+    """Check an unsigned package against independently derived payload bytes."""
+    validate_casefold_paths(expected)
     encoded = {opc_name(name): data for name, data in expected.items()}
+    if isinstance(package_path, (str, os.PathLike)):
+        size = pathlib.Path(package_path).stat().st_size
+    else:
+        position = package_path.tell()
+        package_path.seek(0, os.SEEK_END)
+        size = package_path.tell()
+        package_path.seek(position)
+    if size > PACKAGE_LIMIT:
+        raise ValueError('MSIX archive exceeds the inspection budget')
     with zipfile.ZipFile(package_path) as package:
         names = package.namelist()
         # MakeAppx's footprint files are generated by the official SDK.
         footprint = {'[Content_Types].xml', 'AppxBlockMap.xml'}
-        if (len(encoded) != len(expected) or len(names) != len(set(n.casefold() for n in names))
+        if (set(expected) & footprint or len(encoded) != len(expected) or len(names) != len(set(n.casefold() for n in names))
                 or set(names) != set(encoded) | footprint
-                or sum(i.file_size for i in package.infolist()) > 512*1024*1024):
+                or sum(i.file_size for i in package.infolist()) > PACKAGE_LIMIT):
             raise ValueError('Unexpected/missing MSIX entries or unexpected signature')
+        for entry in package.infolist():
+            if (entry.orig_filename != entry.filename or entry.is_dir()
+                    or entry.external_attr >> 16 & 0o170000 not in (0, 0o100000)
+                    or entry.flag_bits & 1
+                    or entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)):
+                raise ValueError('MSIX entries must be canonical regular files')
+            if entry.filename in footprint and entry.file_size > FOOTPRINT_LIMIT:
+                raise ValueError('MSIX footprint exceeds the inspection budget')
         if package.testzip() is not None or any(package.read(n) != data for n,data in encoded.items()):
-            raise ValueError('MSIX payload differs from validated staging')
+            raise ValueError('MSIX payload differs from validated source and portable input')
+        types = ET.fromstring(package.read('[Content_Types].xml'))
+        types_ns = '{http://schemas.openxmlformats.org/package/2006/content-types}'
+        if types.tag != types_ns + 'Types' or types.attrib:
+            raise ValueError('Unexpected MSIX content-types root')
+        defaults, overrides = {}, {}
+        parts = set(encoded) | {'AppxBlockMap.xml'}
+        for node in types:
+            mime = node.get('ContentType', '')
+            if not mime or any(ord(c) < 32 for c in mime) or len(node):
+                raise ValueError('Invalid MSIX content type')
+            if node.tag == types_ns + 'Default' and set(node.attrib) == {'Extension', 'ContentType'}:
+                extension = node.get('Extension').casefold()
+                if not extension or any(c in extension for c in './\\') or extension in defaults:
+                    raise ValueError('Ambiguous MSIX default content type')
+                defaults[extension] = mime
+            elif node.tag == types_ns + 'Override' and set(node.attrib) == {'PartName', 'ContentType'}:
+                part = node.get('PartName')
+                if not part.startswith('/') or part[1:] not in parts or part in overrides:
+                    raise ValueError('Unexpected MSIX content-type override')
+                overrides[part] = mime
+            else:
+                raise ValueError('Unexpected MSIX content-type element')
+        content_types = {}
+        for part in parts:
+            filename = part.rsplit('/', 1)[-1]
+            extension = filename.rsplit('.', 1)[-1].casefold() if '.' in filename else ''
+            mime = overrides.get('/' + part, defaults.get(extension))
+            if mime is None:
+                raise ValueError('MSIX content types do not cover the complete payload')
+            content_types[part] = mime
+        if (content_types.get('AppxManifest.xml') not in (None, 'application/vnd.ms-appx.manifest+xml')
+                or content_types['AppxBlockMap.xml'] != 'application/vnd.ms-appx.blockmap+xml'):
+            raise ValueError('Unexpected MSIX manifest or block-map content type')
         blocks = ET.fromstring(package.read('AppxBlockMap.xml'))
         ns = {'b': 'http://schemas.microsoft.com/appx/2010/blockmap'}
-        if blocks.get('HashMethod') != 'http://www.w3.org/2001/04/xmlenc#sha256':
+        if blocks.tag != '{'+ns['b']+'}BlockMap' or blocks.get('HashMethod') != 'http://www.w3.org/2001/04/xmlenc#sha256':
             raise ValueError('Unexpected block-map hash algorithm')
         block_files = blocks.findall('b:File',ns)
-        if len(block_files) != len(expected) or {n.get('Name').replace('\\','/') for n in block_files} != set(expected):
+        if (len(block_files) != len(expected) or len(blocks) != len(block_files)
+                or {n.get('Name') for n in block_files} != {name.replace('/', '\\') for name in expected}):
             raise ValueError('MSIX block map does not cover the complete payload')
-        import base64
         for node in block_files:
-            data=expected[node.get('Name').replace('\\','/')]
-            hashes=[n.get('Hash') for n in node.findall('b:Block',ns)]
-            actual=[base64.b64encode(hashlib.sha256(data[i:i+65536]).digest()).decode() for i in range(0,len(data),65536)]
-            if int(node.get('Size')) != len(data) or hashes != actual:
+            name = node.get('Name').replace('\\','/')
+            data = expected[name]
+            entry = package.getinfo(opc_name(name))
+            package.fp.seek(entry.header_offset)
+            header = package.fp.read(30)
+            if len(header) != 30 or header[:4] != b'PK\x03\x04':
+                raise ValueError('Invalid MSIX local file header')
+            header_size = 30 + sum(struct.unpack_from('<HH', header, 26))
+            children = node.findall('b:Block',ns)
+            hashes = [n.get('Hash') for n in children]
+            actual = [base64.b64encode(hashlib.sha256(data[i:i+65536]).digest()).decode() for i in range(0,len(data),65536)]
+            if (set(node.attrib) != {'Name', 'Size', 'LfhSize'} or len(node) != len(children)
+                    or node.get('Size') != str(len(data)) or node.get('LfhSize') != str(header_size)
+                    or hashes != actual):
                 raise ValueError('MSIX block hash mismatch')
+            for child in children:
+                if (not {'Hash'} <= set(child.attrib) <= {'Hash', 'Size'} or len(child)
+                        or ('Size' in child.attrib and (not re.fullmatch(r'[1-9][0-9]*', child.get('Size'))
+                            or len(child.get('Size')) > 10 or int(child.get('Size')) > entry.compress_size))):
+                    raise ValueError('Invalid MSIX block metadata')
+
+
+def verify_packed(package_path, staged):
+    expected = {p.relative_to(staged).as_posix(): p.read_bytes() for p in staged.rglob('*') if p.is_file()}
+    verify_payload(package_path, expected)
 
 
 def build(root, archive, output, identity, development=False, makeappx=None, extra_types=(), msix_version=None, previous_version=None, expected_sha256=None, expected_package_family=None):
@@ -379,14 +469,15 @@ def build(root, archive, output, identity, development=False, makeappx=None, ext
     with tempfile.TemporaryDirectory(prefix='.peerbrush-msix-', dir=output) as temporary:
         temporary = pathlib.Path(temporary)
         stage = temporary/'payload'
-        release = stage_payload(root, archive, stage, identity, extra_types, msix_version, development)
+        expected, release = expected_payload(root, archive, identity, extra_types, msix_version, development, require_provenance=not development)
+        _write_payload(expected, stage)
         final_version = package_version(release['version'], explicit=msix_version, previous=previous_version, development=development)
         label = '-local-test' if development else ''
         name = f"PeerBrush-{final_version}-Windows-x64{label}.msix"
         result = temporary/name
         subprocess.run([str(packager), 'pack', '/d', str(stage.resolve()), '/p', str(result.resolve()), '/o'], check=True)
-        verify_packed(result,stage)
-        report = {'schema':1,'package':name,'sha256':portable.digest(result),'commit':release['commit'],'app_version':release['version'],'version':final_version,'identity':identity,'package_family_name':family,'development_identity':development,'signed':False,'portable_sha256':portable.digest(archive),'installed_tested':False,'file_types':PROJECT_TYPES+sorted(set(extra_types)),'validation':'MakeAppx schema/semantic validation and byte/block-hash verification'}
+        verify_payload(result, expected)
+        report = {'schema':1,'package':name,'sha256':portable.digest(result),'commit':release['commit'],'app_version':release['version'],'version':final_version,'identity':identity,'package_family_name':family,'development_identity':development,'signed':False,'portable_sha256':portable.digest(archive),'installed_tested':False,'file_types':PROJECT_TYPES+sorted(set(extra_types)),'validation':VALIDATION}
         report_path = temporary/(name+'.json')
         report_path.write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8')
         sums = temporary/(name+'.sha256')

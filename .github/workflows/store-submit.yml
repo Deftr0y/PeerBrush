@@ -9,6 +9,18 @@ on:
         description: Published stable release tag with reviewed MSIX assets
         required: true
         type: string
+      source_commit:
+        description: Independently reviewed full release source SHA
+        required: true
+        type: string
+      portable_sha256:
+        description: Reviewed Windows portable SHA-256 from the final release inventory
+        required: true
+        type: string
+      msix_sha256:
+        description: Independently reviewed final SDK-validated MSIX SHA-256
+        required: true
+        type: string
       submit:
         description: Submit after preflight (false is read-only)
         default: false
@@ -24,6 +36,18 @@ on:
     inputs:
       tag:
         description: Published stable release tag (never 0.25 or older)
+        required: true
+        type: string
+      source_commit:
+        description: Independently reviewed full release source SHA
+        required: true
+        type: string
+      portable_sha256:
+        description: Reviewed Windows portable SHA-256 from the final release inventory
+        required: true
+        type: string
+      msix_sha256:
+        description: Independently reviewed final SDK-validated MSIX SHA-256
         required: true
         type: string
       submit:
@@ -50,16 +74,37 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.repository.default_branch }}
+          path: trusted-automation
+          persist-credentials: false
+      - name: Require independent release input selection
+        env:
+          RELEASE_COMMIT: ${{ inputs.source_commit }}
+          PORTABLE_SHA256: ${{ inputs.portable_sha256 }}
+          MSIX_SHA256: ${{ inputs.msix_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          if not re.fullmatch('[0-9a-f]{40}', os.environ['RELEASE_COMMIT']) or any(not re.fullmatch('[0-9a-f]{64}', os.environ[name]) for name in ['PORTABLE_SHA256', 'MSIX_SHA256']):
+              raise SystemExit('Store automation needs independently reviewed source, portable and final MSIX hashes. Automatic release-event selection remains blocked until the final inventory adapter is reviewed.')
+          PY
+      - name: Read the selected release source without executing its scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: selected-release-source
           persist-credentials: false
       - name: Validate and submit the published release
+        working-directory: trusted-automation
         env:
           GH_TOKEN: ${{ github.token }}
           STORE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           STORE_EXECUTE: ${{ github.event_name == 'release' || inputs.submit }}
+          PORTABLE_SHA256: ${{ inputs.portable_sha256 }}
+          MSIX_SHA256: ${{ inputs.msix_sha256 }}
           MSSTORE_TENANT_ID: ${{ secrets.MSSTORE_TENANT_ID }}
           MSSTORE_CLIENT_ID: ${{ secrets.MSSTORE_CLIENT_ID }}
           MSSTORE_CLIENT_SECRET: ${{ secrets.MSSTORE_CLIENT_SECRET }}
         run: |
-          args=(--tag "$STORE_TAG")
+          args=(--tag "$STORE_TAG" --source-root "$GITHUB_WORKSPACE/selected-release-source" --portable-sha256 "$PORTABLE_SHA256" --msix-sha256 "$MSIX_SHA256")
           if [[ "$STORE_EXECUTE" == "true" ]]; then args+=(--submit); fi
           python3 scripts/submit_store_release.py "${args[@]}"

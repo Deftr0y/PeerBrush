@@ -8,7 +8,7 @@ included, and no real submission has been tested.
 ## Missing integration gates
 
 1. Integrate and review the Windows Store packaging/runtime changes into the
-   normal version branch, then promote through `version/0.26` → `dev` → `main`.
+   active version branch, then promote through `version/0.3` → `dev` → `main`.
    Do not blindly merge the historical Store candidate branch: it also contains
    superseded signing/release changes. Preserve newer fixes and attribution.
 2. The actual release publisher must build the Windows MSIX from the same
@@ -28,15 +28,22 @@ included, and no real submission has been tested.
      uses: ./.github/workflows/store-submit.yml
      with:
        tag: ${{ needs.publish.outputs.tag }}
+       source_commit: ${{ needs.publish.outputs.source_commit }}
+       portable_sha256: ${{ needs.publish.outputs.windows_portable_sha256 }}
+       msix_sha256: ${{ needs.publish.outputs.windows_msix_sha256 }}
        submit: true
      secrets: inherit
    ```
 
-   `publish` must expose its exact published tag; adapt the job name to the
+   `publish` must expose its exact published tag, source SHA and independently
+   reviewed Windows portable hash and final SDK-validated MSIX hash from the release
+   qualification; adapt the job name to the
    actual publisher. Never add this after candidate building and imply that
    the candidate is already published. A person publishing via GitHub's UI
-   triggers the release listener. If both paths trigger, product-wide
-   concurrency plus Store pending/version checks prevent duplicate submissions.
+   triggers the release listener, but that listener cannot independently select
+   the required source/hash yet and fails before Store authentication. A reviewed
+   inventory adapter is still required for automatic event handling. Product-wide
+   concurrency and Store pending/version checks preserve submission ownership.
 4. Verify API access for the existing Partner Center account. An Entra tenant
    must be associated and an application authorized for Store submissions.
    Account-type eligibility must be confirmed in Partner Center; do not assume
@@ -61,12 +68,19 @@ included, and no real submission has been tested.
 - Store version mapping is `Cargo major + 1 . minor . patch . 0`. The package
   must be newer than both `1.25.0.0` and the current published Store packages.
   An intentional future mapping change needs code review.
-- Verify release checksum, report hash, resolved tag commit, app version,
-  package version, x64 architecture and exact manifest/product identity before
-  requesting any Store mutation. This is not a replacement for SDK validation,
+- Verify the final package against the independently selected Windows portable
+  and clean exact-source checkout before Store authentication. The shared payload
+  verifier checks the executable, embedded build identity, corresponding source,
+  notices, launcher, complete manifest, logos and block map, alongside report/hash,
+  app/Store version and approved product identity. A manifest-only ZIP is invalid.
+  This is not a replacement for SDK validation,
   installed-runtime QA or source/license review by the package builder.
 - The automation code is checked out from the repository's default branch,
-  never executed from downloaded artifacts or a release tag with secrets.
+  with the selected source in a separate read-only input checkout. Only trusted
+  default-branch scripts execute with credentials. Workflow inputs require the
+  reviewed full source SHA, portable SHA-256 and final MSIX SHA-256; none is taken
+  from the MSIX report. Custom footprint checks cannot establish SDK acceptance;
+  select the final MSIX hash only after the native SDK validation job succeeds.
 - Refuse any existing pending submission. Never delete, resume, replace or
   overwrite it automatically. A successful creation followed by failure leaves
   its draft for deliberate inspection. A retry cannot create a second draft.
