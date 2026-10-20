@@ -10,6 +10,83 @@ use peerbrush::{
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
+fn independent_coverage_eq(actual: Option<&Coverage>, expected: Option<&Coverage>) -> bool {
+    let canonical = |contours: &[Vec<[f32; 2]>]| {
+        let mut paths = contours
+            .iter()
+            .map(|points| {
+                let mut path = points
+                    .iter()
+                    .map(|point| point.map(f32::to_bits))
+                    .collect::<Vec<_>>();
+                let start = (0..path.len())
+                    .min_by(|&a, &b| {
+                        path[a..]
+                            .iter()
+                            .chain(&path[..a])
+                            .cmp(path[b..].iter().chain(&path[..b]))
+                    })
+                    .unwrap_or(0);
+                path.rotate_left(start);
+                path
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    };
+    match (actual, expected) {
+        (Some(a), Some(b)) => {
+            a.mask == b.mask
+                && a.bounds == b.bounds
+                && a.origin == b.origin
+                && canonical(&a.contours) == canonical(&b.contours)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[test]
+fn independent_coverage_comparison_changes_only_closed_loop_start_and_order() {
+    let base = Coverage {
+        mask: Raster::new(4, 4),
+        bounds: [0, 0, 4, 4],
+        origin: [0, 0],
+        contours: vec![
+            vec![[0., 0.], [4., 0.], [4., 4.], [0., 4.]],
+            vec![[1., 1.], [1., 2.], [2., 2.], [2., 1.]],
+            vec![[0., 0.], [1., 0.], [0., 0.], [0., 1.]],
+        ],
+    };
+    let mut rotated = base.clone();
+    for (index, path) in rotated.contours.iter_mut().enumerate() {
+        path.rotate_left(index + 1);
+    }
+    rotated.contours.reverse();
+    assert!(independent_coverage_eq(Some(&base), Some(&rotated)));
+    assert!(independent_coverage_eq(None, None));
+    assert!(!independent_coverage_eq(Some(&base), None));
+    for change in 0..7 {
+        let mut different = base.clone();
+        match change {
+            0 => different.mask.set(0, 0, [1; 4]),
+            1 => different.bounds[2] -= 1,
+            2 => different.origin[0] += 1,
+            3 => different.contours[0][0][0] = -0.,
+            4 => different.contours[0].reverse(),
+            5 => {
+                different.contours.pop();
+            }
+            6 => different.contours[0].swap(1, 2),
+            _ => unreachable!(),
+        }
+        assert!(
+            !independent_coverage_eq(Some(&base), Some(&different)),
+            "Preserve difference {change}"
+        );
+    }
+}
+
 fn edit(engine: &mut Engine, commands: &[Value]) {
     engine
         .edit(
@@ -476,7 +553,10 @@ fn polygon_skew_has_analytic_vertices_and_omitted_or_zero_skew_preserves_legacy_
             assert_eq!(a.layers[0].pixels, b.layers[0].pixels);
             assert_eq!(a.selection, b.selection);
             assert_eq!(a.selection_polygon, b.selection_polygon);
-            assert_eq!(a.selection_coverage, b.selection_coverage);
+            assert!(independent_coverage_eq(
+                a.selection_coverage.as_ref(),
+                b.selection_coverage.as_ref()
+            ));
             for (a, b) in a.layers[0]
                 .mask
                 .as_ref()
@@ -541,7 +621,10 @@ fn multiple_roots_share_the_original_soft_selection_and_one_history_entry() {
             {
                 assert_eq!(a.pixels, b.pixels);
             }
-            assert_eq!(engine.doc.selection_coverage, expected.selection_coverage);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
         }
         assert_eq!(
             engine.doc.export_png().unwrap(),

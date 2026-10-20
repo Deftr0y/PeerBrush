@@ -312,3 +312,28 @@ Run this diagnostic alone from a clean build with explicit profile/provenance:
     cargo test --locked --lib ui::input_performance_diagnostic::actual_workspace_control_and_navigation_components -- --exact --ignored --nocapture --test-threads=1
 
 It reports eight finite samples per component with no timing threshold. Background scheduling and OS/font caches are uncontrolled; CPU egui timings exclude native windows/surfaces, first-present, GPU setup and physical input. The implementation and isolation passed independent source review; compilation, measurement and native visible acceptance remain pending.
+
+
+## Selected-skew and actual-control checkpoint - 2026-10-20
+
+Clean 99bb59f5a10e82c7da0b5e789301e3ee5313779e completed 90 local Rust targets: 1,071 passed, three failed, thirteen opt-in cases ignored and none interrupted. Three host-sensitive provider cases remained explicitly filtered locally; native CI is unfiltered. Four adapter units, seven offscreen GPU checks, actual Windows installed-font Source/PSD/PSB8/16, both format checks and all-target Clippy with warnings passed. The corrected pointer/Cancel/held-key method and selected translation method passed. Embedded/CLI provenance matched clean source; runtime SHA-256 was b89fa9b7f63e6c78278475a62ec8ea9d20c7b287ab7862f18efb8aa67d9f87eb.
+
+Python/qualified-SDK/fresh-runtime completed 323 distinct methods: 318 passed, no failures/errors and five explicit platform/permission skips. The discovery duplication is removed. New release-source guards, optional native readback/acquisition, supported SDK preflight and five fresh headless runtime checks passed. The 387-file source inventory passed; a scoped 405-file current-byte/generated-path scan found only the unchanged reviewed synthetic test fixtures. This is not a historical credential audit.
+
+This checkpoint remains non-passing. All three new selected-skew failures compare independently recomputed Coverage: exact mask, bounds and origin match, and directed contour vertices differ only by cyclic start or whole-loop order. The two integration cases have 24+4 and 18 vertices; the UI case has 32. Each stopped in its first native8 iteration; later assertions/native16 iterations are not inferred as executed. The reviewed test-only correction preserves exact mask/bounds/origin and every f32 vertex bit, winding, adjacency, loop length and multiplicity, normalizing only closed-loop start/order. Same-object save/history checks remain exact; UI redo additionally compares the actual Apply coverage. Two helper contract tests reject changed data/geometry. No production selection math changes; replay is pending.
+
+[Native CI39480861480](https://github.com/Deftr0y/PeerBrush/actions/runs/39480861480) checks synthetic merge 43b0de8fa4db7df9b7071d83c3633232aeb72f31, matching tree ca931a10edb1624e5e42b05041611c8df754e0ab. Policy/attribution passed. macOS and Ubuntu failed only the same new selected-skew UI assertion at line591 and skipped downstream package/installer checks; Windows was still running at recording. No new-source installed or real portable-to-DEB acceptance was reached on those closed platforms. Native input remains held by the user.
+
+
+### PB-108 actual CPU control baseline
+
+The exact clean Windows x64 debug build above passed three fresh-process actual-egui diagnostic runs with accepted shared-engine canvas pixels and unchanged native sources/history. Each series contains eight samples per process (24 pooled samples). Synthetic documents are 512x512, one layer, native8/16; no native window or physical input was used. Pooled median / nearest-rank p95 milliseconds:
+
+| Component | Native8 | Native16 |
+| --- | --- | --- |
+| Unchanged held Wand feather full frame | 20.8274 / 23.5443 | 21.9275 / 23.1128 |
+| Identical direct Wand engine preview | 20.6016 / 22.9820 | 21.2133 / 23.5407 |
+| Unchanged held opacity full frame | 0.1696 / 0.2642 | 0.1668 / 0.2536 |
+| Identical direct opacity engine preview | 0.0043 / 0.0052 | 0.0047 / 0.0057 |
+
+Blank/filled idle medians were 0.1522-0.1613 ms; pan medians 0.1598-0.1656 ms; document clones 0.0004-0.0005 ms. Changed Wand input took 20.19-21.97 ms, and accepted canvas settlement took 66.96-73.31 ms across the six control/depth runs. Construction measured 50.46-58.18 ms. These are CPU/debug component measurements with uncontrolled OS/font caches, background scheduling and worker polling. They establish the repeated unchanged-Wand cost and a comparable diagnostic, not release-mode speed, first-present/physical latency or the cause of the originally reported regression. Reusing an already validated unchanged pending preview is the next focused investigation; no speedup is yet claimed.

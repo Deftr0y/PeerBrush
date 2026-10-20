@@ -1,6 +1,86 @@
 use super::super::workspace_tests as workspace;
 use super::*;
 
+fn independent_coverage_eq(
+    actual: Option<&crate::selection::Coverage>,
+    expected: Option<&crate::selection::Coverage>,
+) -> bool {
+    let canonical = |contours: &[Vec<[f32; 2]>]| {
+        let mut paths = contours
+            .iter()
+            .map(|points| {
+                let mut path = points
+                    .iter()
+                    .map(|point| point.map(f32::to_bits))
+                    .collect::<Vec<_>>();
+                let start = (0..path.len())
+                    .min_by(|&a, &b| {
+                        path[a..]
+                            .iter()
+                            .chain(&path[..a])
+                            .cmp(path[b..].iter().chain(&path[..b]))
+                    })
+                    .unwrap_or(0);
+                path.rotate_left(start);
+                path
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    };
+    match (actual, expected) {
+        (Some(a), Some(b)) => {
+            a.mask == b.mask
+                && a.bounds == b.bounds
+                && a.origin == b.origin
+                && canonical(&a.contours) == canonical(&b.contours)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[test]
+fn independent_coverage_comparison_changes_only_closed_loop_start_and_order() {
+    let base = crate::selection::Coverage {
+        mask: crate::raster::Raster::new(4, 4),
+        bounds: [0, 0, 4, 4],
+        origin: [0, 0],
+        contours: vec![
+            vec![[0., 0.], [4., 0.], [4., 4.], [0., 4.]],
+            vec![[1., 1.], [1., 2.], [2., 2.], [2., 1.]],
+            vec![[0., 0.], [1., 0.], [0., 0.], [0., 1.]],
+        ],
+    };
+    let mut rotated = base.clone();
+    for (index, path) in rotated.contours.iter_mut().enumerate() {
+        path.rotate_left(index + 1);
+    }
+    rotated.contours.reverse();
+    assert!(independent_coverage_eq(Some(&base), Some(&rotated)));
+    assert!(independent_coverage_eq(None, None));
+    assert!(!independent_coverage_eq(Some(&base), None));
+    for change in 0..7 {
+        let mut different = base.clone();
+        match change {
+            0 => different.mask.set(0, 0, [1; 4]),
+            1 => different.bounds[2] -= 1,
+            2 => different.origin[0] += 1,
+            3 => different.contours[0][0][0] = -0.,
+            4 => different.contours[0].reverse(),
+            5 => {
+                different.contours.pop();
+            }
+            6 => different.contours[0].swap(1, 2),
+            _ => unreachable!(),
+        }
+        assert!(
+            !independent_coverage_eq(Some(&base), Some(&different)),
+            "Preserve difference {change}"
+        );
+    }
+}
+
 const SIZE: Vec2 = Vec2::new(1360., 900.);
 fn frame(app: &mut PeerBrush, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
     workspace::draw(app, ctx, SIZE, events)
@@ -588,7 +668,11 @@ fn selected_skew_numeric_control_previews_native_result_then_applies_once_and_un
         assert_eq!(engine.doc.bit_depth, depth);
         assert_eq!(engine.undo.len(), history + 1);
         assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
-        assert_eq!(engine.doc.selection_coverage, expected.selection_coverage);
+        assert!(independent_coverage_eq(
+            engine.doc.selection_coverage.as_ref(),
+            expected.selection_coverage.as_ref()
+        ));
+        let applied_coverage = engine.doc.selection_coverage.clone();
         assert_eq!(
             engine.doc.export_png().unwrap(),
             expected.export_png().unwrap()
@@ -602,6 +686,10 @@ fn selected_skew_numeric_control_previews_native_result_then_applies_once_and_un
         );
         engine.redo("human").unwrap();
         assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
-        assert_eq!(engine.doc.selection_coverage, expected.selection_coverage);
+        assert_eq!(engine.doc.selection_coverage, applied_coverage);
+        assert!(independent_coverage_eq(
+            engine.doc.selection_coverage.as_ref(),
+            expected.selection_coverage.as_ref()
+        ));
     }
 }
