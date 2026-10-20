@@ -101,7 +101,7 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
     if (len(assets) == 6 and not all(dmg_inputs)) or (len(assets) != 6 and any(value is not None for value in dmg_inputs)):
         raise ValueError('Six-record candidates require explicit DMG/signed ZIP/qualification hashes, qualification bytes and publisher Team; other candidates cannot accept DMG inputs.')
     if dmg_trust is not None and (len(assets) != 6 or not isinstance(dmg_trust, dict)
-            or set(dmg_trust) != {'bundle', 'bundle_sha256', 'trusted_root', 'trusted_root_sha256', 'cli',
+            or set(dmg_trust) - {'readback_job'} != {'bundle', 'bundle_sha256', 'trusted_root', 'trusted_root_sha256', 'cli',
                                   'cli_sha256', 'cli_version', 'workflow_commit', 'run_id', 'run_attempt', 'work'}):
         raise ValueError('Native provenance verification requires all independently reviewed inputs with six-record DMG inspection.')
     names = [a.get('file') for a in assets]
@@ -191,6 +191,7 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
             bound['native_origin'] = authenticate(dmg_qualification, qualification_sha256=dmg_qualification_sha256,
                 commit=commit, version=version, source_root=source_root or Path(__file__).resolve().parents[1], **dmg_trust)
             bound['native_producer_authentication'] = bound['native_origin']['native_producer_authentication']
+            bound['native_job_conclusion'] = bound['native_origin']['native_job_conclusion']
         installed['macOS'] = bound
     if previous is not None:
         immutable(previous, inventory)
@@ -210,8 +211,10 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
     if '-' in version:
         blockers.append('prerelease-version')
     if dmg is not None:
-        blockers.append('macos-native-job-provenance-unverified' if dmg_trust is None
-                        else 'macos-native-job-conclusion-not-service-reconciled')
+        if dmg_trust is None:
+            blockers.append('macos-native-job-provenance-unverified')
+        elif installed['macOS']['native_job_conclusion'] != 'service-reconciled-success':
+            blockers.append('macos-native-job-conclusion-not-service-reconciled')
     result = dict(schema=1, version=version, commit=commit,
                 candidate_verified=dmg is None, production_ready=False,
                 immutable_version='checked-against-supplied-inventory' if previous else 'unverified',
@@ -495,6 +498,8 @@ def main():
     for name in ['native-attestation-sha256', 'native-trusted-root-sha256', 'native-gh-sha256',
                  'native-gh-version', 'native-workflow-commit', 'native-run-id', 'native-run-attempt']:
         parser.add_argument('--' + name)
+    parser.add_argument('--native-job-readback', action='store_true',
+                        help='After native attestation authentication, read only its exact public run attempt and jobs; default is offline')
     parser.add_argument('--source-root', type=Path, help='Exact selected release source checkout; defaults to this script checkout')
     parser.add_argument('--deb-sha256')
     parser.add_argument('--portable', type=Path)
@@ -515,6 +520,8 @@ def main():
                      args.native_gh, args.native_gh_sha256, args.native_gh_version,
                      args.native_workflow_commit, args.native_run_id, args.native_run_attempt,
                      args.native_verification_work]
+    if args.native_job_readback and not all(native_values):
+        parser.error('--native-job-readback requires the complete independently reviewed native attestation selection')
     if any(value is not None for value in native_values) and (not all(native_values) or not all(dmg_inputs)):
         parser.error('Native origin verification requires every reviewed verifier/root/bundle/source/run input and full DMG selection')
     dmg_trust = dict(bundle=args.native_attestation_bundle, bundle_sha256=args.native_attestation_sha256,
@@ -522,6 +529,8 @@ def main():
                      cli=args.native_gh, cli_sha256=args.native_gh_sha256, cli_version=args.native_gh_version,
                      workflow_commit=args.native_workflow_commit, run_id=args.native_run_id,
                      run_attempt=args.native_run_attempt, work=args.native_verification_work) if all(native_values) else None
+    if dmg_trust is not None and args.native_job_readback:
+        dmg_trust['readback_job'] = True
     if (any(value is not None for value in dmg_inputs) and not all(dmg_inputs)):
         parser.error('DMG inputs require independent image/ZIP/qualification hashes, qualification path and publisher Team together')
     if (args.include_deb or args.deb) and (args.include_dmg is not None or any(value is not None for value in dmg_inputs)):

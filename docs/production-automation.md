@@ -103,3 +103,13 @@ Artifact acquisition checks official public repository/run/source metadata and a
 The existing Apple signing workflow retains its historical 0.26 source pin. A separately reviewed and approved signing stage must first supply the final ZIP and DMG for the same new stable main commit in one flat two-file artifact. A ZIP-only artifact or a directory containing private signer receipts is insufficient. Do not change that historical pin or enable qualification to fabricate current inputs. No trust roots, signer keys or remote permissions have been configured by this preparation.
 
 Ten prepared offline methods exercise actual inline invocation guards, exact metadata, extraction/immutability, bounded transport and token separation. Their execution and real native/attestation acceptance remain pending. All aggregate installation/public/production readiness gates remain false.
+
+## Optional exact-attempt native completion readback (unreleased)
+
+Keep verification offline by default. Adding the explicit option below to the complete native attestation selection enables two bounded, unauthenticated read-only requests to the official public API, only after this invocation cryptographically authenticates the exact report/source/run:
+
+    --native-job-readback
+
+The selected producer is dispatch-only and first-attempt only. The consumer reads that authenticated run's exact attempt and its jobs, rather than a latest status. Official public repository/source identities, successful run and both named gate/qualify jobs, hosted-runner labels and the ordered successful qualifier steps must agree. Qualify and Attest must be adjacent; later evidence retention and upload must also succeed. No caller success receipt, alternate endpoint, token, log retrieval, dispatch or service mutation is accepted. Inputs are rehashed after readback.
+
+Success records only service-reconciled native job completion. It does not establish installation, public availability or production readiness; all those gates remain closed. Source review of the pinned workflow and its pre-checkout guards remains necessary because API labels and a certificate alone cannot prove what code executed. Offline verification remains available when completion readback is not requested. Eleven prepared fake-GET methods cover exact-attempt failure boundaries and the aggregate caller; actual provider/cryptographic/native execution remains unverified.
