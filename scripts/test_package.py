@@ -835,7 +835,7 @@ class Packages(unittest.TestCase):
 
     def test_toolchain_is_a_required_listed_root_compiler_input_and_source_equivalence_input(self):
         toolchain = self.root / 'rust-toolchain.toml'
-        toolchain.write_text('[toolchain]\nchannel="1.92.0"\n', encoding='utf-8')
+        toolchain.write_bytes(b'[toolchain]\nchannel="1.92.0"\n')
         self.commit()
         commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
         with self.assertRaisesRegex(ValueError, 'Unlisted build configuration'):
@@ -846,7 +846,7 @@ class Packages(unittest.TestCase):
         original = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
         sources = packaging.source_files(self.root, original)
         self.assertEqual(next(data for name, data, _ in sources if name == 'rust-toolchain.toml'), toolchain.read_bytes())
-        toolchain.write_text('[toolchain]\nchannel="1.93.0"\n', encoding='utf-8')
+        toolchain.write_bytes(b'[toolchain]\nchannel="1.93.0"\n')
         self.commit()
         current = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
         with self.assertRaisesRegex(ValueError, 'Executable source inputs differ'):
