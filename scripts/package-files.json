@@ -252,6 +252,7 @@
     "src/ui/selection.rs",
     "src/ui/shortcuts.rs",
     "src/ui/source.rs",
+    "src/ui/text_tests.rs",
     "src/ui/style_settings.rs",
     "src/ui/tabs.rs",
     "src/ui/tool_settings.rs",

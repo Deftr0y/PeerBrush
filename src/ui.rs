@@ -41,6 +41,8 @@ pub(crate) use shortcuts::validate_file as validate_shortcut_preferences;
 mod source;
 mod style_settings;
 mod tabs;
+#[cfg(test)]
+mod text_tests;
 mod tool_settings;
 #[cfg(test)]
 mod tool_settings_tests;
@@ -92,6 +94,7 @@ fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, color: Color32) {
     let icon = match tool {
         Tool::None => Icon::Cursor,
         Tool::Pen => Icon::Curves,
+        Tool::Text => Icon::Text,
         Tool::Move => Icon::Move,
         Tool::Rotate => Icon::Rotate,
         Tool::Scale => Icon::Scale,
@@ -122,6 +125,7 @@ fn eye_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
 #[derive(PartialEq, Clone, Copy)]
 enum Tool {
     Pen,
+    Text,
     None,
     Move,
     Rotate,
@@ -145,6 +149,7 @@ impl Tool {
     fn label(self) -> &'static str {
         match self {
             Self::Pen => "Pen · P",
+            Self::Text => "Text · T",
             Self::None => "Deselect · Q",
             Self::Move => "Move · W",
             Self::Rotate => "Rotate · E",
@@ -873,6 +878,9 @@ impl PeerBrush {
         }
     }
     fn edit(&mut self, commands: Vec<Value>, label: &str) {
+        self.try_edit(commands, label);
+    }
+    fn try_edit(&mut self, commands: Vec<Value>, label: &str) -> bool {
         self.close_proposal();
         let selection_edit = commands.iter().any(|command| {
             command["op"]
@@ -899,14 +907,23 @@ impl PeerBrush {
                 }
                 self.message = label.into();
                 self.last_preview = None;
+                true
             }
             Err(e) => {
                 self.selection_commit_failed |= selection_edit;
                 self.message = e;
+                false
             }
         }
     }
     fn select_tool(&mut self, tool: Tool) {
+        if self
+            .source_editor
+            .as_ref()
+            .is_some_and(|editor| editor.placement.is_some())
+        {
+            self.cancel_source();
+        }
         self.selection_pointer_cancelled = false;
         if self.tool != tool {
             self.straight.reset();
@@ -3337,7 +3354,22 @@ impl PeerBrush {
             }
             return;
         }
+        if self.tool == Tool::Text
+            && !zoom_drag
+            && !pan_drag
+            && (self.source_editor.is_some() || !ui.input(|input| input.key_down(egui::Key::Space)))
+            && self.geometry.is_none()
+            && self.filter_editor.is_none()
+            && self
+                .source_editor
+                .as_ref()
+                .is_none_or(|editor| editor.placement.is_some())
+        {
+            self.text_canvas(ui, doc, &response, &painter, rect, scale);
+            return;
+        }
         if self.geometry.is_some() || self.source_editor.is_some() || self.filter_editor.is_some() {
+            self.text_field_outline(&painter, rect, scale);
             return;
         }
         if self.brush_tool() && self.straight.cancelled {
@@ -4407,6 +4439,11 @@ impl PeerBrush {
             return;
         }
         let typing = self.lifecycle.is_some()
+            || self.source_editor.is_some()
+            || (self.tool == Tool::Text
+                && ctx.input(|input| {
+                    input.pointer.primary_down() || input.pointer.primary_pressed()
+                }))
             || self.shortcuts.open
             || self.filter_editor.is_some()
             || self.lifecycle_frame
@@ -5306,7 +5343,7 @@ impl PeerBrush {
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - 70.0).max(60.0))
                     .show(ui, |ui| {
-                        let mut buttons = Vec::with_capacity(15);
+                        let mut buttons = Vec::with_capacity(16);
                         for (index, tool) in [
                             Tool::Brush,
                             Tool::Smudge,
@@ -5323,6 +5360,7 @@ impl PeerBrush {
                             Tool::Pan,
                             Tool::MagicWand,
                             Tool::Pen,
+                            Tool::Text,
                         ]
                         .into_iter()
                         .enumerate()

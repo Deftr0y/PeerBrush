@@ -36,6 +36,8 @@ An interrupted or failed attempt leaves the original workspace intact and no par
 
 Reopening an existing profile does not import later changes from an old installation. An upgrade uses the same profile and existing preference versions. Replacing a damaged profile or choosing a different legacy source requires the user to preserve and relocate the existing profile explicitly; migration does not automate destructive recovery.
 
+The Text tool extends keyboard preferences to version 2. A recognized version-1 action set is validated and upgraded in memory, preserving every custom binding and pen button. Text receives unshifted T when free; an existing unshifted T binding leaves Text visibly **Unassigned**. Shift+T remains a separate chord. The original file and migration backup are unchanged until an explicit preference edit; that edit uses the existing lease, disk-change checks and atomic write. Unknown action sets, versions and malformed bindings remain protected.
+
 ## Retention and remaining acceptance
 
 Uninstall must retain preferences, migration backups and artwork by default. Any future installer option to remove settings must be explicit, separately reviewed and scoped to recognized preference data; this slice adds no removal operation. The current recovery/workspace retention policy is unchanged.
