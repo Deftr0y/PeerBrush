@@ -3224,12 +3224,22 @@ impl PeerBrush {
             Tool::Liquify,
         ]
         .contains(&self.tool)
-            && !ui.ctx().wants_keyboard_input()
+            && !ui
+                .ctx()
+                .memory(|m| m.focused())
+                .is_some_and(|id| egui::TextEdit::load_state(ui.ctx(), id).is_some())
             && !self.shortcuts.open
             && self.points.is_empty()
             && self.drag_start.is_none()
             && self.gizmo_handle == 0
-            && ui.input(|i| self.shortcuts.size_held(i));
+            && ui.input(|i| {
+                i.focused
+                    && !i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+                    && self.shortcuts.size_held(i)
+            });
         let navigate = self.lifecycle.is_none()
             && !self.lifecycle_frame
             && self.proposal_review.is_none()
@@ -9073,6 +9083,136 @@ mod tests {
         assert!(app.radius > radius);
         assert_eq!(app.shared.lock().unwrap().doc.revision, 0);
         assert!(app.points.is_empty());
+    }
+    #[test]
+    fn size_gesture_survives_control_focus_and_preserves_text_entry_and_native_sources() {
+        for depth in [8, 16] {
+            for control in ["button", "slider", "text"] {
+                // egui-winit maps an unrecognized Hebrew letter to physical S;
+                // this covers that app input shape, not actual OS layout changes.
+                for (physical, typed) in [(None, "s"), (Some(egui::Key::S), "ד")] {
+                    let (mut app, ctx) = fixture();
+                    app.recovery.open = false;
+                    app.shortcuts = shortcuts::Shortcuts::load(Path::new(""));
+                    {
+                        let mut engine = app.shared.lock().unwrap();
+                        engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(1, 1, [12001, 23003, 34007, 65003]);
+                        engine.doc.revision = 7;
+                    }
+                    let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+                    let mut text = String::new();
+                    let mut slider = 0.4;
+                    let mut draw = |app: &mut PeerBrush, events, focused| {
+                        let mut id = egui::Id::NULL;
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    Vec2::new(1360., 900.),
+                                )),
+                                events,
+                                focused,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::Window::new("Shortcut focus fixture")
+                                    .fixed_pos(Pos2::new(20., 100.))
+                                    .default_width(180.)
+                                    .show(ctx, |ui| {
+                                        let response = match control {
+                                            "button" => ui.button("Focused button"),
+                                            "slider" => ui.add(
+                                                egui::Slider::new(&mut slider, 0. ..=1.)
+                                                    .show_value(false),
+                                            ),
+                                            _ => ui.text_edit_singleline(&mut text),
+                                        };
+                                        id = response.id;
+                                        response.request_focus();
+                                    });
+                                app.draw(ctx);
+                            },
+                        );
+                        id
+                    };
+                    draw(&mut app, vec![], true);
+                    let id = draw(&mut app, vec![], true);
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(id));
+                    assert!(ctx.wants_keyboard_input());
+                    assert_eq!(
+                        egui::TextEdit::load_state(&ctx, id).is_some(),
+                        control == "text"
+                    );
+                    app.radius = 20.;
+                    app.brush.hardness = 0.7;
+                    let radius = app.radius;
+                    let hardness = app.brush.hardness;
+                    let at = app.view_rect.unwrap().center();
+                    let key = |pressed| egui::Event::Key {
+                        key: egui::Key::S,
+                        physical_key: physical,
+                        pressed,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    };
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(at),
+                            key(true),
+                            egui::Event::Text(typed.into()),
+                        ],
+                        true,
+                    );
+                    assert_eq!(
+                        app.size_drag.is_some(),
+                        control != "text",
+                        "{control}, depth {depth}, physical {physical:?}"
+                    );
+                    draw(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(at + Vec2::new(24., 20.))],
+                        true,
+                    );
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(id));
+                    if control == "text" {
+                        assert_eq!(app.radius, radius);
+                        assert_eq!(app.brush.hardness, hardness);
+                    } else {
+                        assert!(app.radius > radius);
+                        assert!(app.brush.hardness < hardness);
+                    }
+                    let stopped = (app.radius, app.brush.hardness);
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::WindowFocused(false),
+                            egui::Event::PointerMoved(at + Vec2::new(48., 40.)),
+                        ],
+                        false,
+                    );
+                    assert!(app.size_drag.is_none());
+                    assert_eq!((app.radius, app.brush.hardness), stopped);
+                    draw(
+                        &mut app,
+                        vec![egui::Event::WindowFocused(true), key(false)],
+                        true,
+                    );
+                    assert!(app.size_drag.is_none());
+                    if control == "text" {
+                        assert_eq!(text, typed);
+                    }
+                    assert_eq!(slider, 0.4);
+                    assert!(app.points.is_empty());
+                    let engine = app.shared.lock().unwrap();
+                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                    assert!(engine.undo.is_empty() && engine.redo.is_empty());
+                }
+            }
+        }
     }
     #[test]
     fn alt_temporarily_samples_color_without_painting_or_switching_tools() {
