@@ -205,7 +205,7 @@ impl PeerBrush {
             },if editor.settings.format == Format::Jxl {
                 if doc.icc_profile.is_none() && !doc.srgb_tagged { "Untagged RGB encoded as sRGB" }
                 else if editor.settings.jxl.lossless { "ICC retained" }
-                else { "Output RGB profile may be serialized equivalently" }
+                else { "Decoded output may convert to sRGB" }
             } else if doc.icc_profile.is_some()||doc.srgb_tagged { "ICC retained" } else { "untagged working RGB" }));
             if editor.settings.format == Format::Jxl {
                 ui.horizontal_wrapped(|ui| {
