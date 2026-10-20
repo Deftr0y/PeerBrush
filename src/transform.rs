@@ -6,6 +6,46 @@ use serde_json::Value;
 pub const MOVE_SNAP: f64 = 8.0;
 pub const ANGLE_SNAP: f64 = 15.0;
 pub const SCALE_SNAP: f64 = 0.1;
+pub const SKEW_LIMIT: f64 = 80.0;
+
+fn skew_angles(c: &Value) -> Result<[f64; 2], String> {
+    let mut angles = [0.; 2];
+    if c["op"] == "move" {
+        return Ok(angles);
+    }
+    for (index, name) in ["skew_x", "skew_y"].into_iter().enumerate() {
+        let angle = c.get(name).map_or(Ok(0.), |value| {
+            value.as_f64().ok_or("Transform skew must be a number")
+        })?;
+        if !angle.is_finite() || angle.abs() > SKEW_LIMIT {
+            return Err("Transform skew must be between -80 and 80 degrees".into());
+        }
+        angles[index] = angle;
+    }
+    Ok(angles)
+}
+
+/// Horizontal then vertical shear precede the existing scale/reflection/rotation.
+pub(crate) fn skewed([a, b, c, d]: [f64; 4], command: &Value) -> Result<[f64; 4], String> {
+    let angles = skew_angles(command)?;
+    if angles == [0., 0.] {
+        return Ok([a, b, c, d]);
+    }
+    let [x, y] = angles.map(|angle| angle.to_radians().tan());
+    Ok([
+        a + c * y,
+        b + d * y,
+        a * x + c * (1. + x * y),
+        b * x + d * (1. + x * y),
+    ])
+}
+
+fn selected_skew(c: &Value) -> Result<(), String> {
+    if skew_angles(c)? != [0., 0.] {
+        return Err("Skew does not support selected pixels yet. Use selection_only:false for the whole target; the selection stays unchanged.".into());
+    }
+    Ok(())
+}
 
 pub(crate) fn work_budget(width: u32, height: u32, rasters: usize) -> Result<(), String> {
     if u64::from(width) * u64::from(height) * rasters as u64 > 128_000_000 {
@@ -39,6 +79,7 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
     }
     if command["op"] == "transform" {
         scales(command)?;
+        skew_angles(command)?;
     }
     let Some(snap) = command.get("snap") else {
         return Ok(command.clone());
@@ -50,7 +91,7 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
         return Ok(command.clone());
     }
     let mut resolved = command.clone();
-    let fields = if command["op"] == "move" {
+    let mut fields = if command["op"] == "move" {
         vec![
             ("dx", 0., MOVE_SNAP, -100000., 100000.),
             ("dy", 0., MOVE_SNAP, -100000., 100000.),
@@ -62,6 +103,13 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
             ("scale_y", 1., SCALE_SNAP, 0.05, 20.),
         ]
     };
+    if command["op"] == "transform" {
+        for name in ["skew_x", "skew_y"] {
+            if command.get(name).is_some() {
+                fields.push((name, 0., ANGLE_SNAP, -SKEW_LIMIT, SKEW_LIMIT));
+            }
+        }
+    }
     for (key, default, step, min, max) in fields {
         let number = command.get(key).map_or(Ok(default), |v| {
             v.as_f64().ok_or("Snapped transform values must be numbers")
@@ -79,6 +127,7 @@ pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> 
     for command in &mut commands {
         if command["op"] == "transform" {
             scales(command)?;
+            skew_angles(command)?;
         }
         if command.get("snap").is_some()
             && matches!(command["op"].as_str(), Some("move" | "transform"))
@@ -137,6 +186,7 @@ pub fn selection_with_polygon(
     polygon: &[[f32; 2]],
     c: &Value,
 ) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
+    selected_skew(c)?;
     if layer.mask.as_ref().is_some_and(|mask| mask.linked) {
         return linked_selection(layer, polygon, c, None);
     }
@@ -150,6 +200,7 @@ pub fn selection_with_coverage(
     coverage: &crate::selection::Coverage,
     c: &Value,
 ) -> Result<crate::selection::Coverage, String> {
+    selected_skew(c)?;
     if coverage.bounds[0] >= coverage.bounds[2] {
         return Ok(coverage.clone());
     }

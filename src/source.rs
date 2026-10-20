@@ -705,7 +705,9 @@ pub fn transformed(before: &Layer, after: &mut Layer, c: &Value) -> Result<(), S
         .as_f64()
         .map(|v| v as f32)
         .unwrap_or(before.y as f32 + before.pixels.height as f32 * 0.5);
-    let [a, b, cc, d] = [cos * sx, sin * sx, -sin * sy, cos * sy];
+    let [a, b, cc, d] =
+        crate::transform::skewed([cos * sx, sin * sx, -sin * sy, cos * sy].map(f64::from), c)?
+            .map(|value| value as f32);
     source.prepend([
         a,
         b,
@@ -892,6 +894,7 @@ mod tests {
                 json!({"op":"source.update","layer":id,"source":resized}),
                 json!({"op":"transform","layer":id,"angle":17.,"selection_only":false}),
                 json!({"op":"transform","layer":id,"scale_x":1.2,"scale_y":1.2,"selection_only":false}),
+                json!({"op":"transform","layer":id,"skew_x":15.,"skew_y":-10.,"selection_only":false}),
                 json!({"op":"image.resize","width":220,"height":132}),
             ] {
                 let before = state(&engine);

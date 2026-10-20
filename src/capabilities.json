@@ -934,12 +934,23 @@
       "transform",
       "move"
     ],
-    "behavior": "Whole-layer rotation/scaling accumulate affine placement and regenerate current raster/mask projections from retained native originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the pivot.",
+    "behavior": "Whole-layer rotation/scaling/skew accumulate affine placement and regenerate current raster/mask projections from retained native originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the pivot.",
     "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty] mapping original local coordinates to the current frame, or null. No tile samples in observations.",
     "pixel_edits": "Painting, clone/heal, fill, direct adjustments, image replacement and selected-pixel edits establish a new baseline for only the changed raster. Other mask/color originals and effects remain editable. Image resize and explicit channel-depth conversion establish raster baselines; crop/canvas retain sources.",
     "psd": "Supplementary format 9 retains originals alongside current standard raster/mask channels and merged composite. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
     "limits": "Current plus original tiles count against 512 MiB document memory. 8192 per edge, 32 MP, 128 million output samples per layer command; singular/nonfinite/out-of-range/nested sources refused atomically.",
-    "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists."
+    "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists.",
+    "skew": {
+      "fields": ["skew_x", "skew_y"],
+      "degrees": [-80, 80],
+      "default": 0,
+      "order": "Horizontal shear then vertical shear, then scale/reflection and rotation, around the document-space pivot. Each angle contributes tan(degrees); positive X moves the bottom right, positive Y moves the right edge down.",
+      "snap": "Explicit skew fields snap to the existing 15-degree grid when snap:true; raw bounds still apply.",
+      "targets": "Whole layer/folder and whole independent mask; current linked/unlinked and editable-source restrictions apply.",
+      "selection_pixels": false,
+      "selection": "Nonzero skew of selected pixels rejects atomically. Use selection_only:false to transform the whole target and leave selection geometry unchanged.",
+      "limits": "Affine engine slice only; no Ctrl/Cmd+T session, perspective/distort or control-grid Warp UI."
+    }
   },
   "editable_sources": {
     "commands": [

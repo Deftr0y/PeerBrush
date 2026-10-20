@@ -123,16 +123,23 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     if !px.is_finite() || !py.is_finite() || px.abs() > 100000. || py.abs() > 100000. {
         return Err("Invalid transform pivot".into());
     }
-    if angle.rem_euclid(360.) == 0. && sx == 1. && sy == 1. {
+    if angle.rem_euclid(360.) == 0.
+        && sx == 1.
+        && sy == 1.
+        && crate::transform::skewed([1., 0., 0., 1.], c)? == [1., 0., 0., 1.]
+    {
         return Ok(());
     }
     let (sin, cos) = angle.to_radians().sin_cos();
-    let (a, b, cc, d) = (
-        exact(cos) * sx,
-        exact(sin) * sx,
-        -exact(sin) * sy,
-        exact(cos) * sy,
-    );
+    let [a, b, cc, d] = crate::transform::skewed(
+        [
+            exact(cos) * sx,
+            exact(sin) * sx,
+            -exact(sin) * sy,
+            exact(cos) * sy,
+        ],
+        c,
+    )?;
     let delta = [
         a,
         b,
@@ -331,12 +338,15 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
     }
     crate::transform::work_budget(layer.pixels.width, layer.pixels.height, indices.len())?;
     let (sin, cos) = angle.to_radians().sin_cos();
-    let (a, b, cc, d) = (
-        exact(cos) * sx,
-        exact(sin) * sx,
-        -exact(sin) * sy,
-        exact(cos) * sy,
-    );
+    let [a, b, cc, d] = crate::transform::skewed(
+        [
+            exact(cos) * sx,
+            exact(sin) * sx,
+            -exact(sin) * sy,
+            exact(cos) * sy,
+        ],
+        c,
+    )?;
     for index in indices {
         let mut original = Original::from(&mask.steps[index].pixels);
         original.matrix = compose(
