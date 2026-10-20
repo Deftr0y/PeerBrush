@@ -24,6 +24,14 @@ MAX_INSTALLATION_RECEIPT_BYTES = 64 * 1024
 MAX_DMG_QUALIFICATION_BYTES = 8192
 
 
+def _publication_phases(blockers):
+    # Informational partition only. Unknown checks remain before publication;
+    # neither list grants approval or changes any existing readiness gate.
+    post = 'published-assets-and-website-readback-not-configured'
+    return dict(prepublication_blockers=[value for value in blockers if value != post],
+                postpublication_checks=[value for value in blockers if value == post])
+
+
 def unique_fields(pairs):
     result = {}
     for key, value in pairs:
@@ -223,6 +231,7 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
         result['installed_candidates'] = installed
     if dmg is not None:
         result['asset_binding_verified'] = True
+    result['publication_phases'] = _publication_phases(blockers)
     return result
 
 
@@ -469,7 +478,7 @@ def assess_deb(root, portable, package, *, commit, version, portable_sha256, pac
     if (not isinstance(receipt, dict) or type(receipt.get('schema')) is not int
             or receipt.get('release_ready') is not False or receipt != expected):
         raise ValueError('DEB installation receipt differs from the selected package, source, checks or explicit limits')
-    return dict(schema=1, format='PeerBrushDebQualificationV1', version=version, commit=commit,
+    result = dict(schema=1, format='PeerBrushDebQualificationV1', version=version, commit=commit,
                 record=record, candidate_verified=True, installation_receipt_binding='verified',
                 installation_receipt_provenance='requires-trusted-same-job-producer',
                 installation_checks=dict(DEB_INSTALLATION_CHECKS), content_checks=inspected['content_checks'],
@@ -479,6 +488,8 @@ def assess_deb(root, portable, package, *, commit, version, portable_sha256, pac
                           'real-version-migration-and-interrupted-update-not-verified',
                           'native-shlibdeps-requires-trusted-native-build', 'publisher-signature-not-verified',
                           'update-repository-not-configured', 'published-assets-and-website-readback-not-configured'])
+    result['publication_phases'] = _publication_phases(result['blockers'])
+    return result
 
 
 def main():

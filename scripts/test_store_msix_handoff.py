@@ -16,9 +16,22 @@ import test_store_msix_preflight as preflight_tests
 import test_dmg_handoff as dmg_tests
 from test_msix import synthetic_package
 from verify_release import verify
+from test_production_readiness import assert_publication_phases
 
 
 class StoreHandoff(unittest.TestCase):
+    @contextlib.contextmanager
+    def checked_common_assessment(self):
+        original, seen = handoff.assess, []
+        def inspect(*args, **kwargs):
+            report = original(*args, **kwargs)
+            assert_publication_phases(self, report)
+            seen.append(report)
+            return report
+        with mock.patch.object(handoff, 'assess', side_effect=inspect):
+            yield
+        self.assertEqual(len(seen), 1, 'The actual common inspection must supply informational phases')
+
     def setUp(self):
         self.seed = preflight_tests.StorePreflight(methodName='runTest')
         self.seed.setUp()
@@ -65,7 +78,8 @@ class StoreHandoff(unittest.TestCase):
     def test_real_content_enters_a_closed_auxiliary_bundle_without_changing_common_or_authority(self):
         before = {path.name: digest(path) for path in self.directory.iterdir()}
         (self.package.parent / 'unrelated-private-state.json').write_text('PRIVATE_UNUSED_STATE')
-        result = self.run_handoff()
+        with self.checked_common_assessment():
+            result = self.run_handoff()
         expected = {self.package.name, self.report.name, self.sidecar.name, handoff.MANIFEST}
         self.assertEqual({path.name for path in self.output.iterdir()}, expected)
         self.assertEqual(json.loads((self.output / handoff.MANIFEST).read_bytes()), result)
@@ -78,6 +92,8 @@ class StoreHandoff(unittest.TestCase):
         self.assertTrue(result['content_verified'])
         self.assertFalse(result['ready'])
         self.assertFalse(result['production_ready'])
+        self.assertNotIn('publication_phases', result, 'The closed Store inventory contract is unchanged')
+        self.assertNotIn('publication_phases', json.loads((self.directory / 'release-inventory.json').read_bytes()))
         self.assertEqual(result['native_sdk_validation'], 'not-performed-by-consumer')
         self.assertEqual(result['native_producer_authentication'], 'unverified-requires-trusted-native-job')
         self.assertEqual(result['installed_acceptance'], 'not-performed')
@@ -156,8 +172,9 @@ class StoreHandoff(unittest.TestCase):
                 context.update(dmg_qualification=fixture.evidence,
                     dmg_qualification_sha256=digest(fixture.evidence),
                     macos_team_id=dmg_tests.test_sign_macos.TEAM)
-            result = handoff.common(directory, fixture.root, fixture.commit, '0.2.0',
-                digest(directory / 'release-inventory.json'), windows['sha256'], **context)
+            with self.checked_common_assessment():
+                result = handoff.common(directory, fixture.root, fixture.commit, '0.2.0',
+                    digest(directory / 'release-inventory.json'), windows['sha256'], **context)
             self.assertEqual(result[0], directory)
             self.assertEqual(result[1], directory / windows['file'])
             self.assertEqual(result[2], source['sha256'])

@@ -11,6 +11,7 @@ from unittest import mock
 
 import verify_macos_qualification as native
 import test_dmg_handoff
+from test_production_readiness import assert_publication_phases
 
 
 def sha(data):
@@ -268,10 +269,13 @@ class Aggregate(unittest.TestCase):
             result = fixture.handoff(output=fixture.base / 'authenticated', dmg_trust=values)
         self.assertFalse(result['candidate_verified'])
         self.assertFalse(result['production_ready'])
+        assert_publication_phases(self, result)
         macos = result['installed_candidates']['macOS']
         self.assertEqual(macos['native_producer_authentication'], 'verified-pinned-workflow-oidc-attestation')
         self.assertEqual(macos['native_origin']['qualification_sha256'], sha(fixture.evidence.read_bytes()))
         self.assertIn('macos-native-job-conclusion-not-service-reconciled', result['blockers'])
+        self.assertIn('macos-native-job-conclusion-not-service-reconciled',
+                      result['publication_phases']['prepublication_blockers'])
         self.assertNotIn('macos-native-job-provenance-unverified', result['blockers'])
         self.assertEqual(macos['installed_acceptance'], 'not-established-by-aggregate')
 

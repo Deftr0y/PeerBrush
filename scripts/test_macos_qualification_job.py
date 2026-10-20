@@ -12,6 +12,7 @@ import production_readiness as readiness
 import test_dmg_handoff
 import test_macos_qualification_attestation as fixtures
 import verify_macos_qualification as native
+from test_production_readiness import assert_publication_phases
 
 
 class Readback(unittest.TestCase):
@@ -286,6 +287,7 @@ class Readback(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertFalse(result['candidate_verified'])
         self.assertFalse(result['production_ready'])
+        assert_publication_phases(self, result)
         macos = result['installed_candidates']['macOS']
         self.assertEqual(macos['native_job_conclusion'], 'service-reconciled-success')
         self.assertFalse(macos['ready'])
@@ -294,6 +296,8 @@ class Readback(unittest.TestCase):
         self.assertNotIn('macos-native-job-provenance-unverified', result['blockers'])
         self.assertNotIn('macos-native-job-conclusion-not-service-reconciled', result['blockers'])
         self.assertIn('macos-dmg-native-signing-and-installation-not-verified', result['blockers'])
+        self.assertIn('macos-dmg-native-signing-and-installation-not-verified',
+                      result['publication_phases']['prepublication_blockers'])
 
 
 if __name__ == '__main__':

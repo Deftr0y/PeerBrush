@@ -16,6 +16,7 @@ import production_readiness as readiness
 import test_deb
 import test_final_macos_dmg
 import test_sign_macos
+from test_production_readiness import assert_publication_phases
 from package import digest, git
 from verify_release import inspect_archive, verify
 
@@ -110,6 +111,13 @@ class Handoff(unittest.TestCase):
         self.assertFalse(result['candidate_verified'])
         self.assertTrue(result['asset_binding_verified'])
         self.assertFalse(result['production_ready'])
+        assert_publication_phases(self, result)
+        self.assertEqual(result['blockers'], ['protected-publication-approval-not-configured',
+            'windows-installed-distribution-and-signing-not-verified',
+            'macos-dmg-native-signing-and-installation-not-verified',
+            'linux-installed-distribution-and-update-owner-not-verified',
+            'published-assets-and-website-readback-not-configured',
+            'published-version-immutability-not-reconciled', 'macos-native-job-provenance-unverified'])
         macos = result['installed_candidates']['macOS']
         self.assertTrue(macos['bytes_verified'])
         self.assertFalse(macos['candidate_verified'])
@@ -160,13 +168,15 @@ class Handoff(unittest.TestCase):
             self.assertFalse(self.output.exists())
 
     def test_reinspection_needs_external_pins_and_ignores_local_readiness_claims(self):
-        self.handoff()
+        expected = self.handoff()
         for missing in ['dmg_sha256', 'macos_portable_sha256', 'dmg_qualification', 'dmg_qualification_sha256', 'macos_team_id']:
             with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, 'Six-record'):
                 self.assess(**{missing: None})
-        (self.output / 'production-readiness.json').write_text('{"candidate_verified":true,"production_ready":true}')
+        (self.output / 'production-readiness.json').write_text('{"candidate_verified":true,"production_ready":true,"publication_phases":{"prepublication_blockers":[]}}')
         self.assertFalse(self.assess()['candidate_verified'])
-        self.assertFalse(self.assess()['production_ready'])
+        reassessed = self.assess()
+        assert_publication_phases(self, reassessed)
+        self.assertEqual(reassessed, expected, 'Caller success JSON cannot waive assessed native or publication gates')
         path = self.output / 'release-inventory.json'
         inventory = json.loads(path.read_bytes())
         inventory['assets'][-1]['private_note'] = 'PRIVATE_CANARY'

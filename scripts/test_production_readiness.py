@@ -15,6 +15,39 @@ import production_readiness as readiness
 from verify_release import verify
 
 
+def assert_publication_phases(test, report):
+    phases = report['publication_phases']
+    test.assertEqual(set(phases), {'prepublication_blockers', 'postpublication_checks'})
+    test.assertEqual(phases['postpublication_checks'], ['published-assets-and-website-readback-not-configured'])
+    test.assertEqual(phases['prepublication_blockers'],
+        [value for value in report['blockers'] if value != 'published-assets-and-website-readback-not-configured'])
+    test.assertCountEqual([*phases['prepublication_blockers'], *phases['postpublication_checks']], report['blockers'])
+    test.assertIn('protected-publication-approval-not-configured', phases['prepublication_blockers'])
+    test.assertIs(report['production_ready'], False)
+
+
+class PublicationPhases(unittest.TestCase):
+    def test_exact_postpublication_check_is_partitioned_without_waiving_or_mutating_any_blocker(self):
+        blockers = ['protected-publication-approval-not-configured',
+                    'published-assets-and-website-readback-not-configured',
+                    'future-unknown-native-gate', 'published-assets-and-website-readback-not-configured-extra']
+        original = blockers.copy()
+        phases = readiness._publication_phases(blockers)
+        self.assertEqual(phases, dict(prepublication_blockers=[original[0], original[2], original[3]],
+            postpublication_checks=[original[1]]))
+        self.assertEqual(blockers, original)
+        phases['prepublication_blockers'].clear()
+        phases['postpublication_checks'].clear()
+        self.assertEqual(blockers, original, 'Informational output cannot mutate assessed gates')
+
+    def test_empty_or_post_only_lists_do_not_create_readiness_or_approval_claims(self):
+        for blockers in [[], ['published-assets-and-website-readback-not-configured']]:
+            phases = readiness._publication_phases(blockers)
+            self.assertEqual(set(phases), {'prepublication_blockers', 'postpublication_checks'})
+            self.assertEqual(phases['prepublication_blockers'], [])
+            self.assertEqual(phases['postpublication_checks'], blockers)
+
+
 class Tests(unittest.TestCase):
     def setUp(self):
         self.fixture = test_package.Packages(methodName='runTest')
@@ -32,6 +65,13 @@ class Tests(unittest.TestCase):
 
     def test_exact_source_candidates_never_claim_installed_or_signed_readiness(self):
         report = self.assess()
+        assert_publication_phases(self, report)
+        self.assertEqual(report['blockers'], ['protected-publication-approval-not-configured',
+            'windows-installed-distribution-and-signing-not-verified',
+            'macos-dmg-native-signing-and-installation-not-verified',
+            'linux-installed-distribution-and-update-owner-not-verified',
+            'published-assets-and-website-readback-not-configured',
+            'published-version-immutability-not-reconciled'])
         self.assertTrue(report['candidate_verified'])
         self.assertFalse(report['production_ready'])
         self.assertEqual(set(report['platforms']), {'Windows', 'macOS', 'Linux'})
@@ -57,6 +97,10 @@ class Tests(unittest.TestCase):
     def test_checksums_and_immutable_release_version_are_enforced(self):
         inventory = json.loads((self.directory / 'release-inventory.json').read_text())
         self.assertEqual(self.assess(inventory)['immutable_version'], 'checked-against-supplied-inventory')
+        reconciled = self.assess(inventory)
+        assert_publication_phases(self, reconciled)
+        self.assertNotIn('published-version-immutability-not-reconciled',
+                         reconciled['publication_phases']['prepublication_blockers'])
         for change in ['commit', 'hash', 'missing']:
             previous = copy.deepcopy(inventory)
             if change == 'commit':
@@ -124,6 +168,9 @@ class DebianQualification(unittest.TestCase):
         report = self.assess()
         self.assertTrue(report['candidate_verified'])
         self.assertEqual(report['installation_receipt_binding'], 'verified')
+        assert_publication_phases(self, report)
+        self.assertIn('native-gui-not-verified', report['publication_phases']['prepublication_blockers'])
+        self.assertIn('update-repository-not-configured', report['publication_phases']['prepublication_blockers'])
         self.assertEqual(report['installation_receipt_provenance'], 'requires-trusted-same-job-producer')
         self.assertEqual(report['record']['sha256'], self.receipt['package']['sha256'])
         self.assertEqual(report['record']['source_sha256'], self.receipt['source_sha256'])
@@ -238,6 +285,8 @@ class DebianHandoff(unittest.TestCase):
             (parent / 'installation.json').write_text('SYNTHETIC_PRIVATE_RECEIPT_NEVER_COPY')
             (parent / (self.package.name + '.qualification.json')).write_text('{"production_ready":true,"installation_checks":{"installation":"passed"}}')
         result = self.handoff()
+        assert_publication_phases(self, result)
+        self.assertEqual(result['blockers'], portable_report['blockers'])
         inventory = json.loads((self.output / 'release-inventory.json').read_bytes())
         self.assertEqual(inventory['assets'][:-1], self.before['assets'])
         self.assertEqual(inventory['assets'][-1]['file'], self.package.name)
@@ -258,8 +307,10 @@ class DebianHandoff(unittest.TestCase):
         self.assertEqual(installed['producer_provenance'], 'requires-successful-same-workflow-native-job')
         self.assertFalse(result['production_ready'])
         self.assertEqual(self.assess(), result)
-        (self.output / 'production-readiness.json').write_text('{"production_ready":true}')
-        self.assertFalse(self.assess()['production_ready'], 'Existing report JSON must never grant native authority')
+        (self.output / 'production-readiness.json').write_text('{"production_ready":true,"publication_phases":{"prepublication_blockers":[]}}')
+        reassessed = self.assess()
+        assert_publication_phases(self, reassessed)
+        self.assertEqual(reassessed, result, 'Caller success JSON cannot waive real assessed gates')
 
     def test_selected_hash_control_and_corresponding_source_fail_before_output(self):
         for changes in [dict(package_sha256='a' * 64), dict(portable_sha256='a' * 64), dict(maintainer='Other <other@example.invalid>')]:
