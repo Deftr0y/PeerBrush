@@ -134,6 +134,7 @@ class DebianPackage(unittest.TestCase):
                     self.final_control.replace('Installed-Size: ', 'Installed-Size: 999'),
                     self.final_control.replace('Version: 0.2.0-1', 'Version: 0.26.0-1'),
                     self.final_control.replace(', libegl1', ''),
+                    self.final_control.replace(', libfontconfig1', ''),
                     self.final_control.replace('libc6 (>= 2.34)', 'libc6 [amd64]'),
                     self.final_control + 'Conflicts: another-editor\n',
                     self.final_control + 'Depends: libc6\n']

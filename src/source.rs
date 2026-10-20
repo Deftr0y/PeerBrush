@@ -3,7 +3,7 @@ use crate::{
     engine::{id, Document, Layer},
     raster::{check_size, Raster},
 };
-use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
+use ab_glyph::{point, Font, FontArc, FontRef, PxScale, ScaleFont};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -34,7 +34,7 @@ pub enum Content {
     },
     Text {
         text: String,
-        font: String,
+        font: crate::fonts::TextFont,
         size: f32,
         line_height: f32,
         #[serde(default, skip_serializing_if = "zero")]
@@ -56,16 +56,109 @@ pub enum Content {
     },
 }
 pub fn font(name: &str) -> Result<FontRef<'static>, String> {
-    let data: &'static [u8] = match name {
-        "regular" => include_bytes!("../assets/fonts/UbuntuSans-Regular.ttf"),
-        "medium" => include_bytes!("../assets/fonts/UbuntuSans-Medium.ttf"),
-        "semibold" => include_bytes!("../assets/fonts/UbuntuSans-SemiBold.ttf"),
-        _ => return Err("Choose the bundled regular, medium or semibold font".into()),
-    };
-    FontRef::try_from_slice(data).map_err(|_| "Bundled font is invalid".into())
+    crate::fonts::bundled(name).map_err(|error| match error {
+        crate::fonts::FontError::InvalidReference => {
+            "Choose the bundled regular, medium or semibold font".into()
+        }
+        _ => "Bundled font is invalid".into(),
+    })
+}
+fn spacing(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\u{00a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    )
+}
+fn validate_installed_text(text: &str) -> Result<(), String> {
+    use unicode_script::{Script, UnicodeScript};
+    for ch in text.chars().filter(|ch| *ch != '\n') {
+        let supported = match ch.script() {
+            Script::Latin
+            | Script::Greek
+            | Script::Cyrillic
+            | Script::Han
+            | Script::Hiragana
+            | Script::Katakana
+            | Script::Bopomofo
+            | Script::Common => true,
+            Script::Hangul => matches!(ch, '\u{ac00}'..='\u{d7a3}'),
+            _ => false,
+        };
+        if !supported || unicode_bidi::bidi_class(ch) == unicode_bidi::BidiClass::NSM {
+            return Err("This text needs an unsupported glyph or script shaping. Use supported plain text or explicitly rasterize it externally.".into());
+        }
+    }
+    Ok(())
+}
+fn validate_glyphs(font: &impl Font, text: &str) -> Result<(), String> {
+    for ch in text.chars().filter(|ch| *ch != '\n') {
+        let glyph = font.glyph_id(ch);
+        if glyph.0 == 0 || (!spacing(ch) && font.outline(glyph).is_none()) {
+            return Err("This text needs an unsupported glyph or script shaping. Use supported plain text or explicitly rasterize it externally.".into());
+        }
+    }
+    Ok(())
+}
+fn outline_work(bounds: ab_glyph::Rect, previous: u64) -> Result<u64, String> {
+    if [
+        bounds.min.x,
+        bounds.min.y,
+        bounds.max.x,
+        bounds.max.y,
+        bounds.width(),
+        bounds.height(),
+    ]
+    .iter()
+    .any(|value| !value.is_finite())
+        || bounds.min.x > bounds.max.x
+        || bounds.min.y > bounds.max.y
+    {
+        return Err("Invalid text outline bounds".into());
+    }
+    (bounds.width().ceil() as u64)
+        .checked_mul(bounds.height().ceil() as u64)
+        .and_then(|pixels| previous.checked_add(pixels))
+        .filter(|work| *work <= 32_000_000)
+        .ok_or_else(|| "Text outlines exceed the rendering budget".into())
 }
 impl Source {
     pub fn validate(&self) -> Result<(), String> {
+        self.validated_font().map(|_| ())
+    }
+    /// Saved native projections remain usable without an installed font snapshot.
+    pub fn validate_structure(&self) -> Result<(), String> {
+        self.validate_definition()?;
+        if let Content::Text {
+            text,
+            font: crate::fonts::TextFont::Bundled(name),
+            ..
+        } = &self.content
+        {
+            let font = font(name)?;
+            if text
+                .chars()
+                .filter(|ch| *ch != '\n')
+                .any(|ch| font.glyph_id(ch).0 == 0)
+            {
+                return Err("This text needs an unsupported glyph or script shaping. Use supported plain text or explicitly rasterize it externally.".into());
+            }
+        }
+        Ok(())
+    }
+    fn validated_font(&self) -> Result<Option<FontArc>, String> {
+        self.validate_definition()?;
+        if let Content::Text { text, font, .. } = &self.content {
+            if matches!(font, crate::fonts::TextFont::Installed(_)) {
+                validate_installed_text(text)?;
+            }
+            let font = crate::fonts::snapshot(font).map_err(|error| error.to_string())?;
+            validate_glyphs(&font, text)?;
+            return Ok(Some(font));
+        }
+        Ok(None)
+    }
+    fn validate_definition(&self) -> Result<(), String> {
         check_size(self.width, self.height)?;
         if u64::from(self.width) * u64::from(self.height) > 4_000_000 {
             return Err("Editable text/shape frames are limited to four million pixels".into());
@@ -144,12 +237,13 @@ impl Source {
                         "Invalid text length, size, line/letter spacing or alignment".into(),
                     );
                 }
-                let f = font(name)?;
+                name.validate().map_err(|error| error.to_string())?;
                 for ch in text.chars().filter(|c| *c != '\n') {
                     // This deterministic glyph renderer does not perform shaping or bidi.
                     if ch.is_control()
-                        || f.glyph_id(ch).0 == 0
-                        || matches!(ch as u32,0x0300..=0x036f|0x0590..=0x08ff|0x0900..=0x0fff|0x200c..=0x200f|0x202a..=0x202e|0x2066..=0x2069)
+                        || matches!(ch as u32,0x200c..=0x200f|0x202a..=0x202e|0x2066..=0x2069)
+                        || (name.bundled_name().is_some()
+                            && matches!(ch as u32,0x0300..=0x036f|0x0590..=0x08ff|0x0900..=0x0fff))
                     {
                         return Err("This text needs an unsupported glyph or script shaping. Use supported plain text or explicitly rasterize it externally.".into());
                     }
@@ -196,10 +290,16 @@ impl Source {
         }
     }
     pub fn render(&self, w: u32, h: u32, depth: u16) -> Result<Raster, String> {
-        self.validate()?;
-        self.render_validated(w, h, depth)
+        let font = self.validated_font()?;
+        self.render_validated(w, h, depth, font.as_ref())
     }
-    fn render_validated(&self, w: u32, h: u32, depth: u16) -> Result<Raster, String> {
+    fn render_validated(
+        &self,
+        w: u32,
+        h: u32,
+        depth: u16,
+        font: Option<&FontArc>,
+    ) -> Result<Raster, String> {
         check_size(w, h)?;
         if ![8, 16].contains(&depth) {
             return Err("Editable projections require 8 or 16 bit channels".into());
@@ -233,7 +333,7 @@ impl Source {
                     stroke_width: *stroke_width,
                 },
             };
-            return projected.render_validated(w, h, depth);
+            return projected.render_validated(w, h, depth, None);
         }
         let mut base = Raster::new_depth(self.width, self.height, depth);
         match &self.content {
@@ -243,14 +343,14 @@ impl Source {
             Content::Svg { .. } => unreachable!("SVG projects directly from its vector definition"),
             Content::Text {
                 text,
-                font: name,
                 size,
                 line_height,
                 letter_spacing,
                 align,
                 color,
+                ..
             } => {
-                let f = font(name)?;
+                let f = font.ok_or("Validated text font is missing")?;
                 let scaled = f.as_scaled(PxScale::from(*size));
                 let mut work = 0u64;
                 for (row, line) in text.split('\n').enumerate() {
@@ -282,10 +382,7 @@ impl Source {
                         let g = gid.with_scale_and_position(*size, point(x, y));
                         if let Some(outline) = f.outline_glyph(g) {
                             let bounds = outline.px_bounds();
-                            work += bounds.width().ceil() as u64 * bounds.height().ceil() as u64;
-                            if work > 32_000_000 {
-                                return Err("Text outlines exceed the rendering budget".into());
-                            }
+                            work = outline_work(bounds, work)?;
                             if bounds.max.x >= 0.
                                 && bounds.max.y >= 0.
                                 && bounds.min.x < self.width as f32
@@ -471,7 +568,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<(), String> {
         return Err("Layer limit reached".into());
     }
     let source = parse(c)?;
-    source.validate()?;
+    source.validate_structure()?;
     let parent = c["parent"].as_str();
     if c.get("parent")
         .is_some_and(|v| !v.is_null() && !v.is_string())
@@ -517,7 +614,7 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
         {
             return Err("Only editable text fields can change source dimensions".into());
         }
-        source.validate()?;
+        source.validate_structure()?;
         let [a, b, c, d, tx, ty] = source.matrix.map(f64::from);
         let corners = [
             [0., 0.],
@@ -620,4 +717,383 @@ pub fn transformed(before: &Layer, after: &mut Layer, c: &Value) -> Result<(), S
     after.pixels = source.render(after.pixels.width, after.pixels.height, after.pixels.depth)?;
     after.source = Some(source);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        engine::Engine,
+        fonts::{self, FontError, InstalledFont, TextFont},
+    };
+    use serde_json::json;
+
+    fn reference() -> InstalledFont {
+        let digest = ring::digest::digest(
+            &ring::digest::SHA256,
+            include_bytes!("../assets/fonts/UbuntuSans-Regular.ttf"),
+        );
+        InstalledFont {
+            family: "Synthetic font fixture".into(),
+            postscript: "PeerBrushSynthetic-Regular".into(),
+            style: "normal".into(),
+            weight: 400,
+            stretch: 5,
+            index: 0,
+            sha256: digest
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        }
+    }
+    fn text(font: TextFont) -> Source {
+        Source {
+            width: 160,
+            height: 80,
+            matrix: identity(),
+            content: Content::Text {
+                text: "AV PeerBrush\nNative text".into(),
+                font,
+                size: 22.,
+                line_height: 1.2,
+                letter_spacing: 0.,
+                align: "left".into(),
+                color: [12501, 23003, 34507, 65535],
+            },
+        }
+    }
+    fn state(engine: &Engine) -> Value {
+        let history = |entries: &[crate::engine::History]| {
+            entries.iter().map(|entry| json!({
+            "before":entry.before,"after":entry.after,"actor":entry.actor,"label":entry.label,
+            "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted,
+        })).collect::<Vec<_>>()
+        };
+        json!({"document":engine.doc,"png":engine.doc.export_png().unwrap(),
+            "undo":history(&engine.undo),"redo":history(&engine.redo)})
+    }
+    fn fixture(depth: u16, font: TextFont) -> Engine {
+        let mut engine = Engine::new();
+        engine.doc = Document::new_depth(200, 120, depth).unwrap();
+        let source = text("regular".into());
+        let mut layer = Layer::new(
+            "Installed text fixture",
+            "paint",
+            source.width,
+            source.height,
+        );
+        layer.pixels = source.render(source.width, source.height, depth).unwrap();
+        layer.source = Some(text(font));
+        engine.doc.layers.insert(0, layer);
+        engine
+    }
+    #[test]
+    fn installed_render_validates_and_renders_one_exact_owned_snapshot() {
+        let reference = reference();
+        for depth in [8, 16] {
+            let expected = text("regular".into()).render(160, 80, depth).unwrap();
+            let guard = fonts::test_fonts(vec![(
+                reference.clone(),
+                Ok(FontArc::new(font("regular").unwrap())),
+            )]);
+            let source = text(TextFont::Installed(reference.clone()));
+            source.validate_structure().unwrap();
+            assert_eq!(guard.requests(), 0);
+            let rendered = source.render(160, 80, depth).unwrap();
+            assert_eq!(guard.requests(), 1);
+            assert_eq!(rendered.depth, depth);
+            assert_eq!(rendered.rgba16(), expected.rgba16());
+            assert!(rendered.rgba16().chunks_exact(4).any(|pixel| pixel[3] > 0));
+            if depth == 16 {
+                assert!(rendered.rgba16().iter().any(|value| value % 257 != 0));
+            }
+            source.validate().unwrap();
+            assert_eq!(guard.requests(), 2);
+        }
+    }
+    #[test]
+    fn font_errors_preserve_baked_sources_and_never_resolve_during_storage_or_clipboard() {
+        let reference = reference();
+        for depth in [8, 16] {
+            for error in [
+                FontError::Loading,
+                FontError::Busy,
+                FontError::Missing,
+                FontError::Changed,
+                FontError::Unavailable,
+                FontError::Unsupported,
+                FontError::Variable,
+                FontError::ColorOrBitmap,
+            ] {
+                let source = text(TextFont::Installed(reference.clone()));
+                let engine = fixture(depth, TextFont::Installed(reference.clone()));
+                let before = state(&engine);
+                let guard = fonts::test_fonts(vec![(reference.clone(), Err(error))]);
+                source.validate_structure().unwrap();
+                assert_eq!(guard.requests(), 0);
+                assert_eq!(source.validate().unwrap_err(), error.to_string());
+                assert_eq!(
+                    source.render(160, 80, depth).unwrap_err(),
+                    error.to_string()
+                );
+                assert_eq!(guard.requests(), 2);
+                crate::psd::validate(&engine.doc).unwrap();
+                for bytes in [
+                    crate::psd::encode(&engine.doc).unwrap(),
+                    crate::psd::encode_psb(&engine.doc).unwrap(),
+                ] {
+                    let reopened = crate::psd::decode(&bytes).unwrap();
+                    assert!(!reopened.read_only);
+                    assert_eq!(reopened.bit_depth, depth);
+                    assert_eq!(reopened.layers[0].source, engine.doc.layers[0].source);
+                    assert_eq!(
+                        reopened.layers[0].pixels.rgba16(),
+                        engine.doc.layers[0].pixels.rgba16()
+                    );
+                    assert_eq!(
+                        reopened.export_png().unwrap(),
+                        engine.doc.export_png().unwrap()
+                    );
+                }
+                let snapshot =
+                    crate::layer_clipboard::copy(&engine.doc, &[engine.doc.layers[0].id.clone()])
+                        .unwrap();
+                let mut target = Document::new_depth(200, 120, depth).unwrap();
+                crate::layer_clipboard::paste(&mut target, &snapshot, "").unwrap();
+                let pasted = target
+                    .layers
+                    .iter()
+                    .find(|layer| layer.source.is_some())
+                    .unwrap();
+                assert_eq!(pasted.source, engine.doc.layers[0].source);
+                assert_eq!(pasted.pixels.rgba16(), engine.doc.layers[0].pixels.rgba16());
+                assert_eq!(guard.requests(), 2);
+                assert_eq!(state(&engine), before);
+            }
+        }
+    }
+    #[test]
+    fn missing_font_rejects_rerendering_atomically_but_keeps_move_masks_effects_and_rasterize() {
+        let reference = reference();
+        for depth in [8, 16] {
+            let mut engine = fixture(depth, TextFont::Installed(reference.clone()));
+            let guard = fonts::test_fonts(vec![(reference.clone(), Err(FontError::Missing))]);
+            let id = engine.doc.layers[0].id.clone();
+            let mut updated = engine.doc.layers[0].source.clone().unwrap();
+            if let Content::Text { text, .. } = &mut updated.content {
+                *text = "Changed human text".into();
+            }
+            let mut resized = updated.clone();
+            resized.width += 20;
+            for command in [
+                json!({"op":"source.add","source":updated}),
+                json!({"op":"source.update","layer":id,"source":updated}),
+                json!({"op":"source.update","layer":id,"source":resized}),
+                json!({"op":"transform","layer":id,"angle":17.,"selection_only":false}),
+                json!({"op":"transform","layer":id,"scale_x":1.2,"scale_y":1.2,"selection_only":false}),
+                json!({"op":"image.resize","width":220,"height":132}),
+            ] {
+                let before = state(&engine);
+                let error = engine
+                    .edit(
+                        "human",
+                        &[command.clone()],
+                        None,
+                        None,
+                        "Unavailable text font",
+                    )
+                    .unwrap_err();
+                assert_eq!(error, FontError::Missing.to_string());
+                assert_eq!(state(&engine), before);
+                assert!(Engine::preview_edits(engine.doc.clone(), &[command]).is_err());
+                assert_eq!(state(&engine), before);
+            }
+            let requests = guard.requests();
+            let words = engine.doc.layers[0].pixels.rgba16();
+            let definition = engine.doc.layers[0].source.clone();
+            for command in [
+                json!({"op":"move","layer":id,"dx":3,"dy":2,"selection_only":false}),
+                json!({"op":"effect.add","layer":id,"kind":"invert","settings":{}}),
+                json!({"op":"mask.add","layer":id,"value":255}),
+                json!({"op":"paint","layer":id,"mask":true,"points":[[30,30]],"radius":5,"color":[0,0,0,255]}),
+            ] {
+                engine
+                    .edit(
+                        "human",
+                        &[command],
+                        None,
+                        None,
+                        "Retain saved text appearance",
+                    )
+                    .unwrap();
+            }
+            assert_eq!(guard.requests(), requests);
+            assert_eq!(engine.doc.layers[0].source, definition);
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
+            let before = state(&engine);
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"source.rasterize","layer":id})],
+                    None,
+                    None,
+                    "Explicit rasterize",
+                )
+                .unwrap();
+            assert!(engine.doc.layers[0].source.is_none());
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                engine.undo.last().unwrap().before.export_png().unwrap()
+            );
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.layers[0].source, definition);
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
+            assert_eq!(json!(engine.doc.layers), before["document"]["layers"]);
+            assert_eq!(guard.requests(), requests);
+        }
+    }
+    #[test]
+    fn glyphs_without_outlines_are_rejected_and_spacing_keeps_legacy_advances() {
+        let font = font("regular").unwrap();
+        assert_ne!(font.glyph_id(' ').0, 0);
+        assert!(font.outline(font.glyph_id(' ')).is_none());
+        validate_glyphs(&font, "AV PeerBrush\n ").unwrap();
+        let (_, empty) = font
+            .codepoint_ids()
+            .find(|(glyph, ch)| {
+                if glyph.0 == 0 || spacing(*ch) || font.outline(*glyph).is_some() {
+                    return false;
+                }
+                let mut candidate = text("regular".into());
+                if let Content::Text { text, .. } = &mut candidate.content {
+                    *text = ch.to_string();
+                }
+                candidate.validate_definition().is_ok()
+            })
+            .expect("Bundled fixture includes a nonspacing empty glyph");
+        assert!(validate_glyphs(&font, &empty.to_string()).is_err());
+        let mut historical = text("regular".into());
+        if let Content::Text { text, .. } = &mut historical.content {
+            *text = format!("A{empty}B");
+        }
+        historical.validate_structure().unwrap();
+        assert!(historical.validate().is_err());
+        assert!(historical.render(160, 80, 16).is_err());
+        for unsupported in ["שלום", "مرحبا", "हिन्दी", "A\u{0301}", "A\tB", "A\u{200d}B"]
+        {
+            let mut source = text("regular".into());
+            if let Content::Text { text, .. } = &mut source.content {
+                *text = unsupported.into();
+            }
+            assert!(source.validate_structure().is_err());
+            assert!(source.render(160, 80, 16).is_err());
+        }
+    }
+    #[test]
+    fn installed_plain_script_policy_keeps_saved_metadata_and_rejects_unshaped_runs() {
+        for supported in ["AV PeerBrush 123!", "caf\u{00e9} \u{03a9}\u{03bc}\u{03ad}\u{03b3}\u{03b1} \u{041f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}",
+            "\u{6f22}\u{5b57} \u{3042}\u{3044}\u{3046} \u{30ab}\u{30bf}\u{30ab}\u{30ca} \u{3105}\u{3106} \u{d55c}\u{ae00}", "A\nB \u{3000}"] {
+            validate_installed_text(supported).unwrap();
+        }
+        let reference = reference();
+        let guard = fonts::test_fonts(vec![(
+            reference.clone(),
+            Ok(FontArc::new(font("regular").unwrap())),
+        )]);
+        let mut source = text(TextFont::Installed(reference.clone()));
+        for unsupported in [
+            "שלום",
+            "مرحبا",
+            "हिन्दी",
+            "A\u{0301}",
+            "\u{1000}",
+            "\u{aa60}",
+            "\u{a9e0}",
+            "\u{1780}",
+            "\u{1820}",
+            "A\u{1ab0}",
+            "A\u{1dc0}",
+            "A\u{20d0}",
+            "A\u{fe20}",
+            "\u{0483}",
+            "\u{1100}",
+            "\u{11a8}",
+            "\u{a960}",
+            "\u{d7b0}",
+            "\u{3131}",
+            "\u{ffc2}",
+            "\u{0531}",
+            "\u{10d0}",
+            "\u{fffd}\u{e0100}",
+        ] {
+            assert!(
+                validate_installed_text(unsupported).is_err(),
+                "{unsupported:?}"
+            );
+            if let Content::Text { text, .. } = &mut source.content {
+                *text = unsupported.into();
+            }
+            source.validate_structure().unwrap();
+            assert!(source.validate().is_err());
+            assert!(source.render(160, 80, 16).is_err());
+        }
+        assert_eq!(guard.requests(), 0);
+        if let Content::Text { text, .. } = &mut source.content {
+            *text = "AV caf\u{00e9} \u{03a9} \u{0416}".into();
+        }
+        validate_glyphs(
+            &font("regular").unwrap(),
+            "AV caf\u{00e9} \u{03a9} \u{0416}",
+        )
+        .unwrap();
+        source.render(160, 80, 16).unwrap();
+        assert_eq!(guard.requests(), 1);
+        for depth in [8, 16] {
+            let mut engine = fixture(depth, TextFont::Installed(reference.clone()));
+            if let Content::Text { text, .. } =
+                &mut engine.doc.layers[0].source.as_mut().unwrap().content
+            {
+                *text = "שלום مرحبا हिन्दी \u{1820} A\u{0301}\u{1ab0}".into();
+            }
+            for bytes in [
+                crate::psd::encode(&engine.doc).unwrap(),
+                crate::psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = crate::psd::decode(&bytes).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.layers[0].source, engine.doc.layers[0].source);
+                assert_eq!(
+                    reopened.layers[0].pixels.rgba16(),
+                    engine.doc.layers[0].pixels.rgba16()
+                );
+                assert_eq!(
+                    reopened.export_png().unwrap(),
+                    engine.doc.export_png().unwrap()
+                );
+            }
+        }
+        assert_eq!(guard.requests(), 1);
+    }
+    #[test]
+    fn outline_work_rejects_nonfinite_reversed_overflowing_and_excessive_bounds() {
+        let bounds = |width, height| ab_glyph::Rect {
+            min: point(0., 0.),
+            max: point(width, height),
+        };
+        assert_eq!(outline_work(bounds(10., 20.), 7).unwrap(), 207);
+        assert_eq!(outline_work(bounds(4000., 8000.), 0).unwrap(), 32_000_000);
+        assert!(outline_work(bounds(4000., 8000.), 1).is_err());
+        assert!(outline_work(bounds(1., 1.), u64::MAX).is_err());
+        for (width, height) in [
+            (f32::NAN, 1.),
+            (1., f32::INFINITY),
+            (-1., 1.),
+            (f32::MAX, f32::MAX),
+            (8192., 8192.),
+        ] {
+            assert!(outline_work(bounds(width, height), 0).is_err());
+        }
+    }
 }

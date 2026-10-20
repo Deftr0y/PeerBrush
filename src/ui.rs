@@ -10565,6 +10565,261 @@ mod tests {
             assert!(app.source_editor.is_none());
         }
     }
+
+    #[test]
+    fn missing_installed_text_retains_native_pixels_and_explicit_picker_replacement_previews_and_undoes(
+    ) {
+        use crate::fonts::{self, FontError, InstalledFont, TextFont};
+        let font = InstalledFont {
+            family: "Unavailable fixture".into(),
+            postscript: "UnavailableFixture-Regular".into(),
+            style: "normal".into(),
+            weight: 400,
+            stretch: 5,
+            index: 0,
+            sha256: "d".repeat(64),
+        };
+        let _fonts = fonts::test_fonts(vec![(font.clone(), Err(FontError::Missing))]);
+        let (mut app, ctx) = small_fixture();
+        let original = {
+            let mut engine = app.shared.lock().unwrap();
+            engine.doc = Document::new_depth(32, 32, 16).unwrap();
+            engine.doc.layers[0]
+                .pixels
+                .set16(2, 3, [12347, 33659, 51237, 65535]);
+            engine.doc.layers[0].source = Some(crate::source::Source {
+                width: 32,
+                height: 32,
+                matrix: [1., 0., 0., 1., 0., 0.],
+                content: crate::source::Content::Text {
+                    text: "Hi".into(),
+                    font: TextFont::Installed(font),
+                    size: 16.,
+                    line_height: 1.2,
+                    letter_spacing: 0.,
+                    align: "left".into(),
+                    color: [53471, 12679, 33457, 65535],
+                },
+            });
+            engine.doc.clone()
+        };
+        app.select_content(&original.layers[0].id);
+        app.open_source(&original, "edit");
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.source_editor.is_some());
+        assert!(
+            app.transient.is_empty(),
+            "Missing fonts must retain the saved raster, without failed source previews"
+        );
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+        fn control(app: &mut PeerBrush, ctx: &egui::Context, label: &str) -> Pos2 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Source control absent: {label}"))
+        }
+        // Apply is disabled while the exact font is missing.
+        let apply = control(&mut app, &ctx, "Apply");
+        click(&mut app, &ctx, apply);
+        assert!(app.source_editor.is_some());
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        let label = app.source_editor.as_ref().unwrap().source.content.clone();
+        let crate::source::Content::Text { font, .. } = label else {
+            panic!()
+        };
+        let picker = control(&mut app, &ctx, &font.label());
+        click(&mut app, &ctx, picker);
+        let replacement = control(&mut app, &ctx, "Ubuntu Sans medium");
+        click(&mut app, &ctx, replacement);
+        assert!(
+            matches!(&app.source_editor.as_ref().unwrap().source.content,
+            crate::source::Content::Text {font:TextFont::Bundled(name),..} if name=="medium")
+        );
+        let command = app.source_editor.as_ref().unwrap().command();
+        let expected = Engine::preview_edits(original.clone(), &[command]).unwrap();
+        assert_ne!(
+            expected.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            frame(&mut app, &ctx, vec![], Default::default());
+            if !app.pending
+                && app.canvas_pixels.as_ref().is_some_and(|(w, h, pixels)| {
+                    *pixels == expected.preview(None, (*w).max(*h), None, false).unwrap().2
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Replacement font must preview actual engine pixels"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        let apply = control(&mut app, &ctx, "Apply");
+        click(&mut app, &ctx, apply);
+        assert!(app.source_editor.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(
+            engine.doc.layers[0].pixels.rgba16(),
+            expected.layers[0].pixels.rgba16()
+        );
+        engine.undo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].source, original.layers[0].source);
+        assert_eq!(
+            engine.doc.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+        drop(engine);
+        let current = app.shared.lock().unwrap().doc.clone();
+        app.open_source(&current, "edit");
+        let cancel = control(&mut app, &ctx, "Cancel");
+        click(&mut app, &ctx, cancel);
+        assert!(app.source_editor.is_none());
+        assert!(app.transient.is_empty());
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+    }
+
+    #[test]
+    fn unchanged_installed_text_retries_loading_and_busy_then_previews_ready_native_pixels() {
+        use crate::fonts::{self, FontError, InstalledFont, TextFont};
+        for depth in [8, 16] {
+            for pending in [FontError::Loading, FontError::Busy] {
+                let font = InstalledFont {
+                    family: "Pending fixture".into(),
+                    postscript: "PendingFixture-Regular".into(),
+                    style: "normal".into(),
+                    weight: 400,
+                    stretch: 5,
+                    index: 0,
+                    sha256: "e".repeat(64),
+                };
+                let waiting = fonts::test_fonts(vec![(font.clone(), Err(pending))]);
+                let (mut app, ctx) = small_fixture();
+                let original = {
+                    let mut engine = app.shared.lock().unwrap();
+                    engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                    engine.doc.layers[0]
+                        .pixels
+                        .set16(1, 2, [21347, 41259, 31357, 65535]);
+                    engine.doc.layers[0].source = Some(crate::source::Source {
+                        width: 32,
+                        height: 32,
+                        matrix: [1., 0., 0., 1., 0., 0.],
+                        content: crate::source::Content::Text {
+                            text: "Hi".into(),
+                            font: TextFont::Installed(font.clone()),
+                            size: 16.,
+                            line_height: 1.2,
+                            letter_spacing: 0.,
+                            align: "left".into(),
+                            color: [53471, 12679, 33457, 65535],
+                        },
+                    });
+                    engine.doc.clone()
+                };
+                app.select_content(&original.layers[0].id);
+                app.open_source(&original, "edit");
+                let command = app.source_editor.as_ref().unwrap().command();
+                // A preview can lose its snapshot between UI validation and rendering.
+                app.source_editor.as_mut().unwrap().error = Some(pending.to_string());
+                app.last_preview = Some((
+                    original.id.clone(),
+                    original.revision,
+                    "cached failed preview".into(),
+                    false,
+                ));
+                let draw_source = |app: &mut PeerBrush| {
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1360., 900.),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| app.source_window(ctx, &original),
+                    )
+                };
+                let output = draw_source(&mut app);
+                assert!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                        <= Duration::from_millis(50)
+                );
+                assert!(app.transient.is_empty());
+                assert!(app.source_editor.as_ref().unwrap().error.is_some());
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(
+                    app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+                    original.layers[0].pixels.rgba16()
+                );
+                drop(waiting);
+                let _ready = fonts::test_fonts(vec![(
+                    font,
+                    Ok(ab_glyph::FontArc::new(fonts::bundled("regular").unwrap())),
+                )]);
+                draw_source(&mut app);
+                assert_eq!(
+                    app.source_editor.as_ref().unwrap().command(),
+                    command,
+                    "Readiness must not substitute or edit metadata"
+                );
+                assert!(app.source_editor.as_ref().unwrap().error.is_none());
+                assert!(
+                    app.last_preview.is_none(),
+                    "A cached loading failure must be retried without another property edit"
+                );
+                assert_eq!(app.transient, vec![command.clone()]);
+                let expected = Engine::preview_edits(original.clone(), &[command]).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(4);
+                loop {
+                    frame(&mut app, &ctx, vec![], Default::default());
+                    if !app.pending
+                        && app.canvas_pixels.as_ref().is_some_and(|(w, h, pixels)| {
+                            *pixels == expected.preview(None, (*w).max(*h), None, false).unwrap().2
+                        })
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Ready unchanged font must render after pending state"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(
+                    app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+                    original.layers[0].pixels.rgba16()
+                );
+                app.cancel_source();
+            }
+        }
+    }
+
     #[test]
     fn document_geometry_previews_pixels_dimensions_and_cancels_when_source_changes() {
         for mode in ["crop", "canvas.resize", "image.resize"] {

@@ -948,13 +948,13 @@
       "source.rasterize"
     ],
     "observation": "Each layer exposes its complete source definition or null. Preserve current width/height/matrix when editing content.",
-    "text": "Text/T creates or edits a canvas field. Bundled Ubuntu Sans regular/medium/semibold, explicit multiline plain text, kerning, size, line_height, letter_spacing (native pixels between glyphs, default 0), left/center/right alignment, native RGBA16 color. Missing glyphs or scripts needing shaping/bidi are refused. System document fonts and automatic wrapping remain unsupported.",
+    "text": "Text/T creates or edits a canvas field. Bundled Ubuntu Sans regular/medium/semibold, explicit multiline plain text, kerning, size, line_height, letter_spacing (native pixels between glyphs, default 0), left/center/right alignment, native RGBA16 color. Missing glyphs or scripts needing shaping/bidi are refused. Installed static outline fonts use exact metadata from peerbrush_fonts; loading/missing/changed/unsupported states are explicit. No automatic wrapping or font substitution.",
     "shapes": "Rectangle, ellipse, or straight-segment path with editable points, even-odd fill, open/closed flag, stroke and stroke_width. Native RGBA16 fill/stroke colors.",
     "svg": "Self-contained static UTF-8 SVG/SVGZ retains original markup and editable affine placement. Paths/curves, basic shapes, groups, solid colors, linear/radial gradients, local use and clip paths are supported. Text must be outlined; raster images, filters, masks, patterns, stylesheets, scripts/animation, external resources and unknown visual properties reject. SVG coverage/colors project through RGBA8, promoted for native16 projects; existing native16 raster channels remain exact. image.import retains the definition; image.place and external image-file paste rasterize it.",
     "coordinates": "Source width/height define local frame. x/y on add are document origins. Optional matrix=[a,b,c,d,tx,ty] maps local coordinates to current raster frame, identity by default. source.update may resize a Text field, preserving document placement, native masks and effects; the projection retains its previous extent. Read the updated source/frame from observation. Other source kinds keep their fixed-frame update restriction.",
     "precision": "Native text/shapes use colors 0–65535 regardless of document depth; native16 projections preserve words and sub-byte antialias coverage. 8-bit documents project at their own boundary. SVG uses the explicitly described RGBA8 projection while retaining its original markup.",
     "guards": "Complete-layer transforms preserve definitions; selected-pixel/mask transforms require explicit rasterization. Color painting/placement refuses source layers. Mask painting and effects remain editable. Shared stale/revision/lock/reservation guards are atomic.",
-    "psd": "Private source format 8 supports native text/shapes; SVG requires format 12; nonzero text letter_spacing requires format 30. All supplement current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
+    "psd": "Private source format 8 supports native text/shapes; SVG requires format 12; nonzero text letter_spacing requires format 30; installed-font references require format 31. All supplement current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
     "limits": "4 MP original source frame. Native text/shapes: 4096 characters / 96 lines, size 1–1024, line_height 0.5–4, letter_spacing -1024–1024, 128 path points, stroke_width 0–256, 32 million outline/path work budget. Text field resizing additionally enforces raster, coordinate, mask and native work budgets. SVG: 512 KiB UTF-8 markup, 1 MiB compressed SVGZ, 4096 XML nodes, bounded reference expansion, geometry, nesting, render work and memory. External resource resolvers are disabled."
   },
   "large_documents": {
@@ -1022,5 +1022,19 @@
     "coworking": "Blue scopes and description appear before execution. Scope/lock/reservation/task checks repeat before one commit. Native AI tasks Cancel, protocol cancel, expiry and human takeover discard unfinished work without reacquiring tasks.",
     "isolation": "No files/network/OS/module/eval API, mutable presets, lock changes or direct live storage access. A native engine operation completes before cancellation/deadline rejection; no OS process sandbox is claimed.",
     "documentation": "docs/live-code.md"
+  },
+  "document_fonts": {
+    "tool": "peerbrush_fonts",
+    "actions": [
+      "list",
+      "prepare",
+      "refresh"
+    ],
+    "discovery": "Native DirectWrite/CoreText/Fontconfig available-font inventory on a worker; list returns exact path-free references and explicit unsupported rows. Search128 characters, default 32/max128 rows, offset0–8192. Catalog status and generation distinguish loading/unavailable from ready.",
+    "reference": "Legacy bundled regular/medium/semibold strings, or exact object: family,postscript,style(normal/italic/oblique),weight(1–1000),stretch(1–9),index(0–255),sha256(lowercase64). Use the unmodified returned record. No paths or font bytes in documents or protocol.",
+    "prepare": "Cache-only on UI/render callers. prepare queues an exact SHA/index-verified owned snapshot; retry ready:false/loading/busy. Shared source.add/update render with one snapshot and enforce existing atomic revision/lock/reservation guards.",
+    "preservation": "Missing/changed/unsupported fonts retain saved text metadata and native raster/masks/composite; ordinary move/effects/masks/hierarchy/clipboard/save and unrelated edits remain available. Text re-render, frame resize, scale/rotation and image resize refuse until exact resolution or explicit replacement. UI replacement previews before one Apply/undo; explicit rasterization keeps saved pixels.",
+    "limits": "8192 native descriptors,256collectionfaces,8MiBmetadata,32MiBfontfile,8queuedrequests,64MiBcache plus caller-held in-flight snapshots. Static TrueType/OpenType outline faces only; variable/simulated/color/bitmap/SVG faces explicit unavailable. Plain Latin/Greek/Cyrillic/Han/precomposedHangul/Hiragana/Katakana/Bopomofo/Common glyphs only; no combining marks, joining/shaping scripts, HangulJamo, bidi or automatic wrapping.",
+    "source_format": 31
   }
 }

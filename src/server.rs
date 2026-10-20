@@ -1,3 +1,4 @@
+mod fonts;
 use crate::{
     engine::{self, Engine, Scope},
     psd, raster,
@@ -670,11 +671,12 @@ pub fn tools() -> Value {
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_filters","description":"Browse whole-image filter presets; thumbnail renders a standard reference image, preview renders the explicitly targeted current project without history and returns frozen commands. Apply with peerbrush_edit filter.add/update; edit settings, strength, bypass, delete and reorder non-destructively. Top filters run last after the composite. Save/rename/delete/import/export validated instance-local custom presets outside history. Curated presets are immutable. Preview requires current project_id/document_id/expected_revision; original 8/16-bit sources stay editable.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","thumbnail","preview","save","rename","delete","import","export"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"kind":{"type":"string"},"settings":{"type":"object"},"weight":{"type":"number","minimum":0,"maximum":1},"data":{"type":"object"},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_code","description":"Run bounded Rhai code against a frozen native 8/16-bit project, then commit shared commands atomically. start requires explicit project/document/revision, a named AI actor, active owned task, description and declared scopes. Code cannot bypass locks/reservations or read files/network. Returns run ID immediately; status returns completion and actual PNG with document coordinates. cancel or human takeover discards unfinished work. read_pixel, begin_pixels, write_pixel, commit_pixels and edit are documented in capabilities. One undo step; source changes reject the whole run.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","cancel"]},"actor":{"type":"string"},"task":{"type":"string"},"run":{"type":"string"},"description":{"type":"string","maxLength":240},"scopes":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}},"additionalProperties":false}},"script":{"type":"string","maxLength":65536},"max_edge":{"type":"integer","minimum":32,"maximum":1024}},"required":["action","project_id","document_id"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_exports","description":"Flattened PNG/WebP production presets and selected layer/folder batches. list returns instance-local preset revision; save_preset/delete_preset require expected_library_revision and never enter document history. plan/preview/start require observed project_id/document_id/expected_revision. Targets are isolated selected roots with their masks/effects and internal clipping; ancestor folders and document filters are excluded. An empty target list exports the current composite with document filters. Standalone adjustments/clipped layers and protected-source layers require their containing folder/composite. Presets define format (png by default), portable filenames, explicit numbered duplicates, canvas/alpha bounds, transparent padding and named scale variants. PNG preserves native 8/16-bit channels. Lossless WebP has explicit 8-bit output; native16 working sources remain unchanged. Both retain alpha and ICC without implicit profile conversion. Plan/receipts report output format/bit_depth and native_source_depth. preview returns actual output pixels as PNG with document coordinates. start requires an existing output directory and explicit existing-file policy (error by default, skip, or replace); status reports each written/skipped/failed/not-written output. cancel preserves completed exports and editable sources. Loaded sources, file ownership, concurrent edits and destination conflicts remain guarded.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","save_preset","delete_preset","plan","preview","start","status","cancel"]},"preset":{"type":"string"},"name":{"type":"string"},"actor":{"type":"string"},"expected_library_revision":{"type":"integer","minimum":0},"targets":{"type":"array","maxItems":1024,"items":{"type":"string"}},"directory":{"type":"string"},"existing":{"type":"string","enum":["error","skip","replace"]},"run":{"type":"string"},"output_index":{"type":"integer","minimum":0,"maximum":63},"max_edge":{"type":"integer","minimum":32,"maximum":1024},"settings":{"type":"object","properties":{"format":{"type":"string","enum":["png","webp"],"default":"png"},"template":{"type":"string","maxLength":160},"crop":{"type":"string","enum":["canvas","alpha"]},"padding":{"type":"integer","minimum":0,"maximum":4096},"resampling":{"type":"string","enum":["nearest","bilinear"]},"duplicate_names":{"type":"string","enum":["error","number"]},"variants":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":48},"scale":{"type":"number","minimum":0.01,"maximum":8}},"required":["name","scale"],"additionalProperties":false}}},"required":["template","crop","padding","resampling","duplicate_names","variants"],"additionalProperties":false}},"required":["action"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(fonts::tool());
     for tool in tools.as_array_mut().unwrap() {
         // Project/source properties are added consistently below.
         if !matches!(
             tool["name"].as_str(),
-            Some("peerbrush_capabilities" | "peerbrush_brushes")
+            Some("peerbrush_capabilities" | "peerbrush_brushes" | "peerbrush_fonts")
         ) {
             let properties = &mut tool["inputSchema"]["properties"];
             properties["project_id"] = json!({"type":"string"});
@@ -794,6 +796,9 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
     let _operation = persistent
         .then(|| FileOperation::begin_workspace(&crate::workspace::attach(shared)))
         .transpose()?;
+    if method == "fonts" {
+        return fonts::request(p);
+    }
     if method == "exports" {
         return crate::production_export::request(shared, p);
     }
@@ -1779,6 +1784,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             let method = name.strip_prefix("peerbrush_").unwrap_or(name);
             if ![
                 "capabilities",
+                "fonts",
                 "exports",
                 "brushes",
                 "tool_settings",

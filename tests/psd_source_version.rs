@@ -154,7 +154,7 @@ fn text_tracking_requires_new_sources_and_keeps_current_standard_pixels() {
                 engine.doc.layers[0].pixels.rgba16()
             );
             assert_eq!(reopened.export_png().unwrap(), expected);
-            for format in [8, 29, 31] {
+            for format in [8, 29, u32::MAX] {
                 let rejected = psd::decode(&with_format(&bytes, format)).unwrap();
                 assert!(rejected.read_only);
                 assert!(rejected.layers.iter().all(|layer| layer.source.is_none()));

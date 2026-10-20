@@ -264,6 +264,18 @@ fn has_letter_spacing(doc: &Document) -> bool {
     })
 }
 
+fn has_installed_fonts(doc: &Document) -> bool {
+    doc.layers.iter().any(|layer| {
+        matches!(
+            layer.source.as_ref().map(|source| &source.content),
+            Some(crate::source::Content::Text {
+                font: crate::fonts::TextFont::Installed(_),
+                ..
+            })
+        )
+    })
+}
+
 fn default_blending_ranges(bytes: &[u8], channels: u16) -> bool {
     bytes.is_empty()
         // Photoshop may include transparency/mask channel pairs in addition to
@@ -846,7 +858,9 @@ fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     }
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if has_letter_spacing(doc) {
+        format: if has_installed_fonts(doc) {
+            31
+        } else if has_letter_spacing(doc) {
             30
         } else if doc.layers.iter().any(|layer| layer.mask.is_some()) {
             29
@@ -1739,7 +1753,8 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=30).contains(&e.format)
+                if (1..=31).contains(&e.format)
+                    && (e.format >= 31 || !has_installed_fonts(&e.document))
                     && (e.format >= 30 || !has_letter_spacing(&e.document))
                     && (e.format >= 29
                         || e.document
@@ -2735,7 +2750,7 @@ pub fn validate(doc: &Document) -> Result<(), String> {
             if l.kind != "paint" {
                 return Err("Editable text/vector sources require paint raster projections".into());
             }
-            source.validate()?;
+            source.validate_structure()?;
         }
         if !ids.insert(l.id.clone()) {
             return Err("Duplicate layer ID".into());

@@ -22,6 +22,7 @@ pub mod file_safety;
 pub mod fill;
 pub mod filter_library;
 pub mod filters;
+pub mod fonts;
 pub mod geometry;
 pub mod gpu;
 pub mod grouping;

@@ -36,6 +36,17 @@ fn text() -> Source {
         },
     }
 }
+fn installed_fixture_font() -> peerbrush::fonts::TextFont {
+    peerbrush::fonts::TextFont::Installed(peerbrush::fonts::InstalledFont {
+        family: "Synthetic absent font".into(),
+        postscript: "PeerBrushSynthetic-Absent".into(),
+        style: "normal".into(),
+        weight: 400,
+        stretch: 5,
+        index: 0,
+        sha256: "0".repeat(64),
+    })
+}
 fn fixture(depth: u16) -> Engine {
     let mut e = Engine::new();
     e.doc = Document::new_depth(240, 180, depth).unwrap();
@@ -629,6 +640,158 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
             assert_eq!(artwork(&decoded), artwork(&e.doc));
             assert_eq!(decoded.export_png().unwrap(), e.doc.export_png().unwrap());
         }
+    }
+}
+
+#[test]
+fn text_font_records_preserve_legacy_strings_and_reject_private_or_malformed_references() {
+    for name in ["regular", "medium", "semibold"] {
+        let mut source = text();
+        if let Content::Text { font, .. } = &mut source.content {
+            *font = name.into();
+        }
+        let value = json!(source);
+        assert_eq!(value["content"]["font"], name);
+        assert_eq!(serde_json::from_value::<Source>(value).unwrap(), source);
+        source.validate_structure().unwrap();
+    }
+    let mut source = text();
+    if let Content::Text { font, .. } = &mut source.content {
+        *font = installed_fixture_font();
+    }
+    source.validate_structure().unwrap();
+    let value = json!(source);
+    assert!(value["content"]["font"]["sha256"].is_string());
+    assert!(value["content"]["font"].get("path").is_none());
+    let mut private = value.clone();
+    private["content"]["font"]["path"] = json!("/synthetic/private/font.ttf");
+    assert!(serde_json::from_value::<Source>(private).is_err());
+    for (key, invalid) in [
+        ("family", json!("/synthetic/private/font.ttf")),
+        ("postscript", json!("")),
+        ("style", json!("simulated")),
+        ("weight", json!(0)),
+        ("stretch", json!(10)),
+        ("index", json!(256)),
+        ("sha256", json!("A".repeat(64))),
+    ] {
+        let mut bad = value.clone();
+        bad["content"]["font"][key] = invalid;
+        assert!(serde_json::from_value::<Source>(bad)
+            .unwrap()
+            .validate_structure()
+            .is_err());
+    }
+    for unsupported in [
+        "שלום",
+        "مرحبا",
+        "हिन्दी",
+        "A\u{0301}",
+        "\u{1780}",
+        "\u{1000}",
+    ] {
+        let mut saved = value.clone();
+        saved["content"]["text"] = json!(unsupported);
+        let saved: Source = serde_json::from_value(saved).unwrap();
+        saved.validate_structure().unwrap();
+        assert!(saved.validate().unwrap_err().contains("shaping"));
+    }
+    for unsupported in ["A\tB", "A\u{200d}B", "A\u{202e}B"] {
+        let mut bad = value.clone();
+        bad["content"]["text"] = json!(unsupported);
+        assert!(serde_json::from_value::<Source>(bad)
+            .unwrap()
+            .validate_structure()
+            .is_err());
+    }
+}
+
+#[test]
+fn unavailable_installed_definitions_survive_group_clipboard_and_task_compensation() {
+    for depth in [8, 16] {
+        let mut engine = fixture(depth);
+        edit(&mut engine, json!({"op":"source.add","source":text()}));
+        let id = engine.doc.layers[0].id.clone();
+        let other = engine.doc.layers[1].id.clone();
+        // A saved fixture's font identity is absent here; its existing projection
+        // comes from the real bundled font rather than an invented raster.
+        if let Content::Text { font, .. } =
+            &mut engine.doc.layers[0].source.as_mut().unwrap().content
+        {
+            *font = installed_fixture_font();
+        }
+        let definition = engine.doc.layers[0].source.clone();
+        let native = engine.doc.layers[0].pixels.rgba16();
+        let task = engine
+            .reserve("agent", "Text layer effect", vec![])
+            .unwrap()
+            .id;
+        engine
+            .edit(
+                "agent",
+                &[json!({"op":"effect.add","layer":id,"kind":"invert","settings":{}})],
+                Some(engine.doc.revision),
+                Some(&task),
+                "Agent effect",
+            )
+            .unwrap();
+        edit(
+            &mut engine,
+            json!({"op":"fill","layer":other,"rect":[0,0,5,5],"color":[53,97,173,255]}),
+        );
+        edit(
+            &mut engine,
+            json!({"op":"layer.update","layer":id,"name":"Human retained title"}),
+        );
+        let human = engine.doc.layers[1].pixels.rgba16();
+        engine.undo_task("human", "agent", &task).unwrap();
+        assert!(engine.doc.layers[0].effects.is_empty());
+        assert_eq!(engine.doc.layers[0].name, "Human retained title");
+        assert_eq!(engine.doc.layers[0].source, definition);
+        assert_eq!(engine.doc.layers[0].pixels.rgba16(), native);
+        assert_eq!(engine.doc.layers[1].pixels.rgba16(), human);
+        edit(
+            &mut engine,
+            json!({"op":"group.create_selected","layers":[id]}),
+        );
+        let folder = engine.doc.layers[0].id.clone();
+        let layer = engine
+            .doc
+            .layers
+            .iter()
+            .find(|layer| layer.id == id)
+            .unwrap();
+        assert_eq!(layer.parent.as_deref(), Some(folder.as_str()));
+        assert_eq!(layer.source, definition);
+        let clipboard = layer_clipboard::copy(&engine.doc, &[folder]).unwrap();
+        let mut target = Document::new_depth(240, 180, depth).unwrap();
+        layer_clipboard::paste(&mut target, &clipboard, "").unwrap();
+        let pasted = target
+            .layers
+            .iter()
+            .find(|layer| layer.source.is_some())
+            .unwrap();
+        assert_eq!(pasted.source, definition);
+        assert_eq!(pasted.pixels.rgba16(), native);
+        for bytes in [
+            psd::encode(&engine.doc).unwrap(),
+            psd::encode_psb(&engine.doc).unwrap(),
+        ] {
+            let reopened = psd::decode(&bytes).unwrap();
+            assert!(!reopened.read_only);
+            assert_eq!(reopened.bit_depth, depth);
+            let layer = reopened.layers.iter().find(|layer| layer.id == id).unwrap();
+            assert_eq!(layer.source, definition);
+            assert_eq!(layer.pixels.rgba16(), native);
+            assert_eq!(
+                reopened.export_png().unwrap(),
+                engine.doc.export_png().unwrap()
+            );
+        }
+        engine.undo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].source, definition);
+        assert_eq!(engine.doc.layers[0].pixels.rgba16(), native);
+        assert_eq!(engine.doc.layers[1].pixels.rgba16(), human);
     }
 }
 

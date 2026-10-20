@@ -8,6 +8,70 @@ use std::{
 };
 
 #[test]
+fn modern_fonts_are_bounded_path_free_and_independent_of_document_history() {
+    let canvas = Canvas::new();
+    let before = peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap();
+    let call = |args| {
+        let query = modern_request(
+            json!("fonts"),
+            "tools/call",
+            json!({"name":"peerbrush_fonts","arguments":args}),
+        );
+        response(canvas.modern(&query).send_json(query.clone()))
+            .into_json::<Value>()
+            .unwrap()
+    };
+    let reply = call(json!({"action":"list","limit":1}));
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let result: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(result["fonts"].as_array().unwrap().len() <= 1);
+    assert!(result.get("status").is_some());
+    for font in result["fonts"].as_array().unwrap() {
+        let object = font.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert!(!object.contains_key("path"));
+        if !font["font"].is_null() {
+            assert!(font["font"].get("sha256").is_some());
+        } else {
+            assert!(!font["error"].is_null());
+        }
+    }
+    let prepared = call(json!({"action":"prepare","font":"regular"}));
+    assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+    let result: Value =
+        serde_json::from_str(prepared["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(result["ready"], true);
+    for args in [
+        json!({"action":"list","limit":129}),
+        json!({"action":"list","offset":8193}),
+        json!({"action":"refresh","path":"font.ttf"}),
+        json!({"action":"prepare","font":{"path":"font.ttf"}}),
+    ] {
+        assert_eq!(call(args)["result"]["isError"], true);
+    }
+    assert_eq!(
+        peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap(),
+        before
+    );
+    assert!(canvas.shared.lock().unwrap().undo.is_empty());
+    let schema = server::tools()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "peerbrush_fonts")
+        .unwrap()
+        .clone();
+    assert!(schema["inputSchema"]["properties"]
+        .get("project_id")
+        .is_none());
+    assert_eq!(
+        schema["inputSchema"]["properties"]["font"]["oneOf"][1]["additionalProperties"],
+        false
+    );
+}
+
+#[test]
 fn modern_tool_settings_are_guarded_independent_and_return_real_preview_pixels() {
     let canvas = Canvas::new();
     let call = |args| {

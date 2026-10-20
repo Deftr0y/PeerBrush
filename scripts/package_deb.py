@@ -23,8 +23,8 @@ from verify_release import inspect_archive
 
 
 APP_ID = 'com.peerbrush.PeerBrush'
-# winit/wgpu load these at runtime, beyond the ELF-linked dependency inventory.
-RUNTIME = ['libegl1', 'libvulkan1', 'libwayland-client0', 'libx11-6',
+# Native fonts and winit/wgpu load these beyond the ELF-linked dependency inventory.
+RUNTIME = ['libfontconfig1', 'libegl1', 'libvulkan1', 'libwayland-client0', 'libx11-6',
            'libxcursor1', 'libxi6', 'libxrandr2', 'libxkbcommon0', 'libxkbcommon-x11-0',
            'desktop-file-utils', 'shared-mime-info']
 MAX_DEB_BYTES = 512 * 1024 * 1024

@@ -30,10 +30,12 @@ semver = "1"
 url = "2.5"
 rfd = "0.15"
 ab_glyph = "0.2"
+ring = "0.17.14"
+unicode-script = "0.5.8"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
-windows = { version = "0.58", features = ["ApplicationModel"] }
+windows = { version = "0.58", features = ["ApplicationModel", "Win32_Foundation", "Win32_Graphics_DirectWrite"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"

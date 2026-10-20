@@ -11,6 +11,7 @@ pub(super) struct Editor {
     pub error: Option<String>,
     pub placement: Option<Placement>,
     apply_error: Option<String>,
+    font_search: String,
 }
 pub(super) struct Placement {
     anchor: [f32; 2],
@@ -126,6 +127,7 @@ impl PeerBrush {
             error: None,
             placement: None,
             apply_error: None,
+            font_search: String::new(),
         });
         self.last_preview = None;
     }
@@ -303,6 +305,7 @@ impl PeerBrush {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
+        let mut valid = false;
         egui::Window::new(e.source.label())
             .open(&mut open)
             .collapsible(false)
@@ -384,13 +387,7 @@ impl PeerBrush {
                                 .frame(false),
                         );
                         ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("text font")
-                                .selected_text(format!("Ubuntu Sans {font}"))
-                                .show_ui(ui, |ui| {
-                                    for name in ["regular", "medium", "semibold"] {
-                                        ui.selectable_value(font, name.into(), name);
-                                    }
-                                });
+                            font_picker(ui, font, &mut e.font_search);
                             ui.label("Size");
                             controls::numeric(ui, size, 1. ..=1024.);
                             ui.label("px");
@@ -479,6 +476,27 @@ impl PeerBrush {
                     }
                 }
                 let invalid = e.source.validate().err();
+                valid = invalid.is_none();
+                let pending = |error: &String| {
+                    [
+                        crate::fonts::FontError::Loading,
+                        crate::fonts::FontError::Busy,
+                    ]
+                    .iter()
+                    .any(|pending| error == &pending.to_string())
+                };
+                if invalid.as_ref().is_some_and(pending) {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+                if valid {
+                    if e.error.as_ref().is_some_and(pending) {
+                        e.error = None;
+                        self.last_preview = None;
+                    }
+                    if e.apply_error.as_ref().is_some_and(pending) {
+                        e.apply_error = None;
+                    }
+                }
                 if let Some(error) = invalid
                     .as_ref()
                     .or(e.error.as_ref())
@@ -512,7 +530,16 @@ impl PeerBrush {
         } else if !open || cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cancel_source();
         } else {
-            self.transient = vec![command];
+            if valid {
+                self.transient = vec![command];
+            } else {
+                // Keep the saved raster when a font cannot reproduce this draft.
+                self.transient.retain(|command| {
+                    !command["op"]
+                        .as_str()
+                        .is_some_and(|op| op.starts_with("source."))
+                });
+            }
             self.source_editor = Some(e);
         }
     }
@@ -554,4 +581,88 @@ fn text_hit(doc: &Document, point: [f32; 2]) -> Option<String> {
                 && local[1] < f64::from(source.height))
             .then(|| layer.id.clone())
         })
+}
+
+fn font_picker(ui: &mut egui::Ui, font: &mut crate::fonts::TextFont, search: &mut String) {
+    use crate::fonts::{self, CatalogStatus, TextFont};
+    let label = font.label().into_owned();
+    let short: String = label.chars().take(44).collect();
+    egui::ComboBox::from_id_salt("text font")
+        .selected_text(if short.len() < label.len() {
+            format!("{short}…")
+        } else {
+            short
+        })
+        .width(220.)
+        .show_ui(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            for name in ["regular", "medium", "semibold"] {
+                ui.selectable_value(font, name.into(), format!("Ubuntu Sans {name}"));
+            }
+            ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text("Search installed fonts")
+                    .char_limit(128)
+                    .frame(false),
+            );
+            if ui.button("Refresh installed fonts").clicked() {
+                if let Err(error) = fonts::refresh() {
+                    ui.colored_label(ACCENT, error.to_string());
+                }
+            }
+            let catalog = fonts::catalog();
+            match catalog.status {
+                CatalogStatus::Loading => {
+                    ui.label("Reading installed fonts…");
+                    ui.ctx().request_repaint_after(Duration::from_millis(50));
+                }
+                CatalogStatus::Unavailable(error) => {
+                    ui.colored_label(ACCENT, error.to_string());
+                }
+                CatalogStatus::Ready => {}
+            }
+            let search = search.to_lowercase();
+            let faces: Vec<_> = catalog
+                .faces
+                .iter()
+                .filter(|face| {
+                    search.is_empty()
+                        || face.family.to_lowercase().contains(&search)
+                        || face.postscript.to_lowercase().contains(&search)
+                })
+                .collect();
+            if faces.is_empty() && matches!(catalog.status, CatalogStatus::Ready) {
+                ui.label("No matching installed fonts");
+            }
+            let height = ui
+                .spacing()
+                .interact_size
+                .y
+                .max(ui.text_style_height(&egui::TextStyle::Button));
+            egui::ScrollArea::vertical()
+                .id_salt("installed font rows")
+                .max_height(220.)
+                .show_rows(ui, height, faces.len(), |ui, range| {
+                    for index in range {
+                        let face = faces[index];
+                        if let Some(value) = &face.font {
+                            let candidate = TextFont::Installed(value.clone());
+                            let label = candidate.label().into_owned();
+                            ui.selectable_value(font, candidate, label);
+                        } else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(format!("{} · unavailable", face.family)),
+                            )
+                            .on_disabled_hover_text(
+                                face.error
+                                    .unwrap_or(fonts::FontError::Unsupported)
+                                    .to_string(),
+                            );
+                        }
+                    }
+                });
+        })
+        .response
+        .on_hover_text(label);
 }

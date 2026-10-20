@@ -192,7 +192,7 @@ pub fn active(root: &Shared) -> Result<Shared, String> {
 }
 pub fn mutating(method: &str, p: &Value) -> bool {
     match method {
-        "observe" | "capabilities" | "brushes" => false,
+        "observe" | "capabilities" | "brushes" | "fonts" => false,
         "task" => !matches!(p["action"].as_str(), Some("status" | "recovery")),
         "history" => !matches!(p["action"].as_str(), None | Some("list" | "inspect_task")),
         "proposal" => matches!(p["action"].as_str(), Some("create" | "accept" | "reject")),

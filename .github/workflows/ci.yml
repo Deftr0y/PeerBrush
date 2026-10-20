@@ -85,7 +85,7 @@ jobs:
           restore-keys: |
             peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
       - run: cargo fmt --all -- --check
       - name: Run regression tests and summarize failures
         shell: bash
@@ -147,6 +147,8 @@ jobs:
                   summary.writelines(f'- `{name[:256]}`\n' for name in failures[:100])
           PY
           exit "$test_status"
+      - name: Verify native installed-font inventory without registration
+        run: cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact
       - run: cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
       - run: cargo clippy --all-targets --locked
       - name: Verify native macOS document delivery and icon
