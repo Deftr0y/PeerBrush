@@ -195,6 +195,7 @@ jobs:
       - run: python -B scripts/test_dmg_file_identity.py
       - run: python -B scripts/test_dmg_handoff.py
       - run: python -B scripts/test_macos_qualification_attestation.py
+      - run: python -B scripts/test_macos_qualification_producer.py
       - run: python -B scripts/test_sign_macos_dmg.py
       - name: Native DMG round trip with synthetic unsigned data
         if: runner.os == 'macOS'
