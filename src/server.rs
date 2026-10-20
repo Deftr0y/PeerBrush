@@ -2951,7 +2951,6 @@ pub fn recovery_projects(state_dir: &Path) -> Vec<(String, PathBuf)> {
     results.extend(crate::recovery::legacy(state_dir));
     results
 }
-use std::io::Read;
 pub fn default_state_dir() -> PathBuf {
     std::env::temp_dir().join("PeerBrush")
 }

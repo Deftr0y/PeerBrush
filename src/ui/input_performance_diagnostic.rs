@@ -304,7 +304,7 @@ fn actual_workspace_control_and_navigation_components() {
         }
     }
     println!(
-        "{}",
+        "\n{}",
         json!({"format":"PeerBrushUiCpuDiagnosticV1","build":build,
         "samples_per_series":SAMPLES,"cases":cases,"native_window":false,
         "limits":"CPU egui only; caches and background scheduling uncontrolled; no first-present or physical input latency"})
