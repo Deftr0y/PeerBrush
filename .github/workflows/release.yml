@@ -43,7 +43,7 @@ jobs:
       EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.expected_commit || github.sha }}
           persist-credentials: false
@@ -52,8 +52,9 @@ jobs:
         run: python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
       - name: Check committed package source
         run: python scripts/package.py --check-source
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy, rust-docs
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
@@ -125,7 +126,7 @@ jobs:
             --portable "$PORTABLE" --portable-sha256 "$DIGEST" \
             --installation-receipt "$EVIDENCE/installation.json" --commit "$SOURCE_COMMIT" --version "$VERSION" \
             --maintainer 'PeerBrush CI fixture <builds@example.invalid>' --output "$DEB.qualification.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: runner.os == 'Linux'
         with:
           name: DEB-installation-candidate
@@ -149,13 +150,13 @@ jobs:
           $packageArgs += @('--portable-sha256', (Get-FileHash -Algorithm SHA256 "dist/PeerBrush-$version-Windows-x64.zip").Hash.ToLowerInvariant())
           python @packageArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: runner.os == 'Windows' && inputs.build_store_msix
         with:
           name: unsigned-store-msix-candidate
           path: dist/store-candidate/*
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: candidate-${{ runner.os }}
           path: dist/*.zip
@@ -167,16 +168,16 @@ jobs:
     env:
       EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.expected_commit || github.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: candidate-*
           path: candidates
       - name: Download the same-workflow Ubuntu candidate
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: DEB-installation-candidate
           path: deb-candidate
@@ -197,7 +198,7 @@ jobs:
             --maintainer 'PeerBrush CI fixture <builds@example.invalid>' \
             --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
           echo 'Exact-source candidate archives verified. Production publication remains blocked pending native signing, installed acceptance, protected approval and public asset reconciliation.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: verified-release-candidate
           path: dist/*
@@ -211,7 +212,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: verified-release-candidate
           path: dist
@@ -223,7 +224,7 @@ jobs:
           verify-cert-identity: https://github.com/${{ github.workflow_ref }}
           verify-oidc-issuer: https://token.actions.githubusercontent.com
           release-signing-artifacts: false
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: signed-release-candidate
           path: dist/*
