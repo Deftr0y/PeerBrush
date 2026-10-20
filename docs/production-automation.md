@@ -119,3 +119,38 @@ Success records only service-reconciled native job completion. It does not estab
 Every candidate build/inspection job now runs fixed isolated inline validation before checkout. The optional Sigstore job repeats it before downloading artifacts or signing. Independently selected full source SHA must equal the event SHA and workflow-file SHA in the official repository, with the exact release workflow/ref identity. Checkouts select github.sha only after that guard. Repository release_gate.py still checks exact source plus manifest/lock versions afterward; it cannot grant authority to different code checked out before validation.
 
 Main pushes remain main-only. Manual candidates from the same selected branch or tag remain supported; foreign source/workflow/repository, pull-request events and mismatched refs reject before executable source or artifacts are consumed. Signing stays opt-in and no release publication, dispatch, protected setting or credential change occurs. Three offline methods execute the actual inline guards and verify their ordering. Combined replay remains pending.
+
+
+## Store MSIX auxiliary handoff (unreleased)
+
+The optional release-candidate Store build now has a separate content handoff.
+After the common candidate is inspected, the inspect job downloads the
+same-workflow unsigned Store artifact and independently reopens its MSIX,
+producer JSON and checksum sidecar against the selected Windows portable,
+committed source and canonical Store identity. Explicit inventory, portable,
+MSIX and report hashes are required. Existing strict four/five/six-record
+common inventories and their SHA256SUMS remain unchanged.
+
+handoff_store_msix.py creates a fresh private directory outside Git containing
+exactly the MSIX, original producer JSON, a canonical checksum sidecar and
+store-candidate-inventory.json. Its manifest binds the common inventory and
+corresponding-source hash, package version and operator-selected previous Store
+version. Unknown files, input/source changes, partial copies, links/reparse
+points and existing outputs reject acceptance; failed partial output is retained.
+An optional independently hashed previous auxiliary inventory forbids same-version
+replacement or downgrade and prevents lowering the retained Store baseline.
+This is local supplied-inventory comparison, not service reconciliation.
+
+The application-to-Store mapping remains (major+1).minor.patch.0. The standalone
+MSIX builder still supports an explicit version, but this handoff and Store
+submission only support the canonical source mapping. The release workflow
+rejects an explicit differing mapping before packaging. A different approved
+mapping needs a shared reviewed source/version contract across these consumers.
+
+The verified-store-msix-content artifact is separate from verified-release-candidate.
+It does not enter the common checksum/site inventory or existing Sigstore signing
+job. Content binding grants no native SDK producer authentication, installation,
+Store certification/submission, public availability or production readiness.
+All those authority/readiness fields remain explicitly unverified or false.
+No workflow dispatch, Store authentication, publication or signing configuration
+is enabled by this change.

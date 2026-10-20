@@ -21,7 +21,7 @@ on:
         default: false
         type: boolean
       store_package_version:
-        description: Optional approved Store version A.B.C.0; blank maps Cargo version
+        description: Optional canonical Store version A.B.C.0; blank maps Cargo version
         required: false
         type: string
       previous_store_version:
@@ -118,6 +118,7 @@ jobs:
       - run: python scripts/test_package.py
       - run: python scripts/test_msix.py
       - run: python -B scripts/test_store_msix_preflight.py
+      - run: python -B scripts/test_store_msix_handoff.py
       - run: python scripts/test_sign_macos.py
       - run: python -B scripts/test_deb.py
       - run: python -B scripts/test_deb_version_upgrade_checks.py
@@ -201,6 +202,9 @@ jobs:
           $product = Get-Content -Raw 'packaging/msix/product.store.json' | ConvertFrom-Json
           $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])'
           $packageArgs = @('scripts/package_msix.py', '--portable', "dist/PeerBrush-$version-Windows-x64.zip", '--identity', $identityPath, '--expected-package-family', $product.package_family_name, '--output', 'dist/store-candidate')
+          $canonicalVersion = python -c 'import sys; sys.path.insert(0,"scripts"); from package_msix import package_version; print(package_version(sys.argv[1]))' "$version"
+          if ($LASTEXITCODE -ne 0) { throw 'Canonical Store version mapping failed' }
+          if ($env:STORE_PACKAGE_VERSION -and $env:STORE_PACKAGE_VERSION -cne $canonicalVersion) { throw 'Store handoff requires the canonical Cargo-to-Store version mapping' }
           if ($env:STORE_PACKAGE_VERSION) { $packageArgs += @('--package-version', $env:STORE_PACKAGE_VERSION) }
           if (-not $env:PREVIOUS_STORE_VERSION) { throw 'Read the actual current Store version and supply previous_store_version before building an update candidate.' }
           $packageArgs += @('--previous-version', $env:PREVIOUS_STORE_VERSION)
@@ -258,6 +262,12 @@ jobs:
         with:
           name: DEB-installation-candidate
           path: deb-candidate
+      - name: Download the same-workflow Store MSIX candidate
+        if: inputs.build_store_msix
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-store-msix-candidate
+          path: store-msix-candidate
       - name: Inspect matching archives and checksums
         shell: bash
         run: |
@@ -275,6 +285,38 @@ jobs:
             --maintainer 'PeerBrush CI fixture <builds@example.invalid>' \
             --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
           echo 'Exact-source candidate archives verified. Production publication remains blocked pending native signing, installed acceptance, protected approval and public asset reconciliation.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Bind a separate immutable Store content bundle
+        if: inputs.build_store_msix
+        id: store_handoff
+        shell: bash
+        env:
+          PREVIOUS_STORE_VERSION: ${{ inputs.previous_store_version }}
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          set -- store-msix-candidate/*.msix
+          test "$#" -eq 1
+          MSIX="$1"
+          REPORT="$MSIX.json"
+          INVENTORY_SHA=$(sha256sum dist/release-inventory.json | cut -d ' ' -f 1)
+          WINDOWS_SHA=$(sha256sum "dist/PeerBrush-$VERSION-Windows-x64.zip" | cut -d ' ' -f 1)
+          MSIX_SHA=$(sha256sum "$MSIX" | cut -d ' ' -f 1)
+          REPORT_SHA=$(sha256sum "$REPORT" | cut -d ' ' -f 1)
+          PRIVATE_PARENT=$(mktemp -d "$RUNNER_TEMP/peerbrush-store-handoff.XXXXXX")
+          OUTPUT="$PRIVATE_PARENT/bundle"
+          python3 -B scripts/handoff_store_msix.py --source-root "$PWD" --directory dist \
+            --package "$MSIX" --report "$REPORT" --output "$OUTPUT" \
+            --commit "$EXPECTED_COMMIT" --version "$VERSION" --previous-version "$PREVIOUS_STORE_VERSION" \
+            --inventory-sha256 "$INVENTORY_SHA" --portable-sha256 "$WINDOWS_SHA" \
+            --package-sha256 "$MSIX_SHA" --report-sha256 "$REPORT_SHA" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>'
+          echo "directory=$OUTPUT" >> "$GITHUB_OUTPUT"
+      - name: Retain the separate Store auxiliary bundle
+        if: inputs.build_store_msix
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-store-msix-content
+          path: ${{ steps.store_handoff.outputs.directory }}/*
+          if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: verified-release-candidate
