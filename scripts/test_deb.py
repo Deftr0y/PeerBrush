@@ -316,7 +316,7 @@ class InstallationEvidence(unittest.TestCase):
         for name in ['peerbrush', 'source']:
             hashes = dict(peerbrush=self.expected['executable_sha256'], source=self.expected['source_sha256'])
             hashes[name] = 'd' * 64
-            with self.subTest(hash=name), self.assertRaisesRegex(ValueError, 'Installed executable or corresponding source'):
+            with self.subTest(hash=name), self.assertRaisesRegex(ValueError, 'Installed .* bytes differ'):
                 self.verify_installed(hashes=hashes)
             self.user.assert_not_called()
         for field, value in [('Package', 'another-app'), ('Architecture', 'arm64'), ('Version', '0.26.0-1')]:
@@ -329,6 +329,27 @@ class InstallationEvidence(unittest.TestCase):
                              ('version', '0.26.0'), ('schema', True), ('unexpected', 'not accepted')]:
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'build provenance'):
                 self.verify_installed(info=dict(self.info, **{field: value}))
+
+    def test_missing_or_linked_installed_source_never_reaches_runtime_acceptance(self):
+        binary = pathlib.Path('/usr/bin/peerbrush')
+        source = pathlib.Path('/usr/share/doc/peerbrush/PeerBrush-0.30.0-dev.1-source.zip')
+        for path in [binary, source]:
+            for linked in [False, True]:
+                with self.subTest(path=path.name, linked=linked), \
+                        mock.patch.object(pathlib.Path, 'is_symlink', autospec=True,
+                                          side_effect=lambda candidate: linked and candidate == path), \
+                        mock.patch.object(pathlib.Path, 'is_file', autospec=True,
+                                          side_effect=lambda candidate: candidate != path), \
+                        mock.patch.object(installation, 'digest', return_value=self.expected['executable_sha256']), \
+                        mock.patch.object(installation, 'run') as native:
+                    user = mock.Mock()
+                    label = 'executable' if path == binary else 'corresponding source'
+                    reason = 'is a symbolic link' if linked else 'is missing or not a regular file'
+                    with self.assertRaisesRegex(ValueError, 'Installed ' + label + ' ' + reason):
+                        installation.installed_identity(self.expected, user, self.fields['Version'])
+                    native.assert_not_called()
+                    user.assert_not_called()
+        self.assertFalse(self.output.exists())
 
     def test_receipts_are_canonical_exclusive_and_cannot_replace_previous_evidence(self):
         if os.name == 'posix':

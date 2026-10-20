@@ -22,6 +22,8 @@ from package_deb import deb_version
 
 APP_ID = 'com.peerbrush.PeerBrush'
 MIME = 'image/vnd.adobe.photoshop'
+DOCUMENTATION_OPTIONS = ['--path-include=/usr/share/doc/peerbrush',
+                         '--path-include=/usr/share/doc/peerbrush/*']
 
 
 def run(command, **kwargs):
@@ -78,9 +80,14 @@ def selected_package(package, expected):
 def installed_identity(expected, user, package_version):
     binary = pathlib.Path('/usr/bin/peerbrush')
     source = pathlib.Path('/usr/share/doc/peerbrush') / f'PeerBrush-{expected["version"]}-source.zip'
-    for path, checksum in [(binary, expected['executable_sha256']), (source, expected['source_sha256'])]:
-        if path.is_symlink() or not path.is_file() or digest(path) != checksum:
-            raise ValueError('Installed executable or corresponding source differs from the selected candidate')
+    for label, path, checksum in [('executable', binary, expected['executable_sha256']),
+                                  ('corresponding source', source, expected['source_sha256'])]:
+        if path.is_symlink():
+            raise ValueError(f'Installed {label} is a symbolic link')
+        if not path.is_file():
+            raise ValueError(f'Installed {label} is missing or not a regular file')
+        if digest(path) != checksum:
+            raise ValueError(f'Installed {label} bytes differ from the selected candidate')
     for field, value in [('Package', 'peerbrush'), ('Architecture', 'amd64'), ('Version', package_version)]:
         if run(['dpkg-query', '--showformat=${' + field + '}', '--show', 'peerbrush']) != value:
             raise ValueError('Installed package identity differs from the selected candidate')
@@ -182,7 +189,11 @@ def check(package, expected, output):
             if APP_ID + '.desktop' in cache or pathlib.Path(f'/usr/share/mime/packages/{APP_ID}.xml').exists():
                 raise ValueError('Package-owned MIME integration was not removed')
         retained()
-        run(['apt-get', 'install', '-y', str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+        # Minimized images can exclude /usr/share/doc. Include only this package's
+        # source/notices for these commands; retain the mandatory installed hashes.
+        apt_options = [argument for option in DOCUMENTATION_OPTIONS
+                       for argument in ['-o', 'Dpkg::Options::=' + option]]
+        run(['apt-get', 'install', '-y', *apt_options, str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
         installed(deb_version(expected['version']))
         # Private higher-revision fixture validates dpkg upgrade semantics while
         # retaining exact executable bytes. Never upload it as a release file.
@@ -195,7 +206,7 @@ def check(package, expected, output):
         control.write_text(control.read_text().replace('Version: ' + current + '\n', 'Version: ' + later + '\n'))
         upgrade = work / 'private-upgrade-fixture.deb'
         run(['dpkg-deb', '--root-owner-group', '--build', str(unpacked), str(upgrade)])
-        run(['dpkg', '--install', str(upgrade)])
+        run(['dpkg', *DOCUMENTATION_OPTIONS, '--install', str(upgrade)])
         if run(['dpkg-query', '--showformat=${Version}', '--show', 'peerbrush']) != later:
             raise ValueError('The private higher-revision upgrade was not installed')
         installed(later)
@@ -203,7 +214,7 @@ def check(package, expected, output):
         removed()
         run(['apt-get', 'purge', '-y', 'peerbrush'])
         removed()
-        run(['apt-get', 'install', '-y', str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+        run(['apt-get', 'install', '-y', *apt_options, str(selected)], env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
         installed(current)
         run(['apt-get', 'purge', '-y', 'peerbrush'])
         removed()
