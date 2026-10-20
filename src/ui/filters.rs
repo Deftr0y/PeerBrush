@@ -370,14 +370,8 @@ impl Editor {
 impl PeerBrush {
     pub(super) fn document_filter_stack(&mut self, ui: &mut egui::Ui, doc: &Document) {
         let mut display = self.animation.document(doc, ui.input(|i| i.time), false);
-        if let Some(edit) = &self.parameter_gesture {
-            if edit.document == doc.id && edit.revision == doc.revision {
-                if let Ok(preview) =
-                    crate::engine::Engine::preview_edits(doc.clone(), &edit.commands)
-                {
-                    display = preview;
-                }
-            }
+        if let Some(preview) = self.pending_parameter_document(ui.ctx(), doc) {
+            display = preview;
         }
         ui.set_min_width(290.);
         ui.add_enabled_ui(!doc.read_only && !self.busy, |ui| {

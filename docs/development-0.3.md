@@ -337,3 +337,12 @@ The exact clean Windows x64 debug build above passed three fresh-process actual-
 | Identical direct opacity engine preview | 0.0043 / 0.0052 | 0.0047 / 0.0057 |
 
 Blank/filled idle medians were 0.1522-0.1613 ms; pan medians 0.1598-0.1656 ms; document clones 0.0004-0.0005 ms. Changed Wand input took 20.19-21.97 ms, and accepted canvas settlement took 66.96-73.31 ms across the six control/depth runs. Construction measured 50.46-58.18 ms. These are CPU/debug component measurements with uncontrolled OS/font caches, background scheduling and worker polling. They establish the repeated unchanged-Wand cost and a comparable diagnostic, not release-mode speed, first-present/physical latency or the cause of the originally reported regression. Reusing an already validated unchanged pending preview is the next focused investigation; no speedup is yet claimed.
+
+
+## Pending unchanged-control replay fix
+
+PB-108 now retains one derived validated preview Result within the existing pending parameter edit. Unchanged pointer/typed commands and both layer/filter panels reuse it; command changes invalidate it. Each read checks source identity/revision and a non-owning engine binding, including replacement engines with identical document IDs/revisions. Cache misses use the actual shared source; contention defers display and requests repaint. Cancel, Apply, target/project/lifecycle changes drop the edit and cache. Shared engine validation and background canvas rendering remain in place; commits always recheck current source and reservations through Engine.edit. There is no global/persistent cache or history change.
+
+Five focused native8/16 methods prepare real held Wand controls, both panels and accepted canvas pixels; typed changes/identical commands; remote edits, engine identity/revision and contention; derived-display attribution and cached errors; Cancel, one-step Apply/undo/redo and new reservations rejecting a cached preview's commit. Parent and independent source reviews passed; formatting completed. Combined execution and comparable post-change CPU measurements remain pending. Actual changed-input calculation and original startup/physical latency acceptance remain open; no speedup is claimed before replay.
+
+The 99bb native run subsequently closed: Windows failed only the same selected-skew UI assertion at line591. All three native jobs are non-passing, with aggregate inspection skipped and no downstream installer or real portable-to-DEB acceptance reached.

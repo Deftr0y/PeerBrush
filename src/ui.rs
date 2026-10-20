@@ -41,6 +41,8 @@ mod shortcuts;
 pub(crate) use shortcuts::validate_file as validate_shortcut_preferences;
 #[cfg(test)]
 mod input_performance_diagnostic;
+#[cfg(test)]
+mod parameter_preview_tests;
 mod source;
 mod style_settings;
 mod tabs;
@@ -311,9 +313,14 @@ struct EyeSweep {
 struct ParameterEdit {
     control: egui::Id,
     gesture: String,
+    engine: std::sync::Weak<std::sync::Mutex<crate::engine::Engine>>,
     document: String,
     revision: u64,
     commands: Vec<Value>,
+    // Derived from this edit's source and commands; never authorizes a commit.
+    preview: Option<Result<Document, String>>,
+    #[cfg(test)]
+    preview_runs: usize,
     label: String,
     typing: Option<egui::Context>,
     dirty: bool,
@@ -1280,6 +1287,39 @@ impl PeerBrush {
         };
         self.edit(commands, label);
     }
+    fn pending_parameter_document(
+        &mut self,
+        ctx: &egui::Context,
+        doc: &Document,
+    ) -> Option<Document> {
+        let edit = self.parameter_gesture.as_mut()?;
+        if edit.engine.as_ptr() != Arc::as_ptr(&self.shared)
+            || edit.document != doc.id
+            || edit.revision != doc.revision
+        {
+            edit.preview = None;
+            return None;
+        }
+        let source = {
+            let Ok(engine) = self.shared.try_lock() else {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return None;
+            };
+            if engine.doc.id != edit.document || engine.doc.revision != edit.revision {
+                edit.preview = None;
+                return None;
+            }
+            edit.preview.is_none().then(|| engine.doc.clone())
+        };
+        if let Some(source) = source {
+            #[cfg(test)]
+            {
+                edit.preview_runs += 1;
+            }
+            edit.preview = Some(crate::engine::Engine::preview_edits(source, &edit.commands));
+        }
+        edit.preview.as_ref()?.as_ref().ok().cloned()
+    }
     fn finish_parameter(&mut self, cancel: bool) {
         let Some(edit) = self.parameter_gesture.take() else {
             return;
@@ -1292,6 +1332,11 @@ impl PeerBrush {
             controls::cancel_number_edit(ctx, edit.control);
         }
         if cancel || !edit.dirty {
+            return;
+        }
+        if edit.engine.as_ptr() != Arc::as_ptr(&self.shared) {
+            self.cancelled_parameter = Some(edit.control);
+            self.message = "Image changed during parameter edit · preview cancelled".into();
             return;
         }
         let mut engine = self.shared.lock().unwrap();
@@ -1323,6 +1368,15 @@ impl PeerBrush {
         // A cancelled control must not rebind a still-held pointer to newer work.
         // The next physical press clears this transient guard in draw().
         if self.cancelled_parameter == Some(response.id) {
+            return;
+        }
+        if self
+            .parameter_gesture
+            .as_ref()
+            .is_some_and(|edit| edit.engine.as_ptr() != Arc::as_ptr(&self.shared))
+        {
+            self.finish_parameter(true);
+            self.message = "Image changed during parameter edit · preview cancelled".into();
             return;
         }
         let down = response.is_pointer_button_down_on() || response.dragged();
@@ -1364,9 +1418,13 @@ impl PeerBrush {
             self.parameter_gesture = Some(ParameterEdit {
                 control: response.id,
                 gesture: crate::engine::id(),
+                engine: Arc::downgrade(&self.shared),
                 document: doc.id,
                 revision: doc.revision,
                 commands,
+                preview: None,
+                #[cfg(test)]
+                preview_runs: 0,
                 label: label.into(),
                 typing: Some(response.ctx.clone()),
                 dirty: response.changed(),
@@ -1381,7 +1439,10 @@ impl PeerBrush {
         {
             if response.changed() {
                 let edit = self.parameter_gesture.as_mut().unwrap();
-                edit.commands = commands;
+                if edit.commands != commands {
+                    edit.commands = commands;
+                    edit.preview = None;
+                }
                 edit.dirty = true;
                 self.last_preview = None;
                 if !controls::number_editing(&response.ctx, response.id) {
@@ -1408,8 +1469,25 @@ impl PeerBrush {
                 command["document_id"] = json!(document);
                 command["source_revision"] = json!(revision);
             }
-            match crate::engine::Engine::preview_edits(doc, &commands) {
-                Ok(_) => {
+            let cached = self
+                .parameter_gesture
+                .as_mut()
+                .filter(|edit| {
+                    edit.engine.as_ptr() == Arc::as_ptr(&self.shared)
+                        && edit.control == response.id
+                        && edit.document == doc.id
+                        && edit.revision == doc.revision
+                        && edit.commands == commands
+                })
+                .and_then(|edit| edit.preview.take());
+            #[cfg(test)]
+            let preview_runs = self
+                .parameter_gesture
+                .as_ref()
+                .map_or(0, |edit| edit.preview_runs)
+                + usize::from(cached.is_none());
+            match cached.unwrap_or_else(|| crate::engine::Engine::preview_edits(doc, &commands)) {
+                Ok(preview) => {
                     let gesture = self
                         .parameter_gesture
                         .as_ref()
@@ -1418,9 +1496,13 @@ impl PeerBrush {
                     self.parameter_gesture = Some(ParameterEdit {
                         control: response.id,
                         gesture,
+                        engine: Arc::downgrade(&self.shared),
                         document,
                         revision,
                         commands,
+                        preview: Some(Ok(preview)),
+                        #[cfg(test)]
+                        preview_runs,
                         label: label.into(),
                         typing: None,
                         dirty: response.changed()
@@ -5072,11 +5154,11 @@ impl PeerBrush {
         if ctx.input(|i| i.pointer.any_pressed()) {
             self.animation.cancel();
         }
-        if self
-            .parameter_gesture
-            .as_ref()
-            .is_some_and(|edit| edit.document != doc.id || edit.revision != doc.revision)
-        {
+        if self.parameter_gesture.as_ref().is_some_and(|edit| {
+            edit.engine.as_ptr() != Arc::as_ptr(&self.shared)
+                || edit.document != doc.id
+                || edit.revision != doc.revision
+        }) {
             self.finish_parameter(true);
             self.message = "Image changed during parameter edit · preview cancelled".into();
         }
@@ -5527,12 +5609,8 @@ impl PeerBrush {
                     ui.disable();
                 }
                 let mut display = self.animation.document(&doc, ui.input(|i| i.time), false);
-                if let Some(edit) = &self.parameter_gesture {
-                    if let Ok(preview) =
-                        crate::engine::Engine::preview_edits(doc.clone(), &edit.commands)
-                    {
-                        display = preview;
-                    }
+                if let Some(preview) = self.pending_parameter_document(ui.ctx(), &doc) {
+                    display = preview;
                 }
                 if self.ai_layer(&self.selected, ui.input(|i| i.time)) {
                     ui.style_mut().visuals.selection.stroke.color = AI_BLUE;
@@ -7291,9 +7369,12 @@ mod tests {
         app.parameter_gesture = Some(ParameterEdit {
             control: egui::Id::new("test"),
             gesture: "test".into(),
+            engine: Arc::downgrade(&app.shared),
             document: doc.id,
             revision: doc.revision,
             commands: vec![json!({"op":"layer.update","layer":layer,"opacity":0.2})],
+            preview: None,
+            preview_runs: 0,
             label: "Opacity".into(),
             typing: None,
             dirty: true,
