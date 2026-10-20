@@ -3564,6 +3564,8 @@ mod connection_tests {
                     Err(error) => panic!("local interruption listener failed: {error}"),
                 }
             };
+            // BSD accepts inherit the listener's mode; reads use the timeout below.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
