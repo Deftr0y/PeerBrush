@@ -464,7 +464,7 @@ unsafe fn profile(decoder: &mut Decoder) -> Result<Vec<u8>, String> {
             color.as_mut_ptr(),
         )
     } == JxlDecoderStatus::Success
-        && !sdr(unsafe { &color.assume_init() })
+        && !sdr(unsafe { color.assume_init_ref() })
     {
         return Err("HDR or non-RGB JPEG XL color encodings are not supported".into());
     }
