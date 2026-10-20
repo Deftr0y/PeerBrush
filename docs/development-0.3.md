@@ -300,3 +300,15 @@ The dcabbbe native run subsequently closed: Windows also failed only the drag-st
 ## Pending release source-selection guard
 
 PB-154 candidate native/inspection jobs now validate exact source/event/workflow identity through fixed isolated inline code before checkout. The optional Sigstore job repeats validation before artifact download/signing; repository scripts cannot bless a foreign checkout under a different workflow identity. Main-push and same-ref manual branch/tag candidates remain supported, action pins/upgrade calls and opt-in signing remain unchanged. Three prepared actual-inline methods and all caller registrations passed independent source review; combined execution remains pending. No workflow dispatch, signing, remote permission/configuration change or publication occurred.
+
+## Pending actual CPU workspace diagnostic
+
+PB-108 now has an opt-in source-bound diagnostic of actual offscreen egui construction, idle/pan frames, document clones, range input and held opacity/Wand controls at native8/16 on synthetic 512-square documents. It separately times identical shared-engine previews and requires the accepted canvas pixels/generation to match those commands while native source/history stay unchanged. It uses isolated temporary state and test-only memory clipboard; dedicated native clipboard integration still explicitly uses the real provider, and production construction is unchanged.
+
+Source audit identifies repeated synchronous pending-parameter replay on every layer-panel frame, separately from changed-input validation and the canvas worker. Wand replay includes native-dimension snapshot/selection/feather/contour work. Both call sites existed in published 0.26; their presence is an existing cost opportunity, not proof of the reported regression's cause. No optimization is claimed before measuring the real path.
+
+Run this diagnostic alone from a clean build with explicit profile/provenance:
+
+    cargo test --locked --lib ui::input_performance_diagnostic::actual_workspace_control_and_navigation_components -- --exact --ignored --nocapture --test-threads=1
+
+It reports eight finite samples per component with no timing threshold. Background scheduling and OS/font caches are uncontrolled; CPU egui timings exclude native windows/surfaces, first-present, GPU setup and physical input. The implementation and isolation passed independent source review; compilation, measurement and native visible acceptance remain pending.

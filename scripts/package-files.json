@@ -256,6 +256,7 @@
     "src/ui/filename.rs",
     "src/ui/filters.rs",
     "src/ui/free_transform.rs",
+    "src/ui/input_performance_diagnostic.rs",
     "src/ui/free_transform/tests.rs",
     "src/ui/geometry.rs",
     "src/ui/gradient_stops.rs",

@@ -39,6 +39,8 @@ mod saved_versions;
 mod selection;
 mod shortcuts;
 pub(crate) use shortcuts::validate_file as validate_shortcut_preferences;
+#[cfg(test)]
+mod input_performance_diagnostic;
 mod source;
 mod style_settings;
 mod tabs;
@@ -781,7 +783,10 @@ impl PeerBrush {
             eye_rects: HashMap::new(),
             layer_context: None,
             effect_add_rect: None,
+            #[cfg(not(test))]
             clipboard: crate::clipboard::Worker::new(ctx.clone()),
+            #[cfg(test)]
+            clipboard: crate::clipboard::Worker::memory(ctx.clone()),
             zoom: 1.0,
             pan: Vec2::ZERO,
             frame_pending: false,
