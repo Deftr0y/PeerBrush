@@ -5495,6 +5495,8 @@ impl PeerBrush {
                 self.new_canvas_window(ctx);
             }
             self.finish_capture(ctx, drawn_generation);
+            // Shared-state requests must remain observable while the dialog owns input.
+            ctx.request_repaint_after(Duration::from_millis(200));
             return;
         }
         if self.liquify_effect.as_ref().is_some_and(|id| {

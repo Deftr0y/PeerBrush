@@ -116,7 +116,8 @@ impl Drop for Registration {
         let _ = &self.0; // Retain the callback owner until after unregistration.
         let manager = NSAppleEventManager::sharedAppleEventManager();
         unsafe {
-            let _: () = msg_send![&*manager, removeEventHandlerForEventClass: CORE, andEventID: OPEN];
+            let _: () =
+                msg_send![&*manager, removeEventHandlerForEventClass: CORE, andEventID: OPEN];
         }
     }
 }

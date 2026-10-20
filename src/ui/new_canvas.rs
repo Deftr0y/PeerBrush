@@ -162,6 +162,123 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         (tx, Suggestion::from_request(Ok(rx)))
     }
+    fn capture_readiness(app: &PeerBrush, ctx: &egui::Context, painted: u64) -> String {
+        let time = ctx.input(|input| input.time);
+        let document = &app.shared.lock().unwrap().doc;
+        format!(
+            "pending={}, exports_ready={}, painted_current={}, delay_elapsed={}, fading={}, progress={}, preview_current={}, preview_matches_requested={}",
+            app.pending,
+            app.exports_capture_ready(),
+            painted == app.canvas_generation,
+            time >= app.capture_ready_at,
+            app.animation.fading(),
+            app.animation.progress(time),
+            app.canvas_preview.as_ref().is_some_and(|key| key.0 == document.id && key.1 == document.revision),
+            app.canvas_preview.as_ref() == app.last_preview.as_ref(),
+        )
+    }
+    fn settle_capture_preview(app: &mut PeerBrush, ctx: &egui::Context, size: Vec2) {
+        for _ in 0..200 {
+            let painted = app.canvas_generation;
+            draw(app, ctx, size, vec![]);
+            let document = &app.shared.lock().unwrap().doc;
+            if !app.pending
+                && app.exports_capture_ready()
+                && painted == app.canvas_generation
+                && !app.animation.fading()
+                && app.animation.progress(ctx.input(|input| input.time)) >= 1.
+                && app.canvas_preview.as_ref().is_some_and(|key| {
+                    key.0 == document.id
+                        && key.1 == document.revision
+                        && app.last_preview.as_ref() == Some(key)
+                })
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "Initial painted preview did not settle: {}",
+            capture_readiness(app, ctx, app.canvas_generation)
+        );
+    }
+    #[test]
+    fn new_canvas_capture_queues_screenshot_while_dialog_stays_open_and_sources_unchanged() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = fixture(depth);
+            let size = Vec2::new(980., 640.);
+            settle_capture_preview(&mut app, &ctx, size);
+            let before = source(&app);
+            app.open_new_canvas();
+            let path = std::env::temp_dir().join(format!(
+                "peerbrush-new-canvas-capture-{}.png",
+                crate::engine::id()
+            ));
+            {
+                let mut root = app.workspace_root.lock().unwrap();
+                root.capture_ui = Some(path.clone());
+                root.capture_panel = Some("workspace".into());
+            }
+            let mut requested = false;
+            let mut last_readiness = String::new();
+            for _ in 0..100 {
+                let painted = app.canvas_generation;
+                let output = draw(&mut app, &ctx, size, vec![]);
+                assert!(app.show_new, "Capture must not dismiss the dialog");
+                assert_eq!(source(&app), before);
+                last_readiness = capture_readiness(&app, &ctx, painted);
+                if output
+                    .viewport_output
+                    .values()
+                    .flat_map(|viewport| &viewport.commands)
+                    .any(|command| matches!(command, egui::ViewportCommand::Screenshot(_)))
+                {
+                    requested = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                requested,
+                "Workspace capture did not request the open dialog screenshot: {last_readiness}"
+            );
+            assert!(app.workspace_root.lock().unwrap().capture_ui.is_none());
+            assert!(!path.exists(), "A command is not a fabricated screenshot");
+        }
+    }
+    #[test]
+    fn new_canvas_capture_idle_dialog_keeps_polling_for_later_requests() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = fixture(depth);
+            let size = Vec2::new(980., 640.);
+            settle_capture_preview(&mut app, &ctx, size);
+            // The header's real-time arrival animation otherwise supplies
+            // repaint requests during this short synthetic frame sequence.
+            app.activity_changed = std::time::Instant::now() - Duration::from_secs(1);
+            let before = source(&app);
+            app.open_new_canvas();
+            for _ in 0..20 {
+                draw(&mut app, &ctx, size, vec![]);
+                if app.new_size.pending.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(app.new_size.pending.is_none());
+            for _ in 0..10 {
+                let painted = app.canvas_generation;
+                let output = draw(&mut app, &ctx, size, vec![]);
+                assert!(app.show_new);
+                assert_eq!(source(&app), before);
+                let repaint = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                assert!(
+                    repaint <= Duration::from_millis(200),
+                    "Idle dialog stops polling workspace capture requests: repaint={repaint:?}; {}",
+                    capture_readiness(&app, &ctx, painted)
+                );
+            }
+        }
+    }
     #[test]
     fn dimensions_are_read_once_and_manual_edits_reject_late_results() {
         let (tx, mut suggestion) = pending();
