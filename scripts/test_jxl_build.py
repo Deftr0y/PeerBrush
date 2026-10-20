@@ -1,5 +1,7 @@
-"""Offline build-selection/privacy/source-notice regressions. No tool executes."""
+"""Offline selection/privacy/notices; native build tools never execute."""
 import importlib.util
+import base64
+import json
 import os
 import runpy
 import sys
@@ -108,6 +110,62 @@ class NativeJxlBuild(unittest.TestCase):
                     self.assertNotIn(secret, str(caught.exception))
                     self.assertNotIn(str(executable), str(caught.exception))
                     self.assertLess(len(str(caught.exception)), 100)
+
+    @unittest.skipUnless(os.name == 'nt', 'Actual PowerShell application discovery requires Windows')
+    def test_actual_powershell_capture_keeps_one_precedence_path_and_all_cli_flags(self):
+        host = jxl_build.shutil.which('pwsh')
+        if not host:
+            self.skipTest('PowerShell 7 host is unavailable')
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        begin = workflow.index('          $nativeTools = @{}')
+        end = workflow.index('          $vswhere = ', begin)
+        capture = '\n'.join(line[10:] for line in workflow[begin:end].splitlines())
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            first, second = parent / 'first tools', parent / 'second tools'
+            for directory in [first, second]:
+                directory.mkdir()
+                for name in ['clang-cl', 'cmake', 'ninja']:
+                    (directory / (name + '.exe')).write_bytes(b'Never execute this discovery fixture')
+            receipt = parent / 'argument-receipt.py'
+            receipt.write_text('''import argparse, json, os
+from pathlib import Path
+p = argparse.ArgumentParser()
+for name in ['clang-cl', 'cmake', 'ninja']:
+    p.add_argument('--selected-' + name)
+p.add_argument('cargo_args', nargs=argparse.REMAINDER)
+a = p.parse_args()
+print(json.dumps(dict(
+    uncapped=json.loads(os.environ['FIXTURE_UNCAPPED']),
+    scalar=json.loads(os.environ['FIXTURE_SCALARS']),
+    first=[getattr(a, 'selected_' + name.replace('-', '_')) == str(Path(os.environ['FIXTURE_FIRST']) / (name + '.exe'))
+           for name in ['clang-cl', 'cmake', 'ninja']],
+    remainder=len(a.cargo_args))))
+''', encoding='utf-8', newline='\n')
+            script = """$ErrorActionPreference = 'Stop'
+$env:PATH = $env:FIXTURE_NATIVE_PATH
+$uncapped = @{}
+foreach ($name in @('clang-cl', 'cmake', 'ninja')) {
+    $uncapped[$name] = @(Get-Command $name -CommandType Application -ErrorAction Stop).Count
+}
+"""
+            script += capture + '\n'
+            script += """$env:FIXTURE_UNCAPPED = ($uncapped | ConvertTo-Json -Compress)
+$env:FIXTURE_SCALARS = (@('clang-cl', 'cmake', 'ninja') | ForEach-Object { $nativeTools[$_] -is [string] } | ConvertTo-Json -Compress)
+& $env:FIXTURE_PYTHON -I $env:FIXTURE_SCRIPT --selected-clang-cl ($nativeTools['clang-cl']) --selected-cmake ($nativeTools['cmake']) --selected-ninja ($nativeTools['ninja'])
+exit $LASTEXITCODE
+"""
+            environment = dict(os.environ, FIXTURE_NATIVE_PATH=os.pathsep.join(map(str, [first, second])),
+                FIXTURE_PYTHON=sys.executable, FIXTURE_SCRIPT=str(receipt), FIXTURE_FIRST=str(first))
+            result = subprocess.run([str(Path(host).resolve()), '-NoLogo', '-NoProfile', '-NonInteractive',
+                '-EncodedCommand', base64.b64encode(script.encode('utf-16le')).decode('ascii')],
+                cwd=parent, env=environment, capture_output=True, check=False, timeout=20)
+            self.assertEqual(result.returncode, 0, 'Isolated PowerShell capture/argv fixture failed')
+            self.assertLessEqual(len(result.stdout), 4096)
+            self.assertEqual(json.loads(result.stdout), dict(
+                uncapped={'clang-cl': 2, 'cmake': 2, 'ninja': 2},
+                scalar=[True, True, True], first=[True, True, True], remainder=0))
 
     def test_configure_selects_two_jobs_and_matching_native_compilers(self):
         with mock.patch.object(jxl_build.platform, 'system', return_value='Windows'), mock.patch.object(jxl_build, 'tool', side_effect=[
@@ -358,7 +416,7 @@ class NativeJxlBuild(unittest.TestCase):
                 capture = text.index("$nativeTools = @{}")
                 sdk = text.index('& $launch -Arch amd64')
                 self.assertLess(capture, sdk)
-                self.assertLess(text.index("$nativeTools[$name] = (Get-Command $name -CommandType Application -ErrorAction Stop).Source"), sdk)
+                self.assertLess(text.index("$nativeTools[$name] = (Get-Command $name -CommandType Application -TotalCount 1 -ErrorAction Stop).Source"), sdk)
                 self.assertLess(sdk, setup)
                 self.assertIn("@('clang-cl', 'cmake', 'ninja')", text)
                 for name in ['clang-cl', 'cmake', 'ninja']:

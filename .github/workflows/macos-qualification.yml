@@ -113,7 +113,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $nativeTools = @{}
           foreach ($name in @('clang-cl', 'cmake', 'ninja')) {
-            $nativeTools[$name] = (Get-Command $name -CommandType Application -ErrorAction Stop).Source
+            $nativeTools[$name] = (Get-Command $name -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
           }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath

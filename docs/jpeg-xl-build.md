@@ -26,7 +26,10 @@ Xcode compiler/SDK and Ninja; retain MACOSX_DEPLOYMENT_TARGET=11.0. Standard
 Cargo builds need these process-local variables set before compilation.
 The Windows workflows capture the absolute clang-cl, CMake and Ninja executable
 paths before starting DevShell and pass all three with --selected-clang-cl,
---selected-cmake and --selected-ninja. Qualification uses those exact files after
+--selected-cmake and --selected-ninja. The explicit Application command filter
+can enumerate multiple PATH matches; -TotalCount 1 keeps the first executable
+in execution-precedence order, so an array cannot become extra native arguments.
+Qualification uses those exact files after
 the SDK changes PATH. Partial or relative selections are rejected. CC/CXX and
 CMAKE retain the selected executables; the process-local CMAKE_MAKE_PROGRAM is
 also passed as an explicit CMake cache definition by the vendored helper, so
