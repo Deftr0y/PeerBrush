@@ -43,9 +43,29 @@ jobs:
       EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
+      - name: Require exact release invocation
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ.get('EXPECTED_COMMIT', '')
+          ref = os.environ.get('GITHUB_REF', '')
+          event = os.environ.get('GITHUB_EVENT_NAME', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_SHA': expected, 'GITHUB_WORKFLOW_SHA': expected,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/release.yml@' + ref,
+          }
+          manual_ref = any(ref.startswith(prefix) and len(ref) > len(prefix) for prefix in ['refs/heads/', 'refs/tags/'])
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or not ((event == 'push' and ref == 'refs/heads/main')
+                          or (event == 'workflow_dispatch' and manual_ref))):
+              raise SystemExit('Release source must match its exact reviewed workflow invocation before checkout or signing.')
+          PY
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.expected_commit || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Check exact release source
         shell: bash
@@ -59,6 +79,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
       - run: python -B scripts/test_ci_diagnostics.py
+      - run: python -B scripts/test_release_source_guard.py
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
       - name: Verify native installed-font inventory without registration
@@ -183,9 +204,29 @@ jobs:
     env:
       EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
     steps:
+      - name: Require exact release invocation
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ.get('EXPECTED_COMMIT', '')
+          ref = os.environ.get('GITHUB_REF', '')
+          event = os.environ.get('GITHUB_EVENT_NAME', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_SHA': expected, 'GITHUB_WORKFLOW_SHA': expected,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/release.yml@' + ref,
+          }
+          manual_ref = any(ref.startswith(prefix) and len(ref) > len(prefix) for prefix in ['refs/heads/', 'refs/tags/'])
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or not ((event == 'push' and ref == 'refs/heads/main')
+                          or (event == 'workflow_dispatch' and manual_ref))):
+              raise SystemExit('Release source must match its exact reviewed workflow invocation before checkout or signing.')
+          PY
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.expected_commit || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -226,7 +267,29 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
     steps:
+      - name: Require exact release invocation
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ.get('EXPECTED_COMMIT', '')
+          ref = os.environ.get('GITHUB_REF', '')
+          event = os.environ.get('GITHUB_EVENT_NAME', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_SHA': expected, 'GITHUB_WORKFLOW_SHA': expected,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/release.yml@' + ref,
+          }
+          manual_ref = any(ref.startswith(prefix) and len(ref) > len(prefix) for prefix in ['refs/heads/', 'refs/tags/'])
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or not ((event == 'push' and ref == 'refs/heads/main')
+                          or (event == 'workflow_dispatch' and manual_ref))):
+              raise SystemExit('Release source must match its exact reviewed workflow invocation before checkout or signing.')
+          PY
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: verified-release-candidate

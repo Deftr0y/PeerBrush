@@ -13,6 +13,8 @@ jobs:
         run: python scripts/test_branch_policy.py
       - name: Verify bounded CI failure diagnostics
         run: python -B scripts/test_ci_diagnostics.py
+      - name: Verify exact release invocation guards
+        run: python -B scripts/test_release_source_guard.py
       - name: Enforce branch names and PR destinations
         shell: bash
         run: python scripts/check_branch_policy.py --event "$GITHUB_EVENT_PATH" --ref "$GITHUB_REF"
