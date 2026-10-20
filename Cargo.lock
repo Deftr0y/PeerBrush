@@ -2284,6 +2284,7 @@ dependencies = [
  "image",
  "moxcms",
  "objc2 0.6.5",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "resvg",
  "rfd",

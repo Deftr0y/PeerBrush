@@ -37,7 +37,8 @@ windows = { version = "0.58", features = ["ApplicationModel"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSAppleEventDescriptor", "NSAppleEventManager", "NSDate", "NSError", "NSBundle", "NSProcessInfo"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFURL", "CFData"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSAppleEventDescriptor", "NSAppleEventManager", "NSDate", "NSError", "NSBundle", "NSProcessInfo", "NSData", "NSArray", "objc2-core-foundation"] }
 
 [profile.dev]
 opt-level = 1

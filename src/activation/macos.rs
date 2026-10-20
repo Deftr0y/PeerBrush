@@ -1,10 +1,16 @@
 //! Finder Open Documents delivery without replacing winit's application delegate.
 use crate::server::Shared;
 use objc2::{
-    class, define_class, msg_send, rc::Retained, runtime::AnyObject, sel, DefinedClass,
-    MainThreadMarker, MainThreadOnly,
+    class, define_class, msg_send,
+    rc::Retained,
+    runtime::{AnyObject, Bool},
+    sel, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
-use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager, NSObject, NSObjectProtocol};
+use objc2_core_foundation::CFURL;
+use objc2_foundation::{
+    NSAppleEventDescriptor, NSAppleEventManager, NSData, NSObject, NSObjectProtocol,
+    NSURLBookmarkResolutionOptions, NSURL,
+};
 use std::{
     ffi::{CStr, OsStr},
     os::unix::ffi::OsStrExt,
@@ -15,10 +21,62 @@ use std::{
 const CORE: u32 = u32::from_be_bytes(*b"aevt");
 const OPEN: u32 = u32::from_be_bytes(*b"odoc");
 const DIRECT: u32 = u32::from_be_bytes(*b"----");
+const FILE_URL: u32 = u32::from_be_bytes(*b"furl");
+const ALIAS: u32 = u32::from_be_bytes(*b"alis");
+const BOOKMARK: u32 = u32::from_be_bytes(*b"bmrk");
+/// Native file references are bounded before parsing; at most 16 are accepted.
+pub const MAX_FILE_REFERENCE_BYTES: usize = 64 * 1024;
 static REPAINT: OnceLock<eframe::egui::Context> = OnceLock::new();
 
 pub fn repaint_with(ctx: &eframe::egui::Context) {
     let _ = REPAINT.set(ctx.clone());
+}
+
+fn bookmark_url(data: &NSData) -> Result<Retained<NSURL>, String> {
+    if !(1..=MAX_FILE_REFERENCE_BYTES).contains(&data.length()) {
+        return Err("Finder file reference is empty or too large".into());
+    }
+    let mut stale = Bool::NO;
+    unsafe {
+        NSURL::URLByResolvingBookmarkData_options_relativeToURL_bookmarkDataIsStale_error(
+            data,
+            NSURLBookmarkResolutionOptions::WithoutUI
+                | NSURLBookmarkResolutionOptions::WithoutMounting,
+            None,
+            &mut stale,
+        )
+    }
+    .map_err(|_| "Finder file reference could not be resolved without interaction".into())
+}
+
+fn file_url(descriptor: &NSAppleEventDescriptor) -> Result<Retained<NSURL>, String> {
+    let kind: u32 = unsafe { msg_send![descriptor, descriptorType] };
+    if kind == u32::from_be_bytes(*b"fsrf") {
+        return Err("Finder FSRef document descriptors are not supported".into());
+    }
+    if ![FILE_URL, ALIAS, BOOKMARK].contains(&kind) {
+        return Err("Finder document is not a supported native file reference".into());
+    }
+    let data = descriptor.data();
+    if !(1..=MAX_FILE_REFERENCE_BYTES).contains(&data.length()) {
+        return Err("Finder file reference is empty or too large".into());
+    }
+    if kind == FILE_URL {
+        // Only the original furl type reaches Foundation's otherwise coercing getter.
+        return descriptor
+            .fileURLValue()
+            .ok_or("Finder document is not a local file".into());
+    }
+    if kind == ALIAS {
+        // Convert the native alias format without resolving it. Resolution below
+        // forbids prompting or mounting volumes; no general descriptor coercion.
+        #[allow(deprecated)]
+        let bookmark =
+            unsafe { CFURL::new_bookmark_data_from_alias_record(None, Some(data.as_ref())) }
+                .ok_or("Finder alias could not be decoded")?;
+        return bookmark_url((&*bookmark).as_ref());
+    }
+    bookmark_url(&data)
 }
 
 /// Decode the native boundary before enqueueing any file. NSURL preserves
@@ -45,14 +103,7 @@ pub fn paths(event: &NSAppleEventDescriptor) -> Result<Vec<PathBuf>, String> {
             let descriptor = list
                 .descriptorAtIndex(index)
                 .ok_or("Missing Finder document")?;
-            // fileURLValue coerces text; only native file URL descriptors belong here.
-            let kind: u32 = unsafe { msg_send![&*descriptor, descriptorType] };
-            if kind != u32::from_be_bytes(*b"furl") {
-                return Err("Finder document is not a native file URL".into());
-            }
-            let url = descriptor
-                .fileURLValue()
-                .ok_or("Finder document is not a local file")?;
+            let url = file_url(&descriptor)?;
             if !url.isFileURL() {
                 return Err("Finder document is not a local file".into());
             }
