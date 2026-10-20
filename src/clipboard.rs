@@ -381,10 +381,7 @@ impl Worker {
         let (tx, rx) = mpsc::sync_channel::<Work>(1);
         let (reply_tx, replies) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut clipboard = tests::Fake {
-                image_reads: images.into(),
-                ..Default::default()
-            };
+            let mut clipboard = tests::Fake::with_images(images);
             let mut session = Session::default();
             while let Ok(request) = rx.recv() {
                 let request = match request {
@@ -796,6 +793,14 @@ mod tests {
         sequence: Option<u64>,
         change_on_read: bool,
         edit_on_write: Option<(Shared, Value)>,
+    }
+    impl Fake {
+        pub(super) fn with_images(images: Vec<Result<Image, String>>) -> Self {
+            Self {
+                image_reads: images.into(),
+                ..Default::default()
+            }
+        }
     }
     impl Provider for Fake {
         fn write_image(&mut self, image: &Image) -> Result<(), String> {
