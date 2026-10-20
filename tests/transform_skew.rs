@@ -421,9 +421,9 @@ fn invalid_selected_or_guarded_skew_and_partial_batches_preserve_source_and_hist
             json!({"op":"selection","rect":[2,2,9,8],"feather":1.}),
         );
         let before = state(&engine);
-        let mut selected = command(&engine, json!({"skew_x":15.,"selection_only":true}));
+        let mut selected = command(&engine, json!({"skew_x":81.,"selection_only":true}));
         let error = Engine::preview_edits(engine.doc.clone(), &[selected.clone()]).unwrap_err();
-        assert!(error.contains("selection_only:false"));
+        assert!(error.contains("between -80 and 80"));
         let move_first =
             json!({"op":"move","layer":engine.doc.layers[0].id,"dx":1,"selection_only":false});
         assert!(engine
@@ -448,6 +448,7 @@ fn invalid_selected_or_guarded_skew_and_partial_batches_preserve_source_and_hist
         let coverage = peerbrush::selection::current(&engine.doc).unwrap();
         assert!(transform::selection_with_coverage(&mut layer, &coverage, &selected).is_err());
         assert_eq!(serde_json::to_value(&layer).unwrap(), layer_before);
+        selected["skew_x"] = json!(15.);
         selected["selection_only"] = json!(false);
         edit(&mut engine, selected);
         let old = serde_json::from_value::<Document>(before["document"].clone()).unwrap();
@@ -588,7 +589,7 @@ fn folders_sources_and_protocol_use_shared_skew_without_rasterizing_definitions(
     let discovery = server::capabilities();
     assert_eq!(
         discovery["retained_transforms"]["skew"]["selection_pixels"],
-        false
+        true
     );
     assert_eq!(
         discovery["retained_transforms"]["skew"]["degrees"],

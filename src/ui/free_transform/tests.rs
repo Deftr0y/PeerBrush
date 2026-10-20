@@ -443,7 +443,7 @@ fn selection_choice_pivot_reset_and_pure_move_keep_one_command_and_explicit_boun
             "Pure movement must not rerender missing fonts"
         );
         editor.values.skew = [15., 0.];
-        assert!(editor.commands().is_err());
+        assert_eq!(editor.commands().unwrap()[0]["selection_only"], true);
         let output = frame(&mut app, &ctx, vec![]);
         workspace::click(
             &mut app,
@@ -526,5 +526,82 @@ fn existing_live_tool_and_file_loading_guards_refuse_session_without_discarding_
         app.open_free_transform(&ctx, &doc);
         assert!(app.free_transform.is_none() && app.load_control.is_some());
         assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn selected_skew_numeric_control_previews_native_result_then_applies_once_and_undo_restores_coverage(
+) {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"selection","rect":[4,4,13,13],"feather":1.})],
+                None,
+                None,
+                "Soft selection",
+            )
+            .unwrap();
+        let before = app.shared.lock().unwrap().doc.clone();
+        let history = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let at = app.free_transform.as_ref().unwrap().inputs[5]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, at);
+        workspace::click(&mut app, &ctx, SIZE, at);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("45".into()),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Enter, Default::default())],
+        );
+        assert!(
+            app.free_transform.is_some(),
+            "A numeric Enter does not Apply"
+        );
+        assert_eq!(app.free_transform.as_ref().unwrap().values.skew[0], 45.);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["selection_only"], true);
+        let expected = crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].pixels,
+            before.layers[0].pixels
+        );
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(app.free_transform.is_none(), "{}", app.message);
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.doc.bit_depth, depth);
+        assert_eq!(engine.undo.len(), history + 1);
+        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+        assert_eq!(engine.doc.selection_coverage, expected.selection_coverage);
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            expected.export_png().unwrap()
+        );
+        engine.undo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+        assert_eq!(engine.doc.selection_coverage, before.selection_coverage);
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            before.export_png().unwrap()
+        );
+        engine.redo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+        assert_eq!(engine.doc.selection_coverage, expected.selection_coverage);
     }
 }

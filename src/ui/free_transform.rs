@@ -86,9 +86,6 @@ impl Editor {
             "selection_only":self.selected&&!self.whole,"document_id":self.document,"source_revision":self.revision})
     }
     pub(super) fn commands(&self) -> Result<Vec<Value>, String> {
-        if self.selected && !self.whole && self.values.skew != [0.; 2] {
-            return Err("Selected-pixel skew is unsupported. Choose Whole target to keep the selection in place.".into());
-        }
         if !self.affine() && self.values.offset.iter().all(|value| value.round() == 0.) {
             return Ok(vec![]);
         }

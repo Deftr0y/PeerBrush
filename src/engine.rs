@@ -1030,16 +1030,66 @@ impl Engine {
                 let py = c["pivot"][1]
                     .as_f64()
                     .unwrap_or((b[1] as f64 + b[3] as f64) / 2.);
+                let shear = crate::transform::selected_shear(c).unwrap_or([0., 0.]);
+                let linear = [cos * sx, sin * sx, -sin * sy, cos * sy];
+                let skew = crate::transform::skewed(linear, c)
+                    .ok()
+                    .filter(|_| shear != [0., 0.]);
                 let mut out = b;
                 for p in crate::selection::rectangle(b) {
-                    let x = px + (p[0] as f64 - px) * sx * cos - (p[1] as f64 - py) * sy * sin + dx;
-                    let y = py + (p[0] as f64 - px) * sx * sin + (p[1] as f64 - py) * sy * cos + dy;
+                    let (x, y) = if let Some([a, bb, cc, d]) = skew {
+                        (
+                            px + a * (p[0] as f64 - px) + cc * (p[1] as f64 - py) + dx,
+                            py + bb * (p[0] as f64 - px) + d * (p[1] as f64 - py) + dy,
+                        )
+                    } else {
+                        (
+                            px + (p[0] as f64 - px) * sx * cos - (p[1] as f64 - py) * sy * sin + dx,
+                            py + (p[0] as f64 - px) * sx * sin + (p[1] as f64 - py) * sy * cos + dy,
+                        )
+                    };
                     out = [
                         out[0].min(x.floor() as i32),
                         out[1].min(y.floor() as i32),
                         out[2].max(x.ceil() as i32),
                         out[3].max(y.ceil() as i32),
                     ];
+                }
+                if shear != [0., 0.] {
+                    let (mut sin, mut cos) = (num(c, "angle", 0.) as f32).to_radians().sin_cos();
+                    if sin.abs() < 0.000001 {
+                        sin = 0.;
+                    }
+                    if cos.abs() < 0.000001 {
+                        cos = 0.;
+                    }
+                    let rectangle = crate::selection::rectangle(b);
+                    let covered = self
+                        .doc
+                        .selection_coverage
+                        .as_ref()
+                        .is_some_and(|coverage| coverage.bounds == b);
+                    let points = if covered {
+                        rectangle.as_slice()
+                    } else {
+                        crate::selection::polygon(&self.doc).unwrap_or(&rectangle)
+                    };
+                    for &p in points {
+                        let [x, y] = crate::transform::selected_point(
+                            p,
+                            [px as f32, py as f32],
+                            [dx as f32, dy as f32],
+                            [sx as f32, sy as f32],
+                            [sin, cos],
+                            shear,
+                        );
+                        out = [
+                            out[0].min(x.floor() as i32),
+                            out[1].min(y.floor() as i32),
+                            out[2].max(x.ceil() as i32),
+                            out[3].max(y.ceil() as i32),
+                        ];
+                    }
                 }
                 area = Some(out);
             }

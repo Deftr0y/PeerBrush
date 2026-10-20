@@ -57,14 +57,29 @@ pub(crate) fn skewed([a, b, c, d]: [f64; 4], command: &Value) -> Result<[f64; 4]
     ])
 }
 
-fn selected_skew(c: &Value) -> Result<(), String> {
+pub(crate) fn selected_shear(c: &Value) -> Result<[f32; 2], String> {
     if c["op"] != "move" {
         translation(c)?;
     }
-    if skew_angles(c)? != [0., 0.] {
-        return Err("Skew does not support selected pixels yet. Use selection_only:false for the whole target; the selection stays unchanged.".into());
-    }
-    Ok(())
+    Ok(skew_angles(c)?.map(|angle| angle.to_radians().tan() as f32))
+}
+
+/// The nonzero selected shear map is also used to enclose actual f32 scope bounds.
+pub(crate) fn selected_point(
+    [x, y]: [f32; 2],
+    [px, py]: [f32; 2],
+    [dx, dy]: [f32; 2],
+    [sx, sy]: [f32; 2],
+    [sin, cos]: [f32; 2],
+    [kx, ky]: [f32; 2],
+) -> [f32; 2] {
+    let (mut u, mut v) = (x - px, y - py);
+    u += kx * v;
+    v += ky * u;
+    [
+        px + u * sx * cos - v * sy * sin + dx,
+        py + u * sx * sin + v * sy * cos + dy,
+    ]
 }
 
 pub(crate) fn work_budget(width: u32, height: u32, rasters: usize) -> Result<(), String> {
@@ -213,7 +228,7 @@ pub fn selection_with_polygon(
     polygon: &[[f32; 2]],
     c: &Value,
 ) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
-    selected_skew(c)?;
+    selected_shear(c)?;
     if layer.mask.as_ref().is_some_and(|mask| mask.linked) {
         return linked_selection(layer, polygon, c, None);
     }
@@ -227,7 +242,7 @@ pub fn selection_with_coverage(
     coverage: &crate::selection::Coverage,
     c: &Value,
 ) -> Result<crate::selection::Coverage, String> {
-    selected_skew(c)?;
+    let shear = selected_shear(c)?;
     if coverage.bounds[0] >= coverage.bounds[2] {
         return Ok(coverage.clone());
     }
@@ -253,11 +268,19 @@ pub fn selection_with_coverage(
         let (sx, sy) = scales(c)?;
         (sx as f32, sy as f32)
     };
-    let (sin, cos) = if moving {
+    let (mut sin, mut cos) = if moving {
         (0., 1.)
     } else {
         n("angle", 0.).to_radians().sin_cos()
     };
+    if shear != [0., 0.] {
+        if sin.abs() < 0.000001 {
+            sin = 0.;
+        }
+        if cos.abs() < 0.000001 {
+            cos = 0.;
+        }
+    }
     let px = c["pivot"][0]
         .as_f64()
         .unwrap_or((coverage.bounds[0] as f64 + coverage.bounds[2] as f64) / 2.)
@@ -274,8 +297,15 @@ pub fn selection_with_coverage(
         for x in bounds[0]..bounds[2] {
             let rx = x as f32 + 0.5 - px - dx;
             let ry = y as f32 + 0.5 - py - dy;
-            let ux = (rx * cos + ry * sin) / sx + px - coverage.origin[0] as f32 - 0.5;
-            let uy = (-rx * sin + ry * cos) / sy + py - coverage.origin[1] as f32 - 0.5;
+            let mut u = (rx * cos + ry * sin) / sx;
+            let mut v = (-rx * sin + ry * cos) / sy;
+            if shear != [0., 0.] {
+                // Undo Hy then Hx after the existing inverse rotation/scale.
+                v -= shear[1] * u;
+                u -= shear[0] * v;
+            }
+            let ux = u + px - coverage.origin[0] as f32 - 0.5;
+            let uy = v + py - coverage.origin[1] as f32 - 0.5;
             // Coverage is scalar; RGBA sampling would unpremultiply its edge values.
             let (ix, iy) = (ux.floor() as i32, uy.floor() as i32);
             let (fx, fy) = (ux - ix as f32, uy - iy as f32);
@@ -302,6 +332,7 @@ fn selection_impl(
     if layer.kind == "group" {
         return Err("Transform a paint layer or its mask".into());
     }
+    let shear = selected_shear(c)?;
     let n = |key: &str, default: f32| c[key].as_f64().unwrap_or(default as f64) as f32;
     let move_only = c["op"] == "move";
     let (dx, dy) = if move_only {
@@ -339,14 +370,24 @@ fn selection_impl(
         cos = 0.0;
     }
     let f = |x: f32, y: f32| {
-        [
-            px + (x - px) * sx * cos - (y - py) * sy * sin + dx,
-            py + (x - px) * sx * sin + (y - py) * sy * cos + dy,
-        ]
+        if shear != [0., 0.] {
+            selected_point([x, y], [px, py], [dx, dy], [sx, sy], [sin, cos], shear)
+        } else {
+            [
+                px + (x - px) * sx * cos - (y - py) * sy * sin + dx,
+                py + (x - px) * sx * sin + (y - py) * sy * cos + dy,
+            ]
+        }
     };
     let transformed = polygon.iter().map(|p| f(p[0], p[1])).collect::<Vec<_>>();
     let b = crate::selection::bounds(&transformed)?;
-    if dx == 0.0 && dy == 0.0 && angle.rem_euclid(360.0) == 0.0 && sx == 1.0 && sy == 1.0 {
+    if dx == 0.0
+        && dy == 0.0
+        && angle.rem_euclid(360.0) == 0.0
+        && sx == 1.0
+        && sy == 1.0
+        && shear == [0., 0.]
+    {
         return Ok((b, transformed));
     }
     let mask = c["mask"].as_bool().unwrap_or(false);
@@ -414,8 +455,14 @@ fn selection_impl(
             }
             let rx = x as f32 + 0.5 - px - dx;
             let ry = y as f32 + 0.5 - py - dy;
-            let ux = (rx * cos + ry * sin) / sx + px - ox as f32 - 0.5;
-            let uy = (-rx * sin + ry * cos) / sy + py - oy as f32 - 0.5;
+            let mut u = (rx * cos + ry * sin) / sx;
+            let mut v = (-rx * sin + ry * cos) / sy;
+            if shear != [0., 0.] {
+                v -= shear[1] * u;
+                u -= shear[0] * v;
+            }
+            let ux = u + px - ox as f32 - 0.5;
+            let uy = v + py - oy as f32 - 0.5;
             if cut.depth == 16 {
                 let pixel = cut.sample16(ux, uy);
                 if pixel[3] > 0 {

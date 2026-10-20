@@ -953,10 +953,10 @@
       "default": 0,
       "order": "Horizontal shear then vertical shear, then scale/reflection and rotation, around the document-space pivot. Each angle contributes tan(degrees); positive X moves the bottom right, positive Y moves the right edge down.",
       "snap": "Explicit skew fields snap to the existing 15-degree grid when snap:true; raw bounds still apply.",
-      "targets": "Whole layer/folder and whole independent mask; current linked/unlinked and editable-source restrictions apply.",
-      "selection_pixels": false,
-      "selection": "Nonzero skew of selected pixels rejects atomically. Use selection_only:false to transform the whole target and leave selection geometry unchanged.",
-      "limits": "Affine placement only; selected-pixel skew, perspective/distort and control-grid Warp are unavailable."
+      "targets": "Whole or selected raster layer/folder, linked/unlinked painted masks and exact scalar coverage; current editable-source and mask-effect restrictions apply.",
+      "selection_pixels": true,
+      "selection": "Selected color/mask pixels and soft/hole coverage use one original-sampling pass with the same horizontal-then-vertical shear, scale/reflection, rotation and posttranslation. Omit selection_only or pass true for selected pixels; false keeps selection geometry unchanged while transforming the whole target.",
+      "limits": "Affine placement only; perspective/distort and control-grid Warp are unavailable."
     }
   },
   "free_transform": {
@@ -966,7 +966,7 @@
     "preview": "Actual shared-engine native8/16 result; Apply/Enter commits one undo only after the current preview is rendered. Handle release and mode changes remain pending.",
     "cancellation": "Cancel/Escape, focus loss, changed source or target cancel the draft without rebasing; Save/close/update restart require Apply or Cancel.",
     "reference_point": "Set or drag before an adjustment; Reset transform makes it editable again without stacking/re-cutting selected pixels.",
-    "limits": "Selected-pixel skew requires explicit Whole target (keep selection). No projective distort, perspective or control-grid Warp."
+    "limits": "Selected raster skew follows the current selection by default; Whole target (keep selection) is explicit. No projective distort, perspective or control-grid Warp."
   },
   "editable_sources": {
     "commands": [

@@ -372,6 +372,7 @@
     "tests/task_undo.rs",
     "tests/tool_settings.rs",
     "tests/transform_actions.rs",
+    "tests/selected_skew.rs",
     "tests/transform_skew.rs",
     "tests/transform_snapping.rs",
     "tests/transform_translation.rs",
