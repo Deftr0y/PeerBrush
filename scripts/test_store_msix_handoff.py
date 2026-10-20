@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from package import digest
+from package import digest, git
 import handoff_store_msix as handoff
 import test_store_msix_preflight as preflight_tests
 import test_dmg_handoff as dmg_tests
@@ -24,15 +24,17 @@ class StoreHandoff(unittest.TestCase):
         self.seed.setUp()
         self.addCleanup(self.seed.doCleanups)
         self.root = self.seed.root
-        self.package, self.report = self.seed.package, self.seed.report
         self.fixture = self.seed.fixture.msix.fixture
+        self.package = self.seed.package.rename(self.fixture.output / self.seed.package.name)
+        self.report = self.seed.report.rename(self.fixture.output / self.seed.report.name)
+        self.seed.package, self.seed.report = self.package, self.report
         self.commit = self.seed.inputs['commit']
-        raw = self.root / 'selected-platforms'
-        raw.mkdir()
         archives = [self.seed.fixture.portable, self.fixture.build('macOS'), self.fixture.build('Linux')]
+        raw = self.fixture.output / 'selected-platforms'
+        raw.mkdir()
         for archive in archives:
             shutil.copyfile(archive, raw / archive.name)
-        self.directory = self.root / 'common-candidate'
+        self.directory = self.fixture.output / 'common-candidate'
         with contextlib.redirect_stdout(io.StringIO()):
             verify(raw, self.commit, '0.26.0', self.directory, self.root)
         self.sidecar = self.package.with_name(self.package.name + '.sha256')
@@ -41,6 +43,7 @@ class StoreHandoff(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.parent = Path(self.temporary.name).resolve()
         self.output = self.parent / 'bundle'
+        self.assertEqual(git(self.root, 'status', '--porcelain', '--untracked-files=normal'), b'')
 
     def arguments(self, **overrides):
         values = dict(commit=self.commit, version='0.26.0', previous_version='1.25.0.0',
@@ -358,13 +361,14 @@ class StoreHandoff(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'nt', 'Actual MSIX SDK package requires Windows')
     def test_actual_sdk_store_package_uses_the_same_independent_handoff(self):
-        sdk = self.root / 'sdk-store'
+        sdk = self.fixture.output / 'sdk-store'
         report = handoff.preflight.store.msix.build(self.root, self.seed.fixture.portable, sdk,
             self.seed.fixture.report['identity'], previous_version='1.25.0.0',
             expected_sha256=self.seed.inputs['portable_sha256'],
             expected_package_family=handoff.preflight.store.FAMILY)
         package = sdk / report['package']
         producer = package.with_name(package.name + '.json')
+        self.assertEqual(git(self.root, 'status', '--porcelain', '--untracked-files=normal'), b'')
         result = self.run_handoff(package=package, report=producer,
             package_sha256=digest(package), report_sha256=digest(producer))
         self.assertTrue(result['content_verified'])
