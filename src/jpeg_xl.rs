@@ -753,7 +753,12 @@ fn invoke(
             Ok(())
         };
         let written = writer
-            .map(|writer| writer.join().map_err(|_| FAILED).and_then(|result| result))
+            .map(|writer| {
+                writer
+                    .join()
+                    .map_err(|_| FAILED.to_owned())
+                    .and_then(|result| result)
+            })
             .unwrap_or_else(|| Err(PROTOCOL.into()));
         let read = reader.join().map_err(|_| FAILED);
         cleanup?;
