@@ -81,6 +81,23 @@ class Tests(unittest.TestCase):
                 readiness.immutable(dict(previous, version=bad), candidate)
 
 
+    def test_checksum_output_is_canonical_and_bounded_reader_preserves_crlf_compatibility(self):
+        path = self.directory / 'SHA256SUMS'
+        raw = path.read_bytes()
+        inventory = json.loads((self.directory / 'release-inventory.json').read_bytes())
+        expected = ''.join(f"{a['sha256']}  {a['file']}\n" for a in inventory['assets']).encode()
+        self.assertEqual(raw, expected, 'The shared writer must produce canonical LF on every platform')
+        report = self.assess()
+        for separator in [b'\n', b'\r\n']:
+            path.write_bytes(raw.replace(b'\n', separator))
+            self.assertEqual(self.assess(), report)
+        for malformed in [raw.replace(b'\n', b'\r'), raw + b'\n', raw[:-1], b'\xef\xbb\xbf' + raw, b'\x80' + raw]:
+            path.write_bytes(malformed)
+            with self.subTest(checksums=malformed[:16]), self.assertRaisesRegex(ValueError, 'Final checksum list'):
+                self.assess()
+        path.write_bytes(raw)
+
+
 class DebianQualification(unittest.TestCase):
     def setUp(self):
         self.fixture = test_deb.DebianPackage(methodName='runTest')

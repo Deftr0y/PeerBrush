@@ -236,7 +236,7 @@ def verify(directory, commit, version, output, source_root=None):
     source_name = f'PeerBrush-{version}-source{correction}.zip'
     (output / source_name).write_bytes(source_bytes)
     records.append({'file': source_name, 'bytes': len(source_bytes), 'sha256': sha(source_bytes)})
-    (output / ('SHA256SUMS' + correction)).write_text(''.join(f"{r['sha256']}  {r['file']}\n" for r in records), encoding='utf-8')
+    (output / ('SHA256SUMS' + correction)).write_text(''.join(f"{r['sha256']}  {r['file']}\n" for r in records), encoding='utf-8', newline='\n')
     (output / ('release-inventory' + correction + '.json')).write_text(json.dumps({'schema': 1, 'version': version, 'commit': commit, 'binary_source_commit': binary_commit, 'packaging_correction': correction or None, 'assets': records}, indent=2) + '\n', encoding='utf-8')
     print(f'Verified three matching PeerBrush {version} archives and source from {commit}')
 

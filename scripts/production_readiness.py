@@ -110,7 +110,7 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
     checksums = ''.join(f"{a['sha256']}  {a['file']}\n" for a in assets)
     with regular_file(directory, 'SHA256SUMS').open('rb') as stream:
         actual_checksums = stream.read(64 * 1024 + 1)
-    if len(actual_checksums) > 64 * 1024 or actual_checksums.decode('utf-8') != checksums:
+    if len(actual_checksums) > 64 * 1024 or actual_checksums.replace(b'\r\n', b'\n') != checksums.encode('utf-8'):
         raise ValueError('Final checksum list differs from the inspected inventory.')
     platforms = {}
     with regular_file(directory, source_name).open('rb') as stream:
