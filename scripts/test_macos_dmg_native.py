@@ -17,7 +17,7 @@ class NativeImage(unittest.TestCase):
     def test_synthetic_unsigned_payload_mounts_read_only_with_exact_content(self):
         # Retain failed work if the OS cannot detach; do not recursively clean a
         # mounted filesystem from a test's TemporaryDirectory finalizer either.
-        root = pathlib.Path(tempfile.mkdtemp(prefix='peerbrush-dmg-smoke-'))
+        root = pathlib.Path(tempfile.mkdtemp(prefix='peerbrush-dmg-smoke-')).resolve()
         payload = root / 'payload'
         app = payload / APP / 'Contents/MacOS'
         app.mkdir(parents=True)
