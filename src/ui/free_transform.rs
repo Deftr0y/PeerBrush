@@ -301,24 +301,26 @@ impl Editor {
                 let b = local(p);
                 let ratio = |i: usize| {
                     if a[i].abs() > 0.00001 {
-                        (b[i] / a[i]).abs()
+                        b[i] / a[i]
                     } else {
                         1.
                     }
                 };
                 let mut factors = [if x { ratio(0) } else { 1. }, if y { ratio(1) } else { 1. }];
+                let reflected = factors.map(|factor| factor < 0.);
                 if shift || (self.proportional && x && y) {
                     let factor = if !x {
                         factors[1]
-                    } else if !y || (factors[0] - 1.).abs() > (factors[1] - 1.).abs() {
+                    } else if !y || (factors[0].abs() - 1.).abs() > (factors[1].abs() - 1.).abs() {
                         factors[0]
                     } else {
                         factors[1]
                     };
-                    factors = [factor; 2];
+                    factors = [factor.abs(); 2];
                 }
                 for i in 0..2 {
-                    self.values.scale[i] = (start.scale[i] * factors[i]).clamp(0.05, 20.);
+                    self.values.scale[i] = (start.scale[i] * factors[i].abs()).clamp(0.05, 20.);
+                    self.values.mirror[i] = start.mirror[i] ^ reflected[i];
                 }
             }
         }

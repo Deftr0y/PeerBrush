@@ -982,3 +982,196 @@ fn actual_reference_handle_after_affine_is_presentation_only_and_escape_preserve
         assert_eq!(workspace::source(&app), before);
     }
 }
+
+#[test]
+fn scale_crossing_uses_signed_axes_about_the_reference_with_rotation_skew_and_prior_mirrors() {
+    let cases = [
+        ([-1.25, 0.75], false, false, [true, true], [-1.25, 0.75]),
+        ([1.25, -0.75], false, false, [true, true], [1.25, -0.75]),
+        ([-1.25, -0.75], false, false, [true, true], [-1.25, -0.75]),
+        ([-0.75, 1.5], true, false, [true, true], [-1.5, 1.5]),
+        ([-1.25, 1.], false, true, [true, false], [-1.25, 1.25]),
+    ];
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        for mirrors in [[false, false], [true, false], [false, true], [true, true]] {
+            for (input, proportional, shift, axes, expected) in cases {
+                let editor = app.free_transform.as_mut().unwrap();
+                editor.reference = None;
+                editor.values = Parameters {
+                    scale: [1.6, 0.8],
+                    angle: 30.,
+                    skew: [17., -9.],
+                    mirror: mirrors,
+                    ..Default::default()
+                };
+                editor.proportional = proportional;
+                editor.snap = false;
+                editor.set_reference([5.25, 21.75]).unwrap();
+                let start = editor.values.clone();
+                let key = editor.key().unwrap();
+                let center = editor.reference_point();
+                let origin = editor.corners()[2];
+                let (sin, cos) = start.angle.to_radians().sin_cos();
+                let [dx, dy] = [origin[0] - center[0], origin[1] - center[1]];
+                let local = [dx * cos + dy * sin, -dx * sin + dy * cos];
+                let position = |f: [f64; 2]| {
+                    [
+                        center[0] + cos * local[0] * f[0] - sin * local[1] * f[1],
+                        center[1] + sin * local[0] * f[0] + cos * local[1] * f[1],
+                    ]
+                };
+                editor.drag = Some(Drag {
+                    origin,
+                    start: start.clone(),
+                    handle: Handle::Scale(axes[0], axes[1]),
+                });
+                editor.drag_to(position(input), shift);
+                for i in 0..2 {
+                    assert_eq!(editor.values.mirror[i], mirrors[i] ^ (expected[i] < 0.));
+                    assert!(
+                        (editor.values.scale[i] - start.scale[i] * expected[i].abs()).abs() < 1e-10
+                    );
+                    assert!((editor.corners()[2][i] - position(expected)[i]).abs() < 1e-7);
+                }
+                assert_eq!(editor.reference_point(), center);
+                assert!(editor.commands().is_ok());
+                editor.drag_to(origin, false);
+                assert_eq!(
+                    editor.key().unwrap(),
+                    key,
+                    "Crossing back must restore the starting command exactly"
+                );
+            }
+        }
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn real_corner_crossing_previews_one_native_flip_then_commits_and_roundtrips_once() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        let original = app.shared.lock().unwrap().doc.clone();
+        let undo = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::R, Default::default());
+        let editor = app.free_transform.as_ref().unwrap();
+        let corner = editor.corners()[2];
+        let center = editor.reference_point();
+        let reflected = [2. * center[0] - corner[0], corner[1]];
+        let rect = app.view_rect.unwrap();
+        let screen = |point: [f64; 2]| {
+            app.view
+                .point(point.map(|v| v as f32), rect, rect.width() / 32.)
+        };
+        let start = screen(corner);
+        let end = screen(reflected);
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), pointer(start, true)],
+        );
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().values.mirror,
+            [true, false]
+        );
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start)]);
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().values.mirror,
+            [false, false]
+        );
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        frame(&mut app, &ctx, vec![pointer(end, false)]);
+        assert_eq!(
+            workspace::source(&app),
+            before,
+            "Crossing and release stay pending"
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["mirror_x"], true);
+        assert_eq!(commands[0]["mirror_y"], false);
+        let expected = crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(app.free_transform.is_none(), "{}", app.message);
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), undo + 1);
+        assert_eq!(engine.doc.bit_depth, depth);
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            expected.export_png().unwrap()
+        );
+        for encoded in [
+            crate::psd::encode(&engine.doc).unwrap(),
+            crate::psd::encode_psb(&engine.doc).unwrap(),
+        ] {
+            let reopened = crate::psd::decode(&encoded).unwrap();
+            assert!(!reopened.read_only, "Roundtrip must retain editability");
+            assert_eq!(reopened.bit_depth, depth);
+            assert_eq!(
+                reopened.export_png().unwrap(),
+                engine.doc.export_png().unwrap()
+            );
+            assert_eq!(
+                reopened.layers[0].pixels.rgba16(),
+                engine.doc.layers[0].pixels.rgba16()
+            );
+        }
+        engine.undo("human").unwrap();
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            original.export_png().unwrap()
+        );
+        assert_eq!(
+            engine.doc.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+    }
+}
+
+#[test]
+fn proportional_zero_magnitude_preserves_the_other_axis_crossing_and_never_flips_zero() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        for (ratio, mirror) in [
+            ([-0.5, 0.], [true, false]),
+            ([0., -0.5], [false, true]),
+            ([-0., 0.], [false, false]),
+            ([-0.5, -0.], [true, false]),
+        ] {
+            let editor = app.free_transform.as_mut().unwrap();
+            editor.reference = None;
+            editor.values = Parameters::default();
+            editor.proportional = true;
+            editor.snap = false;
+            let origin = editor.corners()[2];
+            let center = editor.reference_point();
+            editor.drag = Some(Drag {
+                origin,
+                start: editor.values.clone(),
+                handle: Handle::Scale(true, true),
+            });
+            editor.drag_to(
+                [
+                    center[0] + (origin[0] - center[0]) * ratio[0],
+                    center[1] + (origin[1] - center[1]) * ratio[1],
+                ],
+                false,
+            );
+            assert_eq!(editor.values.scale, [0.05; 2]);
+            assert_eq!(editor.values.mirror, mirror);
+            assert!(editor.commands().is_ok());
+        }
+        assert_eq!(workspace::source(&app), before);
+    }
+}
