@@ -615,6 +615,44 @@ fn check_output_size(doc: &Document, plan: &StandardPlan) -> Result<(), String> 
     }
     Ok(())
 }
+// The caller has validated the layout and matching native depth. Keep absent
+// tiles and padded output outside the raster identical to Raster::get/get16.
+fn native_channel_row(pixels: &Raster, y: u32, channel: usize, row: &mut [u8]) {
+    row.fill(0);
+    if y >= pixels.height {
+        return;
+    }
+    let bytes = if pixels.is16() { 2 } else { 1 };
+    let width = (row.len() / bytes).min(pixels.width as usize);
+    let stride = crate::raster::TILE as usize;
+    let start = (y % crate::raster::TILE) as usize * stride * 4 + channel;
+    for x in (0..width).step_by(stride) {
+        let key = ((x / stride) as u32, y / crate::raster::TILE);
+        let count = (width - x).min(stride);
+        if pixels.is16() {
+            if let Some(tile) = pixels.samples16.get(&key) {
+                for (sample, output) in tile[start..]
+                    .iter()
+                    .step_by(4)
+                    .take(count)
+                    .zip(row[x * 2..(x + count) * 2].chunks_exact_mut(2))
+                {
+                    output.copy_from_slice(&sample.to_be_bytes());
+                }
+            }
+        } else if let Some(tile) = pixels.tiles.get(&key) {
+            for (sample, output) in tile[start..]
+                .iter()
+                .step_by(4)
+                .take(count)
+                .zip(&mut row[x..x + count])
+            {
+                *output = *sample;
+            }
+        }
+    }
+}
+
 fn encode_layout(doc: &Document, layout: Layout) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut spool = std::io::Cursor::new(Vec::new());
@@ -916,51 +954,65 @@ fn encode_layout_to<S: Read + Write + Seek>(
                 .write_all(&0u16.to_be_bytes())
                 .map_err(|e| e.to_string())?;
             let (cw, ch_height) = if ch == -2 { (mask_w, mask_h) } else { (w, h) };
+            let raw_native = ch != -2
+                && derived.is_none()
+                && derived16.is_none()
+                && l.kind != "fill"
+                && l.pixels.is16() == high;
             for yy in 0..ch_height {
                 check()?;
-                for xx in 0..cw {
-                    if high {
-                        let value = if ch == -2 {
-                            (crate::depth16::mask_value_prepared(
-                                l,
-                                xx as i32 + mask_x - l.x,
-                                yy as i32 + mask_y - l.y,
-                                mask16.map(|m| m.as_ref()),
-                                true,
-                            ) * 65535.)
-                                .round()
-                                .clamp(0., 65535.) as u16
-                        } else {
-                            let p = if let Some(image) = derived16 {
-                                image.get(xx as i32, yy as i32)
-                            } else if l.kind == "fill" {
-                                l.color.map(|v| v as u16 * 257)
+                if raw_native {
+                    native_channel_row(
+                        &l.pixels,
+                        yy,
+                        if ch == -1 { 3 } else { ch as usize },
+                        &mut row[..cw as usize * usize::from(doc.bit_depth / 8)],
+                    );
+                } else {
+                    for xx in 0..cw {
+                        if high {
+                            let value = if ch == -2 {
+                                (crate::depth16::mask_value_prepared(
+                                    l,
+                                    xx as i32 + mask_x - l.x,
+                                    yy as i32 + mask_y - l.y,
+                                    mask16.map(|m| m.as_ref()),
+                                    true,
+                                ) * 65535.)
+                                    .round()
+                                    .clamp(0., 65535.) as u16
                             } else {
-                                l.pixels.get16(xx as i32, yy as i32)
+                                let p = if let Some(image) = derived16 {
+                                    image.get(xx as i32, yy as i32)
+                                } else if l.kind == "fill" {
+                                    l.color.map(|v| v as u16 * 257)
+                                } else {
+                                    l.pixels.get16(xx as i32, yy as i32)
+                                };
+                                p[if ch == -1 { 3 } else { ch as usize }]
                             };
-                            p[if ch == -1 { 3 } else { ch as usize }]
-                        };
-                        row[xx as usize * 2..xx as usize * 2 + 2]
-                            .copy_from_slice(&value.to_be_bytes());
-                    } else {
-                        row[xx as usize] = if ch == -2 {
-                            (l.mask_value_prepared(
-                                xx as i32 + mask_x - l.x,
-                                yy as i32 + mask_y - l.y,
-                                prepared.as_deref(),
-                                true,
-                            ) * 255.)
-                                .round() as u8
+                            row[xx as usize * 2..xx as usize * 2 + 2]
+                                .copy_from_slice(&value.to_be_bytes());
                         } else {
-                            let p = if let Some(image) = derived {
-                                image.get(xx as i32, yy as i32)
-                            } else if l.kind == "fill" {
-                                l.color
+                            row[xx as usize] = if ch == -2 {
+                                (l.mask_value_prepared(
+                                    xx as i32 + mask_x - l.x,
+                                    yy as i32 + mask_y - l.y,
+                                    prepared.as_deref(),
+                                    true,
+                                ) * 255.)
+                                    .round() as u8
                             } else {
-                                l.pixels.get(xx as i32, yy as i32)
+                                let p = if let Some(image) = derived {
+                                    image.get(xx as i32, yy as i32)
+                                } else if l.kind == "fill" {
+                                    l.color
+                                } else {
+                                    l.pixels.get(xx as i32, yy as i32)
+                                };
+                                p[if ch == -1 { 3 } else { ch as usize }]
                             };
-                            p[if ch == -1 { 3 } else { ch as usize }]
-                        };
+                        }
                     }
                 }
                 standard
@@ -3143,6 +3195,130 @@ mod storage_tests {
             assert_eq!(writer.inner.flushes, 1);
         }
     }
+    #[test]
+    fn native_channel_rows_match_scalar_samples_across_sparse_tiles_and_padding() {
+        for depth in [8, 16] {
+            let mut pixels = Raster::new_depth(513, 259, depth);
+            for (x, y, words) in [
+                (0, 0, [12347, 23459, 34571, 0]),
+                (255, 255, [45679, 11113, 33337, 32769]),
+                (256, 255, [60001, 20003, 40009, 1]),
+                (511, 256, [137, 911, 31001, 65535]),
+                (512, 258, [54321, 12345, 45671, 0]),
+            ] {
+                pixels.set16(x, y, words);
+            }
+            let before = pixels.clone();
+            for y in [0, 1, 254, 255, 256, 258, 259] {
+                for width in [1, 255, 256, 257, 513, 514] {
+                    for channel in 0..4 {
+                        let mut actual = vec![0xA5; width * usize::from(depth / 8)];
+                        native_channel_row(&pixels, y, channel, &mut actual);
+                        let expected = (0..width as i32)
+                            .flat_map(|x| {
+                                if depth == 16 {
+                                    pixels.get16(x, y as i32)[channel].to_be_bytes().to_vec()
+                                } else {
+                                    vec![pixels.get(x, y as i32)[channel]]
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            actual, expected,
+                            "depth={depth}, y={y}, width={width}, channel={channel}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(pixels, before);
+            assert_eq!(pixels.get16(0, 0)[3], 0);
+            assert_ne!(pixels.get16(0, 0)[0], 0);
+        }
+    }
+
+    #[test]
+    fn sparse_native_channel_rows_keep_negative_layer_bounds_and_standard_plane_bytes() {
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(269, 3, depth).unwrap();
+            let layer = &mut doc.layers[0];
+            layer.x = -3;
+            layer.y = -2;
+            layer.pixels = Raster::new_depth(513, 259, depth);
+            for (x, y, words) in [
+                (0, 0, [12347, 23459, 34571, 0]),
+                (255, 0, [45679, 11113, 33337, 32769]),
+                (256, 1, [60001, 20003, 40009, 1]),
+                (511, 256, [137, 911, 31001, 65535]),
+                (512, 258, [54321, 12345, 45671, 0]),
+            ] {
+                layer.pixels.set16(x, y, words);
+            }
+            let before = serde_json::to_value(&doc).unwrap();
+            for layout in [Layout::Psd, Layout::Psb] {
+                let bytes = encode_layout(&doc, layout).unwrap();
+                let mut file = Cursor::new(&bytes);
+                file.bytes(26).unwrap();
+                file.block().unwrap();
+                file.block().unwrap();
+                let section = layout.block(&mut file).unwrap();
+                let mut record = Cursor::new(layer_info(section, depth, layout).unwrap());
+                assert_eq!(record.i16().unwrap(), -1);
+                assert_eq!(
+                    [
+                        record.i32().unwrap(),
+                        record.i32().unwrap(),
+                        record.i32().unwrap(),
+                        record.i32().unwrap()
+                    ],
+                    [-2, -3, 257, 510]
+                );
+                assert_eq!(record.u16().unwrap(), 4);
+                let plane_length = 2 + 513 * 259 * usize::from(depth / 8);
+                for channel in [-1, 0, 1, 2] {
+                    assert_eq!(record.i16().unwrap(), channel);
+                    assert_eq!(record.length(layout.large()).unwrap(), plane_length);
+                }
+                assert_eq!(record.bytes(8).unwrap(), b"8BIMnorm");
+                record.bytes(4).unwrap();
+                record.block().unwrap();
+                for channel in [3usize, 0, 1, 2] {
+                    assert_eq!(record.u16().unwrap(), 0);
+                    let actual = record.bytes(plane_length - 2).unwrap();
+                    let mut expected = Vec::with_capacity(plane_length - 2);
+                    for y in 0..259 {
+                        for x in 0..513 {
+                            if depth == 16 {
+                                expected.extend(
+                                    doc.layers[0].pixels.get16(x, y)[channel].to_be_bytes(),
+                                );
+                            } else {
+                                expected.push(doc.layers[0].pixels.get(x, y)[channel]);
+                            }
+                        }
+                    }
+                    assert_eq!(actual, expected);
+                }
+                let reopened = decode(&bytes).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.bit_depth, depth);
+                assert_eq!((reopened.layers[0].x, reopened.layers[0].y), (-3, -2));
+                assert_eq!(reopened.layers[0].pixels, doc.layers[0].pixels);
+                assert_eq!(reopened.export_png().unwrap(), doc.export_png().unwrap());
+                assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            }
+        }
+        // The empty 16-bit document's synthetic standard layer is still an
+        // 8-bit empty Raster: it retains the existing scalar fallback.
+        let mut empty = Document::new_depth(2, 1, 16).unwrap();
+        empty.layers.clear();
+        for bytes in [encode(&empty).unwrap(), encode_psb(&empty).unwrap()] {
+            let reopened = decode(&bytes).unwrap();
+            assert!(!reopened.read_only);
+            assert_eq!(reopened.bit_depth, 16);
+            assert!(reopened.layers.is_empty());
+        }
+    }
+
     fn streamed_fixture(depth: u16) -> Document {
         let mut doc = Document::new_depth(2, 1, depth).unwrap();
         let layer = &mut doc.layers[0];
