@@ -220,3 +220,26 @@ store, deploy the website or configure an updater. Stable source, approved
 provider access/protection and actual signing, qualification, installed/update
 and public readback acceptance remain required. Its offline workflow fixtures
 are code tests, not real Apple issuance or release evidence.
+
+## Exact reviewed website invocation (unreleased)
+
+The manually dispatched Pages workflow now checks its fixed official main
+invocation before executable checkout or any Pages action. Event/source and
+workflow SHA must agree; the exact pages workflow/ref and a full independently
+reviewed site SHA are required. The main workflow source and site-content source
+are intentionally separate commits. Checkout selects the explicit site SHA,
+then fetches only refs/heads/site-content and requires its current tip and the
+checkout to equal the selected SHA. A moved tip or missing required public
+files stops before configuration or artifact upload. The deploy job repeats
+the fixed invocation check before its privileged Pages action.
+
+The existing manual trigger, contents-read scope, Pages/OIDC deployment scope,
+github-pages protected environment and serialized deployment remain unchanged.
+No protection, credential, dispatch, branch or published content is changed by
+preparing this boundary. It does not implement release publication or website
+eligibility for installed packages. The existing release-source-guard test
+entry point and all its current native/release/signing callers also cover the
+actual website guard/selection programs offline; they exercise accepted and
+refused invocations, exact checkout/current-tip binding, failed fetch and
+missing output. These prepared cases require combined execution; they do not
+deploy Pages or authenticate a release.

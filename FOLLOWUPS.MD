@@ -528,3 +528,6 @@ Combined9f checkpoint (unreleased, non-passing): compile passed; Rust1,212pass/3
 
 
 PB-108/PB-068 fast-parser correction (unreleased, replay pending): replace the measured slower per-byte JSON reader with bounded slice deserialization after guarded 64 KiB decompression, retaining exact limits, real EOF/checksum, cancellation, format/native/source/hash/metadata and protected-fallback gates. Four strong methods remain and one EOF/read-error method is added. Source review and formatting passed; combined correctness and comparable Open timing remain pending. Full decoded JSON allocation and 16000-square acceptance remain unfinished.
+
+
+PB-154 website invocation boundary (unreleased, replay pending): fixed official manual-main/workflow guards now precede checkout and deployment, with exact reviewed site selection and fetched current-tip binding. Existing approval environment, manual trigger, action pins and permissions remain. Four prepared actual-inline methods use existing CI/release/signing callers; independent source review passed. Combined/live acceptance and complete release publication remain open; no deployment or remote setting changed.

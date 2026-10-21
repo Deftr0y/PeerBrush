@@ -5,6 +5,7 @@
     ".github/workflows/ci.yml",
     ".github/workflows/macos-qualification.yml",
     ".github/workflows/macos-release-signing.yml",
+    ".github/workflows/pages.yml",
     ".github/workflows/release.yml",
     ".github/workflows/store-submit.yml",
     "Cargo.lock",

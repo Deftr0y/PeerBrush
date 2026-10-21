@@ -1,4 +1,4 @@
-"""Exercise the actual fixed release workflow guard offline, without checkout or signing."""
+"""Exercise actual release/website guards offline, without checkout, signing or deployment."""
 import os
 from pathlib import Path
 import textwrap
@@ -88,6 +88,111 @@ class ReleaseInvocation(unittest.TestCase):
             with self.subTest(job=job, context='missing'), mock.patch.dict(os.environ, {}, clear=True), \
                     self.assertRaises(SystemExit):
                 exec(program, {})
+
+
+
+class WebsiteInvocation(unittest.TestCase):
+    def setUp(self):
+        root = Path(__file__).resolve().parents[1]
+        self.workflow = (root / '.github/workflows/pages.yml').read_text(encoding='utf-8')
+        build, deploy = self.workflow.split('\n  build:\n', 1)[1].split('\n  deploy:\n', 1)
+        self.sections = dict(build=build, deploy=deploy)
+        self.guards, self.programs = {}, {}
+        for job, section in self.sections.items():
+            steps = section.split('    steps:\n', 1)[1]
+            guard = steps.split('\n      - ', 1)[0]
+            self.guards[job] = guard
+            inline = guard.split("python -I - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
+            self.programs[job] = compile(textwrap.dedent(inline), '<fixed-website-invocation>', 'exec')
+        check = build.split('      - name: Check reviewed public output\n', 1)[1].split('\n      - ', 1)[0]
+        inline = check.split("python -I - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
+        self.check = compile(textwrap.dedent(inline), '<fixed-website-selection>', 'exec')
+
+    def environment(self):
+        return dict(EXPECTED_SITE_COMMIT='2' * 40, GITHUB_SHA=COMMIT,
+                    GITHUB_WORKFLOW_SHA=COMMIT, GITHUB_REPOSITORY=REPOSITORY,
+                    GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REF='refs/heads/main',
+                    GITHUB_WORKFLOW_REF=REPOSITORY + '/.github/workflows/pages.yml@refs/heads/main')
+
+    def test_actual_guard_accepts_distinct_exact_source_and_site_but_rejects_foreign_invocations(self):
+        variants = [('EXPECTED_SITE_COMMIT', ''), ('EXPECTED_SITE_COMMIT', 'site-content'),
+                    ('EXPECTED_SITE_COMMIT', 'A' * 40), ('EXPECTED_SITE_COMMIT', '2' * 39),
+                    ('GITHUB_SHA', ''), ('GITHUB_SHA', 'A' * 40),
+                    ('GITHUB_WORKFLOW_SHA', '3' * 40), ('GITHUB_REPOSITORY', 'fork/PeerBrush'),
+                    ('GITHUB_EVENT_NAME', 'push'), ('GITHUB_EVENT_NAME', 'pull_request_target'),
+                    ('GITHUB_REF', 'refs/heads/site-content'), ('GITHUB_REF', 'refs/tags/v0.30.0'),
+                    ('GITHUB_WORKFLOW_REF', REPOSITORY + '/.github/workflows/other.yml@refs/heads/main'),
+                    ('GITHUB_WORKFLOW_REF', REPOSITORY + '/.github/workflows/pages.yml@refs/heads/topic')]
+        for job, program in self.programs.items():
+            with self.subTest(job=job, valid=True), mock.patch.dict(os.environ, self.environment(), clear=True):
+                exec(program, {})
+            for key, value in variants:
+                with self.subTest(job=job, key=key, value=value), \
+                        mock.patch.dict(os.environ, dict(self.environment(), **{key: value}), clear=True), \
+                        self.assertRaises(SystemExit) as failure:
+                    exec(program, {})
+                self.assertEqual(str(failure.exception),
+                                 'Website deployment requires its exact official main workflow and reviewed site commit.')
+            with self.subTest(job=job, missing=True), mock.patch.dict(os.environ, {}, clear=True), \
+                    self.assertRaises(SystemExit):
+                exec(program, {})
+
+    def test_guards_precede_checkout_and_privileged_actions_without_changing_manual_protections(self):
+        for job, section in self.sections.items():
+            guard = self.guards[job]
+            self.assertTrue(guard.lstrip().startswith('- name: Require exact website invocation\n'))
+            self.assertNotIn('uses:', guard)
+            self.assertNotIn('scripts/', guard)
+            self.assertLess(section.index('name: Require exact website invocation'), section.index('uses: actions/'))
+        build = self.sections['build']
+        checkout = build.split('uses: actions/checkout@', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('ref: ' + '$' + '{{ inputs.expected_site_commit }}', checkout)
+        self.assertNotIn('ref: site-content', checkout)
+        self.assertIn('persist-credentials: false', checkout)
+        self.assertLess(build.index('name: Check reviewed public output'), build.index('uses: actions/configure-pages@'))
+        self.assertIn('path: public-site', build)
+        self.assertIn('on:\n  workflow_dispatch:', self.workflow)
+        self.assertNotIn('  push:', self.workflow)
+        self.assertIn('permissions:\n  contents: read\n', self.workflow)
+        self.assertIn('env:\n  EXPECTED_SITE_COMMIT: ' + '$' + '{{ inputs.expected_site_commit }}', self.workflow)
+        self.assertIn('concurrency:\n  group: github-pages\n  cancel-in-progress: false', self.workflow)
+        self.assertIn('    needs: build\n', self.sections['deploy'])
+        self.assertIn('    permissions:\n      pages: write\n      id-token: write', self.sections['deploy'])
+        self.assertIn('    environment:\n      name: github-pages\n', self.sections['deploy'])
+        import json
+        inventory = json.loads((Path(__file__).resolve().parents[1] / 'scripts/package-files.json').read_text())
+        for path in ['.github/workflows/pages.yml', 'scripts/test_release_source_guard.py']:
+            self.assertIn(path, inventory['source'])
+            self.assertNotIn(path, inventory['portable'])
+
+    def test_actual_selection_pins_checkout_and_fetched_current_output_tip(self):
+        expected = self.environment()['EXPECTED_SITE_COMMIT']
+        with mock.patch.dict(os.environ, self.environment(), clear=True), \
+                mock.patch('subprocess.check_output', side_effect=[expected + '\n', expected + '\n']) as read, \
+                mock.patch('subprocess.run') as fetch, mock.patch.object(Path, 'is_file', return_value=True) as file:
+            exec(self.check, {})
+        self.assertEqual(read.call_args_list,
+                         [mock.call(['git', 'rev-parse', 'HEAD'], text=True),
+                          mock.call(['git', 'rev-parse', 'FETCH_HEAD'], text=True)])
+        fetch.assert_called_once_with(['git', 'fetch', '--no-tags', '--depth=1', 'origin',
+                                       'refs/heads/site-content'], check=True)
+        self.assertEqual(file.call_count, 2)
+
+    def test_actual_selection_rejects_wrong_checkout_moved_tip_missing_output_and_failed_fetch(self):
+        import subprocess
+        expected = self.environment()['EXPECTED_SITE_COMMIT']
+        for head, tip, present, fetch_error in [(COMMIT, expected, True, None),
+                                                (expected, COMMIT, True, None),
+                                                (expected, expected, False, None),
+                                                (expected, expected, True, subprocess.CalledProcessError(1, 'git'))]:
+            with self.subTest(head=head, tip=tip, present=present, fetch_error=fetch_error is not None), \
+                    mock.patch.dict(os.environ, self.environment(), clear=True), \
+                    mock.patch('subprocess.check_output', side_effect=[head, tip]), \
+                    mock.patch('subprocess.run', side_effect=fetch_error) as fetch, \
+                    mock.patch.object(Path, 'is_file', return_value=present), \
+                    self.assertRaises((SystemExit, subprocess.CalledProcessError)):
+                exec(self.check, {})
+            self.assertEqual(fetch.call_count, int(head == expected))
 
 
 if __name__ == '__main__':
