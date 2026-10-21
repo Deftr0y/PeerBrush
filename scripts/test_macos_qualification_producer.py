@@ -68,9 +68,9 @@ class NativeProducer(unittest.TestCase):
         repo = dict(id=acquire.REPOSITORY_ID, full_name=acquire.REPOSITORY,
                     owner=dict(id=acquire.OWNER_ID), fork=False, private=False)
         self.run = dict(id=101, run_attempt=1, status='completed', conclusion='success',
-            event='workflow_dispatch', head_branch='main', head_sha=COMMIT, pull_requests=[],
+            event='workflow_dispatch', path=acquire.SIGNING_WORKFLOW, head_branch='main', head_sha=COMMIT, pull_requests=[],
             repository=copy.deepcopy(repo), head_repository=copy.deepcopy(repo))
-        self.artifact = dict(id=202, expired=False, digest='sha256:' + sha(self.wrapper), size_in_bytes=len(self.wrapper),
+        self.artifact = dict(id=202, name='macos-signed-pair-101-1', expired=False, digest='sha256:' + sha(self.wrapper), size_in_bytes=len(self.wrapper),
             url='https://api.github.com' + acquire.API + 'artifacts/202',
             archive_download_url='https://api.github.com' + acquire.API + 'artifacts/202/zip',
             workflow_run=dict(id=101, repository_id=acquire.REPOSITORY_ID,
@@ -121,8 +121,13 @@ class NativeProducer(unittest.TestCase):
 
     def test_predecessor_first_success_main_and_exact_official_artifact_are_mandatory(self):
         self.assertEqual(self.metadata(), len(self.wrapper))
+        self.run['path'] = acquire.SIGNING_WORKFLOW + '@main'
+        self.assertEqual(self.metadata(), len(self.wrapper))
+        self.run['path'] = acquire.SIGNING_WORKFLOW
         original_run, original_artifact = copy.deepcopy(self.run), copy.deepcopy(self.artifact)
-        for key, value in [('run_attempt', 2), ('run_attempt', True), ('event', 'pull_request'),
+        for key, value in [('run_attempt', 2), ('run_attempt', True), ('event', 'pull_request'), ('event', 'push'),
+                           ('path', '.github/workflows/apple-signing.yml'),
+                           ('path', acquire.SIGNING_WORKFLOW + '@other'), ('path', None),
                            ('status', 'in_progress'), ('conclusion', 'failure'), ('head_sha', '0' * 40),
                            ('head_branch', 'feature/0.3/fork'), ('pull_requests', [{}])]:
             self.run = copy.deepcopy(original_run)
@@ -135,7 +140,8 @@ class NativeProducer(unittest.TestCase):
             with self.subTest(repository_field=key), self.assertRaises(ValueError):
                 self.metadata()
         self.run = original_run
-        for key, value in [('id', 203), ('expired', True), ('digest', 'sha256:' + '0' * 64),
+        for key, value in [('id', 203), ('name', 'macos-signing-recovery-101-1'),
+                           ('name', 'macos-signed-pair-102-1'), ('expired', True), ('digest', 'sha256:' + '0' * 64),
                            ('size_in_bytes', acquire.MAX_ARTIFACT + 1),
                            ('archive_download_url', 'https://example.invalid/artifact'),
                            ('workflow_run', dict(original_artifact['workflow_run'], head_repository_id=1))]:

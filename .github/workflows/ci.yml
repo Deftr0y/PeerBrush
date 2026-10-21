@@ -261,6 +261,7 @@ jobs:
       - run: python -B scripts/test_store_msix_preflight.py
       - run: python -B scripts/test_store_msix_handoff.py
       - run: python scripts/test_sign_macos.py
+      - run: python -B scripts/test_macos_signing_producer.py
       - run: python -B scripts/test_deb.py
       - run: python -B scripts/test_deb_version_upgrade_checks.py
       - run: python -B scripts/test_macos_dmg.py

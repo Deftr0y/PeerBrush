@@ -11,11 +11,11 @@ on:
         required: true
         type: string
       source_run_id:
-        description: Exact successful first-attempt official main artifact run
+        description: Exact successful first-attempt macos-release-signing main run
         required: true
         type: string
       artifact_id:
-        description: Immutable artifact ID containing exactly the selected ZIP and DMG
+        description: Immutable macos-signed-pair-RUN_ID-1 artifact ID
         required: true
         type: string
       artifact_sha256:

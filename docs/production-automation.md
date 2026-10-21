@@ -158,3 +158,61 @@ Store certification/submission, public availability or production readiness.
 All those authority/readiness fields remain explicitly unverified or false.
 No workflow dispatch, Store authentication, publication or signing configuration
 is enabled by this change.
+
+
+## Current-source Mac signing producer (unreleased, dormant)
+
+`macos-release-signing.yml` prepares the missing signed ZIP/final DMG pair for the
+existing native qualification workflow. It neither replaces nor changes the
+historical 0.26 Apple workflow. Both new jobs require an independently repeated
+full source SHA equal to the official main event and workflow SHA, a first
+manual attempt, hosted macOS ARM64 and the missing-by-default
+`PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED` variable. Neither approval settings nor
+this variable are configured by the source change. Do not enable or dispatch it
+without explicit approval and verification of the existing `apple-signing`
+environment's required-reviewer, ref, credential and concurrency protections.
+
+The credential-free job requires a clean stable Cargo/lock version, current
+native tools, formatting, engine/codec/protocol tests and Clippy before building
+and inspecting its exact unsigned Mac ZIP. The dependent protected job verifies
+the selected same-workflow ZIP hash before importing credentials. It reuses the
+reviewed temporary-keychain setup with only its lifetime extended from 7200 to
+10800 seconds for the 150-minute two-format job; the historical workflow is
+unchanged. Each signer retains its existing bounded upload/wait operations.
+It uses the existing `sign_macos.py` ZIP then DMG
+paths, with separate original notarization journals and explicit format/revision
+arguments. No key, account, certificate, permission or protected environment is
+created. This is a Mac producer; three-platform release acceptance remains a
+separate production prerequisite.
+
+Only two exact hash-read-back files enter `macos-signed-pair-RUN_ID-1`: the
+revisioned `-apple-signed-rN.zip` and its `-dmg-signed-rN.dmg`. Checksums and signer
+receipts are not extra members of this pair artifact. The upload's public
+artifact ID/digest and both inner digests are recorded for independent selection;
+the consumer still re-downloads and hashes the artifact and both files. Its
+strict run metadata now requires this producer's workflow path (the documented
+bare or `@main` representation), manual event and exact pair artifact name,
+alongside the existing official source/repository, successful first attempt and
+immutable ID/digest checks. Other workflows and recovery artifacts cannot stand
+in for the pair.
+
+Workflow reruns are refused and neither signer retries a notarization upload.
+On failure, a separate bounded credentials-free recovery tar preserves only
+the journal-selected public input, state and submitted payload; ZIP executable
+modes are retained. DMG finalization/mount directories are never traversed or
+recursively removed. An incomplete tar is never published as a recovery input.
+The recovery artifact has seven-day retention and is **not durable guaranteed
+storage**: cancellation, runner failure, upload failure or the recovery budget
+can prevent it. Reconcile Apple history and preserve the exact work before any
+new submission; use the existing local `--resume` path with the original source,
+input, identity and revision only after reconciliation. This workflow does not
+download or restore a recovery archive automatically. Activation must include an
+approved operational recovery procedure; a missing recovery artifact is a
+blocker, not permission to start a new submission.
+
+The producer does not dispatch qualification, authenticate its own receipts,
+attest native acceptance, install the application, publish assets, submit to a
+store, deploy the website or configure an updater. Stable source, approved
+provider access/protection and actual signing, qualification, installed/update
+and public readback acceptance remain required. Its offline workflow fixtures
+are code tests, not real Apple issuance or release evidence.

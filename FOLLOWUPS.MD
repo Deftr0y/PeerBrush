@@ -495,3 +495,6 @@ Combined checkpoint b99dd37 (unreleased):1,190 Rust passes, zero failures,15igno
 
 
 PB-068 native-mask loading prerequisite (unreleased, next combined tests pending): standard PSD/PSB masks now decode native rows into local tiles while retaining all existing admission, compression/integrity, offset/default, cancellation and protected-document rules. Four reviewed prepared methods cover exact native/source/composite, malformed and interruption behavior. No dimension/pixel/storage limit is raised and no measured total-memory or16000-square acceptance is claimed.
+
+
+PB-145/PB-154 Mac caller prerequisite (unreleased, dormant): the reviewed current-source producer wires existing ZIP/final-DMG signers to strict same-source flat-pair acquisition, with protected approval, first-attempt/main/hosted guards, precredential byte verification and bounded separate credentials-free same-submission recovery. Ten offline methods and caller/inventory changes are prepared and independently reviewed; combined/native/provider/installed acceptance and operational recovery approval remain open. No signing dispatch, enable variable, protected environment, credential or publication state changed.

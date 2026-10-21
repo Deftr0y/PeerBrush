@@ -26,6 +26,7 @@ REPOSITORY = 'Deftr0y/PeerBrush'
 REPOSITORY_ID = 1407648785
 OWNER_ID = 21202494
 WORKFLOW = REPOSITORY + '/.github/workflows/macos-qualification.yml@refs/heads/main'
+SIGNING_WORKFLOW = '.github/workflows/macos-release-signing.yml'
 API = '/repos/' + REPOSITORY + '/actions/'
 MAX_FILE = 512 * 1024 * 1024
 MAX_ARTIFACT = 2 * MAX_FILE + 1024 * 1024
@@ -154,10 +155,12 @@ def metadata(run, artifact, *, commit, run_id, artifact_id, artifact_sha256):
     if (type(run.get('id')) is not int or run['id'] != int(run_id)
             or type(run.get('run_attempt')) is not int or run['run_attempt'] != 1
             or run.get('status') != 'completed' or run.get('conclusion') != 'success'
-            or run.get('event') not in ['push', 'workflow_dispatch'] or run.get('head_branch') != 'main'
+            or run.get('event') != 'workflow_dispatch' or run.get('head_branch') != 'main'
+            or run.get('path') not in {SIGNING_WORKFLOW, SIGNING_WORKFLOW + '@main'}
             or run.get('head_sha') != commit or run.get('pull_requests') != []):
         raise ValueError('Native predecessor is not the exact successful first main attempt.')
-    expected = dict(id=int(artifact_id), expired=False, digest='sha256:' + artifact_sha256,
+    expected = dict(id=int(artifact_id), name='macos-signed-pair-' + run_id + '-1',
+        expired=False, digest='sha256:' + artifact_sha256,
         url='https://api.github.com' + API + 'artifacts/' + artifact_id,
         archive_download_url='https://api.github.com' + API + 'artifacts/' + artifact_id + '/zip')
     if (any(artifact.get(key) != value or type(artifact.get(key)) is not type(value) for key, value in expected.items())

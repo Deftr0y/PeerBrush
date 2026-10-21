@@ -150,3 +150,25 @@ python scripts/qualify_macos_dmg.py --source-root "$REVIEWED_SOURCE" \
 The consumer checks committed corresponding source and embedded executable identity, reconstructs every expected app/support file, mode and Applications shortcut directly from the selected ZIP, then rechecks actual app/image publisher trust, timestamps, hardened runtime, tickets and Gatekeeper. Read-only image mounting must expose exactly one selected volume. Cleanup binds the entire BSD device to that exact image, detaches it and confirms removal. Ambiguous/extra volumes or failed cleanup fail qualification and retain work; do not recursively delete unresolved mounts. Both original and private input copies are hashed again after native inspection.
 
 The exclusive `dmg-qualification.json` contains a strict sanitized asset record and factual check results, with installation/public/production readiness still false or unverified. It contains no local paths, private signing information or arbitrary signer-sidecar fields. Native execution authority still needs a successful trusted native job when consumed; matching JSON alone does not authenticate a producer. This leaf consumer is not yet wired into the aggregate/website final-installer adapter. Select the verified signed ZIP as the Mac portable asset before first publication; existing published files remain immutable. No existing Apple workflow source pin or activation setting is changed.
+
+
+### Prepared current-source workflow caller (disabled)
+
+The separate `macos-release-signing.yml` workflow can prepare both existing
+signer formats for the same reviewed stable main source. See the
+[current-source producer contract](production-automation.md#current-source-mac-signing-producer-unreleased-dormant)
+before activation. It preserves the historical 0.26 source/identity pins, uses
+the existing protected `apple-signing` approval boundary and remains disabled
+without its explicit enable variable. No workflow was dispatched and no remote
+credential, trust or protection setting was changed by this preparation.
+
+The signing functions still own native verification, immutable output and
+same-submission resume. The new caller's flat pair artifact deliberately omits
+sidecar receipts; downstream native qualification reopens the actual ZIP/DMG
+bytes and authenticates its own separate report. A separate credentials-free
+recovery archive retains selected journal/payload files with modes; it does not
+include the keychain, P12 or account secrets, and never walks retained mounts.
+Seven-day artifact retention and best-effort failure steps do not guarantee
+recovery. Never rerun or resubmit after uncertainty without reconciling the
+original notarization and preserving its exact work. Native issuance, installed
+drag/quarantine/update acceptance and all publication gates remain open.
