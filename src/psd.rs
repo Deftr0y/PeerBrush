@@ -525,7 +525,12 @@ fn embedded_source<R: Read>(
         .check()
         .map_err(std::io::Error::other)
         .map_err(serde_json::Error::io)?;
-    serde_json::from_slice(&json)
+    #[cfg(test)]
+    observe_open_phase("json_inflated", json.len());
+    let result = serde_json::from_slice(&json);
+    #[cfg(test)]
+    observe_open_phase("json_parsed", 0);
+    result
 }
 struct BoundedWriter<'a, W> {
     inner: W,
@@ -2056,6 +2061,8 @@ pub fn decode_reader<R: Read + std::io::Seek>(
         "Reading layer sources",
     )?;
     let transparency = merged_transparency(&layer_section, depth, layout)?;
+    #[cfg(test)]
+    observe_open_phase("sections_read", resources.len() + layer_section.len());
     let mut input = HashedReader {
         reader,
         hash: 0xcbf29ce484222325,
@@ -2077,6 +2084,8 @@ pub fn decode_reader<R: Read + std::io::Seek>(
             break;
         }
     }
+    #[cfg(test)]
+    observe_open_phase("composite_decoded", 0);
     decode_parts(
         &resources,
         &layer_section,
@@ -2195,6 +2204,8 @@ fn decode_parts(
         }
     }
     control.preview(&merged, icc_profile.as_deref().map(Vec::as_slice))?;
+    #[cfg(test)]
+    observe_open_phase("preview_ready", 0);
     let high = depth == 16;
     if high && !has_merged_composite {
         return Err("This 16-bit PSD has no saved compatibility image. Re-save a copy in Photoshop with Maximize PSD Compatibility enabled to preview it in PeerBrush".into());
@@ -2208,7 +2219,11 @@ fn decode_parts(
         } else {
             128 * 1024 * 1024
         };
+        #[cfg(test)]
+        observe_open_phase("json_start", bytes.len());
         let result = embedded_source(ZlibDecoder::new(bytes), limit, control);
+        #[cfg(test)]
+        observe_open_phase("source_decoded", 0);
         control.check()?;
         if let Ok(mut e) = result {
             if (1..=34).contains(&e.format)
@@ -2231,6 +2246,8 @@ fn decode_parts(
                 && validate(&e.document).is_ok()
                 && metadata_sources_match(layer_section, layout, &e.document, control) == Ok(true)
             {
+                #[cfg(test)]
+                observe_open_phase("source_accepted", 0);
                 control.progress("Ready", 1, 1)?;
                 e.document.srgb_tagged |= srgb_tagged;
                 return Ok(e.document);
@@ -4024,3 +4041,6 @@ mod mask_rows_tests;
 
 #[cfg(test)]
 mod source_stream_tests;
+
+#[cfg(test)]
+pub(crate) use source_stream_tests::observe_phase as observe_open_phase;

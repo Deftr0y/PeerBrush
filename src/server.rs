@@ -279,7 +279,11 @@ fn open_progress_inner(
     if crate::file_safety::version_with_check(path, || control.check())? != version {
         return Err("File changed while opening; try again".into());
     }
+    #[cfg(test)]
+    psd::observe_open_phase("decoder_start", 0);
     let mut doc = psd::decode_reader(&mut file, control)?;
+    #[cfg(test)]
+    psd::observe_open_phase("decoder_returned", 0);
     doc.name = path
         .file_name()
         .unwrap_or_default()
@@ -294,11 +298,15 @@ fn open_progress_inner(
     if (e.doc.id.clone(), e.doc.revision) != before {
         return Err("Canvas changed while opening. Save the current work and try again.".into());
     }
+    #[cfg(test)]
+    psd::observe_open_phase("source_verified", 0);
     e.replace(doc, Some(path.into()))?;
     ownership.published(version.identity);
     e.release_file_ownership();
     e.file_ownership = Some(ownership);
     e.file_version = Some(version);
+    #[cfg(test)]
+    psd::observe_open_phase("replaced", 0);
     Ok(())
 }
 /// Explicitly flatten unsupported Photoshop structure without reducing channel precision or replacing its file.

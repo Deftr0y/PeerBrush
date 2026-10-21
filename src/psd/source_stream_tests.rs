@@ -568,3 +568,302 @@ fn supplementary_restore_component_timings_keep_exact_dense_sparse_native_docume
         }
     }
 }
+
+type OpenObserver = Box<dyn FnMut(&'static str, usize)>;
+thread_local! {
+    static OPEN_OBSERVER: std::cell::RefCell<Option<OpenObserver>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn observe_phase(phase: &'static str, bytes: usize) {
+    let callback = OPEN_OBSERVER.with(|slot| slot.borrow_mut().take());
+    if let Some(mut callback) = callback {
+        callback(phase, bytes);
+        OPEN_OBSERVER.with(|slot| *slot.borrow_mut() = Some(callback));
+    }
+}
+struct WatchOpen;
+impl WatchOpen {
+    fn new(callback: impl FnMut(&'static str, usize) + 'static) -> Self {
+        OPEN_OBSERVER.with(|slot| assert!(slot.borrow_mut().replace(Box::new(callback)).is_none()));
+        Self
+    }
+}
+impl Drop for WatchOpen {
+    fn drop(&mut self) {
+        OPEN_OBSERVER.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+const OPEN_PHASES: [&str; 14] = [
+    "request_start",
+    "decoder_start",
+    "sections_read",
+    "composite_decoded",
+    "preview_ready",
+    "json_start",
+    "json_inflated",
+    "json_parsed",
+    "source_decoded",
+    "source_accepted",
+    "decoder_returned",
+    "source_verified",
+    "replaced",
+    "request_return",
+];
+
+#[test]
+fn open_phase_observer_is_scoped_and_removes_itself_around_callbacks() {
+    use std::{cell::RefCell, rc::Rc};
+    let phases = Rc::new(RefCell::new(Vec::new()));
+    let seen = phases.clone();
+    let watch = WatchOpen::new(move |phase, bytes| {
+        seen.borrow_mut().push((phase, bytes));
+        observe_phase("nested", 99);
+    });
+    observe_phase("json_start", 12);
+    observe_phase("json_inflated", 34);
+    drop(watch);
+    observe_phase("after_drop", 56);
+    assert_eq!(
+        *phases.borrow(),
+        vec![("json_start", 12), ("json_inflated", 34)]
+    );
+}
+
+#[test]
+#[ignore = "Opt-in actual 2048-square shared Open phases; run alone from a clean build"]
+fn actual_dense_psd_open_phase_diagnostic() {
+    use std::{
+        cell::RefCell,
+        fs,
+        rc::Rc,
+        sync::{Arc, Mutex},
+        time::Instant,
+    };
+    let build: Value = serde_json::from_str(crate::build_info::json()).unwrap();
+    assert_eq!(build["tree"], "clean");
+    assert_eq!(build["format"], "PeerBrushBuildInfoV1");
+    assert_eq!(build["product"], "PeerBrush");
+    assert_eq!(build["commit"].as_str().unwrap().len(), 40);
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = parent.join(format!("pb-open-phases-{}", crate::engine::id()));
+    fs::create_dir(&directory).unwrap();
+    assert_eq!(
+        directory.canonicalize().unwrap().parent(),
+        Some(parent.as_path())
+    );
+    let mut records = Vec::new();
+    for depth in [8, 16] {
+        let source = directory.join(format!("native-{depth}.psd"));
+        let mut document = Document::new_depth(2048, 2048, depth).unwrap();
+        document.name = source.file_name().unwrap().to_string_lossy().into_owned();
+        document.srgb_tagged = true;
+        for y in 0..2048u16 {
+            for x in 0..2048u16 {
+                let alpha = if (u32::from(x) + 3 * u32::from(y)) % 17 == 0 {
+                    0
+                } else if (u32::from(x) + u32::from(y)) % 7 == 0 {
+                    65535
+                } else {
+                    12001u16
+                        .wrapping_add(x.wrapping_mul(31))
+                        .wrapping_add(y.wrapping_mul(47))
+                };
+                document.layers[0].pixels.set16(
+                    i32::from(x),
+                    i32::from(y),
+                    [
+                        x.wrapping_mul(239)
+                            .wrapping_add(y.wrapping_mul(911))
+                            .wrapping_add(17),
+                        x.wrapping_mul(13) ^ y.wrapping_mul(907) ^ 0x873b,
+                        x.wrapping_add(y).wrapping_mul(613).wrapping_add(0x4ef3),
+                        alpha,
+                    ],
+                );
+            }
+        }
+        let pixels = &document.layers[0].pixels;
+        assert_eq!(pixels.depth, depth);
+        assert_eq!(pixels.get16(0, 0)[3], 0);
+        assert_ne!(pixels.get16(0, 0)[..3], [0; 3]);
+        assert!(pixels.get16(1, 1)[3] > 0 && pixels.get16(1, 1)[3] < 65535);
+        assert_eq!(pixels.get16(7, 0)[3], 65535);
+        if depth == 16 {
+            assert!(pixels.get16(1, 1)[..3].iter().any(|value| value % 257 != 0));
+        }
+        let bytes = encode(&document).unwrap();
+        assert!(bytes.len() <= 256 * 1024 * 1024);
+        current_standard_composite(&bytes, Layout::Psd, &document);
+        let expected = serde_json::to_value(&document).unwrap();
+        let expected_png = document.export_png().unwrap();
+        let image = image::load_from_memory(&expected_png).unwrap();
+        assert_eq!(
+            image.color(),
+            if depth == 16 {
+                image::ColorType::Rgba16
+            } else {
+                image::ColorType::Rgba8
+            }
+        );
+        drop(image);
+        {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&source)
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
+        }
+        let version = crate::file_safety::version(&source).unwrap();
+        for repetition in 1..=3 {
+            let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+            let (document_id, revision) = {
+                let engine = shared.lock().unwrap();
+                (engine.doc.id.clone(), engine.doc.revision)
+            };
+            let request = json!({"action":"open","document_id":document_id.clone(),"expected_revision":revision,"path":source,"actor":"human"});
+            let phases = Rc::new(RefCell::new(Vec::new()));
+            let seen = phases.clone();
+            let watch = WatchOpen::new(move |phase, bytes| {
+                seen.borrow_mut().push((phase, Instant::now(), bytes));
+            });
+            let started = Instant::now();
+            phases.borrow_mut().push(("request_start", started, 0));
+            crate::server::dispatch(&shared, "document", &request).unwrap();
+            let finished = Instant::now();
+            drop(watch);
+            phases.borrow_mut().push(("request_return", finished, 0));
+            let phases = phases.borrow();
+            assert_eq!(
+                phases.iter().map(|phase| phase.0).collect::<Vec<_>>(),
+                OPEN_PHASES
+            );
+            let total_ms = finished.duration_since(started).as_secs_f64() * 1000.;
+            assert!(total_ms.is_finite() && total_ms > 0.);
+            let mut sum = 0.;
+            let mut durations = serde_json::Map::new();
+            for adjacent in phases.windows(2) {
+                let elapsed = adjacent[1].1.duration_since(adjacent[0].1).as_secs_f64() * 1000.;
+                assert!(elapsed.is_finite() && elapsed >= 0.);
+                sum += elapsed;
+                assert!(durations
+                    .insert(adjacent[1].0.into(), json!(elapsed))
+                    .is_none());
+            }
+            assert!((sum - total_ms).abs() <= 1e-6);
+            let compressed = phases
+                .iter()
+                .find(|phase| phase.0 == "json_start")
+                .unwrap()
+                .2;
+            let decoded = phases
+                .iter()
+                .find(|phase| phase.0 == "json_inflated")
+                .unwrap()
+                .2;
+            assert!(
+                compressed > 0
+                    && decoded > 0
+                    && decoded
+                        <= if depth == 16 {
+                            512 * 1024 * 1024
+                        } else {
+                            128 * 1024 * 1024
+                        }
+            );
+            let opened_document;
+            {
+                let engine = shared.lock().unwrap();
+                opened_document = engine.doc.id.clone();
+                assert!(
+                    !opened_document.is_empty()
+                        && opened_document != document.id
+                        && opened_document != document_id
+                );
+                // Engine::replace deliberately creates a fresh runtime document ID.
+                let mut actual = serde_json::to_value(&engine.doc).unwrap();
+                actual["id"] = expected["id"].clone();
+                assert!(
+                    actual == expected,
+                    "All persisted native source definitions and stored words remain exact"
+                );
+                assert!(engine.doc.layers[0].pixels == document.layers[0].pixels);
+                assert_eq!(engine.doc.layers.len(), 1);
+                assert!(
+                    engine.doc.layers[0].source.is_none() && engine.doc.layers[0].mask.is_none()
+                );
+                assert!(
+                    engine.doc.warnings.is_empty()
+                        && !engine.doc.read_only
+                        && engine.doc.srgb_tagged
+                );
+                assert_eq!(engine.doc.bit_depth, depth);
+                assert!(engine.undo.is_empty() && engine.redo.is_empty());
+                assert_eq!(engine.saved_revision, engine.doc.revision);
+                assert!(engine.loading.is_none() && engine.file_ownership.is_some());
+                assert_eq!(engine.file_version, Some(version));
+                assert_eq!(engine.path.as_deref(), Some(source.as_path()));
+                assert_eq!(engine.doc.export_png().unwrap(), expected_png);
+            }
+            assert_eq!(crate::file_safety::version(&source).unwrap(), version);
+            let other = Arc::new(Mutex::new(crate::engine::Engine::new()));
+            let before = other.lock().unwrap().doc.id.clone();
+            assert!(crate::server::open(&other, &source)
+                .unwrap_err()
+                .starts_with("File already open"));
+            assert_eq!(other.lock().unwrap().doc.id, before);
+            {
+                let engine = shared.lock().unwrap();
+                assert_eq!(engine.doc.id, opened_document);
+                let mut actual = serde_json::to_value(&engine.doc).unwrap();
+                actual["id"] = expected["id"].clone();
+                assert!(actual == expected);
+                assert!(engine.undo.is_empty() && engine.redo.is_empty());
+            }
+            let phase_count = durations.len();
+            records.push(json!({"depth":depth,"repetition":repetition,"width":2048,"height":2048,
+                "encoded_bytes":bytes.len(),"compressed_json_bytes":compressed,"decoded_json_bytes":decoded,
+                "phase_ms":durations,"total_ms":total_ms,"phase_sum_ms":sum,"phase_count":phase_count,
+                "native_source_and_hidden_rgb_exact":true,"native_png_exact":true,"current_standard_composite_exact":true,
+                "source_file_and_ownership_preserved":true,"empty_history_preserved":true,"embedded_source_accepted":true}));
+        }
+        // Timed reads and all checks must leave the complete original file unchanged.
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+    }
+    assert_eq!(records.len(), 6);
+    for depth in [8, 16] {
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["depth"] == depth)
+                .count(),
+            3
+        );
+    }
+    // Only this newly created, checked synthetic directory is eligible for cleanup.
+    let metadata = fs::symlink_metadata(&directory).unwrap();
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(metadata.file_attributes() & 0x400, 0);
+    }
+    assert_eq!(
+        directory.canonicalize().unwrap().parent(),
+        Some(parent.as_path())
+    );
+    fs::remove_dir_all(&directory).unwrap();
+    assert!(!directory.exists());
+    println!(
+        "\n{}",
+        json!({"format":"PeerBrushOpenPhaseDiagnosticV1","build":build,"native_window":false,
+        "normal_application":false,"before_after_comparison":false,"cli_ipc_included":false,
+        "workload":"actual guarded shared-server Open of one-layer dense native 2048-square PSD",
+        "profile":if cfg!(debug_assertions) {"test-debug-assertions"} else {"test-release"},
+        "note":"Observer/test-profile overhead included. Generation, correctness checks and encoding excluded. Cache, allocation and fixed depth order are uncontrolled. Final source intervals include lock acquisition and checks; these are not total lock-held times. No normal-main/input/memory/16k claim.",
+        "records":records})
+    );
+}
