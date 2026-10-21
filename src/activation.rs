@@ -227,7 +227,10 @@ mod tests {
             assert!(take_quit(&registry));
             assert!(!take_quit(&registry));
             assert_eq!(next(&registry), Some(file));
-            assert_eq!(root.lock().unwrap().doc, before);
+            assert_eq!(
+                serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
             registry.lock().unwrap().exiting = true;
             signal.store(true, Ordering::Release);
             assert!(!take_quit(&registry));

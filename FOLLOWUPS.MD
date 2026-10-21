@@ -519,3 +519,6 @@ PB-068/PB-108 supplementary loading increment (unreleased, replay pending): deco
 
 
 PB-066 shaped text increment (unreleased, combined replay pending): explicit opt-in Ligatures and joining uses shared native bidi/script/cluster/font-face layout; omitted legacy fields keep their original rendering/serialization. Format34 retains actual standard native channels/current composites and missing-font baked sources. Reviewed prepared Arabic/Indic/Latin, collection-face, whitespace/variation, shared protocol/preview/atomic/native storage/UI-cache fixtures use pinned licensed source-only fonts. Independent source review and formatting passed; combined/native visible/installed-font/receiver acceptance and exhaustive hostile-font completion remain open.
+
+
+Combined compile preflightf6f0efe stopped before tests on five Quit-fixture Document equality type errors. A reviewed test-only correction uses complete serialized native documents and retains all lifecycle/history assertions; fresh compile and combined acceptance remain pending.

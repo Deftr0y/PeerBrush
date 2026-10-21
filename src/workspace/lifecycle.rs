@@ -229,8 +229,18 @@ mod tests {
                         let e = shared.lock().unwrap();
                         assert!(!e.closed);
                         assert_eq!(
-                            (&e.doc, e.undo.len(), e.redo.len(), e.saved_revision),
-                            (&expected.0, expected.1, expected.2, expected.3)
+                            (
+                                serde_json::to_value(&e.doc).unwrap(),
+                                e.undo.len(),
+                                e.redo.len(),
+                                e.saved_revision,
+                            ),
+                            (
+                                serde_json::to_value(&expected.0).unwrap(),
+                                expected.1,
+                                expected.2,
+                                expected.3,
+                            )
                         );
                     }
                     close().unwrap();

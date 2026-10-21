@@ -457,7 +457,10 @@ mod tests {
             for (shared, expected) in [&root, &second].into_iter().zip(&before) {
                 let engine = shared.lock().unwrap();
                 assert!(!engine.closed);
-                assert_eq!(&engine.doc, expected);
+                assert_eq!(
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
                 assert_eq!(engine.undo.len(), 1);
             }
             server::save(&root, &app.connection.state_dir.join("first.psd")).unwrap();
@@ -479,7 +482,10 @@ mod tests {
             let late = root.lock().unwrap().doc.clone();
             frame(&mut app, &ctx, vec![]);
             click(&mut app, &ctx, 2);
-            assert_eq!(root.lock().unwrap().doc, late);
+            assert_eq!(
+                serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&late).unwrap()
+            );
             assert!(!app.exit_approved);
             assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
             server::save(&root, &app.connection.state_dir.join("first.psd")).unwrap();
@@ -518,7 +524,10 @@ mod tests {
                 frame(&mut app, &ctx, vec![]);
                 assert!(app.lifecycle.is_none() && !app.exit_approved, "{draft}");
                 assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
-                assert_eq!(root.lock().unwrap().doc, before);
+                assert_eq!(
+                    serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
                 assert!(match draft {
                     "color" => app.color_editor.is_some(),
                     "preferences" => app.project_settings == Some((96, 80, depth)),
