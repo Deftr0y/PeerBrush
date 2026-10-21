@@ -161,6 +161,62 @@ def png(depth=16, *, bad_filter=False):
 
 
 class FixtureContract(unittest.TestCase):
+    def test_installed_runuser_stays_bound_when_child_path_excludes_its_directory(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-runuser-') as temporary:
+            root = Path(temporary).resolve()
+            system = root / 'system-sbin'
+            child_path = root / 'child-bin'
+            system.mkdir()
+            child_path.mkdir()
+            executable = system / ('runuser.exe' if os.name == 'nt' else 'runuser')
+            executable.write_bytes(b'SYNTHETIC_NONEXECUTED_TOOL_FIXTURE\n')
+            executable.chmod(0o755)
+            original = dict(os.environ)
+            with mock.patch.dict(os.environ, {'PATH': str(system)}):
+                selected = upgrade.installed_runuser()
+            self.assertEqual(selected, executable.resolve())
+            environment = dict(PATH=str(child_path), HOME=str(root))
+            with mock.patch.dict(os.environ, {'PATH': str(child_path)}):
+                self.assertIsNone(upgrade.shutil.which('runuser'))
+                session = upgrade.Session(Path('/bin/peerbrush'), environment, root, None, selected)
+                self.assertEqual(session.command('--version')[0], str(selected))
+                reply = subprocess.CompletedProcess([], 0, b'{"ok":true,"result":{}}', b'')
+                with mock.patch.object(upgrade.subprocess, 'run', return_value=reply) as run:
+                    self.assertEqual(session.rpc('observe', {}), {})
+                    self.assertEqual(run.call_args.args[0][0], str(selected))
+                    self.assertEqual(run.call_args.kwargs['env'], environment)
+                process = mock.Mock(pid=1234)
+                process.poll.return_value = 0
+                process.wait.return_value = 0
+                with mock.patch.object(upgrade.subprocess, 'Popen', return_value=process) as popen:
+                    with self.assertRaises(ValueError):
+                        session.__enter__()
+                self.assertEqual(popen.call_args.args[0][0], str(selected))
+                self.assertEqual(popen.call_args.kwargs['env'], environment)
+                self.assertTrue(session.output.closed)
+            self.assertEqual(dict(os.environ), original)
+
+    def test_missing_or_invalid_runuser_fails_with_fixed_diagnostic_before_execution(self):
+        private = 'PRIVATE_RUNUSER_PATH_SENTINEL'
+        original = dict(os.environ)
+        with tempfile.TemporaryDirectory(prefix='peerbrush-runuser-missing-') as temporary:
+            root = Path(temporary).resolve()
+            regular = root / 'synthetic-nonexecutable-runuser'
+            regular.write_bytes(b'SYNTHETIC_NONEXECUTED_TOOL_FIXTURE\n')
+            for selected in [None, private, str(root / private), str(root), str(regular)]:
+                with self.subTest(kind='missing-or-invalid'), mock.patch.object(upgrade.shutil, 'which', return_value=selected), \
+                        mock.patch.object(upgrade.os, 'access', return_value=False), \
+                        mock.patch.object(upgrade.subprocess, 'run') as run, \
+                        mock.patch.object(upgrade.subprocess, 'Popen') as popen:
+                    with self.assertRaises(ValueError) as caught:
+                        upgrade.installed_runuser()
+                    self.assertEqual(str(caught.exception), 'Required runuser executable is unavailable in the disposable compatibility check.')
+                    self.assertIsNone(caught.exception.__cause__)
+                    self.assertNotIn(private, upgrade.failure_diagnostic(caught.exception))
+                    run.assert_not_called()
+                    popen.assert_not_called()
+        self.assertEqual(dict(os.environ), original)
+
     def test_failure_diagnostic_emits_only_fixed_types_allowlisted_locations_and_status(self):
         secret = 'PRIVATE_TOKEN_AND_RPC_ARGUMENTS'
         def captured(source, filename):
@@ -189,7 +245,7 @@ class FixtureContract(unittest.TestCase):
         self.assertLessEqual(len(upgrade.failure_diagnostic(error)), 256)
 
     def test_nonzero_rpc_and_readiness_timeout_keep_sanitizable_causes(self):
-        session = upgrade.Session(Path('/bin/peerbrush'), {}, Path('/private'), None)
+        session = upgrade.Session(Path('/bin/peerbrush'), {}, Path('/private'), None, Path('/usr/sbin/runuser'))
         reply = subprocess.CompletedProcess([], 23, b'PRIVATE_RPC_REPLY', b'PRIVATE_STDERR')
         with mock.patch.object(upgrade.subprocess, 'run', return_value=reply):
             with self.assertRaises(ValueError) as caught:
@@ -204,7 +260,7 @@ class FixtureContract(unittest.TestCase):
         self.assertIn('CalledProcessError exit=23', detail)
         self.assertNotIn('PRIVATE', detail)
         with tempfile.TemporaryDirectory(prefix='peerbrush-readiness-') as temporary:
-            session = upgrade.Session(Path('/bin/peerbrush'), {}, Path(temporary).resolve(), None)
+            session = upgrade.Session(Path('/bin/peerbrush'), {}, Path(temporary).resolve(), None, Path('/usr/sbin/runuser'))
             process = mock.Mock(pid=1234)
             process.poll.return_value = None
             process.wait.return_value = None
@@ -262,8 +318,8 @@ class FixtureContract(unittest.TestCase):
                 self.assertEqual(run.call_count, 1)
 
     def test_explicit_default_commands_rpc_actor_and_guarded_revision(self):
-        session = upgrade.Session(Path('/bin/peerbrush'), {'HOME': '/isolated'}, Path('/private'), Path('/legacy'))
-        self.assertEqual(session.command('--headless'), ['runuser', '-u', 'peerbrush-upgrade-qa',
+        session = upgrade.Session(Path('/bin/peerbrush'), {'HOME': '/isolated'}, Path('/private'), Path('/legacy'), Path('/usr/sbin/runuser'))
+        self.assertEqual(session.command('--headless'), [str(Path('/usr/sbin/runuser')), '-u', 'peerbrush-upgrade-qa',
             '--', str(Path('/bin/peerbrush')), '--state-dir', str(Path('/legacy')), '--headless'])
         session.state = None
         self.assertNotIn('--state-dir', session.command('--headless'))
@@ -293,7 +349,7 @@ class FixtureContract(unittest.TestCase):
             with self.assertRaises(ValueError):
                 upgrade.editable_snapshot(observed)
             self.assertEqual(upgrade.editable_snapshot(observed['state'])['document']['bit_depth'], depth)
-            session = upgrade.Session(Path('/bin/peerbrush'), {}, Path('/private'), None)
+            session = upgrade.Session(Path('/bin/peerbrush'), {}, Path('/private'), None, Path('/usr/sbin/runuser'))
             with mock.patch.object(session, 'rpc', side_effect=[observed, {'saved': True}]) as rpc:
                 self.assertEqual(session.guarded('save_report'), {'saved': True})
                 self.assertEqual(rpc.call_args.args, ('document', dict(action='save_report', document_id='doc', expected_revision=7)))
@@ -329,7 +385,7 @@ class FixtureContract(unittest.TestCase):
 
     def test_private_headless_child_group_is_reaped_and_log_closed_after_failure(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-session-') as temporary:
-            session = upgrade.Session(Path('/bin/peerbrush'), {}, Path(temporary).resolve(), None)
+            session = upgrade.Session(Path('/bin/peerbrush'), {}, Path(temporary).resolve(), None, Path('/usr/sbin/runuser'))
             process = mock.Mock(pid=1234)
             process.poll.return_value = None
             process.wait.side_effect = [subprocess.TimeoutExpired('synthetic', 10), None]
@@ -343,7 +399,7 @@ class FixtureContract(unittest.TestCase):
             self.assertTrue(session.output.closed)
             with mock.patch.object(upgrade.subprocess, 'Popen', side_effect=OSError('synthetic spawn failure')):
                 with self.assertRaises(OSError):
-                    session = upgrade.Session(Path('/bin/peerbrush'), {}, Path(temporary).resolve(), None)
+                    session = upgrade.Session(Path('/bin/peerbrush'), {}, Path(temporary).resolve(), None, Path('/usr/sbin/runuser'))
                     session.__enter__()
             self.assertTrue(session.output.closed)
 

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -217,15 +218,29 @@ def editable_snapshot(state):
                 layers=[{name: layer[name] for name in ['kind', 'bounds', 'source']} for layer in layers])
 
 
+def installed_runuser():
+    """Bind the container's tool before its child receives a restricted PATH."""
+    try:
+        selected = shutil.which('runuser')
+        if selected is not None and Path(selected).is_absolute():
+            selected = Path(selected).resolve(strict=True)
+            if selected.is_file() and os.access(selected, os.X_OK):
+                return selected
+    except (OSError, RuntimeError):
+        pass
+    raise ValueError('Required runuser executable is unavailable in the disposable compatibility check.')
+
+
 class Session:
     """Only synthetic container user state; never prints connection files or RPC contents."""
-    def __init__(self, binary, environment, work, state):
+    def __init__(self, binary, environment, work, state, runuser):
         self.binary, self.environment, self.work, self.state = binary, environment, work, state
+        self.runuser = runuser
         self.process = None
 
     def command(self, *arguments):
         state = ['--state-dir', str(self.state)] if self.state is not None else []
-        return ['runuser', '-u', 'peerbrush-upgrade-qa', '--', str(self.binary), *state, *arguments]
+        return [str(self.runuser), '-u', 'peerbrush-upgrade-qa', '--', str(self.binary), *state, *arguments]
 
     def rpc(self, method, parameters):
         response = subprocess.run(self.command('cli', method, json.dumps(dict(actor='human', **parameters))),
@@ -324,6 +339,7 @@ def check(old_source_root, package, expected, output):
         phase('dependencies')
         runtime_dependencies(package)
         phase('old-fixture')
+        runuser = installed_runuser()
         run(['useradd', '--create-home', '--shell', '/bin/sh', 'peerbrush-upgrade-qa'])
         home = Path('/home/peerbrush-upgrade-qa')
         folders = {name: home / name for name in ['state', 'config', 'data', 'cache', 'runtime', 'artwork', 'old']}
@@ -342,11 +358,11 @@ def check(old_source_root, package, expected, output):
         environment = dict(PATH=os.defpath, HOME=str(home), XDG_CONFIG_HOME=str(folders['config']),
                            XDG_DATA_HOME=str(folders['data']), XDG_CACHE_HOME=str(folders['cache']),
                            TMPDIR=str(folders['runtime']), LANG='C.UTF-8')
-        if run(['runuser', '-u', 'peerbrush-upgrade-qa', '--', str(binary), '--version'], env=environment) != 'PeerBrush ' + OLD_VERSION:
+        if run([str(runuser), '-u', 'peerbrush-upgrade-qa', '--', str(binary), '--version'], env=environment) != 'PeerBrush ' + OLD_VERSION:
             raise ValueError('Historical executable version differs from the selected published artifact.')
         legacy_file = folders['state'] / 'tool-settings.json'
         projects, samples, definitions = [], {}, {}
-        with Session(binary, environment, work, folders['state']) as old_session:
+        with Session(binary, environment, work, folders['state'], runuser) as old_session:
             old_session.rpc('tool_settings', dict(action='set', tool='brush', settings=dict(radius=31.5, opacity=0.375)))
             old_profile = old_session.rpc('tool_settings', dict(action='get', tool='brush'))['profile']
             for depth in [8, 16]:
@@ -377,7 +393,7 @@ def check(old_source_root, package, expected, output):
         run(['apt-get', 'install', '-y', *apt_options, str(package)],
             env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
         def user(command):
-            return run(['runuser', '-u', 'peerbrush-upgrade-qa', '--', *command], env=environment)
+            return run([str(runuser), '-u', 'peerbrush-upgrade-qa', '--', *command], env=environment)
         installed_identity(expected, user, deb_version(expected['version']))
         installed = Path('/usr/bin/peerbrush')
         def readback(session, phase):
@@ -395,7 +411,7 @@ def check(old_source_root, package, expected, output):
                 if png_samples(exported) != samples[project.name]:
                     raise ValueError('Current native8/16 readback differs from the historical saved project.')
         phase('explicit-readback')
-        with Session(installed, environment, work, folders['state']) as current:
+        with Session(installed, environment, work, folders['state'], runuser) as current:
             readback(current, 'explicit')
         profile_root = folders['config'] / 'peerbrush/settings-v1'
         if profile_root.exists() or legacy_file.read_bytes() != original_settings:
@@ -406,9 +422,9 @@ def check(old_source_root, package, expected, output):
                 or (profile_root / 'migration-backup/tool-settings.json').read_bytes() != original_settings):
             raise ValueError('Opt-in migration did not preserve actual historical settings and backup bytes.')
         phase('default-restart')
-        with Session(installed, environment, work, None) as current:
+        with Session(installed, environment, work, None, runuser) as current:
             readback(current, 'migrated')
-        with Session(installed, environment, work, None) as current:
+        with Session(installed, environment, work, None, runuser) as current:
             readback(current, 'restart')
         phase('preserved-inputs')
         if (legacy_file.read_bytes() != original_settings

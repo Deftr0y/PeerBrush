@@ -504,3 +504,6 @@ PB-145/PB-146 native Quit prerequisite (unreleased, combined tests pending): exa
 
 
 PB-154 export acceptance fixture (unreleased, combined replay pending): two actual b99 Windows failures identify the completion helper. Its fixed sleep count is replaced with the existing 15-second monotonic fixture deadline while retaining all terminal/native/profile/source/history/file assertions. A failure-only bounded count/category record and strict two-method CI parser avoid private output. Independent source review and formatting passed; actual cause, corrected native replay and Windows package acceptance remain open.
+
+
+PB-145/PB-155 historical DEB harness correction (unreleased, replay pending): actual b99 Ubuntu current-package lifecycle passed before a bounded historical old-fixture FileNotFoundError. The three runuser callers now bind an installed absolute executable before their restricted child PATH; all published-input/native/settings-migration/install guards remain. Two offline selection/refusal methods are prepared and source-reviewed. The observed exact failing program is unproved; actual historical upgrade/migration acceptance still requires native replay.
