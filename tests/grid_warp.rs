@@ -300,7 +300,7 @@ fn storage(doc: &Document) {
                         let stage = stages[0].clone();
                         *stages = json!(vec![stage; 17]);
                     }
-                    _ => stages[0]["before"] = json!([0.; 9]),
+                    _ => stages[0]["before"] = json!(vec![0.0; 9]),
                 }
             }))
             .unwrap();
@@ -516,7 +516,7 @@ fn independent_mask_warp_retains_off_frame_samples_and_reenters_without_an_eight
             }
             let damaged = rewrite(&bytes, |v| {
                 v["document"]["layers"][0]["mask"]["steps"][1]["pixels"]["retained"]["warps"][0]
-                    ["before"] = json!([0.; 9])
+                    ["before"] = json!(vec![0.0; 9])
             });
             protected(&psd::decode(&damaged).unwrap(), &saved, depth);
         }
