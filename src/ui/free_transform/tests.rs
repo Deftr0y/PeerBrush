@@ -3180,6 +3180,31 @@ fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_g
         let unchanged = workspace::source(&app);
         open(&mut app, &ctx);
         settle(&mut app, &ctx);
+        let current_apply = |app: &PeerBrush, output: &egui::FullOutput| {
+            let at = workspace::label(output, "Apply");
+            let editor = app.free_transform.as_ref().unwrap();
+            assert!(output.shapes.iter().any(|shape| matches!(
+                &shape.shape, egui::Shape::Text(text)
+                    if text.galley.job.text == "Apply" && shape.clip_rect.contains(at)
+            )));
+            assert!(editor.scroll_rect.unwrap().contains(at));
+            assert!(Rect::from_min_size(Pos2::ZERO, SIZE).contains(at));
+            assert_eq!(
+                ctx.layer_id_at(at),
+                Some(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("free transform")
+                ))
+            );
+            assert!(!editor
+                .context
+                .as_ref()
+                .unwrap()
+                .menu_state
+                .read()
+                .area_contains(at));
+            at
+        };
         let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
         let at = transform_context_point(&app, &ctx);
         transform_secondary(&mut app, &ctx, at, egui::Modifiers::ALT);
@@ -3248,8 +3273,9 @@ fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_g
 
         transform_context_choose(&mut app, &ctx, "Flip Horizontal");
         settle(&mut app, &ctx);
-        let apply = warp_reveal(&mut app, &ctx, SIZE, "Apply", None);
-        transform_context(&mut app, &ctx);
+        warp_reveal(&mut app, &ctx, SIZE, "Apply", None);
+        let output = transform_context(&mut app, &ctx);
+        let apply = current_apply(&app, &output);
         assert!(!app
             .free_transform
             .as_ref()
@@ -3268,11 +3294,11 @@ fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_g
         assert!(app.free_transform.as_ref().unwrap().context.is_none());
         assert_eq!(workspace::source(&app), unchanged);
         for canvas in [true, false] {
-            transform_context(&mut app, &ctx);
+            let output = transform_context(&mut app, &ctx);
             let at = if canvas {
                 transform_context_point(&app, &ctx)
             } else {
-                apply
+                current_apply(&app, &output)
             };
             assert!(!app
                 .free_transform
@@ -3311,6 +3337,38 @@ fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_g
             }
             frame(&mut app, &ctx, vec![release]);
         }
+        // Finish an actual numeric entry before the independent menu-keyboard case.
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        if let Some(focus) = ctx.memory(|memory| memory.focused()) {
+            let response = ctx
+                .read_response(focus)
+                .expect("The focused control is still drawn");
+            assert!(egui::TextEdit::load_state(&ctx, focus).is_some());
+            assert!(
+                app.free_transform
+                    .as_ref()
+                    .unwrap()
+                    .inputs
+                    .iter()
+                    .flatten()
+                    .any(|rect| *rect == response.rect),
+                "Only an actual current numeric entry may be completed"
+            );
+            workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+        }
+        assert!(
+            !ctx.wants_keyboard_input(),
+            "The menu-keyboard case starts after numeric entry finishes"
+        );
+        let editor = app
+            .free_transform
+            .as_ref()
+            .expect("Field completion keeps the session pending");
+        assert!(editor.values == values);
+        assert_eq!(editor.commands().unwrap(), commands);
+        assert!(editor.context.is_none() && editor.drag.is_none());
+        assert_eq!(workspace::source(&app), unchanged);
         transform_context(&mut app, &ctx);
         workspace::key(&mut app, &ctx, SIZE, egui::Key::Enter, Default::default());
         assert!(
