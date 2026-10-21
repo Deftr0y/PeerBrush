@@ -673,7 +673,7 @@ fn polygon_seam_vertices_multiple_roots_hidden_children_and_clipboard_preserve_n
                 let (x, y) = (q[0] - a[0] as f64, q[1] - a[1] as f64);
                 (u * y - v * x).abs() < 1e-4
                     && x * u + y * v >= -1e-4
-                    && x * u + y * v <= u * u + v * v + 1e-4;
+                    && x * u + y * v <= u * u + v * v + 1e-4
             }));
         }
         for (i, single) in singles.iter().enumerate() {
