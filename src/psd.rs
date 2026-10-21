@@ -7,10 +7,9 @@ use crate::{
 };
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
-use std::{
-    borrow::Cow,
-    io::{Read, Seek, SeekFrom, Write},
-};
+#[cfg(test)]
+use std::borrow::Cow;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Layout {
@@ -1355,6 +1354,7 @@ fn encode_layout_to<S: Read + Write + Seek>(
     check()
 }
 
+#[cfg(test)]
 fn decode_channel(data: &[u8], w: u32, h: u32, layout: Layout) -> Result<Vec<u8>, String> {
     let count = (w as usize)
         .checked_mul(h as usize)
@@ -1799,6 +1799,151 @@ fn stream_layer_channel(
     }
     Ok(())
 }
+#[cfg(test)]
+thread_local! {
+    static MASK_ROW_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(u32, usize, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn stream_mask_channel(
+    data: &[u8],
+    w: u32,
+    h: u32,
+    pixels: &mut Raster,
+    offset: [i32; 2],
+    layout: Layout,
+    control: &crate::loading::Control,
+) -> Result<(), String> {
+    let high = pixels.depth == 16;
+    let count = (w as usize)
+        .checked_mul(h as usize)
+        .ok_or("Channel overflow")?;
+    // Retain each native depth's existing mask-plane admission, even though the
+    // decoded plane is no longer materialized.
+    if high {
+        if count.checked_mul(2).ok_or("PSD channel size overflow")? > 256 * 1024 * 1024 {
+            return Err("16-bit PSD composite exceeds the 256 MiB decoded-image budget".into());
+        }
+    } else if count > 32 * 1024 * 1024 {
+        return Err("PSD channel exceeds allocation budget".into());
+    }
+    control.check()?;
+    let mut cursor = Cursor::new(data);
+    let kind = cursor.u16()?;
+    if kind > 3 {
+        return Err(if high {
+            "Unsupported 16-bit composite compression"
+        } else {
+            "Unknown PSD compression"
+        }
+        .into());
+    }
+    let row_bytes = (w as usize)
+        .checked_mul(if high { 2 } else { 1 })
+        .ok_or("PSD row size overflow")?;
+    let lengths = if kind == 1 {
+        let lengths = row_lengths(
+            &mut std::io::Cursor::new(&data[cursor.pos..]),
+            h as usize,
+            row_bytes,
+            layout,
+        )?;
+        cursor.bytes(h as usize * if layout.large() { 4 } else { 2 })?;
+        lengths
+    } else {
+        vec![]
+    };
+    let mut zip = (kind >= 2).then(|| ZlibDecoder::new(&data[cursor.pos..]));
+    let mut row = vec![0; row_bytes];
+    let left = (-i64::from(offset[0])).clamp(0, i64::from(w)) as u32;
+    let right = (i64::from(pixels.width) - i64::from(offset[0])).clamp(0, i64::from(w)) as u32;
+    for y in 0..h {
+        #[cfg(test)]
+        MASK_ROW_OBSERVER.with(|observer| {
+            if let Some(mut observe) = observer.take() {
+                observe(y, row.len(), lengths.len());
+                observer.replace(Some(observe));
+            }
+        });
+        control.check()?;
+        if y % 16 == 0 {
+            control.progress("Decoding native mask pixels", y as usize, h as usize)?;
+        }
+        if kind == 1 {
+            // Borrow the bounded encoded packet row from the already-held layer
+            // section; only the decoded native row needs a transfer buffer.
+            let packed = cursor.bytes(lengths[y as usize])?;
+            let (mut i, mut o) = (0, 0);
+            while i < packed.len() {
+                let packet = packed[i] as i8;
+                i += 1;
+                match packet {
+                    0..=127 => {
+                        let n = packet as usize + 1;
+                        if i + n > packed.len() || o + n > row.len() {
+                            return Err("Invalid PSD mask RLE literal".into());
+                        }
+                        row[o..o + n].copy_from_slice(&packed[i..i + n]);
+                        i += n;
+                        o += n;
+                    }
+                    -127..=-1 => {
+                        let n = (-packet as i16 + 1) as usize;
+                        let value = *packed.get(i).ok_or("Invalid PSD mask RLE repeat")?;
+                        i += 1;
+                        if o + n > row.len() {
+                            return Err("PSD mask RLE row overflow".into());
+                        }
+                        row[o..o + n].fill(value);
+                        o += n;
+                    }
+                    _ => {}
+                }
+            }
+            if o != row.len() {
+                return Err("Invalid PSD mask RLE row width".into());
+            }
+        } else if let Some(zip) = &mut zip {
+            zip.read_exact(&mut row).map_err(|e| e.to_string())?;
+        } else {
+            row.copy_from_slice(cursor.bytes(row_bytes)?);
+        }
+        if kind == 3 {
+            if high {
+                let mut previous = 0u16;
+                for word in row.chunks_exact_mut(2) {
+                    previous = previous.wrapping_add(u16::from_be_bytes([word[0], word[1]]));
+                    word.copy_from_slice(&previous.to_be_bytes());
+                }
+            } else {
+                for x in 1..row.len() {
+                    row[x] = row[x].wrapping_add(row[x - 1]);
+                }
+            }
+        }
+        let yy = i64::from(y) + i64::from(offset[1]);
+        if (0..i64::from(pixels.height)).contains(&yy) {
+            for x in left..right {
+                let v = if high {
+                    u16::from_be_bytes([row[x as usize * 2], row[x as usize * 2 + 1]])
+                } else {
+                    u16::from(row[x as usize]) * 257
+                };
+                pixels.set16(x as i32 + offset[0], yy as i32, [v, v, v, 65535]);
+            }
+        }
+    }
+    if let Some(zip) = &mut zip {
+        // Reading through EOF also requires zlib's stream end/checksum. A short
+        // stream, extra decoded byte or corrupt trailer cannot authorize a mask.
+        let mut extra = [0; 1];
+        if zip.read(&mut extra).map_err(|e| e.to_string())? != 0 {
+            return Err("Invalid ZIP mask channel size".into());
+        }
+    }
+    control.check()
+}
+
 /// Stream the composite into native tiles; never buffer the complete encoded file.
 pub fn decode_reader<R: Read + std::io::Seek>(
     reader: &mut R,
@@ -2436,33 +2581,21 @@ fn decode_parts(
                                 if mw < 0 || mh < 0 {
                                     return Err("Invalid mask bounds".into());
                                 }
-                                let values = if high {
-                                    decode_channel_16(bytes, mw as u32, mh as u32, layout)?
-                                } else {
-                                    decode_channel(bytes, mw as u32, mh as u32, layout)?
-                                        .into_iter()
-                                        .map(|v| v as u16 * 257)
-                                        .collect()
-                                };
                                 let (pw, ph) = if rec.layer.kind == "group" {
                                     (w, h)
                                 } else {
                                     (lw, lh)
                                 };
                                 let mut pixels = Raster::new_depth(pw, ph, depth);
-                                for yy in 0..mh {
-                                    if yy % 16 == 0 {
-                                        control.check()?;
-                                    }
-                                    for xx in 0..mw {
-                                        let v = values[(yy * mw + xx) as usize];
-                                        pixels.set16(
-                                            xx + b[1] - rec.bounds[1],
-                                            yy + b[0] - rec.bounds[0],
-                                            [v, v, v, 65535],
-                                        );
-                                    }
-                                }
+                                stream_mask_channel(
+                                    bytes,
+                                    mw as u32,
+                                    mh as u32,
+                                    &mut pixels,
+                                    [b[1] - rec.bounds[1], b[0] - rec.bounds[0]],
+                                    layout,
+                                    control,
+                                )?;
                                 rec.layer.mask = Some(Mask {
                                     linked: true,
                                     cache_key: crate::engine::id(),
@@ -2881,6 +3014,7 @@ fn merged_transparency(section: &[u8], depth: u16, layout: Layout) -> Result<boo
 }
 
 /// Bounded display decode: no 16-bit sources are replaced or marked editable.
+#[cfg(test)]
 fn decode_planes_16(
     data: &[u8],
     w: u32,
@@ -2979,6 +3113,7 @@ fn decode_planes_16(
         .collect())
 }
 
+#[cfg(test)]
 fn decode_channel_16(data: &[u8], w: u32, h: u32, layout: Layout) -> Result<Vec<u16>, String> {
     decode_planes_16(data, w, h, 1, layout)
 }
@@ -3842,3 +3977,6 @@ mod storage_tests {
             .all(|r| r.layer.pixels.tiles.is_empty() && r.layer.pixels.samples16.is_empty()));
     }
 }
+
+#[cfg(test)]
+mod mask_rows_tests;

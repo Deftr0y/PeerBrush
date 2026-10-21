@@ -492,3 +492,6 @@ PB-108/PB-153 checkpoint (unreleased): clean ff8c877 passed1,189 Rust tests with
 
 
 Combined checkpoint b99dd37 (unreleased):1,190 Rust passes, zero failures,15ignored and3explicit local provider filters; formatting/adapter/Clippy/GPU7/font/startup/CPU3 passed. Python381methods:375passes, zero assertion failures, one existing20s PowerShell timeout and5platform/permission skips. All14 independent normal-main PSD/PSB/JXL/projective/Warp cases passed with native source/current-standard-composite/history/file guards. The menu fixture correction passes within the full run. Three-platform native CI39545650366 is in progress; desktop/installed/receiving-application and wider backlog acceptance remain open. Detailed exact-source receipts are in [the development record](docs/development-0.3.md#combined-context-and-save-checkpoint-unreleased-b99dd37).
+
+
+PB-068 native-mask loading prerequisite (unreleased, next combined tests pending): standard PSD/PSB masks now decode native rows into local tiles while retaining all existing admission, compression/integrity, offset/default, cancellation and protected-document rules. Four reviewed prepared methods cover exact native/source/composite, malformed and interruption behavior. No dimension/pixel/storage limit is raised and no measured total-memory or16000-square acceptance is claimed.
