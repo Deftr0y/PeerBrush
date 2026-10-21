@@ -74,6 +74,7 @@
     "examples/gpu_effects.rs",
     "examples/input_performance.rs",
     "examples/macos_activation.rs",
+    "examples/macos_quit.rs",
     "examples/preview_performance.rs",
     "examples/sparkle_preparation.rs",
     "examples/tile_performance.rs",

@@ -362,6 +362,12 @@ pub fn guard(e: &Engine, document: &str, revision: u64) -> Result<(), String> {
     }
     Ok(())
 }
+fn file_operations_idle(counter: &std::sync::atomic::AtomicUsize) -> Result<(), String> {
+    if counter.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return Err("Finish the active file or workspace operation before closing projects".into());
+    }
+    Ok(())
+}
 pub fn close(
     root: &Shared,
     id: &str,
@@ -390,6 +396,7 @@ pub fn close_in(
         .try_lock()
         .map_err(|_| "The project is still working. Try closing again when it finishes.")?;
     guard(&e, document, revision)?;
+    file_operations_idle(&e.file_operations)?;
     if (e.doc.revision != e.saved_revision
         || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version))
         && !discard
@@ -404,6 +411,7 @@ pub fn close_in(
         }],
     )?;
     let mut workspace_guard = workspace.lock().unwrap();
+    file_operations_idle(&workspace_guard.file_operations)?;
     if workspace_guard.exiting {
         return Err("Workspace is exiting".into());
     }

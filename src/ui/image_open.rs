@@ -143,7 +143,13 @@ mod tests {
         let root = app.shared.clone();
         let before = root.lock().unwrap().state();
         app.pending_image_open = Some(pending(&app, &path));
+        crate::activation::quit_signal(&app.workspace)
+            .store(true, std::sync::atomic::Ordering::Release);
         frame(&mut app, &ctx, vec![]);
+        assert!(app.pending_image_open.is_some());
+        assert!(app.lifecycle.is_none() && !app.exit_approved);
+        assert!(!root.lock().unwrap().closed);
+        assert_eq!(root.lock().unwrap().state(), before);
         frame(
             &mut app,
             &ctx,

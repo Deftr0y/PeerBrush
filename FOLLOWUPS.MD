@@ -498,3 +498,6 @@ PB-068 native-mask loading prerequisite (unreleased, next combined tests pending
 
 
 PB-145/PB-154 Mac caller prerequisite (unreleased, dormant): the reviewed current-source producer wires existing ZIP/final-DMG signers to strict same-source flat-pair acquisition, with protected approval, first-attempt/main/hosted guards, precredential byte verification and bounded separate credentials-free same-submission recovery. Ten offline methods and caller/inventory changes are prepared and independently reviewed; combined/native/provider/installed acceptance and operational recovery approval remain open. No signing dispatch, enable variable, protected environment, credential or publication state changed.
+
+
+PB-145/PB-146 native Quit prerequisite (unreleased, combined tests pending): exact pinned winit delegate permission queues ordinary guarded human close without engine locks or replacing existing methods. Shared final close/exit now refuse active project/workspace writes, preserving drafts, source review and stricter update rules. Native8/16 portable fixtures and an owned real-AppKit CI example are prepared; independent source review and pinned formatting passed. Actual combined/native/installed acceptance remains open; Sparkle stays disabled and desktop input QA remains on hold.

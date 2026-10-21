@@ -434,6 +434,102 @@ mod tests {
         assert!(app.exit_approved);
         assert!(root.lock().unwrap().closed && second.lock().unwrap().closed);
     }
+    #[test]
+    fn queued_native_quit_preserves_cancel_save_and_late_write_guards() {
+        use std::sync::atomic::Ordering;
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            dirty(&root, "First native Quit edit");
+            dirty(&second, "Second native Quit edit");
+            let before = [
+                root.lock().unwrap().doc.clone(),
+                second.lock().unwrap().doc.clone(),
+            ];
+            let quit = crate::activation::quit_signal(&app.workspace);
+            quit.store(true, Ordering::Release);
+            frame(&mut app, &ctx, vec![]);
+            assert!(matches!(
+                app.lifecycle.as_ref().unwrap().intent,
+                Intent::Exit
+            ));
+            click(&mut app, &ctx, 2);
+            assert!(app.lifecycle.is_none() && !app.exit_approved);
+            for (shared, expected) in [&root, &second].into_iter().zip(&before) {
+                let engine = shared.lock().unwrap();
+                assert!(!engine.closed);
+                assert_eq!(&engine.doc, expected);
+                assert_eq!(engine.undo.len(), 1);
+            }
+            server::save(&root, &app.connection.state_dir.join("first.psd")).unwrap();
+            server::save(&second, &app.connection.state_dir.join("second.psb")).unwrap();
+            dirty(&root, "Save this exact source");
+            dirty(&second, "Keep review open");
+            quit.store(true, Ordering::Release);
+            frame(&mut app, &ctx, vec![]);
+            click(&mut app, &ctx, 0);
+            waiting(&mut app, &ctx);
+            let operations = second.lock().unwrap().file_operations.clone();
+            operations.fetch_add(1, Ordering::AcqRel);
+            click(&mut app, &ctx, 1);
+            frame(&mut app, &ctx, vec![]);
+            assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
+            assert!(app.lifecycle.as_ref().unwrap().error.is_some());
+            operations.fetch_sub(1, Ordering::AcqRel);
+            dirty(&root, "Late human edit must survive");
+            let late = root.lock().unwrap().doc.clone();
+            frame(&mut app, &ctx, vec![]);
+            click(&mut app, &ctx, 2);
+            assert_eq!(root.lock().unwrap().doc, late);
+            assert!(!app.exit_approved);
+            assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
+            server::save(&root, &app.connection.state_dir.join("first.psd")).unwrap();
+            server::save(&second, &app.connection.state_dir.join("second.psb")).unwrap();
+            quit.store(true, Ordering::Release);
+            let output = frame(&mut app, &ctx, vec![]);
+            assert!(app.exit_approved);
+            assert!(root.lock().unwrap().closed && second.lock().unwrap().closed);
+            assert!(output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close));
+        }
+    }
+
+    #[test]
+    fn queued_native_quit_keeps_existing_color_preferences_and_export_drafts() {
+        use std::sync::atomic::Ordering;
+        for depth in [8, 16] {
+            for draft in ["color", "preferences", "export", "proposal", "live gesture"] {
+                let (mut app, ctx, root, second) = fixture(depth);
+                let before = root.lock().unwrap().doc.clone();
+                match draft {
+                    "color" => {
+                        app.open_color(super::super::color::Target::Foreground, [17, 41, 73, 255])
+                    }
+                    "preferences" => app.project_settings = Some((96, 80, depth)),
+                    "export" => app.open_exports(&before),
+                    "proposal" => {
+                        let proposal = crate::collaboration::propose(&root, "synthetic-review", &json!({"document_id":before.id,"expected_revision":before.revision,"commands":[{"op":"layer.update","layer":before.layers[0].id,"name":"Proposed change"}]})).unwrap();
+                        app.proposal_review = Some(proposal["id"].as_str().unwrap().into());
+                    }
+                    "live gesture" => app.live_gesture = Some(crate::engine::id()),
+                    _ => unreachable!(),
+                }
+                crate::activation::quit_signal(&app.workspace).store(true, Ordering::Release);
+                frame(&mut app, &ctx, vec![]);
+                assert!(app.lifecycle.is_none() && !app.exit_approved, "{draft}");
+                assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
+                assert_eq!(root.lock().unwrap().doc, before);
+                assert!(match draft {
+                    "color" => app.color_editor.is_some(),
+                    "preferences" => app.project_settings == Some((96, 80, depth)),
+                    "export" => app.export_editor.is_some(),
+                    "proposal" => app.proposal_review.is_some(),
+                    "live gesture" => app.live_gesture.is_some(),
+                    _ => false,
+                });
+            }
+        }
+    }
 }
 #[derive(Clone)]
 struct Entry {
@@ -546,7 +642,15 @@ impl PeerBrush {
                 || self.filter_editor.is_some()
                 || self.refinement.is_some()
                 || self.pending_import.is_some()
+                || self.pending_image_open.is_some()
                 || self.rename_edit.is_some()
+                || self.color_editor.is_some()
+                || self.proposal_review.is_some()
+                || self.task_undo_review.is_some()
+                || self.live_gesture.is_some()
+                || self.pen.in_gesture()
+                || self.project_settings.is_some()
+                || self.export_editor.is_some()
                 || !self.points.is_empty()
                 || !self.selection_path.is_empty()
                 || self.layer_drag.is_some()
@@ -717,7 +821,8 @@ impl PeerBrush {
                 }
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.exit_approved {
+        let native_quit = crate::activation::take_quit(&self.workspace);
+        if (ctx.input(|i| i.viewport().close_requested()) || native_quit) && !self.exit_approved {
             self.request_close(Intent::Exit);
         }
         if self.exit_approved {

@@ -1,7 +1,15 @@
 //! Native file activation is queued for the same new-project UI used by File > Open.
 //! The authenticated application RPC never replaces a document to service a launch.
 use crate::{server::Shared, workspace};
-use std::{collections::VecDeque, ffi::OsString, path::PathBuf};
+use std::{
+    collections::VecDeque,
+    ffi::OsString,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -121,6 +129,20 @@ impl Launch {
 pub(crate) struct Queue {
     enabled: bool,
     files: VecDeque<PathBuf>,
+    quit: Arc<AtomicBool>,
+}
+
+/// Native callbacks retain only this presentation signal, never an engine lock.
+pub(crate) fn quit_signal(registry: &workspace::Registry) -> Arc<AtomicBool> {
+    registry.lock().unwrap().activation.quit.clone()
+}
+
+/// Consume one coalesced native Quit request through the ordinary guarded UI.
+pub fn take_quit(registry: &workspace::Registry) -> bool {
+    let workspace = registry.lock().unwrap();
+    workspace.activation.enabled
+        && !workspace.exiting
+        && workspace.activation.quit.swap(false, Ordering::AcqRel)
 }
 
 /// Enable before publishing the listener so simultaneous launches can queue safely.
@@ -176,6 +198,40 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn native_quit_coalesces_without_locks_or_file_queue_changes() {
+        for depth in [8, 16] {
+            let mut engine = Engine::new();
+            engine.doc = crate::engine::Document::new_depth(64, 64, depth).unwrap();
+            engine.doc.revision = 7;
+            let root = Arc::new(Mutex::new(engine));
+            let registry = workspace::attach(&root);
+            let signal = quit_signal(&registry);
+            signal.store(true, Ordering::Release);
+            assert!(
+                !take_quit(&registry),
+                "headless instances never process native Quit"
+            );
+            enable(&root);
+            let file = std::env::temp_dir().join("synthetic pending.psd");
+            enqueue(&root, vec![file.clone()]).unwrap();
+            let before = root.lock().unwrap().doc.clone();
+            {
+                let _engine = root.lock().unwrap();
+                let _workspace = registry.lock().unwrap();
+                signal.store(true, Ordering::Release);
+                signal.store(true, Ordering::Release);
+            }
+            assert!(take_quit(&registry));
+            assert!(!take_quit(&registry));
+            assert_eq!(next(&registry), Some(file));
+            assert_eq!(root.lock().unwrap().doc, before);
+            registry.lock().unwrap().exiting = true;
+            signal.store(true, Ordering::Release);
+            assert!(!take_quit(&registry));
+        }
     }
 
     #[test]

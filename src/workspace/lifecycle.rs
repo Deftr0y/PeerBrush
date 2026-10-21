@@ -120,6 +120,7 @@ fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(
         .collect::<Result<_, _>>()?;
     for (e, r) in engines.iter_mut().zip(&reviewed) {
         guard(e, &r.document, r.revision)?;
+        file_operations_idle(&e.file_operations)?;
         if update {
             if r.discard {
                 return Err("Update restart cannot discard unsaved work".into());
@@ -144,16 +145,7 @@ fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(
         )?;
     }
     let mut registry = workspace.lock().unwrap();
-    if update
-        && registry
-            .file_operations
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-    {
-        return Err(
-            "Finish the workspace/recovery operation before restarting for an update".into(),
-        );
-    }
+    file_operations_idle(&registry.file_operations)?;
     let mut live: Vec<_> = registry.entries.iter().map(|p| p.id.as_str()).collect();
     live.sort_unstable();
     if registry.exiting
@@ -171,4 +163,81 @@ fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(
         e.release_file_ownership();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ordinary_close_and_exit_refuse_late_file_operations_without_closing_any_project() {
+        for depth in [8, 16] {
+            for discard in [false, true] {
+                for exit in [false, true] {
+                    let mut engine = Engine::new();
+                    engine.doc = Document::new_depth(8, 6, depth).unwrap();
+                    let root = Arc::new(Mutex::new(engine));
+                    let workspace = attach(&root);
+                    let second = new_project(&root, 8, 6, depth, None).unwrap();
+                    let mut reviewed = vec![];
+                    let mut before = vec![];
+                    for shared in [&root, &second] {
+                        let mut e = shared.lock().unwrap();
+                        e.doc.layers[0]
+                            .pixels
+                            .set16(2, 3, [12001, 23003, 34007, 45009]);
+                        if discard {
+                            let layer = e.doc.layers[0].id.clone();
+                            e.edit("human", &[json!({"op":"layer.update","layer":layer,"name":"Reviewed unsaved source"})], None, None, "Keep work").unwrap();
+                        }
+                        reviewed.push(Reviewed {
+                            project: e.project_id.clone(),
+                            document: e.doc.id.clone(),
+                            revision: e.doc.revision,
+                            discard,
+                        });
+                        before.push((e.doc.clone(), e.undo.len(), e.redo.len(), e.saved_revision));
+                    }
+                    let close = || {
+                        if exit {
+                            finish_exit(&workspace, &reviewed)
+                        } else {
+                            let row = &reviewed[1];
+                            close_in(
+                                &workspace,
+                                &row.project,
+                                &row.document,
+                                row.revision,
+                                row.discard,
+                                "human",
+                            )
+                        }
+                    };
+                    // The operation starts after exact sources were reviewed, on
+                    // the inactive project; both final paths must check again.
+                    let write = crate::server::FileOperation::begin(&second).unwrap();
+                    assert!(close().unwrap_err().contains("active file"));
+                    drop(write);
+                    let preference =
+                        crate::server::FileOperation::begin_workspace(&workspace).unwrap();
+                    assert!(close().unwrap_err().contains("active file"));
+                    drop(preference);
+                    assert!(!workspace.lock().unwrap().exiting);
+                    assert_eq!(entries_in(&workspace).len(), 2);
+                    for (shared, expected) in [&root, &second].into_iter().zip(&before) {
+                        let e = shared.lock().unwrap();
+                        assert!(!e.closed);
+                        assert_eq!(
+                            (&e.doc, e.undo.len(), e.redo.len(), e.saved_revision),
+                            (&expected.0, expected.1, expected.2, expected.3)
+                        );
+                    }
+                    close().unwrap();
+                    assert!(second.lock().unwrap().closed);
+                    assert_eq!(root.lock().unwrap().closed, exit);
+                }
+            }
+        }
+    }
 }

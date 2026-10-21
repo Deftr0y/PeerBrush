@@ -246,6 +246,8 @@ fn run() -> Result<(), String> {
         "PeerBrush",
         options,
         Box::new(move |cc| {
+            #[cfg(target_os = "macos")]
+            activation::macos::install_termination(&shared, &cc.egui_ctx)?;
             Ok(Box::new(PeerBrush::new_with_preferences(
                 cc,
                 shared,

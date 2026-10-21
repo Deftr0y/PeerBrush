@@ -291,7 +291,7 @@ fn streamed_save_rejects_same_held_inode_symlinks_and_never_deletes_the_foreign_
 
 #[test]
 fn update_restart_is_blocked_during_unlocked_save_and_export_preparation() {
-    use crate::workspace::lifecycle::{finish_update_exit, update_readiness};
+    use crate::workspace::lifecycle::{finish_exit, finish_update_exit, update_readiness};
     let directory = std::env::temp_dir().join(format!("pb-update-save-{}", engine::id()));
     fs::create_dir(&directory).unwrap();
     let mut engine = Engine::new();
@@ -302,6 +302,17 @@ fn update_restart_is_blocked_during_unlocked_save_and_export_preparation() {
     save_prepared(&root, &directory.join("saved.psd"), &json!({}), || {
         assert!(update_readiness(&workspace).is_err());
         assert!(finish_update_exit(&workspace, &reviewed).is_err());
+        assert!(finish_exit(&workspace, &reviewed).is_err());
+        let row = &reviewed[0];
+        assert!(crate::workspace::close_in(
+            &workspace,
+            &row.project,
+            &row.document,
+            row.revision,
+            false,
+            "human"
+        )
+        .is_err());
         assert!(!root.lock().unwrap().closed);
     })
     .unwrap();
@@ -313,6 +324,17 @@ fn update_restart_is_blocked_during_unlocked_save_and_export_preparation() {
         &crate::production_export::Control::default(),
         |doc| {
             assert!(finish_update_exit(&workspace, &reviewed).is_err());
+            assert!(finish_exit(&workspace, &reviewed).is_err());
+            let row = &reviewed[0];
+            assert!(crate::workspace::close_in(
+                &workspace,
+                &row.project,
+                &row.document,
+                row.revision,
+                false,
+                "human"
+            )
+            .is_err());
             doc.export_png()
         },
     )

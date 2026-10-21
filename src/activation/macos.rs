@@ -3,7 +3,7 @@ use crate::server::Shared;
 use objc2::{
     class, define_class, msg_send,
     rc::Retained,
-    runtime::{AnyObject, Bool},
+    runtime::{AnyObject, Bool, Imp, Sel},
     sel, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 use objc2_core_foundation::CFURL;
@@ -15,7 +15,10 @@ use std::{
     ffi::{CStr, OsStr},
     os::unix::ffi::OsStrExt,
     path::PathBuf,
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
 };
 
 const CORE: u32 = u32::from_be_bytes(*b"aevt");
@@ -27,9 +30,85 @@ const BOOKMARK: u32 = u32::from_be_bytes(*b"bmrk");
 /// Native file references are bounded before parsing; at most 16 are accepted.
 pub const MAX_FILE_REFERENCE_BYTES: usize = 64 * 1024;
 static REPAINT: OnceLock<eframe::egui::Context> = OnceLock::new();
+static QUIT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 pub fn repaint_with(ctx: &eframe::egui::Context) {
     let _ = REPAINT.set(ctx.clone());
+}
+
+fn termination_policy(class: &CStr, existing: bool, installed: bool) -> Result<(), String> {
+    if class != c"WinitApplicationDelegate" {
+        return Err("Native Quit requires the pinned winit application delegate".into());
+    }
+    if installed || existing {
+        return Err("Native Quit must not replace an existing termination handler".into());
+    }
+    Ok(())
+}
+
+extern "C-unwind" fn should_terminate(
+    _delegate: &AnyObject,
+    _selector: Sel,
+    _application: &AnyObject,
+) -> usize {
+    // AppKit may reenter while a tool or save holds an engine lock. Queue only;
+    // NSTerminateCancel returns control to the existing winit event loop.
+    let _ = std::panic::catch_unwind(|| {
+        if let Some(quit) = QUIT.get() {
+            quit.store(true, Ordering::Release);
+        }
+        if let Some(ctx) = REPAINT.get() {
+            ctx.request_repaint();
+        }
+    });
+    0
+}
+
+/// Add only the absent permission selector after winit installs its delegate.
+/// The same delegate object, class, ivars and existing methods remain intact.
+pub fn install_termination(root: &Shared, ctx: &eframe::egui::Context) -> Result<(), String> {
+    let _marker = MainThreadMarker::new().ok_or("Native Quit requires the main thread")?;
+    let app: Retained<AnyObject> = unsafe { msg_send![class!(NSApplication), sharedApplication] };
+    let delegate: Option<Retained<AnyObject>> = unsafe { msg_send![&*app, delegate] };
+    let delegate = delegate.ok_or("Native Quit requires an initialized application delegate")?;
+    let class = delegate.class();
+    let selector = sel!(applicationShouldTerminate:);
+    termination_policy(
+        class.name(),
+        class.instance_method(selector).is_some(),
+        QUIT.get().is_some(),
+    )?;
+    if class.superclass() != Some(class!(NSObject)) {
+        return Err("Native Quit requires the pinned winit delegate layout".into());
+    }
+    for method in [
+        sel!(applicationDidFinishLaunching:),
+        sel!(applicationWillTerminate:),
+    ] {
+        if class.instance_method(method).is_none() {
+            return Err("Native Quit requires the pinned winit delegate methods".into());
+        }
+    }
+    let signal = super::quit_signal(&crate::workspace::attach(root));
+    QUIT.set(signal)
+        .map_err(|_| "Native Quit was already initialized")?;
+    repaint_with(ctx);
+    // NSApplicationTerminateReply is NSUInteger on supported 64-bit macOS.
+    // class_addMethod never replaces an existing implementation.
+    let implementation: Imp =
+        unsafe { std::mem::transmute::<*const (), Imp>(should_terminate as *const ()) };
+    let added = unsafe {
+        objc2::ffi::class_addMethod(
+            (class as *const objc2::runtime::AnyClass).cast_mut(),
+            selector,
+            implementation,
+            c"Q@:@".as_ptr(),
+        )
+    };
+    if !added.as_bool() {
+        return Err("Native Quit permission handler could not be installed safely".into());
+    }
+    Ok(())
 }
 
 fn bookmark_url(data: &NSData) -> Result<Retained<NSURL>, String> {
@@ -178,6 +257,24 @@ impl Drop for Registration {
         unsafe {
             let _: () =
                 msg_send![&*manager, removeEventHandlerForEventClass: CORE, andEventID: OPEN];
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn termination_installation_requires_unmodified_pinned_delegate() {
+        termination_policy(c"WinitApplicationDelegate", false, false).unwrap();
+        for (class, existing, installed) in [
+            (c"NSObject", false, false),
+            (c"OtherApplicationDelegate", false, false),
+            (c"WinitApplicationDelegate", true, false),
+            (c"WinitApplicationDelegate", false, true),
+        ] {
+            assert!(termination_policy(class, existing, installed).is_err());
         }
     }
 }
