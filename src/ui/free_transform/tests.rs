@@ -1683,17 +1683,17 @@ fn skew_handles_keep_selected_source_protection_and_support_explicit_whole_sourc
         settle(&mut app, &ctx);
         skew_edge_drag(&mut app, &ctx, 0);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let output = loop {
-            let output = frame(&mut app, &ctx, vec![]);
+        loop {
+            frame(&mut app, &ctx, vec![]);
             if !app.pending && app.free_transform.as_ref().unwrap().error.is_some() {
-                break output;
+                break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "Shared source protection did not arrive"
             );
             std::thread::sleep(Duration::from_millis(2));
-        };
+        }
         assert!(app
             .free_transform
             .as_ref()
@@ -1702,6 +1702,19 @@ fn skew_handles_keep_selected_source_protection_and_support_explicit_whole_sourc
             .as_ref()
             .unwrap()
             .contains("rasterize"));
+        // egui Resize clips to the preceding content height; the new error is measured now.
+        // Draw once with that height before locating and clicking the actual disabled Apply.
+        let output = frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.pending
+                && app.free_transform.as_ref().is_some_and(|editor| {
+                    editor.rendered.is_none()
+                        && editor
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("rasterize"))
+                })
+        );
         workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
         assert!(
             app.free_transform.is_some(),
