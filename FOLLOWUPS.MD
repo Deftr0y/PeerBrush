@@ -465,3 +465,6 @@ PB-145/PB-154 DEB source validation (unreleased, replay pending): an explicit sh
 
 
 PB-108 Save component baseline (unreleased, f01a930): isolated 12-trial native 8/16-bit PSD/PSB diagnostic passed exact source/readback/history/cleanup. Encoding medians 836/841 ms at 8-bit and 1378/1370 ms at 16-bit dominate total Save 1005/1012/1708/1702 ms; verification/backup and publication-return remain separately measured in the plan. Test observer/cache/order/profile limits prevent a speedup, normal-main or total-lock claim. The zero-test binary-selector attempt was rejected and preserved; corrected library invocation/four parser fixtures passed. Audit encoding next; responsiveness acceptance remains open.
+
+
+PB-108 fixed Save descriptor increment (unreleased, replay pending): reuse the invariant identity of the privately owned unchanged handle while retaining every per-transfer current-name identity/type/link check and all fingerprint/readback/lease/source/publication guards. Extended native8/16 PSD/PSB foreign-spool faults and a real-file read/write/Drop replacement regression are prepared, with guarded cleanup. Source review passed; combined replay and measured effect remain open.

@@ -149,6 +149,7 @@ fn streamed_save_faults_preserve_dirty_work_original_and_foreign_temporary_files
                 "output-bytes",
                 "spool-bytes",
                 "foreign-output",
+                "foreign-spool",
                 "published",
             ] {
                 let dir = std::env::temp_dir().join(format!("pb-stream-fault-{}", engine::id()));
@@ -182,12 +183,17 @@ fn streamed_save_faults_preserve_dirty_work_original_and_foreign_temporary_files
                         match fault {
                             "output-bytes" => fs::write(output, b"changed output").unwrap(),
                             "spool-bytes" => fs::write(spool, b"changed spool").unwrap(),
-                            "foreign-output" => {
-                                fs::rename(output, &relocated_observed).unwrap();
-                                fs::write(output, b"foreign bytes must remain").unwrap();
+                            "foreign-output" | "foreign-spool" => {
+                                let selected = if fault == "foreign-output" {
+                                    output
+                                } else {
+                                    spool
+                                };
+                                fs::rename(selected, &relocated_observed).unwrap();
+                                fs::write(selected, b"foreign bytes must remain").unwrap();
                                 fs::write(
                                     &foreign_observed,
-                                    output.as_os_str().to_string_lossy().as_bytes(),
+                                    selected.as_os_str().to_string_lossy().as_bytes(),
                                 )
                                 .unwrap();
                             }
@@ -217,7 +223,7 @@ fn streamed_save_faults_preserve_dirty_work_original_and_foreign_temporary_files
                 } else {
                     assert_eq!(fs::read(&path).unwrap(), original);
                 }
-                if fault == "foreign-output" {
+                if matches!(fault, "foreign-output" | "foreign-spool") {
                     let replaced = PathBuf::from(fs::read_to_string(&foreign).unwrap());
                     assert_eq!(fs::read(replaced).unwrap(), b"foreign bytes must remain");
                     assert!(relocated.is_file());
@@ -603,4 +609,58 @@ fn synthetic_save_phase_diagnostic() {
             "records":records
         })
     );
+}
+
+#[test]
+fn save_temporary_rejects_replaced_names_before_reads_writes_and_cleanup() {
+    for spool in [false, true] {
+        for read in [false, true] {
+            let parent = std::env::temp_dir().canonicalize().unwrap();
+            let directory = parent.join(format!("pb-held-save-{}", engine::id()));
+            fs::create_dir(&directory).unwrap();
+            let destination = directory.join("art.psd");
+            let mut temporary = SaveTemporary::new(&destination, spool).unwrap();
+            temporary.write_all(b"owned native bytes").unwrap();
+            temporary.flush().unwrap();
+            let original_identity = temporary.identity;
+            let fingerprint = temporary.fingerprint;
+            let bytes = temporary.bytes;
+            let name = temporary.path.clone();
+            let relocated = directory.join("relocated-owned-file");
+            if read {
+                temporary.rewind().unwrap();
+            }
+            fs::rename(&name, &relocated).unwrap();
+            fs::write(&name, b"foreign name retained").unwrap();
+            assert_eq!(
+                crate::file_safety::identity(&temporary.file).unwrap(),
+                original_identity
+            );
+            let error = if read {
+                temporary.read(&mut [0; 4]).unwrap_err()
+            } else {
+                temporary.write(b"must not append").unwrap_err()
+            };
+            assert!(error.to_string().contains("identity changed"));
+            assert_eq!(temporary.bytes, bytes);
+            assert_eq!(temporary.fingerprint, fingerprint);
+            assert_eq!(fs::read(&relocated).unwrap(), b"owned native bytes");
+            assert_eq!(fs::read(&name).unwrap(), b"foreign name retained");
+            drop(temporary);
+            assert_eq!(fs::read(&name).unwrap(), b"foreign name retained");
+            assert_eq!(fs::read(&relocated).unwrap(), b"owned native bytes");
+            let metadata = fs::symlink_metadata(&directory).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                assert_eq!(metadata.file_attributes() & 0x400, 0);
+            }
+            assert_eq!(
+                directory.canonicalize().unwrap().parent(),
+                Some(parent.as_path())
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
 }
