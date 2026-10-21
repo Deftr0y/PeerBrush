@@ -462,3 +462,6 @@ Combined f01a930 checkpoint (unreleased, non-passing): all-target compile passed
 
 
 PB-145/PB-154 DEB source validation (unreleased, replay pending): an explicit shared missing-integration-asset refusal replaces the f01 KeyError while preserving strict rejection and all content/readiness gates. Three focused asset cases and the actual public consumer remain required in the next combined run; source review passed.
+
+
+PB-108 Save component baseline (unreleased, f01a930): isolated 12-trial native 8/16-bit PSD/PSB diagnostic passed exact source/readback/history/cleanup. Encoding medians 836/841 ms at 8-bit and 1378/1370 ms at 16-bit dominate total Save 1005/1012/1708/1702 ms; verification/backup and publication-return remain separately measured in the plan. Test observer/cache/order/profile limits prevent a speedup, normal-main or total-lock claim. The zero-test binary-selector attempt was rejected and preserved; corrected library invocation/four parser fixtures passed. Audit encoding next; responsiveness acceptance remains open.

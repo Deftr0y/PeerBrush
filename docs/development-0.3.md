@@ -698,3 +698,17 @@ The fresh normal application from the same clean commit passed all 14 independen
 ## Missing DEB integration source validation (unreleased, replay pending)
 
 The shared DEB payload mapping now rejects absent selected-source desktop, MIME or icon assets with an explicit ValueError before indexing. Staging and final-byte inspection retain all source/control/hash/readiness gates. One focused method covers all three missing assets, and the existing public incomplete-source fixture requires this exact refusal. Independent source review passed; corrected combined execution remains required.
+
+
+## PB-108 Save component baseline (unreleased, f01a930)
+
+After every combined QA process closed, the isolated ignored library diagnostic passed all 12 trials at clean `f01a9306fb4af7403d447625d41adbe45f6d6687`: dense 2048-square native 8/16-bit, PSD/PSB, three Save As trials each. Exact native readback, source identity, saved revision, history and owned synthetic cleanup passed. The first private launcher selected the binary harness and ran zero tests; its strict parser rejected that result. The corrected library selector and four parser fixtures passed; original failed evidence is preserved privately.
+
+| Native depth/container | Encode median ms | Verify/backup ms | Precommit to publication ms | Publication to return ms | Whole Save ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+|8 / PSD|836.37|110.52|2.10|55.81|1004.98|
+|8 / PSB|840.96|109.22|2.31|55.78|1011.66|
+|16 / PSD|1377.86|227.02|2.10|110.99|1707.71|
+|16 / PSB|1370.48|217.33|2.57|112.73|1702.12|
+
+Each phase median is calculated independently, so medians need not add to the whole-save median. Source-check callbacks total 109,038 per three native 8-bit trials in each container and 117,099 per native 16-bit group. Encoding dominates this workload and directs the next audit. These opt-in test-profile observations include observer overhead, fixed trial order and uncontrolled filesystem cache/scheduling. They are not a before/after comparison, normal-main wall time, total memory or physical input latency; publication-to-return includes verification/cleanup and does not measure total engine-lock duration. Strict receipt SHA-256 `fffb3407031681e8da1ab164f862c38ff86d92c21934d11a9bb5194a4687a171`; raw log `223799ec4defa7870761c5557f6a4dc20560725fd465fc1b6ba63980ffd22084`. PB-108 remains open.
