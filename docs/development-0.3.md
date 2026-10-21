@@ -693,3 +693,8 @@ At `f01a9306fb4af7403d447625d41adbe45f6d6687`, all-target compilation passed. Th
 Python ran 379 methods: 371 passed, one method failed both native-compiler subcases, two methods errored and five platform/permission cases skipped. The existing local PowerShell capture still exceeded its exact 20-second timeout. Actual native-consumer Cargo exited 101; its cause requires retained diagnostics. The final-DEB public-input regression refused missing selected-source integration assets through an unintended KeyError; clear shared validation is prepared. No failed check is counted as acceptance.
 
 The fresh normal application from the same clean commit passed all 14 independently checked cases: PSD/PSB four, JXL two, projective four and grid Warp four, preserving native8/16 words, original sources, current standard channels/composites, undo/redo, reopening and file-ownership/consent guards. The runtime SHA-256 was `7744c87ea8459c8456f03646aa0311e0cd0e63a9d74d15ad5a3a67b22415a02e`. These CLI cases and offscreen controls do not qualify desktop input, installation/upgrades, Photoshop, physical latency or 16000-square documents. Native desktop input remains held at the user's request.
+
+
+## Missing DEB integration source validation (unreleased, replay pending)
+
+The shared DEB payload mapping now rejects absent selected-source desktop, MIME or icon assets with an explicit ValueError before indexing. Staging and final-byte inspection retain all source/control/hash/readiness gates. One focused method covers all three missing assets, and the existing public incomplete-source fixture requires this exact refusal. Independent source review passed; corrected combined execution remains required.

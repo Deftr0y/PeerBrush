@@ -274,7 +274,7 @@ class Published(unittest.TestCase):
         self.assertFalse(blocked['content_verified'])
         self.assertFalse(blocked['ready'])
         self.assertFalse(any(p['url'].endswith('.deb') for p in entry['platforms']))
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, 'required integration asset'):
             self.published(maintainer=test_deb.MAINTAINER)
         report['release_ready'] = True
         self.assets[name + '.json'] = site.encode(report)

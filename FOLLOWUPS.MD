@@ -459,3 +459,6 @@ PB-153 grid fixture construction (unreleased, compile replay pending):2418 resol
 
 
 Combined f01a930 checkpoint (unreleased, non-passing): all-target compile passed; Rust1,181pass/1transform-menu focus failure/15ignored across94outer targets, with3explicit local provider filters. Formatting/adapter/Clippy/GPU7/fonts/startup/CPU3 passed. Python379methods:371pass, one actual-native compiler method failed both subcases, two errors (unchanged20s PowerShell capture and DEB missing selected-source assets),5skips. Fresh normal-main PSD4/JXL2/projective4/gridWarp4 passed with native8/16 original/source/current-standard-composite and history/file-safety guards. The reviewed menu correction latches typing/IME through the complete secondary gesture and preserves numeric Escape through an explicit focus precondition; two focused regressions await combined replay. Native input/install/upgrade/receiving-editor/PB-108/PB-068 acceptance remains open; exact commit/runtime and limits are in the plan.
+
+
+PB-145/PB-154 DEB source validation (unreleased, replay pending): an explicit shared missing-integration-asset refusal replaces the f01 KeyError while preserving strict rejection and all content/readiness gates. Three focused asset cases and the actual public consumer remain required in the next combined run; source review passed.

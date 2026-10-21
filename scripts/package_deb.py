@@ -111,6 +111,8 @@ def payload_files(archive, checked, inputs):
         (f'packaging/linux/{APP_ID}.xml', f'usr/share/mime/packages/{APP_ID}.xml'),
         ('assets/peerbrush-logo.png', 'usr/share/peerbrush/peerbrush-logo.png'),
     ]:
+        if name not in inputs:
+            raise ValueError('DEB source is missing a required integration asset')
         yield destination, inputs[name], 0o644
 
 

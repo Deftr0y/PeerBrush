@@ -172,6 +172,16 @@ class DebianPackage(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.inspect()
 
+    def test_missing_selected_integration_assets_are_rejected(self):
+        checked, inputs = deb.portable_payload(self.root, self.archive, digest(self.archive))
+        for missing in [f'packaging/linux/{deb.APP_ID}.desktop',
+                        f'packaging/linux/{deb.APP_ID}.xml', 'assets/peerbrush-logo.png']:
+            with self.subTest(missing=missing):
+                incomplete = dict(inputs)
+                del incomplete[missing]
+                with self.assertRaisesRegex(ValueError, 'required integration asset'):
+                    list(deb.payload_files(self.archive, checked, incomplete))
+
     def test_exact_staging_preserves_binary_source_notices_and_consent(self):
         original = self.archive.read_bytes()
         stage = self.root / 'deb-stage'
