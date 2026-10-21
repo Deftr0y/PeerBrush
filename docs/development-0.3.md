@@ -14,7 +14,7 @@ The implementation scope now proposes **v0.3 inclusion of PB-145/PB-146/PB-147/P
 
 Standing precision, UI/MCP/CLI consistency, save safety and documented GPU/Photoshop fallbacks remain in force. Earlier completed rows and measurements remain historical records; only unresolved portions are scheduled here. Do not repeat implemented work or mark remaining native/hardware/receiving-application acceptance complete without evidence.
 
-Remote control from another computer and third-party plugin/add-on tools are deferred until after v0.3 by the maintainer's scope decision. Preserve their future backlog entries; the existing local MCP/proposal work does not implement them. Finish the editor, installation and updates in this milestone.
+Remote control from another computer and third-party plugin/add-on tools are outside the requested scope and will not be developed. Historical placeholders are not a commitment to implement them in a later release. Existing local MCP/proposal work remains in scope. Finish the editor, installation and updates in this milestone.
 
 ## Implementation and review
 
@@ -848,7 +848,7 @@ The first combined compile-only barrier at cleanf6f0efedbc51ea8abfa7bcff64faa541
 
 ## Milestone scope and Store activation decision
 
-Remote control and third-party add-ons are deferred until after v0.3; their future backlog entries remain. The editor, installation and update foundations retain the sequence above, with PB-108 first. Store submission stays disabled while integration is prepared: no durable private host or backend is configured. Existing filesystem journaling and read-only preflight do not establish hosted submission or recovery acceptance. Do not select a persistent credential-bearing runner or temporary artifact-based state path as an implicit substitute.
+Remote control and third-party add-ons were clarified as unrequested and are excluded from development; no later-release implementation is planned. The editor, installation and update foundations retain the sequence above, with PB-108 first. Store submission stays disabled while integration is prepared: no durable private host or backend is configured. Existing filesystem journaling and read-only preflight do not establish hosted submission or recovery acceptance. Do not select a persistent credential-bearing runner or temporary artifact-based state path as an implicit substitute.
 
 
 ## Combined shaped-text and loading checkpoint (unreleased, 9f746c5)
