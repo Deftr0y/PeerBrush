@@ -192,6 +192,17 @@ def _unsigned_binding(unsigned, signed):
             raise ValueError('Signing changed an unsigned content type.')
 
 
+def verify_native_signature(package, publisher, certificate_sha256, signtool, powershell, work):
+    """Fixed native signature checks for selected MSIX and Desktop VCLibs bytes."""
+    # Embedded package verification, all signatures, Default Authentication policy,
+    # timestamp required. Deliberately no catalog search or policy override options.
+    # https://learn.microsoft.com/windows/win32/seccrypto/signtool
+    _command(signtool, ['verify', '/pa', '/all', '/tw', '/q', str(package)], work, 'signtool')
+    return _certificate(_command(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive',
+        '-Command', CERTIFICATE_SCRIPT], work, 'certificate', package=package),
+        publisher, certificate_sha256)
+
+
 def inspect_final(root, portable, unsigned, package, *, commit, version, identity,
                   package_family, portable_sha256, unsigned_sha256, package_sha256,
                   certificate_sha256, signtool, signtool_sha256, powershell, powershell_sha256, work):
@@ -239,13 +250,8 @@ def inspect_final(root, portable, unsigned, package, *, commit, version, identit
     msix.verify_payload(copies[1], expected)
     msix.verify_payload(copies[2], expected, signed=True)
     _unsigned_binding(copies[1], copies[2])
-    # Embedded package verification, all signatures, Default Authentication policy,
-    # timestamp required. Deliberately no catalog search or policy override options.
-    # https://learn.microsoft.com/windows/win32/seccrypto/signtool
-    _command(tools[0], ['verify', '/pa', '/all', '/tw', '/q', str(copies[2])], work, 'signtool')
-    metadata = _certificate(_command(tools[1], ['-NoLogo', '-NoProfile', '-NonInteractive',
-        '-Command', CERTIFICATE_SCRIPT], work, 'certificate', package=copies[2]),
-        identity['publisher'], certificate_sha256)
+    metadata = verify_native_signature(copies[2], identity['publisher'], certificate_sha256,
+        tools[0], tools[1], work)
     _source(root, commit)
     private_inspection_directory(work, root, fresh=False)
     for source, copied, checksum in zip(paths, copies, [portable_sha256, unsigned_sha256, package_sha256]):
