@@ -498,8 +498,9 @@ impl SaveTemporary {
             return Err("Save temporary path is not a regular file".into());
         }
         let named = fs::File::open(&self.path).map_err(|e| e.to_string())?;
-        // The owned handle never changes; bind this name to its captured identity.
-        if crate::file_safety::identity(&named)? != self.identity {
+        if crate::file_safety::identity(&self.file)? != self.identity
+            || crate::file_safety::identity(&named)? != self.identity
+        {
             return Err("Save temporary file identity changed; destination retained".into());
         }
         Ok(())
