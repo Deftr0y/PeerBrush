@@ -746,3 +746,21 @@ The 38c79 failure showed egui clearing TextEdit focus before application shortcu
 ## Literal Ninja compiler arguments (unreleased, replay pending)
 
 Retained actual38c79 native-consumer records showed successful C/C++ compilation/preprocessing in both modes, but Ninja consumed the synthetic literal dollar prefix in one quoted argument; direct cc retained it. The same-version CMake patch now applies one Ninja dollar-escaping layer to discovered compiler arguments at both joins, using the existing Ninja/Multi-Config selector before native POSIX/CRT command parsing. Explicit Config flag fragments and other generator behavior remain unchanged. Exact dollar/backtick argument acceptance is preserved; failure labels now add only bounded language/index values. The existing two-join source-contract fixture is updated without relaxing its count. Parent and independent source review plus formatting passed; corrected actual consumer and final platform package execution remain pending. No dependency/version/license or source-inventory changes were needed.
+
+
+## Native channel-row results (unreleased, ff8c877)
+
+At clean `ff8c877fcb42eb24ffadecc41f2b072244a6ac7f`, all-target compilation passed. Rust recorded 1,189 passes, one later context-menu assertion failure and 15 ignored tests across 94 targets, with the same three local provider filters. Both native channel-row methods and all three numeric-Escape methods passed. Formatting, adapter, Clippy, seven GPU cases, native fonts/startup and three CPU checks passed. Python ran 381 methods: 375 passed, no assertion failures, one existing exact 20-second PowerShell capture timeout and five platform/permission skips. Actual cc/CMake C/C++ consumers passed both legacy and quoted modes, including literal dollar/backtick, Unicode, quote, include and privacy-remap arguments.
+
+The matching normal application passed all 14 PSD/PSB, JXL, projective and grid-Warp cases, retaining native8/16 source/current-standard-composite/history/file-safety evidence. Its SHA-256 was `e410ac43cb5baea7db62eaa99c377fa6b93213dd7cd769feb7ce11e2682d9374`. The remaining long menu method now fails at a later helper call after its numeric-Escape assertions pass. Test-only caller attribution and failure-only fixed Boolean state preserve the gesture and every assertion; a focused diagnostic is required before choosing another behavior change.
+
+After all QA processes closed, a separate normal-main comparison passed 32 balanced trials: four fresh trials per build/native depth/container, with each build first twice per cell, using deterministic dense 2048-square clean Save As fixtures. Baseline was clean `f01a9306fb4af7403d447625d41adbe45f6d6687`, runtime `7744c87ea8459c8456f03646aa0311e0cd0e63a9d74d15ad5a3a67b22415a02e`; candidate was the qualified ff8 runtime above. Rust1.92/native tools and dev opt1/dependencies2/debug0/incremental0 profiles match. Cargo manifests/lock, native tool helper and the complete guarded Save server path are byte-identical; the native channel-row path is the meaningful Save change.
+
+| Depth/container | Baseline Save median ms | Row Save median ms | Observed change |
+| --- | ---: | ---: | ---: |
+|8 / PSD|1076.29|813.76|-24.39%|
+|8 / PSB|1066.03|809.23|-24.09%|
+|16 / PSD|1833.51|1540.78|-15.97%|
+|16 / PSB|1826.37|1517.42|-16.92%|
+
+The requested memory sample interval was 5ms; the maximum observed Save sample gap was16.90ms. Median sampled application private commit remained in comparable ranges (roughly67MiB native8 and165-181MiB native16), with no total-memory or lifetime-peak guarantee. Save wall time includes CLI request/process overhead. Cache, thermal state, scheduling and user/background OS activity are uncontrolled; other QA was stopped. Native metadata/observed history, original fixture and executable checks passed, while this timing driver does not independently prove every native pixel; dedicated exact byte/PSD/PSB/current-composite tests provide that separate evidence. This is a scoped Save result, not physical input latency, full PB-108 closure, native installation, 16k or Photoshop acceptance. Receipt SHA-256 `6233021fa9274565b9f8be3aaa0769d5e2cba84eddfa41f8dd04b942226cbcc4`; reviewed driver `5ba31a39e7909d6af01fcdd48bd723f76f3c128d6d0613ed44078a6d6fc06d8f`.

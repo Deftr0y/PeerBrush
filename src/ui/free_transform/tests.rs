@@ -3020,13 +3020,42 @@ fn transform_secondary(
         );
     }
 }
+#[track_caller]
 fn transform_context(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
     let at = transform_context_point(app, ctx);
+    let state = |app: &PeerBrush| {
+        let editor = app.free_transform.as_ref().unwrap();
+        let focus = ctx.memory(|memory| memory.focused());
+        (
+            ctx.wants_keyboard_input(),
+            focus.is_some(),
+            focus.is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some()),
+            ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+            }),
+            ctx.input(|input| input.pointer.primary_down()),
+            ctx.input(|input| input.pointer.secondary_down()),
+            editor.context_frame,
+            editor.context_secondary_typing,
+            editor.drag.is_some(),
+            ctx.memory(|memory| memory.any_popup_open()),
+            ctx.memory(|memory| memory.top_modal_layer().is_some()),
+        )
+    };
+    let before = state(app);
     transform_secondary(app, ctx, at, Default::default());
-    assert!(app.free_transform.as_ref().unwrap().context.is_some());
+    assert!(
+        app.free_transform.as_ref().unwrap().context.is_some(),
+        "Actual secondary gesture must open its context menu; booleans (keyboard, focus, text, ime, primary, secondary, frame, typed_gesture, drag, popup, modal): before={before:?}, after={:?}",
+        state(app)
+    );
     frame(app, ctx, vec![]);
     frame(app, ctx, vec![])
 }
+#[track_caller]
 fn transform_context_choose(app: &mut PeerBrush, ctx: &egui::Context, label: &str) {
     let output = transform_context(app, ctx);
     let root = app
