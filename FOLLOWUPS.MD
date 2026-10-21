@@ -510,3 +510,6 @@ PB-145/PB-155 historical DEB harness correction (unreleased, replay pending): ac
 
 
 PB-154 Store invocation prerequisite (unreleased, hosted writer blocked): a fixed isolated guard verifies exact official manual-main automation separately from release data before checkout. Hosted write requests and unknown publisher routes stop before credentials; final authenticated read-only preflight retains existing access, with no submit forwarding or guessed state path. Five offline trust/privacy/caller methods are prepared and independently source-reviewed. Durable private host/backend and actual publisher selection, combined/provider/public acceptance and explicit activation remain open; no remote setting changed.
+
+
+PB-145/PB-154 Mac producer caller completion (unreleased, dormant): native activation and Quit components now gate the credential-free producer build before any signing. One additional prepared order/no-bypass method brings producer offline methods to11. Independent source review passed; combined/native execution and explicit activation remain open.

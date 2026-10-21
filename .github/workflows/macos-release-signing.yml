@@ -106,6 +106,8 @@ jobs:
           cargo test --locked
           cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact
           cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
+          cargo run --locked --example macos_activation
+          cargo run --locked --example macos_quit
           cargo clippy --all-targets --locked
           python3 -B scripts/test_package.py
           python3 -B scripts/test_sign_macos.py

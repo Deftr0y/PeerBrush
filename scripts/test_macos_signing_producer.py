@@ -116,6 +116,27 @@ class AppleSigningProducer(unittest.TestCase):
         self.assertLess(self.build.index('name: Require stable exact source'), self.build.index('name: Test and build'))
         self.assertNotIn('secrets.', self.build)
 
+    def test_native_activation_and_quit_must_pass_in_guarded_unprivileged_build_before_signing(self):
+        build = step(self.build, 'Test and build without Apple credentials')
+        activation = 'cargo run --locked --example macos_activation'
+        quit = 'cargo run --locked --example macos_quit'
+        for command in [activation, quit]:
+            self.assertEqual(self.workflow.count(command), 1)
+            self.assertIn(command, build)
+            self.assertNotIn(command, self.sign)
+        self.assertLess(build.index('cargo test --locked\n'), build.index(activation))
+        self.assertLess(build.index('cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests'), build.index(activation))
+        self.assertLess(build.index(activation), build.index(quit))
+        self.assertLess(build.index(quit), build.index('python3 -B scripts/build_release.py'))
+        for forbidden in ['continue-on-error:', 'if: always()', 'secrets.', '|| true']:
+            self.assertNotIn(forbidden, build)
+        self.assertLess(self.build.index('name: Require reviewed main invocation'), self.build.index('name: Checkout reviewed main source'))
+        self.assertLess(self.build.index('name: Require stable exact source before tests'), self.build.index('name: Test and build without Apple credentials'))
+        self.assertLess(self.build.index('name: Test and build without Apple credentials'), self.build.index('name: Retain exact unsigned input'))
+        self.assertIn('needs: build\n', self.sign)
+        self.assertIn("needs.build.result == 'success'", self.sign)
+        self.assertIn('environment: apple-signing', self.sign)
+
     def test_existing_native_signers_and_protected_approval_are_the_only_signing_path(self):
         self.assertIn('permissions:\n  contents: read\n', self.workflow)
         self.assertNotIn('id-token:', self.workflow)
