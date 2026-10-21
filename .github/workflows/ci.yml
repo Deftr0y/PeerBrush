@@ -174,6 +174,13 @@ jobs:
                       matched += ['JXL_WORKER_' + code for code in sorted(set(re.findall(r'^JXL_TIMEOUT_ERROR_(FAILED|PROTOCOL|RESOURCE|OTHER)$', body, re.M)))]
                       if matched:
                           print('::error title=Regression failure category::' + name[:128] + ': ' + ', '.join(matched))
+                      if name in {'protocol_presets_preview_and_repeated_batches_keep_native_files_profiles_and_source', 'batch_existing_file_policies_report_written_skipped_failed_and_unattempted_outputs'}:
+                          records = re.findall(r'^PB_EXPORT_WAIT elapsed_ms=(0|[1-9][0-9]{0,5}) status=(running) phase=(planning|rendering|complete|stopped|unknown) outputs=(0|[1-9][0-9]{0,2}) written=(0|[1-9][0-9]{0,2}) skipped=(0|[1-9][0-9]{0,2}) failed=(0|[1-9][0-9]{0,2}) not_written=(0|[1-9][0-9]{0,2})$', body, re.M)
+                          if len(records) == 1:
+                              elapsed, status, phase, outputs, written, skipped, failed, pending = records[0]
+                              counts = [int(value) for value in [outputs, written, skipped, failed, pending]]
+                              if 15000 <= int(elapsed) <= 999999 and max(counts) <= 64 and sum(counts[1:]) == counts[0]:
+                                  print(f'::error title=Export completion diagnostic::elapsed_ms={elapsed} status={status} phase={phase} outputs={outputs} written={written} skipped={skipped} failed={failed} not_written={pending}')
                       if name == 'ui::effect_color::tests::effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes':
                           records = re.findall(r'^PB_EFFECT_COLOR_HISTORY depth=(8|16) action=(escape|invalid|source) before=(0|[1-9][0-9]{0,4}) after=(0|[1-9][0-9]{0,4})$', body, re.M)
                           if len(records) == 1:

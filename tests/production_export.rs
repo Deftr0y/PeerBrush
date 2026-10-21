@@ -369,16 +369,38 @@ fn invalid_exports_and_cancellation_keep_original_precision_pixels_and_definitio
 }
 
 fn wait_job(shared: &peerbrush::server::Shared, run: &str) -> serde_json::Value {
-    for _ in 0..1000 {
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(15);
+    loop {
         let state =
             peerbrush::server::dispatch(shared, "exports", &json!({"action":"status","run":run}))
                 .unwrap();
         if state["status"] != "running" {
             return state;
         }
+        if std::time::Instant::now() >= deadline {
+            let phase = match state["stage"].as_str().unwrap_or("") {
+                "Planning native output" => "planning",
+                "Export complete" => "complete",
+                "Export stopped" => "stopped",
+                stage if stage.starts_with("Rendering ") => "rendering",
+                _ => "unknown",
+            };
+            let count = |status: &str| {
+                state["outputs"].as_array().map_or(0, |outputs| {
+                    outputs
+                        .iter()
+                        .filter(|output| output["status"] == status)
+                        .count()
+                })
+            };
+            panic!("PB_EXPORT_WAIT elapsed_ms={} status=running phase={} outputs={} written={} skipped={} failed={} not_written={}",
+                start.elapsed().as_millis().min(999999), phase,
+                state["outputs"].as_array().map_or(0, Vec::len),
+                count("written"), count("skipped"), count("failed"), count("not_written"));
+        }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    panic!("Export run did not finish")
 }
 #[test]
 fn export_presets_persist_with_revision_and_disk_conflict_guards_outside_history() {

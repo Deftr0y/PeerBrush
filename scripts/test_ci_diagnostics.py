@@ -90,6 +90,32 @@ class Diagnostics(unittest.TestCase):
         output = self.summarize(header.replace(name, 'other::fixture') + valid + '\n' + PRIVATE)
         self.assertNotIn('Effect color history diagnostic', output)
 
+    def test_export_wait_record_is_fixed_bounded_and_allowlisted(self):
+        names = ['protocol_presets_preview_and_repeated_batches_keep_native_files_profiles_and_source',
+                 'batch_existing_file_policies_report_written_skipped_failed_and_unattempted_outputs']
+        valid = 'PB_EXPORT_WAIT elapsed_ms=15000 status=running phase=rendering outputs=2 written=1 skipped=0 failed=0 not_written=1'
+        for name in names:
+            header = 'test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n'
+            output = self.summarize(header + valid + '\n' + PRIVATE)
+            self.assertIn('Export completion diagnostic::elapsed_ms=15000 status=running phase=rendering outputs=2 written=1 skipped=0 failed=0 not_written=1', output)
+            for phase in ['planning', 'rendering', 'complete', 'stopped', 'unknown']:
+                self.assertIn('phase=' + phase, self.summarize(header + valid.replace('phase=rendering', 'phase=' + phase)))
+            invalid = [valid.replace('elapsed_ms=15000', 'elapsed_ms=14999'),
+                       valid.replace('elapsed_ms=15000', 'elapsed_ms=015000'),
+                       valid.replace('elapsed_ms=15000', 'elapsed_ms=1000000'),
+                       valid.replace('status=running', 'status=failed'),
+                       valid.replace('phase=rendering', 'phase=' + PRIVATE),
+                       valid.replace('outputs=2', 'outputs=3'),
+                       valid.replace('outputs=2', 'outputs=257').replace('not_written=1', 'not_written=256'),
+                       valid.replace('written=1', 'written=-1'),
+                       valid.replace('written=1', 'written=01'),
+                       valid + ' ' + PRIVATE, PRIVATE + valid, valid + '\n' + valid]
+            for marker in invalid:
+                with self.subTest(marker=marker):
+                    self.assertNotIn('Export completion diagnostic', self.summarize(header + marker + '\n' + PRIVATE))
+        self.assertNotIn('Export completion diagnostic', self.summarize('test other::test ... FAILED\n---- other::test stdout ----\n' + valid))
+        self.assertNotIn('Export completion diagnostic', self.summarize(valid))
+
     def test_unknown_output_never_turns_warning_locations_into_compiler_errors(self):
         output = self.summarize('warning: example\n  --> src/gpu.rs:8:2\n' + PRIVATE)
         self.assertIn('UNKNOWN', output)
