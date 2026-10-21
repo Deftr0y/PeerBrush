@@ -466,6 +466,43 @@ struct Embedded {
     standard_hash: u64,
     document: Document,
 }
+// Keep the decoded-size and cancellation checks below BufReader: serde_json's
+// reader consumes individual bytes, while native decompression stays chunked.
+struct EmbeddedReader<'a, R> {
+    inner: R,
+    remaining: usize,
+    control: &'a crate::loading::Control,
+}
+impl<R: Read> Read for EmbeddedReader<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.control.check().map_err(std::io::Error::other)?;
+        let size = bytes.len().min(self.remaining.saturating_add(1));
+        let n = self.inner.read(&mut bytes[..size])?;
+        if n > self.remaining {
+            return Err(std::io::Error::other(
+                "Editable PSD source data exceeds its decoded budget",
+            ));
+        }
+        self.remaining -= n;
+        Ok(n)
+    }
+}
+fn embedded_source<R: Read>(
+    input: R,
+    limit: usize,
+    control: &crate::loading::Control,
+) -> Result<Embedded, serde_json::Error> {
+    // from_reader calls end(): trailing whitespace must reach real zlib EOF,
+    // including its checksum, even when the JSON ends exactly at the budget.
+    serde_json::from_reader(std::io::BufReader::with_capacity(
+        64 * 1024,
+        EmbeddedReader {
+            inner: input,
+            remaining: limit,
+            control,
+        },
+    ))
+}
 struct BoundedWriter<'a, W> {
     inner: W,
     written: usize,
@@ -2140,59 +2177,36 @@ fn decode_parts(
     // (for example a profile added without changing layer/composite hashes).
     if let Some(bytes) = embedded.filter(|_| warnings.is_empty()) {
         control.progress("Restoring editable sources", 0, 1)?;
-        let mut json = vec![];
         let limit = if high {
             512 * 1024 * 1024
         } else {
             128 * 1024 * 1024
         };
-        let mut zip = ZlibDecoder::new(&bytes[..]).take(limit + 1);
-        let mut chunk = vec![0; 1024 * 1024];
-        let result = (|| -> Result<(), String> {
-            loop {
-                control.check()?;
-                let n = zip.read(&mut chunk).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                json.extend_from_slice(&chunk[..n]);
-            }
-            Ok(())
-        })();
+        let result = embedded_source(ZlibDecoder::new(bytes), limit, control);
         control.check()?;
-        if result.is_ok()
-            && json.len()
-                <= if high {
-                    512 * 1024 * 1024
-                } else {
-                    128 * 1024 * 1024
-                }
-        {
-            if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=33).contains(&e.format)
-                    && (e.format >= 33 || !crate::retained::has_warps(&e.document))
-                    && (e.format >= 32 || !crate::retained::has_projective(&e.document))
-                    && (e.format >= 31 || !has_installed_fonts(&e.document))
-                    && (e.format >= 30 || !has_letter_spacing(&e.document))
-                    && (e.format >= 29
-                        || e.document
-                            .layers
-                            .iter()
-                            .all(|layer| layer.mask.as_ref().is_none_or(|mask| mask.linked)))
-                    && e.document.width == w
-                    && e.document.height == h
-                    && e.document.bit_depth == depth
-                    && (!high || e.format >= 5)
-                    && e.standard_hash == hash(layer_section) ^ composite_hash
-                    && e.document.psd_global_mask == global_mask_settings
-                    && validate(&e.document).is_ok()
-                    && metadata_sources_match(layer_section, layout, &e.document, control)
-                        == Ok(true)
-                {
-                    control.progress("Ready", 1, 1)?;
-                    e.document.srgb_tagged |= srgb_tagged;
-                    return Ok(e.document);
-                }
+        if let Ok(mut e) = result {
+            if (1..=33).contains(&e.format)
+                && (e.format >= 33 || !crate::retained::has_warps(&e.document))
+                && (e.format >= 32 || !crate::retained::has_projective(&e.document))
+                && (e.format >= 31 || !has_installed_fonts(&e.document))
+                && (e.format >= 30 || !has_letter_spacing(&e.document))
+                && (e.format >= 29
+                    || e.document
+                        .layers
+                        .iter()
+                        .all(|layer| layer.mask.as_ref().is_none_or(|mask| mask.linked)))
+                && e.document.width == w
+                && e.document.height == h
+                && e.document.bit_depth == depth
+                && (!high || e.format >= 5)
+                && e.standard_hash == hash(layer_section) ^ composite_hash
+                && e.document.psd_global_mask == global_mask_settings
+                && validate(&e.document).is_ok()
+                && metadata_sources_match(layer_section, layout, &e.document, control) == Ok(true)
+            {
+                control.progress("Ready", 1, 1)?;
+                e.document.srgb_tagged |= srgb_tagged;
+                return Ok(e.document);
             }
         }
         warnings.push(
@@ -3980,3 +3994,6 @@ mod storage_tests {
 
 #[cfg(test)]
 mod mask_rows_tests;
+
+#[cfg(test)]
+mod source_stream_tests;

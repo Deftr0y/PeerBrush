@@ -825,3 +825,10 @@ Five prepared offline methods execute the actual inline guard and check foreign/
 
 
 The dormant current-source Mac signing producer also runs the existing native activation and guarded Quit examples after regressions in its credential-free build job, before release building or artifact retention. A new source-contract method checks exact order, absence of bypass/credentials and the protected signer dependency on successful build. This completes the new Quit caller reach and brings prepared producer methods to11; parent/independent source review passed. Combined execution and native producer dispatch remain pending and the producer stays disabled.
+
+
+## Bounded supplementary-source restoration (unreleased, combined tests pending)
+
+PSD/PSB editable JSON now parses through a64KiB buffered decoded reader rather than retaining the complete128/512MiB decoded transfer alongside native tiles. The reader checks cancellation at refills, rejects a decoded budget+1 byte and still requires real zlib EOF/checksum plus JSON end, including trailing whitespace at the exact limit. Non-retried cancellation remains an opening error through the original outer Control check before any admission or fallback. The complete source-format/feature/native/dimension/memory/standard-hash/metadata predicates and protected saved-pixel fallback remain. No size cap or format is raised by this change.
+
+Four prepared regular methods cover exact bounds/end/integrity, real refill cancellation/read counts, historical full-buffer parity, actual native8/16 PSD/PSB/source/mask/history/composite and protected-fallback behavior. An ignored fixed256x192 dense/sparse same-source timing method compares the old and new parsers, with one old-first pair per cell and explicit cache/order/cancellation-cost limits. Parent and independent source review plus pinned formatting passed. Combined parity and isolated component performance execution remain required; neither total RAM nor a speedup, whole-application latency or16000-square acceptance is established. See [the bounded loading record](large-documents.md#supplementary-editable-source-loading-unreleased-verification-pending).

@@ -228,6 +228,7 @@
     "src/psd.rs",
     "src/psd/mask_rows_tests.rs",
     "src/psd/patterns.rs",
+    "src/psd/source_stream_tests.rs",
     "src/psd/styles.rs",
     "src/raster.rs",
     "src/recovery.rs",

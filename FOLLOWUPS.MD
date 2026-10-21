@@ -513,3 +513,6 @@ PB-154 Store invocation prerequisite (unreleased, hosted writer blocked): a fixe
 
 
 PB-145/PB-154 Mac producer caller completion (unreleased, dormant): native activation and Quit components now gate the credential-free producer build before any signing. One additional prepared order/no-bypass method brings producer offline methods to11. Independent source review passed; combined/native execution and explicit activation remain open.
+
+
+PB-068/PB-108 supplementary loading increment (unreleased, replay pending): decoded JSON streams through64KiB buffered reads with unchanged128/512MiB bounds, real end/checksum checks, cancellability and exact native/source/standard-hash/metadata/protected-fallback gates. Four regular methods and one ignored old/new component diagnostic are prepared; independent source review and pinned formatting passed. Combined parity and measured cost remain pending; no total-memory, speedup or16000-square claim is made.
