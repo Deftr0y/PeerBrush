@@ -27,7 +27,56 @@ packaging = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packaging)
 
 
+def native_flags_failure_category(stdout, stderr):
+    message = b'\n'.join(stream[-65536:] for stream in [stdout, stderr] if isinstance(stream, bytes))
+    if b'--locked' in message and (b'cannot update the lock file' in message
+            or (b'needs to be updated' in message and (b'lock file' in message or b'lockfile' in message))):
+        return 'LOCKFILE_UPDATE_REQUIRED'
+    if b'--offline' in message and (b'no matching package named' in message
+            or b'attempting to make an HTTP request' in message):
+        return 'OFFLINE_DEPENDENCY_MISSING'
+    if re.search(rb'error\[E[0-9]{4}\]:', message):
+        return 'RUST_COMPILE_ERROR'
+    if b'native preprocessing could not start' in message:
+        return 'PREPROCESS_START_FAILED'
+    if b'native preprocessing failed' in message:
+        return 'PREPROCESS_FAILED'
+    if b'CMake Error' in message or b'ninja: build stopped:' in message:
+        return 'CMAKE_OR_NINJA_FAILED'
+    if b'failed to run custom build command' in message:
+        return 'CUSTOM_BUILD_COMMAND_FAILED'
+    return 'UNKNOWN'
+
+
 class Packages(unittest.TestCase):
+    def test_native_flags_failure_categories_are_bounded_and_never_forward_private_output(self):
+        sentinel = b'SYNTHETIC_PRIVATE_COMPILER_CANARY'
+        cases = [
+            ('lock', b'error: the lock file ' + sentinel + b' needs to be updated but --locked was passed', 'LOCKFILE_UPDATE_REQUIRED'),
+            ('lock-alternative', b'error: cannot update the lock file ' + sentinel + b' because --locked was passed', 'LOCKFILE_UPDATE_REQUIRED'),
+            ('offline', b'error: no matching package named ' + sentinel + b' found; --offline was specified', 'OFFLINE_DEPENDENCY_MISSING'),
+            ('offline-http', b'attempting to make an HTTP request, but --offline was specified', 'OFFLINE_DEPENDENCY_MISSING'),
+            ('rust', sentinel + b' error[E0433]: compile error', 'RUST_COMPILE_ERROR'),
+            ('preprocess-start', sentinel + b' native preprocessing could not start', 'PREPROCESS_START_FAILED'),
+            ('preprocess', sentinel + b' native preprocessing failed', 'PREPROCESS_FAILED'),
+            ('cmake', sentinel + b' CMake Error: failure', 'CMAKE_OR_NINJA_FAILED'),
+            ('ninja', sentinel + b' ninja: build stopped: subcommand failed.', 'CMAKE_OR_NINJA_FAILED'),
+            ('build', sentinel + b' failed to run custom build command', 'CUSTOM_BUILD_COMMAND_FAILED'),
+            ('unknown', sentinel, 'UNKNOWN'),
+            ('lock-without-locked', b'lock file needs to be updated', 'UNKNOWN'),
+            ('bad-code', b'error[E12345]: ' + sentinel, 'UNKNOWN'),
+            ('signal-no-inference', b'killed ' + sentinel, 'UNKNOWN'),
+        ]
+        for label, message, expected in cases:
+            with self.subTest(category=label):
+                result = native_flags_failure_category(message, None)
+                self.assertEqual(result, expected)
+                self.assertNotIn(sentinel.decode(), result)
+                self.assertEqual(native_flags_failure_category(None, message), expected)
+        self.assertEqual(native_flags_failure_category('not bytes', None), 'UNKNOWN')
+        self.assertEqual(native_flags_failure_category(b'CMake Error' + b'x' * 65536, b''), 'UNKNOWN')
+        self.assertEqual(native_flags_failure_category(b'x' * 65536 + b'CMake Error', b''), 'CMAKE_OR_NINJA_FAILED')
+
     @unittest.skipUnless(all(os.environ.get(name) for name in ['CC', 'CXX', 'CMAKE', 'CMAKE_MAKE_PROGRAM']),
                          'Requires qualified native compiler, CMake and Ninja')
     def test_release_flags_reach_actual_cc_and_cmake_consumers_without_literal_quotes(self):
@@ -72,7 +121,8 @@ class Packages(unittest.TestCase):
                                                 cwd=repository, env=child, capture_output=True, timeout=180)
                     except subprocess.TimeoutExpired:
                         raise AssertionError('native-flags-consumer-timeout') from None
-                    self.assertTrue(result.returncode == 0, 'native-flags-consumer-exit-' + str(result.returncode))
+                    category = native_flags_failure_category(result.stdout, result.stderr) if result.returncode else 'NONE'
+                    self.assertTrue(result.returncode == 0, 'native-flags-consumer-exit-' + str(result.returncode) + '-category-' + category)
                     for language in ['c', 'cpp']:
                         data = (root / ('cc-' + language + '.args')).read_bytes()
                         actual = []

@@ -468,3 +468,6 @@ PB-108 Save component baseline (unreleased, f01a930): isolated 12-trial native 8
 
 
 PB-108 fixed Save descriptor increment (unreleased, replay pending): reuse the invariant identity of the privately owned unchanged handle while retaining every per-transfer current-name identity/type/link check and all fingerprint/readback/lease/source/publication guards. Extended native8/16 PSD/PSB foreign-spool faults and a real-file read/write/Drop replacement regression are prepared, with guarded cleanup. Source review passed; combined replay and measured effect remain open.
+
+
+PB-145/PB-154 native-consumer fixture correction (unreleased, replay pending): actual qualified f01 replay proved both Cargo101 failures were stale standalone lock refusals before compilation. Pinned Cargo generated the exact offline feature graph, dropping only unused parallel dependencies and preserving retained versions; --offline/--locked and all compiler/remap assertions remain. Bounded allowlisted diagnostics and a privacy/bounds regression expose future categories without private output. Independent source review passed; actual consumer/final-package qualification remains pending.
