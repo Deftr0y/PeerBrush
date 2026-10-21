@@ -3184,6 +3184,11 @@ fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_g
                 egui::Event::Text("4.25".into()),
             ],
         );
+        assert!(
+            ctx.wants_keyboard_input(),
+            "The actual numeric field is still editing"
+        );
+        assert_eq!(app.free_transform.as_ref().unwrap().values.offset[0], 4.25);
         let typed = app.free_transform.as_ref().unwrap().commands().unwrap();
         let at = transform_context_point(&app, &ctx);
         transform_secondary(&mut app, &ctx, at, Default::default());
@@ -3193,11 +3198,24 @@ fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_g
             typed
         );
         assert_eq!(workspace::source(&app), unchanged);
+        // The outside press normally ends DragValue editing. Re-enter the actual
+        // field before checking its separate Escape contract.
+        warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+        let at = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, at);
+        assert!(ctx.wants_keyboard_input());
         workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
         assert!(
             app.free_transform.is_some(),
             "Numeric Escape only completes the field"
         );
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            typed
+        );
+        assert_eq!(workspace::source(&app), unchanged);
 
         transform_context_choose(&mut app, &ctx, "Flip Horizontal");
         settle(&mut app, &ctx);
@@ -3317,5 +3335,136 @@ fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_g
         frame(&mut app, &ctx, vec![egui::Event::WindowFocused(false)]);
         assert!(app.free_transform.is_none());
         assert_eq!(workspace::source(&app), later);
+    }
+}
+
+#[test]
+fn canvas_context_typing_guard_spans_held_and_same_frame_secondary_gestures() {
+    for depth in [8, 16] {
+        for same_frame in [false, true] {
+            let (mut app, ctx) = warp_fixture(depth, "color");
+            let unchanged = workspace::source(&app);
+            open(&mut app, &ctx);
+            settle(&mut app, &ctx);
+            warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+            let numeric = app.free_transform.as_ref().unwrap().inputs[0]
+                .unwrap()
+                .center();
+            for _ in 0..2 {
+                workspace::click(&mut app, &ctx, SIZE, numeric);
+            }
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                    egui::Event::Text("4.25".into()),
+                ],
+            );
+            assert!(ctx.wants_keyboard_input());
+            let values = app.free_transform.as_ref().unwrap().values.clone();
+            assert_eq!(values.offset[0], 4.25);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            let at = transform_context_point(&app, &ctx);
+            let secondary = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let mut events = vec![egui::Event::PointerMoved(at), secondary(true)];
+            if same_frame {
+                events.push(secondary(false));
+            }
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+                    time: Some(ctx.input(|input| input.time) + 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.draw(ctx);
+                    if ctx.output(|output| output.num_completed_passes == 0) {
+                        ctx.request_discard(
+                            "Verify the typing guard across a repeated layout pass",
+                        );
+                    }
+                },
+            );
+            assert_eq!(output.platform_output.num_completed_passes, 2);
+            {
+                let editor = app.free_transform.as_ref().unwrap();
+                assert!(editor.context.is_none() && editor.drag.is_none());
+                assert!(editor.values == values);
+                assert_eq!(editor.commands().unwrap(), commands);
+                assert_eq!(workspace::source(&app), unchanged);
+            }
+            if !same_frame {
+                frame(&mut app, &ctx, vec![]);
+                assert!(app.free_transform.as_ref().unwrap().context.is_none());
+                frame(&mut app, &ctx, vec![secondary(false)]);
+            }
+            let editor = app.free_transform.as_ref().unwrap();
+            assert!(editor.context.is_none() && editor.drag.is_none());
+            assert!(editor.values == values);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert_eq!(workspace::source(&app), unchanged);
+
+            // A new click after completing the field is a new menu gesture,
+            // even without an intervening idle input frame.
+            transform_context(&mut app, &ctx);
+            assert_eq!(
+                app.free_transform.as_ref().unwrap().commands().unwrap(),
+                commands
+            );
+            workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+            assert!(app.free_transform.as_ref().unwrap().context.is_none());
+            warp_click(&mut app, &ctx, SIZE, "Cancel");
+            assert!(app.free_transform.is_none());
+            assert_eq!(workspace::source(&app), unchanged);
+        }
+    }
+}
+
+#[test]
+fn canvas_context_ime_during_secondary_hold_stays_blocked_through_release() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let unchanged = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        assert!(!ctx.wants_keyboard_input());
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        let at = transform_context_point(&app, &ctx);
+        let secondary = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(at), secondary(true)],
+            vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+            vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
+            vec![secondary(false)],
+        ] {
+            frame(&mut app, &ctx, events);
+            let editor = app.free_transform.as_ref().unwrap();
+            assert!(editor.context.is_none() && editor.drag.is_none());
+            assert!(editor.values == values);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert_eq!(workspace::source(&app), unchanged);
+        }
+        transform_context(&mut app, &ctx);
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            commands
+        );
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+        warp_click(&mut app, &ctx, SIZE, "Cancel");
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), unchanged);
     }
 }

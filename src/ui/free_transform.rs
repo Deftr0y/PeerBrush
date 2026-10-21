@@ -80,6 +80,7 @@ pub(super) struct Editor {
     warp_amount: f64,
     context: egui::menu::MenuRootManager,
     context_frame: bool,
+    context_secondary_typing: bool,
     proportional: bool,
     snap: bool,
     prior_tool: Tool,
@@ -119,6 +120,21 @@ impl Editor {
     }
     fn show_context(&mut self, ui: &mut egui::Ui, available: Rect) -> bool {
         let was_open = self.context.is_some();
+        let typing = ui.ctx().wants_keyboard_input()
+            || ui.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+            });
+        // An outside press can end a numeric field before this gesture's release.
+        if ui.input(|input| input.pointer.secondary_pressed()) {
+            self.context_secondary_typing = typing;
+        } else if ui
+            .input(|input| input.pointer.secondary_down() || input.pointer.secondary_released())
+        {
+            self.context_secondary_typing |= typing;
+        }
         if self.context.as_ref().is_some_and(|root| {
             ui.input(|input| {
                 input.pointer.any_pressed()
@@ -144,13 +160,8 @@ impl Editor {
         if !navigating
             && !ui.input(|input| input.pointer.primary_down())
             && self.drag.is_none()
-            && !ui.ctx().wants_keyboard_input()
-            && !ui.input(|input| {
-                input
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, egui::Event::Ime(_)))
-            })
+            && !typing
+            && !self.context_secondary_typing
             && ui
                 .ctx()
                 .memory(|memory| !memory.any_popup_open() && memory.top_modal_layer().is_none())
@@ -1073,6 +1084,7 @@ impl PeerBrush {
             warp_amount: 0.15,
             context: Default::default(),
             context_frame: false,
+            context_secondary_typing: false,
             proportional: true,
             snap: false,
             prior_tool,
