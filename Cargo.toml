@@ -61,5 +61,6 @@ strip = true
 
 
 [patch.crates-io]
+cmake = { path = "vendor/cmake" }
 egui-winit = { path = "vendor/egui-winit" }
 jpegxl-src = { path = "vendor/jpegxl-src" }

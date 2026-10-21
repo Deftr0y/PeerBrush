@@ -105,6 +105,8 @@ jobs:
       - run: python -B scripts/test_ci_diagnostics.py
       - run: python -B scripts/test_release_source_guard.py
       - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
+      - run: rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
       - name: Build source-matched JPEG XL worker for integration tests
         run: cargo build --locked --bin peerbrush
       - run: cargo test --locked

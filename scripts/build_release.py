@@ -3,6 +3,8 @@ import argparse
 import hashlib
 import os
 import pathlib
+import re
+import shlex
 import subprocess
 from package import git
 from jxl_build import configure, reject_overrides
@@ -18,6 +20,56 @@ def source_input_state(root):
         return hashlib.sha256(b'\0'.join(parts)).hexdigest()
     except (OSError, UnicodeError, subprocess.SubprocessError):
         return 'unknown'
+
+
+def native_shell_flags(value):
+    """Match locked cc's shlex parser; newlines/control input is rejected by the caller."""
+    arguments, word = [], []
+    quote, active = None, False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        index += 1
+        if quote == "'":
+            if character == "'":
+                quote = None
+            else:
+                word.append(character)
+        elif quote == '"':
+            if character == '"':
+                quote = None
+            elif character == '\\':
+                if index == len(value):
+                    raise ValueError('Malformed native shell compiler flags')
+                following = value[index]
+                index += 1
+                if following not in '$`"\\':
+                    word.append('\\')
+                word.append(following)
+            else:
+                word.append(character)
+        elif character in ' \t':
+            if active:
+                arguments.append(''.join(word))
+                word, active = [], False
+        elif character == '#' and not active:
+            break
+        elif character in "'\"":
+            quote, active = character, True
+        elif character == '\\':
+            if index == len(value):
+                raise ValueError('Malformed native shell compiler flags')
+            word.append(value[index])
+            index += 1
+            active = True
+        else:
+            word.append(character)
+            active = True
+    if quote is not None:
+        raise ValueError('Malformed native shell compiler flags')
+    if active:
+        arguments.append(''.join(word))
+    return arguments
 
 
 def release_environment(root, inherited=None):
@@ -37,16 +89,23 @@ def release_environment(root, inherited=None):
         for spelling in dict.fromkeys([str(prefix), prefix.as_posix()]):
             flags.append(f'--remap-path-prefix={spelling}={replacement}')
     environment['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
-    # Keep native source/macro paths subject to the same package privacy gate.
+    # cc defaults to ASCII whitespace; preserve inherited argv before enabling shell parsing.
+    shell_flags = environment.get('CC_SHELL_ESCAPED_FLAGS', '') not in ['', '0', 'false', 'no']
+    native_flags = {}
+    for key, value in environment.items():
+        if re.fullmatch(r'(?:(?:HOST|TARGET)_)?(?:CFLAGS|CXXFLAGS|ARFLAGS|RANLIBFLAGS)(?:_.+)?', key):
+            if any((ord(character) < 32 and character != '\t') or ord(character) == 127 for character in value):
+                raise ValueError('Native compiler flags contain an unsupported control character')
+            native_flags[key] = native_shell_flags(value) if shell_flags else re.findall(r'[^ \t\n\r\v\f]+', value)
     for key in ['CFLAGS', 'CXXFLAGS']:
-        native = [environment[key]] if environment.get(key) else []
+        native = native_flags.setdefault(key, [])
         for prefix, replacement in prefixes:
             for spelling in dict.fromkeys([str(prefix), prefix.as_posix()]):
                 if any(c in spelling for c in ['\"', '\r', '\n', '\0']):
                     raise ValueError('Native path remapping contains an unsupported character')
-                flag = '-ffile-prefix-map=' + spelling + '=' + replacement
-                native.append('\"' + ('/clang:' if os.name == 'nt' else '') + flag + '\"')
-        environment[key] = ' '.join(native)
+                native.append(('/clang:' if os.name == 'nt' else '') + '-ffile-prefix-map=' + spelling + '=' + replacement)
+    environment.update({key: shlex.join(flags) for key, flags in native_flags.items()})
+    environment['CC_SHELL_ESCAPED_FLAGS'] = '1'
     return environment
 
 

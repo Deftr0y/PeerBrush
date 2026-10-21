@@ -117,6 +117,8 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
       - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
+      - run: rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
       - name: Build source-matched JPEG XL worker for integration tests
         run: cargo build --locked --bin peerbrush
       # Cached bytes are an optimization; source builds and every qualification gate still run.

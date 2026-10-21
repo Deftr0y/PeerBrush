@@ -6,6 +6,8 @@ import io
 import json
 import os
 import pathlib
+import re
+import shlex
 import plistlib
 import struct
 import subprocess
@@ -26,6 +28,80 @@ spec.loader.exec_module(packaging)
 
 
 class Packages(unittest.TestCase):
+    @unittest.skipUnless(all(os.environ.get(name) for name in ['CC', 'CXX', 'CMAKE', 'CMAKE_MAKE_PROGRAM']),
+                         'Requires qualified native compiler, CMake and Ninja')
+    def test_release_flags_reach_actual_cc_and_cmake_consumers_without_literal_quotes(self):
+        from build_release import release_environment
+        from jxl_build import configure
+        repository = pathlib.Path(__file__).resolve().parents[1]
+        fixture = repository / 'tests/fixtures/native-build-flags/Cargo.toml'
+        environment, _ = configure()
+        version = subprocess.run(['rustc', '-vV'], env=environment, check=True, capture_output=True, text=True, timeout=20)
+        self.assertTrue('release: 1.92.0' in version.stdout, 'native-flags-rust-version')
+        target = next(row.removeprefix('host: ') for row in version.stdout.splitlines() if row.startswith('host: '))
+        with tempfile.TemporaryDirectory(prefix='peerbrush-native-flags-') as temporary:
+            area = pathlib.Path(temporary).resolve()
+            for shell_mode in [False, True]:
+                with self.subTest(shell_mode=shell_mode):
+                    root = area / (('shell' if shell_mode else 'legacy') + ' source ' + chr(0xE9))
+                    root.mkdir()
+                    source = 'const char *pb_native_path(void) { return __FILE__; }\n'
+                    (root / 'native.c').write_text(source.replace('pb_native_path', 'pb_native_c_path'), encoding='utf-8')
+                    (root / 'native.cpp').write_text('extern "C" ' + source.replace('pb_native_path', 'pb_native_cpp_path'), encoding='utf-8')
+                    (root / 'CMakeLists.txt').write_text('cmake_minimum_required(VERSION 3.15)\nproject(flags_probe C CXX)\nadd_library(flags_probe STATIC native.c native.cpp)\n', encoding='utf-8')
+                    (root / 'launcher.py').write_text((repository / 'tests/fixtures/native-build-flags/launcher.py').read_text(encoding='utf-8'), encoding='utf-8')
+                    expected = ['-DPB_BACKSLASH="C:\\\\synthetic\\\\end\\\\"', '-DPB_UNICODE=' + chr(0xE9)]
+                    if shell_mode:
+                        include = root / 'include'
+                        include.mkdir()
+                        expected += ['-DPB_SPACES="two words"', '-DPB_QUOTES="one\\\\\\"two"', '-DPB_APOSTROPHE="one\'two"', '-I' + str(include) + '\\']
+                    raw = shlex.join(expected) if shell_mode else ' '.join(expected)
+                    if shell_mode:
+                        literal = '-DPB_ESCAPES="$cash`tick"'
+                        token = '"' + literal.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`') + '"'
+                        raw += ' -DPB_HASH=foo#bar ' + token + ' # ignored malformed quote \"'
+                        expected += ['-DPB_HASH=foo#bar', literal]
+                    inherited = dict(environment)
+                    inherited.update(CFLAGS=raw, CXXFLAGS=raw,
+                                     CC_SHELL_ESCAPED_FLAGS='true' if shell_mode else '0')
+                    child = release_environment(root, inherited)
+                    child.update(PB_FLAGS_ROOT=str(root), PB_FLAGS_TARGET=target, PB_FLAGS_PYTHON=sys.executable, NUM_JOBS='1')
+                    try:
+                        result = subprocess.run(['cargo', 'run', '--offline', '--locked', '--quiet',
+                                                 '--manifest-path', str(fixture), '--target-dir', str(area / 'cargo-output')],
+                                                cwd=repository, env=child, capture_output=True, timeout=180)
+                    except subprocess.TimeoutExpired:
+                        raise AssertionError('native-flags-consumer-timeout') from None
+                    self.assertTrue(result.returncode == 0, 'native-flags-consumer-exit-' + str(result.returncode))
+                    for language in ['c', 'cpp']:
+                        data = (root / ('cc-' + language + '.args')).read_bytes()
+                        actual = []
+                        while data:
+                            self.assertTrue(len(data) >= 4, 'native-flags-frame-header')
+                            size = int.from_bytes(data[:4], 'big')
+                            self.assertTrue(size <= len(data) - 4, 'native-flags-frame-body')
+                            actual.append(data[4:4 + size].decode('utf-8'))
+                            data = data[4 + size:]
+                        cmake_arguments = json.loads((root / ('cmake-' + language + '.args.json')).read_text(encoding='utf-8'))
+                        for argument in expected:
+                            self.assertTrue(argument in actual, 'native-flags-cc-argv')
+                            self.assertTrue(argument in cmake_arguments, 'native-flags-cmake-argv')
+                        remaps = [argument for argument in actual if '-ffile-prefix-map=' in argument]
+                        self.assertTrue(bool(remaps), 'native-flags-missing-remap')
+                        self.assertTrue(all(argument in cmake_arguments for argument in remaps), 'native-flags-cmake-remap')
+                        preprocessed = (root / ('preprocessed-' + language + '.txt')).read_text(encoding='utf-8')
+                        returned = re.search(r'return\s+("(?:[^"\\]|\\.)*")\s*;', preprocessed)
+                        self.assertIsNotNone(returned, 'native-flags-missing-file-literal')
+                        self.assertTrue(json.loads(returned.group(1)).replace('\\', '/') == 'peerbrush/native.' + language, 'native-flags-file-prefix')
+                        objects = [path for path in (root / 'cmake-output').rglob('native.' + language + '.*')
+                                   if path.suffix in ['.o', '.obj']]
+                        self.assertTrue(len(objects) == 1, 'native-flags-cmake-object-count')
+                        object_bytes = objects[0].read_bytes()
+                        self.assertTrue(any(('peerbrush' + separator + 'native.' + language).encode() + b'\0' in object_bytes
+                                            for separator in ['/', '\\']), 'native-flags-cmake-file-prefix')
+                        self.assertTrue(not any(argument.startswith('"' + ('/clang:' if os.name == 'nt' else '') + '-ffile-prefix-map=') for argument in actual),
+                                        'native-flags-literal-quotes')
+
     def test_release_flags_remap_paths_and_preserve_encoded_options(self):
         environment = release_environment(pathlib.Path('synthetic checkout'), {'CARGO_ENCODED_RUSTFLAGS': '-C\x1ftarget-feature=+sse2'})
         flags = environment['CARGO_ENCODED_RUSTFLAGS'].split('\x1f')

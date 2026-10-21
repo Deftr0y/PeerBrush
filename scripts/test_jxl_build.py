@@ -5,6 +5,7 @@ import json
 import os
 import re
 import runpy
+import shlex
 import sys
 from pathlib import Path
 import subprocess
@@ -115,6 +116,62 @@ class NativeJxlBuild(unittest.TestCase):
                     jxl_build.configure({name: value},
                         selected=dict.fromkeys(['clang-cl', 'cmake', 'ninja'], Path.cwd()))
 
+    def test_native_shell_flags_match_locked_cc_comments_quotes_and_escapes(self):
+        from build_release import native_shell_flags
+        cases = [
+            ('# ignored malformed quote "', []),
+            ('foo#bar # ignored', ['foo#bar']),
+            ("''#suffix \"\" '#quoted' \\#escaped", ['#suffix', '', '#quoted', '#escaped']),
+            ("one' two'\" three\"", ['one two three']),
+            ('"-DVALUE=\\$cash\\`tick"', ['-DVALUE=$cash`tick']),
+            ('"back\\slash" "quote\\\"tail" "end\\\\"', ['back\\slash', 'quote"tail', 'end\\']),
+            ('escaped\\ space plain\tword', ['escaped space', 'plain', 'word']),
+        ]
+        for flags, expected in cases:
+            with self.subTest(case=flags):
+                self.assertEqual(native_shell_flags(flags), expected)
+        for flags in ["'unclosed", '"unclosed', 'trailing\\']:
+            with self.subTest(malformed=flags), self.assertRaises(ValueError):
+                native_shell_flags(flags)
+
+    def test_native_flags_keep_prior_cc_mode_for_standard_and_target_families(self):
+        for mode in ['', '0', 'false', 'no', '1', 'true', 'False', 'NO']:
+            shell = mode not in ['', '0', 'false', 'no']
+            expected = ['-DKEEP=C:\\synthetic\\path', '-DQUOTED="literal"']
+            if shell:
+                expected += ['-DSPACE=two words', "-DAPOSTROPHE=one'two"]
+            raw = shlex.join(expected) if shell else ' '.join(expected)
+            inherited = {'CC_SHELL_ESCAPED_FLAGS': mode}
+            for family in ['CFLAGS', 'CXXFLAGS', 'ARFLAGS', 'RANLIBFLAGS']:
+                for name in [family, 'HOST_' + family, 'TARGET_' + family,
+                             family + '_x86_64-unknown-linux-gnu', family + '_x86_64_unknown_linux_gnu']:
+                    inherited[name] = raw
+            original = dict(inherited)
+            with self.subTest(mode=mode), mock.patch('build_release.source_input_state', return_value='unknown'):
+                result = release_environment(Path('synthetic checkout'), inherited)
+            self.assertEqual(inherited, original)
+            self.assertEqual(result['CC_SHELL_ESCAPED_FLAGS'], '1')
+            for name in original:
+                if name == 'CC_SHELL_ESCAPED_FLAGS':
+                    continue
+                arguments = shlex.split(result[name], comments=False, posix=True)
+                self.assertEqual(arguments[:len(expected)], expected)
+                if name not in ['CFLAGS', 'CXXFLAGS']:
+                    self.assertEqual(arguments, expected)
+
+    def test_native_flags_reject_malformed_shell_and_control_values_without_mutating_input(self):
+        variants = [('CFLAGS', '"unterminated', 'true'),
+                    ('TARGET_CXXFLAGS', "'unterminated", 'False')]
+        variants += [(name, '-DINVALID=' + character, mode)
+                     for name in ['CFLAGS', 'CXXFLAGS', 'HOST_ARFLAGS', 'RANLIBFLAGS_target']
+                     for character in ['\r', '\n', '\0', '\x1b', '\x7f'] for mode in ['0', '1']]
+        for name, flags, mode in variants:
+            inherited = {name: flags, 'CC_SHELL_ESCAPED_FLAGS': mode}
+            original = dict(inherited)
+            with self.subTest(name=name, mode=mode), mock.patch('build_release.source_input_state', return_value='unknown'), self.assertRaises(ValueError):
+                release_environment(Path('synthetic checkout'), inherited)
+            self.assertEqual(inherited, original)
+
     def test_native_remapping_preserves_existing_flags_and_rejects_line_injection(self):
         with mock.patch('build_release.source_input_state', return_value='unknown'):
             environment = release_environment(Path('synthetic checkout'),
@@ -123,7 +180,9 @@ class NativeJxlBuild(unittest.TestCase):
             self.assertTrue(environment['CXXFLAGS'].startswith('-DREVIEWED_CPP=1 '))
             for name in ['CFLAGS', 'CXXFLAGS']:
                 self.assertIn('-ffile-prefix-map=', environment[name])
-                self.assertIn('=peerbrush"', environment[name])
+                arguments = shlex.split(environment[name], comments=False, posix=True)
+                self.assertTrue(any(argument.endswith('=peerbrush') for argument in arguments))
+                self.assertEqual(environment['CC_SHELL_ESCAPED_FLAGS'], '1')
                 if os.name == 'nt':
                     self.assertIn('/clang:-ffile-prefix-map=', environment[name])
             with self.assertRaisesRegex(ValueError, 'unsupported character'):
@@ -462,6 +521,13 @@ exit $LASTEXITCODE
             (root / 'assets/fonts').mkdir(parents=True)
             (root / 'assets/fonts/LICENCE.txt').write_text('Synthetic font notice', encoding='utf-8')
             policy = {'vendored': [directory], 'source': [directory + '/' + name for name in names], 'rust_notices': []}
+            cmake_directory = root / 'vendor/cmake'
+            cmake_directory.mkdir(parents=True)
+            (cmake_directory / 'Cargo.toml').write_text('[package]\nname="cmake"\nversion="0.1.58"\nlicense="MIT OR Apache-2.0"\n', encoding='utf-8')
+            for name in ['LICENSE-MIT', 'LICENSE-APACHE']:
+                (cmake_directory / name).write_text('Synthetic CMake corresponding notice: ' + name, encoding='utf-8')
+            policy['vendored'].append('vendor/cmake')
+            policy['source'] += ['vendor/cmake/' + name for name in ['LICENSE-MIT', 'LICENSE-APACHE']]
             bundle = root / 'bundle'
             bundle.mkdir()
             packaging.dependency_notices(root, bundle, root / 'registry', policy, root)
@@ -470,6 +536,8 @@ exit $LASTEXITCODE
                                  (root / directory / name).read_bytes())
             self.assertEqual((bundle / 'licenses/jpegxl-src-0.12.0/GPL-3.0.txt').read_bytes(),
                              (root / 'LICENSE').read_bytes())
+            for name in ['LICENSE-MIT', 'LICENSE-APACHE']:
+                self.assertEqual((bundle / 'licenses/cmake-0.1.58' / name).read_bytes(), (cmake_directory / name).read_bytes())
             policy['source'].remove(directory + '/libjxl/third_party/skcms/LICENSE')
             with self.assertRaisesRegex(ValueError, 'Missing committed JPEG XL'):
                 packaging.dependency_notices(root, bundle, root / 'registry', policy, root)
@@ -506,6 +574,10 @@ exit $LASTEXITCODE
         self.assertEqual(cargo['dependencies']['jpegxl-sys']['version'], '=0.13.0')
         self.assertEqual(cargo['dependencies']['jpegxl-sys']['features'], ['vendored'])
         self.assertEqual(cargo['patch']['crates-io']['jpegxl-src']['path'], 'vendor/jpegxl-src')
+        self.assertEqual(cargo['patch']['crates-io']['cmake']['path'], 'vendor/cmake')
+        cmake = tomllib.loads((root / 'vendor/cmake/Cargo.toml').read_text(encoding='utf-8'))
+        self.assertEqual(cmake['package']['version'], '0.1.58')
+        self.assertEqual((root / 'vendor/cmake/src/lib.rs').read_text(encoding='utf-8').count('push_quoted_flag(&mut flagsflag, arg);'), 2)
         toolchain = tomllib.loads((root / 'rust-toolchain.toml').read_text(encoding='utf-8'))
         self.assertEqual(toolchain['toolchain']['channel'], '1.92.0')
         helper = (root / 'vendor/jpegxl-src/src/lib.rs').read_text(encoding='utf-8')

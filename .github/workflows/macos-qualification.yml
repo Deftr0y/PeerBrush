@@ -136,6 +136,8 @@ jobs:
       - name: Test exact source without native attestation authority
         run: |
           cargo fmt --all -- --check
+          cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
+          rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
           cargo build --locked --bin peerbrush
           cargo test --locked --all-targets
           cargo clippy --locked --all-targets
