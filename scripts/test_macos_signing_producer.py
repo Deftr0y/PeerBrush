@@ -63,6 +63,7 @@ class AppleSigningProducer(unittest.TestCase):
         return path
 
     def zip_state(self, submission=True):
+        (self.parent / 'macos-zip-work').mkdir(mode=0o700)
         original = self.write('macos-unsigned/' + UNSIGNED, b'synthetic unsigned public package')
         self.environment['UNSIGNED_SHA256'] = digest(original.read_bytes())
         payload = self.write('macos-zip-work/payload/PeerBrush/PeerBrush.app/Contents/MacOS/peerbrush', b'synthetic signed executable', 0o755)
@@ -236,6 +237,7 @@ class AppleSigningProducer(unittest.TestCase):
     def test_actual_dmg_recovery_uses_only_three_prepared_files_and_never_walks_finalization(self):
         original = self.write('macos-signed/' + SIGNED, b'synthetic public signed ZIP')
         self.environment['UNSIGNED_SHA256'] = '1' * 64
+        (self.parent / 'macos-dmg-work').mkdir(mode=0o700)
         submitted = self.write('macos-dmg-work/submission.dmg', b'synthetic submitted disk image')
         candidate = SIGNED[:-4] + '-dmg-candidate-r3.dmg'
         hashes = {}
@@ -255,6 +257,21 @@ class AppleSigningProducer(unittest.TestCase):
             self.assertEqual({member.name for member in archive.getmembers()},
                 {'dmg/input/' + SIGNED, 'dmg/state.json', 'dmg/submission.dmg'} |
                 {'dmg/prepared/' + name for name in hashes})
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX private directory modes')
+    def test_recovery_rejects_non_private_work_before_retaining_any_payload(self):
+        for kind in ['zip', 'dmg']:
+            for mode in [0o755, 0o770, 0o777]:
+                with self.subTest(kind=kind, mode=oct(mode)), tempfile.TemporaryDirectory(prefix='peerbrush-recovery-mode-') as temporary:
+                    self.parent = Path(temporary).resolve()
+                    self.environment['RUNNER_TEMP'] = str(self.parent)
+                    work = self.parent / ('macos-' + kind + '-work')
+                    work.mkdir(mode=0o700)
+                    work.chmod(mode)
+                    with self.assertRaises(SystemExit):
+                        self.execute('Preserve narrow credentials-free same-submission recovery')
+                    self.assertFalse((self.parent / 'macos-signing-recovery.tar.partial').exists())
+                    self.assertFalse((self.parent / 'macos-signing-recovery.tar').exists())
 
     def test_changed_final_recovery_input_cannot_publish_a_partial_archive(self):
         original, payload, state = self.zip_state()
