@@ -3,6 +3,7 @@ import importlib.util
 import base64
 import json
 import os
+import re
 import runpy
 import sys
 from pathlib import Path
@@ -454,6 +455,41 @@ exit $LASTEXITCODE
         self.assertIn('"$(git rev-parse HEAD)"', text)
         self.assertIn("rows[0]['build'].get('tree') != 'clean'", text)
         self.assertIn('caches/scheduling uncontrolled', text)
+
+    def test_ci_cache_saves_after_main_without_bypassing_tests_or_release_source(self):
+        root = Path(__file__).resolve().parents[1] / '.github/workflows'
+        text = (root / 'ci.yml').read_text(encoding='utf-8')
+        pin = 'caa296126883cff596d87d8935842f9db880ef25'
+        restore = text.index('      - name: Restore Rust dependencies and build outputs')
+        build = text.index('      - name: Build source-matched JPEG XL worker for integration tests')
+        save = text.index('      - name: Save CI build cache after main compilation')
+        regression = text.index('      - name: Run regression tests and summarize failures')
+        self.assertLess(restore, build)
+        self.assertLess(build, save)
+        self.assertLess(save, regression)
+        restore_block = text[restore:text.index("      - if: runner.os == 'Linux'", restore)]
+        save_block = text[save:regression]
+        self.assertEqual(text.count('actions/cache/restore@' + pin), 1)
+        self.assertEqual(text.count('actions/cache/save@' + pin), 1)
+        self.assertNotIn('actions/cache@', text)
+        self.assertIn('        id: cargo_cache\n', restore_block)
+        self.assertIn("key: peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py') }}", restore_block)
+        self.assertIn('restore-keys: |\n            peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-\n', restore_block)
+        paths = ['~/.cargo/registry/index', '~/.cargo/registry/cache', '~/.cargo/registry/src', 'target']
+        for block in [restore_block, save_block]:
+            actual = re.search(r'(?m)^          path: \|\n((?:            [^\n]+\n)+)', block)
+            self.assertIsNotNone(actual)
+            self.assertEqual([line.strip() for line in actual[1].splitlines()], paths)
+        self.assertIn("if: success() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''\n", save_block)
+        self.assertIn('key: ${{ steps.cargo_cache.outputs.cache-primary-key }}\n', save_block)
+        self.assertEqual(text.count('outputs.cache-hit'), 1, 'Cache hits never gate build or acceptance')
+        self.assertIn('run: cargo build --locked --bin peerbrush\n', text[build:save])
+        self.assertNotIn('        if:', text[build:save])
+        self.assertNotIn('always()', save_block)
+        self.assertNotIn('continue-on-error:', save_block)
+        for name in ['release.yml', 'macos-qualification.yml']:
+            with self.subTest(workflow=name):
+                self.assertNotIn('actions/cache', (root / name).read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':

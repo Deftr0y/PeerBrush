@@ -99,8 +99,9 @@ jobs:
           with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
               output.write(f'version={version}\n')
           PY
-      - name: Cache Rust dependencies and build outputs
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
+      - name: Restore Rust dependencies and build outputs
+        id: cargo_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
         with:
           path: |
             ~/.cargo/registry/index
@@ -115,6 +116,17 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: Build source-matched JPEG XL worker for integration tests
         run: cargo build --locked --bin peerbrush
+      # Cached bytes are an optimization; source builds and every qualification gate still run.
+      - name: Save CI build cache after main compilation
+        if: success() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            target
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
       - name: Run regression tests and summarize failures
         shell: bash
         run: |
