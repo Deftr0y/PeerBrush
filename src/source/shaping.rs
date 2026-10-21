@@ -569,9 +569,26 @@ mod tests {
                 let png = base64::engine::general_purpose::STANDARD
                     .decode(reply["images"][0]["data"].as_str().unwrap())
                     .unwrap();
-                assert_eq!(png, preview.preview(None, 280, None, false).unwrap().2);
+                let (width, height, rgba, rect) = preview.preview(None, 280, None, false).unwrap();
+                let feedback =
+                    image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+                assert_eq!(feedback.color(), image::ColorType::Rgba8);
+                assert_eq!((feedback.width(), feedback.height()), (width, height));
+                assert_eq!(feedback.as_bytes(), rgba.as_slice());
+                assert_eq!(reply["images"][0]["mime_type"], "image/png");
+                assert_eq!(reply["images"][0]["width"], serde_json::json!(width));
+                assert_eq!(reply["images"][0]["height"], serde_json::json!(height));
+                assert_eq!(reply["images"][0]["document_rect"], serde_json::json!(rect));
+                assert_eq!(reply["images"][0]["revision"], serde_json::json!(1));
+                assert_eq!(reply["revision"], serde_json::json!(1));
+                let observed = crate::server::dispatch(
+                    &shared,
+                    "observe",
+                    &serde_json::json!({"image": false}),
+                )
+                .unwrap();
                 assert_eq!(
-                    reply["state"]["layers"][0]["source"]["content"]["layout"],
+                    observed["state"]["layers"][0]["source"]["content"]["layout"],
                     "shaped"
                 );
                 let mut engine = shared.lock().unwrap();

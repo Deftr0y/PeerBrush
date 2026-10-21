@@ -39,18 +39,28 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
         assert_eq!(snapshot(&engine), original);
         let shared = Arc::new(Mutex::new(engine));
         let reply = peerbrush::server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[command],"expected_revision":0,"feedback":"always","max_edge":220})).unwrap();
+        let observed =
+            peerbrush::server::dispatch(&shared, "observe", &json!({"image": false})).unwrap();
         assert_eq!(
-            reply["state"]["layers"][0]["source"]["content"]["layout"],
+            observed["state"]["layers"][0]["source"]["content"]["layout"],
             "shaped"
         );
         assert_eq!(reply["images"][0]["document_rect"], json!([0, 0, 220, 120]));
         let actual_png = base64::engine::general_purpose::STANDARD
             .decode(reply["images"][0]["data"].as_str().unwrap())
             .unwrap();
-        assert_eq!(
-            actual_png,
-            expected.preview(None, 220, None, false).unwrap().2
-        );
+        let (width, height, rgba, rect) = expected.preview(None, 220, None, false).unwrap();
+        let feedback =
+            image::load_from_memory_with_format(&actual_png, image::ImageFormat::Png).unwrap();
+        assert_eq!(feedback.color(), image::ColorType::Rgba8);
+        assert_eq!((feedback.width(), feedback.height()), (width, height));
+        assert_eq!(feedback.as_bytes(), rgba.as_slice());
+        assert_eq!(reply["images"][0]["mime_type"], "image/png");
+        assert_eq!(reply["images"][0]["width"], json!(width));
+        assert_eq!(reply["images"][0]["height"], json!(height));
+        assert_eq!(reply["images"][0]["document_rect"], json!(rect));
+        assert_eq!(reply["images"][0]["revision"], json!(1));
+        assert_eq!(reply["revision"], json!(1));
         let mut engine = shared.lock().unwrap();
         assert_eq!(
             engine.doc.export_png().unwrap(),
