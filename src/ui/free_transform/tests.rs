@@ -3468,3 +3468,235 @@ fn canvas_context_ime_during_secondary_hold_stays_blocked_through_release() {
         assert_eq!(workspace::source(&app), unchanged);
     }
 }
+
+#[test]
+fn numeric_escape_keeps_the_session_and_blocks_same_frame_canvas_or_apply_until_fresh_escape() {
+    for depth in [8, 16] {
+        for canvas in [true, false] {
+            for multipass in [false, true] {
+                for held in [false, true] {
+                    let (mut app, ctx) = warp_fixture(depth, "color");
+                    let unchanged = workspace::source(&app);
+                    open(&mut app, &ctx);
+                    settle(&mut app, &ctx);
+                    warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+                    let numeric = app.free_transform.as_ref().unwrap().inputs[0]
+                        .unwrap()
+                        .center();
+                    workspace::click(&mut app, &ctx, SIZE, numeric);
+                    assert!(ctx.wants_keyboard_input());
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![
+                            key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                            egui::Event::Text("4.25".into()),
+                        ],
+                    );
+                    assert!(ctx.wants_keyboard_input());
+                    assert_eq!(app.free_transform.as_ref().unwrap().values.offset[0], 4.25);
+                    let output = settle(&mut app, &ctx);
+                    actual_preview(&app, &output);
+                    let apply = warp_reveal(&mut app, &ctx, SIZE, "Apply", None);
+                    assert!(
+                        ctx.wants_keyboard_input(),
+                        "The actual numeric editor still owns input"
+                    );
+                    let owner = ctx.memory(|memory| memory.focused()).unwrap();
+                    assert_eq!(app.free_transform.as_ref().unwrap().text_focus, Some(owner));
+                    let values = app.free_transform.as_ref().unwrap().values.clone();
+                    let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+                    assert!(!commands.is_empty());
+                    let at = if canvas {
+                        transform_context_point(&app, &ctx)
+                    } else {
+                        apply
+                    };
+                    let mut events = vec![
+                        key_event(egui::Key::Escape, Default::default()),
+                        egui::Event::PointerMoved(at),
+                        pointer(at, true),
+                    ];
+                    if !held {
+                        events.push(pointer(at, false));
+                    }
+                    if multipass {
+                        let output = ctx.run(egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+                            time: Some(ctx.input(|input| input.time) + 0.05),
+                            events,
+                            ..Default::default()
+                        }, |ctx| {
+                            app.draw(ctx);
+                            if ctx.output(|output| output.num_completed_passes == 0) {
+                                ctx.request_discard("Verify numeric Escape and pointer shielding across two passes");
+                            }
+                        });
+                        assert_eq!(output.platform_output.num_completed_passes, 2);
+                    } else {
+                        frame(&mut app, &ctx, events);
+                    }
+                    {
+                        let editor = app
+                            .free_transform
+                            .as_ref()
+                            .expect("The field's Escape must not cancel the session");
+                        assert!(editor.drag.is_none() && editor.context.is_none());
+                        assert!(editor.values == values);
+                        assert_eq!(editor.commands().unwrap(), commands);
+                        assert!(
+                            !ctx.wants_keyboard_input(),
+                            "Escape completed the numeric field"
+                        );
+                        assert_eq!(workspace::source(&app), unchanged);
+                    }
+                    if held {
+                        for events in [vec![], vec![pointer(at, false)]] {
+                            frame(&mut app, &ctx, events);
+                            let editor = app
+                                .free_transform
+                                .as_ref()
+                                .expect("The old held press/release cannot Apply");
+                            assert!(editor.drag.is_none() && editor.context.is_none());
+                            assert!(editor.values == values);
+                            assert_eq!(editor.commands().unwrap(), commands);
+                            assert_eq!(workspace::source(&app), unchanged);
+                        }
+                    }
+                    let mut repeat = key_event(egui::Key::Escape, Default::default());
+                    if let egui::Event::Key { repeat, .. } = &mut repeat {
+                        *repeat = true;
+                    }
+                    frame(&mut app, &ctx, vec![repeat]);
+                    let editor = app
+                        .free_transform
+                        .as_ref()
+                        .expect("A held repeat is not a new session Escape");
+                    assert!(editor.values == values);
+                    assert_eq!(editor.commands().unwrap(), commands);
+                    assert_eq!(workspace::source(&app), unchanged);
+                    let mut released = key_event(egui::Key::Escape, Default::default());
+                    if let egui::Event::Key { pressed, .. } = &mut released {
+                        *pressed = false;
+                    }
+                    frame(&mut app, &ctx, vec![released]);
+                    assert!(app.free_transform.is_some());
+                    assert_eq!(workspace::source(&app), unchanged);
+                    workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+                    assert!(
+                        app.free_transform.is_none(),
+                        "A released and fresh Escape still cancels"
+                    );
+                    assert_eq!(workspace::source(&app), unchanged);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn numeric_escape_held_apply_press_needs_a_fresh_click_and_commits_only_once() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let original = app.shared.lock().unwrap().doc.clone();
+        let undo = app.shared.lock().unwrap().undo.len();
+        let unchanged = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+        let numeric = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, numeric);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("4.25".into()),
+            ],
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let apply = warp_reveal(&mut app, &ctx, SIZE, "Apply", None);
+        assert!(ctx.wants_keyboard_input());
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let expected = crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::Escape, Default::default()),
+                egui::Event::PointerMoved(apply),
+                pointer(apply, true),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![pointer(apply, false)]);
+        assert!(
+            app.free_transform.is_some(),
+            "Releasing the old press must not Apply"
+        );
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            commands
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+        let mut released = key_event(egui::Key::Escape, Default::default());
+        if let egui::Event::Key { pressed, .. } = &mut released {
+            *pressed = false;
+        }
+        frame(&mut app, &ctx, vec![released]);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), undo + 1);
+        skew_native_layers_eq(&engine.doc, &expected);
+        assert!(independent_coverage_eq(
+            engine.doc.selection_coverage.as_ref(),
+            expected.selection_coverage.as_ref()
+        ));
+        engine.undo("human").unwrap();
+        skew_native_layers_eq(&engine.doc, &original);
+        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+    }
+}
+
+#[test]
+fn numeric_escape_release_and_fresh_press_in_one_input_batch_cancels() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let unchanged = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+        let numeric = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, numeric);
+        assert!(ctx.wants_keyboard_input());
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Escape, Default::default())],
+        );
+        assert!(app.free_transform.is_some());
+        assert_eq!(workspace::source(&app), unchanged);
+        let mut released = key_event(egui::Key::Escape, Default::default());
+        if let egui::Event::Key { pressed, .. } = &mut released {
+            *pressed = false;
+        }
+        frame(
+            &mut app,
+            &ctx,
+            vec![released, key_event(egui::Key::Escape, Default::default())],
+        );
+        assert!(
+            app.free_transform.is_none(),
+            "Ordered release then new press is a fresh Escape"
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+    }
+}

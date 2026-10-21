@@ -477,3 +477,6 @@ Corrected38c79 checkpoint (unreleased, non-passing): all-target compile passed; 
 
 
 PB-108 native Photoshop row increment (unreleased, replay pending): a bounded codec-local raw Color row path reuses existing sparse tiles and row storage to reduce repeated map lookups. Exact native8/16/hidden RGB/padding/planar order/source/hash/current-composite and derived/fill/mask/depth-fallback behavior remain. Two scalar-byte/independent-standard-plane/PSDPSB/PNG/source fixtures are prepared and source-reviewed; full combined replay and measured benefit remain required. Original Save identity checks are retained.
+
+
+PB-153 numeric Escape correction (unreleased, replay pending): exact prior TextEdit ownership protects the field's Escape from cancelling its pending transform. Existing ordered key tracking handles held/coalesced keys; the existing context guard covers a primary press through release so old Apply clicks cannot commit. Three prepared actual-control methods cover native8/16, held/same-frame/forced2pass canvas and Apply, fresh cancellation and one real Apply/Undo. Original assertions remain; independent source review passed, combined/native replay pending.

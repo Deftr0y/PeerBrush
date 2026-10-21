@@ -81,6 +81,7 @@ pub(super) struct Editor {
     context: egui::menu::MenuRootManager,
     context_frame: bool,
     context_secondary_typing: bool,
+    text_focus: Option<egui::Id>,
     proportional: bool,
     snap: bool,
     prior_tool: Tool,
@@ -1085,6 +1086,7 @@ impl PeerBrush {
             context: Default::default(),
             context_frame: false,
             context_secondary_typing: false,
+            text_focus: None,
             proportional: true,
             snap: false,
             prior_tool,
@@ -1146,6 +1148,7 @@ impl PeerBrush {
     }
     pub(super) fn free_transform_keys(&mut self, ctx: &egui::Context, doc: &Document) {
         self.sync_free_transform(ctx, doc);
+        let mut fresh_escape = false;
         ctx.input(|input| {
             for event in &input.events {
                 if let egui::Event::Key {
@@ -1157,7 +1160,10 @@ impl PeerBrush {
                 {
                     for key in std::iter::once(*key).chain(*physical_key) {
                         if *pressed {
-                            self.selection_shortcut_keys.insert(key);
+                            let fresh = self.selection_shortcut_keys.insert(key);
+                            if key == egui::Key::Escape {
+                                fresh_escape |= fresh;
+                            }
                         } else {
                             self.selection_shortcut_keys.remove(&key);
                         }
@@ -1177,13 +1183,25 @@ impl PeerBrush {
             }
             return;
         }
+        // egui clears ordinary TextEdit focus before draw when Escape arrives.
+        // Keep that field's Escape out of the session and behind-field controls.
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape))
+            && self
+                .free_transform
+                .as_ref()
+                .and_then(|editor| editor.text_focus)
+                .is_some_and(|id| ctx.memory(|memory| memory.had_focus_last_frame(id)))
+        {
+            self.free_transform.as_mut().unwrap().context_frame = true;
+            return;
+        }
         if ctx.wants_keyboard_input()
             || !Self::free_transform_keyboard(ctx)
             || ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))))
         {
             return;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if fresh_escape && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cancel_free_transform();
             self.message = "Free Transform cancelled.".into();
             return;
@@ -1410,9 +1428,10 @@ impl PeerBrush {
         let Some(mut editor) = self.free_transform.take() else {
             return;
         };
-        // Canvas and deferred shortcuts have finished; keep popup dismissal guarded
-        // through Apply, then start the next draw without the frame latch.
-        let context_frame = std::mem::take(&mut editor.context_frame);
+        // Keep a dismissed input's primary press guarded through its release,
+        // including the final Apply check after canvas and deferred shortcuts.
+        let context_frame = editor.context_frame;
+        editor.context_frame &= ctx.input(|input| input.pointer.primary_down());
         let typing = ctx.wants_keyboard_input()
             || ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
         let before = editor.key();
@@ -1615,6 +1634,9 @@ impl PeerBrush {
                 #[cfg(not(test))]
                 let _ = response;
             });
+        editor.text_focus = ctx
+            .memory(|memory| memory.focused())
+            .filter(|id| egui::TextEdit::load_state(ctx, *id).is_some());
         if !open || cancel {
             self.free_transform = Some(editor);
             self.cancel_free_transform();
