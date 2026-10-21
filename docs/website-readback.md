@@ -51,3 +51,16 @@ Native signatures remain `not-verified-by-readback`, installed acceptance and pr
 The comparison covers the seven prepared release-related files, actual cache URLs and selected public release downloads. It does not render a browser, inspect every image/font/video or prove every CDN region is consistent. Normal visual/accessibility checks, native installed-platform acceptance and separately authorized live release/website readback remain required.
 
 The regression tests are entirely offline: synthetic committed package repositories, the existing public website layout fixture and fake HTTP responses cover correct/stale/missing/cache/redirect behavior, package/source/checksum/inventory tampering, wrong/unpublished sources, historical availability, malformed local inputs and bounded diagnostics. Earlier readback checks passed in the combined Python checkpoint; the new reconciliation cases require the next combined verification. No live unpublished release probe is part of this work.
+
+## Typed Mac qualification binding (unreleased)
+
+The shared published-download reader recognizes the explicit signed-candidate
+handoff's FINAL_DMG.qualification.json without confusing it with a signer
+verification receipt. Actual public signed ZIP/image/source/checksum bytes and
+the strict qualification must agree. Missing companions and ambiguous legacy
+plus typed receipts fail closed. This is asset binding only: the reader does
+not authenticate native evidence or grant installed-package eligibility, and
+the existing expected/selectable platform schema remains portable-only. It
+therefore cannot make a DMG selectable or change production/installation status.
+Native installed/public acceptance and an explicitly reviewed eligible-platform
+schema remain separate work before any future DMG download can be shown ready.

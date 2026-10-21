@@ -38,3 +38,35 @@ Review and apply only the seven-file overlay on a documented `maintenance/site-*
 Tests use synthetic committed packages, mocked public HTTP responses and the seven public site output files from `edab369181b8ed43874e82a5cd705c94146dc5eb`. They exercise unavailable assets, public byte/checksum/source tampering, URL/redirect limits, receipt rejection, policy without portable fallback, immutable output/history, delayed latest availability, historical-target rejection, pinned-inventory rejection, cache renewal, idempotence and complete static/dynamic display updates. Focused tests also inspect actual synthetic ar/xz/tar DEB bytes, preserve installed-policy exclusions and reject altered payload/source/control/version, missing authority/companion assets and forged readiness. No live new-release download, native installation/signing or deployed website readback is performed by these tests.
 
 The public release/asset fields follow the [GitHub Releases API](https://docs.github.com/en/rest/releases/releases) and [release assets API](https://docs.github.com/en/rest/releases/assets). See [production automation](production-automation.md) and the [release maintenance playbook](release-maintenance.md) for the remaining publication and approval gates.
+
+## Typed final-DMG qualification companion (unreleased)
+
+The explicit signed Mac candidate handoff now supplies the actual selected
+strict public qualification as FINAL_DMG.qualification.json, plus the existing
+canonical FINAL_DMG.sha256 digest/name companion. This is a qualification report,
+not a signer verification receipt. It contains only the existing bounded public
+qualification schema; private signing journals, CLI/root/bundle inputs and raw
+provider responses are excluded. These two companion assets are separate from
+the common six-record public package/source inventory and its checksum list.
+The future publisher must explicitly retain them with the exact selected DMG.
+No publisher or deployment is activated by preparing this contract.
+
+When that typed qualification asset is present, website preparation downloads
+and structurally inspects the actual signed Mac ZIP before processing the DMG.
+It then reuses the final-DMG binding validator on the actual public image/ZIP,
+source, selected hashes and strict report. Missing companion ZIPs remain
+explicit exclusions. A malformed, forged, changed or overclaiming qualification
+fails, and simultaneous typed qualification and legacy signer-verification
+assets are refused as ambiguous. A malformed typed report never falls back to
+the legacy receipt path. Existing releases that supply only the legacy signer
+sidecar retain their previous recognition and exclusion behavior.
+
+Successful matching records asset_binding_verified:true only. The website does
+not authenticate the native producer, repeat Apple checks or establish image
+contents from an unauthenticated report; content_verified:false, ready:false,
+production_ready:false and unverified installed/public availability remain.
+No DMG download row is created. Real native authentication is required by the
+candidate replacement command itself, and separate installed acceptance and
+website eligibility work remain necessary. The shared published reader also
+serves deployed readback; this public binding is not a deployment or readiness
+authority. Prepared fake-HTTP/native-command tests require combined execution.

@@ -420,6 +420,107 @@ class Published(unittest.TestCase):
                 site.prepare(self.root, 'a' * 40, self.inventory, 'v0.2.0', self.commit, self.notes, output.with_name(output.name + '-failed'), self.get)
             self.assertFalse(output.with_name(output.name + '-failed').exists())
 
+    def final_dmg(self):
+        import test_sign_macos
+        from verify_release import inspect_archive
+        self.final_deb()
+        original = next(a for a in self.inventory['assets'] if a.get('platform') == 'macOS')
+        signer = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')
+        signer.setUp()
+        self.addCleanup(signer.doCleanups)
+        signer.archive = self.directory / original['file']
+        signer.kwargs.update(archive=signer.archive, commit=self.commit,
+                             expected_sha256=site.sha(self.assets[original['file']]), source_root=self.root)
+        signed = signer.sign()  # Every Apple operation remains mocked by the existing fixture.
+        self.macos = inspect_archive(signed, self.commit, '0.2.0', self.root)['record']
+        self.inventory['assets'] = [self.macos if a == original else a for a in self.inventory['assets']]
+        self.assets.pop(original['file'])
+        self.assets[signed.name] = signed.read_bytes()
+        self.dmg_name = signed.stem + '-dmg-signed-r2.dmg'
+        image = b'SYNTHETIC_UNVERIFIED_BYTES_NOT_A_DMG'
+        self.dmg_record = dict(file=self.dmg_name, bytes=len(image), sha256=site.sha(image), platform='macOS',
+                               architecture='arm64', binary_source_commit=self.commit, source_sha256=self.macos['source_sha256'])
+        self.inventory['assets'].append(self.dmg_record)
+        self.qualification = dict(schema=1, format='PeerBrushDmgQualificationV1', version='0.2.0', commit=self.commit,
+            record=self.dmg_record, signed_zip=dict(file=signed.name, sha256=self.macos['sha256']),
+            executable_sha256=self.macos['executable_sha256'], publisher_team_id=test_sign_macos.TEAM,
+            candidate_verified=True, ready=False, production_ready=False, public_availability='unverified',
+            content_checks=['exact-source-signed-zip-and-corresponding-source', 'exact-mounted-files-modes-and-Applications-link'],
+            native_checks=['Developer-ID-publisher-and-secure-timestamps', 'app-hardened-runtime-and-empty-entitlements',
+                           'image-and-app-stapled-tickets-and-Gatekeeper', 'hdiutil-integrity-and-read-only-mount'],
+            limits={'drag-to-Applications-and-launch': 'not-performed', 'fresh-quarantined-download': 'not-performed',
+                    'upgrade-settings-and-unsaved-work': 'not-performed', 'public-availability': 'not-assessed'},
+            native_job_provenance='requires-trusted-native-job-at-consumption')
+        self.assets[self.dmg_name] = image
+        self.assets[self.dmg_name + '.qualification.json'] = site.encode(self.qualification)
+        self.assets[self.dmg_name + '.sha256'] = f'{site.sha(image)}  {self.dmg_name}\n'.encode()
+        self.assets['SHA256SUMS'] = ''.join(f"{a['sha256']}  {a['file']}\n" for a in self.inventory['assets']).encode()
+        self.metadata()
+
+    def test_public_typed_dmg_qualification_binds_actual_companion_bytes_without_native_or_installed_authority(self):
+        self.final_dmg()
+        self.requests.clear()
+        with mock.patch('verify_macos_qualification.authenticate') as authenticate:
+            entry, excluded = self.published(maintainer=test_deb.MAINTAINER)
+        authenticate.assert_not_called()
+        proof = next(row for row in excluded if row.get('file') == self.dmg_name)
+        self.assertTrue(proof['asset_binding_verified'])
+        self.assertEqual(proof['qualification_binding'], 'exact-schema-and-independent-digest-matched')
+        self.assertFalse(proof['content_verified'])
+        self.assertFalse(proof['ready'])
+        self.assertFalse(proof['production_ready'])
+        self.assertEqual(proof['native_producer_authentication'], 'not-verified-by-website')
+        self.assertEqual(proof['installed_acceptance'], 'unverified')
+        self.assertEqual(proof['public_availability'], 'unverified')
+        self.assertEqual(entry['platforms'], [])
+        requests = [url.rsplit('/', 1)[-1] for url, api in self.requests if not api]
+        self.assertEqual(requests.count(self.macos['file']), 1)
+        self.assertLess(requests.index(self.macos['file']), requests.index(self.dmg_name))
+        self.assertIn(self.dmg_name + '.qualification.json', requests)
+        self.assertNotIn(self.dmg_name + '.verification.json', requests)
+
+    def test_public_typed_dmg_qualification_rejects_forged_malformed_and_overclaiming_reports(self):
+        self.final_dmg()
+        original = self.assets[self.dmg_name + '.qualification.json']
+        changes = [dict(self.qualification, ready=True), dict(self.qualification, production_ready=True),
+                   dict(self.qualification, private_path='PRIVATE_CANARY'), dict(self.qualification, commit='0' * 40),
+                   dict(self.qualification, publisher_team_id='Z9Y8X7W6V5'),
+                   dict(self.qualification, record=dict(self.dmg_record, sha256='0' * 64)),
+                   dict(self.qualification, signed_zip=dict(self.qualification['signed_zip'], sha256='0' * 64)),
+                   [], True]
+        for report in changes:
+            self.assets[self.dmg_name + '.qualification.json'] = site.encode(report)
+            self.metadata()
+            with self.subTest(report_type=type(report).__name__), self.assertRaises(ValueError):
+                self.published(maintainer=test_deb.MAINTAINER)
+        duplicate = original.replace(b'"schema": 1', b'"schema": 1, "schema": 1')
+        for raw in [b'{', b'\x80', original + b' {}', duplicate, b'x' * (site.MAX_DMG_QUALIFICATION_BYTES + 1)]:
+            self.assets[self.dmg_name + '.qualification.json'] = raw
+            self.metadata()
+            with self.subTest(length=len(raw)), self.assertRaises((ValueError, UnicodeError)):
+                self.published(maintainer=test_deb.MAINTAINER)
+
+    def test_public_typed_dmg_qualification_requires_available_companion_and_refuses_ambiguous_signer_receipts(self):
+        self.final_dmg()
+        companion = self.assets.pop(self.macos['file'])
+        self.metadata()
+        entry, excluded = self.published(maintainer=test_deb.MAINTAINER)
+        proof = next(row for row in excluded if row.get('file') == self.dmg_name)
+        self.assertEqual(proof['reason'], 'final-dmg-signed-zip-not-publicly-available')
+        self.assertFalse(proof['asset_binding_verified'])
+        self.assertEqual(entry['platforms'], [])
+        self.assets[self.macos['file']] = companion
+        self.inventory['assets'].remove(self.macos)
+        self.assets['SHA256SUMS'] = ''.join(f"{a['sha256']}  {a['file']}\n" for a in self.inventory['assets']).encode()
+        self.metadata()
+        _, excluded = self.published(maintainer=test_deb.MAINTAINER)
+        self.assertIn('final-dmg-signed-zip-not-in-inventory', [row['reason'] for row in excluded])
+        self.inventory['assets'].append(self.macos)
+        self.assets['SHA256SUMS'] = ''.join(f"{a['sha256']}  {a['file']}\n" for a in self.inventory['assets']).encode()
+        self.assets[self.dmg_name + '.verification.json'] = b'{}'
+        self.metadata()
+        with self.assertRaisesRegex(ValueError, 'ambiguous qualification'):
+            self.published(maintainer=test_deb.MAINTAINER)
 
 class Rendering(unittest.TestCase):
     def setUp(self):

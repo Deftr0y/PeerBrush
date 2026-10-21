@@ -22,6 +22,8 @@ DEB_INSTALLATION_LIMITS = {'native-gui': 'not-performed', 'real-application-vers
                            'public-availability': 'not-assessed'}
 MAX_INSTALLATION_RECEIPT_BYTES = 64 * 1024
 MAX_DMG_QUALIFICATION_BYTES = 8192
+NATIVE_TRUST_FIELDS = {'bundle', 'bundle_sha256', 'trusted_root', 'trusted_root_sha256', 'cli',
+                       'cli_sha256', 'cli_version', 'workflow_commit', 'run_id', 'run_attempt', 'work'}
 
 
 def _publication_phases(blockers):
@@ -109,8 +111,7 @@ def assess(directory, commit, version, previous=None, source_root=None, *,
     if (len(assets) == 6 and not all(dmg_inputs)) or (len(assets) != 6 and any(value is not None for value in dmg_inputs)):
         raise ValueError('Six-record candidates require explicit DMG/signed ZIP/qualification hashes, qualification bytes and publisher Team; other candidates cannot accept DMG inputs.')
     if dmg_trust is not None and (len(assets) != 6 or not isinstance(dmg_trust, dict)
-            or set(dmg_trust) - {'readback_job'} != {'bundle', 'bundle_sha256', 'trusted_root', 'trusted_root_sha256', 'cli',
-                                  'cli_sha256', 'cli_version', 'workflow_commit', 'run_id', 'run_attempt', 'work'}):
+            or set(dmg_trust) - {'readback_job'} != NATIVE_TRUST_FIELDS):
         raise ValueError('Native provenance verification requires all independently reviewed inputs with six-record DMG inspection.')
     names = [a.get('file') for a in assets]
     if (any(not isinstance(name, str) or len(relative_path(name).parts) != 1 for name in names)
@@ -388,31 +389,56 @@ def read_dmg_qualification(path):
 
 def handoff_dmg(directory, image, qualification_path, output, commit, version, *, image_sha256,
                 archive_sha256, qualification_sha256, team_id, deb_sha256, linux_portable_sha256,
-                maintainer, previous=None, source_root=None, dmg_trust=None):
-    """Append the selected DMG; never swap an existing Mac ZIP or trust native claims."""
+                maintainer, previous=None, source_root=None, dmg_trust=None, signed_archive=None):
+    """Append DMG; an explicit signed-ZIP replacement also requires authenticated native completion."""
     root = source_root or Path(__file__).resolve().parents[1]
     directory, image, qualification_path = handoff_path(directory), handoff_path(image), handoff_path(qualification_path)
+    if signed_archive is not None:
+        if (not isinstance(dmg_trust, dict) or set(dmg_trust) != NATIVE_TRUST_FIELDS | {'readback_job'}
+                or dmg_trust.get('readback_job') is not True):
+            raise ValueError('Explicit signed Mac selection requires complete native attestation and successful exact-job readback.')
+        signed_archive = handoff_path(signed_archive)
     output = private_inspection_directory(output, root, fresh=True)
+    native_inputs = [image, qualification_path] + ([signed_archive] if signed_archive is not None else [])
+    if signed_archive is not None:
+        work = private_inspection_directory(dmg_trust['work'], root, fresh=True)
+        if output.is_relative_to(work) or work.is_relative_to(output):
+            raise ValueError('Native authentication work must remain outside the public candidate output.')
+        for key in ['bundle', 'trusted_root', 'cli']:
+            if handoff_path(dmg_trust[key]).is_relative_to(output):
+                raise ValueError('Native trust inputs must remain outside the public candidate output.')
     if (output.is_relative_to(directory) or directory.is_relative_to(output)
-            or any(output.is_relative_to(path.parent) for path in [image, qualification_path])):
+            or any(output.is_relative_to(path.parent) for path in native_inputs)):
         raise ValueError('DMG handoff requires fresh output separate from candidate and native evidence directories.')
     inventory_bytes = read_inventory(directory)
     assess(directory, commit, version, source_root=root, deb_sha256=deb_sha256,
            linux_portable_sha256=linux_portable_sha256, maintainer=maintainer, _inventory_bytes=inventory_bytes)
     inventory = json.loads(inventory_bytes, object_pairs_hook=unique_fields)
     if len(inventory['assets']) != 5:
-        raise ValueError('DMG handoff requires a five-record candidate already selecting its signed Mac ZIP and DEB.')
-    macos = next(asset for asset in inventory['assets'] if asset.get('platform') == 'macOS')
-    if macos['sha256'] != archive_sha256:
+        raise ValueError('DMG handoff requires a five-record portable/source/DEB candidate.')
+    original_macos = next(asset for asset in inventory['assets'] if asset.get('platform') == 'macOS')
+    macos = original_macos
+    if signed_archive is not None:
+        if original_macos['native_publisher_signing'] != 'not-configured' or original_macos['signing_verification'] != 'unsigned':
+            raise ValueError('Explicit signed selection replaces only an unsigned, unpublished Mac candidate.')
+        selected = inspect_archive(signed_archive, commit, version, root)
+        macos = selected['record']
+        if (selected['packaging_correction'] or macos['sha256'] != archive_sha256
+                or macos['platform'] != 'macOS' or macos['binary_source_commit'] != commit
+                or macos['source_sha256'] != original_macos['source_sha256']):
+            raise ValueError('Selected signed Mac ZIP differs from the exact candidate source or independent digest.')
+    elif macos['sha256'] != archive_sha256:
         raise ValueError('Selected signed ZIP hash differs from the existing immutable Mac inventory record.')
+    archive = signed_archive if signed_archive is not None else directory / macos['file']
     qualification = read_dmg_qualification(qualification_path)
-    bound = bind_dmg(root, directory / macos['file'], image, commit=commit, version=version,
+    bound = bind_dmg(root, archive, image, commit=commit, version=version,
                      archive_sha256=archive_sha256, image_sha256=image_sha256,
                      qualification=qualification, qualification_sha256=qualification_sha256, team_id=team_id)
     if image.name.casefold() in {asset['file'].casefold() for asset in inventory['assets']}:
         raise ValueError('Final DMG collides with an existing immutable candidate file.')
     final = dict(schema=1, version=version, commit=commit, binary_source_commit=commit,
-                 packaging_correction=None, assets=[*inventory['assets'], bound['record']])
+                 packaging_correction=None,
+                 assets=[macos if asset == original_macos else asset for asset in inventory['assets']] + [bound['record']])
     if previous is not None:
         immutable(previous, final)
         if (previous['version'] == version
@@ -424,18 +450,23 @@ def handoff_dmg(directory, image, qualification_path, output, commit, version, *
     private_inspection_directory(output, root, fresh=True)
     output.mkdir(mode=0o700)
     os.chmod(output, 0o700)
-    # No producer report, signing journal, private receipt or unlisted sidecar is
-    # copied. Every selected byte is bounded and checked during exclusive copy.
+    def selected_file(asset):
+        if asset['file'] == image.name:
+            return image
+        if signed_archive is not None and asset['file'] == macos['file']:
+            return signed_archive
+        return regular_file(directory, asset['file'])
+    # Copy only selected files; producer/private journals have no authority.
     for asset in final['assets']:
         private_inspection_directory(output, root, fresh=False)
-        source = image if asset['file'] == image.name else regular_file(directory, asset['file'])
+        source = selected_file(asset)
         checksum, size = bounded_file(source, 512 * 1024 * 1024, output / asset['file'])
         if size != asset['bytes'] or checksum != asset['sha256']:
             raise ValueError('Selected input changed during DMG handoff; preserve partial output.')
     if read_inventory(directory) != inventory_bytes or read_dmg_qualification(qualification_path) != qualification:
         raise ValueError('Candidate inventory or qualification changed during DMG handoff; preserve partial output.')
     for asset in final['assets']:
-        source = image if asset['file'] == image.name else regular_file(directory, asset['file'])
+        source = selected_file(asset)
         if bounded_file(source, 512 * 1024 * 1024) != (asset['sha256'], asset['bytes']):
             raise ValueError('Selected input changed after DMG handoff; preserve partial output.')
     private_inspection_directory(output, root, fresh=False)
@@ -448,6 +479,51 @@ def handoff_dmg(directory, image, qualification_path, output, commit, version, *
                     dmg_sha256=image_sha256, macos_portable_sha256=archive_sha256,
                     dmg_qualification=qualification, dmg_qualification_sha256=qualification_sha256, macos_team_id=team_id,
                     dmg_trust=dmg_trust)
+    if signed_archive is not None:
+        native = result['installed_candidates']['macOS']
+        if (native['native_producer_authentication'] != 'verified-pinned-workflow-oidc-attestation'
+                or native['native_job_conclusion'] != 'service-reconciled-success'):
+            raise ValueError('Signed Mac selection did not authenticate successful native qualification.')
+        private_inspection_directory(output, root, fresh=False)
+        # This is the exact public qualification type, never a signer receipt.
+        public_qualification = output / (image.name + '.qualification.json')
+        with public_qualification.open('xb') as stream:
+            stream.write(qualification)
+        checksum = f"{image_sha256}  {image.name}\n".encode('ascii')
+        with (output / (image.name + '.sha256')).open('xb') as stream:
+            stream.write(checksum)
+        # Native verification can take time. Recheck original and selected output
+        # bytes after it and the public sidecar writes, before the success report.
+        if read_inventory(directory) != inventory_bytes or read_dmg_qualification(qualification_path) != qualification:
+            raise ValueError('Original candidate or qualification changed after native authentication.')
+        for asset in inventory['assets']:
+            if bounded_file(regular_file(directory, asset['file']), 512 * 1024 * 1024) != (asset['sha256'], asset['bytes']):
+                raise ValueError('Original candidate changed after native authentication.')
+        for asset in final['assets']:
+            for path in [selected_file(asset), regular_file(output, asset['file'])]:
+                if bounded_file(path, 512 * 1024 * 1024) != (asset['sha256'], asset['bytes']):
+                    raise ValueError('Selected Mac candidate changed after native authentication.')
+        from verify_macos_qualification import LIMITS
+        work = private_inspection_directory(dmg_trust['work'], root, fresh=False)
+        for key, copy_name, limit in [('bundle', 'bundle.jsonl', LIMITS['bundle']),
+                                     ('trusted_root', 'trusted_root.jsonl', LIMITS['trusted-root']),
+                                     ('cli', 'gh', LIMITS['gh'])]:
+            for path in [handoff_path(dmg_trust[key]), regular_file(work, copy_name)]:
+                if bounded_file(path, limit)[0] != dmg_trust[key + '_sha256']:
+                    raise ValueError('Native trust input changed after public qualification preparation.')
+        with regular_file(output, image.name + '.sha256').open('rb') as stream:
+            public_checksum = stream.read(len(checksum) + 1)
+        with regular_file(output, 'SHA256SUMS').open('rb') as stream:
+            final_checksums = stream.read(64 * 1024 + 1)
+        if (bounded_file(regular_file(work, 'dmg-qualification.json'), MAX_DMG_QUALIFICATION_BYTES)[0] != qualification_sha256
+                or read_dmg_qualification(public_qualification) != qualification or public_checksum != checksum
+                or read_inventory(output) != (json.dumps(final, indent=2) + '\n').encode('utf-8')
+                or final_checksums != ''.join(f"{a['sha256']}  {a['file']}\n" for a in final['assets']).encode('utf-8')):
+            raise ValueError('Public qualification binding changed before candidate acceptance.')
+        expected_files = {a['file'] for a in final['assets']} | {'release-inventory.json', 'SHA256SUMS',
+                         image.name + '.qualification.json', image.name + '.sha256'}
+        if {path.name for path in output.iterdir()} != expected_files:
+            raise ValueError('Public candidate contains unexpected files after native authentication.')
     private_inspection_directory(output, root, fresh=False)
     with (output / 'production-readiness.json').open('x', encoding='utf-8', newline='\n') as stream:
         stream.write(json.dumps(result, indent=2, sort_keys=True) + '\n')
@@ -499,6 +575,7 @@ def main():
     mode.add_argument('--deb', type=Path)
     parser.add_argument('--include-deb', type=Path, help='With --directory, assemble a fresh five-record candidate; --output then names a new directory')
     parser.add_argument('--include-dmg', type=Path, help='Append a selected final DMG to a five-record signed-ZIP/DEB candidate; output is a fresh external directory')
+    parser.add_argument('--signed-macos-archive', type=Path, help='Only with --include-dmg: explicitly replace unsigned Mac candidate; requires native attestation and exact successful-job readback')
     parser.add_argument('--dmg-sha256')
     parser.add_argument('--macos-portable-sha256')
     parser.add_argument('--dmg-qualification', type=Path, help='External standalone native qualification; its JSON never authenticates native execution')
@@ -549,6 +626,8 @@ def main():
     deb_inputs = [args.deb_sha256, args.portable, args.portable_sha256, args.maintainer, args.installation_receipt]
     if all(dmg_inputs) and not all([args.deb_sha256, args.portable_sha256, args.maintainer]):
         parser.error('Six-record inspection/handoff requires explicit DEB/portable hashes and maintainer')
+    if args.signed_macos_archive is not None and (not args.include_dmg or dmg_trust is None or not args.native_job_readback):
+        parser.error('--signed-macos-archive requires --include-dmg and all independently selected native attestation/readback inputs')
     if args.include_dmg:
         if (not all(dmg_inputs) or not all([args.deb_sha256, args.portable_sha256, args.maintainer])
                 or args.portable is not None or args.installation_receipt is not None):
@@ -559,10 +638,14 @@ def main():
                                  image_sha256=args.dmg_sha256, archive_sha256=args.macos_portable_sha256,
                                  qualification_sha256=args.dmg_qualification_sha256, team_id=args.macos_team_id,
                                  deb_sha256=args.deb_sha256, linux_portable_sha256=args.portable_sha256,
-                                 maintainer=args.maintainer, previous=previous, source_root=root, dmg_trust=dmg_trust)
+                                 maintainer=args.maintainer, previous=previous, source_root=root, dmg_trust=dmg_trust,
+                                 **({'signed_archive': args.signed_macos_archive} if args.signed_macos_archive is not None else {}))
         except Exception:
             parser.exit(1, 'Final DMG candidate handoff failed; preserve partial output for local inspection.\n')
-        print('Six-record candidate byte binding verified; native job authentication and production publication remain blocked.')
+        if args.signed_macos_archive is not None:
+            print('Six-record byte binding and native qualification verified; installed acceptance and production publication remain blocked.')
+        else:
+            print('Six-record candidate byte binding verified; native job authentication and production publication remain blocked.')
         return 2 if args.require_ready and not result['production_ready'] else 0
     elif args.deb:
         if not all(deb_inputs) or args.previous_inventory or args.include_deb:

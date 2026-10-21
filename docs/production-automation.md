@@ -243,3 +243,45 @@ actual website guard/selection programs offline; they exercise accepted and
 refused invocations, exact checkout/current-tip binding, failed fetch and
 missing output. These prepared cases require combined execution; they do not
 deploy Pages or authenticate a release.
+
+## Explicit signed Mac candidate assembly (unreleased, verification pending)
+
+The current main candidate job still produces an unsigned Mac ZIP. A separately
+approved signing/qualification run is not automatically dispatched or consumed
+by release.yml. A new explicit local handoff closes the candidate assembly gap:
+add --signed-macos-archive SELECTED_SIGNED_ZIP to the existing --include-dmg
+command, with its independently selected --macos-portable-sha256 and all existing
+DMG/source/DEB selections. The five-record seed must select an unsigned Mac ZIP.
+Only that Mac record is replaced in a fresh external six-record candidate;
+Windows, Linux, corresponding source and DEB records/bytes stay unchanged. Both
+the seed and signed archive are independently inspected against the exact same
+reviewed source/version and corresponding source ZIP. Published same-version
+replacement/addition and downgrades remain refused; existing outputs are never
+overwritten.
+
+This explicit replacement additionally requires every existing native attestation
+input and --native-job-readback. The aggregate itself invokes the pinned offline
+CLI/root/bundle verifier and then its bounded exact-attempt successful native job
+reader. A caller's success JSON or unsigned native report cannot authorize the
+replacement. The consumer currently requires Linux x64; no verifier, root,
+artifact, credential or signing service is installed or configured. Failure
+retains private partial output without a success readiness report.
+
+After successful authentication the new mode adds exactly two public companion
+files: SELECTED_DMG.qualification.json, containing the unchanged strict bounded
+PeerBrushDmgQualificationV1 report, and SELECTED_DMG.sha256, containing the
+canonical image digest/name line. The qualification is correctly typed and is
+never renamed to a signer verification receipt. These companions are outside
+the unchanged six-asset common inventory; the checksum list still covers those
+six assets. Private signing journals, authentication output, trust roots,
+verifier executables, attestation bundles and operational paths are not copied.
+Original/copied candidates, qualification and selected trust inputs are rehashed
+after verification and companion creation before the final report.
+
+Overall candidate_verified, ready and production_ready remain false; installed
+acceptance and public availability remain unverified. The website can bind this
+typed public report to actual public ZIP/image/source bytes while retaining its
+installed-download exclusion. Actual release workflow orchestration, installed
+and interruption acceptance, protected publication, public asset reconciliation
+and native website eligibility remain unfinished. Offline fixture tests mock
+only cryptographic/provider boundaries and do not establish real native trust.

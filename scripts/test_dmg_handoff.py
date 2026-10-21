@@ -272,6 +272,204 @@ class Handoff(unittest.TestCase):
         self.assertIn('inspection failed', error.getvalue())
         self.assertFalse(self.output.exists())
 
+    def unsigned_seed(self):
+        directory = self.base / 'unsigned-with-deb'
+        directory.mkdir()
+        unsigned = inspect_archive(self.unsigned, self.commit, '0.2.0', self.root)['record']
+        inventory = copy.deepcopy(self.before)
+        inventory['assets'] = [unsigned if a.get('platform') == 'macOS' else a for a in inventory['assets']]
+        for asset in inventory['assets']:
+            path = self.unsigned if asset == unsigned else self.directory / asset['file']
+            shutil.copyfile(path, directory / asset['file'])
+        (directory / 'release-inventory.json').write_text(json.dumps(inventory))
+        (directory / 'SHA256SUMS').write_text(''.join(f"{a['sha256']}  {a['file']}\n" for a in inventory['assets']))
+        return directory, inventory
+
+    def native_selection(self):
+        inputs = self.base / 'selected-native-trust'
+        inputs.mkdir()
+        result = dict(cli_version='2.102.0', workflow_commit=self.commit, run_id='123', run_attempt='1',
+                      work=self.base / 'native-verification', readback_job=True)
+        for key, name, data in [('bundle', 'selected-bundle.jsonl', b'OFFLINE_BUNDLE_FIXTURE\n'),
+                                ('trusted_root', 'reviewed-root.jsonl', b'OFFLINE_ROOT_FIXTURE\n'),
+                                ('cli', 'reviewed-gh', b'OFFLINE_EXECUTABLE_FIXTURE_NOT_RUN')]:
+            path = inputs / name
+            path.write_bytes(data)
+            result[key], result[key + '_sha256'] = path, digest(path)
+        return result
+
+    def fake_native_authentication(self, qualification, **inputs):
+        # Only the cryptographic/provider boundary is mocked. The real aggregate
+        # still binds all source/archive/report bytes and rechecks owned copies.
+        self.assertIs(inputs['readback_job'], True)
+        self.assertEqual(qualification, self.evidence.read_bytes())
+        work = inputs['work']
+        work.mkdir(mode=0o700)
+        for key, name in [('bundle', 'bundle.jsonl'), ('trusted_root', 'trusted_root.jsonl'), ('cli', 'gh')]:
+            shutil.copyfile(inputs[key], work / name)
+        (work / 'dmg-qualification.json').write_bytes(qualification)
+        return dict(native_producer_authentication='verified-pinned-workflow-oidc-attestation',
+                    native_job_conclusion='service-reconciled-success', installed_acceptance='not-performed',
+                    public_availability='unverified', candidate_verified=False, ready=False, production_ready=False)
+
+    def selected_handoff(self, directory, trust, output=None, **changes):
+        return readiness.handoff_dmg(directory, self.image, self.evidence, output or self.output,
+                    self.commit, '0.2.0', **(self.inputs() | dict(signed_archive=self.signed, dmg_trust=trust) | changes))
+
+    def test_explicit_signed_selection_preserves_nonmac_assets_and_types_public_qualification_without_readiness(self):
+        directory, original = self.unsigned_seed()
+        trust = self.native_selection()
+        for parent in [directory, self.image.parent, self.evidence.parent, trust['bundle'].parent]:
+            (parent / 'private-journal.json').write_text('PRIVATE_CANARY_NOT_A_PUBLIC_ASSET')
+        with mock.patch('verify_macos_qualification.authenticate', side_effect=self.fake_native_authentication) as authenticate:
+            result = self.selected_handoff(directory, trust)
+        authenticate.assert_called_once()
+        self.assertIs(authenticate.call_args.kwargs['readback_job'], True)
+        final = json.loads((self.output / 'release-inventory.json').read_bytes())
+        nonmac = lambda value: [a for a in value['assets'] if a.get('platform') != 'macOS']
+        self.assertEqual(nonmac(final), nonmac(original))
+        self.assertEqual([a for a in final['assets'] if a.get('platform') == 'macOS'], [self.macos, self.record])
+        self.assertNotIn(self.unsigned.name, {a['file'] for a in final['assets']})
+        for asset in original['assets']:
+            self.assertEqual(digest(directory / asset['file']), asset['sha256'])
+        self.assertEqual((self.output / (self.image.name + '.qualification.json')).read_bytes(), self.evidence.read_bytes())
+        self.assertEqual((self.output / (self.image.name + '.sha256')).read_bytes(),
+                         f'{digest(self.image)}  {self.image.name}\n'.encode())
+        self.assertEqual({path.name for path in self.output.iterdir()},
+                         {a['file'] for a in final['assets']} | {'release-inventory.json', 'SHA256SUMS',
+                          'production-readiness.json', self.image.name + '.qualification.json', self.image.name + '.sha256'})
+        self.assertFalse(result['production_ready'])
+        self.assertFalse(result['candidate_verified'])
+        assert_publication_phases(self, result)
+        macos = result['installed_candidates']['macOS']
+        self.assertEqual(macos['native_job_conclusion'], 'service-reconciled-success')
+        self.assertEqual(macos['installed_acceptance'], 'not-established-by-aggregate')
+        self.assertFalse(macos['ready'])
+        self.assertEqual(macos['public_availability'], 'unverified')
+        self.assertEqual(len(self.signer.calls), self.native_calls)
+        for path in self.output.iterdir():
+            if path.suffix == '.json':
+                self.assertNotIn('PRIVATE_CANARY', path.read_text())
+                self.assertNotIn(str(self.base), path.read_text())
+
+    def test_explicit_signed_selection_requires_all_trust_inputs_and_actual_successful_native_result(self):
+        directory, _ = self.unsigned_seed()
+        trust = self.native_selection()
+        invalid = [None, {}, dict(trust, readback_job=False), dict(trust, readback_job=1),
+                   {key: value for key, value in trust.items() if key != 'bundle'}, dict(trust, receipt={'ready': True})]
+        with mock.patch('verify_macos_qualification.authenticate') as authenticate:
+            for selected in invalid:
+                with self.subTest(selected=list(selected) if selected else selected), self.assertRaisesRegex(ValueError, 'complete native'):
+                    self.selected_handoff(directory, selected)
+                self.assertFalse(self.output.exists())
+        authenticate.assert_not_called()
+        nested = dict(trust, work=self.output / 'private-verification')
+        with mock.patch('verify_macos_qualification.authenticate') as authenticate, self.assertRaises(ValueError):
+            self.selected_handoff(directory, nested)
+        authenticate.assert_not_called()
+        self.assertFalse(self.output.exists())
+        for key, value in [('native_producer_authentication', 'caller-json-success'),
+                           ('native_job_conclusion', 'not-service-reconciled')]:
+            output = self.base / ('rejected-' + key)
+            selected = dict(trust, work=self.base / ('work-' + key))
+            def invalid_origin(qualification, **inputs):
+                return dict(self.fake_native_authentication(qualification, **inputs), **{key: value})
+            with mock.patch('verify_macos_qualification.authenticate', side_effect=invalid_origin), \
+                    self.subTest(key=key), self.assertRaisesRegex(ValueError, 'did not authenticate'):
+                self.selected_handoff(directory, selected, output)
+            self.assertFalse((output / 'production-readiness.json').exists())
+            self.assertFalse((output / (self.image.name + '.qualification.json')).exists())
+
+    def test_explicit_signed_selection_keeps_all_digest_source_and_published_version_guards(self):
+        directory, original = self.unsigned_seed()
+        trust = self.native_selection()
+        for changes in [dict(archive_sha256='0' * 64), dict(image_sha256='0' * 64),
+                        dict(qualification_sha256='0' * 64), dict(team_id='Z9Y8X7W6V5'),
+                        dict(previous=original), dict(previous=dict(original, version='999.0.0'))]:
+            with self.subTest(changes=list(changes)), \
+                    mock.patch('verify_macos_qualification.authenticate') as authenticate, self.assertRaises(ValueError):
+                self.selected_handoff(directory, trust, **changes)
+            authenticate.assert_not_called()
+            self.assertFalse(self.output.exists())
+        with self.assertRaisesRegex(ValueError, 'only an unsigned'):
+            self.selected_handoff(self.directory, trust)
+        self.assertFalse(self.output.exists())
+        with mock.patch.object(readiness, 'inspect_archive', wraps=readiness.inspect_archive) as inspect:
+            # The real selected archive inspection, not producer JSON, owns source agreement.
+            inspected = inspect_archive(self.signed, self.commit, '0.2.0', self.root)
+            bad = copy.deepcopy(inspected)
+            bad['record']['source_sha256'] = '0' * 64
+            def selected(path, *args, **kwargs):
+                return bad if pathlib.Path(path) == self.signed else inspect._mock_wraps(path, *args, **kwargs)
+            inspect.side_effect = selected
+            with self.assertRaisesRegex(ValueError, 'exact candidate source'):
+                self.selected_handoff(directory, trust)
+        self.assertFalse(self.output.exists())
+
+    def test_explicit_signed_selection_rechecks_original_and_owned_bytes_after_native_authentication(self):
+        directory, original = self.unsigned_seed()
+        trust = self.native_selection()
+        windows = next(a for a in original['assets'] if a.get('platform') == 'Windows')
+        source = next(a for a in original['assets'] if 'platform' not in a)
+        cases = [('signed', self.signed), ('image', self.image), ('qualification', self.evidence),
+                 ('windows', directory / windows['file']), ('source', directory / source['file']),
+                 ('bundle', trust['bundle']), ('root', trust['trusted_root']), ('cli', trust['cli']),
+                 ('copied-signed', None), ('copied-root', None), ('copied-inventory', None),
+                 ('copied-checksums', None), ('unexpected-private', None)]
+        for label, path in cases:
+            output = self.base / ('changed-' + label)
+            selected = dict(trust, work=self.base / ('verification-' + label))
+            original_bytes = path.read_bytes() if path is not None else None
+            def mutate(qualification, **inputs):
+                result = self.fake_native_authentication(qualification, **inputs)
+                selected_output = {'copied-signed': output / self.signed.name,
+                                   'copied-root': inputs['work'] / 'trusted_root.jsonl',
+                                   'copied-inventory': output / 'release-inventory.json',
+                                   'copied-checksums': output / 'SHA256SUMS',
+                                   'unexpected-private': output / 'private-unknown.json'}
+                target = path if path is not None else selected_output[label]
+                target.write_bytes(b'CHANGED_AFTER_AUTHENTICATION')
+                return result
+            try:
+                with mock.patch('verify_macos_qualification.authenticate', side_effect=mutate), \
+                        self.subTest(label=label), self.assertRaises(ValueError):
+                    self.selected_handoff(directory, selected, output)
+                self.assertFalse((output / 'production-readiness.json').exists())
+            finally:
+                if path is not None:
+                    path.write_bytes(original_bytes)
+
+    def test_cli_signed_selection_is_explicit_requires_native_readback_and_keeps_false_readiness_exit(self):
+        trust = self.native_selection()
+        argv = ['production_readiness.py', '--directory', str(self.directory), '--include-dmg', str(self.image),
+                '--signed-macos-archive', str(self.signed), '--dmg-sha256', digest(self.image),
+                '--macos-portable-sha256', self.macos['sha256'], '--dmg-qualification', str(self.evidence),
+                '--dmg-qualification-sha256', digest(self.evidence), '--macos-team-id', test_sign_macos.TEAM,
+                '--deb-sha256', digest(self.deb), '--portable-sha256', digest(self.debian.archive),
+                '--maintainer', test_deb.MAINTAINER, '--source-root', str(self.root), '--commit', self.commit,
+                '--version', '0.2.0', '--output', str(self.output), '--require-ready', '--native-job-readback']
+        flags = {'bundle': 'native-attestation-bundle', 'bundle_sha256': 'native-attestation-sha256',
+                 'trusted_root': 'native-trusted-root', 'trusted_root_sha256': 'native-trusted-root-sha256',
+                 'cli': 'native-gh', 'cli_sha256': 'native-gh-sha256', 'cli_version': 'native-gh-version',
+                 'workflow_commit': 'native-workflow-commit', 'run_id': 'native-run-id',
+                 'run_attempt': 'native-run-attempt', 'work': 'native-verification-work'}
+        for key, flag in flags.items():
+            argv += ['--' + flag, str(trust[key])]
+        output = io.StringIO()
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(readiness, 'handoff_dmg', return_value={'production_ready': False}) as handoff, \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(readiness.main(), 2)
+        self.assertIn('native qualification verified; installed acceptance and production publication remain blocked', output.getvalue())
+        self.assertEqual(handoff.call_args.kwargs['signed_archive'], self.signed)
+        self.assertIs(handoff.call_args.kwargs['dmg_trust']['readback_job'], True)
+        for flag, count in [('--native-job-readback', 1), ('--native-gh', 2), ('--include-dmg', 2)]:
+            at = argv.index(flag)
+            invalid = argv[:at] + argv[at + count:]
+            with mock.patch.object(sys, 'argv', invalid), mock.patch.object(readiness, 'handoff_dmg') as handoff, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                readiness.main()
+            handoff.assert_not_called()
 
 class NativeProducerContract(unittest.TestCase):
     def test_real_consumer_schema_binds_without_authenticating_its_job(self):

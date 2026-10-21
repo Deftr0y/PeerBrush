@@ -19,7 +19,7 @@ import urllib.request
 import zipfile
 
 from package import git, relative_path, source_files
-from production_readiness import immutable
+from production_readiness import MAX_DMG_QUALIFICATION_BYTES, bind_dmg, immutable, unique_fields
 from package_deb import deb_version, inspect_final
 from verify_release import inspect_archive
 
@@ -310,8 +310,8 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
                     or any(archive.getinfo(name).file_size != len(data) for name, data in inputs.items())
                     or any(archive.read(name) != data for name, data in inputs.items())):
                 raise ValueError('Published corresponding source differs from the exact selected commit.')
-        # Inspect each portable companion once before final DEB content.
-        for name, record in sorted(records.items(), key=lambda item: recognize(item[0], version)[0] == 'deb'):
+        # Inspect each portable companion before either final installer binding.
+        for name, record in sorted(records.items(), key=lambda item: recognize(item[0], version)[0] in {'deb', 'dmg'}):
             kind, platform = recognize(name, version)
             if kind == 'source':
                 continue
@@ -323,13 +323,39 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
             if path.stat().st_size != record['bytes'] or file_sha(path) != record['sha256']:
                 raise ValueError('Published package bytes differ from the final inventory.')
             if kind in {'dmg', 'deb'}:
-                suffix = '.verification.json' if kind == 'dmg' else '.json'
-                report = json.loads(download(name + suffix, 2 * 1024 * 1024))
+                typed = kind == 'dmg' and name + '.qualification.json' in assets
+                if typed and name + '.verification.json' in assets:
+                    raise ValueError('Final DMG has ambiguous qualification and signer receipt assets.')
+                suffix = '.qualification.json' if typed else '.verification.json' if kind == 'dmg' else '.json'
+                raw_report = download(name + suffix, MAX_DMG_QUALIFICATION_BYTES if typed else 2 * 1024 * 1024)
+                report = json.loads(raw_report, object_pairs_hook=unique_fields) if typed else json.loads(raw_report)
+                if typed and not isinstance(report, dict):
+                    raise ValueError('Public DMG qualification must be a strict object.')
                 checksum = download(name + '.sha256', 1024)
                 if checksum.decode('ascii').replace('\r\n', '\n') != f"{record['sha256']}  {name}\n":
                     raise ValueError('Final installer checksum report differs.')
-                reason = installed_report(kind, record, report, commit, version)
-                exclusion = dict(file=name, reason=reason)
+                if typed:
+                    exclusion = dict(file=name, reason='native-final-installer-validation-not-configured',
+                                     asset_binding_verified=False, content_verified=False, ready=False, production_ready=False,
+                                     native_producer_authentication='not-verified-by-website', installed_acceptance='unverified',
+                                     public_availability='unverified')
+                    companions = [r for r in records.values() if recognize(r['file'], version) == ('zip', 'macOS')]
+                    if len(companions) != 1:
+                        exclusion['reason'] = 'final-dmg-signed-zip-not-in-inventory'
+                    elif not (pathlib.Path(temporary) / companions[0]['file']).exists():
+                        exclusion['reason'] = 'final-dmg-signed-zip-not-publicly-available'
+                    else:
+                        companion = companions[0]
+                        bound = bind_dmg(root, pathlib.Path(temporary) / companion['file'], path,
+                                         commit=commit, version=version, archive_sha256=companion['sha256'],
+                                         image_sha256=record['sha256'], qualification=raw_report,
+                                         qualification_sha256=sha(raw_report), team_id=report.get('publisher_team_id'))
+                        if bound['record'] != record:
+                            raise ValueError('Public DMG qualification differs from its inventory record.')
+                        exclusion.update(asset_binding_verified=True, qualification_binding=bound['qualification_binding'])
+                else:
+                    reason = installed_report(kind, record, report, commit, version)
+                    exclusion = dict(file=name, reason=reason)
                 if kind == 'deb':
                     exclusion.update(content_verified=False, ready=False, production_ready=False,
                                      installed_acceptance='unverified', update_repository='not-configured',
