@@ -22,6 +22,76 @@ spec.loader.exec_module(packaging)
 
 
 class NativeJxlBuild(unittest.TestCase):
+    def test_native_python_pin_reuses_one_existing_interpreter_before_tool_path_shadowing(self):
+        import select_native_python
+        import shutil
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            selected = root / 'selected Python'
+            tools = root / 'native tools'
+            selected.mkdir()
+            tools.mkdir()
+            executable = selected / 'python3.13'
+            executable.write_bytes(b'synthetic selected interpreter; never executed')
+            executable.chmod(0o755)
+            for name in ['python', 'python3']:
+                os.link(executable, selected / name)
+            shadow = tools / 'python3'
+            shadow.write_bytes(b'synthetic old interpreter; never executed')
+            shadow.chmod(0o755)
+            destination = root / 'github-path'
+            destination.write_text('existing entry\n', encoding='utf-8')
+            with mock.patch.object(select_native_python.sys, 'executable', str(executable)), \
+                 mock.patch.object(select_native_python.sys, 'version_info', (3, 13, 2)), \
+                 mock.patch.dict(os.environ, {'GITHUB_PATH': str(destination)}):
+                select_native_python.main()
+            self.assertEqual(destination.read_text(encoding='utf-8'), 'existing entry\n' + str(selected) + '\n')
+            # GitHub prepends GITHUB_PATH entries for subsequent steps, ahead of exported PATH.
+            changed = os.pathsep.join([str(tools), str(selected)])
+            environment_destination = root / 'github-env'
+            jxl_build.write_github_environment(environment_destination, dict(PATH=changed))
+            exported = dict(row.split('=', 1) for row in environment_destination.read_text(encoding='utf-8').splitlines())['PATH']
+            self.assertEqual(exported, changed)
+            pinned = os.pathsep.join([*reversed(destination.read_text(encoding='utf-8').splitlines()), exported])
+            with mock.patch.object(sys, 'platform', 'darwin'):
+                self.assertEqual(Path(shutil.which('python3', path=changed)), shadow)
+                self.assertTrue(Path(shutil.which('python3', path=pinned)).samefile(executable))
+                self.assertTrue(Path(shutil.which('python', path=pinned)).samefile(executable))
+
+    def test_native_python_pin_rejects_old_or_mismatched_runtime_before_environment_write(self):
+        import select_native_python
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            executable = root / 'python'
+            executable.write_bytes(b'synthetic interpreter')
+            (root / 'python3').write_bytes(b'different interpreter')
+            destination = root / 'github-path'
+            destination.write_bytes(b'prior environment\n')
+            with mock.patch.object(select_native_python.sys, 'executable', str(executable)), \
+                 mock.patch.dict(os.environ, {'GITHUB_PATH': str(destination)}):
+                for version in [(3, 10, 9), (3, 13, 2)]:
+                    with self.subTest(version=version), \
+                         mock.patch.object(select_native_python.sys, 'version_info', version), \
+                         self.assertRaises(ValueError):
+                        select_native_python.main()
+                self.assertEqual(destination.read_bytes(), b'prior environment\n')
+
+    def test_macos_native_python_pin_precedes_tool_setup_and_preserves_qualification_guards(self):
+        root = Path(__file__).resolve().parents[1]
+        pin = 'run: python -I scripts/select_native_python.py'
+        for name in ['ci.yml', 'release.yml', 'macos-qualification.yml']:
+            text = (root / '.github/workflows' / name).read_text(encoding='utf-8')
+            with self.subTest(workflow=name):
+                expected = 2 if name == 'macos-qualification.yml' else 1
+                self.assertEqual(text.count(pin), expected)
+                self.assertLess(text.index(pin), text.index('scripts/jxl_build.py --github-env'))
+                if name == 'macos-qualification.yml':
+                    for section in text.split('    steps:\n')[1:]:
+                        self.assertLess(section.index('Require reviewed main invocation'), section.index('Checkout reviewed main source'))
+                        self.assertLess(section.index('Checkout reviewed main source'), section.index(pin))
+                        self.assertLess(section.index(pin), section.index('Require exact main source'))
+                    self.assertLess(text.index('name: Qualify selected final DMG'), text.index('name: Attest generated native qualification'))
+
     def test_cargo_child_preserves_exact_argv_environment_and_isolated_state(self):
         environment = {'PATH': 'synthetic native tools', 'CXXFLAGS': '-DKEEP=1'}
         arguments = ['--', 'run', '--locked', '--', '--state-dir', 'C:/synthetic state with spaces']

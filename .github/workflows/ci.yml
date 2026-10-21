@@ -59,6 +59,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Pin existing Python for native packaging
+        if: runner.os == 'macOS'
+        run: python -I scripts/select_native_python.py
       - name: Check committed package source
         run: python scripts/package.py --check-source
       - if: runner.os == 'Windows'

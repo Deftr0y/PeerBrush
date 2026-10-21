@@ -83,3 +83,5 @@ Follow the [release-maintenance playbook](release-maintenance.md) for actual pub
 JPEG XL builds require the committed Rust 1.92 toolchain and native CMake/Ninja/Clang prerequisites. See [JPEG XL build inputs](jpeg-xl-build.md); do not install a global toolchain or workload to bypass an unqualified compiler.
 
 Integration codec tests launch the application worker in the matching Cargo profile directory. Build that source-matched main before running tests; the development test helper and all current native CI callers do so. Installed application launches use their exact current executable, including renamed installations; no PATH-selected worker or configurable executable is accepted.
+
+macOS native workflows qualify the already installed `python` as Python 3.11 or newer before native tool setup and pin its existing directory through `GITHUB_PATH`. Both `python` and `python3` in that directory must resolve to the qualified executable; no interpreter is installed. This preserves the qualified runtime when codec tool selection exports a PATH that could otherwise shadow it. A fixed numeric Python version is recorded; filesystem paths are not printed.
