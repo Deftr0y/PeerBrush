@@ -169,6 +169,12 @@ jobs:
                       matched += ['JXL_WORKER_' + code for code in sorted(set(re.findall(r'^JXL_TIMEOUT_ERROR_(FAILED|PROTOCOL|RESOURCE|OTHER)$', body, re.M)))]
                       if matched:
                           print('::error title=Regression failure category::' + name[:128] + ': ' + ', '.join(matched))
+                      if name == 'ui::effect_color::tests::effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes':
+                          records = re.findall(r'^PB_EFFECT_COLOR_HISTORY depth=(8|16) action=(escape|invalid|source) before=(0|[1-9][0-9]{0,4}) after=(0|[1-9][0-9]{0,4})$', body, re.M)
+                          if len(records) == 1:
+                              depth, action, before, after = records[0]
+                              if max(int(before), int(after)) <= 65535 and before != after:
+                                  print(f'::error title=Effect color history diagnostic::depth={depth} action={action} before={before} after={after}')
           elif int(sys.argv[3]):
               codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
               categories = []

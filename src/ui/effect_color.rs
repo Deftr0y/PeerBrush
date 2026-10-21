@@ -634,6 +634,12 @@ mod tests {
                         before.export_png().unwrap()
                     );
                 } else {
+                    if engine.undo.len() != history {
+                        eprintln!(
+                            "\nPB_EFFECT_COLOR_HISTORY depth={depth} action={action} before={history} after={}",
+                            engine.undo.len()
+                        );
+                    }
                     assert_eq!(engine.undo.len(), history, "{depth}/{action}");
                     assert_eq!(
                         serde_json::to_value(&engine.doc).unwrap(),

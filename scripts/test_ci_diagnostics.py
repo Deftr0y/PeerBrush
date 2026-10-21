@@ -52,6 +52,44 @@ class Diagnostics(unittest.TestCase):
             output = self.summarize('test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n' + marker)
             self.assertNotIn('Regression failure category', output)
 
+    def test_effect_color_history_record_reports_only_exact_fixed_fields(self):
+        name = 'ui::effect_color::tests::effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes'
+        header = 'test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n'
+        for depth in [8, 16]:
+            for action in ['escape', 'invalid', 'source']:
+                with self.subTest(depth=depth, action=action):
+                    marker = f'PB_EFFECT_COLOR_HISTORY depth={depth} action={action} before=0 after=1'
+                    output = self.summarize(header + marker + '\n' + PRIVATE)
+                    self.assertIn(f'Effect color history diagnostic::depth={depth} action={action} before=0 after=1', output)
+        output = self.summarize(header + 'PB_EFFECT_COLOR_HISTORY depth=16 action=source before=65535 after=0\n' + PRIVATE)
+        self.assertIn('before=65535 after=0', output)
+
+    def test_effect_color_history_record_rejects_unknown_private_malformed_and_out_of_bounds_data(self):
+        name = 'ui::effect_color::tests::effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes'
+        header = 'test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n'
+        valid = 'PB_EFFECT_COLOR_HISTORY depth=8 action=escape before=0 after=1'
+        invalid = [
+            valid.replace('depth=8', 'depth=32'),
+            valid.replace('action=escape', 'action=enter'),
+            valid.replace('action=escape', 'action=' + PRIVATE),
+            valid.replace('before=0', 'before=-1'),
+            valid.replace('before=0', 'before=00'),
+            valid.replace('before=0', 'before=65536'),
+            valid.replace('after=1', 'after=65536'),
+            valid.replace('after=1', 'after=100000'),
+            valid.replace('after=1', 'after=' + PRIVATE),
+            valid.replace('after=1', 'after=0'),
+            PRIVATE + valid,
+            valid + ' ' + PRIVATE,
+            valid + '\n' + valid,
+        ]
+        for marker in invalid:
+            with self.subTest(marker=marker):
+                output = self.summarize(header + marker + '\n' + PRIVATE)
+                self.assertNotIn('Effect color history diagnostic', output)
+        output = self.summarize(header.replace(name, 'other::fixture') + valid + '\n' + PRIVATE)
+        self.assertNotIn('Effect color history diagnostic', output)
+
     def test_unknown_output_never_turns_warning_locations_into_compiler_errors(self):
         output = self.summarize('warning: example\n  --> src/gpu.rs:8:2\n' + PRIVATE)
         self.assertIn('UNKNOWN', output)
