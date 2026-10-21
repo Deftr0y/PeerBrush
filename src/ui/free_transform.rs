@@ -19,6 +19,7 @@ struct Parameters {
     skew: [f64; 2],
     mirror: [bool; 2],
     projective: Option<Quad>,
+    warp: Option<crate::warp::Grid>,
 }
 impl Default for Parameters {
     fn default() -> Self {
@@ -29,6 +30,7 @@ impl Default for Parameters {
             skew: [0.; 2],
             mirror: [false; 2],
             projective: None,
+            warp: None,
         }
     }
 }
@@ -39,6 +41,7 @@ enum Handle {
     Scale(bool, bool),
     Skew(usize),
     Projective(usize, bool),
+    Warp(usize),
     Pivot,
 }
 struct Drag {
@@ -71,6 +74,12 @@ pub(super) struct Editor {
     mode: Tool,
     skew_mode: bool,
     projective_mode: Option<ProjectiveMode>,
+    warp_mode: bool,
+    warp_domains: [Result<[f64; 4], String>; 2],
+    warp_preset: Option<&'static str>,
+    warp_amount: f64,
+    context: egui::menu::MenuRootManager,
+    context_frame: bool,
     proportional: bool,
     snap: bool,
     prior_tool: Tool,
@@ -83,18 +92,23 @@ pub(super) struct Editor {
     #[cfg(test)]
     projective_inputs: [Option<Rect>; 8],
     #[cfg(test)]
+    warp_inputs: [Option<Rect>; 18],
+    #[cfg(test)]
+    warp_amount_input: Option<Rect>,
+    #[cfg(test)]
     scroll_rect: Option<Rect>,
     #[cfg(test)]
     scroll_offset: Vec2,
 }
 impl Editor {
     pub(super) fn mode(&self) -> Option<Tool> {
-        (!self.skew_mode && self.projective_mode.is_none()).then_some(self.mode)
+        (!self.skew_mode && self.projective_mode.is_none() && !self.warp_mode).then_some(self.mode)
     }
     pub(super) fn set_mode(&mut self, mode: Tool) {
         self.mode = mode;
         self.skew_mode = false;
         self.projective_mode = None;
+        self.warp_mode = false;
         self.drag = None;
     }
     pub(super) fn live_key(&self) -> String {
@@ -103,12 +117,123 @@ impl Editor {
             self.gesture, self.document, self.revision
         )
     }
+    fn show_context(&mut self, ui: &mut egui::Ui, available: Rect) -> bool {
+        let was_open = self.context.is_some();
+        if self.context.as_ref().is_some_and(|root| {
+            ui.input(|input| {
+                input.pointer.any_pressed()
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|p| !root.menu_state.read().area_contains(p))
+            })
+        }) {
+            *self.context = None;
+        }
+        let navigating = ui.input(|input| {
+            input.modifiers.alt || input.key_down(egui::Key::Space) || input.pointer.middle_down()
+        });
+        if navigating {
+            *self.context = None;
+        }
+        let response = ui.interact(
+            available,
+            ui.id().with(("free transform context", &self.gesture)),
+            egui::Sense::hover(),
+        );
+        if !navigating
+            && !ui.input(|input| input.pointer.primary_down())
+            && self.drag.is_none()
+            && !ui.ctx().wants_keyboard_input()
+            && !ui.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+            })
+            && ui
+                .ctx()
+                .memory(|memory| !memory.any_popup_open() && memory.top_modal_layer().is_none())
+            && ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary))
+        {
+            if let Some(at) = ui.input(|input| input.pointer.interact_pos()).filter(|at| {
+                available.contains(*at) && ui.ctx().layer_id_at(*at) == Some(ui.layer_id())
+            }) {
+                *self.context = Some(egui::menu::MenuRoot::new(at, response.id));
+                self.drag = None;
+            }
+        }
+        let block_canvas = self.context_frame || was_open || self.context.is_some();
+        self.context_frame = block_canvas;
+        let mut context = std::mem::take(&mut self.context);
+        context.show(&response, |ui| {
+            for (mode, label) in [
+                (Tool::Move, "Move"),
+                (Tool::Scale, "Scale"),
+                (Tool::Rotate, "Rotate"),
+            ] {
+                if ui
+                    .selectable_label(self.mode() == Some(mode), label)
+                    .clicked()
+                {
+                    self.set_mode(mode);
+                    ui.close_menu();
+                }
+            }
+            if ui.selectable_label(self.skew_mode, "Skew").clicked() {
+                self.skew_mode = true;
+                self.projective_mode = None;
+                self.warp_mode = false;
+                self.drag = None;
+                ui.close_menu();
+            }
+            for (mode, label) in [
+                (ProjectiveMode::Distort, "Distort"),
+                (ProjectiveMode::Perspective, "Perspective"),
+            ] {
+                if ui
+                    .selectable_label(self.projective_mode == Some(mode), label)
+                    .clicked()
+                {
+                    self.projective_mode = Some(mode);
+                    self.skew_mode = false;
+                    self.warp_mode = false;
+                    self.drag = None;
+                    ui.close_menu();
+                }
+            }
+            if ui.selectable_label(self.warp_mode, "Grid Warp").clicked() {
+                self.warp_mode = true;
+                self.skew_mode = false;
+                self.projective_mode = None;
+                self.drag = None;
+                ui.close_menu();
+            }
+            ui.separator();
+            for (axis, label) in [(0, "Flip Horizontal"), (1, "Flip Vertical")] {
+                if ui
+                    .selectable_label(self.values.mirror[axis], label)
+                    .clicked()
+                {
+                    self.values.mirror[axis] = !self.values.mirror[axis];
+                    self.drag = None;
+                    ui.close_menu();
+                }
+            }
+        });
+        self.context = context;
+        if was_open != self.context.is_some() {
+            ui.ctx().request_repaint();
+        }
+        block_canvas
+    }
     fn affine(&self) -> bool {
         self.values.scale != [1.; 2]
             || self.values.angle.rem_euclid(360.) != 0.
             || self.values.skew != [0.; 2]
             || self.values.mirror != [false; 2]
             || self.values.projective.is_some()
+            || self.values.warp.is_some()
     }
     fn raw(&self, id: &str, snap: bool) -> Value {
         json!({"op":if self.affine() {"transform"}else{"move"},"layer":id,
@@ -195,15 +320,85 @@ impl Editor {
         command["snap"] = json!(false);
         crate::transform::resolve_command(&command)
     }
-    fn command(&self, id: &str, snap: bool) -> Result<Value, String> {
+    fn projection_command(&self, id: &str, snap: bool) -> Result<Value, String> {
         let mut command = self.affine_command(id, snap)?;
+        command.as_object_mut().unwrap().remove("warp");
         if let Some(quad) = &self.values.projective {
             command["projective"] = json!({"rect":quad.rect,"quad":quad.corners});
-            crate::transform::resolve_command(&command)
         } else {
             command.as_object_mut().unwrap().remove("projective");
-            Ok(command)
         }
+        crate::transform::resolve_command(&command)
+    }
+    fn command(&self, id: &str, snap: bool) -> Result<Value, String> {
+        let mut command = self.projection_command(id, snap)?;
+        if let Some(grid) = &self.values.warp {
+            command["warp"] = json!(grid);
+        }
+        crate::transform::resolve_command(&command)
+    }
+    fn warp_domain(&self) -> Result<[f64; 4], String> {
+        self.warp_domains[usize::from(self.whole || !self.selected)].clone()
+    }
+    fn grid(&self) -> Result<crate::warp::Grid, String> {
+        self.values
+            .warp
+            .clone()
+            .map_or_else(|| crate::warp::Grid::identity(self.warp_domain()?), Ok)
+    }
+    fn set_grid(&mut self, grid: crate::warp::Grid) {
+        self.values.warp = (!grid.is_identity()).then_some(grid);
+    }
+    fn post_map(&self) -> Result<crate::projective::Map, String> {
+        crate::warp::CommandMap::new(&self.projection_command("", self.snap)?, self.pivot)
+            .map(|map| map.after)
+    }
+    fn grid_points(&self) -> Result<[[f64; 2]; 9], String> {
+        let mut points = self.grid()?.points;
+        let map = self.post_map()?;
+        for point in &mut points {
+            *point = map.point(*point)?;
+        }
+        Ok(points)
+    }
+    fn outline(&self) -> Vec<[f64; 2]> {
+        if self.values.warp.is_some() && self.projective_mode.is_none() {
+            let points = Self::rectangle(self.target_bounds()).map(|p| p.map(|v| v as f32));
+            if let Ok(points) = self
+                .command("", self.snap)
+                .and_then(|c| crate::warp::CommandMap::new(&c, self.pivot))
+                .and_then(|map| map.polygon(&points))
+            {
+                return points.into_iter().map(|p| p.map(f64::from)).collect();
+            }
+        }
+        self.corners().to_vec()
+    }
+    fn edge_points(&self) -> [[f64; 2]; 4] {
+        let corners = self.corners();
+        let mut points = std::array::from_fn(|i| {
+            [
+                (corners[i][0] + corners[(i + 1) % 4][0]) * 0.5,
+                (corners[i][1] + corners[(i + 1) % 4][1]) * 0.5,
+            ]
+        });
+        if self.values.warp.is_some() && self.projective_mode.is_none() {
+            if let Ok(map) = self
+                .command("", self.snap)
+                .and_then(|c| crate::warp::CommandMap::new(&c, self.pivot))
+            {
+                let source = Self::rectangle(self.target_bounds());
+                for (i, point) in points.iter_mut().enumerate() {
+                    *point = map
+                        .point([
+                            (source[i][0] + source[(i + 1) % 4][0]) * 0.5,
+                            (source[i][1] + source[(i + 1) % 4][1]) * 0.5,
+                        ])
+                        .unwrap_or(*point);
+                }
+            }
+        }
+        points
     }
     fn target_bounds(&self) -> [f64; 4] {
         if self.selected && !self.whole {
@@ -299,6 +494,11 @@ impl Editor {
         let Ok(c) = self.command("", self.snap) else {
             return p;
         };
+        if self.values.warp.is_some() {
+            return crate::warp::CommandMap::new(&c, self.pivot)
+                .and_then(|map| map.point(p))
+                .unwrap_or(p);
+        }
         if self.values.projective.is_some() {
             return crate::projective::combined(&c)
                 .and_then(|map| map.ok_or_else(|| "Missing projective map".into()))
@@ -323,6 +523,29 @@ impl Editor {
         ]
     }
     fn corners(&self) -> [[f64; 2]; 4] {
+        if self.values.warp.is_some() {
+            if self.projective_mode.is_some() {
+                // P controls are the A(quad) reference plane, not warped subject corners.
+                if let Ok((quad, map)) = self.quad().and_then(|quad| {
+                    self.affine_command("", self.snap)
+                        .and_then(|c| crate::projective::affine(&c, self.pivot))
+                        .map(|map| (quad, map))
+                }) {
+                    let mut points = quad.corners;
+                    if points.iter_mut().all(|p| match map.point(*p) {
+                        Ok(point) => {
+                            *p = point;
+                            true
+                        }
+                        Err(_) => false,
+                    }) {
+                        return points;
+                    }
+                }
+            } else {
+                return Self::rectangle(self.target_bounds()).map(|p| self.point(p));
+            }
+        }
         if let Some(quad) = &self.values.projective {
             if quad.rect == self.target_bounds() {
                 if let Ok(map) = self
@@ -458,6 +681,148 @@ impl Editor {
             self.set_quad(quad);
         }
     }
+    fn drag_node(
+        &mut self,
+        index: usize,
+        origin: [f64; 2],
+        mut point: [f64; 2],
+        shift: bool,
+    ) -> Result<(), String> {
+        if point == origin {
+            return Ok(());
+        }
+        if self.snap {
+            point = point.map(f64::round);
+        }
+        if shift {
+            let axis = usize::from((point[0] - origin[0]).abs() >= (point[1] - origin[1]).abs());
+            point[axis] = origin[axis];
+        }
+        let inverse = self.post_map()?.inverse()?;
+        let a = inverse.point(origin)?;
+        let b = inverse.point(point)?;
+        let mut grid = self.grid()?;
+        for axis in 0..2 {
+            grid.points[index][axis] += b[axis] - a[axis];
+        }
+        self.set_grid(grid);
+        self.warp_preset = None;
+        Ok(())
+    }
+    fn warp_controls(&mut self, ui: &mut egui::Ui) {
+        if !self.warp_mode {
+            return;
+        }
+        ui.label("3 by 3 grid with straight segments between points.");
+        ui.label("Drag nodes; Shift constrains document X/Y. Presets use this grid.");
+        let mut preset_changed = false;
+        ui.horizontal(|ui| {
+            for (name, label) in [("arc", "Arc"), ("bulge", "Bulge"), ("flag", "Flag")] {
+                if ui
+                    .selectable_label(self.warp_preset == Some(name), label)
+                    .clicked()
+                {
+                    self.warp_preset = Some(name);
+                    preset_changed = true;
+                }
+            }
+            if self.warp_preset.is_none() {
+                ui.label("Custom");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_sized([82., 20.], egui::Label::new("Amount"));
+            let response = ui
+                .add_enabled_ui(self.warp_preset.is_some(), |ui| {
+                    controls::numeric(ui, &mut self.warp_amount, -0.25..=0.25)
+                })
+                .inner;
+            #[cfg(test)]
+            {
+                self.warp_amount_input = Some(response.rect);
+            }
+            preset_changed |= response.changed();
+        });
+        if preset_changed {
+            if let Some(name) = self.warp_preset {
+                let rect = self
+                    .values
+                    .warp
+                    .as_ref()
+                    .map(|grid| Ok(grid.rect))
+                    .unwrap_or_else(|| self.warp_domain());
+                match rect.and_then(|rect| crate::warp::Grid::preset(rect, name, self.warp_amount))
+                {
+                    Ok(grid) => self.set_grid(grid),
+                    Err(error) => self.error = Some(error),
+                }
+            }
+        }
+        if ui.button("Reset Warp").clicked() {
+            self.values.warp = None;
+            self.warp_preset = None;
+        }
+        ui.label(
+            "Reset Warp fits a fresh grid to this target and keeps the other transform settings.",
+        );
+        let state = self.grid().and_then(|grid| {
+            self.post_map()
+                .and_then(|map| map.inverse().map(|inverse| (grid, map, inverse)))
+        });
+        let (mut grid, map, inverse) = match state {
+            Ok(state) => state,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        if self.warp_domain().is_ok_and(|b| {
+            b[0] < grid.rect[0] || b[1] < grid.rect[1] || b[2] > grid.rect[2] || b[3] > grid.rect[3]
+        }) {
+            ui.label("This grid may not cover Whole target. Return to selection or Reset Warp.");
+        }
+        ui.label("Node positions: document X / Y");
+        let mut changed = false;
+        for (index, point) in grid.points.iter_mut().enumerate() {
+            let mut displayed = match map.point(*point) {
+                Ok(point) => point,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
+            let edited = ui
+                .horizontal(|ui| {
+                    ui.add_sized([82., 20.], egui::Label::new(format!("Node {}", index + 1)));
+                    let mut edited = false;
+                    for (axis, value) in displayed.iter_mut().enumerate() {
+                        let response = controls::numeric(ui, value, -100000. ..=100000.);
+                        #[cfg(test)]
+                        {
+                            self.warp_inputs[index * 2 + axis] = Some(response.rect);
+                        }
+                        #[cfg(not(test))]
+                        let _ = axis;
+                        edited |= response.changed();
+                    }
+                    edited
+                })
+                .inner;
+            if edited {
+                match inverse.point(displayed) {
+                    Ok(p) => {
+                        *point = p;
+                        changed = true;
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
+        }
+        if changed {
+            self.set_grid(grid);
+            self.warp_preset = None;
+        }
+    }
     fn drag_to(&mut self, p: [f64; 2], shift: bool) {
         let Some(drag) = &self.drag else {
             return;
@@ -467,6 +832,12 @@ impl Editor {
         let handle = drag.handle;
         self.values = start.clone();
         match handle {
+            Handle::Warp(index) => {
+                if let Err(error) = self.drag_node(index, origin, p, shift) {
+                    self.error = Some(error);
+                }
+                return;
+            }
             Handle::Projective(index, perspective) => {
                 if let Err(error) = self.drag_corner(index, origin, p, perspective, shift) {
                     self.error = Some(error);
@@ -665,6 +1036,17 @@ impl PeerBrush {
             .selection
             .map(|bounds| bounds.map(f64::from))
             .unwrap_or(whole_bounds);
+        let warp_domains = [false, true].map(|whole| {
+            let commands = roots
+                .iter()
+                .map(|id| {
+                    json!({"op":"transform","layer":id,
+                "mask":self.mask,"step":if roots.len()==1 {self.mask_step.clone()}else{None},
+                "selection_only":doc.selection.is_some()&&!whole})
+                })
+                .collect::<Vec<_>>();
+            crate::warp::domain(doc, &commands)
+        });
         let prior_tool = self.tool;
         self.select_tool(Tool::Move);
         self.close_proposal();
@@ -685,6 +1067,12 @@ impl PeerBrush {
             mode: Tool::Move,
             skew_mode: false,
             projective_mode: None,
+            warp_mode: false,
+            warp_domains,
+            warp_preset: None,
+            warp_amount: 0.15,
+            context: Default::default(),
+            context_frame: false,
             proportional: true,
             snap: false,
             prior_tool,
@@ -696,6 +1084,10 @@ impl PeerBrush {
             inputs: [None; 9],
             #[cfg(test)]
             projective_inputs: [None; 8],
+            #[cfg(test)]
+            warp_inputs: [None; 18],
+            #[cfg(test)]
+            warp_amount_input: None,
             #[cfg(test)]
             scroll_rect: None,
             #[cfg(test)]
@@ -761,6 +1153,18 @@ impl PeerBrush {
                 }
             }
         });
+        if self
+            .free_transform
+            .as_ref()
+            .is_some_and(|editor| editor.context.is_some())
+        {
+            self.free_transform.as_mut().unwrap().context_frame = true;
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                *self.free_transform.as_mut().unwrap().context = None;
+                ctx.request_repaint();
+            }
+            return;
+        }
         if ctx.wants_keyboard_input()
             || !Self::free_transform_keyboard(ctx)
             || ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))))
@@ -797,25 +1201,21 @@ impl PeerBrush {
             return;
         };
         let before = editor.values.clone();
+        let context_frame = editor.show_context(ui, available);
         let old_reference = editor.reference_point();
         let view = self.view;
         let screen = |p: [f64; 2]| view.point(p.map(|v| v as f32), rect, scale);
         let corners = editor.corners().map(screen);
-        let middle = (corners[0] + corners[1].to_vec2()) * 0.5;
+        let edges = editor.edge_points().map(screen);
+        let middle = edges[0];
         let center = screen(editor.reference_point());
         let rotation = middle + (middle - center).normalized() * 26.;
         let points = [
-            corners[0],
-            corners[1],
-            corners[2],
-            corners[3],
-            (corners[0] + corners[1].to_vec2()) * 0.5,
-            (corners[1] + corners[2].to_vec2()) * 0.5,
-            (corners[2] + corners[3].to_vec2()) * 0.5,
-            (corners[3] + corners[0].to_vec2()) * 0.5,
+            corners[0], corners[1], corners[2], corners[3], edges[0], edges[1], edges[2], edges[3],
         ];
         let navigating = ui.input(|i| {
-            i.modifiers.alt
+            context_frame
+                || i.modifiers.alt
                 || i.key_down(egui::Key::Space)
                 || i.pointer.middle_down()
                 || i.pointer.secondary_down()
@@ -823,6 +1223,13 @@ impl PeerBrush {
         if navigating {
             editor.drag = None;
         }
+        let grid_points = (editor.warp_mode || editor.values.warp.is_some())
+            .then(|| editor.grid_points())
+            .transpose()
+            .ok()
+            .flatten()
+            .map(|points| points.map(screen));
+        let outline = editor.outline().into_iter().map(screen).collect::<Vec<_>>();
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let hit = pointer
             .filter(|p| {
@@ -831,6 +1238,15 @@ impl PeerBrush {
                     && ui.ctx().layer_id_at(*p) == Some(ui.layer_id())
             })
             .and_then(|p| {
+                // Center node wins over an overlapping reference; reference fields remain available.
+                if editor.warp_mode {
+                    if let Some(index) = grid_points
+                        .as_ref()
+                        .and_then(|points| points.iter().position(|node| p.distance(*node) < 9.))
+                    {
+                        return Some(Handle::Warp(index));
+                    }
+                }
                 if p.distance(center) < 9. {
                     return Some(Handle::Pivot);
                 }
@@ -851,7 +1267,10 @@ impl PeerBrush {
                         .position(|point| p.distance(*point) < 9.)
                         .map(|index| Handle::Skew(index % 2));
                 }
-                if editor.projective_mode.is_none() && editor.mode == Tool::Scale {
+                if !editor.warp_mode
+                    && editor.projective_mode.is_none()
+                    && editor.mode == Tool::Scale
+                {
                     return points
                         .iter()
                         .position(|point| p.distance(*point) < 9.)
@@ -859,13 +1278,16 @@ impl PeerBrush {
                             Handle::Scale(index < 4 || index % 2 == 1, index < 4 || index % 2 == 0)
                         });
                 }
-                if editor.projective_mode.is_none() && editor.mode == Tool::Rotate {
+                if !editor.warp_mode
+                    && editor.projective_mode.is_none()
+                    && editor.mode == Tool::Rotate
+                {
                     return points
                         .iter()
                         .any(|point| p.distance(*point) < 10.)
                         .then_some(Handle::Rotate);
                 }
-                Rect::from_points(&corners)
+                Rect::from_points(&outline)
                     .contains(p)
                     .then_some(Handle::Move)
             });
@@ -899,21 +1321,24 @@ impl PeerBrush {
         }
         let painter = ui.painter().with_clip_rect(available);
         let corners = editor.corners().map(screen);
-        let middle = (corners[0] + corners[1].to_vec2()) * 0.5;
+        let edges = editor.edge_points().map(screen);
+        let middle = edges[0];
         let center = screen(editor.reference_point());
         let rotation = middle + (middle - center).normalized() * 26.;
         painter.add(egui::Shape::closed_line(
-            corners.to_vec(),
+            editor.outline().into_iter().map(screen).collect(),
             Stroke::new(1.25, ACCENT),
         ));
-        let mut handles = if editor.skew_mode {
+        let mut handles = if editor.skew_mode || editor.warp_mode {
             vec![]
         } else {
             corners.to_vec()
         };
-        if (editor.projective_mode.is_none() && editor.mode == Tool::Scale) || editor.skew_mode {
+        if (!editor.warp_mode && editor.projective_mode.is_none() && editor.mode == Tool::Scale)
+            || editor.skew_mode
+        {
             for i in 0..4 {
-                handles.push((corners[i] + corners[(i + 1) % 4].to_vec2()) * 0.5);
+                handles.push(edges[i]);
             }
         }
         for (index, p) in handles.into_iter().enumerate() {
@@ -926,6 +1351,33 @@ impl PeerBrush {
                     egui::FontId::proportional(11.),
                     ACCENT,
                 );
+            }
+        }
+        if editor.warp_mode || editor.values.warp.is_some() {
+            if let Ok(nodes) = editor.grid_points() {
+                let nodes = nodes.map(screen);
+                for line in [
+                    [0, 1, 2],
+                    [3, 4, 5],
+                    [6, 7, 8],
+                    [0, 3, 6],
+                    [1, 4, 7],
+                    [2, 5, 8],
+                ] {
+                    painter.add(egui::Shape::line(
+                        line.map(|i| nodes[i]).to_vec(),
+                        Stroke::new(1., ACCENT),
+                    ));
+                }
+                if editor.warp_mode {
+                    for node in nodes {
+                        painter.rect_filled(
+                            Rect::from_center_size(node, Vec2::splat(7.)),
+                            1.,
+                            ACCENT,
+                        );
+                    }
+                }
             }
         }
         painter.circle_stroke(rotation, 5., Stroke::new(1.5, ACCENT));
@@ -946,6 +1398,9 @@ impl PeerBrush {
         let Some(mut editor) = self.free_transform.take() else {
             return;
         };
+        // Canvas and deferred shortcuts have finished; keep popup dismissal guarded
+        // through Apply, then start the next draw without the frame latch.
+        let context_frame = std::mem::take(&mut editor.context_frame);
         let typing = ctx.wants_keyboard_input()
             || ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
         let before = editor.key();
@@ -977,6 +1432,7 @@ impl PeerBrush {
                     if ui.selectable_label(editor.skew_mode, "Skew").clicked() {
                         editor.skew_mode = true;
                         editor.projective_mode = None;
+                        editor.warp_mode = false;
                         editor.drag = None;
                     }
                 });
@@ -985,12 +1441,18 @@ impl PeerBrush {
                                            (ProjectiveMode::Perspective, "Perspective")] {
                         if ui.selectable_label(editor.projective_mode == Some(mode), label).clicked() {
                             editor.projective_mode = Some(mode);
+                            editor.warp_mode = false;
                             editor.skew_mode = false;
                             editor.drag = None;
                         }
                     }
+                    if ui.selectable_label(editor.warp_mode,"Grid Warp").clicked() {
+                        editor.warp_mode=true;editor.skew_mode=false;editor.projective_mode=None;editor.drag=None;
+                    }
                 });
-                if let Some(mode) = editor.projective_mode {
+                if editor.warp_mode {
+                    ui.label("Drag a grid point or choose a preset.");
+                } else if let Some(mode) = editor.projective_mode {
                     ui.label(if mode == ProjectiveMode::Distort {
                         "Drag a corner freely. Shift constrains its axis."
                     } else {
@@ -1091,12 +1553,14 @@ impl PeerBrush {
                     ctx.request_repaint();
                 }
                 editor.projective_controls(ui);
+                editor.warp_controls(ui);
                 if ui.button("Reset transform").clicked() {
                     if editor.reference.is_some() {
                         editor.pivot = editor.reference_point();
                     }
                     editor.reference = None;
                     editor.values = Parameters::default();
+                    editor.warp_preset = None;
                     editor.drag = None;
                     editor.changed();
                 }
@@ -1114,9 +1578,10 @@ impl PeerBrush {
                 if !rendered {
                     ui.label("Rendering shared-engine preview...");
                 }
-                ui.label("Grid and preset Warp are not available yet.");
                 ui.horizontal(|ui| {
                     let ready = commands.is_ok()
+                        && editor.context.is_none()
+                        && !context_frame
                         && rendered
                         && editor.drag.is_none()
                         && !self.busy

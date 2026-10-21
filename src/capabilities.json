@@ -980,15 +980,26 @@
     }
   },
   "free_transform": {
-    "native_ui": "Layer > Free Transform or Ctrl/Cmd+T",
-    "modes": ["move", "scale", "rotate", "skew", "mirror", "distort", "perspective"],
-    "commands": "One guarded shared transform per target combines projective corners, affine values and dx/dy in one A*P sample. Pure movement stays move, including saved text with unavailable fonts.",
+    "native_ui": "Layer > Free Transform or Ctrl/Cmd+T; right-click the unobscured canvas for modes and flips",
+    "modes": [
+      "move",
+      "scale",
+      "rotate",
+      "skew",
+      "mirror",
+      "distort",
+      "perspective",
+      "grid_warp"
+    ],
+    "commands": "One guarded shared transform per target combines grid Warp, projective corners, affine values and dx/dy in one A*P*W original sample. Pure movement stays move, including saved text with unavailable fonts.",
     "preview": "Actual shared-engine native8/16 result; Apply/Enter commits one undo only after the current preview is rendered. Handle release and mode changes remain pending.",
     "cancellation": "Cancel/Escape, focus loss, changed source or target cancel the draft without rebasing; Save/close/update restart require Apply or Cancel.",
     "reference_point": "Enter or drag before or after an adjustment. Moving only the reference preserves exact commands and rendered pixels; later affine values use the chosen document-space reference in one original-sampling command, with explicit fractional posttranslation when needed. User values snap before reference compensation; Reset clears the pending transform.",
     "skew_handles": "The compact Skew mode exposes X handles at the top/bottom edge centers and Y handles at the left/right centers. Drag changes the corresponding shared horizontal-then-vertical shear about the current reference, including existing rotation, scale and mirrors. Shift uses fifteen-degree snapping. Release and switching back to Move/Rotate/Scale keep the same pending command and actual rendered preview; no new engine operation or source format.",
     "projective_handles": "Distort drags one corner; Shift constrains its axis. Perspective drags a symmetric edge pair; Shift selects the vertical pair. Exact document X/Y corner entry is independent. Existing affine fields apply after the quad; mode changes and release retain one pending command. Invalid quads remain editable with Apply disabled. The controls scroll vertically on short windows.",
-    "limits": "Selected raster transforms follow the current selection by default; Whole target (keep selection) is explicit. Editable text/vector projective changes require native-precision rasterization. Grid/preset Warp remains unavailable."
+    "limits": "Selected raster transforms follow the current selection by default; Whole target (keep selection) is explicit. Editable text/vector projective or Warp changes require native-precision rasterization. Grid Warp is a bounded coarse grid, without Bezier or Photoshop preset/metadata equivalence. Native visible interaction acceptance remains pending.",
+    "context_menu": "Right-click the canvas for Move/Scale/Rotate/Skew/Distort/Perspective/Grid Warp and horizontal/vertical flips in the same pending session. Mode changes preserve exact commands. Escape closes this menu first; outside dismissal cannot start a transform. Alt/Space/middle navigation, numeric typing and floating-window occlusion retain their input guards.",
+    "warp_controls": "Coarse 3 by 3 grid with straight segments between nodes, Arc/Bulge/Flag presets and exact document X/Y fields. Nodes use inverse A*P, not inverse Warp. Ordinary guides use full seam-split A*P*W; Distort/Perspective controls retain their A(quad) projection plane. Folded grids remain repairable with Apply disabled. Whole target retains the exact Grid/A/P and shared admission may reject insufficient coverage; Reset Warp fits a fresh current-target grid while preserving other transform settings."
   },
   "editable_sources": {
     "commands": [

@@ -108,9 +108,12 @@ fn open(app: &mut PeerBrush, ctx: &egui::Context) {
     assert!(app.free_transform.is_some(), "{}", app.message);
 }
 fn settle(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
+    settle_size(app, ctx, SIZE)
+}
+fn settle_size(app: &mut PeerBrush, ctx: &egui::Context, size: Vec2) -> egui::FullOutput {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        frame(app, ctx, vec![]);
+        workspace::draw(app, ctx, size, vec![]);
         let ready = app.free_transform.as_ref().is_some_and(|editor| {
             editor
                 .key()
@@ -118,7 +121,7 @@ fn settle(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
                 .is_some_and(|key| editor.rendered.as_ref() == Some(&key))
         });
         if ready && !app.pending && app.canvas_preview == app.last_preview {
-            return frame(app, ctx, vec![]);
+            return workspace::draw(app, ctx, size, vec![]);
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -785,6 +788,7 @@ fn moved_reference_preserves_exact_command_then_anchors_the_next_affine_change()
         skew: [9., -4.],
         mirror: [true, false],
         projective: None,
+        warp: None,
     };
     for reference in [[9.125, 11.5], [12.25, 7.75]] {
         let commands = editor.commands().unwrap();
@@ -1200,6 +1204,7 @@ fn edge_skew_follows_the_actual_sheared_axes_and_reference_and_restores_exact_co
                         skew: [15., -15.],
                         mirror: mirrored,
                         projective: None,
+                        warp: None,
                     };
                     editor.snap = snap;
                     editor.set_reference([5.25, 21.75]).unwrap();
@@ -2303,4 +2308,1014 @@ fn small_projective_window_scrolls_to_reference_corner_apply_and_cancel() {
     workspace::click(&mut app, &ctx, size, at);
     assert!(app.free_transform.is_none());
     assert_eq!(workspace::source(&app), before);
+}
+
+#[derive(Clone, Copy)]
+enum WarpInput {
+    Base(usize),
+    Node(usize),
+    Amount,
+}
+fn warp_input(editor: &Editor, input: WarpInput) -> Rect {
+    match input {
+        WarpInput::Base(index) => editor.inputs[index],
+        WarpInput::Node(index) => editor.warp_inputs[index],
+        WarpInput::Amount => editor.warp_amount_input,
+    }
+    .unwrap()
+}
+fn warp_reveal(
+    app: &mut PeerBrush,
+    ctx: &egui::Context,
+    size: Vec2,
+    label: &str,
+    input: Option<WarpInput>,
+) -> Pos2 {
+    let visible = |app: &PeerBrush, output: &egui::FullOutput| {
+        let editor = app.free_transform.as_ref().unwrap();
+        let viewport = editor.scroll_rect.unwrap();
+        let screen = Rect::from_min_size(Pos2::ZERO, size);
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                let at = text.pos + text.galley.size() * 0.5;
+                let rect = input.map_or(Rect::from_center_size(at, Vec2::splat(2.)), |input| {
+                    warp_input(editor, input)
+                });
+                (shape.clip_rect.contains(at)
+                    && viewport.contains_rect(rect)
+                    && screen.contains_rect(rect))
+                .then_some((at, rect, editor.scroll_offset))
+            }
+            _ => None,
+        })
+    };
+    // Use real wheel navigation from the top; do not force egui scroll state.
+    workspace::draw(app, ctx, size, vec![]);
+    let viewport = app.free_transform.as_ref().unwrap().scroll_rect.unwrap();
+    workspace::draw(
+        app,
+        ctx,
+        size,
+        vec![
+            egui::Event::PointerMoved(viewport.center()),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0., 2000.),
+                modifiers: Default::default(),
+            },
+        ],
+    );
+    for _ in 0..60 {
+        workspace::draw(app, ctx, size, vec![]);
+        if ctx.input(|i| i.time_since_last_scroll()) >= 0.1 {
+            break;
+        }
+    }
+    let (mut previous, mut stable) = (None, 0);
+    for _ in 0..180 {
+        let output = workspace::draw(app, ctx, size, vec![]);
+        if let Some((at, rect, offset)) = visible(app, &output) {
+            if previous == Some((rect, offset)) && ctx.input(|i| i.time_since_last_scroll()) >= 0.1
+            {
+                stable += 1;
+            } else {
+                stable = 0;
+            }
+            if stable >= 4 {
+                return at;
+            }
+            previous = Some((rect, offset));
+        } else if ctx.input(|i| i.time_since_last_scroll()) >= 0.1 {
+            let viewport = app.free_transform.as_ref().unwrap().scroll_rect.unwrap();
+            workspace::draw(
+                app,
+                ctx,
+                size,
+                vec![
+                    egui::Event::PointerMoved(viewport.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0., -80.),
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            previous = None;
+            stable = 0;
+        }
+    }
+    panic!("Actual Warp control is not stably visible: {label}");
+}
+fn warp_click(app: &mut PeerBrush, ctx: &egui::Context, size: Vec2, label: &str) {
+    let at = warp_reveal(app, ctx, size, label, None);
+    workspace::click(app, ctx, size, at);
+}
+fn warp_enter(
+    app: &mut PeerBrush,
+    ctx: &egui::Context,
+    size: Vec2,
+    label: &str,
+    input: WarpInput,
+    text: &str,
+) {
+    warp_reveal(app, ctx, size, label, Some(input));
+    for _ in 0..2 {
+        let editor = app.free_transform.as_ref().unwrap();
+        let rect = warp_input(editor, input);
+        assert!(editor.scroll_rect.unwrap().contains_rect(rect));
+        workspace::click(app, ctx, size, rect.center());
+    }
+    assert!(
+        ctx.wants_keyboard_input(),
+        "The actual numeric editor must own typing"
+    );
+    workspace::draw(
+        app,
+        ctx,
+        size,
+        vec![
+            key_event(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text(text.into()),
+        ],
+    );
+    workspace::draw(
+        app,
+        ctx,
+        size,
+        vec![key_event(egui::Key::Enter, Default::default())],
+    );
+    assert!(
+        app.free_transform.is_some(),
+        "Numeric Enter must not Apply Warp"
+    );
+}
+fn warp_fixture(depth: u16, target: &str) -> (PeerBrush, egui::Context) {
+    let (mut app, ctx) = workspace::fixture(depth);
+    {
+        let mut engine = app.shared.lock().unwrap();
+        engine
+            .edit(
+                "human",
+                &[json!({"op":"mask.add","layer":app.selected})],
+                None,
+                None,
+                "Painted mask",
+            )
+            .unwrap();
+        for y in 0..24 {
+            for x in 0..32 {
+                let layer = &mut engine.doc.layers[0];
+                layer.pixels.set16(
+                    x,
+                    y,
+                    [
+                        10001 + x as u16 * 137,
+                        20003 + y as u16 * 193,
+                        40007,
+                        if (x + y) % 7 == 0 { 0 } else { 49157 },
+                    ],
+                );
+                let value = 12347 + x as u16 * 97 + y as u16 * 193;
+                layer.mask.as_mut().unwrap().steps[1].pixels.set16(
+                    x,
+                    y,
+                    [value, value, value, 65535],
+                );
+            }
+        }
+        if target == "mask" {
+            engine.doc.layers[0].mask.as_mut().unwrap().linked = false;
+        }
+        if target == "folder" {
+            let mut root = crate::engine::Layer::new("Warp folder", "group", 32, 24);
+            root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
+            let mut child = engine.doc.layers[0].clone();
+            child.parent = Some(root.id.clone());
+            let mut hidden = child.clone();
+            hidden.id = crate::engine::id();
+            hidden.visible = false;
+            hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
+            app.selected = root.id.clone();
+            engine.doc.layers = vec![root, child, hidden];
+        }
+        let mut mask = crate::raster::Raster::new(32, 24);
+        for y in 4..21 {
+            for x in 4..26 {
+                if !(12..16).contains(&x) || !(10..14).contains(&y) {
+                    mask.set(
+                        x,
+                        y,
+                        [if x == 4 || y == 4 {
+                            64
+                        } else if x == 5 || y == 5 {
+                            128
+                        } else {
+                            255
+                        }; 4],
+                    );
+                }
+            }
+        }
+        let coverage = crate::selection::from_mask(mask).unwrap();
+        engine.doc.selection = Some(coverage.bounds);
+        engine.doc.selection_polygon = None;
+        engine.doc.selection_coverage = Some(coverage);
+    }
+    app.selection_layers = [app.selected.clone()].into_iter().collect();
+    app.mask = target == "mask";
+    app.zoom = 0.4;
+    (app, ctx)
+}
+fn warp_node_drag(app: &mut PeerBrush, ctx: &egui::Context, release: bool) {
+    warp_click(app, ctx, SIZE, "Grid Warp");
+    frame(app, ctx, vec![]);
+    let viewport = app.canvas_input_region.unwrap().0;
+    let controls = ctx
+        .memory(|m| m.area_rect(egui::Id::new("free transform")))
+        .unwrap();
+    let rect = app.view_rect.unwrap();
+    let node = app.free_transform.as_ref().unwrap().grid_points().unwrap()[4];
+    let start = app
+        .view
+        .point(node.map(|v| v as f32), rect, rect.width() / 32.);
+    let left = controls.right().max(viewport.left()) + 30.;
+    let right = viewport.right() - 30.;
+    assert!(left < right, "Fixture needs unobscured canvas space");
+    app.pan.x += (left + right) * 0.5 - start.x;
+    frame(app, ctx, vec![]);
+    let rect = app.view_rect.unwrap();
+    let node = app.free_transform.as_ref().unwrap().grid_points().unwrap()[4];
+    let start = app
+        .view
+        .point(node.map(|v| v as f32), rect, rect.width() / 32.);
+    assert!(app
+        .canvas_input_region
+        .unwrap()
+        .0
+        .shrink(20.)
+        .contains(start));
+    assert!(ctx
+        .layer_id_at(start)
+        .is_some_and(|layer| layer.order == egui::Order::Background));
+    frame(
+        app,
+        ctx,
+        vec![egui::Event::PointerMoved(start), pointer(start, true)],
+    );
+    assert!(matches!(
+        app.free_transform
+            .as_ref()
+            .unwrap()
+            .drag
+            .as_ref()
+            .map(|d| d.handle),
+        Some(Handle::Warp(4))
+    ));
+    let end = start + Vec2::new(6., 4.);
+    frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+    if release {
+        frame(app, ctx, vec![pointer(end, false)]);
+    }
+}
+
+#[test]
+fn warp_nodes_use_post_map_while_projective_controls_keep_their_reference_plane() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.values.offset = [2., -1.];
+        editor.values.scale = [1.1, 0.9];
+        editor.values.angle = 17.;
+        editor.values.skew = [7., -4.];
+        let grid = crate::warp::Grid::preset(editor.warp_domain().unwrap(), "arc", 0.15).unwrap();
+        editor.set_grid(grid.clone());
+        let rect = editor.target_bounds();
+        editor.projective_mode = Some(ProjectiveMode::Distort);
+        let affine =
+            crate::projective::affine(&editor.affine_command("", false).unwrap(), editor.pivot)
+                .unwrap();
+        for (actual, point) in editor.corners().into_iter().zip(Editor::rectangle(rect)) {
+            let expected = affine.point(point).unwrap();
+            for a in 0..2 {
+                assert!((actual[a] - expected[a]).abs() < 1e-10);
+            }
+        }
+        let mut quad = Editor::rectangle(rect);
+        quad[0][0] += 0.5;
+        quad[2][1] -= 0.25;
+        editor.set_quad(Quad {
+            rect,
+            corners: quad,
+        });
+        let projection = editor.values.projective.clone();
+        let old_affine = (
+            editor.values.offset,
+            editor.values.scale,
+            editor.values.angle,
+            editor.values.skew,
+        );
+        let origin = editor.grid_points().unwrap()[4];
+        let destination = [origin[0] + 0.25, origin[1] - 0.125];
+        editor.drag_node(4, origin, destination, false).unwrap();
+        let displayed = editor.grid_points().unwrap()[4];
+        for axis in 0..2 {
+            assert!((displayed[axis] - destination[axis]).abs() < 1e-9);
+        }
+        assert!(editor.values.projective == projection);
+        assert_eq!(
+            (
+                editor.values.offset,
+                editor.values.scale,
+                editor.values.angle,
+                editor.values.skew
+            ),
+            old_affine
+        );
+        editor.projective_mode = Some(ProjectiveMode::Distort);
+        let affine =
+            crate::projective::affine(&editor.affine_command("", false).unwrap(), editor.pivot)
+                .unwrap();
+        for (actual, point) in editor.corners().into_iter().zip(quad) {
+            let expected = affine.point(point).unwrap();
+            for axis in 0..2 {
+                assert!((actual[axis] - expected[axis]).abs() < 1e-10);
+            }
+        }
+        let initial = editor.commands().unwrap();
+        editor.set_reference([5.25, 8.5]).unwrap();
+        assert_eq!(editor.commands().unwrap(), initial);
+        editor.set_mode(Tool::Move);
+        assert_eq!(editor.commands().unwrap(), initial);
+        assert!(
+            editor.outline().len() > 4,
+            "Warped boundaries must include triangle seam bends"
+        );
+        let map = crate::warp::CommandMap::new(&initial[0], editor.pivot).unwrap();
+        let corners = Editor::rectangle(editor.target_bounds());
+        for (i, actual) in editor.edge_points().into_iter().enumerate() {
+            let expected = map
+                .point([
+                    (corners[i][0] + corners[(i + 1) % 4][0]) * 0.5,
+                    (corners[i][1] + corners[(i + 1) % 4][1]) * 0.5,
+                ])
+                .unwrap();
+            for a in 0..2 {
+                assert!((actual[a] - expected[a]).abs() < 1e-10);
+            }
+        }
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn actual_grid_presets_nodes_and_mixed_modes_preview_then_apply_native_targets_once() {
+    for depth in [8, 16] {
+        for target in ["color", "mask", "folder"] {
+            let (mut app, ctx) = warp_fixture(depth, target);
+            let before = workspace::source(&app);
+            let original = app.shared.lock().unwrap().doc.clone();
+            let history = app.shared.lock().unwrap().undo.len();
+            open(&mut app, &ctx);
+            settle(&mut app, &ctx);
+            warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+            for (label, name) in [("Arc", "arc"), ("Bulge", "bulge"), ("Flag", "flag")] {
+                warp_click(&mut app, &ctx, SIZE, label);
+                let editor = app.free_transform.as_ref().unwrap();
+                assert_eq!(
+                    editor.values.warp.as_ref().unwrap(),
+                    &crate::warp::Grid::preset(editor.warp_domain().unwrap(), name, 0.15).unwrap()
+                );
+                let output = settle(&mut app, &ctx);
+                actual_preview(&app, &output);
+                assert_eq!(workspace::source(&app), before);
+            }
+            warp_node_drag(&mut app, &ctx, true);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            assert_eq!(workspace::source(&app), before);
+            let requested =
+                app.free_transform.as_ref().unwrap().grid_points().unwrap()[4][0] + 0.25;
+            warp_enter(
+                &mut app,
+                &ctx,
+                SIZE,
+                "Node 5",
+                WarpInput::Node(8),
+                &format!("{requested:.6}"),
+            );
+            assert!(
+                (app.free_transform.as_ref().unwrap().grid_points().unwrap()[4][0] - requested)
+                    .abs()
+                    < 1e-5
+            );
+            warp_enter(&mut app, &ctx, SIZE, "Move X", WarpInput::Base(0), "2");
+            warp_enter(&mut app, &ctx, SIZE, "Angle", WarpInput::Base(4), "11");
+            warp_click(&mut app, &ctx, SIZE, "Distort");
+            real_projective_corner_drag(&mut app, &ctx, "Distort");
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert!(commands[0]["warp"].is_object());
+            assert!(commands[0]["projective"].is_object());
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            warp_click(&mut app, &ctx, SIZE, "Move");
+            assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            assert_eq!(workspace::source(&app), before);
+            let expected =
+                crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+            if target == "color" {
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "other",
+                        "Selection owner",
+                        vec![crate::engine::Scope::layer("@selection")],
+                    )
+                    .unwrap();
+                warp_click(&mut app, &ctx, SIZE, "Apply");
+                assert!(app.free_transform.is_some());
+                assert_eq!(workspace::source(&app), before);
+                app.shared.lock().unwrap().leases.clear();
+            }
+            warp_click(&mut app, &ctx, SIZE, "Apply");
+            assert!(app.free_transform.is_none(), "{}", app.message);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            assert_eq!(engine.doc.bit_depth, depth);
+            skew_native_layers_eq(&engine.doc, &expected);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
+            let applied = engine.doc.clone();
+            for data in [
+                crate::psd::encode(&engine.doc).unwrap(),
+                crate::psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = crate::psd::decode(&data).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.bit_depth, depth);
+                skew_native_layers_eq(&reopened, &applied);
+                assert_eq!(
+                    reopened.export_png().unwrap(),
+                    applied.export_png().unwrap()
+                );
+            }
+            engine.undo("human").unwrap();
+            skew_native_layers_eq(&engine.doc, &original);
+            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            engine.redo("human").unwrap();
+            skew_native_layers_eq(&engine.doc, &applied);
+            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+        }
+    }
+}
+
+#[test]
+fn invalid_grid_is_repairable_and_held_node_escape_and_source_changes_preserve_history() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        settle(&mut app, &ctx);
+        let good = app
+            .free_transform
+            .as_ref()
+            .unwrap()
+            .values
+            .warp
+            .clone()
+            .unwrap();
+        let mut bad = good.clone();
+        bad.points[4] = bad.points[0];
+        {
+            let editor = app.free_transform.as_mut().unwrap();
+            editor.values.warp = Some(bad);
+            editor.changed();
+        }
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.free_transform.as_ref().unwrap().commands().is_err());
+        assert!(app.free_transform.as_ref().unwrap().rendered.is_none());
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_some());
+        assert_eq!(workspace::source(&app), before);
+        for axis in 0..2 {
+            warp_enter(
+                &mut app,
+                &ctx,
+                SIZE,
+                "Node 5",
+                WarpInput::Node(8 + axis),
+                &format!("{:.6}", good.points[4][axis]),
+            );
+        }
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert_eq!(workspace::source(&app), before);
+        warp_node_drag(&mut app, &ctx, false);
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Escape, Default::default())],
+        );
+        assert!(app.free_transform.is_none());
+        frame(&mut app, &ctx, vec![pointer(Pos2::new(800., 500.), false)]);
+        assert_eq!(workspace::source(&app), before);
+        open(&mut app, &ctx);
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        settle(&mut app, &ctx);
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":app.selected,"name":"Later human work"})],
+                None,
+                None,
+                "Later work",
+            )
+            .unwrap();
+        let later = workspace::source(&app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), later);
+    }
+}
+
+#[test]
+fn warp_scope_toggle_preserves_pending_map_and_explicit_reset_keeps_affine_values() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let before = workspace::source(&app);
+        let original = app.shared.lock().unwrap().doc.clone();
+        let history = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        warp_enter(&mut app, &ctx, SIZE, "Move X", WarpInput::Base(0), "2");
+        warp_enter(&mut app, &ctx, SIZE, "Angle", WarpInput::Base(4), "7");
+        {
+            let editor = app.free_transform.as_mut().unwrap();
+            let rect = editor.target_bounds();
+            let mut corners = Editor::rectangle(rect);
+            corners[0][0] += 0.25;
+            editor.set_quad(Quad { rect, corners });
+            editor.changed();
+        }
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        settle(&mut app, &ctx);
+        let key = app.free_transform.as_ref().unwrap().key().unwrap();
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            frame(&mut app, &ctx, vec![]);
+            if !app.pending && app.free_transform.as_ref().unwrap().error.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Shared insufficient-domain preview must fail"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.free_transform.as_ref().unwrap().values == values);
+        assert!(app.free_transform.as_ref().unwrap().rendered.is_none());
+        assert_eq!(workspace::source(&app), before);
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_some());
+        assert_eq!(workspace::source(&app), before);
+        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Reset Warp");
+        let editor = app.free_transform.as_ref().unwrap();
+        assert!(editor.values.warp.is_none());
+        assert_eq!(editor.values.offset, values.offset);
+        assert_eq!(editor.values.angle, values.angle);
+        assert!(editor.values.projective == values.projective);
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let editor = app.free_transform.as_ref().unwrap();
+        assert_eq!(
+            editor.values.warp.as_ref().unwrap().rect,
+            editor.warp_domain().unwrap()
+        );
+        let commands = editor.commands().unwrap();
+        let expected = crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), history + 1);
+        skew_native_layers_eq(&engine.doc, &expected);
+        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+        assert_eq!(
+            engine.doc.layers[0]
+                .pixels
+                .retained
+                .as_ref()
+                .unwrap()
+                .warps
+                .len(),
+            1
+        );
+        for bytes in [
+            crate::psd::encode(&engine.doc).unwrap(),
+            crate::psd::encode_psb(&engine.doc).unwrap(),
+        ] {
+            let reopened = crate::psd::decode(&bytes).unwrap();
+            assert!(!reopened.read_only);
+            assert_eq!(reopened.bit_depth, depth);
+            skew_native_layers_eq(&reopened, &engine.doc);
+            assert_eq!(
+                reopened.export_png().unwrap(),
+                engine.doc.export_png().unwrap()
+            );
+        }
+        engine.undo("human").unwrap();
+        skew_native_layers_eq(&engine.doc, &original);
+        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+    }
+}
+
+#[test]
+fn short_window_grid_amount_and_last_node_are_real_controls_and_cancel_is_exact() {
+    let size = Vec2::new(980., 640.);
+    let (mut app, ctx) = warp_fixture(16, "color");
+    let before = workspace::source(&app);
+    workspace::draw(&mut app, &ctx, size, vec![]);
+    workspace::key(&mut app, &ctx, size, egui::Key::T, egui::Modifiers::COMMAND);
+    warp_click(&mut app, &ctx, size, "Grid Warp");
+    warp_click(&mut app, &ctx, size, "Arc");
+    warp_enter(&mut app, &ctx, size, "Amount", WarpInput::Amount, "0.2");
+    let editor = app.free_transform.as_ref().unwrap();
+    assert_eq!(
+        editor.values.warp.as_ref().unwrap(),
+        &crate::warp::Grid::preset(editor.warp_domain().unwrap(), "arc", 0.2).unwrap()
+    );
+    let x = editor.grid_points().unwrap()[8][0] + 0.25;
+    warp_enter(
+        &mut app,
+        &ctx,
+        size,
+        "Node 9",
+        WarpInput::Node(16),
+        &format!("{x:.6}"),
+    );
+    assert!((app.free_transform.as_ref().unwrap().grid_points().unwrap()[8][0] - x).abs() < 1e-5);
+    let output = settle_size(&mut app, &ctx, size);
+    actual_preview(&app, &output);
+    assert_eq!(workspace::source(&app), before);
+    warp_reveal(&mut app, &ctx, size, "Apply", None);
+    warp_click(&mut app, &ctx, size, "Cancel");
+    assert!(app.free_transform.is_none());
+    assert_eq!(workspace::source(&app), before);
+}
+
+fn transform_context_point(app: &PeerBrush, ctx: &egui::Context) -> Pos2 {
+    let (viewport, layer) = app.canvas_input_region.unwrap();
+    (1..8)
+        .flat_map(|y| (1..8).map(move |x| (x, y)))
+        .map(|(x, y)| viewport.min + viewport.size() * Vec2::new(x as f32 / 8., y as f32 / 8.))
+        .find(|at| ctx.layer_id_at(*at) == Some(layer))
+        .expect("A visible unoccluded canvas region for the real secondary click")
+}
+fn transform_secondary(
+    app: &mut PeerBrush,
+    ctx: &egui::Context,
+    at: Pos2,
+    modifiers: egui::Modifiers,
+) {
+    for pressed in [true, false] {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+                time: Some(ctx.input(|input| input.time) + 0.05),
+                modifiers,
+                events: vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+    }
+}
+fn transform_context(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
+    let at = transform_context_point(app, ctx);
+    transform_secondary(app, ctx, at, Default::default());
+    assert!(app.free_transform.as_ref().unwrap().context.is_some());
+    frame(app, ctx, vec![]);
+    frame(app, ctx, vec![])
+}
+fn transform_context_choose(app: &mut PeerBrush, ctx: &egui::Context, label: &str) {
+    let output = transform_context(app, ctx);
+    let root = app
+        .free_transform
+        .as_ref()
+        .unwrap()
+        .context
+        .as_ref()
+        .unwrap();
+    let at = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                let at = text.pos + text.galley.size() * 0.5;
+                (shape.clip_rect.contains(at)
+                    && root.menu_state.read().area_contains(at)
+                    && ctx
+                        .layer_id_at(at)
+                        .is_some_and(|layer| layer.order == egui::Order::Foreground))
+                .then_some(at)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("Visible actual transform context action: {label}"));
+    workspace::click(app, ctx, SIZE, at);
+    assert!(app.free_transform.as_ref().unwrap().context.is_none());
+}
+
+#[test]
+fn canvas_context_modes_keep_the_same_native_map_and_flips_apply_once() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let original = app.shared.lock().unwrap().doc.clone();
+        let unchanged = workspace::source(&app);
+        let undo = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        warp_enter(&mut app, &ctx, SIZE, "Move X", WarpInput::Base(0), "3");
+        warp_enter(&mut app, &ctx, SIZE, "Angle", WarpInput::Base(4), "9");
+        warp_click(&mut app, &ctx, SIZE, "Distort");
+        real_projective_corner_drag(&mut app, &ctx, "Distort");
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        for label in [
+            "Move",
+            "Scale",
+            "Rotate",
+            "Skew",
+            "Distort",
+            "Perspective",
+            "Grid Warp",
+        ] {
+            transform_context_choose(&mut app, &ctx, label);
+            let editor = app.free_transform.as_ref().unwrap();
+            match label {
+                "Move" => assert_eq!(editor.mode(), Some(Tool::Move)),
+                "Scale" => assert_eq!(editor.mode(), Some(Tool::Scale)),
+                "Rotate" => assert_eq!(editor.mode(), Some(Tool::Rotate)),
+                "Skew" => assert!(
+                    editor.skew_mode && editor.projective_mode.is_none() && !editor.warp_mode
+                ),
+                "Distort" => assert!(editor.projective_mode == Some(ProjectiveMode::Distort)),
+                "Perspective" => {
+                    assert!(editor.projective_mode == Some(ProjectiveMode::Perspective))
+                }
+                "Grid Warp" => assert!(
+                    editor.warp_mode && !editor.skew_mode && editor.projective_mode.is_none()
+                ),
+                _ => unreachable!(),
+            }
+            assert!(editor.values == values);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert!(editor.drag.is_none());
+            assert_eq!(workspace::source(&app), unchanged);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+        }
+        for (label, mirrors) in [
+            ("Flip Horizontal", [true, false]),
+            ("Flip Vertical", [true, true]),
+            ("Flip Horizontal", [false, true]),
+        ] {
+            transform_context_choose(&mut app, &ctx, label);
+            assert_eq!(app.free_transform.as_ref().unwrap().values.mirror, mirrors);
+            assert_eq!(workspace::source(&app), unchanged);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+        }
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(!commands[0]["warp"].is_null());
+        assert!(!commands[0]["projective"].is_null());
+        assert_eq!(commands[0]["mirror_y"], true);
+        let expected = crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), undo + 1);
+        skew_native_layers_eq(&engine.doc, &expected);
+        assert!(independent_coverage_eq(
+            engine.doc.selection_coverage.as_ref(),
+            expected.selection_coverage.as_ref()
+        ));
+        let applied = engine.doc.clone();
+        engine.undo("human").unwrap();
+        skew_native_layers_eq(&engine.doc, &original);
+        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+        engine.redo("human").unwrap();
+        skew_native_layers_eq(&engine.doc, &applied);
+        assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+    }
+}
+
+#[test]
+fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_guards() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let unchanged = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let at = transform_context_point(&app, &ctx);
+        transform_secondary(&mut app, &ctx, at, egui::Modifiers::ALT);
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            commands
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+
+        // A click over the actual floating numeric control cannot open the canvas menu.
+        warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+        let at = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        assert_ne!(
+            ctx.layer_id_at(at),
+            Some(app.canvas_input_region.unwrap().1)
+        );
+        transform_secondary(&mut app, &ctx, at, Default::default());
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        for _ in 0..2 {
+            workspace::click(&mut app, &ctx, SIZE, at);
+        }
+        assert!(ctx.wants_keyboard_input());
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("4.25".into()),
+            ],
+        );
+        let typed = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let at = transform_context_point(&app, &ctx);
+        transform_secondary(&mut app, &ctx, at, Default::default());
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            typed
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+        assert!(
+            app.free_transform.is_some(),
+            "Numeric Escape only completes the field"
+        );
+
+        transform_context_choose(&mut app, &ctx, "Flip Horizontal");
+        settle(&mut app, &ctx);
+        let apply = warp_reveal(&mut app, &ctx, SIZE, "Apply", None);
+        transform_context(&mut app, &ctx);
+        assert!(!app
+            .free_transform
+            .as_ref()
+            .unwrap()
+            .context
+            .as_ref()
+            .unwrap()
+            .menu_state
+            .read()
+            .area_contains(apply));
+        workspace::click(&mut app, &ctx, SIZE, apply);
+        assert!(
+            app.free_transform.is_some(),
+            "Outside menu dismissal must not Apply behind the popup"
+        );
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert_eq!(workspace::source(&app), unchanged);
+        for canvas in [true, false] {
+            transform_context(&mut app, &ctx);
+            let at = if canvas {
+                transform_context_point(&app, &ctx)
+            } else {
+                apply
+            };
+            assert!(!app
+                .free_transform
+                .as_ref()
+                .unwrap()
+                .context
+                .as_ref()
+                .unwrap()
+                .menu_state
+                .read()
+                .area_contains(at));
+            let values = app.free_transform.as_ref().unwrap().values.clone();
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    key_event(egui::Key::Escape, Default::default()),
+                    egui::Event::PointerMoved(at),
+                    pointer(at, true),
+                    pointer(at, false),
+                ],
+            );
+            let editor = app
+                .free_transform
+                .as_ref()
+                .expect("Escape dismisses only the menu in this input frame");
+            assert!(editor.context.is_none());
+            assert!(editor.drag.is_none());
+            assert!(editor.values == values);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert_eq!(workspace::source(&app), unchanged);
+            let mut release = key_event(egui::Key::Escape, Default::default());
+            if let egui::Event::Key { pressed, .. } = &mut release {
+                *pressed = false;
+            }
+            frame(&mut app, &ctx, vec![release]);
+        }
+        transform_context(&mut app, &ctx);
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::Enter, Default::default());
+        assert!(
+            app.free_transform.is_some(),
+            "Menu Enter may activate an item, never Apply the session behind it"
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+        if app.free_transform.as_ref().unwrap().context.is_none() {
+            transform_context(&mut app, &ctx);
+        }
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert!(app.free_transform.as_ref().unwrap().values == values);
+        assert_eq!(workspace::source(&app), unchanged);
+        transform_context(&mut app, &ctx);
+        let at = transform_context_point(&app, &ctx);
+        workspace::click(&mut app, &ctx, SIZE, at);
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert!(
+            app.free_transform.as_ref().unwrap().drag.is_none(),
+            "Dismissal must not begin a transform behind the popup"
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+        warp_click(&mut app, &ctx, SIZE, "Cancel");
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), unchanged);
+
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        transform_context(&mut app, &ctx);
+        let selected = app.selected.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":selected,"name":"Later human work"})],
+                None,
+                None,
+                "Later human work",
+            )
+            .unwrap();
+        let later = workspace::source(&app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), later);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        transform_context(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![egui::Event::WindowFocused(false)]);
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), later);
+    }
 }

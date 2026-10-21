@@ -104,4 +104,30 @@ Editable text/vector sources and adjustment folder children require explicit nat
 
 Supplementary PSD/PSB source format **33** is required when any Color or painted-mask original contains Warp stages. Observations add `warp_stages` only for those retained sources, with no raster samples or paths. Current standard native raster/mask channels and the current merged composite are still written; malformed, downgraded and future sources reopen protected from the standard merged data. Clipboard and recovery carry the same strict native source format. Grid metadata and retained tiles count against existing document/proposal budgets. This is PeerBrush editability, not Photoshop nonlinear-transform interchange.
 
-Prepared tests cover independent piecewise inverse and seam oracles, native8/16 Color/linked and independent masks/paint steps, soft/hole coverage and exact original remainders, hidden folders, composed and successive maps, protocol reservations and atomic failures, 16/17-stage limits, identity compatibility, clipboard validation, and PSD/PSB source33/current standard channels/merged and PNG readback. They have not executed in this private stage; combined tests, actual native interaction and external-editor interoperability remain unverified.
+Prepared tests cover independent piecewise inverse and seam oracles, native8/16 Color/linked and independent masks/paint steps, soft/hole coverage and exact original remainders, hidden folders, composed and successive maps, protocol reservations and atomic failures, 16/17-stage limits, identity compatibility, clipboard validation, and PSD/PSB source33/current standard channels/merged and PNG readback. They have not executed at this checkpoint; combined tests, actual native interaction and external-editor interoperability remain unverified.
+
+
+### Pending grid Warp and canvas menu (unreleased)
+
+Right-click an unobscured canvas area during Free Transform to choose Move,
+Scale, Rotate, Skew, Distort, Perspective or Grid Warp, or toggle horizontal and
+vertical flips. These change the same pending session: mode choices preserve its
+exact command, and flips preview through the shared engine before one Apply.
+Escape first closes the menu; Cancel still discards the pending session. Menu
+dismissal cannot begin a transform behind it. Alt/Space/middle navigation,
+numeric typing, floating controls and source/focus cancellation keep their guards.
+
+Grid Warp offers nine control nodes, Arc/Bulge/Flag presets, amount and compact
+document X/Y fields. It uses straight segments and eight affine triangles; this
+does not implement smooth Bezier patches or Photoshop Warp interchange. Each
+pending command samples its original once in A*P*W order. Node edits inverse only
+the A*P post-map, while ordinary guides follow the complete seam-split map.
+Distort/Perspective handles retain the separate A(quad) projection plane when
+Warp is active. Invalid grids stay editable for repair with Apply disabled.
+
+Changing to Whole target preserves the exact grid and other transform settings.
+If the grid does not cover that target, shared preview refuses it; returning to
+selection restores the pending map. Explicit Reset Warp fits a fresh grid to the
+current target while preserving affine/projective settings. Controls scroll on
+short windows. Combined engine/UI tests and visible native acceptance remain
+pending; source implementation alone is not runtime acceptance.
