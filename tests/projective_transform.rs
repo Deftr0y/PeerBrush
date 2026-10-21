@@ -224,6 +224,60 @@ fn matte(doc: &Document) -> Vec<u16> {
         .collect()
 }
 
+fn protected_standard_readback(doc: &Document, standard: &[u16], depth: u16) {
+    assert!(doc.read_only);
+    assert_eq!((doc.width, doc.height, doc.bit_depth), (64, 48, depth));
+    assert_eq!(doc.layers.len(), 1);
+    assert!(!peerbrush::retained::has_originals(doc));
+    assert!(doc
+        .layers
+        .iter()
+        .all(|l| l.source.is_none() && l.mask.is_none()));
+    // Standard merged RGB is white-matted at native depth. Its independently
+    // decoded straight RGB need not equal the pre-matte editable RGB.
+    let (max, divisor) = if depth == 16 {
+        (65535i64, 1i64)
+    } else {
+        (255, 257)
+    };
+    let restored = standard
+        .chunks_exact(4)
+        .flat_map(|pixel| {
+            let alpha = i64::from(pixel[3]) / divisor;
+            (0..4).map(move |channel| {
+                let value = i64::from(pixel[channel]) / divisor;
+                let value = if channel == 3 {
+                    alpha
+                } else if alpha == 0 {
+                    0
+                } else {
+                    (((value + alpha - max) * max + alpha / 2) / alpha).clamp(0, max)
+                };
+                (value * divisor) as u16
+            })
+        })
+        .collect::<Vec<_>>();
+    let layer = &doc.layers[0];
+    assert_eq!(layer.pixels.depth, depth);
+    assert_eq!(
+        (layer.x, layer.y, layer.pixels.width, layer.pixels.height),
+        (0, 0, 64, 48)
+    );
+    assert_eq!(layer.pixels.rgba16(), restored);
+    assert_eq!(matte(doc), standard);
+    let png = image::load_from_memory(&doc.export_png().unwrap()).unwrap();
+    assert_eq!((png.width(), png.height()), (64, 48));
+    assert_eq!(
+        png.color(),
+        if depth == 16 {
+            image::ColorType::Rgba16
+        } else {
+            image::ColorType::Rgba8
+        }
+    );
+    assert_eq!(png.to_rgba16().into_raw(), restored);
+}
+
 #[test]
 fn whole_projective_native_color_masks_preview_history_and_format32_standard_channels() {
     for depth in [8, 16] {
@@ -302,13 +356,14 @@ fn whole_projective_native_color_masks_preview_history_and_format32_standard_cha
                     assert_eq!(value(&standard), value(&e.doc));
                 }
             }
-            assert_eq!(standard_composite(&bytes), matte(&e.doc));
+            let composite = standard_composite(&bytes);
+            assert_eq!(composite, matte(&e.doc));
             for format in [31, u32::MAX] {
                 let rejected =
                     psd::decode(&rewrite(&bytes, |v| v["format"] = json!(format))).unwrap();
                 assert!(rejected.read_only);
                 assert!(!peerbrush::retained::has_originals(&rejected));
-                assert_eq!(rejected.export_png().unwrap(), e.doc.export_png().unwrap());
+                protected_standard_readback(&rejected, &composite, depth);
             }
             let rejected = psd::decode(&rewrite(&bytes, |v| {
                 v["document"]["layers"][0]["pixels"]["retained"]["projective"] =
@@ -316,7 +371,7 @@ fn whole_projective_native_color_masks_preview_history_and_format32_standard_cha
             }))
             .unwrap();
             assert!(rejected.read_only);
-            assert_eq!(rejected.export_png().unwrap(), e.doc.export_png().unwrap());
+            protected_standard_readback(&rejected, &composite, depth);
         }
         let after = e.doc.clone();
         e.undo("human").unwrap();
@@ -465,13 +520,21 @@ fn selected_projective_soft_coverage_hole_native_masks_and_scalar_inverse_are_sh
             native_layers(&e.doc, &preview);
             assert_eq!(e.undo.len(), 1);
             let after = selection::current(&e.doc).unwrap();
+            let mut outside_bilinear_support = 0;
+            let mut inside_sampled_pixels = 0;
             for y in after.bounds[1]..after.bounds[3] {
                 for x in after.bounds[0]..after.bounds[2] {
                     let [u, v] = inverse(x as f64 + 0.5, y as f64 + 0.5);
+                    // P is injective on the original rectangle: this analytic
+                    // membership is independent of the engine's polygon fitter.
+                    let inside = u >= f64::from(coverage.bounds[0])
+                        && u <= f64::from(coverage.bounds[2])
+                        && v >= f64::from(coverage.bounds[1])
+                        && v <= f64::from(coverage.bounds[3]);
                     let [u, v] = [(u - 0.5) as f32, (v - 0.5) as f32];
                     let expected = |r: &Raster| {
                         let p = sample(r, u, v);
-                        if p[3] == 0 {
+                        if !inside || p[3] == 0 {
                             [0; 4]
                         } else {
                             p
@@ -507,6 +570,48 @@ fn selected_projective_soft_coverage_hole_native_masks_and_scalar_inverse_are_sh
                         + at(ix + 1, iy + 1) * fx * fy)
                         .round() as u8;
                     assert_eq!((after.value(x, y) * 255.).round() as u8, scalar);
+                    if !inside && scalar > 0 {
+                        outside_bilinear_support += 1;
+                    }
+                    if inside && sample(&cut, u, v)[3] > 0 {
+                        inside_sampled_pixels += 1;
+                    }
+                }
+            }
+            assert!(
+                outside_bilinear_support > 0,
+                "Exercise scalar interpolation beyond the center-clipped Color/mask polygon"
+            );
+            assert!(
+                inside_sampled_pixels > 0,
+                "Exercise actual moved native pixels"
+            );
+            for y in 0..12 {
+                for x in 0..16 {
+                    let remainder = |mut p: [u16; 4], moved: bool| {
+                        let factor = coverage.value(x, y);
+                        if moved && factor > 0. {
+                            p[3] = (f64::from(p[3]) * (1. - f64::from(factor))).round() as u16;
+                            if p[3] == 0 {
+                                return [0; 4];
+                            }
+                            if depth == 8 {
+                                p = p.map(|v| u16::from(peerbrush::raster::project16(v)) * 257);
+                            }
+                        }
+                        p
+                    };
+                    assert_eq!(
+                        color(&e.doc.layers[0], x, y),
+                        remainder(
+                            color(&before.layers[0], x, y),
+                            matches!(target, "linked" | "color")
+                        )
+                    );
+                    assert_eq!(
+                        paint(&e.doc.layers[0], x, y),
+                        remainder(paint(&before.layers[0], x, y), target != "color")
+                    );
                 }
             }
             assert_eq!(
