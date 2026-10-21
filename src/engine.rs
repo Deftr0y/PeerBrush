@@ -994,6 +994,29 @@ impl Engine {
                 .and_then(|_| rect(&c["rect"]))
                 .or(self.doc.selection);
         }
+        if op == "transform" && c.get("projective").is_some() {
+            match crate::projective::combined(c) {
+                Ok(Some(map)) => {
+                    let area = self
+                        .doc
+                        .selection
+                        .filter(|_| c["selection_only"] != false)
+                        .and_then(|b| {
+                            map.bounds(b.map(|v| v as f64)).ok().map(|p| {
+                                [
+                                    b[0].min(p[0].floor() as i32),
+                                    b[1].min(p[1].floor() as i32),
+                                    b[2].max(p[2].ceil() as i32),
+                                    b[3].max(p[3].ceil() as i32),
+                                ]
+                            })
+                        });
+                    return vec![Scope { target, rect: area }];
+                }
+                Err(_) => return vec![Scope { target, rect: None }],
+                Ok(None) => {}
+            }
+        }
         if ["move", "transform"].contains(&op) && c["selection_only"] != false {
             if let Some(b) = self.doc.selection {
                 let moving = op == "move";
@@ -1838,6 +1861,9 @@ impl Engine {
             return Ok(());
         }
         if self.doc.layers[i].source.is_some() {
+            if op == "transform" && crate::projective::parse(c)?.is_some() {
+                return Err("Rasterize the editable text/vector source at its native precision before a projective transform".into());
+            }
             let mask = c["mask"] == true;
             if !mask
                 && matches!(

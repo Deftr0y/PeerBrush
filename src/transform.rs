@@ -72,6 +72,7 @@ pub(crate) fn skewed([a, b, c, d]: [f64; 4], command: &Value) -> Result<[f64; 4]
 }
 
 pub(crate) fn selected_shear(c: &Value) -> Result<[f32; 2], String> {
+    crate::projective::parse(c)?;
     fractional_translation(c)?;
     if c["op"] != "move" {
         translation(c)?;
@@ -134,6 +135,7 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
         return Ok(command.clone());
     }
     fractional_translation(command)?;
+    crate::projective::parse(command)?;
     if command["op"] == "transform" {
         scales(command)?;
         skew_angles(command)?;
@@ -190,6 +192,7 @@ pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> 
     for command in &mut commands {
         if matches!(command["op"].as_str(), Some("move" | "transform")) {
             fractional_translation(command)?;
+            crate::projective::parse(command)?;
         }
         if command["op"] == "transform" {
             scales(command)?;
@@ -268,6 +271,20 @@ pub fn selection_with_coverage(
     c: &Value,
 ) -> Result<crate::selection::Coverage, String> {
     let shear = selected_shear(c)?;
+    let projective = crate::projective::combined(c)?;
+    let inverse = projective
+        .map(|p| {
+            crate::projective::Map::affine_matrix([
+                1.,
+                0.,
+                0.,
+                1.,
+                -(coverage.origin[0] as f64) - 0.5,
+                -(coverage.origin[1] as f64) - 0.5,
+            ])
+            .compose(p.inverse()?)
+        })
+        .transpose()?;
     if coverage.bounds[0] >= coverage.bounds[2] {
         return Ok(coverage.clone());
     }
@@ -329,8 +346,14 @@ pub fn selection_with_coverage(
                 v -= shear[1] * u;
                 u -= shear[0] * v;
             }
-            let ux = u + px - coverage.origin[0] as f32 - 0.5;
-            let uy = v + py - coverage.origin[1] as f32 - 0.5;
+            let [ux, uy] = if let Some(map) = inverse {
+                map.sample([x as f64 + 0.5, y as f64 + 0.5])
+            } else {
+                [
+                    u + px - coverage.origin[0] as f32 - 0.5,
+                    v + py - coverage.origin[1] as f32 - 0.5,
+                ]
+            };
             // Coverage is scalar; RGBA sampling would unpremultiply its edge values.
             let (ix, iy) = (ux.floor() as i32, uy.floor() as i32);
             let (fx, fy) = (ux - ix as f32, uy - iy as f32);
@@ -354,6 +377,13 @@ fn selection_impl(
     coverage: Option<&crate::selection::Coverage>,
 ) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
     let area = crate::selection::bounds(polygon)?;
+    let projective = crate::projective::combined(c)?;
+    if let Some(map) = projective {
+        map.bounds(area.map(|v| v as f64))?;
+        if layer.source.is_some() {
+            return Err("Rasterize the editable source at its native precision before a projective transform".into());
+        }
+    }
     if layer.kind == "group" {
         return Err("Transform a paint layer or its mask".into());
     }
@@ -404,9 +434,20 @@ fn selection_impl(
             ]
         }
     };
-    let transformed = polygon.iter().map(|p| f(p[0], p[1])).collect::<Vec<_>>();
+    let transformed = if let Some(map) = projective {
+        polygon
+            .iter()
+            .map(|p| {
+                map.point([p[0] as f64, p[1] as f64])
+                    .map(|p| p.map(|v| v as f32))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        polygon.iter().map(|p| f(p[0], p[1])).collect::<Vec<_>>()
+    };
     let b = crate::selection::bounds(&transformed)?;
-    if dx == 0.0
+    if projective.is_none()
+        && dx == 0.0
         && dy == 0.0
         && angle.rem_euclid(360.0) == 0.0
         && sx == 1.0
@@ -417,6 +458,19 @@ fn selection_impl(
     }
     let mask = c["mask"].as_bool().unwrap_or(false);
     let (ox, oy) = (layer.x, layer.y);
+    let inverse = projective
+        .map(|p| {
+            crate::projective::Map::affine_matrix([
+                1.,
+                0.,
+                0.,
+                1.,
+                -(ox as f64) - 0.5,
+                -(oy as f64) - 0.5,
+            ])
+            .compose(p.inverse()?)
+        })
+        .transpose()?;
     let left = ox.min(b[0]);
     let top = oy.min(b[1]);
     let right = (ox + layer.pixels.width as i32).max(b[2]);
@@ -486,8 +540,11 @@ fn selection_impl(
                 v -= shear[1] * u;
                 u -= shear[0] * v;
             }
-            let ux = u + px - ox as f32 - 0.5;
-            let uy = v + py - oy as f32 - 0.5;
+            let [ux, uy] = if let Some(map) = inverse {
+                map.sample([x as f64 + 0.5, y as f64 + 0.5])
+            } else {
+                [u + px - ox as f32 - 0.5, v + py - oy as f32 - 0.5]
+            };
             if cut.depth == 16 {
                 let pixel = cut.sample16(ux, uy);
                 if pixel[3] > 0 {
@@ -1030,10 +1087,19 @@ pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), St
     if doc.layers.iter().any(|l| ids.contains(&l.id) && l.locked) {
         return Err("A layer inside the folder is locked".into());
     }
+    let projective = crate::projective::parse(c)?;
+    if projective.is_some()
+        && doc.layers.iter().any(|l| {
+            ids.contains(&l.id)
+                && (l.source.is_some() || !matches!(l.kind.as_str(), "group" | "paint" | "fill"))
+        })
+    {
+        return Err("Rasterize editable text/vector or adjustment children at their native precision before a projective folder transform".into());
+    }
     if doc.selection.is_some() && c["selection_only"] != false {
         let coverage = crate::selection::current(doc).ok_or("Selection no longer exists")?;
         let mut command = c.clone();
-        if command["pivot"].is_null() {
+        if command["pivot"].is_null() && projective.is_none() {
             command["pivot"] = serde_json::json!([
                 (coverage.bounds[0] as f64 + coverage.bounds[2] as f64) / 2.,
                 (coverage.bounds[1] as f64 + coverage.bounds[3] as f64) / 2.
@@ -1059,7 +1125,7 @@ pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), St
     let bounds =
         tree_bounds(doc, &[root.into()]).unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
     let mut command = c.clone();
-    if command["pivot"].is_null() {
+    if command["pivot"].is_null() && projective.is_none() {
         command["pivot"] = serde_json::json!([
             (bounds[0] as f64 + bounds[2] as f64) / 2.,
             (bounds[1] as f64 + bounds[3] as f64) / 2.

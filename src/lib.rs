@@ -41,6 +41,7 @@ pub mod path;
 pub mod placement;
 pub mod preview;
 pub mod production_export;
+pub(crate) mod projective;
 pub mod psd;
 pub mod raster;
 pub mod recovery;

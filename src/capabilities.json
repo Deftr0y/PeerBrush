@@ -934,10 +934,10 @@
       "transform",
       "move"
     ],
-    "behavior": "Whole-layer rotation/scaling/skew accumulate affine placement and regenerate current raster/mask projections from retained native originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the pivot.",
-    "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty] mapping original local coordinates to the current frame, or null. No tile samples in observations.",
+    "behavior": "Whole-layer rotation/scaling/skew and explicit projective placement accumulate one map and regenerate current native raster/mask projections from retained originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the map and pivot.",
+    "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty], or null. Optional projective is a row-major nine-coefficient original-local homography applied before matrix. Absent projective retains the exact affine schema. No tile samples in observations.",
     "pixel_edits": "Painting, clone/heal, fill, direct adjustments, image replacement and selected-pixel edits establish a new baseline for only the changed raster. Other mask/color originals and effects remain editable. Image resize and explicit channel-depth conversion establish raster baselines; crop/canvas retain sources.",
-    "psd": "Supplementary format 9 retains originals alongside current standard raster/mask channels and merged composite. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
+    "psd": "Supplementary format 9 retains affine originals; format 32 is required for any projective Color or mask original. Current standard raster/mask channels and merged composite remain present. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
     "limits": "Current plus original tiles count against 512 MiB document memory. 8192 per edge, 32 MP, 128 million output samples per layer command; singular/nonfinite/out-of-range/nested sources refused atomically.",
     "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists.",
     "translation": {
@@ -956,7 +956,16 @@
       "targets": "Whole or selected raster layer/folder, linked/unlinked painted masks and exact scalar coverage; current editable-source and mask-effect restrictions apply.",
       "selection_pixels": true,
       "selection": "Selected color/mask pixels and soft/hole coverage use one original-sampling pass with the same horizontal-then-vertical shear, scale/reflection, rotation and posttranslation. Omit selection_only or pass true for selected pixels; false keeps selection geometry unchanged while transforming the whole target.",
-      "limits": "Affine placement only; perspective/distort and control-grid Warp are unavailable."
+      "limits": "Skew is affine; explicit projective placement is a separate shared command field. Control-grid/preset Warp remains unavailable."
+    },
+    "projective": {
+      "field": "Optional strict transform.projective={rect:[left,top,right,bottom],quad:[[TLx,TLy],[TRx,TRy],[BRx,BRy],[BLx,BLy]]}; document pixels, no unknown fields.",
+      "order": "The source rect maps to the convex same-winding quad first, then existing affine skew/scale/mirrors/rotation and posttranslation apply once. Missing pivot defaults to rect center for nonidentity projective commands; explicit pivot is shared by all targets. Quad coordinates are exact; snap only resolves existing affine fields.",
+      "targets": "Whole or selected native raster Color, linked/unlinked painted masks, explicit paint steps and hidden raster folder descendants. Editable text/vector and adjustment children require explicit native-precision rasterization; existing editable-source mask and mask-effect restrictions remain.",
+      "guards": "Full composed retained-original frame must avoid the projective horizon, including hidden RGB/off-frame samples. Folded, unstable, nonfinite, oversized and over-budget maps reject atomically. Shared source/revision, locks, reservations, preview and undo rules apply.",
+      "precision": "One inverse sample of each original at native8/16; selected feather/hole coverage uses the same inverse as scalar coverage. Selected edits establish a raster baseline as before. Omitted/exact identity projective preserves legacy affine arithmetic and serialization.",
+      "source_format": 32,
+      "limits": "Shared engine/protocol slice. This does not enable native Free Transform projective controls or control-grid/preset Warp; those require their own UI/acceptance. No Photoshop projective metadata equivalence is claimed."
     }
   },
   "free_transform": {

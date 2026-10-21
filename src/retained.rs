@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 pub struct Original {
     pub pixels: Box<Raster>,
     pub matrix: [f64; 6],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projective: Option<[f64; 9]>,
 }
 pub const IDENTITY: [f64; 6] = [1., 0., 0., 1., 0., 0.];
 fn exact(v: f64) -> f64 {
@@ -37,6 +39,7 @@ impl Original {
         r.retained.as_deref().cloned().unwrap_or_else(|| Self {
             pixels: Box::new(r.clone()),
             matrix: IDENTITY,
+            projective: None,
         })
     }
     pub fn validate(&self, depth: u16) -> Result<(), String> {
@@ -52,7 +55,33 @@ impl Original {
         {
             return Err("Invalid retained transform source or placement".into());
         }
+        if self.projective.is_some() {
+            self.placement()?.bounds([
+                0.,
+                0.,
+                self.pixels.width as f64,
+                self.pixels.height as f64,
+            ])?;
+        }
         Ok(())
+    }
+    pub(crate) fn placement(&self) -> Result<crate::projective::Map, String> {
+        let affine = crate::projective::Map::affine_matrix(self.matrix);
+        self.projective
+            .map(crate::projective::Map::from_matrix)
+            .transpose()?
+            .map_or(Ok(affine), |p| affine.compose(p))
+    }
+    fn prepend(&mut self, delta: crate::projective::Map) -> Result<(), String> {
+        let map = delta.compose(self.placement()?)?;
+        if let Some(matrix) = map.as_affine() {
+            self.matrix = matrix;
+            self.projective = None;
+        } else {
+            self.matrix = IDENTITY;
+            self.projective = Some(map.matrix());
+        }
+        self.validate(self.pixels.depth)
     }
     pub fn render(mut self, w: u32, h: u32) -> Result<Raster, String> {
         self.matrix = self.matrix.map(exact);
@@ -62,6 +91,12 @@ impl Original {
         let det = a * d - b * c;
         let mut out = if self.pixels.bytes() == 0 {
             Raster::new_depth(w, h, self.pixels.depth)
+        } else if self.projective.is_some() {
+            let inverse = crate::projective::Map::affine_matrix([1., 0., 0., 1., -0.5, -0.5])
+                .compose(self.placement()?.inverse()?)?;
+            crate::transform::resample(&self.pixels, w, h, None, |x, y| {
+                inverse.sample([x as f64 + 0.5, y as f64 + 0.5])
+            })
         } else if self.matrix == IDENTITY && (w, h) == (self.pixels.width, self.pixels.height) {
             (*self.pixels).clone()
         } else {
@@ -76,7 +111,7 @@ impl Original {
         out.retained = Some(Box::new(self));
         Ok(out)
     }
-    fn bounds(&self, full: bool) -> [f64; 4] {
+    fn bounds(&self, full: bool) -> Result<[f64; 4], String> {
         let p = if full {
             [0, 0, self.pixels.width as i32, self.pixels.height as i32]
         } else {
@@ -87,6 +122,10 @@ impl Original {
                 self.pixels.height as i32,
             ])
         };
+        if self.projective.is_some() {
+            self.validate(self.pixels.depth)?;
+            return self.placement()?.bounds(p.map(|v| v as f64));
+        }
         let [a, b, c, d, tx, ty] = self.matrix;
         let ps = [[p[0], p[1]], [p[2], p[1]], [p[2], p[3]], [p[0], p[3]]].map(|[x, y]| {
             [
@@ -94,17 +133,24 @@ impl Original {
                 exact(b * x as f64 + d * y as f64 + ty),
             ]
         });
-        [
+        Ok([
             ps.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min),
             ps.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min),
             ps.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max),
             ps.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max),
-        ]
+        ])
     }
 }
 pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     if c["op"] == "move" {
         return crate::transform::move_layer(layer, c);
+    }
+    let projective = crate::projective::parse(c)?;
+    if projective.is_some() && layer.source.is_some() {
+        return Err(
+            "Rasterize the editable source at its native precision before a projective transform"
+                .into(),
+        );
     }
     let n = |key: &str, d: f64| c[key].as_f64().unwrap_or(d);
     let angle = n("angle", 0.);
@@ -113,18 +159,23 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         return Err("Transform scale must be 0.05–20 and rotation must be finite".into());
     }
     let (px, py) = (
-        c["pivot"][0]
-            .as_f64()
-            .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.),
-        c["pivot"][1]
-            .as_f64()
-            .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.),
+        c["pivot"][0].as_f64().unwrap_or_else(|| {
+            projective
+                .map(|p| p.center()[0])
+                .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.)
+        }),
+        c["pivot"][1].as_f64().unwrap_or_else(|| {
+            projective
+                .map(|p| p.center()[1])
+                .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.)
+        }),
     );
     if !px.is_finite() || !py.is_finite() || px.abs() > 100000. || py.abs() > 100000. {
         return Err("Invalid transform pivot".into());
     }
     let [dx, dy] = crate::transform::translation(c)?;
-    if angle.rem_euclid(360.) == 0.
+    if projective.is_none()
+        && angle.rem_euclid(360.) == 0.
         && sx == 1.
         && sy == 1.
         && dx == 0.
@@ -157,6 +208,20 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     if dy != 0. {
         delta[5] += dy;
     }
+    let projective_delta = projective
+        .map(|p| {
+            crate::projective::affine(c, p.center())?
+                .compose(p.map)?
+                .compose(crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]))
+        })
+        .transpose()?;
     let world = ["group", "adjustment"].contains(&layer.kind.as_str());
     if world && layer.mask.is_none() {
         return Ok(());
@@ -175,7 +240,11 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         }
     }
     if let Some(color) = &mut color {
-        color.matrix = compose(delta, color.matrix);
+        if let Some(map) = projective_delta {
+            color.prepend(map)?;
+        } else {
+            color.matrix = compose(delta, color.matrix);
+        }
     }
     let mut masks: Vec<_> = layer
         .mask
@@ -185,18 +254,23 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
                 .iter()
                 .map(|s| {
                     let mut r = Original::from(&s.pixels);
-                    r.matrix = compose(delta, r.matrix);
-                    r
+                    if let Some(map) = projective_delta {
+                        r.prepend(map)?;
+                    } else {
+                        r.matrix = compose(delta, r.matrix);
+                    }
+                    Ok(r)
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()
         })
+        .transpose()?
         .unwrap_or_default();
     let full = layer.mask.as_ref().is_some_and(|m| {
         m.steps
             .iter()
             .any(|s| s.kind == "paint" && s.pixels.bytes() > 0)
     });
-    let mut bounds = color.as_ref().map(|s| s.bounds(full));
+    let mut bounds = color.as_ref().map(|s| s.bounds(full)).transpose()?;
     for (s, o) in layer
         .mask
         .as_ref()
@@ -205,7 +279,7 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         .zip(&masks)
     {
         if s.kind == "paint" && o.pixels.bytes() > 0 {
-            let b = o.bounds(true);
+            let b = o.bounds(true)?;
             bounds = Some(
                 bounds
                     .map(|a| {
@@ -227,8 +301,12 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
             layer.pixels.height,
             layer.pixels.depth,
         ));
-        r.matrix = delta;
-        let b = r.bounds(true);
+        if let Some(map) = projective_delta {
+            r.prepend(map)?;
+        } else {
+            r.matrix = delta;
+        }
+        let b = r.bounds(true)?;
         bounds = Some(
             bounds
                 .map(|a| {
@@ -242,13 +320,14 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
                 .unwrap_or(b),
         );
     }
-    let b = bounds.unwrap();
-    let (left, top, right, bottom) = (
-        exact(b[0]).floor(),
-        exact(b[1]).floor(),
-        exact(b[2]).ceil(),
-        exact(b[3]).ceil(),
-    );
+    let mut b = bounds.unwrap();
+    if projective_delta.is_none()
+        && color.as_ref().is_none_or(|s| s.projective.is_none())
+        && masks.iter().all(|s| s.projective.is_none())
+    {
+        b = b.map(exact);
+    }
+    let (left, top, right, bottom) = (b[0].floor(), b[1].floor(), b[2].ceil(), b[3].ceil());
     if [left, top, right, bottom]
         .iter()
         .any(|v| !v.is_finite() || v.abs() > 100000.)
@@ -294,6 +373,7 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
 /// Mask-only placement keeps Color and other mask steps unchanged. Off-frame
 /// mask samples remain in the retained original, including through a PSD save.
 pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    let projective = crate::projective::combined(c)?;
     let moving = c["op"] == "move";
     let (sx, sy) = if moving {
         (1., 1.)
@@ -356,24 +436,66 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
     )?;
     for index in indices {
         let mut original = Original::from(&mask.steps[index].pixels);
-        original.matrix = compose(
-            [
-                a,
-                b,
-                cc,
-                d,
-                px - a * px - cc * py + dx,
-                py - b * px - d * py + dy,
-            ],
-            original.matrix,
-        );
+        if let Some(map) = projective {
+            original.prepend(
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    -(layer.x as f64),
+                    -(layer.y as f64),
+                ])
+                .compose(map)?
+                .compose(crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]))?,
+            )?;
+        } else {
+            original.matrix = compose(
+                [
+                    a,
+                    b,
+                    cc,
+                    d,
+                    px - a * px - cc * py + dx,
+                    py - b * px - d * py + dy,
+                ],
+                original.matrix,
+            );
+        }
         mask.steps[index].pixels = original.render(layer.pixels.width, layer.pixels.height)?;
     }
     mask.cache_key = crate::engine::id();
     Ok(())
 }
 pub fn observe(r: &Raster) -> Value {
-    r.retained.as_ref().map(|s|json!({"width":s.pixels.width,"height":s.pixels.height,"bit_depth":s.pixels.depth,"matrix":s.matrix,"bytes":s.pixels.bytes()})).unwrap_or(Value::Null)
+    r.retained.as_ref().map(|s| {
+        let mut value = json!({"width":s.pixels.width,"height":s.pixels.height,"bit_depth":s.pixels.depth,"matrix":s.matrix,"bytes":s.pixels.bytes()});
+        if let Some(map) = s.projective { value["projective"] = json!(map); }
+        value
+    }).unwrap_or(Value::Null)
+}
+pub fn has_projective(doc: &Document) -> bool {
+    doc.layers.iter().any(|l| {
+        l.pixels
+            .retained
+            .as_ref()
+            .is_some_and(|o| o.projective.is_some())
+            || l.mask.as_ref().is_some_and(|m| {
+                m.steps.iter().any(|s| {
+                    s.pixels
+                        .retained
+                        .as_ref()
+                        .is_some_and(|o| o.projective.is_some())
+                })
+            })
+    })
 }
 pub fn has_originals(doc: &Document) -> bool {
     doc.layers.iter().any(|l| {

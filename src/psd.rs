@@ -1043,7 +1043,9 @@ fn encode_layout_to<S: Read + Write + Seek>(
     drop(standard);
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if has_installed_fonts(doc) {
+        format: if crate::retained::has_projective(doc) {
+            32
+        } else if has_installed_fonts(doc) {
             31
         } else if has_letter_spacing(doc) {
             30
@@ -1968,7 +1970,8 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=31).contains(&e.format)
+                if (1..=32).contains(&e.format)
+                    && (e.format >= 32 || !crate::retained::has_projective(&e.document))
                     && (e.format >= 31 || !has_installed_fonts(&e.document))
                     && (e.format >= 30 || !has_letter_spacing(&e.document))
                     && (e.format >= 29
