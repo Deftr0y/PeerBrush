@@ -478,8 +478,7 @@ struct Embedded {
     standard_hash: u64,
     document: Document,
 }
-// Keep the decoded-size and cancellation checks below BufReader: serde_json's
-// reader consumes individual bytes, while native decompression stays chunked.
+// Bound decoded bytes and check cancellation before native decompression.
 struct EmbeddedReader<'a, R> {
     inner: R,
     remaining: usize,
@@ -504,16 +503,29 @@ fn embedded_source<R: Read>(
     limit: usize,
     control: &crate::loading::Control,
 ) -> Result<Embedded, serde_json::Error> {
-    // from_reader calls end(): trailing whitespace must reach real zlib EOF,
-    // including its checksum, even when the JSON ends exactly at the budget.
-    serde_json::from_reader(std::io::BufReader::with_capacity(
-        64 * 1024,
-        EmbeddedReader {
-            inner: input,
-            remaining: limit,
-            control,
-        },
-    ))
+    // Slice parsing avoids per-byte reader overhead. The capped JSON buffer
+    // remains separate from the 64 KiB transfer scratch and restored sources.
+    let mut reader = EmbeddedReader {
+        inner: input,
+        remaining: limit,
+        control,
+    };
+    let mut json = Vec::new();
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).map_err(serde_json::Error::io)?;
+        if n == 0 {
+            break;
+        }
+        json.extend_from_slice(&chunk[..n]);
+    }
+    // Reaching the real zlib EOF validates the checksum even at the exact cap.
+    // Do not start the indivisible JSON parse if the final read was canceled.
+    control
+        .check()
+        .map_err(std::io::Error::other)
+        .map_err(serde_json::Error::io)?;
+    serde_json::from_slice(&json)
 }
 struct BoundedWriter<'a, W> {
     inner: W,

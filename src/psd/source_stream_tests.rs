@@ -8,7 +8,7 @@ fn compressed(bytes: &[u8]) -> Vec<u8> {
     zip.finish().unwrap()
 }
 
-// The former full-buffer path is only a fixture oracle, never a load fallback.
+// The original 1 MiB-chunk capped reader is a fixture oracle, never a load fallback.
 fn legacy(bytes: &[u8], limit: usize) -> Option<Embedded> {
     let mut json = Vec::new();
     let mut zip = ZlibDecoder::new(bytes).take(limit as u64 + 1);
@@ -35,7 +35,7 @@ fn small_json() -> Vec<u8> {
 }
 
 #[test]
-fn streaming_source_requires_json_end_real_zlib_eof_checksum_and_exact_decoded_budget() {
+fn bounded_source_requires_json_end_real_zlib_eof_checksum_and_exact_decoded_budget() {
     let control = crate::loading::Control::default();
     let json = small_json();
     let zipped = compressed(&json);
@@ -71,7 +71,7 @@ fn streaming_source_requires_json_end_real_zlib_eof_checksum_and_exact_decoded_b
         &control
     )
     .is_err());
-    // The payload is complete JSON, but end() still has to validate the footer.
+    // The payload is complete JSON, but decompression still has to validate the footer.
     for cut in 1..=4 {
         let truncated = &padded[..padded.len() - cut];
         assert!(legacy(truncated, whitespace.len()).is_none());
@@ -193,6 +193,59 @@ fn buffered_source_checks_cancellation_on_refill_without_per_byte_native_reads()
     assert_eq!(calls.get(), 0);
 }
 
+#[test]
+fn bounded_slice_source_checks_final_eof_cancel_and_never_retries_read_errors() {
+    struct FinalCancel<'a> {
+        bytes: &'a [u8],
+        control: &'a crate::loading::Control,
+    }
+    impl Read for FinalCancel<'_> {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.bytes.read(output)?;
+            if n == 0 {
+                self.control.cancel();
+            }
+            Ok(n)
+        }
+    }
+    let control = crate::loading::Control::default();
+    // Invalid JSON makes cancellation-before-parse distinguishable from a
+    // syntax error, without relying on timing or a global observation hook.
+    let result = embedded_source(
+        FinalCancel {
+            bytes: b"not JSON",
+            control: &control,
+        },
+        64,
+        &control,
+    );
+    assert_eq!(
+        result.err().unwrap().io_error_kind(),
+        Some(std::io::ErrorKind::Other)
+    );
+    assert!(control.check().unwrap_err().contains("Opening canceled"));
+
+    struct Interrupted<'a>(&'a Cell<usize>);
+    impl Read for Interrupted<'_> {
+        fn read(&mut self, _output: &mut [u8]) -> std::io::Result<usize> {
+            self.0.set(self.0.get() + 1);
+            Err(std::io::ErrorKind::Interrupted.into())
+        }
+    }
+    let control = crate::loading::Control::default();
+    let calls = Cell::new(0);
+    let result = embedded_source(Interrupted(&calls), 64, &control);
+    assert_eq!(
+        result.err().unwrap().io_error_kind(),
+        Some(std::io::ErrorKind::Interrupted)
+    );
+    assert_eq!(
+        calls.get(),
+        1,
+        "The capped read loop does not retry an interrupted reader"
+    );
+}
+
 fn fixture(depth: u16) -> crate::engine::Engine {
     let mut engine = crate::engine::Engine::new();
     engine.doc = Document::new_depth(32, 24, depth).unwrap();
@@ -302,8 +355,7 @@ fn current_standard_composite(bytes: &[u8], layout: Layout, doc: &Document) {
 }
 
 #[test]
-fn streaming_editable_native_sources_match_legacy_reader_masks_png_history_and_standard_composite()
-{
+fn bounded_editable_native_sources_match_legacy_reader_masks_png_history_and_standard_composite() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
         let before = serde_json::to_value(&engine.doc).unwrap();
@@ -463,7 +515,7 @@ fn invalid_streams_or_definition_gates_preserve_standard_protected_fallback_and_
 }
 
 #[test]
-#[ignore = "opt-in same-source restoration component timing; not a latency SLA"]
+#[ignore = "opt-in same-source capped-reader component timing; not a latency SLA"]
 fn supplementary_restore_component_timings_keep_exact_dense_sparse_native_documents() {
     for depth in [8, 16] {
         for dense in [false, true] {
@@ -497,6 +549,10 @@ fn supplementary_restore_component_timings_keep_exact_dense_sparse_native_docume
                 128 * 1024 * 1024
             };
             let control = crate::loading::Control::default();
+            // Both paths retain a capped full JSON buffer and use from_slice.
+            // Original: 1 MiB transfer + take; current: guarded 64 KiB transfer.
+            // This fixed old-first component sample does not isolate parsing,
+            // establish a cold-cache measurement or assert a latency threshold.
             let start = std::time::Instant::now();
             let old = legacy(&zipped, limit).unwrap();
             let old_ms = start.elapsed().as_secs_f64() * 1000.;
