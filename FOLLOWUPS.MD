@@ -194,7 +194,7 @@ Original priority numbers for the following implemented slices are historical; r
 
 All slices preserve native 16-bit precision, shared engine/reservation rules, current standard PSD raster/mask data and merged composites, and the compact Ember UI. Verify behavior changes with engine/codec/protocol tests and the native workspace.
 
-Installed distribution, associations, updates, persistent settings and production automation are consolidated in the high-priority foundations above. Remote connections and plugin architecture remain future work, now planned for v0.3 alongside the other open extensions and acceptance. Broader GPU modes and Photoshop structures retain the documented fallbacks and fidelity limits; these extensions are not part of the completed feature checkpoint.
+Installed distribution, associations, updates, persistent settings and production automation are consolidated in the high-priority foundations above. Remote control from another computer and third-party plugin/add-on tools remain future work, explicitly deferred until after v0.3. Their acceptance criteria must be defined before a later implementation; existing local MCP/proposal work does not close them. Broader GPU modes and Photoshop structures retain the documented fallbacks and fidelity limits; these extensions are not part of the completed feature checkpoint.
 
 ## Earlier requested work — implementation records
 

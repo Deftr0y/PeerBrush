@@ -20,6 +20,8 @@ Only those five files and regenerated inventory, checksums and readiness report 
 
 ## Private Store submission state
 
+Store submission remains explicitly disabled while integration is prepared. No persistent private host or storage backend is configured. Temporary runner disks, caches and downloadable artifacts cannot substitute for a durable write-ahead journal. Activating service writes requires a reviewed durable deployment and separate explicit approval.
+
 The existing MSIX writer still validates a published stable release, exact Store identity, package provenance and checksums, current published version and absence of a pending submission. Actual submission additionally requires an absolute `--state` file inside an existing durable private directory. Before release downloads or authentication, the tool rejects supplied receipt paths inside any Git checkout, including independently cloned release-source inputs and worktrees identified by a `.git` file. It also rejects symbolic links, junctions and reparse points throughout the supplied path. Locking and receipt writes recheck these boundaries. The directory and receipt must stay outside public source, release packages and Actions artifacts.
 
 ```sh

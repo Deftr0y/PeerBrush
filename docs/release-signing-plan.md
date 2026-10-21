@@ -14,7 +14,7 @@ Proposed for v0.3 implementation, following the first measurable PB-108 fix: set
 
 Completion is demonstrated by an installed-platform acceptance matrix and one exact-source release progressing from main to verified public downloads/website and independently reported Store state. A delayed/rejected Store channel must not be labelled available or cause a duplicate submission; another ready platform may be published with its status stated explicitly. Preserve branch policies, protected signing approval, GPLv3/source availability and existing version history. Credential values, private operations and approval changes do not belong in public planning documents or this work's implicit authority.
 
-Current boundary: CI and manual release/signing/Pages workflows exist; end-to-end main-push publication and active Store submission automation are not established. The historical checklist below retains earlier completed work and unresolved platform gates; it is not evidence that automation or native acceptance is complete.
+Current boundary: CI and manual release/signing/Pages workflows exist; end-to-end main-push publication and active Store submission automation are not established. Store integration is prepared with submission explicitly disabled; no durable private host or storage backend is configured. The historical checklist below retains earlier completed work and unresolved platform gates; it is not evidence that automation or native acceptance is complete.
 
 ## 1 Make packaging include only approved content
 
