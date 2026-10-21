@@ -684,9 +684,9 @@ pub fn transformed(before: &Layer, after: &mut Layer, c: &Value) -> Result<(), S
     let Some(mut source) = before.source.clone() else {
         return Ok(());
     };
-    if crate::projective::parse(c)?.is_some() {
+    if crate::projective::parse(c)?.is_some() || crate::warp::parse(c)?.is_some() {
         return Err(
-            "Rasterize the editable source at its native precision before a projective transform"
+            "Rasterize the editable source at its native precision before Distort, Perspective or Warp"
                 .into(),
         );
     }

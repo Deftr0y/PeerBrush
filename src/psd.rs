@@ -1043,7 +1043,9 @@ fn encode_layout_to<S: Read + Write + Seek>(
     drop(standard);
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if crate::retained::has_projective(doc) {
+        format: if crate::retained::has_warps(doc) {
+            33
+        } else if crate::retained::has_projective(doc) {
             32
         } else if has_installed_fonts(doc) {
             31
@@ -1970,7 +1972,8 @@ fn decode_parts(
                 }
         {
             if let Ok(mut e) = serde_json::from_slice::<Embedded>(&json) {
-                if (1..=32).contains(&e.format)
+                if (1..=33).contains(&e.format)
+                    && (e.format >= 33 || !crate::retained::has_warps(&e.document))
                     && (e.format >= 32 || !crate::retained::has_projective(&e.document))
                     && (e.format >= 31 || !has_installed_fonts(&e.document))
                     && (e.format >= 30 || !has_letter_spacing(&e.document))
@@ -2999,13 +3002,7 @@ pub fn validate(doc: &Document) -> Result<(), String> {
         if !l.opacity.is_finite() {
             return Err("Invalid opacity".into());
         }
-        total += l.pixels.bytes();
-        total += l
-            .pixels
-            .retained
-            .as_ref()
-            .map(|s| s.pixels.bytes())
-            .unwrap_or(0);
+        total += l.pixels.stored_bytes();
         let mut p = l.parent.as_deref();
         let mut depth = 0;
         while let Some(parent) = p {
@@ -3037,13 +3034,7 @@ pub fn validate(doc: &Document) -> Result<(), String> {
                 if s.pixels.depth != doc.bit_depth {
                     return Err("Mask precision does not match the document".into());
                 }
-                total += s.pixels.bytes();
-                total += s
-                    .pixels
-                    .retained
-                    .as_ref()
-                    .map(|s| s.pixels.bytes())
-                    .unwrap_or(0);
+                total += s.pixels.stored_bytes();
                 let valid = match s.kind.as_str() {
                     "blur" => (0.0..=64.0).contains(&s.value),
                     "levels" => (0.1..=5.0).contains(&s.value),

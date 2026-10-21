@@ -488,7 +488,10 @@ impl Raster {
             + self
                 .retained
                 .as_ref()
-                .map(|s| s.pixels.bytes())
+                .map(|s| {
+                    s.pixels.bytes()
+                        + s.warps.capacity() * std::mem::size_of::<crate::warp::Stage>()
+                })
                 .unwrap_or(0)
     }
     /// Interpolate premultiplied color to keep transparent edges clean.

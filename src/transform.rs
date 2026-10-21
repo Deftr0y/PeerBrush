@@ -73,6 +73,7 @@ pub(crate) fn skewed([a, b, c, d]: [f64; 4], command: &Value) -> Result<[f64; 4]
 
 pub(crate) fn selected_shear(c: &Value) -> Result<[f32; 2], String> {
     crate::projective::parse(c)?;
+    crate::warp::parse(c)?;
     fractional_translation(c)?;
     if c["op"] != "move" {
         translation(c)?;
@@ -136,6 +137,7 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
     }
     fractional_translation(command)?;
     crate::projective::parse(command)?;
+    crate::warp::parse(command)?;
     if command["op"] == "transform" {
         scales(command)?;
         skew_angles(command)?;
@@ -193,6 +195,7 @@ pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> 
         if matches!(command["op"].as_str(), Some("move" | "transform")) {
             fractional_translation(command)?;
             crate::projective::parse(command)?;
+            crate::warp::parse(command)?;
         }
         if command["op"] == "transform" {
             scales(command)?;
@@ -257,6 +260,7 @@ pub fn selection_with_polygon(
     c: &Value,
 ) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
     selected_shear(c)?;
+    warp_selection_preflight(layer, polygon, c)?;
     if layer.mask.as_ref().is_some_and(|mask| mask.linked) {
         return linked_selection(layer, polygon, c, None);
     }
@@ -271,6 +275,9 @@ pub fn selection_with_coverage(
     c: &Value,
 ) -> Result<crate::selection::Coverage, String> {
     let shear = selected_shear(c)?;
+    let warped = crate::warp::parse(c)?
+        .map(|_| crate::warp::CommandMap::new(c, [0., 0.]))
+        .transpose()?;
     let projective = crate::projective::combined(c)?;
     let inverse = projective
         .map(|p| {
@@ -289,6 +296,7 @@ pub fn selection_with_coverage(
         return Ok(coverage.clone());
     }
     let polygon = crate::selection::rectangle(coverage.bounds);
+    warp_selection_preflight(layer, &polygon, c)?;
     let (bounds, _) = if layer.mask.as_ref().is_some_and(|mask| mask.linked) {
         linked_selection(layer, &polygon, c, Some(coverage))?
     } else if c["mask"] == true && c["step"].is_null() {
@@ -346,7 +354,12 @@ pub fn selection_with_coverage(
                 v -= shear[1] * u;
                 u -= shear[0] * v;
             }
-            let [ux, uy] = if let Some(map) = inverse {
+            let [ux, uy] = if let Some(map) = &warped {
+                map.sample(
+                    [x as f64 + 0.5, y as f64 + 0.5],
+                    coverage.origin.map(|v| v as f64),
+                )
+            } else if let Some(map) = inverse {
                 map.sample([x as f64 + 0.5, y as f64 + 0.5])
             } else {
                 [
@@ -370,6 +383,36 @@ pub fn selection_with_coverage(
     }
     Ok(crate::selection::from_mask(mask)?.local(-bounds[0], -bounds[1]))
 }
+fn warp_selection_preflight(layer: &Layer, polygon: &[[f32; 2]], c: &Value) -> Result<(), String> {
+    if crate::warp::parse(c)?.is_none() {
+        return Ok(());
+    }
+    if layer.source.is_some() {
+        return Err("Rasterize editable sources at native precision before Warp".into());
+    }
+    let area = crate::selection::bounds(polygon)?;
+    let map = crate::warp::CommandMap::new(c, [0., 0.])?;
+    map.covers([
+        area[0] as f64 - 1.,
+        area[1] as f64 - 1.,
+        area[2] as f64 + 1.,
+        area[3] as f64 + 1.,
+    ])?;
+    let transformed = map.polygon(polygon)?;
+    let b = crate::selection::bounds(&transformed)?;
+    map.bounds(area.map(|v| v as f64))?;
+    let w = (layer.x + layer.pixels.width as i32).max(b[2]) - layer.x.min(b[0]);
+    let h = (layer.y + layer.pixels.height as i32).max(b[3]) - layer.y.min(b[1]);
+    check_size(w as u32, h as u32)?;
+    let steps = layer.mask.as_ref().map_or(0, |m| m.steps.len());
+    crate::warp::work_budget(
+        w as u32,
+        h as u32,
+        1 + steps * (1 + steps),
+        1,
+        polygon.len() + transformed.len(),
+    )
+}
 fn selection_impl(
     layer: &mut Layer,
     polygon: &[[f32; 2]],
@@ -378,10 +421,25 @@ fn selection_impl(
 ) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
     let area = crate::selection::bounds(polygon)?;
     let projective = crate::projective::combined(c)?;
-    if let Some(map) = projective {
+    let warped = crate::warp::parse(c)?
+        .map(|_| crate::warp::CommandMap::new(c, [0., 0.]))
+        .transpose()?;
+    if let Some(map) = &warped {
+        map.covers([
+            area[0] as f64 - 1.,
+            area[1] as f64 - 1.,
+            area[2] as f64 + 1.,
+            area[3] as f64 + 1.,
+        ])?;
         map.bounds(area.map(|v| v as f64))?;
         if layer.source.is_some() {
-            return Err("Rasterize the editable source at its native precision before a projective transform".into());
+            return Err("Rasterize editable sources at native precision before Warp".into());
+        }
+    }
+    if let Some(map) = projective.filter(|_| warped.is_none()) {
+        map.bounds(area.map(|v| v as f64))?;
+        if layer.source.is_some() {
+            return Err("Rasterize the editable source at its native precision before Distort, Perspective or Warp".into());
         }
     }
     if layer.kind == "group" {
@@ -434,7 +492,9 @@ fn selection_impl(
             ]
         }
     };
-    let transformed = if let Some(map) = projective {
+    let transformed = if let Some(map) = &warped {
+        map.polygon(polygon)?
+    } else if let Some(map) = projective {
         polygon
             .iter()
             .map(|p| {
@@ -447,6 +507,7 @@ fn selection_impl(
     };
     let b = crate::selection::bounds(&transformed)?;
     if projective.is_none()
+        && warped.is_none()
         && dx == 0.0
         && dy == 0.0
         && angle.rem_euclid(360.0) == 0.0
@@ -478,6 +539,15 @@ fn selection_impl(
     let (w, h) = ((right - left) as u32, (bottom - top) as u32);
     check_size(w, h)?;
     work_budget(w, h, 1 + layer.mask.as_ref().map_or(0, |m| m.steps.len()))?;
+    if warped.is_some() {
+        crate::warp::work_budget(
+            w,
+            h,
+            1 + layer.mask.as_ref().map_or(0, |m| m.steps.len()),
+            1,
+            polygon.len() + transformed.len(),
+        )?;
+    }
     let mask_step = if mask {
         let m = layer.mask.as_ref().ok_or("Layer has no mask")?;
         Some(
@@ -540,7 +610,9 @@ fn selection_impl(
                 v -= shear[1] * u;
                 u -= shear[0] * v;
             }
-            let [ux, uy] = if let Some(map) = inverse {
+            let [ux, uy] = if let Some(map) = &warped {
+                map.sample([x as f64 + 0.5, y as f64 + 0.5], [ox as f64, oy as f64])
+            } else if let Some(map) = inverse {
                 map.sample([x as f64 + 0.5, y as f64 + 0.5])
             } else {
                 [u + px - ox as f32 - 0.5, v + py - oy as f32 - 0.5]
@@ -1088,18 +1160,19 @@ pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), St
         return Err("A layer inside the folder is locked".into());
     }
     let projective = crate::projective::parse(c)?;
-    if projective.is_some()
+    let warp = crate::warp::parse(c)?;
+    if (projective.is_some() || warp.is_some())
         && doc.layers.iter().any(|l| {
             ids.contains(&l.id)
                 && (l.source.is_some() || !matches!(l.kind.as_str(), "group" | "paint" | "fill"))
         })
     {
-        return Err("Rasterize editable text/vector or adjustment children at their native precision before a projective folder transform".into());
+        return Err("Rasterize editable text/vector or adjustment children at their native precision before folder Distort, Perspective or Warp".into());
     }
     if doc.selection.is_some() && c["selection_only"] != false {
         let coverage = crate::selection::current(doc).ok_or("Selection no longer exists")?;
         let mut command = c.clone();
-        if command["pivot"].is_null() && projective.is_none() {
+        if command["pivot"].is_null() && projective.is_none() && warp.is_none() {
             command["pivot"] = serde_json::json!([
                 (coverage.bounds[0] as f64 + coverage.bounds[2] as f64) / 2.,
                 (coverage.bounds[1] as f64 + coverage.bounds[3] as f64) / 2.
@@ -1125,7 +1198,7 @@ pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), St
     let bounds =
         tree_bounds(doc, &[root.into()]).unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
     let mut command = c.clone();
-    if command["pivot"].is_null() && projective.is_none() {
+    if command["pivot"].is_null() && projective.is_none() && warp.is_none() {
         command["pivot"] = serde_json::json!([
             (bounds[0] as f64 + bounds[2] as f64) / 2.,
             (bounds[1] as f64 + bounds[3] as f64) / 2.

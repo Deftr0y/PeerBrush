@@ -12,6 +12,12 @@ pub struct Original {
     pub matrix: [f64; 6],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projective: Option<[f64; 9]>,
+    #[serde(
+        default,
+        deserialize_with = "crate::warp::stages",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub warps: Vec<crate::warp::Stage>,
 }
 pub const IDENTITY: [f64; 6] = [1., 0., 0., 1., 0., 0.];
 fn exact(v: f64) -> f64 {
@@ -40,6 +46,7 @@ impl Original {
             pixels: Box::new(r.clone()),
             matrix: IDENTITY,
             projective: None,
+            warps: Vec::new(),
         })
     }
     pub fn validate(&self, depth: u16) -> Result<(), String> {
@@ -55,7 +62,9 @@ impl Original {
         {
             return Err("Invalid retained transform source or placement".into());
         }
-        if self.projective.is_some() {
+        if !self.warps.is_empty() {
+            self.prepared()?.bounds(self.support())?;
+        } else if self.projective.is_some() {
             self.placement()?.bounds([
                 0.,
                 0.,
@@ -64,6 +73,25 @@ impl Original {
             ])?;
         }
         Ok(())
+    }
+    fn support(&self) -> [f64; 4] {
+        [
+            -1.,
+            -1.,
+            self.pixels.width as f64 + 1.,
+            self.pixels.height as f64 + 1.,
+        ]
+    }
+    fn prepared(&self) -> Result<crate::warp::Placement, String> {
+        crate::warp::Placement::new(&self.warps, self.placement()?)
+    }
+    pub(crate) fn support_bounds_in(
+        &self,
+        frame: crate::projective::Map,
+    ) -> Result<[f64; 4], String> {
+        self.validate(self.pixels.depth)?;
+        crate::warp::Placement::new(&self.warps, frame.compose(self.placement()?)?)?
+            .bounds(self.support())
     }
     pub(crate) fn placement(&self) -> Result<crate::projective::Map, String> {
         let affine = crate::projective::Map::affine_matrix(self.matrix);
@@ -83,6 +111,23 @@ impl Original {
         }
         self.validate(self.pixels.depth)
     }
+    fn append_warp(
+        &mut self,
+        grid: &crate::warp::Grid,
+        frame: crate::projective::Map,
+        after: crate::projective::Map,
+    ) -> Result<(), String> {
+        if self.warps.len() >= crate::warp::MAX_STAGES {
+            return Err("Retained Warp stage limit reached; undo an earlier Warp or cancel".into());
+        }
+        self.warps.push(crate::warp::Stage {
+            before: frame.compose(self.placement()?)?.matrix(),
+            grid: grid.clone(),
+        });
+        self.matrix = IDENTITY;
+        self.projective = None;
+        self.prepend(after)
+    }
     pub fn render(mut self, w: u32, h: u32) -> Result<Raster, String> {
         self.matrix = self.matrix.map(exact);
         self.validate(self.pixels.depth)?;
@@ -91,6 +136,12 @@ impl Original {
         let det = a * d - b * c;
         let mut out = if self.pixels.bytes() == 0 {
             Raster::new_depth(w, h, self.pixels.depth)
+        } else if !self.warps.is_empty() {
+            crate::warp::work_budget(w, h, 1, self.warps.len(), 0)?;
+            let placement = self.prepared()?;
+            crate::transform::resample(&self.pixels, w, h, None, |x, y| {
+                placement.sample([x as f64 + 0.5, y as f64 + 0.5])
+            })
         } else if self.projective.is_some() {
             let inverse = crate::projective::Map::affine_matrix([1., 0., 0., 1., -0.5, -0.5])
                 .compose(self.placement()?.inverse()?)?;
@@ -122,6 +173,10 @@ impl Original {
                 self.pixels.height as i32,
             ])
         };
+        if !self.warps.is_empty() {
+            self.validate(self.pixels.depth)?;
+            return self.prepared()?.bounds(p.map(|v| v as f64));
+        }
         if self.projective.is_some() {
             self.validate(self.pixels.depth)?;
             return self.placement()?.bounds(p.map(|v| v as f64));
@@ -146,9 +201,22 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         return crate::transform::move_layer(layer, c);
     }
     let projective = crate::projective::parse(c)?;
-    if projective.is_some() && layer.source.is_some() {
+    let warp = crate::warp::parse(c)?;
+    let warped = warp
+        .as_ref()
+        .map(|_| {
+            crate::warp::CommandMap::new(
+                c,
+                [
+                    layer.x as f64 + layer.pixels.width as f64 / 2.,
+                    layer.y as f64 + layer.pixels.height as f64 / 2.,
+                ],
+            )
+        })
+        .transpose()?;
+    if (projective.is_some() || warp.is_some()) && layer.source.is_some() {
         return Err(
-            "Rasterize the editable source at its native precision before a projective transform"
+            "Rasterize the editable source at its native precision before Distort, Perspective or Warp"
                 .into(),
         );
     }
@@ -162,11 +230,13 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         c["pivot"][0].as_f64().unwrap_or_else(|| {
             projective
                 .map(|p| p.center()[0])
+                .or_else(|| warp.as_ref().map(|w| (w.rect[0] + w.rect[2]) * 0.5))
                 .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.)
         }),
         c["pivot"][1].as_f64().unwrap_or_else(|| {
             projective
                 .map(|p| p.center()[1])
+                .or_else(|| warp.as_ref().map(|w| (w.rect[1] + w.rect[3]) * 0.5))
                 .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.)
         }),
     );
@@ -175,6 +245,7 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     }
     let [dx, dy] = crate::transform::translation(c)?;
     if projective.is_none()
+        && warp.is_none()
         && angle.rem_euclid(360.) == 0.
         && sx == 1.
         && sy == 1.
@@ -227,7 +298,7 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         return Ok(());
     }
     let mut color = (!world && layer.source.is_none()).then(|| Original::from(&layer.pixels));
-    if layer.kind == "fill" {
+    if layer.kind == "fill" && warp.is_none() {
         if let Some(color) = &mut color {
             let mut r =
                 Raster::new_depth(layer.pixels.width, layer.pixels.height, layer.pixels.depth);
@@ -240,7 +311,20 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         }
     }
     if let Some(color) = &mut color {
-        if let Some(map) = projective_delta {
+        if let (Some(grid), Some(map)) = (&warp, &warped) {
+            color.append_warp(
+                grid,
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]),
+                map.after,
+            )?;
+        } else if let Some(map) = projective_delta {
             color.prepend(map)?;
         } else {
             color.matrix = compose(delta, color.matrix);
@@ -254,7 +338,20 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
                 .iter()
                 .map(|s| {
                     let mut r = Original::from(&s.pixels);
-                    if let Some(map) = projective_delta {
+                    if let (Some(grid), Some(map)) = (&warp, &warped) {
+                        r.append_warp(
+                            grid,
+                            crate::projective::Map::affine_matrix([
+                                1.,
+                                0.,
+                                0.,
+                                1.,
+                                layer.x as f64,
+                                layer.y as f64,
+                            ]),
+                            map.after,
+                        )?;
+                    } else if let Some(map) = projective_delta {
                         r.prepend(map)?;
                     } else {
                         r.matrix = compose(delta, r.matrix);
@@ -301,7 +398,20 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
             layer.pixels.height,
             layer.pixels.depth,
         ));
-        if let Some(map) = projective_delta {
+        if let (Some(grid), Some(map)) = (&warp, &warped) {
+            r.append_warp(
+                grid,
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]),
+                map.after,
+            )?;
+        } else if let Some(map) = projective_delta {
             r.prepend(map)?;
         } else {
             r.matrix = delta;
@@ -322,8 +432,13 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     }
     let mut b = bounds.unwrap();
     if projective_delta.is_none()
-        && color.as_ref().is_none_or(|s| s.projective.is_none())
-        && masks.iter().all(|s| s.projective.is_none())
+        && warp.is_none()
+        && color
+            .as_ref()
+            .is_none_or(|s| s.projective.is_none() && s.warps.is_empty())
+        && masks
+            .iter()
+            .all(|s| s.projective.is_none() && s.warps.is_empty())
     {
         b = b.map(exact);
     }
@@ -341,6 +456,31 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         h,
         1 + masks.iter().filter(|o| o.pixels.bytes() > 0).count(),
     )?;
+    let stages = color
+        .as_ref()
+        .map_or(0, |o| o.warps.len())
+        .max(masks.iter().map(|o| o.warps.len()).max().unwrap_or(0));
+    if stages > 0 {
+        crate::warp::work_budget(
+            w,
+            h,
+            1 + masks.iter().filter(|o| o.pixels.bytes() > 0).count(),
+            stages,
+            0,
+        )?;
+    }
+    if layer.kind == "fill" && warp.is_some() {
+        if let Some(color) = &mut color {
+            let mut r =
+                Raster::new_depth(color.pixels.width, color.pixels.height, color.pixels.depth);
+            for y in 0..r.height {
+                for x in 0..r.width {
+                    r.set(x as i32, y as i32, layer.color);
+                }
+            }
+            color.pixels = Box::new(r);
+        }
+    }
     let local = [1., 0., 0., 1., -left, -top];
     let before = layer.source.is_some().then(|| layer.clone());
     layer.pixels = if let Some(mut o) = color {
@@ -374,6 +514,19 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
 /// mask samples remain in the retained original, including through a PSD save.
 pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
     let projective = crate::projective::combined(c)?;
+    let warp = crate::warp::parse(c)?;
+    let warped = warp
+        .as_ref()
+        .map(|_| {
+            crate::warp::CommandMap::new(
+                c,
+                [
+                    layer.x as f64 + layer.pixels.width as f64 / 2.,
+                    layer.y as f64 + layer.pixels.height as f64 / 2.,
+                ],
+            )
+        })
+        .transpose()?;
     let moving = c["op"] == "move";
     let (sx, sy) = if moving {
         (1., 1.)
@@ -424,6 +577,20 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
         return Err("Select a paint mask step to transform".into());
     }
     crate::transform::work_budget(layer.pixels.width, layer.pixels.height, indices.len())?;
+    let stages = indices
+        .iter()
+        .map(|&i| Original::from(&mask.steps[i].pixels).warps.len() + usize::from(warp.is_some()))
+        .max()
+        .unwrap_or(0);
+    if stages > 0 {
+        crate::warp::work_budget(
+            layer.pixels.width,
+            layer.pixels.height,
+            indices.len(),
+            stages,
+            0,
+        )?;
+    }
     let (sin, cos) = angle.to_radians().sin_cos();
     let [a, b, cc, d] = crate::transform::skewed(
         [
@@ -436,7 +603,28 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
     )?;
     for index in indices {
         let mut original = Original::from(&mask.steps[index].pixels);
-        if let Some(map) = projective {
+        if let (Some(grid), Some(map)) = (&warp, &warped) {
+            original.append_warp(
+                grid,
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]),
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    -(layer.x as f64),
+                    -(layer.y as f64),
+                ])
+                .compose(map.after)?,
+            )?;
+        } else if let Some(map) = projective {
             original.prepend(
                 crate::projective::Map::affine_matrix([
                     1.,
@@ -478,6 +666,7 @@ pub fn observe(r: &Raster) -> Value {
     r.retained.as_ref().map(|s| {
         let mut value = json!({"width":s.pixels.width,"height":s.pixels.height,"bit_depth":s.pixels.depth,"matrix":s.matrix,"bytes":s.pixels.bytes()});
         if let Some(map) = s.projective { value["projective"] = json!(map); }
+        if !s.warps.is_empty(){value["warp_stages"]=json!(s.warps);}
         value
     }).unwrap_or(Value::Null)
 }
@@ -493,6 +682,22 @@ pub fn has_projective(doc: &Document) -> bool {
                         .retained
                         .as_ref()
                         .is_some_and(|o| o.projective.is_some())
+                })
+            })
+    })
+}
+pub fn has_warps(doc: &Document) -> bool {
+    doc.layers.iter().any(|l| {
+        l.pixels
+            .retained
+            .as_ref()
+            .is_some_and(|o| !o.warps.is_empty())
+            || l.mask.as_ref().is_some_and(|m| {
+                m.steps.iter().any(|s| {
+                    s.pixels
+                        .retained
+                        .as_ref()
+                        .is_some_and(|o| !o.warps.is_empty())
                 })
             })
     })

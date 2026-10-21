@@ -63,4 +63,5 @@ pub mod transform;
 pub mod tree;
 pub mod ui;
 pub mod updates;
+pub mod warp;
 pub mod workspace;

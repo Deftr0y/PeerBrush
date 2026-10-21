@@ -935,9 +935,9 @@
       "move"
     ],
     "behavior": "Whole-layer rotation/scaling/skew and explicit projective placement accumulate one map and regenerate current native raster/mask projections from retained originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the map and pivot.",
-    "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty], or null. Optional projective is a row-major nine-coefficient original-local homography applied before matrix. Absent projective retains the exact affine schema. No tile samples in observations.",
+    "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty], or null. Optional projective is a row-major nine-coefficient original-local homography applied before matrix. Optional warp_stages is the bounded exact before-homography/grid chain applied before that final placement. Absent nonlinear maps retain the exact affine schema. No tile samples in observations.",
     "pixel_edits": "Painting, clone/heal, fill, direct adjustments, image replacement and selected-pixel edits establish a new baseline for only the changed raster. Other mask/color originals and effects remain editable. Image resize and explicit channel-depth conversion establish raster baselines; crop/canvas retain sources.",
-    "psd": "Supplementary format 9 retains affine originals; format 32 is required for any projective Color or mask original. Current standard raster/mask channels and merged composite remain present. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
+    "psd": "Supplementary format 9 retains affine originals; format 32 is required for any projective Color or mask original, format 33 for any retained Warp stage. Current standard raster/mask channels and merged composite remain present. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
     "limits": "Current plus original tiles count against 512 MiB document memory. 8192 per edge, 32 MP, 128 million output samples per layer command; singular/nonfinite/out-of-range/nested sources refused atomically.",
     "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists.",
     "translation": {
@@ -956,7 +956,7 @@
       "targets": "Whole or selected raster layer/folder, linked/unlinked painted masks and exact scalar coverage; current editable-source and mask-effect restrictions apply.",
       "selection_pixels": true,
       "selection": "Selected color/mask pixels and soft/hole coverage use one original-sampling pass with the same horizontal-then-vertical shear, scale/reflection, rotation and posttranslation. Omit selection_only or pass true for selected pixels; false keeps selection geometry unchanged while transforming the whole target.",
-      "limits": "Skew is affine; explicit projective placement is a separate shared command field. Control-grid/preset Warp remains unavailable."
+      "limits": "Skew is affine; explicit projective placement and coarse control-grid Warp are separate shared command fields."
     },
     "projective": {
       "field": "Optional strict transform.projective={rect:[left,top,right,bottom],quad:[[TLx,TLy],[TRx,TRy],[BRx,BRy],[BLx,BLy]]}; document pixels, no unknown fields.",
@@ -965,7 +965,18 @@
       "guards": "Full composed retained-original frame must avoid the projective horizon, including hidden RGB/off-frame samples. Folded, unstable, nonfinite, oversized and over-budget maps reject atomically. Shared source/revision, locks, reservations, preview and undo rules apply.",
       "precision": "One inverse sample of each original at native8/16; selected feather/hole coverage uses the same inverse as scalar coverage. Selected edits establish a raster baseline as before. Omitted/exact identity projective preserves legacy affine arithmetic and serialization.",
       "source_format": 32,
-      "limits": "Shared native UI/engine/MCP/CLI operation. Control-grid/preset Warp and native desktop/receiving-application acceptance remain pending. No Photoshop projective metadata equivalence is claimed."
+      "limits": "Shared native UI/engine/MCP/CLI operation. Native desktop/receiving-application acceptance remains pending. No Photoshop projective metadata equivalence is claimed."
+    },
+    "warp": {
+      "field": "Optional strict transform.warp={rect:[left,top,right,bottom],points:[[x0,y0],...,[x8,y8]]}, nine row-major 3x3 control points in document pixels; or exactly {rect,preset,amount} with preset arc/bulge/flag and amount -0.25..0.25. No unknown fields. move rejects Warp.",
+      "geometry": "Coarse continuous piecewise-affine grid: each of four cells has the fixed top-left to bottom-right diagonal, eight triangles total. Positive conditioned triangles, non-overlapping topology and complete interpolation-support coverage are required. This is not a smooth Bezier/Photoshop Warp model.",
+      "order": "One shared A*P*W command: grid first, then projective, then existing affine/translation. Explicit pivot wins; otherwise projective rect center, then Warp rect center. Snap affects existing affine values, not grid points. Distort/Perspective guides use their explicit projection frame when Warp is active.",
+      "targets": "Native8/16 whole or selected raster Color, linked/unlinked painted masks, an explicit paint step and hidden raster folder descendants. Editable sources and adjustment children retain explicit native-precision rasterize guidance and existing mask-effect restrictions.",
+      "retention": "Whole targets retain one original plus at most 16 exact grid stages, with each preceding placement and a final affine/projective placement. Ordinary affine/projective changes do not consume stages. All inverses run before one original sample. At the limit, undo an earlier Warp or cancel; no silent baking. Selected edits establish their existing raster baseline.",
+      "selection": "Polygon edges split at every crossed fixed-grid seam before transformation; scalar feather/hole coverage uses the same inverse as native Color/masks. Outside-grid or horizon failure stays invalid through the whole inverse chain, becoming transparent only at final sampling.",
+      "guards": "Grid must cover full retained original and bilinear support, including off-frame masks/hidden samples. Per polygon 8192 vertices and 131072 seam candidates; mapping cost area*rasters*(1+9*stages+vertices) <=128 million before output allocation. Existing 8192-edge/32MP/native memory/locks/source/revision/reservations/atomic batch guards remain. Omitted/exact identity Warp uses the unchanged legacy path.",
+      "source_format": 33,
+      "limits": "Bounded coarse grid, not arbitrary mesh topology, Bezier controls or Photoshop preset/metadata equivalence. The mapping budget is a work bound, not total process RAM. Native interaction and platform acceptance remain separate."
     }
   },
   "free_transform": {
