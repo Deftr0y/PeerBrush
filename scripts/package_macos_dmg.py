@@ -71,7 +71,7 @@ def private_inspection_directory(path, root, *, fresh):
     return path
 
 
-def bounded_file(path, limit, destination=None):
+def bounded_file(path, limit, destination=None, *, executable=False):
     """Hash/copy a regular file without following a changed link or growing input."""
     path = inspection_path(path)
     before = path.lstat()
@@ -83,9 +83,15 @@ def bounded_file(path, limit, destination=None):
         # Windows Python 3.12 can expose creation time from lstat's ctime
         # and last-write time from fstat's ctime. The shared file ID must still
         # match; check each timestamp source for stability independently below.
-        identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode,
+        # Windows lstat synthesizes executable bits from an .exe filename while
+        # fstat reports the opened handle's permissions. Only native-tool callers
+        # opt into comparing type/read/write bits across these two APIs; each API's
+        # full original mode remains independently stable below.
+        cross_mode = lambda info: ((stat.S_IFMT(info.st_mode) | (stat.S_IMODE(info.st_mode) & 0o666))
+                                  if os.name == 'nt' and executable else info.st_mode)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, cross_mode(info),
                                  info.st_nlink, getattr(info, 'st_birthtime_ns', None))
-        state = lambda info: (identity(info), info.st_ctime_ns)
+        state = lambda info: (identity(info), info.st_mode, info.st_ctime_ns)
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
                 or not 0 <= metadata.st_size <= limit or identity(before) != identity(metadata)
                 or (os.name == 'nt' and not metadata.st_ino)
