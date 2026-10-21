@@ -2194,11 +2194,27 @@ fn small_projective_window_scrolls_to_reference_corner_apply_and_cancel() {
             _ => None,
         })
     };
-    let scroll_to = |app: &mut PeerBrush, label: &str| {
+    let scroll_to = |app: &mut PeerBrush, label: &str, field: Option<(bool, usize)>| {
+        let target = |app: &PeerBrush, output: &egui::FullOutput| {
+            let at = visible(output, label)?;
+            let editor = app.free_transform.as_ref()?;
+            let clip = editor.scroll_rect?;
+            let rect = if let Some((projective, index)) = field {
+                if projective {
+                    editor.projective_inputs[index]?
+                } else {
+                    editor.inputs[index]?
+                }
+            } else {
+                Rect::from_center_size(at, Vec2::splat(2.))
+            };
+            (clip.contains_rect(rect) && Rect::from_min_size(Pos2::ZERO, size).contains_rect(rect))
+                .then_some((at, rect, editor.scroll_offset))
+        };
         for _ in 0..12 {
             let output = workspace::draw(app, &ctx, size, vec![]);
-            if let Some(at) = visible(&output, label) {
-                return at;
+            if target(app, &output).is_some() {
+                break;
             }
             let window = ctx
                 .memory(|m| m.area_rect(egui::Id::new("free transform")))
@@ -2217,11 +2233,41 @@ fn small_projective_window_scrolls_to_reference_corner_apply_and_cancel() {
                 ],
             );
         }
-        panic!("Window scrolling did not expose {label}");
+        // A wheel changes offset after layout and smooths across frames. Observe
+        // the real viewport/field until stable; never click a stale stored rect.
+        let (mut previous, mut stable) = (None, 0);
+        for _ in 0..60 {
+            let output = workspace::draw(app, &ctx, size, vec![]);
+            if let Some((at, rect, offset)) = target(app, &output) {
+                if previous == Some((rect, offset)) {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                }
+                if stable >= 4 {
+                    return at;
+                }
+                previous = Some((rect, offset));
+            } else {
+                previous = None;
+                stable = 0;
+            }
+        }
+        panic!("Window scrolling did not expose a stable, fully visible {label}");
     };
-    let enter = |app: &mut PeerBrush, at: Pos2, text: &str| {
-        workspace::click(app, &ctx, size, at);
-        workspace::click(app, &ctx, size, at);
+    let enter = |app: &mut PeerBrush, projective: bool, index: usize, text: &str| {
+        // Re-read the actual field after scrolling and each click layout.
+        for _ in 0..2 {
+            let editor = app.free_transform.as_ref().unwrap();
+            let rect = if projective {
+                editor.projective_inputs[index]
+            } else {
+                editor.inputs[index]
+            }
+            .unwrap();
+            assert!(editor.scroll_rect.unwrap().contains_rect(rect));
+            workspace::click(app, &ctx, size, rect.center());
+        }
         workspace::draw(
             app,
             &ctx,
@@ -2242,24 +2288,18 @@ fn small_projective_window_scrolls_to_reference_corner_apply_and_cancel() {
             "Numeric Enter must keep the session"
         );
     };
-    scroll_to(&mut app, "Reference X");
-    let at = app.free_transform.as_ref().unwrap().inputs[7]
-        .unwrap()
-        .center();
-    enter(&mut app, at, "4.25");
+    scroll_to(&mut app, "Reference X", Some((false, 7)));
+    enter(&mut app, false, 7, "4.25");
     assert_eq!(
         app.free_transform.as_ref().unwrap().reference_point()[0],
         4.25
     );
-    scroll_to(&mut app, "Top left");
-    let at = app.free_transform.as_ref().unwrap().projective_inputs[0]
-        .unwrap()
-        .center();
+    scroll_to(&mut app, "Top left", Some((true, 0)));
     let x = app.free_transform.as_ref().unwrap().corners()[0][0] + 0.25;
-    enter(&mut app, at, &format!("{x:.6}"));
+    enter(&mut app, true, 0, &format!("{x:.6}"));
     assert!((app.free_transform.as_ref().unwrap().corners()[0][0] - x).abs() < 1e-5);
-    scroll_to(&mut app, "Apply");
-    let at = scroll_to(&mut app, "Cancel");
+    scroll_to(&mut app, "Apply", None);
+    let at = scroll_to(&mut app, "Cancel", None);
     workspace::click(&mut app, &ctx, size, at);
     assert!(app.free_transform.is_none());
     assert_eq!(workspace::source(&app), before);

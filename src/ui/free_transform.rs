@@ -82,6 +82,10 @@ pub(super) struct Editor {
     inputs: [Option<Rect>; 9],
     #[cfg(test)]
     projective_inputs: [Option<Rect>; 8],
+    #[cfg(test)]
+    scroll_rect: Option<Rect>,
+    #[cfg(test)]
+    scroll_offset: Vec2,
 }
 impl Editor {
     pub(super) fn mode(&self) -> Option<Tool> {
@@ -692,6 +696,10 @@ impl PeerBrush {
             inputs: [None; 9],
             #[cfg(test)]
             projective_inputs: [None; 8],
+            #[cfg(test)]
+            scroll_rect: None,
+            #[cfg(test)]
+            scroll_offset: Vec2::ZERO,
         });
         self.free_transform_frame = true;
         self.last_preview = None;
@@ -947,10 +955,15 @@ impl PeerBrush {
             .id(egui::Id::new("free transform"))
             .open(&mut open)
             .resizable(false)
-            .vscroll(true)
             .collapsible(false)
             .default_width(330.)
+            .default_height(ctx.screen_rect().height())
             .show(ctx, |ui| {
+                let response = egui::ScrollArea::vertical()
+                    .id_salt("free transform controls")
+                    .auto_shrink([true, true])
+                    .drag_to_scroll(false)
+                    .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (mode, label) in [
                         (Tool::Move, "Move"),
@@ -1116,6 +1129,14 @@ impl PeerBrush {
                             && ctx.input(|i| i.key_pressed(egui::Key::Enter)));
                     cancel = ui.button("Cancel").clicked();
                 });
+                    });
+                #[cfg(test)]
+                {
+                    editor.scroll_rect = Some(response.inner_rect);
+                    editor.scroll_offset = response.state.offset;
+                }
+                #[cfg(not(test))]
+                let _ = response;
             });
         if !open || cancel {
             self.free_transform = Some(editor);
