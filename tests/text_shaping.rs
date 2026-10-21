@@ -71,13 +71,38 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
         let id = engine.doc.layers[0].id.clone();
         let clip = layer_clipboard::copy(&engine.doc, &[id.clone()]).unwrap();
         let mut destination = Document::new_depth(220, 120, depth).unwrap();
+        let mut original_destination = destination.layers[0].clone();
         let pasted = layer_clipboard::paste(&mut destination, &clip, "").unwrap();
         assert_eq!(pasted.len(), 1);
-        assert_eq!(destination.layers[0].source, Some(source()));
+        let copied = destination
+            .layers
+            .iter()
+            .find(|layer| layer.id == pasted[0])
+            .unwrap();
+        assert_eq!(copied.source, Some(source()));
+        assert_eq!(copied.pixels.depth, depth);
         assert_eq!(
-            destination.layers[0].pixels.rgba16(),
-            engine.doc.layers[0].pixels.rgba16()
+            (copied.x, copied.y),
+            (engine.doc.layers[0].x, engine.doc.layers[0].y)
         );
+        assert_eq!(copied.pixels.rgba16(), engine.doc.layers[0].pixels.rgba16());
+        // Paste wraps the original top-level paint destination; returned IDs
+        // identify copied roots, independently of their position in the stack.
+        let parent = copied.parent.as_ref().expect("Paste destination wrapper");
+        let wrapper = destination
+            .layers
+            .iter()
+            .find(|layer| &layer.id == parent)
+            .unwrap();
+        assert_eq!(wrapper.kind, "group");
+        assert!(wrapper.parent.is_none());
+        let retained = destination
+            .layers
+            .iter()
+            .find(|layer| layer.id == original_destination.id)
+            .unwrap();
+        original_destination.parent = Some(parent.clone());
+        assert_eq!(json!(retained), json!(original_destination));
         let before = snapshot(&engine);
         let mut changed = source();
         if let Content::Text { text, .. } = &mut changed.content {
@@ -92,9 +117,15 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
             .is_err());
         assert_eq!(snapshot(&engine), before);
         engine.leases.clear();
+        // Snapshot-derived properties use exact source guards in addition to
+        // expected_revision's optimistic, disjoint-edit conflict handling.
+        let mut stale = update.clone();
+        stale["document_id"] = json!(engine.doc.id);
+        stale["source_revision"] = json!(0);
         assert!(engine
-            .edit("human", &[update.clone()], Some(0), None, "Stale")
-            .is_err());
+            .edit("human", &[stale], Some(0), None, "Stale")
+            .unwrap_err()
+            .contains("The source project changed."));
         assert_eq!(snapshot(&engine), before);
         engine.doc.layers[0].locked = true;
         let locked = snapshot(&engine);

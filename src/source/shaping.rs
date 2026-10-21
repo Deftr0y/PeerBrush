@@ -674,15 +674,19 @@ mod tests {
                     before_reserved
                 );
                 engine.leases.clear();
+                // expected_revision permits disjoint edits; sampled source definitions
+                // also require the exact source guard used by the native text editor.
+                let document_id = engine.doc.id.clone();
                 assert!(engine
                     .edit(
                         "human",
-                        &[serde_json::json!({"op":"source.update","layer":id,"source":definition})],
+                        &[serde_json::json!({"op":"source.update","layer":id,"source":definition,"document_id":document_id,"source_revision":0})],
                         Some(0),
                         None,
                         "Stale shaped text"
                     )
-                    .is_err());
+                    .unwrap_err()
+                    .contains("The source project changed."));
                 assert_eq!(
                     serde_json::json!({"doc":engine.doc,"png":engine.doc.export_png().unwrap(),"undo":engine.undo.len(),"redo":engine.redo.len()}),
                     before_reserved
