@@ -2305,6 +2305,7 @@ dependencies = [
  "eframe",
  "flate2",
  "fontdb",
+ "harfrust",
  "image",
  "jpegxl-sys",
  "libc",

@@ -27,6 +27,7 @@ fn text() -> Source {
         matrix: [1., 0., 0., 1., 0., 0.],
         content: Content::Text {
             text: "PeerBrush\nEditable".into(),
+            layout: peerbrush::source::TextLayout::Legacy,
             font: "regular".into(),
             size: 24.,
             line_height: 1.2,

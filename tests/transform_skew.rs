@@ -534,6 +534,7 @@ fn folders_sources_and_protocol_use_shared_skew_without_rasterizing_definitions(
             },
             Content::Text {
                 text: "AV".into(),
+                layout: peerbrush::source::TextLayout::Legacy,
                 font: "regular".into(),
                 size: 12.,
                 line_height: 1.2,

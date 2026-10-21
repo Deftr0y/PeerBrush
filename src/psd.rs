@@ -268,6 +268,18 @@ fn has_letter_spacing(doc: &Document) -> bool {
     })
 }
 
+fn has_shaped_text(doc: &Document) -> bool {
+    doc.layers.iter().any(|layer| {
+        matches!(
+            layer.source.as_ref().map(|source| &source.content),
+            Some(crate::source::Content::Text {
+                layout: crate::source::TextLayout::Shaped,
+                ..
+            })
+        )
+    })
+}
+
 fn has_installed_fonts(doc: &Document) -> bool {
     doc.layers.iter().any(|layer| {
         matches!(
@@ -1131,7 +1143,9 @@ fn encode_layout_to<S: Read + Write + Seek>(
     drop(standard);
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if crate::retained::has_warps(doc) {
+        format: if has_shaped_text(doc) {
+            34
+        } else if crate::retained::has_warps(doc) {
             33
         } else if crate::retained::has_projective(doc) {
             32
@@ -2185,7 +2199,8 @@ fn decode_parts(
         let result = embedded_source(ZlibDecoder::new(bytes), limit, control);
         control.check()?;
         if let Ok(mut e) = result {
-            if (1..=33).contains(&e.format)
+            if (1..=34).contains(&e.format)
+                && (e.format >= 34 || !has_shaped_text(&e.document))
                 && (e.format >= 33 || !crate::retained::has_warps(&e.document))
                 && (e.format >= 32 || !crate::retained::has_projective(&e.document))
                 && (e.format >= 31 || !has_installed_fonts(&e.document))

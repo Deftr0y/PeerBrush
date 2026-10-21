@@ -123,6 +123,7 @@ fn installed_text_format_31_retains_native_standard_channels_masks_composite_and
             matrix: [1., 0., 0., 1., 0., 0.],
             content: Content::Text {
                 text: "Native text".into(),
+                layout: peerbrush::source::TextLayout::Legacy,
                 font: "regular".into(),
                 size: 17.,
                 line_height: 1.2,

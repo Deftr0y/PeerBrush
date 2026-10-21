@@ -564,6 +564,7 @@ fn text_source() -> Source {
         matrix: [1., 0., 0., 1., 0., 0.],
         content: Content::Text {
             text: "Existing".into(),
+            layout: crate::source::TextLayout::Legacy,
             font: "regular".into(),
             size: 24.,
             line_height: 1.2,
@@ -571,6 +572,92 @@ fn text_source() -> Source {
             align: "left".into(),
             color: [12501, 23003, 34507, 65535],
         },
+    }
+}
+
+#[test]
+fn explicit_shaped_layout_control_previews_native_pixels_caches_unchanged_validation_and_applies_once(
+) {
+    for depth in [8, 16] {
+        let (mut app, ctx, file) = fixture(depth);
+        let (id, _, local) = existing_field(&mut app);
+        let before = state(&app);
+        text_tool(&mut app, &ctx);
+        let at = point(&app, local);
+        click(&mut app, &ctx, at);
+        assert_eq!(
+            app.source_editor.as_ref().unwrap().layer.as_deref(),
+            Some(id.as_str())
+        );
+        replace_text(&mut app, &ctx, "Existing", "office a\u{0301}");
+        let output = draw(&mut app, &ctx, vec![], Default::default());
+        click(&mut app, &ctx, label(&output, "Ligatures and joining"));
+        assert!(matches!(
+            app.source_editor.as_ref().unwrap().source.content,
+            Content::Text {
+                layout: crate::source::TextLayout::Shaped,
+                ..
+            }
+        ));
+        let expected = command_preview(&app);
+        settle(&mut app, &ctx, &expected);
+        let runs = app.source_editor.as_ref().unwrap().validation_runs;
+        assert_eq!(runs, 1);
+        for _ in 0..8 {
+            draw(&mut app, &ctx, vec![], Default::default());
+        }
+        assert_eq!(app.source_editor.as_ref().unwrap().validation_runs, runs);
+        assert_eq!(state(&app), before);
+        number(&mut app, &ctx, "Letter spacing", "0", "2.5");
+        let expected = command_preview(&app);
+        settle(&mut app, &ctx, &expected);
+        assert_eq!(
+            app.source_editor.as_ref().unwrap().validation_runs,
+            runs + 1
+        );
+        assert_eq!(state(&app), before);
+        let draft = app.source_editor.as_ref().unwrap().source.clone();
+        let output = draw(&mut app, &ctx, vec![], Default::default());
+        click(&mut app, &ctx, label(&output, "Apply"));
+        assert!(app.source_editor.is_none());
+        {
+            let mut engine = app.shared.lock().unwrap();
+            let applied = engine
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.id == id)
+                .unwrap();
+            assert_eq!(applied.source, Some(draft));
+            assert_eq!(applied.pixels.depth, depth);
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                expected.export_png().unwrap()
+            );
+            assert_eq!(
+                engine.undo.len(),
+                before["undo"].as_array().unwrap().len() + 1
+            );
+            engine.undo("human").unwrap();
+            assert_eq!(json!(engine.doc.layers), before["doc"]["layers"]);
+            engine.redo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                expected.export_png().unwrap()
+            );
+        }
+        let current = app.shared.lock().unwrap().doc.clone();
+        app.selected = id;
+        app.open_source(&current, "edit");
+        draw(&mut app, &ctx, vec![], Default::default());
+        let before_cancel = state(&app);
+        let output = draw(&mut app, &ctx, vec![], Default::default());
+        click(&mut app, &ctx, label(&output, "Ligatures and joining"));
+        let output = draw(&mut app, &ctx, vec![], Default::default());
+        click(&mut app, &ctx, label(&output, "Cancel"));
+        assert!(app.source_editor.is_none());
+        assert_eq!(state(&app), before_cancel);
+        file.unchanged();
     }
 }
 

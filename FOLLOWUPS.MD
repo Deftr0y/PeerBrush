@@ -516,3 +516,6 @@ PB-145/PB-154 Mac producer caller completion (unreleased, dormant): native activ
 
 
 PB-068/PB-108 supplementary loading increment (unreleased, replay pending): decoded JSON streams through64KiB buffered reads with unchanged128/512MiB bounds, real end/checksum checks, cancellability and exact native/source/standard-hash/metadata/protected-fallback gates. Four regular methods and one ignored old/new component diagnostic are prepared; independent source review and pinned formatting passed. Combined parity and measured cost remain pending; no total-memory, speedup or16000-square claim is made.
+
+
+PB-066 shaped text increment (unreleased, combined replay pending): explicit opt-in Ligatures and joining uses shared native bidi/script/cluster/font-face layout; omitted legacy fields keep their original rendering/serialization. Format34 retains actual standard native channels/current composites and missing-font baked sources. Reviewed prepared Arabic/Indic/Latin, collection-face, whitespace/variation, shared protocol/preview/atomic/native storage/UI-cache fixtures use pinned licensed source-only fonts. Independent source review and formatting passed; combined/native visible/installed-font/receiver acceptance and exhaustive hostile-font completion remain open.

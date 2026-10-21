@@ -6,6 +6,7 @@ use crate::{
 use ab_glyph::{point, Font, FontArc, FontRef, PxScale, ScaleFont};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+mod shaping;
 
 fn identity() -> [f32; 6] {
     [1., 0., 0., 1., 0., 0.]
@@ -22,6 +23,18 @@ pub struct Source {
     pub matrix: [f32; 6],
     pub content: Content,
 }
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextLayout {
+    #[default]
+    Legacy,
+    Shaped,
+}
+impl TextLayout {
+    fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Content {
@@ -34,6 +47,8 @@ pub enum Content {
     },
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "TextLayout::is_legacy")]
+        layout: TextLayout,
         font: crate::fonts::TextFont,
         size: f32,
         line_height: f32,
@@ -124,7 +139,31 @@ fn outline_work(bounds: ab_glyph::Rect, previous: u64) -> Result<u64, String> {
 }
 impl Source {
     pub fn validate(&self) -> Result<(), String> {
-        self.validated_font().map(|_| ())
+        let font = self.validated_font()?;
+        if matches!(
+            self.content,
+            Content::Text {
+                layout: TextLayout::Shaped,
+                ..
+            }
+        ) {
+            self.validate_shaped_snapshot(font.as_ref().ok_or("Validated text font is missing")?)?;
+        }
+        Ok(())
+    }
+    /// The source UI retains exactly the owned snapshot selected for this draft.
+    pub(crate) fn validate_shaped_snapshot(&self, font: &FontArc) -> Result<(), String> {
+        self.validate_definition()?;
+        if !matches!(
+            self.content,
+            Content::Text {
+                layout: TextLayout::Shaped,
+                ..
+            }
+        ) {
+            return Err("Shaped validation requires a shaped text source".into());
+        }
+        shaping::layout(self, font).map(|_| ())
     }
     /// Saved native projections remain usable without an installed font snapshot.
     pub fn validate_structure(&self) -> Result<(), String> {
@@ -132,6 +171,7 @@ impl Source {
         if let Content::Text {
             text,
             font: crate::fonts::TextFont::Bundled(name),
+            layout: TextLayout::Legacy,
             ..
         } = &self.content
         {
@@ -148,12 +188,18 @@ impl Source {
     }
     fn validated_font(&self) -> Result<Option<FontArc>, String> {
         self.validate_definition()?;
-        if let Content::Text { text, font, .. } = &self.content {
-            if matches!(font, crate::fonts::TextFont::Installed(_)) {
+        if let Content::Text {
+            text, font, layout, ..
+        } = &self.content
+        {
+            if *layout == TextLayout::Legacy && matches!(font, crate::fonts::TextFont::Installed(_))
+            {
                 validate_installed_text(text)?;
             }
             let font = crate::fonts::snapshot(font).map_err(|error| error.to_string())?;
-            validate_glyphs(&font, text)?;
+            if *layout == TextLayout::Legacy {
+                validate_glyphs(&font, text)?;
+            }
             return Ok(Some(font));
         }
         Ok(None)
@@ -216,6 +262,7 @@ impl Source {
             Content::Text {
                 text,
                 font: name,
+                layout,
                 size,
                 line_height,
                 letter_spacing,
@@ -225,6 +272,7 @@ impl Source {
                 if text.len() > 16384
                     || text.chars().count() > 4096
                     || text.lines().count() > 96
+                    || (*layout == TextLayout::Shaped && text.split('\n').count() > 96)
                     || !size.is_finite()
                     || !(1. ..=1024.).contains(size)
                     || !line_height.is_finite()
@@ -239,11 +287,14 @@ impl Source {
                 }
                 name.validate().map_err(|error| error.to_string())?;
                 for ch in text.chars().filter(|c| *c != '\n') {
-                    // This deterministic glyph renderer does not perform shaping or bidi.
                     if ch.is_control()
-                        || matches!(ch as u32,0x200c..=0x200f|0x202a..=0x202e|0x2066..=0x2069)
-                        || (name.bundled_name().is_some()
-                            && matches!(ch as u32,0x0300..=0x036f|0x0590..=0x08ff|0x0900..=0x0fff))
+                        || matches!(ch as u32,0x200e..=0x200f|0x202a..=0x202e|0x2066..=0x2069)
+                        || (*layout == TextLayout::Shaped
+                            && matches!(ch, '\u{061c}' | '\u{2028}' | '\u{2029}'))
+                        || (*layout == TextLayout::Legacy
+                            && (matches!(ch as u32, 0x200c..=0x200d)
+                                || (name.bundled_name().is_some()
+                                    && matches!(ch as u32,0x0300..=0x036f|0x0590..=0x08ff|0x0900..=0x0fff))))
                     {
                         return Err("This text needs an unsupported glyph or script shaping. Use supported plain text or explicitly rasterize it externally.".into());
                     }
@@ -335,12 +386,38 @@ impl Source {
             };
             return projected.render_validated(w, h, depth, None);
         }
+        let shaped = if matches!(
+            self.content,
+            Content::Text {
+                layout: TextLayout::Shaped,
+                ..
+            }
+        ) {
+            Some(shaping::layout(
+                self,
+                font.ok_or("Validated text font is missing")?,
+            )?)
+        } else {
+            None
+        };
         let mut base = Raster::new_depth(self.width, self.height, depth);
         match &self.content {
             Content::Bezier { .. } => {
                 unreachable!("Cubic paths project through validated native geometry")
             }
             Content::Svg { .. } => unreachable!("SVG projects directly from its vector definition"),
+            Content::Text {
+                layout: TextLayout::Shaped,
+                color,
+                ..
+            } => {
+                shaping::paint(
+                    &mut base,
+                    *color,
+                    font.ok_or("Validated text font is missing")?,
+                    shaped.ok_or("Shaped text layout is missing")?,
+                )?;
+            }
             Content::Text {
                 text,
                 size,
@@ -770,6 +847,7 @@ mod tests {
             matrix: identity(),
             content: Content::Text {
                 text: "AV PeerBrush\nNative text".into(),
+                layout: crate::source::TextLayout::Legacy,
                 font,
                 size: 22.,
                 line_height: 1.2,

@@ -12,12 +12,57 @@ pub(super) struct Editor {
     pub placement: Option<Placement>,
     apply_error: Option<String>,
     font_search: String,
+    validation: Option<Validation>,
+    #[cfg(test)]
+    pub(super) validation_runs: usize,
+}
+struct Validation {
+    source: Source,
+    font: ab_glyph::FontArc,
+    result: Result<(), String>,
 }
 pub(super) struct Placement {
     anchor: [f32; 2],
     dragged: bool,
 }
 impl Editor {
+    fn invalid(&mut self) -> Option<String> {
+        use ab_glyph::Font;
+        let Content::Text {
+            layout: crate::source::TextLayout::Shaped,
+            font,
+            ..
+        } = &self.source.content
+        else {
+            self.validation = None;
+            return self.source.validate().err();
+        };
+        let font = match crate::fonts::snapshot(font) {
+            Ok(font) => font,
+            Err(error) => {
+                self.validation = None;
+                return Some(error.to_string());
+            }
+        };
+        if let Some(validation) = &self.validation {
+            if validation.source == self.source
+                && std::ptr::eq(validation.font.font_data(), font.font_data())
+            {
+                return validation.result.clone().err();
+            }
+        }
+        let result = self.source.validate_shaped_snapshot(&font);
+        #[cfg(test)]
+        {
+            self.validation_runs += 1;
+        }
+        self.validation = Some(Validation {
+            source: self.source.clone(),
+            font,
+            result: result.clone(),
+        });
+        result.err()
+    }
     pub fn command(&self) -> Value {
         json!({"op":if self.layer.is_some(){"source.update"}else{"source.add"},"layer":self.layer,"parent":self.parent,"source":self.source,"x":self.x,"y":self.y,"document_id":self.document,"source_revision":self.revision})
     }
@@ -75,6 +120,7 @@ impl PeerBrush {
             let content = if kind == "text" {
                 Content::Text {
                     text: "Text".into(),
+                    layout: crate::source::TextLayout::Legacy,
                     font: "regular".into(),
                     size: 48.,
                     line_height: 1.2,
@@ -128,6 +174,9 @@ impl PeerBrush {
             placement: None,
             apply_error: None,
             font_search: String::new(),
+            validation: None,
+            #[cfg(test)]
+            validation_runs: 0,
         });
         self.last_preview = None;
     }
@@ -372,6 +421,7 @@ impl PeerBrush {
                     }
                     Content::Text {
                         text,
+                        layout,
                         font,
                         size,
                         line_height,
@@ -386,6 +436,10 @@ impl PeerBrush {
                                 .char_limit(4096)
                                 .frame(false),
                         );
+                        let mut shaped = *layout == crate::source::TextLayout::Shaped;
+                        if ui.checkbox(&mut shaped, "Ligatures and joining").on_hover_text("Enable font shaping and bidirectional ordering. Existing text keeps its original layout until enabled.").changed() {
+                            *layout = if shaped { crate::source::TextLayout::Shaped } else { crate::source::TextLayout::Legacy };
+                        }
                         ui.horizontal(|ui| {
                             font_picker(ui, font, &mut e.font_search);
                             ui.label("Size");
@@ -475,7 +529,7 @@ impl PeerBrush {
                         });
                     }
                 }
-                let invalid = e.source.validate().err();
+                let invalid = e.invalid();
                 valid = invalid.is_none();
                 let pending = |error: &String| {
                     [
@@ -665,4 +719,105 @@ fn font_picker(ui: &mut egui::Ui, font: &mut crate::fonts::TextFont, search: &mu
         })
         .response
         .on_hover_text(label);
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::fonts::{self, FontError, InstalledFont, TextFont};
+    #[test]
+    fn shaped_validation_reuses_only_current_source_and_owned_ready_font_and_retries_status_changes(
+    ) {
+        let reference = InstalledFont {
+            family: "Synthetic validation fixture".into(),
+            postscript: "PeerBrushSynthetic-Regular".into(),
+            style: "normal".into(),
+            weight: 400,
+            stretch: 5,
+            index: 0,
+            sha256: "0".repeat(64),
+        };
+        let font = ab_glyph::FontArc::new(crate::source::font("regular").unwrap());
+        let source = Source {
+            width: 180,
+            height: 96,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: Content::Text {
+                text: "office a\u{0301}".into(),
+                layout: crate::source::TextLayout::Shaped,
+                font: TextFont::Installed(reference.clone()),
+                size: 24.,
+                line_height: 1.2,
+                letter_spacing: 0.,
+                align: "left".into(),
+                color: [12501, 23003, 34507, 65535],
+            },
+        };
+        let mut editor = Editor {
+            document: "synthetic-document".into(),
+            revision: 0,
+            layer: None,
+            parent: None,
+            source,
+            x: 0,
+            y: 0,
+            error: None,
+            placement: None,
+            apply_error: None,
+            font_search: String::new(),
+            validation: None,
+            validation_runs: 0,
+        };
+        {
+            let guard = fonts::test_fonts(vec![(reference.clone(), Ok(font.clone()))]);
+            assert_eq!(editor.invalid(), None);
+            assert_eq!(editor.validation_runs, 1);
+            for _ in 0..8 {
+                assert_eq!(editor.invalid(), None);
+            }
+            assert_eq!(editor.validation_runs, 1);
+            assert_eq!(
+                guard.requests(),
+                9,
+                "One cache-only snapshot check per validation; no second resolution"
+            );
+            if let Content::Text { text, .. } = &mut editor.source.content {
+                *text = "\u{10ffff}".into();
+            }
+            assert!(editor.invalid().is_some());
+            assert_eq!(editor.validation_runs, 2);
+            assert!(editor.invalid().is_some());
+            assert_eq!(
+                editor.validation_runs, 2,
+                "Invalid layout is cached only for the same Source and snapshot"
+            );
+            if let Content::Text { text, .. } = &mut editor.source.content {
+                *text = "office".into();
+            }
+            assert_eq!(editor.invalid(), None);
+            assert_eq!(editor.validation_runs, 3);
+        }
+        {
+            let _guard = fonts::test_fonts(vec![(reference.clone(), Err(FontError::Loading))]);
+            assert_eq!(editor.invalid(), Some(FontError::Loading.to_string()));
+            assert!(editor.validation.is_none());
+        }
+        {
+            let _guard = fonts::test_fonts(vec![(reference.clone(), Ok(font.clone()))]);
+            assert_eq!(editor.invalid(), None);
+            assert_eq!(editor.validation_runs, 4);
+        }
+        {
+            let same_bytes = ab_glyph::FontArc::try_from_vec(
+                include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf").to_vec(),
+            )
+            .unwrap();
+            let _guard = fonts::test_fonts(vec![(reference, Ok(same_bytes))]);
+            assert_eq!(editor.invalid(), None);
+            assert_eq!(
+                editor.validation_runs, 5,
+                "A different owned snapshot invalidates derived layout validation"
+            );
+        }
+    }
 }

@@ -10934,6 +10934,7 @@ mod tests {
                 matrix: [1., 0., 0., 1., 0., 0.],
                 content: crate::source::Content::Text {
                     text: "Hi".into(),
+                    layout: crate::source::TextLayout::Legacy,
                     font: TextFont::Installed(font),
                     size: 16.,
                     line_height: 1.2,
@@ -11072,6 +11073,7 @@ mod tests {
                         matrix: [1., 0., 0., 1., 0., 0.],
                         content: crate::source::Content::Text {
                             text: "Hi".into(),
+                            layout: crate::source::TextLayout::Legacy,
                             font: TextFont::Installed(font.clone()),
                             size: 16.,
                             line_height: 1.2,

@@ -3,17 +3,53 @@
   "coordinates": "Document pixels. rect=[left,top,right,bottom], right/bottom exclusive.",
   "brush_library": {
     "tool": "peerbrush_brushes",
-    "actions": ["list", "preview", "save", "delete"],
+    "actions": [
+      "list",
+      "preview",
+      "save",
+      "delete"
+    ],
     "presets": "26 original procedural presets, with Basic first: Hard Round, Soft Round, Pencil, Ink Pen and Airbrush; followed by Sketch, Ink, Paint, Airbrush, Texture and Blend. List returns stable IDs and complete shared settings. Paint/smudge/clone/heal accepts preset:ID; explicit settings override it before reservation scopes are checked.",
     "custom": "Instance-local brushes.json, outside document history and PSD sources. save without id creates a custom brush; id updates only an existing custom brush. Curated brushes are immutable. Maximum 256 custom brushes/4 MiB; invalid or externally changed files are preserved and writes refused.",
-    "preview": "Actual shared-engine pressure stroke PNG, 64–512 by 24–128, coordinate_space brush_preview and rect [0,0,width,height]. This rectangle is not a document placement.",
-    "pressure_gamma": "0.1–4, default 1 (linear). response = clamp((pressure-pressure_min)/(pressure_max-pressure_min),0,1)^gamma before size/opacity and taper. pressure_min/max are 0–1, default 0/1, minimum gap 0.01. Below 1 responds more at light force; above 1 needs more force. Native16 and mouse taper remain unchanged.",
-    "example": {"op":"paint","layer":"ID","preset":"brush-pen","radius":12,"points":[[20,30],[100,50]],"pressures":[0.2,0.9],"color":[240,100,30,255]},
+    "preview": "Actual shared-engine pressure stroke PNG, 64\u2013512 by 24\u2013128, coordinate_space brush_preview and rect [0,0,width,height]. This rectangle is not a document placement.",
+    "pressure_gamma": "0.1\u20134, default 1 (linear). response = clamp((pressure-pressure_min)/(pressure_max-pressure_min),0,1)^gamma before size/opacity and taper. pressure_min/max are 0\u20131, default 0/1, minimum gap 0.01. Below 1 responds more at light force; above 1 needs more force. Native16 and mouse taper remain unchanged.",
+    "example": {
+      "op": "paint",
+      "layer": "ID",
+      "preset": "brush-pen",
+      "radius": 12,
+      "points": [
+        [
+          20,
+          30
+        ],
+        [
+          100,
+          50
+        ]
+      ],
+      "pressures": [
+        0.2,
+        0.9
+      ],
+      "color": [
+        240,
+        100,
+        30,
+        255
+      ]
+    },
     "limits": "Five procedural tips; no proprietary brush assets or .brush/.brushset import. Blend settings operate on existing pigment through smudge; ordinary paint uses the same tip/coverage settings."
   },
   "ai_proposals": {
     "tool": "peerbrush_proposal",
-    "actions": ["create", "list", "preview", "accept", "reject"],
+    "actions": [
+      "create",
+      "list",
+      "preview",
+      "accept",
+      "reject"
+    ],
     "behavior": "Optional frozen native-depth drafts. Direct peerbrush_edit remains available. Create requires document_id and expected_revision. Preview returns actual PNG content, document_rect and preview_only:true. Human acceptance commits the reviewed result as one AI-authored history step; changed sources, reservations and ended tasks reject acceptance.",
     "limits": "Four pending drafts, 256 MiB additional unique native raster tiles, 100 commands/8 MiB per draft, 15-minute expiry, 16 transient metadata records. No proposals are saved in PSD or recovery files. Task-bound drafts require their reservation to remain active.",
     "task_recovery": "peerbrush_task action recovery returns active tasks and up to 100 recent ended/expired/taken-over task records with scopes. Committed edits remain; no automatic rollback or reservation restart. Use selective task undo for an explicit compensation."
@@ -868,7 +904,7 @@
     ],
     "empty": "Active zero-coverage selection; selection=null means deselected.",
     "object_region": "Deterministic perimeter-color extraction. Use peerbrush_segment for learned subject/object confidence.",
-    "refinement": "selection.refine and mask.refine accept smooth 0–32 px, feather 0–64 px, shift -32–32 px, contrast 0–100%, edge 0–100% and edge_radius 1–32 px. Image-guided feathering uses merged colors by default; sample_merged:false and layer select one source. Native16 mask words and original mask steps remain intact. source_revision/document_id protect snapshot-dependent results.",
+    "refinement": "selection.refine and mask.refine accept smooth 0\u201332 px, feather 0\u201364 px, shift -32\u201332 px, contrast 0\u2013100%, edge 0\u2013100% and edge_radius 1\u201332 px. Image-guided feathering uses merged colors by default; sample_merged:false and layer select one source. Native16 mask words and original mask steps remain intact. source_revision/document_id protect snapshot-dependent results.",
     "mask_from_selection": "mask.from_selection on a layer maps document coverage into its native local mask frame. mode replace/add/subtract/intersect; one undoable editable paint step.",
     "confidence_import": "selection.import accepts one PNG path or base64 png, an explicit in-canvas document rect, channel luma/alpha and selection mode. Bilinear confidence resampling preserves soft edges. Maximum document/mask size 16 megapixels; original image channels stay unchanged.",
     "preview": "peerbrush_observe selection_view cutout/mask/overlay returns presentation-only PNG feedback with actual document coordinates."
@@ -891,7 +927,7 @@
       ],
       "mode": "replace"
     },
-    "limits": "One inference at a time, 2048-pixel preview edge, 16-megapixel document, 16 MiB JSON input/output and configurable 1–180 second timeout. Source revision/project changes cancel the result; leases and history use the shared engine."
+    "limits": "One inference at a time, 2048-pixel preview edge, 16-megapixel document, 16 MiB JSON input/output and configurable 1\u2013180 second timeout. Source revision/project changes cancel the result; leases and history use the shared engine."
   },
   "retouch": {
     "commands": [
@@ -902,7 +938,7 @@
     "guards": "Optional document_id and exact source_revision reject stale or different source documents. Shared expected_revision, task reservations and locks apply.",
     "mask": "mask:true writes the active paint mask step. Source is evaluated layer mask or explicit source_step paint ID. No merged artwork into masks.",
     "precision": "Native16 source samples, premultiplied fractional interpolation and grayscale values remain native16. Heal preserves destination alpha and transparent hidden pixels.",
-    "limits": "Merged sampling 16 MP; heal_radius integer 1–64 (default brush radius clamped 1–32). Brush work budgets apply.",
+    "limits": "Merged sampling 16 MP; heal_radius integer 1\u201364 (default brush radius clamped 1\u201332). Brush work budgets apply.",
     "algorithm": "Clone copies sampled color/alpha through brush coverage. Heal transfers texture with local average color adaptation; not full Photoshop healing."
   },
   "document_geometry": {
@@ -941,15 +977,27 @@
     "limits": "Current plus original tiles count against 512 MiB document memory. 8192 per edge, 32 MP, 128 million output samples per layer command; singular/nonfinite/out-of-range/nested sources refused atomically.",
     "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists.",
     "translation": {
-      "fields": ["dx", "dy"],
-      "pixels": [-100000, 100000],
+      "fields": [
+        "dx",
+        "dy"
+      ],
+      "pixels": [
+        -100000,
+        100000
+      ],
       "default": 0,
       "rounding": "Round to whole document pixels by default; snap:true uses the existing 8-pixel grid. A strict boolean fractional_translation:true opts transform commands into fractional dx/dy within the same bounds; absent/false preserves legacy arithmetic and move remains integer.",
       "behavior": "Translation follows the affine placement in the same source-sampling pass, including selected coverage, masks and editable sources; no separate selected-pixel cut."
     },
     "skew": {
-      "fields": ["skew_x", "skew_y"],
-      "degrees": [-80, 80],
+      "fields": [
+        "skew_x",
+        "skew_y"
+      ],
+      "degrees": [
+        -80,
+        80
+      ],
       "default": 0,
       "order": "Horizontal shear then vertical shear, then scale/reflection and rotation, around the document-space pivot. Each angle contributes tan(degrees); positive X moves the bottom right, positive Y moves the right edge down.",
       "snap": "Explicit skew fields snap to the existing 15-degree grid when snap:true; raw bounds still apply.",
@@ -1008,14 +1056,24 @@
       "source.rasterize"
     ],
     "observation": "Each layer exposes its complete source definition or null. Preserve current width/height/matrix when editing content.",
-    "text": "Text/T creates or edits a canvas field. Bundled Ubuntu Sans regular/medium/semibold, explicit multiline plain text, kerning, size, line_height, letter_spacing (native pixels between glyphs, default 0), left/center/right alignment, native RGBA16 color. Missing glyphs or scripts needing shaping/bidi are refused. Installed static outline fonts use exact metadata from peerbrush_fonts; loading/missing/changed/unsupported states are explicit. No automatic wrapping or font substitution.",
+    "text": "Text/T retains editable fields, bundled Ubuntu Sans or exact installed static-outline fonts, explicit newlines, size/line_height/letter_spacing, alignment and native RGBA16. Omitted layout is legacy and never silently reflows; explicit layout:shaped enables exact-font ligatures/combining/script+bidi layout through native outlines. No automatic wrapping or font substitution. Loading/missing/changed/unsupported states are explicit.",
     "shapes": "Rectangle, ellipse, or straight-segment path with editable points, even-odd fill, open/closed flag, stroke and stroke_width. Native RGBA16 fill/stroke colors.",
     "svg": "Self-contained static UTF-8 SVG/SVGZ retains original markup and editable affine placement. Paths/curves, basic shapes, groups, solid colors, linear/radial gradients, local use and clip paths are supported. Text must be outlined; raster images, filters, masks, patterns, stylesheets, scripts/animation, external resources and unknown visual properties reject. SVG coverage/colors project through RGBA8, promoted for native16 projects; existing native16 raster channels remain exact. image.import retains the definition; image.place and external image-file paste rasterize it.",
     "coordinates": "Source width/height define local frame. x/y on add are document origins. Optional matrix=[a,b,c,d,tx,ty] maps local coordinates to current raster frame, identity by default. source.update may resize a Text field, preserving document placement, native masks and effects; the projection retains its previous extent. Read the updated source/frame from observation. Other source kinds keep their fixed-frame update restriction.",
-    "precision": "Native text/shapes use colors 0–65535 regardless of document depth; native16 projections preserve words and sub-byte antialias coverage. 8-bit documents project at their own boundary. SVG uses the explicitly described RGBA8 projection while retaining its original markup.",
+    "precision": "Native text/shapes use colors 0\u201365535 regardless of document depth; native16 projections preserve words and sub-byte antialias coverage. 8-bit documents project at their own boundary. SVG uses the explicitly described RGBA8 projection while retaining its original markup.",
     "guards": "Complete-layer transforms preserve definitions; selected-pixel/mask transforms require explicit rasterization. Color painting/placement refuses source layers. Mask painting and effects remain editable. Shared stale/revision/lock/reservation guards are atomic.",
-    "psd": "Private source format 8 supports native text/shapes; SVG requires format 12; nonzero text letter_spacing requires format 30; installed-font references require format 31. All supplement current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
-    "limits": "4 MP original source frame. Native text/shapes: 4096 characters / 96 lines, size 1–1024, line_height 0.5–4, letter_spacing -1024–1024, 128 path points, stroke_width 0–256, 32 million outline/path work budget. Text field resizing additionally enforces raster, coordinate, mask and native work budgets. SVG: 512 KiB UTF-8 markup, 1 MiB compressed SVGZ, 4096 XML nodes, bounded reference expansion, geometry, nesting, render work and memory. External resource resolvers are disabled."
+    "psd": "Private source format 8 supports native text/shapes; SVG requires format 12; nonzero text letter_spacing requires format 30; installed-font references require format 31; explicit shaped text requires format 34. All supplement current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
+    "limits": "4 MP original source frame. Native text/shapes: 4096 characters / 96 lines / 16384 shaped glyphs, shaped coordinates \u00b1100000, size 1\u20131024, line_height 0.5\u20134, letter_spacing -1024\u20131024, 128 path points, stroke_width 0\u2013256, 32 million outline/path work budget. Text field resizing additionally enforces raster, coordinate, mask and native work budgets. SVG: 512 KiB UTF-8 markup, 1 MiB compressed SVGZ, 4096 XML nodes, bounded reference expansion, geometry, nesting, render work and memory. External resource resolvers are disabled.",
+    "text_layout": {
+      "default": "legacy",
+      "values": [
+        "legacy",
+        "shaped"
+      ],
+      "ui": "Ligatures and joining",
+      "shaped": "Horizontal bidi visual runs with resolved script itemization, exact face-index font bytes, font-unit advances/offsets scaled by native font height; left/center/right align full advances including spaces. Cluster tracking keeps ligatures/marks; joining/complex scripts require zero letter spacing. Join controls/default ignorables shape invisibly; unsupported actual glyph/outline/variation, explicit bidi formatting controls, non-newline controls and over-budget output reject.",
+      "limits": "No automatic paragraph wrapping, language override, vertical text, rich text or Photoshop type objects; native installed-font and visible interaction acceptance remain pending."
+    }
   },
   "large_documents": {
     "document_actions": [
@@ -1036,8 +1094,8 @@
   "channel_clamp": {
     "settings": {
       "channel": "r, g, b or o (opacity); default r",
-      "minimum": "0–1, default 0",
-      "maximum": "0–1, default 1; must be at least minimum"
+      "minimum": "0\u20131, default 0",
+      "maximum": "0\u20131, default 1; must be at least minimum"
     },
     "processing": "Clamp one channel at native 8/16-bit precision; in-range values and other channels remain exact; stack instances for independent bounds",
     "sources": "Layer and isolated folder color stacks; original pixels retained; shared preview, strength, bypass, removal, undo and source/reservation guards",
@@ -1046,7 +1104,7 @@
   },
   "posterize": {
     "settings": {
-      "levels": "Integer 2–256, default 4"
+      "levels": "Integer 2\u2013256, default 4"
     },
     "channels": "RGB only; alpha and editable source pixels are preserved",
     "processing": "Nearest evenly spaced channel levels at native 8/16-bit depth; strength interpolates before/after at native precision",
@@ -1090,11 +1148,12 @@
       "prepare",
       "refresh"
     ],
-    "discovery": "Native DirectWrite/CoreText/Fontconfig available-font inventory on a worker; list returns exact path-free references and explicit unsupported rows. Search128 characters, default 32/max128 rows, offset0–8192. Catalog status and generation distinguish loading/unavailable from ready.",
-    "reference": "Legacy bundled regular/medium/semibold strings, or exact object: family,postscript,style(normal/italic/oblique),weight(1–1000),stretch(1–9),index(0–255),sha256(lowercase64). Use the unmodified returned record. No paths or font bytes in documents or protocol.",
+    "discovery": "Native DirectWrite/CoreText/Fontconfig available-font inventory on a worker; list returns exact path-free references and explicit unsupported rows. Search128 characters, default 32/max128 rows, offset0\u20138192. Catalog status and generation distinguish loading/unavailable from ready.",
+    "reference": "Legacy bundled regular/medium/semibold strings, or exact object: family,postscript,style(normal/italic/oblique),weight(1\u20131000),stretch(1\u20139),index(0\u2013255),sha256(lowercase64). Use the unmodified returned record. No paths or font bytes in documents or protocol.",
     "prepare": "Cache-only on UI/render callers. prepare queues an exact SHA/index-verified owned snapshot; retry ready:false/loading/busy. Shared source.add/update render with one snapshot and enforce existing atomic revision/lock/reservation guards.",
     "preservation": "Missing/changed/unsupported fonts retain saved text metadata and native raster/masks/composite; ordinary move/effects/masks/hierarchy/clipboard/save and unrelated edits remain available. Text re-render, frame resize, scale/rotation and image resize refuse until exact resolution or explicit replacement. UI replacement previews before one Apply/undo; explicit rasterization keeps saved pixels.",
-    "limits": "8192 native descriptors,256collectionfaces,8MiBmetadata,32MiBfontfile,8queuedrequests,64MiBcache plus caller-held in-flight snapshots. Static TrueType/OpenType outline faces only; variable/simulated/color/bitmap/SVG faces explicit unavailable. Plain Latin/Greek/Cyrillic/Han/precomposedHangul/Hiragana/Katakana/Bopomofo/Common glyphs only; no combining marks, joining/shaping scripts, HangulJamo, bidi or automatic wrapping.",
-    "source_format": 31
+    "limits": "8192 native descriptors,256collectionfaces,8MiBmetadata,32MiBfontfile,8queuedrequests,64MiBcache plus caller-held in-flight snapshots. Static TrueType/OpenType outline faces only; variable/simulated/color/bitmap/SVG faces explicit unavailable. Legacy layout retains plain Latin/Greek/Cyrillic/Han/precomposedHangul/Hiragana/Katakana/Bopomofo/Common limits. Explicit shaped layout supports exact-font joining, combining and bidi subject to glyph/outline/work limits; no automatic wrapping or fallback.",
+    "source_format": 31,
+    "shaped_source_format": 34
   }
 }
