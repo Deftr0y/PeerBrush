@@ -244,7 +244,7 @@ mod tests {
         let grid = Grid::preset([0., 0., 16., 12.], "arc", 0.25).unwrap();
         let c = json!({"op":"transform","warp":grid,"projective":{"rect":[0,0,16,12],"quad":[[0,0],[12.8,0],[12.8,9.6],[0,12]]},"pivot":[0,0],"scale_x":1.5,"scale_y":0.75,"dx":3,"dy":1});
         let map = CommandMap::new(&c, [8., 6.]).unwrap();
-        for p in [[0., 0.], [4., 2.], [8., 6.], [13.25, 9.5], [16., 12.]] {
+        for p in [[0.0_f64, 0.], [4., 2.], [8., 6.], [13.25, 9.5], [16., 12.]] {
             let warped_y = p[1] + 3. * (1. - (p[0] / 8. - 1.).abs());
             let divisor = 1. + p[0] / 64.;
             let expected = [p[0] / divisor * 1.5 + 3., warped_y / divisor * 0.75 + 1.];

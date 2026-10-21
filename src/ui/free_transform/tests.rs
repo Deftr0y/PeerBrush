@@ -3086,9 +3086,9 @@ fn canvas_context_modes_keep_the_same_native_map_and_flips_apply_once() {
             transform_context_choose(&mut app, &ctx, label);
             let editor = app.free_transform.as_ref().unwrap();
             match label {
-                "Move" => assert_eq!(editor.mode(), Some(Tool::Move)),
-                "Scale" => assert_eq!(editor.mode(), Some(Tool::Scale)),
-                "Rotate" => assert_eq!(editor.mode(), Some(Tool::Rotate)),
+                "Move" => assert!(editor.mode() == Some(Tool::Move)),
+                "Scale" => assert!(editor.mode() == Some(Tool::Scale)),
+                "Rotate" => assert!(editor.mode() == Some(Tool::Rotate)),
                 "Skew" => assert!(
                     editor.skew_mode && editor.projective_mode.is_none() && !editor.warp_mode
                 ),
