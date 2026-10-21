@@ -13,6 +13,7 @@ import urllib.request
 
 import prepare_site_release as site
 import test_package
+import test_deb
 from package import git
 from verify_release import verify
 
@@ -55,12 +56,13 @@ class Published(unittest.TestCase):
             return site.encode(self.release if '/releases/' in url else dict(sha=self.commit))
         data = self.assets[url.rsplit('/', 1)[-1]]
         if destination is not None:
-            destination.write_bytes(data)
+            with destination.open('xb') as stream:
+                stream.write(data)
             return destination
         return data
 
-    def published(self):
-        return site.published(self.root, self.inventory, 'v0.2.0', self.commit, self.notes, self.get)
+    def published(self, maintainer=None):
+        return site.published(self.root, self.inventory, 'v0.2.0', self.commit, self.notes, self.get, maintainer=maintainer)
 
     def test_public_exact_source_bytes_and_checksums_are_required(self):
         entry, excluded = self.published()
@@ -181,6 +183,52 @@ class Published(unittest.TestCase):
         self.assertFalse(report['site_update_prepared'])
         self.assertEqual(list(p.name for p in output.iterdir()), ['website-output.json'])
 
+    def final_deb(self):
+        deb = test_deb.deb
+        source_root = pathlib.Path(__file__).resolve().parents[1]
+        for name in [f'packaging/linux/{deb.APP_ID}.desktop', f'packaging/linux/{deb.APP_ID}.xml']:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((source_root / name).read_bytes())
+            self.fixture.policy['source'].append(name)
+        (self.root / 'packaging/release-policy.json').write_bytes(site.encode(dict(
+            schema=1, formats={'Windows': 'microsoft-store', 'macOS': 'dmg', 'Linux': 'deb'})))
+        self.fixture.save_policy()
+        self.fixture.commit()
+        self.commit = git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        for platform in site.PLATFORMS:
+            self.fixture.build(platform)
+        for path in self.directory.iterdir():
+            path.unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            verify(self.fixture.output, self.commit, '0.2.0', self.directory, self.root)
+        self.inventory = json.loads((self.directory / 'release-inventory.json').read_bytes())
+        self.assets = {p.name: p.read_bytes() for p in self.directory.iterdir() if p.name != 'release-inventory.json'}
+        self.linux = next(row for row in self.inventory['assets'] if row.get('platform') == 'Linux')
+        stage = self.root / 'site-deb-stage'
+        self.deb_report = deb.stage_payload(self.root, self.directory / self.linux['file'], stage, self.linux['sha256'])
+        self.deb_entries = [('.', 0o755, None)] + [
+            (path.relative_to(stage).as_posix(), 0o755 if path.is_dir() or path.relative_to(stage).as_posix() == 'usr/bin/peerbrush' else 0o644,
+             None if path.is_dir() else path.read_bytes()) for path in sorted(stage.rglob('*'))]
+        size = (sum(len(data) for _, _, data in self.deb_entries if data is not None) + 1023) // 1024
+        self.deb_control = deb.control('0.2.0', 'libc6 (>= 2.34), ' + ', '.join(deb.RUNTIME), size, test_deb.MAINTAINER)
+        self.deb_package = self.root / 'peerbrush_0.2.0-1_amd64.deb'
+        test_deb.write_deb(self.deb_package, test_deb.tar_bytes(self.deb_entries),
+                           test_deb.tar_bytes([('.', 0o755, None), ('control', 0o644, self.deb_control.encode())]))
+        self.deb_record = dict(file=self.deb_package.name, platform='Linux', architecture='amd64',
+                              binary_source_commit=self.commit, source_sha256=self.deb_report['source_sha256'])
+        self.inventory['assets'].append(self.deb_record)
+        self.refresh_deb()
+
+    def refresh_deb(self):
+        data, name = self.deb_package.read_bytes(), self.deb_package.name
+        self.deb_record.update(bytes=len(data), sha256=site.sha(data))
+        self.deb_report.update(file=name, sha256=site.sha(data))
+        self.assets.update({name: data, name + '.json': site.encode(self.deb_report),
+                            name + '.sha256': f'{site.sha(data)}  {name}\n'.encode()})
+        self.assets['SHA256SUMS'] = ''.join(f'{r["sha256"]}  {r["file"]}\n' for r in self.inventory['assets']).encode()
+        self.metadata()
+
     def test_exact_installer_names_and_candidate_receipts_remain_blocked(self):
         dmg = 'PeerBrush-0.2.0-macOS-arm64-apple-signed-r2-dmg-signed-r3.dmg'
         deb = 'peerbrush_0.2.0-1_amd64.deb'
@@ -221,13 +269,130 @@ class Published(unittest.TestCase):
         self.assets['SHA256SUMS'] = ''.join(f'{r["sha256"]}  {r["file"]}\n' for r in self.inventory['assets']).encode()
         self.metadata()
         entry, excluded = self.published()
-        self.assertIn(dict(file=name, reason='native-final-installer-validation-not-configured'), excluded)
+        blocked = next(row for row in excluded if row.get('file') == name)
+        self.assertEqual(blocked['reason'], 'final-deb-approved-maintainer-not-configured')
+        self.assertFalse(blocked['content_verified'])
+        self.assertFalse(blocked['ready'])
         self.assertFalse(any(p['url'].endswith('.deb') for p in entry['platforms']))
+        with self.assertRaises(ValueError):
+            self.published(maintainer=test_deb.MAINTAINER)
         report['release_ready'] = True
         self.assets[name + '.json'] = site.encode(report)
         self.metadata()
         with self.assertRaises(ValueError):
             self.published()
+
+    def test_actual_deb_content_is_verified_but_installed_policy_never_becomes_ready(self):
+        self.final_deb()
+        self.requests.clear()
+        with mock.patch.object(test_deb.deb, 'run') as native:
+            entry, excluded = self.published(maintainer=test_deb.MAINTAINER)
+        native.assert_not_called()
+        self.assertEqual(sum(not api and url.rsplit('/', 1)[-1] == self.linux['file']
+                             for url, api in self.requests), 1)
+        proof = next(row for row in excluded if row.get('file') == self.deb_package.name)
+        self.assertTrue(proof['content_verified'])
+        self.assertEqual(len(proof['content_checks']), 5)
+        self.assertFalse(proof['ready'])
+        self.assertFalse(proof['production_ready'])
+        self.assertEqual(proof['installed_acceptance'], 'unverified')
+        self.assertEqual(proof['update_repository'], 'not-configured')
+        self.assertEqual(proof['public_availability'], 'unverified')
+        self.assertEqual(entry['platforms'], [])
+        # Selection and public bytes, not inventory iteration order, bind the companion ZIP.
+        self.inventory['assets'].remove(self.deb_record)
+        self.inventory['assets'].insert(0, self.deb_record)
+        self.refresh_deb()
+        self.requests.clear()
+        repeated, excluded = self.published(maintainer=test_deb.MAINTAINER)
+        self.assertEqual(sum(not api and url.rsplit('/', 1)[-1] == self.linux['file']
+                             for url, api in self.requests), 1)
+        self.assertEqual(repeated['platforms'], [])
+        self.assertIn(proof, excluded)
+        output = self.root.parent / (self.root.name + '-deb-content')
+        self.addCleanup(lambda: shutil.rmtree(output, ignore_errors=True))
+        with mock.patch.object(site, 'site_sources', return_value={}):
+            report = site.prepare(self.root, 'a' * 40, self.inventory, 'v0.2.0', self.commit,
+                                  self.notes, output, self.get, maintainer=test_deb.MAINTAINER)
+        self.assertFalse(report['site_update_prepared'])
+        self.assertEqual(list(path.name for path in output.iterdir()), ['website-output.json'])
+        self.assertIn(proof, report['excluded'])
+        self.assertNotIn(test_deb.MAINTAINER, json.dumps(report))
+
+    def test_deb_missing_approved_identity_or_public_companion_remains_unverified(self):
+        self.final_deb()
+        _, excluded = self.published()
+        proof = next(row for row in excluded if row.get('file') == self.deb_package.name)
+        self.assertFalse(proof['content_verified'])
+        self.assertEqual(proof['reason'], 'final-deb-approved-maintainer-not-configured')
+        for name, reason in [(self.deb_package.name, 'not-publicly-available'),
+                             (self.linux['file'], 'final-deb-portable-not-publicly-available')]:
+            with self.subTest(missing=name):
+                data = self.assets.pop(name)
+                self.metadata()
+                entry, excluded = self.published(maintainer=test_deb.MAINTAINER)
+                self.assertEqual(entry['platforms'], [])
+                self.assertIn(reason, [row['reason'] for row in excluded])
+                self.assertFalse(any(row.get('content_verified') for row in excluded))
+                self.assets[name] = data
+                self.metadata()
+        self.inventory['assets'].remove(self.linux)
+        self.refresh_deb()
+        _, excluded = self.published(maintainer=test_deb.MAINTAINER)
+        self.assertIn('final-deb-portable-not-in-inventory', [row['reason'] for row in excluded])
+        self.assertFalse(any(row.get('content_verified') for row in excluded))
+
+    def test_deb_inspection_rejects_actual_payload_source_version_and_control_changes(self):
+        self.final_deb()
+        for maintainer in ['Other <other@example.invalid>', 'invalid', 'Synthetic\nInjected <mail@example.invalid>']:
+            with self.subTest(maintainer=maintainer), self.assertRaises(ValueError):
+                self.published(maintainer=maintainer)
+        variants = [
+            (self.deb_entries + [('usr/share/unexpected', 0o644, b'extra')], self.deb_control),
+            ([(name, mode, b'wrong source' if name.endswith('-source.zip') else data)
+              for name, mode, data in self.deb_entries], self.deb_control),
+            (self.deb_entries, self.deb_control.replace('Version: 0.2.0-1', 'Version: 0.30.0-1')),
+            (self.deb_entries, self.deb_control + 'Unexpected: injected\n'),
+        ]
+        for entries, control in variants:
+            with self.subTest(control=control[-30:]):
+                test_deb.write_deb(self.deb_package, test_deb.tar_bytes(entries),
+                                   test_deb.tar_bytes([('.', 0o755, None), ('control', 0o644, control.encode())]))
+                self.refresh_deb()
+                with self.assertRaises(ValueError):
+                    self.published(maintainer=test_deb.MAINTAINER)
+
+    def test_deb_sidecar_claims_and_prerelease_never_grant_download_authority(self):
+        self.final_deb()
+        for key, value in [('release_ready', True), ('installation_test', 'passed'),
+                           ('update_repository', 'https://example.invalid/approved')]:
+            with self.subTest(claim=key):
+                self.assets[self.deb_package.name + '.json'] = site.encode(dict(self.deb_report, **{key: value}))
+                self.metadata()
+                with self.assertRaises(ValueError):
+                    self.published(maintainer=test_deb.MAINTAINER)
+        self.refresh_deb()
+        self.assets[self.deb_package.name + '.json'] = site.encode(dict(self.deb_report, ready=True, native_verified=True))
+        self.metadata()
+        entry, excluded = self.published(maintainer=test_deb.MAINTAINER)
+        self.assertEqual(entry['platforms'], [])
+        self.assertTrue(any(row.get('content_verified') for row in excluded))
+        self.assertFalse(any(row.get('ready') for row in excluded))
+        with self.assertRaises(ValueError):
+            site.published(self.root, self.inventory, 'v0.2.0-dev.1', self.commit, self.notes,
+                           self.get, maintainer=test_deb.MAINTAINER)
+
+    def test_cli_forwards_the_explicit_approved_public_maintainer(self):
+        notes = self.root / 'public-notes.json'
+        notes.write_bytes(site.encode(self.notes))
+        arguments = ['prepare_site_release.py', '--site-commit', 'a' * 40, '--tag', 'v0.2.0',
+                     '--commit', self.commit, '--inventory', str(self.directory / 'release-inventory.json'),
+                     '--notes', str(notes), '--output', str(self.root.parent / 'not-written'),
+                     '--maintainer', test_deb.MAINTAINER]
+        with mock.patch('sys.argv', arguments), mock.patch.object(site, 'prepare',
+                return_value={'site_update_prepared': False}) as prepare, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(site.main(), 2)
+        self.assertEqual(prepare.call_args.kwargs['maintainer'], test_deb.MAINTAINER)
 
     def test_preparation_writes_only_new_review_overlay_and_bound_hashes(self):
         previous = json.loads((pathlib.Path(__file__).resolve().parents[1] / 'tests/fixtures/site-release-output.json').read_bytes())['files']

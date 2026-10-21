@@ -20,7 +20,7 @@ import zipfile
 
 from package import git, relative_path, source_files
 from production_readiness import immutable
-from package_deb import deb_version
+from package_deb import deb_version, inspect_final
 from verify_release import inspect_archive
 
 
@@ -227,7 +227,7 @@ def installed_report(kind, record, data, commit, version):
     return 'native-final-installer-validation-not-configured'
 
 
-def published(root, inventory, tag, commit, notes, get=public_get):
+def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer=None):
     match = re.fullmatch('v(' + STABLE + ')', tag)
     if not match or not re.fullmatch('[0-9a-f]{40}', commit):
         raise ValueError('Choose a canonical stable vA.B.C tag and full source SHA.')
@@ -310,7 +310,8 @@ def published(root, inventory, tag, commit, notes, get=public_get):
                     or any(archive.getinfo(name).file_size != len(data) for name, data in inputs.items())
                     or any(archive.read(name) != data for name, data in inputs.items())):
                 raise ValueError('Published corresponding source differs from the exact selected commit.')
-        for name, record in records.items():
+        # Inspect each portable companion once before final DEB content.
+        for name, record in sorted(records.items(), key=lambda item: recognize(item[0], version)[0] == 'deb'):
             kind, platform = recognize(name, version)
             if kind == 'source':
                 continue
@@ -327,7 +328,31 @@ def published(root, inventory, tag, commit, notes, get=public_get):
                 checksum = download(name + '.sha256', 1024)
                 if checksum.decode('ascii').replace('\r\n', '\n') != f"{record['sha256']}  {name}\n":
                     raise ValueError('Final installer checksum report differs.')
-                excluded.append(dict(file=name, reason=installed_report(kind, record, report, commit, version)))
+                reason = installed_report(kind, record, report, commit, version)
+                exclusion = dict(file=name, reason=reason)
+                if kind == 'deb':
+                    exclusion.update(content_verified=False, ready=False, production_ready=False,
+                                     installed_acceptance='unverified', update_repository='not-configured',
+                                     public_availability='unverified')
+                    if maintainer is None:
+                        exclusion['reason'] = 'final-deb-approved-maintainer-not-configured'
+                    else:
+                        portable_records = [r for r in records.values() if recognize(r['file'], version) == ('zip', 'Linux')]
+                        if len(portable_records) != 1:
+                            exclusion['reason'] = 'final-deb-portable-not-in-inventory'
+                        else:
+                            portable = portable_records[0]
+                            portable_path = pathlib.Path(temporary) / portable['file']
+                            if not portable_path.exists():
+                                exclusion['reason'] = 'final-deb-portable-not-publicly-available'
+                            else:
+                                checked = inspect_final(root, portable_path, path, commit=commit, version=version,
+                                                        portable_sha256=portable['sha256'], package_sha256=record['sha256'],
+                                                        maintainer=maintainer)
+                                if checked['record'] != record or checked['portable_sha256'] != portable['sha256']:
+                                    raise ValueError('Final DEB content differs from the selected public inventory.')
+                                exclusion.update(content_verified=True, content_checks=checked['content_checks'])
+                excluded.append(exclusion)
                 continue
             inspected = inspect_archive(path, commit, version, root, selected)
             if inspected['record'] != record or sha(inspected['source']) != records[source_name]['sha256']:
@@ -462,10 +487,10 @@ def output_path(root, output):
     return output
 
 
-def prepare(root, site_commit, inventory, tag, commit, notes, output, get=public_get):
+def prepare(root, site_commit, inventory, tag, commit, notes, output, get=public_get, *, maintainer=None):
     output = output_path(root, output)
     previous = site_sources(root, site_commit)
-    entry, excluded = published(root, inventory, tag, commit, notes, get)
+    entry, excluded = published(root, inventory, tag, commit, notes, get, maintainer=maintainer)
     overlay = render(previous, entry) if entry['platforms'] else {}
     report = dict(schema=1, version=tag, commit=commit, site_commit=site_commit,
                   site_update_prepared=bool(overlay), deployment_performed=False,
@@ -496,10 +521,11 @@ def main():
         parser.add_argument('--' + name, required=True)
     for name in ['inventory', 'notes', 'output']:
         parser.add_argument('--' + name, required=True, type=pathlib.Path)
+    parser.add_argument('--maintainer', help='Approved public DEB maintainer name <email>; content inspection does not establish download readiness')
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
     report = prepare(root, args.site_commit, json.loads(args.inventory.read_bytes()), args.tag,
-                     args.commit, json.loads(args.notes.read_bytes()), args.output)
+                     args.commit, json.loads(args.notes.read_bytes()), args.output, maintainer=args.maintainer)
     print('Reviewable website overlay prepared; deployment was not performed.' if report['site_update_prepared']
           else 'No eligible public platforms; only an exclusion report was prepared.')
     return 0 if report['site_update_prepared'] else 2
