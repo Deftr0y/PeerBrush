@@ -225,6 +225,7 @@ pub(super) fn runtime(
         command: Some(command),
         test_prefix: true,
         response_started: started,
+        publication_started: None,
         primary_kill_failed: false,
         input_written: None,
         stall_writer: false,
@@ -263,6 +264,51 @@ fn healthy_child(depth: u16) {
     assert!(signature(&result.encoded));
 }
 
+#[test]
+fn cancellation_after_joined_native_result_discards_output_and_releases_worker() {
+    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    for depth in [8, 16] {
+        let words = vec![12347_u16; 3 * 2 * 4];
+        let bytes = vec![47_u8; 3 * 2 * 4];
+        let pixels = if depth == 8 {
+            PixelsRef::Eight(&bytes)
+        } else {
+            PixelsRef::Sixteen(&words)
+        };
+        let profile = crate::color_profile::srgb_profile();
+        let info = Info {
+            width: 3,
+            height: 2,
+            bit_depth: depth,
+        };
+        let started = Arc::new(AtomicBool::new(false));
+        let mut runtime = runtime("", depth, Duration::from_secs(10), None);
+        runtime.publication_started = Some(started.clone());
+        let request = super::request(
+            Operation::Encode,
+            Some(info),
+            Some(Options::default()),
+            profile.len(),
+            raw_size(info).unwrap(),
+        )
+        .unwrap();
+        let check = || {
+            if started.load(Ordering::SeqCst) {
+                Err("fixture publication canceled".into())
+            } else {
+                Ok(())
+            }
+        };
+        let error = invoke(request, Input::Pixels(pixels, profile), &check, runtime)
+            .err()
+            .expect("Canceled completed work returned output");
+        assert!(started.load(Ordering::SeqCst));
+        assert_eq!(error, "fixture publication canceled");
+        assert!(!FAILED_STOP.load(Ordering::SeqCst));
+        assert!(RETAINED.lock().unwrap().is_none());
+        healthy_child(depth);
+    }
+}
 #[test]
 fn stalled_unconsumed_large_input_cancels_or_times_out_and_kill_fallback_recovers() {
     let _serial = PROCESS_FIXTURES.lock().unwrap();

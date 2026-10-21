@@ -494,6 +494,8 @@ struct Runtime {
     #[cfg(test)]
     response_started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
+    publication_started: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
     primary_kill_failed: bool,
     #[cfg(test)]
     input_written: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -513,6 +515,8 @@ impl Default for Runtime {
             test_prefix: false,
             #[cfg(test)]
             response_started: None,
+            #[cfg(test)]
+            publication_started: None,
             #[cfg(test)]
             primary_kill_failed: false,
             #[cfg(test)]
@@ -689,6 +693,7 @@ fn invoke(
                 };
                 match event {
                     Event::Ready => {
+                        check()?;
                         let mut input = input.take().ok_or(PROTOCOL)?;
                         let body = body.take().ok_or(PROTOCOL)?;
                         #[cfg(test)]
@@ -705,7 +710,9 @@ fn invoke(
                         }));
                     }
                     Event::Result(output) => {
-                        result = Some(output?);
+                        let output = output?;
+                        check()?;
+                        result = Some(output);
                     }
                 }
             }
@@ -765,6 +772,11 @@ fn invoke(
         operation.and_then(|result| {
             written?;
             read?;
+            #[cfg(test)]
+            if let Some(started) = runtime.publication_started {
+                started.store(true, Ordering::SeqCst);
+            }
+            check()?;
             Ok(result)
         })
     })

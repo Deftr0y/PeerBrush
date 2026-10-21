@@ -268,8 +268,8 @@ fn malformed_truncated_canceled_and_invalid_requests_return_no_output() {
     )
     .unwrap();
     for payload in [&encoded, &sixteen] {
-        // The parent checks cancellation while queued and while its isolated
-        // worker runs. The backend separately tests exact native event phases.
+        // Cover entry, queue, validated IPC and final publication boundaries.
+        // The backend separately tests exact native event phases.
         for threshold in [0, 2, 4, 5, 6] {
             let count = Cell::new(0);
             let check = || {
@@ -281,7 +281,11 @@ fn malformed_truncated_canceled_and_invalid_requests_return_no_output() {
                     Ok(())
                 }
             };
-            assert!(jpeg_xl::decode(payload, &check).is_err());
+            let error = jpeg_xl::decode(payload, &check)
+                .err()
+                .expect("Canceled decode returned output");
+            assert_eq!(error, "fixture canceled", "threshold {threshold}");
+            assert!(count.get() > threshold);
         }
     }
     assert!(jpeg_xl::encode(
