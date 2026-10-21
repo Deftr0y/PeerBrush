@@ -577,7 +577,7 @@ exit $LASTEXITCODE
         self.assertEqual(cargo['patch']['crates-io']['cmake']['path'], 'vendor/cmake')
         cmake = tomllib.loads((root / 'vendor/cmake/Cargo.toml').read_text(encoding='utf-8'))
         self.assertEqual(cmake['package']['version'], '0.1.58')
-        self.assertEqual((root / 'vendor/cmake/src/lib.rs').read_text(encoding='utf-8').count('push_quoted_flag(&mut flagsflag, arg);'), 2)
+        self.assertEqual((root / 'vendor/cmake/src/lib.rs').read_text(encoding='utf-8').count('push_quoted_flag(&mut flagsflag, arg, is_ninja);'), 2)
         toolchain = tomllib.loads((root / 'rust-toolchain.toml').read_text(encoding='utf-8'))
         self.assertEqual(toolchain['toolchain']['channel'], '1.92.0')
         helper = (root / 'vendor/jpegxl-src/src/lib.rs').read_text(encoding='utf-8')

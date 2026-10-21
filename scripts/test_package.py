@@ -133,9 +133,9 @@ class Packages(unittest.TestCase):
                             actual.append(data[4:4 + size].decode('utf-8'))
                             data = data[4 + size:]
                         cmake_arguments = json.loads((root / ('cmake-' + language + '.args.json')).read_text(encoding='utf-8'))
-                        for argument in expected:
-                            self.assertTrue(argument in actual, 'native-flags-cc-argv')
-                            self.assertTrue(argument in cmake_arguments, 'native-flags-cmake-argv')
+                        for index, argument in enumerate(expected):
+                            self.assertTrue(argument in actual, 'native-flags-cc-argv-' + language + '-' + str(index))
+                            self.assertTrue(argument in cmake_arguments, 'native-flags-cmake-argv-' + language + '-' + str(index))
                         remaps = [argument for argument in actual if '-ffile-prefix-map=' in argument]
                         self.assertTrue(bool(remaps), 'native-flags-missing-remap')
                         self.assertTrue(all(argument in cmake_arguments for argument in remaps), 'native-flags-cmake-remap')

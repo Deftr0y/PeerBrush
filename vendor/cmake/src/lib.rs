@@ -737,7 +737,7 @@ impl Config {
                             continue;
                         }
                         flagsflag.push(" ");
-                        push_quoted_flag(&mut flagsflag, arg);
+                        push_quoted_flag(&mut flagsflag, arg, is_ninja);
                     }
                     cmd.arg(flagsflag);
                 }
@@ -761,7 +761,7 @@ impl Config {
                                 continue;
                             }
                             flagsflag.push(" ");
-                            push_quoted_flag(&mut flagsflag, arg);
+                            push_quoted_flag(&mut flagsflag, arg, is_ninja);
                         }
                         cmd.arg(flagsflag);
                     }
@@ -1252,7 +1252,7 @@ CMake suite maintained and supported by Kitware (kitware.com/cmake).
     }
 }
 
-fn push_quoted_flag(output: &mut OsString, argument: &OsStr) {
+fn push_quoted_flag(output: &mut OsString, argument: &OsStr, is_ninja: bool) {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1261,6 +1261,9 @@ fn push_quoted_flag(output: &mut OsString, argument: &OsStr) {
             if byte == b'\'' {
                 quoted.extend_from_slice(b"'\\''");
             } else {
+                if is_ninja && byte == b'$' {
+                    quoted.push(byte);
+                }
                 quoted.push(byte);
             }
         }
@@ -1283,6 +1286,9 @@ fn push_quoted_flag(output: &mut OsString, argument: &OsStr) {
                 backslashes
             };
             quoted.extend(std::iter::repeat(u16::from(b'\\')).take(count));
+            if is_ninja && unit == u16::from(b'$') {
+                quoted.push(unit);
+            }
             quoted.push(unit);
             backslashes = 0;
         }

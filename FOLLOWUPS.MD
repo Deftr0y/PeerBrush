@@ -480,3 +480,6 @@ PB-108 native Photoshop row increment (unreleased, replay pending): a bounded co
 
 
 PB-153 numeric Escape correction (unreleased, replay pending): exact prior TextEdit ownership protects the field's Escape from cancelling its pending transform. Existing ordered key tracking handles held/coalesced keys; the existing context guard covers a primary press through release so old Apply clicks cannot commit. Three prepared actual-control methods cover native8/16, held/same-frame/forced2pass canvas and Apply, fresh cancellation and one real Apply/Undo. Original assertions remain; independent source review passed, combined/native replay pending.
+
+
+PB-145/PB-154 literal Ninja argument correction (unreleased, replay pending): actual retained38c79 argv proved Ninja consumed a synthetic dollar prefix while builds succeeded. One generator-aware escaping layer preserves literal compiler arguments at both existing CMake joins; explicit Config fragments/other generators remain unchanged. Exact native argument assertions and two-site source-contract count remain strict. Independent source review passed; corrected combined/native package execution remains required.
