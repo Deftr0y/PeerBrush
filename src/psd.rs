@@ -472,14 +472,13 @@ struct BoundedWriter<'a, W> {
     written: usize,
     limit: usize,
     check: &'a dyn Fn() -> Result<(), String>,
+    error: &'static str,
 }
 impl<W: Write> Write for BoundedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         (self.check)().map_err(std::io::Error::other)?;
         if self.written.saturating_add(bytes.len()) > self.limit {
-            return Err(std::io::Error::other(
-                "Editable PSD source data exceeds its bounded serialization budget",
-            ));
+            return Err(std::io::Error::other(self.error));
         }
         let n = self.inner.write(bytes)?;
         self.written += n;
@@ -1228,6 +1227,7 @@ fn encode_layout_to<S: Read + Write + Seek>(
             128 * 1024 * 1024
         },
         check,
+        error: "Editable PSD source data exceeds its bounded serialization budget",
     };
     serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
     let compressed = z.inner.finish().map_err(|e| e.to_string())?;
@@ -1265,7 +1265,13 @@ fn encode_layout_to<S: Read + Write + Seek>(
     let resource_length =
         u32::try_from(resources.len()).map_err(|_| "PSD resource length overflow")?;
     u32b(&mut header, resource_length);
-    let mut out = StandardWriter::new(output, check);
+    let mut out = BoundedWriter {
+        inner: output,
+        written: 0,
+        limit: 256 * 1024 * 1024,
+        check,
+        error: "Photoshop output exceeds the initial 256 MiB file limit",
+    };
     out.write_all(&header).map_err(|e| e.to_string())?;
     out.write_all(&resources).map_err(|e| e.to_string())?;
     layout.write_length(&mut out, layer_length)?;
@@ -3073,6 +3079,76 @@ pub fn validate(doc: &Document) -> Result<(), String> {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    #[test]
+    fn bounded_source_and_final_writers_keep_short_write_limits_and_cancellation() {
+        struct Short {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let n = bytes.len().min(2);
+                self.bytes.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        for error in [
+            "Editable PSD source data exceeds its bounded serialization budget",
+            "Photoshop output exceeds the initial 256 MiB file limit",
+        ] {
+            let cancelled = std::cell::Cell::new(false);
+            let checks = std::cell::Cell::new(0);
+            let check = || {
+                checks.set(checks.get() + 1);
+                if cancelled.get() {
+                    Err("Project source changed while saving".into())
+                } else {
+                    Ok(())
+                }
+            };
+            let mut writer = BoundedWriter {
+                inner: Short {
+                    bytes: vec![],
+                    flushes: 0,
+                },
+                written: 0,
+                limit: 3,
+                check: &check,
+                error,
+            };
+            writer.write_all(b"abc").unwrap();
+            assert_eq!(writer.written, 3);
+            assert_eq!(writer.inner.bytes, b"abc");
+            assert_eq!(
+                checks.get(),
+                2,
+                "Every partial write still checks the source"
+            );
+            assert_eq!(writer.write(b"d").unwrap_err().to_string(), error);
+            assert_eq!(writer.written, 3);
+            assert_eq!(writer.inner.bytes, b"abc");
+            cancelled.set(true);
+            for result in [writer.write(b"d").map(|_| ()), writer.flush()] {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "Project source changed while saving"
+                );
+            }
+            assert_eq!(
+                writer.inner.flushes, 0,
+                "Cancelled flush never reaches the file"
+            );
+            assert_eq!(writer.written, 3);
+            assert_eq!(writer.inner.bytes, b"abc");
+            cancelled.set(false);
+            writer.flush().unwrap();
+            assert_eq!(writer.inner.flushes, 1);
+        }
+    }
     fn streamed_fixture(depth: u16) -> Document {
         let mut doc = Document::new_depth(2, 1, depth).unwrap();
         let layer = &mut doc.layers[0];
