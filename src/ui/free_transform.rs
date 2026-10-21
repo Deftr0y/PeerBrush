@@ -1,6 +1,16 @@
-//! One source-bound affine preview; the shared engine owns every pixel and guard.
+//! One source-bound transform preview; the shared engine owns every pixel and guard.
 use super::*;
 
+#[derive(Clone, PartialEq)]
+struct Quad {
+    rect: [f64; 4],
+    corners: [[f64; 2]; 4],
+}
+#[derive(Clone, Copy, PartialEq)]
+enum ProjectiveMode {
+    Distort,
+    Perspective,
+}
 #[derive(Clone, PartialEq)]
 struct Parameters {
     offset: [f64; 2],
@@ -8,6 +18,7 @@ struct Parameters {
     angle: f64,
     skew: [f64; 2],
     mirror: [bool; 2],
+    projective: Option<Quad>,
 }
 impl Default for Parameters {
     fn default() -> Self {
@@ -17,6 +28,7 @@ impl Default for Parameters {
             angle: 0.,
             skew: [0.; 2],
             mirror: [false; 2],
+            projective: None,
         }
     }
 }
@@ -26,6 +38,7 @@ enum Handle {
     Rotate,
     Scale(bool, bool),
     Skew(usize),
+    Projective(usize, bool),
     Pivot,
 }
 struct Drag {
@@ -57,6 +70,7 @@ pub(super) struct Editor {
     values: Parameters,
     mode: Tool,
     skew_mode: bool,
+    projective_mode: Option<ProjectiveMode>,
     proportional: bool,
     snap: bool,
     prior_tool: Tool,
@@ -66,14 +80,17 @@ pub(super) struct Editor {
     pub rendered: Option<String>,
     #[cfg(test)]
     inputs: [Option<Rect>; 9],
+    #[cfg(test)]
+    projective_inputs: [Option<Rect>; 8],
 }
 impl Editor {
     pub(super) fn mode(&self) -> Option<Tool> {
-        (!self.skew_mode).then_some(self.mode)
+        (!self.skew_mode && self.projective_mode.is_none()).then_some(self.mode)
     }
     pub(super) fn set_mode(&mut self, mode: Tool) {
         self.mode = mode;
         self.skew_mode = false;
+        self.projective_mode = None;
         self.drag = None;
     }
     pub(super) fn live_key(&self) -> String {
@@ -87,6 +104,7 @@ impl Editor {
             || self.values.angle.rem_euclid(360.) != 0.
             || self.values.skew != [0.; 2]
             || self.values.mirror != [false; 2]
+            || self.values.projective.is_some()
     }
     fn raw(&self, id: &str, snap: bool) -> Value {
         json!({"op":if self.affine() {"transform"}else{"move"},"layer":id,
@@ -123,7 +141,7 @@ impl Editor {
             py - b * px - d * py + dy,
         ])
     }
-    fn command(&self, id: &str, snap: bool) -> Result<Value, String> {
+    fn affine_command(&self, id: &str, snap: bool) -> Result<Value, String> {
         let mut command = crate::transform::resolve_command(&self.raw(id, snap))?;
         let Some(reference) = &self.reference else {
             return Ok(command);
@@ -172,6 +190,50 @@ impl Editor {
         // User values were snapped above; never round the reference compensation.
         command["snap"] = json!(false);
         crate::transform::resolve_command(&command)
+    }
+    fn command(&self, id: &str, snap: bool) -> Result<Value, String> {
+        let mut command = self.affine_command(id, snap)?;
+        if let Some(quad) = &self.values.projective {
+            command["projective"] = json!({"rect":quad.rect,"quad":quad.corners});
+            crate::transform::resolve_command(&command)
+        } else {
+            command.as_object_mut().unwrap().remove("projective");
+            Ok(command)
+        }
+    }
+    fn target_bounds(&self) -> [f64; 4] {
+        if self.selected && !self.whole {
+            self.bounds
+        } else {
+            self.whole_bounds
+        }
+    }
+    fn rectangle([l, t, r, b]: [f64; 4]) -> [[f64; 2]; 4] {
+        [[l, t], [r, t], [r, b], [l, b]]
+    }
+    fn quad(&self) -> Result<Quad, String> {
+        let rect = self.target_bounds();
+        if let Some(quad) = &self.values.projective {
+            if quad.rect == rect {
+                return Ok(quad.clone());
+            }
+            let command =
+                json!({"op":"transform","projective":{"rect":quad.rect,"quad":quad.corners}});
+            if let Some(specification) = crate::projective::parse(&command)? {
+                let mut corners = Self::rectangle(rect);
+                for point in &mut corners {
+                    *point = specification.map.point(*point)?;
+                }
+                return Ok(Quad { rect, corners });
+            }
+        }
+        Ok(Quad {
+            rect,
+            corners: Self::rectangle(rect),
+        })
+    }
+    fn set_quad(&mut self, quad: Quad) {
+        self.values.projective = (quad.corners != Self::rectangle(quad.rect)).then_some(quad);
     }
     fn reference_point(&self) -> [f64; 2] {
         let offset = crate::transform::resolve_command(&self.raw("", self.snap))
@@ -233,6 +295,12 @@ impl Editor {
         let Ok(c) = self.command("", self.snap) else {
             return p;
         };
+        if self.values.projective.is_some() {
+            return crate::projective::combined(&c)
+                .and_then(|map| map.ok_or_else(|| "Missing projective map".into()))
+                .and_then(|map| map.point(p))
+                .unwrap_or(p);
+        }
         let (sx, sy) = crate::transform::scales(&c).unwrap_or((1., 1.));
         let (sin, cos) = c["angle"].as_f64().unwrap_or(0.).to_radians().sin_cos();
         let [a, b, cc, d] = crate::transform::skewed([cos * sx, sin * sx, -sin * sy, cos * sy], &c)
@@ -251,6 +319,25 @@ impl Editor {
         ]
     }
     fn corners(&self) -> [[f64; 2]; 4] {
+        if let Some(quad) = &self.values.projective {
+            if quad.rect == self.target_bounds() {
+                if let Ok(map) = self
+                    .affine_command("", self.snap)
+                    .and_then(|command| crate::projective::affine(&command, self.pivot))
+                {
+                    let mut corners = quad.corners;
+                    if corners.iter_mut().all(|p| match map.point(*p) {
+                        Ok(point) => {
+                            *p = point;
+                            true
+                        }
+                        Err(_) => false,
+                    }) {
+                        return corners;
+                    }
+                }
+            }
+        }
         let [l, t, r, b] = if self.selected && !self.whole {
             self.bounds
         } else {
@@ -262,6 +349,111 @@ impl Editor {
         self.error = None;
         self.rendered = None;
     }
+    fn drag_corner(
+        &mut self,
+        index: usize,
+        origin: [f64; 2],
+        p: [f64; 2],
+        perspective: bool,
+        shift: bool,
+    ) -> Result<(), String> {
+        if p == origin {
+            return Ok(());
+        }
+        let mut quad = self.quad()?;
+        let command = self.affine_command("", self.snap)?;
+        let inverse = crate::projective::affine(&command, self.pivot)?.inverse()?;
+        let a = inverse.point(origin)?;
+        let b = inverse.point(if self.snap { p.map(f64::round) } else { p })?;
+        let mut delta = [b[0] - a[0], b[1] - a[1]];
+        if perspective {
+            let other = if shift { 3 - index } else { index ^ 1 };
+            let edge = [
+                quad.corners[index][0] - quad.corners[other][0],
+                quad.corners[index][1] - quad.corners[other][1],
+            ];
+            let squared = edge[0] * edge[0] + edge[1] * edge[1];
+            if squared <= 1e-12 {
+                return Err("Perspective edge has no extent".into());
+            }
+            let amount = (delta[0] * edge[0] + delta[1] * edge[1]) / squared;
+            delta = edge.map(|v| v * amount);
+            for axis in 0..2 {
+                quad.corners[other][axis] -= delta[axis];
+            }
+        } else if shift {
+            delta[if delta[0].abs() >= delta[1].abs() {
+                1
+            } else {
+                0
+            }] = 0.;
+        }
+        for axis in 0..2 {
+            quad.corners[index][axis] += delta[axis];
+        }
+        self.set_quad(quad);
+        Ok(())
+    }
+    fn projective_controls(&mut self, ui: &mut egui::Ui) {
+        if self.projective_mode.is_none() {
+            return;
+        }
+        let state = self.quad().and_then(|quad| {
+            let command = self.affine_command("", self.snap)?;
+            let map = crate::projective::affine(&command, self.pivot)?;
+            Ok((quad, map, map.inverse()?))
+        });
+        let (mut quad, map, inverse) = match state {
+            Ok(state) => state,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        ui.label("Corner positions: document X / Y");
+        let mut changed = false;
+        for (index, label) in ["Top left", "Top right", "Bottom right", "Bottom left"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut point = match map.point(quad.corners[index]) {
+                Ok(point) => point,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
+            let edited = ui
+                .horizontal(|ui| {
+                    ui.add_sized([82., 20.], egui::Label::new(label));
+                    let mut edited = false;
+                    for (axis, value) in point.iter_mut().enumerate() {
+                        let response = controls::numeric(ui, value, -100000. ..=100000.);
+                        #[cfg(test)]
+                        {
+                            self.projective_inputs[index * 2 + axis] = Some(response.rect);
+                        }
+                        #[cfg(not(test))]
+                        let _ = axis;
+                        edited |= response.changed();
+                    }
+                    edited
+                })
+                .inner;
+            if edited {
+                match inverse.point(point) {
+                    Ok(point) => {
+                        quad.corners[index] = point;
+                        changed = true;
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
+        }
+        if changed {
+            self.set_quad(quad);
+        }
+    }
     fn drag_to(&mut self, p: [f64; 2], shift: bool) {
         let Some(drag) = &self.drag else {
             return;
@@ -271,6 +463,12 @@ impl Editor {
         let handle = drag.handle;
         self.values = start.clone();
         match handle {
+            Handle::Projective(index, perspective) => {
+                if let Err(error) = self.drag_corner(index, origin, p, perspective, shift) {
+                    self.error = Some(error);
+                }
+                return;
+            }
             Handle::Pivot => {
                 if let Err(error) =
                     self.set_reference(p.map(|value| value.clamp(-100000., 100000.)))
@@ -482,6 +680,7 @@ impl PeerBrush {
             values: Parameters::default(),
             mode: Tool::Move,
             skew_mode: false,
+            projective_mode: None,
             proportional: true,
             snap: false,
             prior_tool,
@@ -491,6 +690,8 @@ impl PeerBrush {
             rendered: None,
             #[cfg(test)]
             inputs: [None; 9],
+            #[cfg(test)]
+            projective_inputs: [None; 8],
         });
         self.free_transform_frame = true;
         self.last_preview = None;
@@ -628,13 +829,21 @@ impl PeerBrush {
                 if p.distance(rotation) < 10. {
                     return Some(Handle::Rotate);
                 }
+                if let Some(mode) = editor.projective_mode {
+                    if let Some(index) = corners.iter().position(|point| p.distance(*point) < 9.) {
+                        return Some(Handle::Projective(
+                            index,
+                            mode == ProjectiveMode::Perspective,
+                        ));
+                    }
+                }
                 if editor.skew_mode {
                     return points[4..]
                         .iter()
                         .position(|point| p.distance(*point) < 9.)
                         .map(|index| Handle::Skew(index % 2));
                 }
-                if editor.mode == Tool::Scale {
+                if editor.projective_mode.is_none() && editor.mode == Tool::Scale {
                     return points
                         .iter()
                         .position(|point| p.distance(*point) < 9.)
@@ -642,7 +851,7 @@ impl PeerBrush {
                             Handle::Scale(index < 4 || index % 2 == 1, index < 4 || index % 2 == 0)
                         });
                 }
-                if editor.mode == Tool::Rotate {
+                if editor.projective_mode.is_none() && editor.mode == Tool::Rotate {
                     return points
                         .iter()
                         .any(|point| p.distance(*point) < 10.)
@@ -694,7 +903,7 @@ impl PeerBrush {
         } else {
             corners.to_vec()
         };
-        if editor.mode == Tool::Scale || editor.skew_mode {
+        if (editor.projective_mode.is_none() && editor.mode == Tool::Scale) || editor.skew_mode {
             for i in 0..4 {
                 handles.push((corners[i] + corners[(i + 1) % 4].to_vec2()) * 0.5);
             }
@@ -738,6 +947,7 @@ impl PeerBrush {
             .id(egui::Id::new("free transform"))
             .open(&mut open)
             .resizable(false)
+            .vscroll(true)
             .collapsible(false)
             .default_width(330.)
             .show(ctx, |ui| {
@@ -747,16 +957,34 @@ impl PeerBrush {
                         (Tool::Rotate, "Rotate"),
                         (Tool::Scale, "Scale"),
                     ] {
-                        if ui.selectable_label(!editor.skew_mode && editor.mode == mode, label).clicked() {
+                        if ui.selectable_label(editor.mode() == Some(mode), label).clicked() {
                             editor.set_mode(mode);
                         }
                     }
                     if ui.selectable_label(editor.skew_mode, "Skew").clicked() {
                         editor.skew_mode = true;
+                        editor.projective_mode = None;
                         editor.drag = None;
                     }
                 });
-                if editor.skew_mode {
+                ui.horizontal(|ui| {
+                    for (mode, label) in [(ProjectiveMode::Distort, "Distort"),
+                                           (ProjectiveMode::Perspective, "Perspective")] {
+                        if ui.selectable_label(editor.projective_mode == Some(mode), label).clicked() {
+                            editor.projective_mode = Some(mode);
+                            editor.skew_mode = false;
+                            editor.drag = None;
+                        }
+                    }
+                });
+                if let Some(mode) = editor.projective_mode {
+                    ui.label(if mode == ProjectiveMode::Distort {
+                        "Drag a corner freely. Shift constrains its axis."
+                    } else {
+                        "Drag a corner pair along its edge. Shift uses the vertical pair."
+                    });
+                    ui.label("Release keeps the actual preview pending; Apply commits once.");
+                } else if editor.skew_mode {
                     ui.label("Top/bottom: X · Left/right: Y · Shift: 15° snap.")
                         .on_hover_text("Drag an edge handle to shear the actual artwork. An edge on the reference axis stays fixed; drag the opposite edge or move the reference point. Release keeps the preview pending.");
                 } else {
@@ -849,6 +1077,7 @@ impl PeerBrush {
                     }
                     ctx.request_repaint();
                 }
+                editor.projective_controls(ui);
                 if ui.button("Reset transform").clicked() {
                     if editor.reference.is_some() {
                         editor.pivot = editor.reference_point();
@@ -872,7 +1101,7 @@ impl PeerBrush {
                 if !rendered {
                     ui.label("Rendering shared-engine preview...");
                 }
-                ui.label("Affine only. Perspective and Warp are not available.");
+                ui.label("Grid and preset Warp are not available yet.");
                 ui.horizontal(|ui| {
                     let ready = commands.is_ok()
                         && rendered

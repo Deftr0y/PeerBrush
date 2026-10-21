@@ -784,6 +784,7 @@ fn moved_reference_preserves_exact_command_then_anchors_the_next_affine_change()
         angle: 27.,
         skew: [9., -4.],
         mirror: [true, false],
+        projective: None,
     };
     for reference in [[9.125, 11.5], [12.25, 7.75]] {
         let commands = editor.commands().unwrap();
@@ -1198,6 +1199,7 @@ fn edge_skew_follows_the_actual_sheared_axes_and_reference_and_restores_exact_co
                         angle: 30.,
                         skew: [15., -15.],
                         mirror: mirrored,
+                        projective: None,
                     };
                     editor.snap = snap;
                     editor.set_reference([5.25, 21.75]).unwrap();
@@ -1740,4 +1742,525 @@ fn skew_handles_keep_selected_source_protection_and_support_explicit_whole_sourc
         assert!(app.free_transform.is_none());
         assert_eq!(workspace::source(&app), before);
     }
+}
+
+#[test]
+fn projective_corners_share_affine_order_pair_constraints_and_moved_reference() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.values.offset = [2., -1.];
+        editor.values.scale = [1.3, 0.8];
+        editor.values.angle = 23.;
+        editor.values.skew = [7., -4.];
+        let rect = editor.target_bounds();
+        let mut corners = Editor::rectangle(rect);
+        corners[0][0] += 0.5;
+        editor.set_quad(Quad { rect, corners });
+        let origin = editor.corners()[2];
+        let destination = [origin[0] + 0.7, origin[1] - 0.4];
+        editor
+            .drag_corner(2, origin, destination, false, false)
+            .unwrap();
+        let actual = editor.corners()[2];
+        for axis in 0..2 {
+            assert!((actual[axis] - destination[axis]).abs() < 1e-10);
+        }
+        let command = editor.commands().unwrap().pop().unwrap();
+        let map = crate::projective::combined(&command).unwrap().unwrap();
+        for (source, handle) in Editor::rectangle(rect).into_iter().zip(editor.corners()) {
+            let actual = map.point(source).unwrap();
+            for axis in 0..2 {
+                assert!((actual[axis] - handle[axis]).abs() < 1e-10);
+            }
+        }
+        for vertical in [false, true] {
+            let old = editor.quad().unwrap();
+            let other = if vertical { 3 } else { 1 };
+            let origin = editor.corners()[0];
+            editor
+                .drag_corner(
+                    0,
+                    origin,
+                    [origin[0] + 0.2, origin[1] + 0.3],
+                    true,
+                    vertical,
+                )
+                .unwrap();
+            let new = editor.quad().unwrap();
+            for axis in 0..2 {
+                assert!(
+                    (new.corners[0][axis] + new.corners[other][axis]
+                        - old.corners[0][axis]
+                        - old.corners[other][axis])
+                        .abs()
+                        < 1e-10
+                );
+            }
+            for index in 0..4 {
+                if index != 0 && index != other {
+                    assert_eq!(new.corners[index], old.corners[index]);
+                }
+            }
+        }
+        let commands = editor.commands().unwrap();
+        editor.set_reference([4.25, 5.5]).unwrap();
+        assert_eq!(editor.commands().unwrap(), commands);
+        let key = editor.key().unwrap();
+        editor.set_mode(Tool::Rotate);
+        assert_eq!(editor.key().unwrap(), key);
+        assert!(matches!(editor.mode(), Some(Tool::Rotate)));
+        editor.values.angle += 11.;
+        assert_eq!(
+            editor.commands().unwrap()[0]["projective"],
+            commands[0]["projective"]
+        );
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+fn real_projective_corner_drag(app: &mut PeerBrush, ctx: &egui::Context, mode: &str) {
+    let output = frame(app, ctx, vec![]);
+    workspace::click(app, ctx, SIZE, workspace::label(&output, mode));
+    frame(app, ctx, vec![]);
+    let editor = app.free_transform.as_ref().unwrap();
+    let rect = app.view_rect.unwrap();
+    let reference = app.view.point(
+        editor.reference_point().map(|v| v as f32),
+        rect,
+        rect.width() / 32.,
+    );
+    let controls = ctx
+        .memory(|memory| memory.area_rect(egui::Id::new("free transform")))
+        .unwrap();
+    let available = app.canvas_input_region.unwrap().0;
+    let left = controls.right().max(available.left()) + 24.;
+    let right = available.right() - 24.;
+    assert!(left < right, "The fixture needs unobscured canvas space");
+    app.pan.x += (left + right) * 0.5 - reference.x;
+    frame(app, ctx, vec![]);
+    let editor = app.free_transform.as_ref().unwrap();
+    assert!(editor.mode().is_none());
+    let rect = app.view_rect.unwrap();
+    let available = app.canvas_input_region.unwrap().0;
+    let (index, start) = editor
+        .corners()
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                i,
+                app.view
+                    .point(p.map(|v| v as f32), rect, rect.width() / 32.),
+            )
+        })
+        .find(|(_, p)| {
+            available.shrink(24.).contains(*p)
+                && ctx
+                    .layer_id_at(*p)
+                    .is_some_and(|layer| layer.order == egui::Order::Background)
+        })
+        .expect("An actual projective corner must be visible outside floating controls");
+    let end = start + Vec2::new(12., 4.);
+    frame(
+        app,
+        ctx,
+        vec![egui::Event::PointerMoved(start), pointer(start, true)],
+    );
+    assert!(
+        matches!(app.free_transform.as_ref().unwrap().drag.as_ref().map(|drag|drag.handle),
+        Some(Handle::Projective(i,perspective)) if i == index && perspective == (mode == "Perspective"))
+    );
+    frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+    frame(app, ctx, vec![pointer(end, false)]);
+    assert!(app.free_transform.as_ref().unwrap().drag.is_none());
+    assert!(app
+        .free_transform
+        .as_ref()
+        .unwrap()
+        .values
+        .projective
+        .is_some());
+}
+
+#[test]
+fn real_projective_modes_preview_native_selected_color_masks_folders_and_commit_once() {
+    for depth in [8, 16] {
+        for target in ["color", "mask", "folder"] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":app.selected})],
+                        None,
+                        None,
+                        "Painted mask",
+                    )
+                    .unwrap();
+                for y in 0..24 {
+                    for x in 0..32 {
+                        let layer = &mut engine.doc.layers[0];
+                        layer.pixels.set16(
+                            x,
+                            y,
+                            [
+                                10001 + x as u16 * 137,
+                                20003 + y as u16 * 193,
+                                40007,
+                                if (x + y) % 7 == 0 { 0 } else { 49157 },
+                            ],
+                        );
+                        let value = 12347 + x as u16 * 97 + y as u16 * 193;
+                        layer.mask.as_mut().unwrap().steps[1].pixels.set16(
+                            x,
+                            y,
+                            [value, value, value, 65535],
+                        );
+                    }
+                }
+                if target == "mask" {
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"mask.link","layer":app.selected,"linked":false})],
+                            None,
+                            None,
+                            "Unlink mask",
+                        )
+                        .unwrap();
+                }
+                if target == "folder" {
+                    let mut root = crate::engine::Layer::new("Projective folder", "group", 32, 24);
+                    root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
+                    let mut child = engine.doc.layers[0].clone();
+                    child.parent = Some(root.id.clone());
+                    let mut hidden = child.clone();
+                    hidden.id = crate::engine::id();
+                    hidden.visible = false;
+                    hidden.mask = None;
+                    hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
+                    app.selected = root.id.clone();
+                    engine.doc.layers = vec![root, child, hidden];
+                }
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"selection","kind":"ellipse",
+                    "rect":[4,4,26,21],"feather":1.})],
+                        None,
+                        None,
+                        "Soft selection",
+                    )
+                    .unwrap();
+            }
+            app.selection_layers = [app.selected.clone()].into_iter().collect();
+            app.mask = target == "mask";
+            app.zoom = 0.4;
+            let original = app.shared.lock().unwrap().doc.clone();
+            let before = workspace::source(&app);
+            let history = app.shared.lock().unwrap().undo.len();
+            open(&mut app, &ctx);
+            settle(&mut app, &ctx);
+            for mode in ["Distort", "Perspective"] {
+                real_projective_corner_drag(&mut app, &ctx, mode);
+                let output = settle(&mut app, &ctx);
+                actual_preview(&app, &output);
+                assert_eq!(workspace::source(&app), before);
+            }
+            // Real coordinate entry keeps Enter in the numeric editor.
+            let at = app.free_transform.as_ref().unwrap().projective_inputs[0]
+                .unwrap()
+                .center();
+            let requested = app.free_transform.as_ref().unwrap().corners()[0][0] + 0.25;
+            workspace::click(&mut app, &ctx, SIZE, at);
+            workspace::click(&mut app, &ctx, SIZE, at);
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                    egui::Event::Text(format!("{requested:.6}")),
+                ],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![key_event(egui::Key::Enter, Default::default())],
+            );
+            assert!(app.free_transform.is_some(), "Numeric Enter must not Apply");
+            assert!(
+                (app.free_transform.as_ref().unwrap().corners()[0][0] - requested).abs() < 1e-5
+            );
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["selection_only"], true);
+            assert_eq!(commands[0]["mask"], app.mask);
+            assert!(!commands[0]["projective"].is_null());
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Move"));
+            assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+            let expected =
+                crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+            assert_eq!(workspace::source(&app), before);
+            let output = settle(&mut app, &ctx);
+            if target == "color" {
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "other",
+                        "Selection owner",
+                        vec![crate::engine::Scope::layer("@selection")],
+                    )
+                    .unwrap();
+                workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+                assert!(
+                    app.free_transform.is_some(),
+                    "Reserved Apply must retain the pending session"
+                );
+                assert_eq!(workspace::source(&app), before);
+                app.shared.lock().unwrap().leases.clear();
+            }
+            let output = settle(&mut app, &ctx);
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+            assert!(app.free_transform.is_none(), "{}", app.message);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            assert_eq!(engine.doc.bit_depth, depth);
+            skew_native_layers_eq(&engine.doc, &expected);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
+            for data in [
+                crate::psd::encode(&engine.doc).unwrap(),
+                crate::psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = crate::psd::decode(&data).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.bit_depth, depth);
+                skew_native_layers_eq(&reopened, &engine.doc);
+                assert_eq!(
+                    reopened.export_png().unwrap(),
+                    engine.doc.export_png().unwrap()
+                );
+            }
+            engine.undo("human").unwrap();
+            skew_native_layers_eq(&engine.doc, &original);
+            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            engine.redo("human").unwrap();
+            skew_native_layers_eq(&engine.doc, &expected);
+        }
+    }
+}
+
+#[test]
+fn invalid_projective_quad_stays_uncommitted_and_can_be_repaired_then_canceled() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.projective_mode = Some(ProjectiveMode::Distort);
+        let rect = editor.target_bounds();
+        let mut corners = Editor::rectangle(rect);
+        corners[0] = corners[1];
+        editor.set_quad(Quad { rect, corners });
+        editor.changed();
+        frame(&mut app, &ctx, vec![]);
+        let output = frame(&mut app, &ctx, vec![]);
+        assert!(app.free_transform.as_ref().unwrap().commands().is_err());
+        assert!(app.free_transform.as_ref().unwrap().rendered.is_none());
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(app.free_transform.is_some());
+        assert_eq!(workspace::source(&app), before);
+        // Repair through the real document-coordinate field, including numeric Enter.
+        let at = app.free_transform.as_ref().unwrap().projective_inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, at);
+        workspace::click(&mut app, &ctx, SIZE, at);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text(format!("{}", rect[0] + 0.25)),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Enter, Default::default())],
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert_eq!(workspace::source(&app), before);
+        frame(&mut app, &ctx, vec![egui::Event::WindowFocused(false)]);
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn pending_projective_selection_scope_reuses_one_map_when_toggling_whole_target() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        {
+            let mut engine = app.shared.lock().unwrap();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"selection","rect":[4,4,20,18]})],
+                    None,
+                    None,
+                    "Selection",
+                )
+                .unwrap();
+        }
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        let rect = editor.target_bounds();
+        let mut corners = Editor::rectangle(rect);
+        corners[0][0] += 0.5;
+        editor.set_quad(Quad { rect, corners });
+        let initial = editor.commands().unwrap()[0]["projective"].clone();
+        let points = [[5.25, 6.5], [10., 11.], [-1., 2.]];
+        let expected = points.map(|p| editor.point(p));
+        editor.whole = true;
+        let whole = editor.quad().unwrap();
+        assert_eq!(whole.rect, editor.whole_bounds);
+        // Reframing the controls represents the same homography across its entire domain.
+        let reparameterized = json!({"op":"transform",
+            "projective":{"rect":whole.rect,"quad":whole.corners}});
+        let map = crate::projective::parse(&reparameterized)
+            .unwrap()
+            .unwrap()
+            .map;
+        for (point, expected) in points.into_iter().zip(expected) {
+            let actual = map.point(point).unwrap();
+            for axis in 0..2 {
+                assert!((actual[axis] - expected[axis]).abs() < 1e-10);
+            }
+        }
+        assert_eq!(editor.commands().unwrap()[0]["projective"], initial);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert_eq!(workspace::source(&app), before);
+        workspace::click(
+            &mut app,
+            &ctx,
+            SIZE,
+            workspace::label(&output, "Whole target (keep selection)"),
+        );
+        assert!(!app.free_transform.as_ref().unwrap().whole);
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap()[0]["projective"],
+            initial
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert_eq!(workspace::source(&app), before);
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Cancel"));
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn small_projective_window_scrolls_to_reference_corner_apply_and_cancel() {
+    let size = Vec2::new(980., 640.);
+    let (mut app, ctx) = workspace::fixture(16);
+    let before = workspace::source(&app);
+    workspace::draw(&mut app, &ctx, size, vec![]);
+    workspace::key(&mut app, &ctx, size, egui::Key::T, egui::Modifiers::COMMAND);
+    let output = workspace::draw(&mut app, &ctx, size, vec![]);
+    workspace::click(&mut app, &ctx, size, workspace::label(&output, "Distort"));
+    let visible = |output: &egui::FullOutput, label: &str| {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                let at = text.pos + text.galley.size() * 0.5;
+                (shape.clip_rect.contains(at) && Rect::from_min_size(Pos2::ZERO, size).contains(at))
+                    .then_some(at)
+            }
+            _ => None,
+        })
+    };
+    let scroll_to = |app: &mut PeerBrush, label: &str| {
+        for _ in 0..12 {
+            let output = workspace::draw(app, &ctx, size, vec![]);
+            if let Some(at) = visible(&output, label) {
+                return at;
+            }
+            let window = ctx
+                .memory(|m| m.area_rect(egui::Id::new("free transform")))
+                .unwrap();
+            workspace::draw(
+                app,
+                &ctx,
+                size,
+                vec![
+                    egui::Event::PointerMoved(window.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0., -80.),
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        panic!("Window scrolling did not expose {label}");
+    };
+    let enter = |app: &mut PeerBrush, at: Pos2, text: &str| {
+        workspace::click(app, &ctx, size, at);
+        workspace::click(app, &ctx, size, at);
+        workspace::draw(
+            app,
+            &ctx,
+            size,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text(text.into()),
+            ],
+        );
+        workspace::draw(
+            app,
+            &ctx,
+            size,
+            vec![key_event(egui::Key::Enter, Default::default())],
+        );
+        assert!(
+            app.free_transform.is_some(),
+            "Numeric Enter must keep the session"
+        );
+    };
+    scroll_to(&mut app, "Reference X");
+    let at = app.free_transform.as_ref().unwrap().inputs[7]
+        .unwrap()
+        .center();
+    enter(&mut app, at, "4.25");
+    assert_eq!(
+        app.free_transform.as_ref().unwrap().reference_point()[0],
+        4.25
+    );
+    scroll_to(&mut app, "Top left");
+    let at = app.free_transform.as_ref().unwrap().projective_inputs[0]
+        .unwrap()
+        .center();
+    let x = app.free_transform.as_ref().unwrap().corners()[0][0] + 0.25;
+    enter(&mut app, at, &format!("{x:.6}"));
+    assert!((app.free_transform.as_ref().unwrap().corners()[0][0] - x).abs() < 1e-5);
+    scroll_to(&mut app, "Apply");
+    let at = scroll_to(&mut app, "Cancel");
+    workspace::click(&mut app, &ctx, size, at);
+    assert!(app.free_transform.is_none());
+    assert_eq!(workspace::source(&app), before);
 }
