@@ -14,7 +14,7 @@ pub struct Version {
     pub identity: (u64, u64),
     pub bytes: u64,
     modified: u128,
-    fingerprint: [u64; 2],
+    fingerprint: [u8; 32],
 }
 
 #[cfg(unix)]
@@ -74,6 +74,9 @@ pub(crate) fn hash(bytes: &[u8], state: &mut [u64; 2]) {
         state[1] = (state[1] ^ b as u64).wrapping_mul(0x9e3779b185ebca87);
     }
 }
+pub(crate) fn finish_fingerprint(context: ring::digest::Context) -> [u8; 32] {
+    context.finish().as_ref().try_into().unwrap()
+}
 pub fn version(path: &Path) -> Result<Version, String> {
     version_with_check(path, || Ok(()))
 }
@@ -88,7 +91,7 @@ pub(crate) fn version_with_check(
     if before.0 > 256 * 1024 * 1024 {
         return Err("File exceeds the 256 MiB safety-check limit; original retained".into());
     }
-    let mut fingerprint = [0xcbf29ce484222325, 0x84222325cbf29ce4];
+    let mut fingerprint = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
@@ -101,7 +104,7 @@ pub(crate) fn version_with_check(
         if total > 256 * 1024 * 1024 {
             return Err("File grew beyond its safety-check limit; original retained".into());
         }
-        hash(&buffer[..n], &mut fingerprint);
+        fingerprint.update(&buffer[..n]);
     }
     check()?;
     if stamp(&file)? != before
@@ -114,7 +117,7 @@ pub(crate) fn version_with_check(
         identity,
         bytes: total,
         modified: before.1,
-        fingerprint,
+        fingerprint: finish_fingerprint(fingerprint),
     })
 }
 pub fn snapshot(path: &Path) -> Result<Option<Version>, String> {
@@ -125,14 +128,19 @@ pub fn snapshot(path: &Path) -> Result<Option<Version>, String> {
     }
 }
 pub(crate) fn published_version(path: &Path, bytes: &[u8]) -> Result<Version, String> {
-    let mut expected = [0xcbf29ce484222325, 0x84222325cbf29ce4];
-    hash(bytes, &mut expected);
-    verified_version(path, bytes.len() as u64, expected, || Ok(()))
+    let mut expected = ring::digest::Context::new(&ring::digest::SHA256);
+    expected.update(bytes);
+    verified_version(
+        path,
+        bytes.len() as u64,
+        finish_fingerprint(expected),
+        || Ok(()),
+    )
 }
 pub(crate) fn verified_version(
     path: &Path,
     bytes: u64,
-    expected: [u64; 2],
+    expected: [u8; 32],
     check: impl Fn() -> Result<(), String>,
 ) -> Result<Version, String> {
     let actual = version_with_check(path, check)?;
@@ -449,5 +457,137 @@ mod tests {
         drop(descriptor);
         drop(next);
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn content_fingerprints_match_standard_sha256_vectors_across_chunks() {
+        let vectors = [
+            (
+                Vec::new(),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc".to_vec(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                vec![b'a'; 1_000_000],
+                "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+            ),
+        ];
+        for (bytes, expected) in vectors {
+            for chunk in [1, 63, 64, 65, 4093, 65535, 65536, 65537] {
+                if bytes.len() > 65536 && chunk < 4093 {
+                    continue;
+                }
+                let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+                for part in bytes.chunks(chunk) {
+                    context.update(part);
+                }
+                let actual = finish_fingerprint(context)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                assert_eq!(actual, expected, "{} bytes / {chunk}", bytes.len());
+            }
+        }
+    }
+
+    #[test]
+    fn content_version_readback_matches_buffered_and_streamed_fingerprints() {
+        let path = std::env::temp_dir().join(format!("pb-sha256-readback-{}", crate::engine::id()));
+        let bytes = vec![b'a'; 1_000_000];
+        fs::write(&path, &bytes).unwrap();
+        let version = version(&path).unwrap();
+        let hex = version
+            .fingerprint
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        assert_eq!(published_version(&path, &bytes).unwrap(), version);
+        let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+        for chunk in bytes.chunks(4093) {
+            context.update(chunk);
+        }
+        let expected = finish_fingerprint(context);
+        assert_eq!(
+            verified_version(&path, bytes.len() as u64, expected, || Ok(())).unwrap(),
+            version
+        );
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut changed = bytes.clone();
+        changed[65536] ^= 1;
+        fs::write(&path, &changed).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(verified_version(&path, bytes.len() as u64, expected, || Ok(())).is_err());
+        assert!(source_conflict(Some(&path), Some(version)));
+        assert_eq!(fs::read(&path).unwrap(), changed);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "Opt-in isolated file-content hash component; run alone from a clean build"]
+    fn content_fingerprint_component_diagnostic() {
+        use std::{hint::black_box, time::Instant};
+        let build: serde_json::Value = serde_json::from_str(crate::build_info::json()).unwrap();
+        assert_eq!(build["tree"], "clean");
+        assert_eq!(build["commit"].as_str().unwrap().len(), 40);
+        let bytes: Vec<u8> = (0..32 * 1024 * 1024usize)
+            .map(|i| (i.wrapping_mul(73).wrapping_add(19) & 255) as u8)
+            .collect();
+        let before = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        let expected: [u8; 32] = before.as_ref().try_into().unwrap();
+        let mut legacy = [0xcbf29ce484222325, 0x84222325cbf29ce4];
+        hash(&bytes, &mut legacy);
+        let mut records = Vec::new();
+        for trial in 1..=4 {
+            let algorithms = if trial % 2 == 1 {
+                ["legacy-dual-fnv", "sha256"]
+            } else {
+                ["sha256", "legacy-dual-fnv"]
+            };
+            for (position, algorithm) in algorithms.into_iter().enumerate() {
+                let started = Instant::now();
+                let valid = if algorithm == "legacy-dual-fnv" {
+                    let mut actual = [0xcbf29ce484222325, 0x84222325cbf29ce4];
+                    for chunk in bytes.chunks(64 * 1024) {
+                        hash(black_box(chunk), &mut actual);
+                    }
+                    let actual = black_box(actual);
+                    let elapsed = started.elapsed();
+                    (actual == legacy, elapsed)
+                } else {
+                    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+                    for chunk in bytes.chunks(64 * 1024) {
+                        context.update(black_box(chunk));
+                    }
+                    let actual = black_box(finish_fingerprint(context));
+                    let elapsed = started.elapsed();
+                    (actual == expected, elapsed)
+                };
+                assert!(valid.0);
+                records.push(serde_json::json!({"trial":trial,"algorithm":algorithm,"position":position+1,
+                    "bytes":bytes.len(),"chunk_bytes":65536,"hash_ms":valid.1.as_secs_f64()*1000.,"exact_fingerprint":true}));
+            }
+        }
+        assert_eq!(
+            ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref(),
+            expected.as_slice()
+        );
+        println!(
+            "\n{}",
+            serde_json::json!({"format":"PeerBrushContentFingerprintComponentV1","build":build,
+            "profile":if cfg!(debug_assertions) {"test-debug-assertions"} else {"test-release"},
+            "normal_application":false,"native_window":false,"records":records,
+            "note":"Balanced in-memory 32 MiB content-hash component only. File I/O, metadata, ownership, full Open/Save, lock time, memory, cache and scheduling are not qualified by these timings."})
+        );
     }
 }

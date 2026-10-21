@@ -460,7 +460,7 @@ struct SaveTemporary {
     file: fs::File,
     identity: (u64, u64),
     bytes: u64,
-    fingerprint: [u64; 2],
+    fingerprint: ring::digest::Context,
     reading: bool,
 }
 impl SaveTemporary {
@@ -484,7 +484,7 @@ impl SaveTemporary {
             file,
             identity,
             bytes: 0,
-            fingerprint: [0xcbf29ce484222325, 0x84222325cbf29ce4],
+            fingerprint: ring::digest::Context::new(&ring::digest::SHA256),
             reading: false,
         };
         temporary.check_path()?;
@@ -528,8 +528,12 @@ impl SaveTemporary {
         self.file.sync_all().map_err(|e| e.to_string())?;
         self.check_path()?;
         let before = self.stamp()?;
-        let version =
-            crate::file_safety::verified_version(&self.path, self.bytes, self.fingerprint, check)?;
+        let version = crate::file_safety::verified_version(
+            &self.path,
+            self.bytes,
+            crate::file_safety::finish_fingerprint(self.fingerprint.clone()),
+            check,
+        )?;
         self.check_path()?;
         if version.identity != self.identity || self.stamp()? != before {
             return Err("Save temporary file changed during verification".into());
@@ -564,7 +568,7 @@ impl Write for SaveTemporary {
         self.check_path().map_err(std::io::Error::other)?;
         let n = self.file.write(bytes)?;
         self.bytes += n as u64;
-        crate::file_safety::hash(&bytes[..n], &mut self.fingerprint);
+        self.fingerprint.update(&bytes[..n]);
         Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -714,8 +718,12 @@ fn save_prepared(
     #[cfg(test)]
     save_safety_tests::observe("published", path, &spool_path)?;
     // The engine is already locked; never invoke the source-locking callback here.
-    let version =
-        crate::file_safety::verified_version(path, output.bytes, output.fingerprint, || Ok(()))?;
+    let version = crate::file_safety::verified_version(
+        path,
+        output.bytes,
+        crate::file_safety::finish_fingerprint(output.fingerprint.clone()),
+        || Ok(()),
+    )?;
     if version != staged {
         return Err("Published save changed before verification; current work remains open and the previous version is retained".into());
     }
@@ -862,7 +870,7 @@ pub(crate) fn export_derived_to_guarded(
     struct Output<'a> {
         file: &'a mut fs::File,
         bytes: usize,
-        fingerprint: [u64; 2],
+        fingerprint: ring::digest::Context,
         control: &'a crate::production_export::Control,
     }
     impl Write for Output<'_> {
@@ -878,7 +886,7 @@ pub(crate) fn export_derived_to_guarded(
                 ));
             }
             let n = self.file.write(bytes)?;
-            crate::file_safety::hash(&bytes[..n], &mut self.fingerprint);
+            self.fingerprint.update(&bytes[..n]);
             self.bytes += n;
             Ok(n)
         }
@@ -907,13 +915,13 @@ pub(crate) fn export_derived_to_guarded(
     let mut output = Output {
         file: &mut file,
         bytes: 0,
-        fingerprint: [0xcbf29ce484222325, 0x84222325cbf29ce4],
+        fingerprint: ring::digest::Context::new(&ring::digest::SHA256),
         control,
     };
     encode(&doc, &mut output)?;
     output.flush().map_err(|e| e.to_string())?;
     let bytes = output.bytes;
-    let fingerprint = output.fingerprint;
+    let fingerprint = crate::file_safety::finish_fingerprint(output.fingerprint.clone());
     drop(output);
     file.sync_all().map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;

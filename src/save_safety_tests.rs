@@ -645,7 +645,7 @@ fn save_temporary_rejects_replaced_names_before_reads_writes_and_cleanup() {
             temporary.write_all(b"owned native bytes").unwrap();
             temporary.flush().unwrap();
             let original_identity = temporary.identity;
-            let fingerprint = temporary.fingerprint;
+            let fingerprint = crate::file_safety::finish_fingerprint(temporary.fingerprint.clone());
             let bytes = temporary.bytes;
             let name = temporary.path.clone();
             let relocated = directory.join("relocated-owned-file");
@@ -665,7 +665,10 @@ fn save_temporary_rejects_replaced_names_before_reads_writes_and_cleanup() {
             };
             assert!(error.to_string().contains("identity changed"));
             assert_eq!(temporary.bytes, bytes);
-            assert_eq!(temporary.fingerprint, fingerprint);
+            assert_eq!(
+                crate::file_safety::finish_fingerprint(temporary.fingerprint.clone()),
+                fingerprint
+            );
             assert_eq!(fs::read(&relocated).unwrap(), b"owned native bytes");
             assert_eq!(fs::read(&name).unwrap(), b"foreign name retained");
             drop(temporary);
@@ -685,4 +688,62 @@ fn save_temporary_rejects_replaced_names_before_reads_writes_and_cleanup() {
             fs::remove_dir_all(directory).unwrap();
         }
     }
+}
+
+#[test]
+fn save_temporary_fingerprint_tracks_only_written_bytes_and_survives_reads() {
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = parent.join(format!("pb-stream-fingerprint-{}", engine::id()));
+    fs::create_dir(&directory).unwrap();
+    let destination = directory.join("art.psd");
+    let bytes = vec![b'a'; 1_000_000];
+    for spool in [false, true] {
+        let mut temporary = SaveTemporary::new(&destination, spool).unwrap();
+        for chunk in bytes.chunks(4093) {
+            let mut remaining = chunk;
+            while !remaining.is_empty() {
+                let written = temporary.write(remaining).unwrap();
+                assert!(written > 0 && written <= remaining.len());
+                remaining = &remaining[written..];
+            }
+        }
+        let expected = crate::file_safety::finish_fingerprint(temporary.fingerprint.clone());
+        assert_eq!(
+            expected
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        assert_eq!(temporary.bytes, bytes.len() as u64);
+        assert_eq!(
+            temporary.verify(|| Ok(())).unwrap(),
+            crate::file_safety::published_version(&temporary.path, &bytes).unwrap()
+        );
+        temporary.rewind().unwrap();
+        let mut readback = Vec::new();
+        temporary.read_to_end(&mut readback).unwrap();
+        assert_eq!(readback, bytes);
+        let error = temporary.write(b"rejected after read").unwrap_err();
+        assert!(error.to_string().contains("not sequential"));
+        assert_eq!(temporary.bytes, bytes.len() as u64);
+        assert_eq!(
+            crate::file_safety::finish_fingerprint(temporary.fingerprint.clone()),
+            expected
+        );
+        assert_eq!(fs::read(&temporary.path).unwrap(), bytes);
+    }
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+    let metadata = fs::symlink_metadata(&directory).unwrap();
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(metadata.file_attributes() & 0x400, 0);
+    }
+    assert_eq!(
+        directory.canonicalize().unwrap().parent(),
+        Some(parent.as_path())
+    );
+    fs::remove_dir(directory).unwrap();
 }
