@@ -421,3 +421,186 @@ fn flushed_temp_failure_preserves_original_and_cleans_incomplete_file() {
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+#[ignore = "Opt-in synthetic Save phase timings; run alone from a clean build"]
+fn synthetic_save_phase_diagnostic() {
+    use std::{cell::RefCell, rc::Rc, time::Instant};
+    let build: Value = serde_json::from_str(crate::build_info::json()).unwrap();
+    assert_eq!(build["tree"], "clean");
+    assert_eq!(build["commit"].as_str().unwrap().len(), 40);
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = parent.join(format!("pb-save-phases-{}", engine::id()));
+    fs::create_dir(&directory).unwrap();
+    assert_eq!(
+        directory.canonicalize().unwrap().parent(),
+        Some(parent.as_path())
+    );
+    let mut records = Vec::new();
+    for depth in [8, 16] {
+        let source = directory.join(format!("source-{depth}.psd"));
+        let shared = Arc::new(Mutex::new(Engine::new()));
+        {
+            let mut e = shared.lock().unwrap();
+            e.doc = engine::Document::new_depth(2048, 2048, depth).unwrap();
+            for y in 0..2048i32 {
+                for x in 0..2048i32 {
+                    let (x, y) = (x as u16, y as u16);
+                    let alpha = if (u32::from(x) + 3 * u32::from(y)) % 17 == 0 {
+                        0
+                    } else {
+                        12001u16
+                            .wrapping_add(x.wrapping_mul(31))
+                            .wrapping_add(y.wrapping_mul(47))
+                    };
+                    e.doc.layers[0].pixels.set16(
+                        i32::from(x),
+                        i32::from(y),
+                        [
+                            x.wrapping_mul(239)
+                                .wrapping_add(y.wrapping_mul(911))
+                                .wrapping_add(17),
+                            x.wrapping_mul(13) ^ y.wrapping_mul(907) ^ 0x873b,
+                            x.wrapping_add(y).wrapping_mul(613).wrapping_add(0x4ef3),
+                            alpha,
+                        ],
+                    );
+                }
+            }
+        }
+        save(&shared, &source).unwrap();
+        drop(shared);
+        let source_version = crate::file_safety::version(&source).unwrap();
+        for trial in 1..=3 {
+            for extension in ["psd", "psb"] {
+                let output = directory.join(format!("saved-{depth}-{trial}.{extension}"));
+                let shared = Arc::new(Mutex::new(Engine::new()));
+                open(&shared, &source).unwrap();
+                let before = shared.lock().unwrap().doc.clone();
+                assert_eq!(shared.lock().unwrap().saved_revision, before.revision);
+                let history = shared.lock().unwrap().undo.len();
+                #[derive(Default)]
+                struct Phases {
+                    source_checks: u64,
+                    encoded: Option<std::time::Duration>,
+                    precommit: Option<std::time::Duration>,
+                    published: Option<std::time::Duration>,
+                }
+                let started = Instant::now();
+                let phases = Rc::new(RefCell::new(Phases::default()));
+                let observed = phases.clone();
+                let observed_engine = shared.clone();
+                let watch = WatchSave::new(move |phase, _, _| {
+                    let mut p = observed.borrow_mut();
+                    match phase {
+                        "encoding" => p.source_checks += 1,
+                        "encoded" => {
+                            assert!(
+                                observed_engine.try_lock().is_ok(),
+                                "Encoding must leave the engine available"
+                            );
+                            assert!(p.encoded.replace(started.elapsed()).is_none());
+                        }
+                        "published" => {
+                            assert!(
+                                observed_engine.try_lock().is_err(),
+                                "This existing checkpoint is inside the publication lock"
+                            );
+                            assert!(p.published.replace(started.elapsed()).is_none());
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                });
+                let precommit = phases.clone();
+                let precommit_engine = shared.clone();
+                save_prepared(&shared, &output, &json!({}), || {
+                    assert!(
+                        precommit_engine.try_lock().is_ok(),
+                        "Verification before final publication must leave the engine available"
+                    );
+                    assert!(precommit
+                        .borrow_mut()
+                        .precommit
+                        .replace(started.elapsed())
+                        .is_none());
+                })
+                .unwrap();
+                let total = started.elapsed();
+                drop(watch);
+                let p = phases.borrow();
+                let (encoded, precommit, published) = (
+                    p.encoded.unwrap(),
+                    p.precommit.unwrap(),
+                    p.published.unwrap(),
+                );
+                assert!(encoded <= precommit && precommit <= published && published <= total);
+                let millis = |d: std::time::Duration| d.as_secs_f64() * 1000.;
+                records.push(json!({
+                    "depth":depth,"container":extension,"trial":trial,
+                    "width":2048,"height":2048,"layers":1,"painted_masks":0,"effects":0,
+                    "source_check_callbacks":p.source_checks,
+                    "encode_ms":millis(encoded),
+                    "verify_and_backup_ms":millis(precommit-encoded),
+                    "precommit_to_published_ms":millis(published-precommit),
+                    "published_to_return_ms":millis(total-published),
+                    "precommit_to_return_ms":millis(total-precommit),
+                    "engine_locked_at_published_checkpoint":true,
+                    "save_ms":millis(total),"output_bytes":fs::metadata(&output).unwrap().len()
+                }));
+                drop(p);
+                {
+                    let e = shared.lock().unwrap();
+                    assert_eq!(
+                        (e.doc.id.as_str(), e.doc.revision, e.doc.bit_depth),
+                        (before.id.as_str(), before.revision, depth)
+                    );
+                    assert_eq!(e.undo.len(), history);
+                    assert_eq!(
+                        e.doc.layers[0].pixels.rgba16(),
+                        before.layers[0].pixels.rgba16()
+                    );
+                    assert_eq!(e.saved_revision, before.revision);
+                }
+                let loaded = psd::decode(&fs::read(&output).unwrap()).unwrap();
+                assert!(!loaded.read_only);
+                assert_eq!(loaded.bit_depth, depth);
+                assert_eq!(loaded.layers[0].pixels.depth, depth);
+                assert_eq!(
+                    loaded.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert_eq!(
+                    crate::file_safety::version(&source).unwrap(),
+                    source_version
+                );
+                drop(shared);
+            }
+        }
+    }
+    // Only this newly created, checked synthetic directory is eligible for cleanup.
+    let metadata = fs::symlink_metadata(&directory).unwrap();
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(metadata.file_attributes() & 0x400, 0);
+    }
+    assert_eq!(
+        directory.canonicalize().unwrap().parent(),
+        Some(parent.as_path())
+    );
+    fs::remove_dir_all(&directory).unwrap();
+    assert!(!directory.exists());
+    println!(
+        "\n{}",
+        json!({
+            "format":"PeerBrushSavePhaseDiagnosticV1","build":build,
+            "native_window":false,"normal_application":false,
+            "workload":"synthetic clean Save As from a native dense PSD",
+            "profile":if cfg!(debug_assertions) {"test-debug-assertions"} else {"test-release"},
+            "note":"Opt-in test observer overhead is included. Cache and scheduling are uncontrolled. The final phase includes post-publication verification and return cleanup. The engine is observed locked at the publication checkpoint; exact unlock time is not instrumented. This is not input-to-display latency or total lock time.",
+            "records":records
+        })
+    );
+}
