@@ -507,3 +507,6 @@ PB-154 export acceptance fixture (unreleased, combined replay pending): two actu
 
 
 PB-145/PB-155 historical DEB harness correction (unreleased, replay pending): actual b99 Ubuntu current-package lifecycle passed before a bounded historical old-fixture FileNotFoundError. The three runuser callers now bind an installed absolute executable before their restricted child PATH; all published-input/native/settings-migration/install guards remain. Two offline selection/refusal methods are prepared and source-reviewed. The observed exact failing program is unproved; actual historical upgrade/migration acceptance still requires native replay.
+
+
+PB-154 Store invocation prerequisite (unreleased, hosted writer blocked): a fixed isolated guard verifies exact official manual-main automation separately from release data before checkout. Hosted write requests and unknown publisher routes stop before credentials; final authenticated read-only preflight retains existing access, with no submit forwarding or guessed state path. Five offline trust/privacy/caller methods are prepared and independently source-reviewed. Durable private host/backend and actual publisher selection, combined/provider/public acceptance and explicit activation remain open; no remote setting changed.

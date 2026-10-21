@@ -292,6 +292,7 @@ jobs:
           python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --output "$RUNNER_TEMP/peerbrush-sparkle-preparation"
           cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-preparation/Sparkle.framework"
       - run: python scripts/test_submit_store_release.py
+      - run: python -B scripts/test_store_workflow.py
       - run: python scripts/test_store_release_state.py
       - run: python scripts/test_production_readiness.py
       - run: python -B scripts/test_prepare_site_release.py

@@ -147,6 +147,7 @@
     "scripts/test_store_msix_handoff.py",
     "scripts/test_store_msix_preflight.py",
     "scripts/test_store_release_state.py",
+    "scripts/test_store_workflow.py",
     "scripts/test_submit_store_release.py",
     "scripts/verify_macos_qualification.py",
     "scripts/verify_release.py",

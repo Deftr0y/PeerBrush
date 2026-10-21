@@ -17,33 +17,21 @@ included, and no real submission has been tested.
    the GitHub release **before publishing it**. Use the reviewed MSIX packager;
    do not fabricate these reports for arbitrary binaries. The current candidate
    workflow does not publish releases or provide this end-to-end contract.
-3. Wire the real GitHub release publisher to call this reusable workflow after
-   publication. A `release: published` listener alone is insufficient: releases
-   created using `GITHUB_TOKEN` do not start downstream event workflows. A
-   reusable job is explicit and does not need a new personal access token:
+3. Select and review the actual publisher and durable private state host before
+   implementing a hosted writer. Neither exists in this workflow. Its retained
+   `release` and reusable declarations are explicitly blocked by the job and
+   pre-checkout guards; do not wire an assumed publisher or inherit credentials
+   into an unreviewed caller. A `release: published` listener alone is also
+   insufficient: releases created using `GITHUB_TOKEN` do not start downstream
+   event workflows. The future publisher must supply the exact published tag,
+   source SHA, independently selected Windows portable hash and final
+   SDK-validated MSIX hash. Candidates are not published releases.
 
-   ```yaml
-   store:
-     needs: publish
-     uses: ./.github/workflows/store-submit.yml
-     with:
-       tag: ${{ needs.publish.outputs.tag }}
-       source_commit: ${{ needs.publish.outputs.source_commit }}
-       portable_sha256: ${{ needs.publish.outputs.windows_portable_sha256 }}
-       msix_sha256: ${{ needs.publish.outputs.windows_msix_sha256 }}
-       submit: true
-     secrets: inherit
-   ```
-
-   `publish` must expose its exact published tag, source SHA and independently
-   reviewed Windows portable hash and final SDK-validated MSIX hash from the release
-   qualification; adapt the job name to the
-   actual publisher. Never add this after candidate building and imply that
-   the candidate is already published. A person publishing via GitHub's UI
-   triggers the release listener, but that listener cannot independently select
-   the required source/hash yet and fails before Store authentication. A reviewed
-   inventory adapter is still required for automatic event handling. Product-wide
-   concurrency and Store pending/version checks preserve submission ownership.
+   The existing local CLI already requires durable private `--state` before
+   submission and journals every uncertain mutation. A runner temporary file,
+   cache or Actions artifact is not a persistence adapter. Hosted submission is
+   refused before checkout even when `submit=true` and the enable variable is
+   set. See [the state and host boundary](production-automation.md#private-store-submission-state).
 4. Verify API access for the existing Partner Center account. An Entra tenant
    must be associated and an application authorized for Store submissions.
    Account-type eligibility must be confirmed in Partner Center; do not assume
@@ -54,12 +42,16 @@ included, and no real submission has been tested.
    `9PNR6T1Q2ZL9` as `applicationId`; it is **not** the Entra client ID and does
    not require the CLI's seller ID. Credential creation and access grants are
    separate security operations. Do not paste values into issues, code or logs.
-6. Review the complete pipeline, run the offline tests, and only then enable
-   the repository variable `MSSTORE_AUTOMATION_ENABLED=true`. First manually
-   dispatch with `submit=false` and a new, reviewed, fully packaged stable
-   release. This authenticates and checks Store state without changing it.
-   An actual next-version submission and subsequent certification/publication
-   verification remain required to establish end-to-end success.
+6. Keep `MSSTORE_AUTOMATION_ENABLED` unset pending explicit approval, offline
+   verification and actual provider access. A separately approved manual
+   `submit=false` preflight must select `automation_commit` as the independently
+   reviewed full main automation/workflow SHA, plus `tag`, `source_commit`,
+   `portable_sha256` and `msix_sha256` for the real published stable release.
+   It authenticates and checks Store state without creating a submission.
+   An approved durable host/backend and its actual caller, next-version
+   submission, certification and public readback remain required for end-to-end
+   success. No account, credential, permission or enable setting is configured
+   by preparing this code.
 
 ## Behavior and boundaries
 
@@ -75,12 +67,23 @@ included, and no real submission has been tested.
   app/Store version and approved product identity. A manifest-only ZIP is invalid.
   This is not a replacement for SDK validation,
   installed-runtime QA or source/license review by the package builder.
-- The automation code is checked out from the repository's default branch,
-  with the selected source in a separate read-only input checkout. Only trusted
-  default-branch scripts execute with credentials. Workflow inputs require the
-  reviewed full source SHA, portable SHA-256 and final MSIX SHA-256; none is taken
-  from the MSIX report. Custom footprint checks cannot establish SDK acceptance;
-  select the final MSIX hash only after the native SDK validation job succeeds.
+- A fixed isolated inline guard runs before any checkout or repository script.
+  Only a first-attempt manual invocation of the official main Store workflow on
+  hosted Ubuntu x64 is accepted. The independent `automation_commit` must equal
+  both `GITHUB_SHA` and `GITHUB_WORKFLOW_SHA`; checkout uses that `github.sha`,
+  never a moving default branch or the release input. The existing release gate
+  verifies the actual automation checkout afterward. The separate
+  `source_commit` is release data and may differ from the automation SHA; none
+  of its scripts executes. Its full SHA and both independently selected hashes
+  must be well formed before checkout. None is taken from the MSIX report.
+  Select the final MSIX hash only after the native SDK validation job succeeds;
+  custom footprint checks cannot establish SDK acceptance.
+- Only the final authenticated read-only preflight step receives the existing
+  Partner Center secrets and read-only GitHub token. No hosted step forwards
+  `--submit` or invents `--state`. The preflight still requires authorized Store
+  access, because it checks actual product identity, pending submissions and
+  published version. The unchanged local CLI's explicitly authorized write
+  route has the persistence rules above; this workflow supplies no write host.
 - Refuse any existing pending submission. Never delete, resume, replace or
   overwrite it automatically. A successful creation followed by failure leaves
   its draft for deliberate inspection. A retry cannot create a second draft.
@@ -105,6 +108,8 @@ Run offline tests:
 
 ```sh
 python scripts/test_submit_store_release.py
+python scripts/test_store_release_state.py
+python -B scripts/test_store_workflow.py
 ```
 
 ## Official references

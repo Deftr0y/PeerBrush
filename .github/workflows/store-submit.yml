@@ -1,10 +1,14 @@
-name: Submit published release to Microsoft Store
+name: Microsoft Store release preflight (submission blocked)
 
 on:
   release:
     types: [published]
   workflow_call:
     inputs:
+      automation_commit:
+        description: Independently reviewed full main automation and workflow SHA
+        required: true
+        type: string
       tag:
         description: Published stable release tag with reviewed MSIX assets
         required: true
@@ -22,7 +26,7 @@ on:
         required: true
         type: string
       submit:
-        description: Submit after preflight (false is read-only)
+        description: Write route remains blocked pending durable private host integration
         default: false
         type: boolean
     secrets:
@@ -34,6 +38,10 @@ on:
         required: true
   workflow_dispatch:
     inputs:
+      automation_commit:
+        description: Independently reviewed full main automation and workflow SHA
+        required: true
+        type: string
       tag:
         description: Published stable release tag (never 0.25 or older)
         required: true
@@ -51,7 +59,7 @@ on:
         required: true
         type: string
       submit:
-        description: Submit after preflight (false is read-only)
+        description: Write route remains blocked pending durable private host integration
         default: false
         type: boolean
 
@@ -65,40 +73,62 @@ concurrency:
 
 jobs:
   submit:
-    # Deliberately inactive until setup and the MSIX release integration are reviewed.
-    if: vars.MSSTORE_AUTOMATION_ENABLED == 'true'
+    # Missing by default; reusable/release writers remain blocked pending a real publisher/state host.
+    if: vars.MSSTORE_AUTOMATION_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.workflow_ref == 'Deftr0y/PeerBrush/.github/workflows/store-submit.yml@refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Check out trusted automation from the default branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          path: trusted-automation
-          persist-credentials: false
-      - name: Require independent release input selection
+      - name: Require reviewed manual main Store invocation
         env:
+          AUTOMATION_COMMIT: ${{ inputs.automation_commit }}
           RELEASE_COMMIT: ${{ inputs.source_commit }}
           PORTABLE_SHA256: ${{ inputs.portable_sha256 }}
           MSIX_SHA256: ${{ inputs.msix_sha256 }}
+          STORE_EXECUTE: ${{ inputs.submit }}
+          STORE_AUTOMATION_ENABLED: ${{ vars.MSSTORE_AUTOMATION_ENABLED }}
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import os, re
-          if not re.fullmatch('[0-9a-f]{40}', os.environ['RELEASE_COMMIT']) or any(not re.fullmatch('[0-9a-f]{64}', os.environ[name]) for name in ['PORTABLE_SHA256', 'MSIX_SHA256']):
-              raise SystemExit('Store automation needs independently reviewed source, portable and final MSIX hashes. Automatic release-event selection remains blocked until the final inventory adapter is reviewed.')
+          automation = os.environ.get('AUTOMATION_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_SHA': automation, 'GITHUB_WORKFLOW_SHA': automation,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/store-submit.yml@refs/heads/main',
+              'GITHUB_RUN_ATTEMPT': '1', 'RUNNER_ENVIRONMENT': 'github-hosted',
+              'RUNNER_OS': 'Linux', 'RUNNER_ARCH': 'X64', 'STORE_AUTOMATION_ENABLED': 'true',
+          }
+          if (not re.fullmatch('[0-9a-f]{40}', automation)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or not re.fullmatch('[0-9a-f]{40}', os.environ.get('RELEASE_COMMIT', ''))
+                  or any(not re.fullmatch('[0-9a-f]{64}', os.environ.get(key, ''))
+                         for key in ['PORTABLE_SHA256', 'MSIX_SHA256'])):
+              raise SystemExit('Store preflight requires independently reviewed exact manual main automation and separate release inputs before checkout.')
+          if os.environ.get('STORE_EXECUTE') != 'false':
+              raise SystemExit('Hosted Store submission remains blocked until an approved durable private host/state integration is implemented.')
           PY
+      - name: Check out the reviewed automation source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-automation
+          persist-credentials: false
+      - name: Verify actual automation checkout
+        working-directory: trusted-automation
+        env:
+          AUTOMATION_COMMIT: ${{ inputs.automation_commit }}
+        run: python3 -B scripts/release_gate.py --commit "$AUTOMATION_COMMIT"
       - name: Read the selected release source without executing its scripts
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_commit }}
           path: selected-release-source
           persist-credentials: false
-      - name: Validate and submit the published release
+      - name: Validate the published release (read-only)
         working-directory: trusted-automation
         env:
           GH_TOKEN: ${{ github.token }}
-          STORE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
-          STORE_EXECUTE: ${{ github.event_name == 'release' || inputs.submit }}
+          STORE_TAG: ${{ inputs.tag }}
           PORTABLE_SHA256: ${{ inputs.portable_sha256 }}
           MSIX_SHA256: ${{ inputs.msix_sha256 }}
           MSSTORE_TENANT_ID: ${{ secrets.MSSTORE_TENANT_ID }}
@@ -106,5 +136,4 @@ jobs:
           MSSTORE_CLIENT_SECRET: ${{ secrets.MSSTORE_CLIENT_SECRET }}
         run: |
           args=(--tag "$STORE_TAG" --source-root "$GITHUB_WORKSPACE/selected-release-source" --portable-sha256 "$PORTABLE_SHA256" --msix-sha256 "$MSIX_SHA256")
-          if [[ "$STORE_EXECUTE" == "true" ]]; then args+=(--submit); fi
           python3 scripts/submit_store_release.py "${args[@]}"
