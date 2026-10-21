@@ -43,3 +43,9 @@ Existing `document` action `open` remains synchronous. `open_async` returns imme
 ```
 
 No partial loaded document is exposed to editing clients. Observe the current document ID and revision again after loading completes.
+
+## Native PNG import transfer (unreleased, verification pending)
+
+Static noninterlaced RGB/RGBA8/16 PNGs with normal orientation decode rows into the existing native tiles through shared Open/import/placement/file-paste preparation. One native RGBA row and a fixed 64 KiB checked input buffer replace the full DynamicImage/RGBA transfer copy for this layout. Existing decoder state, CMS buffers/tables, profiles, encoded bytes and final tiles still allocate separately. Sparse zero rows avoid creating empty tiles while hidden RGB beneath zero alpha remains native data.
+
+Header/profile/orientation/APNG checks, the conservative decoded-coexistence/import budget, native8/16 precision, document memory limits and source/file/ownership/revision guards remain unchanged. Open checks cancellation per row and before accepting final PNG completion; unsupported row layouts retain the existing decoder rather than silently changing content. No canvas/file cap is raised. Full decoded supplementary JSON, full effect/filter preparation, other image layouts and original native residency remain PB-068 limits. The complete 16000-square edit/save/reopen/export envelope is not qualified by this transfer change.

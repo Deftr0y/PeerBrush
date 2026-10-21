@@ -60,7 +60,9 @@ impl Prepared {
     }
     pub(crate) fn document(&self, options: &Value, control: &Control) -> Result<Document, String> {
         control.progress("Decoding image", 0, 1)?;
-        let prepared = self.encoded.prepare(options, image_import::BUDGET)?;
+        let prepared = self
+            .encoded
+            .prepare_with_control(options, image_import::BUDGET, control)?;
         control.check()?;
         let pixels = prepared.pixels;
         let mut doc = Document::new_depth(pixels.width, pixels.height, pixels.depth)?;

@@ -8,6 +8,8 @@ use std::{
     path::Path,
 };
 
+mod png_rows;
+
 pub const EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp", "jxl", "ico", "pbm", "pgm", "ppm",
     "pam", "pnm", "tga", "qoi", "svg", "svgz",
@@ -513,6 +515,25 @@ impl Encoded {
         })
     }
     pub fn decode(&self, command: &Value, budget: usize) -> Result<Raster, String> {
+        self.decode_with_control(command, budget, &crate::loading::Control::default())
+    }
+    pub(crate) fn decode_with_control(
+        &self,
+        command: &Value,
+        budget: usize,
+        control: &crate::loading::Control,
+    ) -> Result<Raster, String> {
+        control.check()?;
+        let result = self.decode_inner(command, budget, control);
+        control.check()?;
+        result
+    }
+    fn decode_inner(
+        &self,
+        command: &Value,
+        budget: usize,
+        control: &crate::loading::Control,
+    ) -> Result<Raster, String> {
         let Codec::Image(format) = self.format else {
             return self.decode_jxl(command, budget);
         };
@@ -564,7 +585,7 @@ impl Encoded {
                 if image.info.choice.is_some() {
                     return Err("An icon variant cannot contain an animation".into());
                 }
-                let pixels = image.decode(&serde_json::json!({}), budget)?;
+                let pixels = image.decode_with_control(&serde_json::json!({}), budget, control)?;
                 let width = if entry[0] == 0 { 256 } else { entry[0] as u32 };
                 let height = if entry[1] == 0 { 256 } else { entry[1] as u32 };
                 if (pixels.width, pixels.height) != (width, height) {
@@ -624,6 +645,11 @@ impl Encoded {
         }
         let orientation = decoder.orientation().map_err(|e| e.to_string())?;
         let animated = self.info.choice == Some("frame");
+        if format == ImageFormat::Png && !animated && png_rows::supported(bytes, orientation) {
+            drop(decoder);
+            // Layout eligibility is decided before decoding; failures never fall back.
+            return png_rows::decode(bytes, width, height, depth, profile.as_deref(), control);
+        }
         let mut image = if animated {
             if width as u64 * height as u64 * (index as u64 + 1) > 256 * 1024 * 1024 {
                 return Err("Animation decoding work exceeds the import budget; export the selected frame separately".into());
@@ -673,8 +699,16 @@ impl Encoded {
         }
     }
     pub fn prepare(&self, command: &Value, budget: usize) -> Result<Prepared, String> {
+        self.prepare_with_control(command, budget, &crate::loading::Control::default())
+    }
+    pub(crate) fn prepare_with_control(
+        &self,
+        command: &Value,
+        budget: usize,
+        control: &crate::loading::Control,
+    ) -> Result<Prepared, String> {
         Ok(Prepared {
-            pixels: self.decode(command, budget)?,
+            pixels: self.decode_with_control(command, budget, control)?,
             source: self.source.clone(),
         })
     }
