@@ -120,12 +120,13 @@ fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(
         .collect::<Result<_, _>>()?;
     for (e, r) in engines.iter_mut().zip(&reviewed) {
         guard(e, &r.document, r.revision)?;
-        file_operations_idle(&e.file_operations)?;
         if update {
             if r.discard {
                 return Err("Update restart cannot discard unsaved work".into());
             }
             update_project_ready(e)?;
+        } else {
+            file_operations_idle(&e.file_operations)?;
         }
         if !r.discard
             && (e.doc.revision != e.saved_revision
@@ -145,7 +146,19 @@ fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(
         )?;
     }
     let mut registry = workspace.lock().unwrap();
-    file_operations_idle(&registry.file_operations)?;
+    if update {
+        if registry
+            .file_operations
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return Err(
+                "Finish the workspace/recovery operation before restarting for an update".into(),
+            );
+        }
+    } else {
+        file_operations_idle(&registry.file_operations)?;
+    }
     let mut live: Vec<_> = registry.entries.iter().map(|p| p.id.as_str()).collect();
     live.sort_unstable();
     if registry.exiting
@@ -169,6 +182,103 @@ fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn update_exit_keeps_original_operation_diagnostics_and_precedence_without_closing_projects() {
+        for depth in [8, 16] {
+            let mut engine = Engine::new();
+            engine.doc = Document::new_depth(8, 6, depth).unwrap();
+            let root = Arc::new(Mutex::new(engine));
+            let workspace = attach(&root);
+            let second = new_project(&root, 8, 6, depth, None).unwrap();
+            let mut reviewed = update_readiness(&workspace).unwrap();
+            let project = second.lock().unwrap().project_id.clone();
+            let write = crate::server::FileOperation::begin(&second).unwrap();
+            assert_eq!(
+                finish_update_exit(&workspace, &reviewed).unwrap_err(),
+                "Finish the active file, loading or code operation before restarting for an update"
+            );
+            assert_eq!(
+                finish_exit(&workspace, &reviewed).unwrap_err(),
+                "Finish the active file or workspace operation before closing projects"
+            );
+            let row = reviewed
+                .iter_mut()
+                .find(|row| row.project == project)
+                .unwrap();
+            row.discard = true;
+            assert_eq!(
+                finish_update_exit(&workspace, &reviewed).unwrap_err(),
+                "Update restart cannot discard unsaved work"
+            );
+            reviewed
+                .iter_mut()
+                .find(|row| row.project == project)
+                .unwrap()
+                .discard = false;
+            // Actual new work and an updated exact source review: Save must
+            // retain priority over an in-flight project operation for updates.
+            let name = {
+                let mut e = second.lock().unwrap();
+                let layer = e.doc.layers[0].id.clone();
+                e.edit(
+                    "human",
+                    &[json!({"op":"layer.update","layer":layer,"name":"Human work"})],
+                    None,
+                    None,
+                    "Keep human work",
+                )
+                .unwrap();
+                assert_ne!(e.doc.revision, e.saved_revision);
+                reviewed
+                    .iter_mut()
+                    .find(|row| row.project == project)
+                    .unwrap()
+                    .revision = e.doc.revision;
+                e.doc.name.clone()
+            };
+            let snapshot = |shared: &Shared| {
+                let e = shared.lock().unwrap();
+                json!({"document":e.doc,"png":e.doc.export_png().unwrap(),
+                    "undo":e.undo.len(),"redo":e.redo.len(),"saved":e.saved_revision,"closed":e.closed})
+            };
+            let before = snapshot(&second);
+            assert_eq!(
+                finish_update_exit(&workspace, &reviewed).unwrap_err(),
+                format!("Save {name} before restarting for an update")
+            );
+            assert_eq!(snapshot(&second), before);
+            assert!(!workspace.lock().unwrap().exiting);
+            assert!(!root.lock().unwrap().closed);
+            drop(write);
+
+            // Keep the dirty project in the ordinary human path; a fresh saved
+            // workspace exercises the original final workspace/recovery guard.
+            let root = Arc::new(Mutex::new(Engine::new()));
+            root.lock().unwrap().doc = Document::new_depth(8, 6, depth).unwrap();
+            let workspace = attach(&root);
+            let reviewed = update_readiness(&workspace).unwrap();
+            let before = snapshot(&root);
+            let write = crate::server::FileOperation::begin_workspace(&workspace).unwrap();
+            assert_eq!(
+                update_readiness(&workspace).unwrap_err(),
+                "Finish the current workspace/recovery operation before restarting for an update"
+            );
+            assert_eq!(
+                finish_update_exit(&workspace, &reviewed).unwrap_err(),
+                "Finish the workspace/recovery operation before restarting for an update"
+            );
+            assert_eq!(
+                finish_exit(&workspace, &reviewed).unwrap_err(),
+                "Finish the active file or workspace operation before closing projects"
+            );
+            assert_eq!(snapshot(&root), before);
+            assert!(!workspace.lock().unwrap().exiting);
+            drop(write);
+            finish_update_exit(&workspace, &reviewed).unwrap();
+            assert!(root.lock().unwrap().closed);
+        }
+    }
 
     #[test]
     fn ordinary_close_and_exit_refuse_late_file_operations_without_closing_any_project() {
