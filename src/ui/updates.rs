@@ -2,6 +2,9 @@ use super::*;
 use crate::updates::{self, Channel, Owner, Progress, Report};
 use std::time::Instant;
 
+#[cfg(any(windows, test))]
+mod store;
+
 enum Event {
     Progress(Progress),
     Complete(Result<Report, String>),
@@ -17,6 +20,8 @@ pub(super) struct Panel {
     next_auto: Instant,
     last_notification: Option<String>,
     defer_current: bool,
+    #[cfg(any(windows, test))]
+    store_check: store::Check,
 }
 impl Panel {
     pub fn load(directory: &Path) -> Self {
@@ -31,7 +36,13 @@ impl Panel {
             next_auto: Instant::now() + Duration::from_secs(2),
             last_notification: None,
             defer_current: false,
+            #[cfg(any(windows, test))]
+            store_check: store::Check::default(),
         }
+    }
+    #[cfg(windows)]
+    pub(super) fn native_window(&mut self, frame: &eframe::Frame) {
+        self.store_check.window(frame);
     }
     fn start(&mut self, ctx: &egui::Context, manual: bool) {
         if self.receiver.is_some() {
@@ -83,6 +94,13 @@ impl Panel {
         }
     }
     fn tick(&mut self, ctx: &egui::Context, allow_notification: bool) {
+        #[cfg(any(windows, test))]
+        {
+            self.store_check.tick(Instant::now());
+            if self.store_check.pending() {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
         let events: Vec<_> = self
             .receiver
             .as_ref()
@@ -135,6 +153,11 @@ impl Panel {
                 if self.owner != Owner::Direct {
                     ui.label("Public release notes do not establish your Store or package provider's update availability.");
                 }
+                #[cfg(any(windows, test))]
+                if self.owner == Owner::MicrosoftStore {
+                    self.store_check.show(ui);
+                }
+                ui.label("Official GitHub release notes and portable package metadata");
                 let mut preferences = self.store.preferences.clone();
                 ui.add_enabled_ui(self.store.error.is_none() && self.receiver.is_none(), |ui| {
                     ui.checkbox(&mut preferences.automatic_checks, "Check official releases daily");
@@ -194,6 +217,8 @@ impl Panel {
         self.open = open && !later;
         if !self.open {
             self.defer_current = true;
+            #[cfg(any(windows, test))]
+            self.store_check.cancel();
         }
     }
 }

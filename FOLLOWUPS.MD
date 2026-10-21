@@ -531,3 +531,6 @@ PB-108/PB-068 fast-parser correction (unreleased, replay pending): replace the m
 
 
 PB-154 website invocation boundary (unreleased, replay pending): fixed official manual-main/workflow guards now precede checkout and deployment, with exact reviewed site selection and fetched current-tip binding. Existing approval environment, manual trigger, action pins and permissions remain. Four prepared actual-inline methods use existing CI/release/signing callers; independent source review passed. Combined/live acceptance and complete release publication remain open; no deployment or remote setting changed.
+
+
+PB-147 native Store checking (unreleased, replay pending): separate read-only manual query uses the actual window thread/association, exact current Store identity and bounded result inspection. Unknown/service/window errors, pre/post-poll deadlines and one cancellation quarantine remain distinct from no update; late results cannot replace rejection. Public release notes/preferences and artwork/history remain independent. Four prepared actual-control/native8/16/fake-operation methods include the post-poll timeout path; source review and formatting passed. Combined and real installed acceptance remain open; no installation or submission is enabled.

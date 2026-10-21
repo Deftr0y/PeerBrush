@@ -6062,6 +6062,8 @@ impl PeerBrush {
 
 impl eframe::App for PeerBrush {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        self.updates.native_window(_frame);
         self.draw(ctx);
     }
     fn on_exit(&mut self) {
