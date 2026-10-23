@@ -2,6 +2,8 @@ use super::*;
 use crate::updates::{self, Channel, Owner, Progress, Report};
 use std::time::Instant;
 
+#[cfg(test)]
+mod prepared_tests;
 #[cfg(any(windows, test))]
 mod store;
 
@@ -26,6 +28,8 @@ pub(super) struct Panel {
     store_check: store::Check,
     #[cfg(any(windows, test))]
     app_installer_check: store::Check,
+    #[cfg(any(windows, test))]
+    windows_prepared: updates::windows::Controller,
 }
 impl Panel {
     #[cfg(target_os = "macos")]
@@ -50,6 +54,8 @@ impl Panel {
             store_check: store::Check::default(),
             #[cfg(any(windows, test))]
             app_installer_check: store::Check::app_installer(),
+            #[cfg(any(windows, test))]
+            windows_prepared: updates::windows::Controller::load(directory),
         }
     }
     #[cfg(windows)]
@@ -109,6 +115,10 @@ impl Panel {
     fn tick(&mut self, ctx: &egui::Context, allow_notification: bool) {
         #[cfg(any(windows, test))]
         {
+            self.windows_prepared.tick();
+            if self.windows_prepared.view.busy {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
             for check in [&mut self.store_check, &mut self.app_installer_check] {
                 check.tick(Instant::now());
                 if check.pending() {
@@ -185,6 +195,7 @@ impl Panel {
                 #[cfg(any(windows, test))]
                 if self.owner == Owner::WindowsAppInstaller {
                     self.app_installer_check.show(ui);
+                    self.windows_prepared.show(ui);
                 }
                 #[cfg(target_os = "macos")]
                 if self.native_updater.configured() {
@@ -283,6 +294,8 @@ impl Panel {
             self.store_check.cancel();
             #[cfg(any(windows, test))]
             self.app_installer_check.cancel();
+            #[cfg(any(windows, test))]
+            self.windows_prepared.later();
         }
     }
 }

@@ -1,4 +1,6 @@
-//! Authenticated release discovery only. No downloaded code or installer is executed.
+//! Release discovery and dormant signed media preparation. No installer is executed.
+#[cfg(any(windows, test))]
+pub(crate) mod windows;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
