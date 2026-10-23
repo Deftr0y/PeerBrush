@@ -103,6 +103,31 @@ def framework_identity(package, runtime):
     return {key: identity[key] for key in ['Name', 'Publisher', 'Version', 'ProcessorArchitecture']}
 
 
+def descriptor_bytes_for_selection(identity, dependency, version, descriptor_uri, package_uri, runtime_uri):
+    """Canonical descriptor serialization shared by native preparation and byte binding.
+
+    The caller validates identities/media; this function establishes no native trust.
+    """
+    root_attributes = dict(xmlns=INSTALLER_NS, Version=version, Uri=descriptor_uri)
+    main_attributes = dict(Name=identity['name'], Publisher=identity['publisher'],
+        Version=version, ProcessorArchitecture='x64', Uri=package_uri)
+    dependency_attributes = dict(dependency, Uri=runtime_uri)
+    # App Installer's native text contract is narrower than signed MSIX identity:
+    # https://learn.microsoft.com/en-us/uwp/schemas/appinstallerschema/element-appinstaller#remarks
+    for attributes in [root_attributes, main_attributes, dependency_attributes]:
+        for field, value in attributes.items():
+            if (type(value) is not str or not value.isascii()
+                    or any(ord(character) < 32 or ord(character) == 127 or character in '&<>"' for character in value)):
+                raise ValueError(f'App Installer {field} requires literal printable ASCII without XML escaping; the signed MSIX may remain valid.')
+    installer = ET.Element('AppInstaller', **root_attributes)
+    ET.SubElement(installer, 'MainPackage', **main_attributes)
+    ET.SubElement(ET.SubElement(installer, 'Dependencies'), 'Package', **dependency_attributes)
+    descriptor_bytes = ET.tostring(installer, encoding='UTF-8', xml_declaration=True) + b'\n'
+    if len(descriptor_bytes) > 16 * 1024 or not descriptor_bytes.isascii() or b'&' in descriptor_bytes:
+        raise ValueError('App Installer descriptor exceeds its bound or requires unsupported XML text.')
+    return descriptor_bytes
+
+
 def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_license, commit, version, package_family,
             portable_sha256, unsigned_sha256, package_sha256, certificate_sha256,
             runtime_sha256, runtime_certificate_sha256, runtime_license_sha256, descriptor_uri, package_uri, runtime_uri,
@@ -166,23 +191,8 @@ def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_lic
         tools[0], tools[1], runtime_work)
     # Emit no automatic-update configuration. Existing OS/provider policies can
     # still apply; association does not establish shared unsaved-work protection.
-    root_attributes = dict(xmlns=INSTALLER_NS, Version=result['package_version'], Uri=descriptor_uri)
-    main_attributes = dict(Name=selected_identity['name'], Publisher=selected_identity['publisher'],
-        Version=result['package_version'], ProcessorArchitecture='x64', Uri=package_uri)
-    dependency_attributes = dict(dependency, Uri=runtime_uri)
-    # App Installer's native text contract is narrower than signed MSIX identity:
-    # https://learn.microsoft.com/en-us/uwp/schemas/appinstallerschema/element-appinstaller#remarks
-    for attributes in [root_attributes, main_attributes, dependency_attributes]:
-        for field, value in attributes.items():
-            if (type(value) is not str or not value.isascii()
-                    or any(ord(character) < 32 or ord(character) == 127 or character in '&<>"' for character in value)):
-                raise ValueError(f'App Installer {field} requires literal printable ASCII without XML escaping; the signed MSIX may remain valid.')
-    installer = ET.Element('AppInstaller', **root_attributes)
-    ET.SubElement(installer, 'MainPackage', **main_attributes)
-    ET.SubElement(ET.SubElement(installer, 'Dependencies'), 'Package', **dependency_attributes)
-    descriptor_bytes = ET.tostring(installer, encoding='UTF-8', xml_declaration=True) + b'\n'
-    if len(descriptor_bytes) > 16 * 1024 or not descriptor_bytes.isascii() or b'&' in descriptor_bytes:
-        raise ValueError('App Installer descriptor exceeds its bound or requires unsupported XML text.')
+    descriptor_bytes = descriptor_bytes_for_selection(selected_identity, dependency, result['package_version'],
+        descriptor_uri, package_uri, runtime_uri)
     def unchanged():
         signed._source(root, commit)
         private_inspection_directory(work, root, fresh=False)

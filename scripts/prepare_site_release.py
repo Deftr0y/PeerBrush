@@ -293,7 +293,21 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
         return data
 
     checksums = download('SHA256SUMS', 64 * 1024)
-    expected_checksums = ''.join(f"{r['sha256']}  {r['file']}\n" for r in inventory['assets'])
+    final = None
+    if 'final-release-inventory.json' in assets:
+        # A public final manifest adds byte bindings only. It cannot grant native
+        # signing/installation authority or make a Store/installer selectable.
+        from final_release import checksum_bytes, validate_manifest
+        from publish_release import public_readback
+        raw_final = download('final-release-inventory.json', 128 * 1024)
+        final = json.loads(raw_final, object_pairs_hook=unique_fields)
+        validate_manifest(final)
+        if final['base_inventory'] != inventory:
+            raise ValueError('Public final manifest differs from the independently selected base inventory.')
+        public_readback(final, get)
+        expected_checksums = checksum_bytes(final).decode('ascii')
+    else:
+        expected_checksums = ''.join(f"{r['sha256']}  {r['file']}\n" for r in inventory['assets'])
     if checksums.decode('ascii').replace('\r\n', '\n') != expected_checksums:
         raise ValueError('Published checksum list differs from the verified final inventory.')
     source_name = f'PeerBrush-{version}-source.zip'
@@ -394,6 +408,12 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
                                   url=assets[name]['browser_download_url'], bytes=record['bytes'], sha256=record['sha256'],
                                   nativeSigning=trust, packageReadiness='portable-archive-verified',
                                   description=f'{architecture} · Portable ZIP · Native trust {trust}'))
+    if final is not None:
+        direct = final['channels']['windows-direct']
+        excluded.append(dict(file=direct['file'], reason='windows-native-final-producer-and-installed-acceptance-unverified',
+                             asset_binding_verified=True, content_verified=False, ready=False, production_ready=False,
+                             native_producer_authentication='not-verified-by-website', installed_acceptance='unverified',
+                             public_availability='verified-by-exact-public-byte-readback'))
     for platform, kind in formats.items():
         if (kind, platform) not in seen:
             excluded.append(dict(platform=platform, format=kind,

@@ -1,0 +1,131 @@
+name: PeerBrush production preparation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact reviewed main SHA; all final inputs must bind this source
+        type: string
+        required: true
+      candidate_run_id:
+        description: Successful same-source release-candidate run; data inputs only
+        type: string
+        required: true
+      input_artifact_name:
+        description: Explicit final-input bundle name; native producers remain unconfigured
+        type: string
+        required: true
+      selection_sha256:
+        description: Independently reviewed selection.json SHA-256; contains paths/public pins only
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: production-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact source and existing version checks
+        run: python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - name: Verify offline composition and transaction contracts
+        run: |
+          python -B scripts/test_final_release.py
+          python -B scripts/test_publish_release.py
+      - name: Report disabled production authority
+        run: |
+          echo 'Final composition and immutable transaction are prepared. Authenticated Windows signing/installed producers and complete installed acceptance remain source work; publication and Store submission are disabled.' >> "$GITHUB_STEP_SUMMARY"
+
+  compose:
+    if: github.event_name == 'workflow_dispatch' && vars.PEERBRUSH_FINAL_INPUTS_CONFIGURED == 'true'
+    needs: gate
+    runs-on: ubuntu-24.04
+    environment: production-preparation
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+      INPUT_NAME: ${{ inputs.input_artifact_name }}
+      SELECTION_SHA256: ${{ inputs.selection_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require reviewed main source and successful selected predecessor
+        run: |
+          python -I - <<'PY'
+          import json, os, re, sys
+          sys.path.insert(0, 'scripts')
+          from prepare_site_release import API, public_get
+          expected, run, name = (os.environ[key] for key in ['EXPECTED_COMMIT', 'CANDIDATE_RUN', 'INPUT_NAME'])
+          if (not re.fullmatch('[0-9a-f]{40}', expected) or expected != os.environ.get('GITHUB_SHA')
+                  or expected != os.environ.get('GITHUB_WORKFLOW_SHA') or os.environ.get('GITHUB_REF') != 'refs/heads/main'
+                  or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/production.yml@refs/heads/main'
+                  or not re.fullmatch('[1-9][0-9]{0,19}', run) or not re.fullmatch('[A-Za-z0-9._-]{1,128}', name)
+                  or not re.fullmatch('[0-9a-f]{64}', os.environ['SELECTION_SHA256'])):
+              raise SystemExit('Require exact reviewed main and bounded independently selected inputs.')
+          value = json.loads(public_get(API + 'actions/runs/' + run, 262144, api=True))
+          if (value.get('head_sha') != expected or value.get('head_branch') != 'main' or value.get('pull_requests') != []
+                  or value.get('status') != 'completed' or value.get('conclusion') != 'success'
+                  or value.get('path') not in {'.github/workflows/release.yml', '.github/workflows/release.yml@main'}
+                  or value.get('event') not in {'push', 'workflow_dispatch'}
+                  or value.get('repository', {}).get('full_name') != 'Deftr0y/PeerBrush'
+                  or value.get('head_repository', {}).get('full_name') != 'Deftr0y/PeerBrush'):
+              raise SystemExit('Selected predecessor did not pass at this exact main source.')
+          for field in ['repository', 'head_repository']:
+              repository = value[field]
+              if (repository.get('id') != 1407648785 or repository.get('fork') is not False
+                      or repository.get('private') is not False or repository.get('owner', {}).get('id') != 21202494):
+                  raise SystemExit('Selected predecessor is not the official public nonfork repository.')
+          PY
+          python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - name: Acquire explicitly selected input data without execution authority
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_run_id }}
+          name: ${{ inputs.input_artifact_name }}
+          path: ${{ runner.temp }}/peerbrush-final-inputs
+      - name: Compose final bytes and preserve native authority blockers
+        working-directory: ${{ runner.temp }}/peerbrush-final-inputs
+        run: |
+          set +e
+          python -B "$GITHUB_WORKSPACE/scripts/final_release.py" --source-root "$GITHUB_WORKSPACE" \
+            --directory base --selection selection.json --selection-sha256 "$SELECTION_SHA256" \
+            --output "$RUNNER_TEMP/peerbrush-final-candidate"
+          result=$?
+          set -e
+          if [ "$result" -eq 0 ]; then exit 1; fi
+          if [ "$result" -ne 2 ]; then exit "$result"; fi
+          echo 'Final byte composition retained; production remains blocked by explicit native authority/acceptance gates.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain exact public candidate files only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: final-release-composition-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-final-candidate/*
+          if-no-files-found: error
+
+  publish:
+    # No write authority is requested until the missing authenticated native
+    # signing/installed producers, explicit release approval and public readback
+    # are reviewed and wired. A variable or uploaded ready JSON cannot enable it.
+    if: ${{ false }}
+    needs: compose
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo 'Publication remains disabled pending native producer implementation and explicit approval.'

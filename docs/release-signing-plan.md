@@ -134,3 +134,9 @@ Completion: every in-scope public destination has been read back and matches the
 - [Removing sensitive data from Git history](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
 
 The checklist records public implementation requirements. Actual credentials, audit findings, account identities, private storage locations and release receipts belong outside this repository.
+
+## Pending final-artifact composition checkpoint (unreleased)
+
+The prepared [final composition and immutable transaction](production-publishing.md) binds the actual existing portable/source, DEB, final signed-DMG/native-origin and Windows MSIX/framework/App Installer consumers. It does not authenticate a Windows signing producer, executable signing, runtime redistribution approval or complete installed acceptance from JSON. All installed channels remain unverified and production readiness remains false. The protected preparation workflow requests read permissions only and its publication job is unconditionally disabled; Store submission remains disabled without an approved durable backend.
+
+Native signing/installed producer and final-input-bundle source work, installed upgrade/interruption/unsaved-work acceptance, final website/update adapters, approved identities/signing access/runtime media and explicit publication approvals are still required. Prepared offline fixtures and transaction recovery tests have not executed in combined QA. No checklist completion, operating-system trust, published availability or release authorization is inferred from this checkpoint.
