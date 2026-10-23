@@ -235,7 +235,7 @@ class Composition(unittest.TestCase):
                 # Recompute ordinary content hashes/block maps to isolate the
                 # original-byte PE binding, not a stale checksum failure.
                 with zipfile.ZipFile(io.BytesIO(unsigned_before)) as archive:
-                    payload = {name: archive.read(name) for name in self.original_payload}
+                    payload = {name: archive.read(final.msix.opc_name(name)) for name in self.original_payload}
                 payload['peerbrush.exe'] = executable
                 release = json.loads(payload['release.json'])
                 checksum = hashlib.sha256(executable).hexdigest()

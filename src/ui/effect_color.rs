@@ -708,34 +708,53 @@ mod tests {
                                 .expect("Actual color-field control for invalid HEX blur"),
                         );
                     } else if action == "invalid_channels" {
-                        let red = output
+                        // Font centers need not coincide with the painted bar.
+                        // F0 from the valid HEX draft displays as 94.1176% red.
+                        let bars = output
                             .shapes
                             .iter()
-                            .find_map(|shape| match &shape.shape {
-                                egui::Shape::Text(text) if text.galley.job.text == "R" => {
-                                    Some(Rect::from_min_size(text.pos, text.galley.size()))
+                            .filter_map(|bar| {
+                                let egui::Shape::Rect(shape) = &bar.shape else {
+                                    return None;
+                                };
+                                let rect = shape.rect;
+                                if shape.fill != Color32::from_rgb(54, 51, 58)
+                                    || (rect.height() - 22.).abs() >= 0.01
+                                {
+                                    return None;
                                 }
-                                _ => None,
+                                let red_label = output.shapes.iter().any(|label| {
+                                    let egui::Shape::Text(text) = &label.shape else {
+                                        return false;
+                                    };
+                                    let label_rect =
+                                        Rect::from_min_size(text.pos, text.galley.size());
+                                    label.clip_rect == bar.clip_rect
+                                        && text.galley.job.text == "R"
+                                        && label_rect.right() < rect.left()
+                                        && rect.top() <= label_rect.center().y
+                                        && label_rect.center().y <= rect.bottom()
+                                });
+                                let red_value = output.shapes.iter().any(|value| {
+                                    let egui::Shape::Text(text) = &value.shape else {
+                                        return false;
+                                    };
+                                    value.clip_rect == bar.clip_rect
+                                        && text.galley.job.text == "94.1176%"
+                                        && rect.contains(
+                                            Rect::from_min_size(text.pos, text.galley.size())
+                                                .center(),
+                                        )
+                                });
+                                (red_label && red_value).then_some(rect)
                             })
-                            .expect("Expanded precise red channel");
-                        blur_at = Some(
-                            output
-                                .shapes
-                                .iter()
-                                .find_map(|shape| match &shape.shape {
-                                    egui::Shape::Rect(shape)
-                                        if (shape.rect.width() - 160.).abs() < 0.01
-                                            && (shape.rect.height() - 22.).abs() < 0.01
-                                            && shape.rect.left() > red.right()
-                                            && (shape.rect.center().y - red.center().y).abs()
-                                                < 1. =>
-                                    {
-                                        Some(shape.rect.center())
-                                    }
-                                    _ => None,
-                                })
-                                .expect("Actual precise red-channel control for invalid HEX blur"),
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            bars.len(),
+                            1,
+                            "Unique actual precise red-channel bar for invalid HEX blur"
                         );
+                        blur_at = Some(bars[0].center());
                     }
                 }
                 if let Some(at) = blur_at {
@@ -743,6 +762,20 @@ mod tests {
                         &mut app,
                         vec![egui::Event::PointerMoved(at), button(at, true)],
                     );
+                    if action == "invalid_channels" {
+                        let response = ctx
+                            .memory(|memory| memory.focused())
+                            .and_then(|id| ctx.read_response(id))
+                            .expect("Precise red-channel control received actual focus");
+                        assert_ne!(response.id, editor);
+                        assert!(response.sense.senses_drag() && response.rect.contains(at));
+                        assert_eq!(
+                            response.layer_id,
+                            ctx.read_response(editor)
+                                .expect("HEX editor in the same picker")
+                                .layer_id
+                        );
+                    }
                     draw(&mut app, vec![button(at, false)]);
                 } else {
                     draw(
