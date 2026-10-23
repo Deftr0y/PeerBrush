@@ -633,16 +633,18 @@ pub(crate) fn encode_to<S: Read + Write + Seek>(
     output: &mut dyn Write,
     spool: &mut S,
     check: &dyn Fn() -> Result<(), String>,
+    progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    encode_layout_to(doc, Layout::Psd, output, spool, check)
+    encode_layout_progress_to(doc, Layout::Psd, output, spool, check, progress)
 }
 pub(crate) fn encode_psb_to<S: Read + Write + Seek>(
     doc: &Document,
     output: &mut dyn Write,
     spool: &mut S,
     check: &dyn Fn() -> Result<(), String>,
+    progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    encode_layout_to(doc, Layout::Psb, output, spool, check)
+    encode_layout_progress_to(doc, Layout::Psb, output, spool, check, progress)
 }
 fn check_output_size(doc: &Document, plan: &StandardPlan) -> Result<(), String> {
     // Validation bounds every frame and record count; u64 also covers their aggregate.
@@ -731,6 +733,17 @@ fn encode_layout_to<S: Read + Write + Seek>(
     spool: &mut S,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
+    encode_layout_progress_to(doc, layout, output, spool, check, &|_, _, _| Ok(()))
+}
+fn encode_layout_progress_to<S: Read + Write + Seek>(
+    doc: &Document,
+    layout: Layout,
+    output: &mut dyn Write,
+    spool: &mut S,
+    check: &dyn Fn() -> Result<(), String>,
+    progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
+) -> Result<(), String> {
+    progress("Preparing Photoshop sources", 0, 0)?;
     check()?;
     if spool.stream_position().map_err(|e| e.to_string())? != 0
         || spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != 0
@@ -746,33 +759,44 @@ fn encode_layout_to<S: Read + Write + Seek>(
     let plan = standard_plan(doc);
     check_output_size(doc, &plan)?;
     let high = doc.bit_depth == 16;
+    progress("Preparing layer masks", 0, 0)?;
+    check()?;
     let masks = if high {
         vec![None; doc.layers.len()]
     } else {
         doc.layers
             .iter()
             .map(|l| {
-                l.mask
+                check()?;
+                Ok(l.mask
                     .as_ref()
-                    .and_then(|m| m.prepare(l.pixels.width, l.pixels.height))
+                    .and_then(|m| m.prepare(l.pixels.width, l.pixels.height)))
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, String>>()?
     };
+    progress("Preparing layer effects", 0, 0)?;
+    check()?;
     let colors = if high {
         vec![None; doc.layers.len()]
     } else {
         crate::effects::prepare(doc, &masks)?
     };
+    progress("Preparing native layer effects", 0, 0)?;
+    check()?;
     let colors16 = if high {
         Some(crate::depth16::prepare(doc)?)
     } else {
         None
     };
+    progress("Preparing native masks", 0, 0)?;
+    check()?;
     let masks16 = if high {
         Some(crate::depth16::prepare_masks(doc)?)
     } else {
         None
     };
+    progress("Preparing current composite", 0, 0)?;
+    check()?;
     let composite16 = if high {
         Some(crate::depth16::render(doc)?)
     } else {
@@ -833,6 +857,7 @@ fn encode_layout_to<S: Read + Write + Seek>(
     }
     let mut records = vec![];
     let mut channel_bytes = 0u64;
+    let mut layer_rows = 0usize;
     for (l, section) in &ordered {
         let [x, y, right, bottom] = standard_bounds(doc, l, *section);
         let (w, h) = ((right - x) as u32, (bottom - y) as u32);
@@ -864,6 +889,7 @@ fn encode_layout_to<S: Read + Write + Seek>(
             channel_bytes = channel_bytes
                 .checked_add(length)
                 .ok_or("Photoshop channel length overflow")?;
+            layer_rows += ch_height as usize;
         }
         records.extend_from_slice(b"8BIM");
         records.extend_from_slice(match l.blend.as_str() {
@@ -991,6 +1017,8 @@ fn encode_layout_to<S: Read + Write + Seek>(
     standard.write_all(&records).map_err(|e| e.to_string())?;
     drop(records);
     let mut row = [0u8; crate::raster::MAX_EDGE as usize * 2];
+    let mut completed_rows = 0;
+    progress("Writing standard layer channels", 0, layer_rows)?;
     for (l, section) in &ordered {
         check()?;
         let [x, y, right, bottom] = standard_bounds(doc, l, *section);
@@ -1083,6 +1111,12 @@ fn encode_layout_to<S: Read + Write + Seek>(
                 standard
                     .write_all(&row[..cw as usize * usize::from(doc.bit_depth / 8)])
                     .map_err(|e| e.to_string())?;
+                completed_rows += 1;
+                progress(
+                    "Writing standard layer channels",
+                    completed_rows,
+                    layer_rows,
+                )?;
             }
         }
     }
@@ -1107,6 +1141,9 @@ fn encode_layout_to<S: Read + Write + Seek>(
     let layer_hash = standard.hash;
     standard.hash = 0xcbf29ce484222325;
     let (w, h) = (doc.width, doc.height);
+    let composite_rows = h as usize * 4;
+    let mut completed_composite_rows = 0;
+    progress("Writing current composite", 0, composite_rows)?;
     standard
         .write_all(&0u16.to_be_bytes())
         .map_err(|e| e.to_string())?;
@@ -1130,6 +1167,12 @@ fn encode_layout_to<S: Read + Write + Seek>(
                 standard
                     .write_all(&row[..w as usize * 2])
                     .map_err(|e| e.to_string())?;
+                completed_composite_rows += 1;
+                progress(
+                    "Writing current composite",
+                    completed_composite_rows,
+                    composite_rows,
+                )?;
             }
         }
     } else {
@@ -1151,6 +1194,12 @@ fn encode_layout_to<S: Read + Write + Seek>(
                 standard
                     .write_all(&row[..w as usize])
                     .map_err(|e| e.to_string())?;
+                completed_composite_rows += 1;
+                progress(
+                    "Writing current composite",
+                    completed_composite_rows,
+                    composite_rows,
+                )?;
             }
         }
     }
@@ -1158,6 +1207,8 @@ fn encode_layout_to<S: Read + Write + Seek>(
     let composite_hash = standard.hash;
     standard.flush().map_err(|e| e.to_string())?;
     drop(standard);
+    progress("Writing editable sources", 0, 0)?;
+    check()?;
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
         format: if has_shaped_text(doc) {
@@ -1354,6 +1405,8 @@ fn encode_layout_to<S: Read + Write + Seek>(
     };
     serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
     let compressed = z.inner.finish().map_err(|e| e.to_string())?;
+    progress("Assembling verified Photoshop output", 0, 0)?;
+    check()?;
     let mut resources = vec![];
     resources.extend_from_slice(b"8BIM");
     u16b(&mut resources, 4000);
@@ -3638,6 +3691,89 @@ mod storage_tests {
         }
         (section, merged)
     }
+    #[test]
+    fn save_progress_counts_real_rows_and_cancellation_keeps_exact_native_sources() {
+        use std::cell::{Cell, RefCell};
+        for depth in [8, 16] {
+            let doc = streamed_fixture(depth);
+            let before = serde_json::to_value(&doc).unwrap();
+            for layout in [Layout::Psd, Layout::Psb] {
+                let rows = RefCell::new(Vec::new());
+                let mut output = Vec::new();
+                let mut spool = std::io::Cursor::new(Vec::new());
+                encode_layout_progress_to(
+                    &doc,
+                    layout,
+                    &mut output,
+                    &mut spool,
+                    &|| Ok(()),
+                    &|stage, completed, total| {
+                        if total != 0 {
+                            rows.borrow_mut()
+                                .push((stage.to_string(), completed, total));
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                let rows = rows.into_inner();
+                for (stage, total) in [
+                    ("Writing standard layer channels", 5),
+                    ("Writing current composite", 4),
+                ] {
+                    let actual: Vec<_> = rows
+                        .iter()
+                        .filter(|row| row.0 == stage)
+                        .map(|row| (row.1, row.2))
+                        .collect();
+                    assert_eq!(
+                        actual,
+                        (0..=total).map(|done| (done, total)).collect::<Vec<_>>()
+                    );
+                }
+                let mut cursor = Cursor::new(&output);
+                cursor.bytes(26).unwrap();
+                cursor.block().unwrap();
+                cursor.block().unwrap();
+                let section = layout.block(&mut cursor).unwrap();
+                let expected = expected_standard(&doc, layout.large());
+                assert_eq!(section, expected.0);
+                assert_eq!(&output[cursor.pos..], expected.1);
+                assert_eq!(
+                    serde_json::to_value(decode(&output).unwrap()).unwrap(),
+                    before
+                );
+
+                let control = crate::saving::Control::default();
+                control.begin(doc.id.clone(), doc.revision).unwrap();
+                let stopped = Cell::new(false);
+                let mut incomplete = Vec::new();
+                let mut partial_spool = std::io::Cursor::new(Vec::new());
+                let error = encode_layout_progress_to(
+                    &doc,
+                    layout,
+                    &mut incomplete,
+                    &mut partial_spool,
+                    &|| control.check(),
+                    &|stage, completed, total| {
+                        control.progress(stage, completed, total)?;
+                        if stage == "Writing standard layer channels" && completed == 2 {
+                            assert!(control.cancel());
+                            stopped.set(true);
+                        }
+                        control.check()
+                    },
+                )
+                .unwrap_err();
+                assert!(error.contains("canceled"));
+                assert!(stopped.get());
+                assert!(incomplete.is_empty());
+                assert!(partial_spool.get_ref().len() < spool.get_ref().len());
+                assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            }
+        }
+    }
+
     #[test]
     fn streamed_psd_and_psb_match_independent_standard_bytes_and_native_private_sources() {
         for depth in [8, 16] {

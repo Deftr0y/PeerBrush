@@ -454,6 +454,101 @@ pub fn save_accepted_source(
 fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     save_prepared(shared, path, request, || {})
 }
+// One registered control per project, retained for terminal observation. Its file
+// operation guard also covers asynchronous scheduling and failed worker creation.
+struct SaveOperation {
+    shared: Shared,
+    control: crate::saving::Control,
+    _operation: FileOperation,
+    completed: bool,
+}
+impl SaveOperation {
+    fn begin(
+        shared: &Shared,
+        request: &Value,
+        control: &crate::saving::Control,
+    ) -> Result<Self, String> {
+        let mut e = shared.lock().unwrap();
+        e.ensure_open()?;
+        crate::workspace::validate_target(&e, request)?;
+        if request["expected_revision"]
+            .as_u64()
+            .is_some_and(|revision| revision != e.doc.revision)
+        {
+            return Err("Project revision changed before saving".into());
+        }
+        if e.saving.as_ref().is_some_and(|c| !c.status().finished) {
+            return Err("A working save is already active for this project".into());
+        }
+        control.begin(e.doc.id.clone(), e.doc.revision)?;
+        e.saving = Some(control.clone());
+        if e.loading.is_none() {
+            e.status = "Saving Photoshop document".into();
+        }
+        Ok(Self {
+            shared: shared.clone(),
+            control: control.clone(),
+            _operation: FileOperation::track(e.file_operations.clone()),
+            completed: false,
+        })
+    }
+    fn complete(&mut self, result: &Result<(), String>) {
+        let mut e = self.shared.lock().unwrap();
+        if e.loading.is_none() && e.saving.as_ref().is_some_and(|c| c.same(&self.control)) {
+            e.status = result
+                .as_ref()
+                .map(|_| "Photoshop document saved".into())
+                .unwrap_or_else(|error| error.clone());
+        }
+        self.completed = true;
+        self.control.finish(result);
+    }
+}
+impl Drop for SaveOperation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.complete(&Err("Save interrupted; current work remains open".into()));
+        }
+    }
+}
+fn save_controlled(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    control: &crate::saving::Control,
+    before_commit: impl FnOnce(),
+) -> Result<(), String> {
+    let mut operation = SaveOperation::begin(shared, request, control)?;
+    let result = save_prepared_inner(shared, path, request, control, before_commit);
+    operation.complete(&result);
+    result
+}
+fn save_async(shared: &Shared, path: PathBuf, request: &Value) -> Result<(), String> {
+    if request["document_id"].as_str().is_none() || request["expected_revision"].as_u64().is_none()
+    {
+        return Err("Async Save requires observed document_id and expected_revision".into());
+    }
+    let control = crate::saving::Control::default();
+    let mut operation = SaveOperation::begin(shared, request, &control)?;
+    let shared = shared.clone();
+    let request = request.clone();
+    let worker = move || {
+        let result = save_prepared_inner(&shared, &path, &request, &control, || {});
+        operation.complete(&result);
+    };
+    // Dropping the unstarted closure exercises the same owned guard cleanup as
+    // an OS thread-creation error, without exhausting host threads in a test.
+    #[cfg(test)]
+    if let Err(error) = save_safety_tests::observe("spawn", Path::new(""), Path::new("")) {
+        drop(worker);
+        return Err(error);
+    }
+    thread::Builder::new()
+        .name("peerbrush-save".into())
+        .spawn(worker)
+        .map(|_| ())
+        .map_err(|error| format!("Could not start saving: {error}"))
+}
 // Working Save owns both files; neither becomes a loaded source until verified publication.
 struct SaveTemporary {
     path: PathBuf,
@@ -566,6 +661,9 @@ impl Write for SaveTemporary {
             ));
         }
         self.check_path().map_err(std::io::Error::other)?;
+        #[cfg(test)]
+        save_safety_tests::observe("write", &self.path, Path::new(""))
+            .map_err(std::io::Error::other)?;
         let n = self.file.write(bytes)?;
         self.bytes += n as u64;
         self.fingerprint.update(&bytes[..n]);
@@ -601,7 +699,22 @@ fn save_prepared(
     request: &Value,
     before_commit: impl FnOnce(),
 ) -> Result<(), String> {
-    let _operation = FileOperation::begin(shared)?;
+    save_controlled(
+        shared,
+        path,
+        request,
+        &crate::saving::Control::default(),
+        before_commit,
+    )
+}
+fn save_prepared_inner(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    control: &crate::saving::Control,
+    before_commit: impl FnOnce(),
+) -> Result<(), String> {
+    control.progress("Checking destination", 0, 0)?;
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -622,6 +735,10 @@ fn save_prepared(
     let (doc, source_path, source_version, saved_revision, project) = {
         let e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, request)?;
+        let source = control.status();
+        if e.doc.id != source.document_id || e.doc.revision != source.revision {
+            return Err("Project source changed before saving; current work preserved".into());
+        }
         if request["expected_revision"]
             .as_u64()
             .is_some_and(|r| r != e.doc.revision)
@@ -662,6 +779,7 @@ fn save_prepared(
     #[cfg(test)]
     let spool_path = spool.path.clone();
     let check = || {
+        control.check()?;
         let e = shared.lock().unwrap();
         e.ensure_open()?;
         if e.doc.id != doc.id
@@ -682,17 +800,33 @@ fn save_prepared(
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("psb"))
     {
-        psd::encode_psb_to(&doc, &mut output, &mut spool, &check)?;
+        psd::encode_psb_to(
+            &doc,
+            &mut output,
+            &mut spool,
+            &check,
+            &|stage, completed, total| control.progress(stage, completed, total),
+        )?;
     } else {
-        psd::encode_to(&doc, &mut output, &mut spool, &check)?;
+        psd::encode_to(
+            &doc,
+            &mut output,
+            &mut spool,
+            &check,
+            &|stage, completed, total| control.progress(stage, completed, total),
+        )?;
     }
     #[cfg(test)]
     save_safety_tests::observe("encoded", &output_path, &spool_path)?;
+    control.progress("Verifying native spool", 0, 0)?;
     spool.verify(&check)?;
+    control.progress("Verifying save output", 0, 0)?;
     let staged = output.verify(&check)?;
     let spool_stamp = spool.stamp()?;
     let output_stamp = output.stamp()?;
     // Preserve the previous exact file before touching its replacement.
+    control.progress("Preserving previous version", 0, 0)?;
+    check()?;
     let backup = lease.preserve()?;
     before_commit();
     let mut e = shared.lock().unwrap();
@@ -713,6 +847,9 @@ fn save_prepared(
     spool.validate(spool_stamp)?;
     spool.remove()?;
     lease.validate()?;
+    // Serialize the last cancellation decision with the first irreversible step.
+    // No cancellable callback may run after this transition or after rename.
+    control.commit()?;
     replace_file(&output.path, path)?;
     sync_parent(path)?;
     #[cfg(test)]
@@ -984,7 +1121,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_proposal","description":"Create and render frozen proposed edits for explicit human review. create needs observed document_id/expected_revision and ordinary engine commands; the shared project and history stay unchanged. preview returns actual PNG pixels with document coordinates. Only actor human can accept; agents can list, preview or reject their proposals. A changed project or ended/expired/taken-over task invalidates its draft. Never silently reacquire a task. Direct edits remain available when already authorized.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","preview","accept","reject"]},"actor":{"type":"string"},"proposal":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"task":{"type":"string"},"label":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"feedback":{"type":"string","enum":["batch","request"]}},"required":["action"],"additionalProperties":false}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status","recovery"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
-        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export flattened PNG/WebP/JPEG XL selected by destination extension. PNG and JPEG XL keep native 8/16-bit channels; lossless WebP is explicitly 8-bit output only, including from native16 sources. All retain alpha and supported color handling; JPEG XL assigns untagged RGB to sRGB and defaults to lossless, with optional jxl lossless/distance/effort settings; exporting never changes the editable document's precision. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Working saves remain PSD/PSB under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. pattern_sources inspects protected raw RGB pattern assets; it requires observed document_id/expected_revision. Optional pattern_index returns native PNG content in pattern_asset coordinates, without interpreting Photoshop color handling or style placement. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_report","export","compatible_copy","pattern_sources"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"pattern_index":{"type":"integer","minimum":0,"maximum":15},"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
+        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export flattened PNG/WebP/JPEG XL selected by destination extension. PNG and JPEG XL keep native 8/16-bit channels; lossless WebP is explicitly 8-bit output only, including from native16 sources. All retain alpha and supported color handling; JPEG XL assigns untagged RGB to sRGB and defaults to lossless, with optional jxl lossless/distance/effort settings; exporting never changes the editable document's precision. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Working saves remain PSD/PSB under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. save remains synchronous; save_async requires observed document_id/expected_revision and returns immediately. Observe state.saving and file_status; cancel_save requires its exact run. Cancellation is cooperative before final publication; late cancellation is refused while the verified save finishes. Existing effect/composite preparation, backup and OS calls may finish before cancellation is observed. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. pattern_sources inspects protected raw RGB pattern assets; it requires observed document_id/expected_revision. Optional pattern_index returns native PNG content in pattern_asset coordinates, without interpreting Photoshop color handling or style placement. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_async","cancel_save","save_report","export","compatible_copy","pattern_sources"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"run":{"type":"string","description":"Exact observed state.saving.run required by cancel_save."},"pattern_index":{"type":"integer","minimum":0,"maximum":15},"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply a supported absolute local image path or base64 PNG. SVG/SVGZ placement creates rendered pixels; image.import retains editable vector markup. Use image_info and explicit frame/page/variant for animations, multipage TIFF and icons. Supply an exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
@@ -2053,11 +2190,32 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     p["convert_to_srgb"].as_bool().unwrap_or(false),
                     p["document_id"].as_str(),
                 )?,
-                "save" => {
+                "save" | "save_async" => {
                     let path = path
                         .or_else(|| shared.lock().unwrap().path.clone())
                         .ok_or("Choose a PSD or PSB path")?;
-                    save_guarded(shared, &path, p)?;
+                    if action == "save_async" {
+                        save_async(shared, path, p)?;
+                    } else {
+                        save_guarded(shared, &path, p)?;
+                    }
+                }
+                "cancel_save" => {
+                    let control = {
+                        let e = shared.lock().unwrap();
+                        crate::workspace::validate_target(&e, p)?;
+                        e.saving.clone().ok_or("No working save to cancel")?
+                    };
+                    let run = p["run"]
+                        .as_str()
+                        .ok_or("Observe state.saving.run before canceling")?;
+                    if control.status().run != run {
+                        return Err("Save run changed; observe its current status".into());
+                    }
+                    let accepted = control.cancel();
+                    return Ok(
+                        json!({"run":run,"cancel_accepted":accepted,"saving":control.status()}),
+                    );
                 }
                 "export" => export_guarded(shared, path.as_deref().ok_or("Missing path")?, p)?,
                 _ => return Err("Unknown document action".into()),

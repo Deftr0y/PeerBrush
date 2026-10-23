@@ -98,6 +98,107 @@ mod tests {
         panic!("Save reply did not arrive");
     }
     #[test]
+    fn shared_save_cancel_status_and_reply_keep_the_native_close_review_open() {
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            dirty(&root, "Keep canceled save work");
+            frame(&mut app, &ctx, vec![]);
+            app.request_close(Intent::Close(app.project_id.clone()));
+            frame(&mut app, &ctx, vec![]);
+            let source = app
+                .lifecycle
+                .as_ref()
+                .unwrap()
+                .current()
+                .unwrap()
+                .source
+                .clone();
+            let before = serde_json::to_value(&root.lock().unwrap().doc).unwrap();
+            let other = serde_json::to_value(&second.lock().unwrap().doc).unwrap();
+            let control = crate::saving::Control::default();
+            control
+                .begin(source.document.clone(), source.revision)
+                .unwrap();
+            control
+                .progress("Writing current composite", 2, 16)
+                .unwrap();
+            root.lock().unwrap().saving = Some(control.clone());
+            let (tx, rx) = mpsc::channel();
+            app.lifecycle.as_mut().unwrap().saving = Some(rx);
+            let mut output = frame(&mut app, &ctx, vec![]);
+            for _ in 0..3 {
+                output = frame(&mut app, &ctx, vec![]);
+            }
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Writing current composite"));
+            assert!(text.contains("Cancel saving"));
+            let cancel = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Cancel saving" => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(cancel),
+                        egui::Event::PointerButton {
+                            pos: cancel,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+            assert!(control.status().cancel_requested);
+            let result = control.check();
+            control.finish(&result);
+            tx.send(SaveReply {
+                source,
+                result: result.map(|_| true),
+            })
+            .unwrap();
+            frame(&mut app, &ctx, vec![]);
+            assert!(app.lifecycle.as_ref().unwrap().current().is_some());
+            assert!(app
+                .lifecycle
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("canceled"));
+            let e = root.lock().unwrap();
+            assert!(!e.closed);
+            assert_ne!(e.doc.revision, e.saved_revision);
+            assert_eq!(e.undo.len(), 1);
+            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+            drop(e);
+            assert!(!second.lock().unwrap().closed);
+            assert_eq!(
+                serde_json::to_value(&second.lock().unwrap().doc).unwrap(),
+                other
+            );
+            click(&mut app, &ctx, 2);
+        }
+    }
+
+    #[test]
     fn clean_conflicting_project_reviews_native_cancel_failed_save_and_discard() {
         for depth in [8, 16] {
             let (mut app, ctx, root, second) = fixture(depth);
@@ -938,6 +1039,12 @@ impl PeerBrush {
             "Save project before closing?"
         };
         let saving = review.saving.is_some();
+        let save_control = current.as_ref().and_then(|row| {
+            crate::workspace::get_in(&self.workspace, &row.source.project)
+                .ok()
+                .and_then(|shared| shared.try_lock().ok().and_then(|e| e.saving.clone()))
+                .filter(|control| !control.status().finished)
+        });
         let mut action = 0;
         let mut save_as = false;
         review.buttons = [None; 3];
@@ -964,10 +1071,14 @@ impl PeerBrush {
                 ui.label(RichText::new(error).color(ACCENT));
             }
             if saving {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Saving…");
-                });
+                if let Some(control) = &save_control {
+                    super::saving::progress(ui, control);
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Saving…");
+                    });
+                }
             }
             ui.horizontal(|ui| {
                 for (index, label) in ["Save", "Don't Save", "Cancel"].into_iter().enumerate() {

@@ -48,6 +48,7 @@ pub mod recovery;
 pub(crate) mod render;
 pub mod retained;
 pub mod retouch;
+pub mod saving;
 pub mod segmentation;
 pub mod selection;
 pub mod server;

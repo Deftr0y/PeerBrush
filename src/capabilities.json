@@ -1079,9 +1079,13 @@
     "document_actions": [
       "open",
       "open_async",
-      "cancel_open"
+      "cancel_open",
+      "save",
+      "save_async",
+      "cancel_save"
     ],
-    "progress": "observe state.loading stage/completed/total and state.file_status; no partial editable document is exposed",
+    "progress": "Observe state.loading stage/completed/total and state.file_status; no partial editable document is exposed. Working Save exposes state.saving run/document_id/revision/stage/completed/total/can_cancel/cancel_requested/finished/error; retained terminal status belongs to that exact run.",
+    "save": "save remains synchronous. save_async requires observed document_id/expected_revision; cancel_save requires the exact observed run. Cooperative cancellation is accepted before atomic publication, preserving current work and destination; late cancellation returns cancel_accepted:false while publication/readback completes. Existing full effect/composite preparation, backup and OS operations may finish before cancellation is observed. Native UI Save and close-save use the same shared control.",
     "decoder": "Row-to-native-tile raw/RLE/ZIP/predicted composites and color channels, cancellable section reads, bounded saved-image preview, direct validated PeerBrush source restoration",
     "rendering": "Coarse shared-engine frame before detailed native preview; revision/view guards; native sources remain 8/16-bit",
     "disk_cache": {

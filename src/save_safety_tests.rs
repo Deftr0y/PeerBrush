@@ -747,3 +747,380 @@ fn save_temporary_fingerprint_tracks_only_written_bytes_and_survives_reads() {
     );
     fs::remove_dir(directory).unwrap();
 }
+
+#[test]
+fn controlled_save_cancellation_and_writer_errors_preserve_native_work_and_originals() {
+    for depth in [8, 16] {
+        for extension in ["psd", "psb"] {
+            for selected in [
+                "Preparing layer masks",
+                "Writing standard layer channels",
+                "Verifying native spool",
+                "Verifying save output",
+                "writer failure",
+                "readback corruption",
+            ] {
+                let directory =
+                    std::env::temp_dir().join(format!("pb-save-control-{}", engine::id()));
+                fs::create_dir(&directory).unwrap();
+                let path = directory.join(format!("art.{extension}"));
+                let shared =
+                    native_save_fixture(depth, path.file_name().unwrap().to_str().unwrap());
+                // A larger canvas keeps real verification in multiple 64 KiB reads;
+                // the small editable layer/mask and its native hidden samples stay intact.
+                {
+                    let mut e = shared.lock().unwrap();
+                    e.doc.width = 257;
+                    e.doc.height = 257;
+                }
+                save(&shared, &path).unwrap();
+                let original = fs::read(&path).unwrap();
+                {
+                    let mut e = shared.lock().unwrap();
+                    let layer = e.doc.layers[0].id.clone();
+                    e.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})], None, None, "Unsaved native work").unwrap();
+                }
+                let (document, saved, version, history) = {
+                    let e = shared.lock().unwrap();
+                    (
+                        serde_json::to_value(&e.doc).unwrap(),
+                        e.saved_revision,
+                        e.file_version,
+                        e.undo.len(),
+                    )
+                };
+                let control = crate::saving::Control::default();
+                let observed_control = control.clone();
+                let hit = std::rc::Rc::new(std::cell::Cell::new(false));
+                let observed_hit = hit.clone();
+                let mut read_checks = 0;
+                let watch = WatchSave::new(move |phase, output, _| {
+                    let status = observed_control.status();
+                    if selected == "writer failure"
+                        && phase == "write"
+                        && fs::metadata(output).is_ok_and(|m| m.len() > 0)
+                    {
+                        observed_hit.set(true);
+                        return Err("Injected save writer failure".into());
+                    }
+                    if selected == "readback corruption" && phase == "encoded" {
+                        let mut file = fs::OpenOptions::new().write(true).open(output).unwrap();
+                        file.write_all(b"BAD!").unwrap();
+                        file.sync_all().unwrap();
+                        observed_hit.set(true);
+                    }
+                    if phase == "encoding" && status.stage == selected {
+                        if selected.starts_with("Verifying") {
+                            read_checks += 1;
+                        }
+                        if (selected == "Preparing layer masks")
+                            || (selected == "Writing standard layer channels"
+                                && status.completed >= 2)
+                            || (selected.starts_with("Verifying") && read_checks == 3)
+                        {
+                            assert!(observed_control.cancel());
+                            observed_hit.set(true);
+                        }
+                    }
+                    Ok(())
+                });
+                let error =
+                    save_controlled(&shared, &path, &json!({}), &control, || {}).unwrap_err();
+                drop(watch);
+                assert!(hit.get(), "The selected real save phase must be reached");
+                assert!(
+                    error.contains(match selected {
+                        "writer failure" => "writer failure",
+                        "readback corruption" => "verification",
+                        _ => "canceled",
+                    }),
+                    "{selected}: {error}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let e = shared.lock().unwrap();
+                assert_eq!(serde_json::to_value(&e.doc).unwrap(), document);
+                assert_eq!(e.saved_revision, saved);
+                assert_eq!(e.file_version, version);
+                assert_eq!(e.undo.len(), history);
+                assert!(e.file_ownership.is_some());
+                assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
+                assert!(control.status().finished && control.status().error.is_some());
+                assert_eq!(
+                    control.status().cancel_requested,
+                    !matches!(selected, "writer failure" | "readback corruption")
+                );
+                assert!(!control.cancel());
+                assert!(!fs::read_dir(&directory).unwrap().any(|entry| matches!(
+                    entry.unwrap().path().extension().and_then(|s| s.to_str()),
+                    Some("tmp" | "psd-spool")
+                )));
+                drop(e);
+                drop(shared);
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn controlled_save_last_cancel_is_atomic_and_late_cancel_cannot_hide_publication() {
+    for depth in [8, 16] {
+        for extension in ["psd", "psb"] {
+            for late in [false, true] {
+                let directory =
+                    std::env::temp_dir().join(format!("pb-save-boundary-{}", engine::id()));
+                fs::create_dir(&directory).unwrap();
+                let path = directory.join(format!("art.{extension}"));
+                let shared =
+                    native_save_fixture(depth, path.file_name().unwrap().to_str().unwrap());
+                save(&shared, &path).unwrap();
+                let original = fs::read(&path).unwrap();
+                {
+                    let mut e = shared.lock().unwrap();
+                    let layer = e.doc.layers[0].id.clone();
+                    e.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})], None, None, "Pending work").unwrap();
+                }
+                let (document, saved, history) = {
+                    let e = shared.lock().unwrap();
+                    (
+                        serde_json::to_value(&e.doc).unwrap(),
+                        e.saved_revision,
+                        e.undo.len(),
+                    )
+                };
+                let control = crate::saving::Control::default();
+                let observed_control = control.clone();
+                let published = std::rc::Rc::new(std::cell::Cell::new(false));
+                let observed_published = published.clone();
+                let watch = WatchSave::new(move |phase, _, _| {
+                    if phase == "published" {
+                        assert!(late);
+                        assert_eq!(observed_control.status().stage, "Finishing save");
+                        assert!(!observed_control.cancel());
+                        observed_published.set(true);
+                    }
+                    Ok(())
+                });
+                let result = save_controlled(&shared, &path, &json!({}), &control, || {
+                    if !late {
+                        assert!(control.cancel());
+                    }
+                });
+                drop(watch);
+                assert_eq!(result.is_ok(), late);
+                assert_eq!(published.get(), late);
+                let e = shared.lock().unwrap();
+                assert_eq!(serde_json::to_value(&e.doc).unwrap(), document);
+                assert_eq!(e.undo.len(), history);
+                assert_eq!(e.saved_revision, if late { e.doc.revision } else { saved });
+                assert_eq!(fs::read(&path).unwrap() == original, !late);
+                if late {
+                    let decoded = psd::decode(&fs::read(&path).unwrap()).unwrap();
+                    assert!(!decoded.read_only);
+                    assert_eq!(
+                        decoded.layers[0].pixels.rgba16(),
+                        e.doc.layers[0].pixels.rgba16()
+                    );
+                    assert!(crate::file_safety::previous_versions(&path)
+                        .unwrap()
+                        .iter()
+                        .any(|old| fs::read(&old.path).unwrap() == original));
+                }
+                assert!(control.status().finished);
+                assert_eq!(control.status().error.is_none(), late);
+                drop(e);
+                drop(shared);
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn save_run_binding_duplicate_registration_and_failed_spawn_keep_operations_owned() {
+    let directory = std::env::temp_dir().join(format!("pb-save-run-{}", engine::id()));
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("art.psd");
+    let shared = native_save_fixture(16, "art.psd");
+    let (document, revision) = {
+        let e = shared.lock().unwrap();
+        (e.doc.id.clone(), e.doc.revision)
+    };
+    let request = json!({"document_id":document,"expected_revision":revision});
+    let source = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+    assert!(save_async(&shared, path.clone(), &json!({})).is_err());
+    assert!(SaveOperation::begin(
+        &shared,
+        &json!({"document_id":"stale"}),
+        &crate::saving::Control::default()
+    )
+    .is_err());
+    assert!(SaveOperation::begin(
+        &shared,
+        &json!({"document_id":document,"expected_revision":revision+1}),
+        &crate::saving::Control::default()
+    )
+    .is_err());
+    let control = crate::saving::Control::default();
+    let mut operation = SaveOperation::begin(&shared, &request, &control).unwrap();
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .file_operations
+            .load(Ordering::Acquire),
+        1
+    );
+    assert!(save_async(&shared, path.clone(), &request)
+        .unwrap_err()
+        .contains("already active"));
+    assert!(dispatch(
+        &shared,
+        "document",
+        &json!({"action":"cancel_save","document_id":document,"run":"old-run"})
+    )
+    .is_err());
+    assert!(!control.status().cancel_requested);
+    let reply = dispatch(
+        &shared,
+        "document",
+        &json!({"action":"cancel_save","document_id":document,"run":control.status().run}),
+    )
+    .unwrap();
+    assert_eq!(reply["cancel_accepted"], true);
+    let result = control.check();
+    operation.complete(&result);
+    drop(operation);
+    let watch = WatchSave::new(|phase, _, _| {
+        if phase == "spawn" {
+            Err("Injected save worker creation failure".into())
+        } else {
+            Ok(())
+        }
+    });
+    assert!(save_async(&shared, path.clone(), &request)
+        .unwrap_err()
+        .contains("creation failure"));
+    drop(watch);
+    let e = shared.lock().unwrap();
+    assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
+    assert_eq!(serde_json::to_value(&e.doc).unwrap(), source);
+    assert!(e.saving.as_ref().unwrap().status().finished);
+    assert!(e
+        .saving
+        .as_ref()
+        .unwrap()
+        .status()
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("interrupted"));
+    assert!(!path.exists());
+    drop(e);
+    drop(shared);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn later_human_edit_fails_controlled_save_without_marking_it_saved_or_canceled() {
+    let directory = std::env::temp_dir().join(format!("pb-save-stale-control-{}", engine::id()));
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("art.psb");
+    let shared = native_save_fixture(16, "art.psb");
+    save(&shared, &path).unwrap();
+    let original = fs::read(&path).unwrap();
+    let saved = shared.lock().unwrap().saved_revision;
+    let history = shared.lock().unwrap().undo.len();
+    let control = crate::saving::Control::default();
+    let error = save_controlled(&shared, &path, &json!({}), &control, || {
+        let mut e = shared.lock().unwrap();
+        let layer = e.doc.layers[0].id.clone();
+        e.edit(
+            "human",
+            &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})],
+            None,
+            None,
+            "Later human work",
+        )
+        .unwrap();
+    })
+    .unwrap_err();
+    assert!(error.contains("source changed"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    let e = shared.lock().unwrap();
+    assert_eq!(e.undo.len(), history + 1);
+    assert_eq!(e.saved_revision, saved);
+    assert_ne!(e.saved_revision, e.doc.revision);
+    assert_eq!(
+        e.doc.layers[0].pixels.get16(1, 0),
+        [13 * 257, 29 * 257, 53 * 257, 97 * 257]
+    );
+    assert!(control.status().finished && control.status().error.is_some());
+    assert!(!control.status().cancel_requested);
+    drop(e);
+    drop(shared);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn queued_save_rejects_early_cancel_or_newer_human_source_before_serialization() {
+    for depth in [8, 16] {
+        for cancel in [false, true] {
+            let directory = std::env::temp_dir().join(format!("pb-queued-save-{}", engine::id()));
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("queued.psd");
+            let shared = native_save_fixture(depth, "queued.psd");
+            let control = crate::saving::Control::default();
+            let mut operation = SaveOperation::begin(&shared, &json!({}), &control).unwrap();
+            if cancel {
+                assert!(control.cancel());
+            } else {
+                let mut e = shared.lock().unwrap();
+                let layer = e.doc.layers[0].id.clone();
+                e.edit(
+                    "human",
+                    &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})],
+                    None,
+                    None,
+                    "Work after async registration",
+                )
+                .unwrap();
+            }
+            let (before, saved, history) = {
+                let e = shared.lock().unwrap();
+                (
+                    serde_json::to_value(&e.doc).unwrap(),
+                    e.saved_revision,
+                    e.undo.len(),
+                )
+            };
+            let result = save_prepared_inner(&shared, &path, &json!({}), &control, || {
+                panic!("No stale/canceled save may reach publication")
+            });
+            assert!(result.as_ref().unwrap_err().contains(if cancel {
+                "canceled"
+            } else {
+                "source changed before saving"
+            }));
+            operation.complete(&result);
+            drop(operation);
+            let e = shared.lock().unwrap();
+            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+            assert_eq!(e.saved_revision, saved);
+            assert_eq!(e.undo.len(), history);
+            assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
+            assert!(!e.closed);
+            assert_ne!(e.doc.revision, e.saved_revision);
+            assert!(control.status().finished && control.status().error.is_some());
+            assert_eq!(control.status().cancel_requested, cancel);
+            assert!(!path.exists());
+            assert!(!fs::read_dir(&directory).unwrap().any(|entry| matches!(
+                entry.unwrap().path().extension().and_then(|s| s.to_str()),
+                Some("tmp" | "psd-spool")
+            )));
+            drop(e);
+            drop(shared);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+}

@@ -36,6 +36,7 @@ mod recovery;
 mod refinement;
 mod retouch;
 mod saved_versions;
+mod saving;
 mod selection;
 mod shortcuts;
 pub(crate) use shortcuts::validate_file as validate_shortcut_preferences;
@@ -5973,6 +5974,7 @@ impl PeerBrush {
         }
         self.recovery_window(ctx);
         self.saved_versions_window(ctx);
+        self.save_progress_windows(ctx);
         let loading = self
             .load_control
             .clone()
