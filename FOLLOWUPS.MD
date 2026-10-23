@@ -651,3 +651,12 @@ PB-147 checkpoint-only preservation source (unreleased; not executed): real defa
 - New Windows authenticated preparation/Later, macOS authenticated capture ownership/reaping, and distinct Linux receipt authentication source follows that checkpoint and still awaits combined QA. Native application/restart, full macOS exit/health/recovery, coherent final release-input assembly and installed acceptance remain unfinished. Producers, publishing and Store submission stay disabled. Remote control and third-party add-ons remain excluded.
 
 See the [development record](docs/development-0.3.md#combined-checkpoint-2de8c0d-and-following-source-unreleased-2026-10-23-utc) for evidence limits and remaining release prerequisites. Preserve all prior completed history.
+
+
+### Next integrated v0.3 qualification (unreleased, 2026-10-23 UTC)
+
+- PB-108 remains first. Actual Save source now spools the compressed Photoshop source resource into the existing file-backed spool, with bounded replay and prepared native8/16 PSD/PSB, history, standard-composite, cancellation/error and newer-human-work regressions. Combined checks precede the separately prepared balanced Save timing/sampled-memory comparison. No new performance result is claimed.
+- CI534 is terminal for the earlier `2de8c0d` tree: complete Windows/Ubuntu jobs passed; macOS failed two later Sparkle fixture checks after Rust/Clippy/signing/unsigned-DMG checks passed. Later macOS checks and aggregate inspection were skipped. The fixture correction and all later integrated source need fresh native replay.
+- Integrated update/release source now includes authenticated Windows preparation/Later; exact macOS original/copied bundle ownership and durable current-profile capture/retirement; distinct Linux installation/migration receipt authentication; and bounded final native-input assembly through existing consumers. These changes await combined qualification. Native apply/final exit/outcomes/health/recovery, provisioned publication authority and installed acceptance remain unfinished. All update activation, publishing and Store submission gates stay disabled; remote control and third-party add-ons remain excluded.
+
+See the [source and acceptance record](docs/development-0.3.md#integrated-source-before-the-next-combined-qa-unreleased-2026-10-23-utc). Earlier results and completed history remain preserved.
