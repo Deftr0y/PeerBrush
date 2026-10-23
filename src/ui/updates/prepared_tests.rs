@@ -106,9 +106,10 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
         fs::create_dir(&directory).unwrap();
         let (mut app, ctx) = crate::ui::tests::fixture();
         app.recovery.open = false;
-        {
+        let (raster_id, source_id, source_before) = {
             let mut engine = app.shared.lock().unwrap();
             engine.doc = Document::new_depth(32, 24, depth).unwrap();
+            let raster_id = engine.doc.layers[0].id.clone();
             engine.doc.layers[0]
                 .pixels
                 .set16(3, 4, [12347, 23459, 34567, 45679]);
@@ -135,21 +136,47 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
                     "Editable source",
                 )
                 .unwrap();
+            let source_layer = engine
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.source.is_some())
+                .unwrap();
+            let source_id = source_layer.id.clone();
+            let source_before = serde_json::to_value(source_layer).unwrap();
             fs::write(
                 directory.join("owned.psd"),
                 crate::psd::encode(&engine.doc).unwrap(),
             )
             .unwrap();
             engine.saved_revision = engine.doc.revision;
-        }
+            (raster_id, source_id, source_before)
+        };
         crate::server::open(&app.shared, &directory.join("owned.psd")).unwrap();
         {
             let mut engine = app.shared.lock().unwrap();
-            app.selected = engine.doc.layers[0].id.clone();
+            let raster = engine
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.id == raster_id)
+                .expect("Native PSD must retain the original raster layer ID");
+            assert_eq!(raster.kind, "paint");
+            assert!(raster.source.is_none());
+            assert_eq!(raster.pixels.depth, depth);
+            app.selected = raster.id.clone();
             for x in [4, 6] {
                 engine.edit("human",&[json!({"op":"paint","layer":app.selected,"points":[[x,4]],"radius":1,"color":[231,73,31,255]})],None,None,"Human stroke").unwrap();
             }
             engine.undo("human").unwrap();
+            assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+            let source_layer = engine
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.id == source_id)
+                .expect("Native PSD must retain the editable vector source layer ID");
+            assert_eq!(serde_json::to_value(source_layer).unwrap(), source_before);
         }
         let (document, png, path, version, ownership, marker, previous_history) = {
             let engine = app.shared.lock().unwrap();

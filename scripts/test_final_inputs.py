@@ -407,12 +407,17 @@ class UpstreamHandoff(unittest.TestCase):
         q = dict(commit=commit, version=version, portable=f.directory / next(row['file'] for row in f.inventory['assets'] if row['file'].endswith('-Linux-x64.zip')),
             portable_sha256=next(row['sha256'] for row in f.inventory['assets'] if row['file'].endswith('-Linux-x64.zip')),
             package=f.fixture.deb, package_sha256=sha(f.fixture.deb.read_bytes()), maintainer=f.options['maintainer'])
-        upgrade = linux_dir / 'portable-to-deb.json'
+        receipts = linux_dir / 'receipts'
+        receipts.mkdir(mode=0o700)
+        installation = receipts / 'installation.json'
+        installation.write_bytes(f.receipt.read_bytes())
+        upgrade = receipts / 'portable-to-deb.json'
         upgrade.write_bytes(qualify_linux_deb.encode(test_linux_qualification.driver_receipt(q)) + b'\n')
-        qualify_linux_deb.qualify(f.root, q, f.receipt, sha(f.receipt.read_bytes()), upgrade, sha(upgrade.read_bytes()), linux_dir / 'report')
+        qualify_linux_deb.qualify(f.root, q, installation, sha(installation.read_bytes()), upgrade, sha(upgrade.read_bytes()), linux_dir / 'report')
         self.services, self.commands, self.gets = {}, [], []
         self.fail_crypto = None
         final_selection = copy.deepcopy(f.options)
+        final_selection['linux_receipt'] = installation
         _, windows_selection = self.windows.trust()
         final_selection['windows']['native'] = windows_selection
         final_selection['windows']['identity'] = 'direct-identity.json'
@@ -453,7 +458,7 @@ class UpstreamHandoff(unittest.TestCase):
                 'windows-installer-qualification.sigstore.json': bundles['windows'], f.descriptor.name:
                     (f.fixture.base / ('windows-descriptor-' + str(self.windows.serial)) / f.descriptor.name).read_bytes()},
             linux_native={'linux-deb-qualification.json': (linux_dir / 'report/linux-deb-qualification.json').read_bytes(),
-                'installation.json': f.receipt.read_bytes(), 'portable-to-deb.json': upgrade.read_bytes(), 'linux-deb-qualification.sigstore.json': bundles['linux']})
+                'installation.json': installation.read_bytes(), 'portable-to-deb.json': upgrade.read_bytes(), 'linux-deb-qualification.sigstore.json': bundles['linux']})
         windows_portable = 'PeerBrush-' + version + '-Windows-x64.zip'
         self.files['windows_signed'].update({windows_portable: (f.directory / windows_portable).read_bytes(),
             'direct-identity.json': (f.direct / 'identity.json').read_bytes(), 'runtime-license.txt': (f.direct / 'runtime-license.txt').read_bytes()})

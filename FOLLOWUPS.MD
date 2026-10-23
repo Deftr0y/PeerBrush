@@ -663,3 +663,6 @@ See the [source and acceptance record](docs/development-0.3.md#integrated-source
 
 
 Compilation checkpoint `1babddf` failed before local behavioral tests; no new Save measurement was launched. Narrow Windows name/API, PSD spool-borrow and macOS Panel-visibility repairs preserve validation, profile-retirement ordering and activation holds, and require a fresh combined replay. PB-108 remains first and open. [Preserved failure and repair scope](docs/development-0.3.md#compilation-only-checkpoint-1babddf-unreleased-2026-10-23-utc).
+
+
+Failed combined checkpoint `c5c2a0f` is closed and preserved: Rust 1,291 passes/one failure/19 ignored with three provider exclusions; Python 511 passes/one failure/11 errors/12 skips across 535 methods; all 18 headless main-application cases passed. All three native CI538 application builds passed, then failed the prepared-update raster-target fixture; later packaging was skipped. The reviewed raster selection and Linux receipt-layout/workflow-call fixtures preserve production validation and require a fresh combined replay. Five new Save regressions passed, but the performance comparison remains held and PB-108 stays first and open. [Exact failed batch and correction scope](docs/development-0.3.md#failed-combined-checkpoint-c5c2a0f-unreleased-2026-10-23-utc).

@@ -251,9 +251,12 @@ class Transactions(unittest.TestCase):
         self.assertIn('contents: read', text)
         self.assertNotIn('contents: write', text)
         self.assertIn('if: ${{ false }}', text.split('\n  publish:\n', 1)[1])
-        self.assertIn("expected != os.environ.get('GITHUB_WORKFLOW_SHA')", text)
-        self.assertIn("value.get('conclusion') != 'success'", text)
-        self.assertIn("value.get('head_sha') != expected", text)
+        acquire = text.split('      - name: Acquire separate exact final-input producer data\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('python -B scripts/acquire_final_inputs.py --source-root "$GITHUB_WORKSPACE"', acquire)
+        self.assertIn('--commit "$EXPECTED_COMMIT" --candidate-run-id "$CANDIDATE_RUN"', acquire)
+        self.assertIn('--run-id "$FINAL_INPUTS_RUN" --artifact-id "$FINAL_INPUTS_ARTIFACT"', acquire)
+        self.assertIn('--artifact-sha256 "$FINAL_INPUTS_ARTIFACT_SHA256" --bundle-sha256 "$FINAL_INPUTS_BUNDLE_SHA256"', acquire)
+        self.assertIn('--index-sha256 "$FINAL_INPUTS_INDEX_SHA256" --selection-sha256 "$SELECTION_SHA256"', acquire)
         self.assertIn('--selection-sha256 "$SELECTION_SHA256"', text)
         for name in ['ci.yml', 'release.yml']:
             caller = (root / '.github/workflows' / name).read_text(encoding='utf-8')

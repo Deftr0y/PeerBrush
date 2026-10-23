@@ -57,7 +57,13 @@ class LinuxFacts(unittest.TestCase):
         self.q = dict(commit=f.fixture.commit, version='0.2.0', portable=f.directory / portable['file'],
             portable_sha256=portable['sha256'], package=f.directory / deb['file'], package_sha256=deb['sha256'],
             maintainer=f.options['maintainer'])
-        self.upgrade = f.fixture.base / 'private-portable-to-deb.json'
+        receipts = f.fixture.base / 'linux-receipts'
+        receipts.mkdir(mode=0o700)
+        self.original_receipt = f.receipt
+        f.receipt = receipts / f.receipt.name
+        f.receipt.write_bytes(self.original_receipt.read_bytes())
+        f.options['linux_receipt'] = f.receipt
+        self.upgrade = receipts / 'private-portable-to-deb.json'
         self.upgrade.write_bytes(qualifier.encode(driver_receipt(self.q)) + b'\n')
         self.report_dir = f.fixture.base / 'linux-report'
         self.report_path = self.report_dir / qualifier.REPORT
@@ -125,6 +131,19 @@ class LinuxFacts(unittest.TestCase):
                 path.write_text(json.dumps(options, default=str), encoding='utf-8')
                 return final.from_selection(self.f.root, self.f.directory, self.output, path, sha(path.read_bytes()))
             return final.compose(self.f.root, self.f.directory, self.output, **options)
+
+    def test_report_output_inside_each_selected_input_parent_refuses_without_changing_inputs(self):
+        selected = dict(portable=Path(self.q['portable']), package=Path(self.q['package']),
+                        installation=self.f.receipt, upgrade=self.upgrade)
+        originals = {path: sha(path.read_bytes()) for path in [*selected.values(), self.original_receipt]}
+        for label, path in selected.items():
+            with self.subTest(input=label):
+                output = path.parent / ('refused-linux-report-' + label)
+                with self.assertRaisesRegex(ValueError, 'separate from selected input directories'):
+                    qualifier.qualify(self.f.root, self.q, self.f.receipt, sha(self.f.receipt.read_bytes()),
+                                      self.upgrade, sha(self.upgrade.read_bytes()), output)
+                self.assertFalse(output.exists())
+                self.assertEqual({path: sha(path.read_bytes()) for path in originals}, originals)
 
     def test_actual_two_receipt_qualification_and_authenticated_composition_keep_every_installed_gate(self):
         value = self.qualify()
