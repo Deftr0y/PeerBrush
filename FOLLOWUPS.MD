@@ -660,3 +660,6 @@ See the [development record](docs/development-0.3.md#combined-checkpoint-2de8c0d
 - Integrated update/release source now includes authenticated Windows preparation/Later; exact macOS original/copied bundle ownership and durable current-profile capture/retirement; distinct Linux installation/migration receipt authentication; and bounded final native-input assembly through existing consumers. These changes await combined qualification. Native apply/final exit/outcomes/health/recovery, provisioned publication authority and installed acceptance remain unfinished. All update activation, publishing and Store submission gates stay disabled; remote control and third-party add-ons remain excluded.
 
 See the [source and acceptance record](docs/development-0.3.md#integrated-source-before-the-next-combined-qa-unreleased-2026-10-23-utc). Earlier results and completed history remain preserved.
+
+
+Compilation checkpoint `1babddf` failed before local behavioral tests; no new Save measurement was launched. Narrow Windows name/API, PSD spool-borrow and macOS Panel-visibility repairs preserve validation, profile-retirement ordering and activation holds, and require a fresh combined replay. PB-108 remains first and open. [Preserved failure and repair scope](docs/development-0.3.md#compilation-only-checkpoint-1babddf-unreleased-2026-10-23-utc).

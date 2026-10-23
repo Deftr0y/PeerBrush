@@ -1,11 +1,6 @@
 //! SDK-free read-only package trust. No deployment API, shell launch or settings.
 use super::*;
-use std::{
-    collections::BTreeSet,
-    mem::size_of,
-    os::windows::{ffi::OsStrExt, io::AsRawHandle},
-};
-use windows::{
+use ::windows::{
     core::{w, PCWSTR, PWSTR},
     ApplicationModel::{Package, PackageSignatureKind},
     Management::Deployment::PackageManager,
@@ -27,8 +22,13 @@ use windows::{
         UI::Shell::SHCreateStreamOnFileEx,
     },
 };
+use std::{
+    collections::BTreeSet,
+    mem::size_of,
+    os::windows::{ffi::OsStrExt, io::AsRawHandle},
+};
 
-fn native<T>(result: windows::core::Result<T>) -> Result<T> {
+fn native<T>(result: ::windows::core::Result<T>) -> Result<T> {
     result.map_err(|_| {
         "Native Windows package verification could not complete; no installation occurred.".into()
     })
@@ -67,8 +67,10 @@ impl super::Verifier for Verifier {
         let executing = native(Package::Current())?;
         let executing_name = native(native(executing.Id())?.FullName())?;
         let current = native(
-            native(PackageManager::new())?
-                .FindPackageForUser(&windows::core::HSTRING::new(), &executing_name),
+            native(PackageManager::new())?.FindPackageByUserSecurityIdPackageFullName(
+                &::windows::core::HSTRING::new(),
+                &executing_name,
+            ),
         )?;
         let kind = native(current.SignatureKind())?;
         if (kind != PackageSignatureKind::Developer && kind != PackageSignatureKind::Enterprise)
@@ -141,7 +143,7 @@ impl Drop for Trust {
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         unsafe {
             WinVerifyTrust(
-                windows::Win32::Foundation::HWND(-1isize as _),
+                ::windows::Win32::Foundation::HWND(-1isize as _),
                 &mut action,
                 &mut self.0 as *mut _ as _,
             );
@@ -180,7 +182,7 @@ unsafe fn signature(file: &Held, certificate: &str) -> Result<String> {
     // WTD_UI_NONE; revocation is not weakened/offline-assumed. This synchronous
     // provider may contact the network: the owner retains one cancel quarantine.
     if WinVerifyTrust(
-        windows::Win32::Foundation::HWND(-1isize as _),
+        ::windows::Win32::Foundation::HWND(-1isize as _),
         &mut action,
         &mut state.0 as *mut _ as _,
     ) != 0
@@ -274,7 +276,7 @@ unsafe fn sha256_oid(value: *const u8) -> bool {
             .all(|(i, b)| *value.add(i) == *b)
 }
 
-unsafe fn string(value: windows::core::Result<PWSTR>) -> Result<String> {
+unsafe fn string(value: ::windows::core::Result<PWSTR>) -> Result<String> {
     let value = native(value)?;
     if value.is_null() {
         return Err("Missing native package text.".into());
@@ -445,7 +447,7 @@ unsafe fn verify(
     let reader = native(factory.CreatePackageReader(&stream))?;
     let metadata = native(reader.GetManifest())?;
     let id = native(metadata.GetPackageId())?;
-    if !native(id.ComparePublisher(&windows::core::HSTRING::from(signer_subject)))?.as_bool() {
+    if !native(id.ComparePublisher(&::windows::core::HSTRING::from(signer_subject)))?.as_bool() {
         return Err(
             "Verified signing certificate subject differs from the native package Publisher."
                 .into(),
@@ -535,7 +537,7 @@ unsafe fn verify(
             .filter(|n| *n <= PACKAGE)
             .ok_or("Native package payload exceeds its aggregate bound.")?;
         let payload_stream = native(payload.GetStream())?;
-        let map_file = native(blockmap.GetFile(&windows::core::HSTRING::from(&name)))?;
+        let map_file = native(blockmap.GetFile(&::windows::core::HSTRING::from(&name)))?;
         if native(map_file.GetUncompressedSize())? != size
             || !native(map_file.ValidateFileHash(&payload_stream))?.as_bool()
         {
@@ -586,7 +588,7 @@ unsafe fn verify(
             return Err("Signed package omits its matching corresponding-source archive.".into());
         }
         let source_hash = value["source_sha256"].as_str().unwrap_or_default();
-        let source_file = native(reader.GetPayloadFile(&windows::core::HSTRING::from(archive)))?;
+        let source_file = native(reader.GetPayloadFile(&::windows::core::HSTRING::from(archive)))?;
         if !sha(source_hash)
             || stream_hash(&native(source_file.GetStream())?, control)?.sha256 != source_hash
         {

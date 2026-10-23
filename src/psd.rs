@@ -1399,28 +1399,27 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     {
         return Err("Photoshop standard spool length changed".into());
     }
-    let mut source = StandardWriter::new(&mut *spool, check);
-    // Count the existing standard bytes against the same spool/file limit;
-    // the fresh hash covers only the appended compressed source segment.
-    source.bytes = total;
-    let mut z = BoundedWriter {
-        inner: ZlibEncoder::new(source, Compression::fast()),
-        written: 0,
-        limit: if high {
-            512 * 1024 * 1024
-        } else {
-            128 * 1024 * 1024
-        },
-        check,
-        error: "Editable PSD source data exceeds its bounded serialization budget",
+    let (compressed_length, compressed_hash, spool_length) = {
+        let mut source = StandardWriter::new(&mut *spool, check);
+        // Count the existing standard bytes against the same spool/file limit;
+        // the fresh hash covers only the appended compressed source segment.
+        source.bytes = total;
+        let mut z = BoundedWriter {
+            inner: ZlibEncoder::new(source, Compression::fast()),
+            written: 0,
+            limit: if high {
+                512 * 1024 * 1024
+            } else {
+                128 * 1024 * 1024
+            },
+            check,
+            error: "Editable PSD source data exceeds its bounded serialization budget",
+        };
+        serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
+        let mut source = z.inner.finish().map_err(|e| e.to_string())?;
+        source.flush().map_err(|e| e.to_string())?;
+        (source.bytes - total, source.hash, source.bytes)
     };
-    serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
-    let mut source = z.inner.finish().map_err(|e| e.to_string())?;
-    source.flush().map_err(|e| e.to_string())?;
-    let compressed_length = source.bytes - total;
-    let compressed_hash = source.hash;
-    let spool_length = source.bytes;
-    drop(source);
     progress("Assembling verified Photoshop output", 0, 0)?;
     check()?;
     let payload_length = compressed_length

@@ -6076,7 +6076,7 @@ impl eframe::App for PeerBrush {
     fn on_exit(&mut self) {
         crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
         #[cfg(target_os = "macos")]
-        if let Err(error) = self.updates.native_updater.retire_profile_capture() {
+        if let Err(error) = self.updates.retire_profile_capture() {
             eprintln!("PeerBrush: app update profile capture remains unusable: {error}");
         }
         self.exit_tool_profile();

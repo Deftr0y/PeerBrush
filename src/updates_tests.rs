@@ -8,16 +8,16 @@ use std::{
 #[cfg(windows)]
 #[test]
 fn windows_ownership_keeps_store_priority_and_queries_association_only_for_supported_signatures() {
-    use windows::ApplicationModel::PackageSignatureKind as Signature;
+    use ::windows::ApplicationModel::PackageSignatureKind as Signature;
     for (signature, expected) in [
         (Ok(Signature::Store), Owner::MicrosoftStore),
         (Ok(Signature::None), Owner::WindowsPackage),
         (Ok(Signature::System), Owner::WindowsPackage),
         (Ok(Signature(i32::MAX)), Owner::WindowsPackage),
         (
-            Err(windows::core::Error::from_hresult(windows::core::HRESULT(
-                0x80004005_u32 as i32,
-            ))),
+            Err(::windows::core::Error::from_hresult(
+                ::windows::core::HRESULT(0x80004005_u32 as i32),
+            )),
             Owner::Unknown,
         ),
     ] {

@@ -26,7 +26,7 @@ impl Owner {
     pub fn current() -> Self {
         #[cfg(windows)]
         {
-            use windows::ApplicationModel::Package;
+            use ::windows::ApplicationModel::Package;
             match crate::packaged::package_family() {
                 Ok(None) => Self::Direct,
                 Ok(Some(_)) => match Package::Current() {
@@ -78,10 +78,10 @@ impl Owner {
 
 #[cfg(windows)]
 fn windows_package_owner(
-    signature: windows::core::Result<windows::ApplicationModel::PackageSignatureKind>,
+    signature: ::windows::core::Result<::windows::ApplicationModel::PackageSignatureKind>,
     app_installer_associated: impl FnOnce() -> bool,
 ) -> Owner {
-    use windows::ApplicationModel::PackageSignatureKind;
+    use ::windows::ApplicationModel::PackageSignatureKind;
     match signature {
         Ok(PackageSignatureKind::Store) => Owner::MicrosoftStore,
         Ok(PackageSignatureKind::Developer | PackageSignatureKind::Enterprise) => {

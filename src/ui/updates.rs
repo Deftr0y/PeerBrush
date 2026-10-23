@@ -36,6 +36,10 @@ impl Panel {
     pub(super) fn set_update_profile(&mut self, profile: Option<crate::settings::UpdateProfile>) {
         self.native_updater.set_update_profile(profile);
     }
+    #[cfg(target_os = "macos")]
+    pub(super) fn retire_profile_capture(&mut self) -> Result<(), String> {
+        self.native_updater.retire_profile_capture()
+    }
     pub fn load(directory: &Path) -> Self {
         Self {
             open: false,
