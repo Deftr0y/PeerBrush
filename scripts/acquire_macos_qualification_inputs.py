@@ -141,7 +141,11 @@ def request(host, target, limit, *, token=None, destination=None, redirect=False
         connection.close()
 
 
-def metadata(run, artifact, *, commit, run_id, artifact_id, artifact_sha256):
+def metadata(run, artifact, *, commit, run_id, artifact_id, artifact_sha256, _windows=False, _portable=False):
+    if type(_windows) is not bool or type(_portable) is not bool or (_windows and _portable):
+        raise ValueError('Native predecessor uses a fixed platform adapter.')
+    workflow = '.github/workflows/release.yml' if _portable else '.github/workflows/windows-release-signing.yml' if _windows else SIGNING_WORKFLOW
+    artifact_name = 'candidate-Windows' if _portable else ('windows-signed-inputs-' if _windows else 'macos-signed-pair-') + run_id + '-1'
     repo = dict(id=REPOSITORY_ID, full_name=REPOSITORY)
     if not isinstance(run, dict) or not isinstance(artifact, dict):
         raise ValueError('Native predecessor metadata must be objects.')
@@ -156,10 +160,10 @@ def metadata(run, artifact, *, commit, run_id, artifact_id, artifact_sha256):
             or type(run.get('run_attempt')) is not int or run['run_attempt'] != 1
             or run.get('status') != 'completed' or run.get('conclusion') != 'success'
             or run.get('event') != 'workflow_dispatch' or run.get('head_branch') != 'main'
-            or run.get('path') not in {SIGNING_WORKFLOW, SIGNING_WORKFLOW + '@main'}
+            or run.get('path') not in {workflow, workflow + '@main'}
             or run.get('head_sha') != commit or run.get('pull_requests') != []):
         raise ValueError('Native predecessor is not the exact successful first main attempt.')
-    expected = dict(id=int(artifact_id), name='macos-signed-pair-' + run_id + '-1',
+    expected = dict(id=int(artifact_id), name=artifact_name,
         expired=False, digest='sha256:' + artifact_sha256,
         url='https://api.github.com' + API + 'artifacts/' + artifact_id,
         archive_download_url='https://api.github.com' + API + 'artifacts/' + artifact_id + '/zip')
@@ -175,8 +179,13 @@ def metadata(run, artifact, *, commit, run_id, artifact_id, artifact_sha256):
 
 
 def extract(archive, output, selected_files):
+    if (not isinstance(selected_files, dict) or not 1 <= len(selected_files) <= 8
+            or any(type(name) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,223}', name)
+                   or not hexadecimal(checksum, 64) for name, checksum in selected_files.items())
+            or len({name.casefold() for name in selected_files}) != len(selected_files)):
+        raise ValueError('Native input files require a bounded unique basename/hash selection.')
     # Preflight the ordinary small central directory before ZipFile allocates
-    # entries. Our two sub-512 MiB files never require ZIP64 or archive comments.
+    # entries. The fixed bounded file selections require no ZIP64 or comments.
     if archive.stat().st_size < 22:
         raise ValueError('Missing bounded native artifact ZIP directory.')
     with archive.open('rb') as stream:
@@ -186,13 +195,14 @@ def extract(archive, output, selected_files):
         raise ValueError('Missing bounded native artifact ZIP directory.')
     signature, disk, directory_disk, count_disk, count, size, offset, comment = struct.unpack('<4s4H2IH', end)
     if (signature != b'PK\x05\x06' or disk != 0 or directory_disk != 0
-            or count_disk != 2 or count != 2 or not 0 < size <= 4096 or comment != 0
+            or count_disk != len(selected_files) or count != len(selected_files) or not 0 < size <= 4096 or comment != 0
             or offset + size != archive.stat().st_size - 22):
-        raise ValueError('Native input artifact must contain exactly two bounded ordinary ZIP entries.')
+        raise ValueError('Native input artifact must match its bounded ordinary ZIP entry selection.')
     with zipfile.ZipFile(archive) as source:
         members = source.infolist()
-        if len(members) != 2 or {member.filename for member in members} != set(selected_files):
-            raise ValueError('Native artifact inventory differs from the two selected final files.')
+        if (len(members) != len(selected_files) or {member.filename for member in members} != set(selected_files)
+                or sum(member.file_size for member in members) > MAX_ARTIFACT):
+            raise ValueError('Native artifact inventory differs from the selected final files.')
         for member in members:
             kind = stat.S_IFMT(member.external_attr >> 16)
             if (member.is_dir() or member.external_attr & 0x10 or kind not in [0, stat.S_IFREG]

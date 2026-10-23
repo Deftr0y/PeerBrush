@@ -42,6 +42,17 @@ REQUIRED_JOB_STEPS = (
 )
 
 
+def _policy(windows):
+    if type(windows) is not bool:
+        raise ValueError('Native platform policy must be selected by its fixed adapter.')
+    if windows:
+        workflow = '.github/workflows/windows-qualification.yml'
+        return (workflow, REPOSITORY_URI + '/' + workflow + '@refs/heads/main',
+                'windows-installer-qualification.json', 'PeerBrushWindowsInstallerQualificationV1',
+                'PeerBrushWindowsNativeOriginV1', 'windows-2025', 'Qualify selected final Windows installer', 16 * 1024)
+    return (WORKFLOW, IDENTITY, 'dmg-qualification.json', 'PeerBrushDmgQualificationV1',
+            'PeerBrushMacosNativeOriginV1', 'macos-26', 'Qualify selected final DMG', LIMITS['qualification'])
+
 
 def _command(executable, arguments, work, label):
     """Only fixed built-in CLI commands; capture private output with a size/deadline guard."""
@@ -79,8 +90,9 @@ def _command(executable, arguments, work, label):
     return output.read_bytes()
 
 
-def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt):
+def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt, _windows=False):
     """Only inspect output from the successful, pinned cryptographic verifier process."""
+    workflow, identity, filename, *_ = _policy(_windows)
     if not isinstance(data, bytes) or not 0 < len(data) <= OUTPUT_LIMIT:
         raise ValueError('Native attestation verifier returned unsupported output.')
     try:
@@ -95,14 +107,14 @@ def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt)
         if not isinstance(signature, dict) or set(signature) != {'certificate'}:
             raise ValueError('signature')
         certificate = signature['certificate']
-        expected = dict(subjectAlternativeName=IDENTITY, issuer=ISSUER,
-                        buildSignerURI=IDENTITY, buildSignerDigest=commit,
+        expected = dict(subjectAlternativeName=identity, issuer=ISSUER,
+                        buildSignerURI=identity, buildSignerDigest=commit,
                         runnerEnvironment='github-hosted', sourceRepositoryURI=REPOSITORY_URI,
                         sourceRepositoryDigest=commit, sourceRepositoryRef='refs/heads/main',
                         sourceRepositoryIdentifier=REPOSITORY_ID,
                         sourceRepositoryOwnerURI='https://github.com/Deftr0y',
                         sourceRepositoryOwnerIdentifier=OWNER_ID,
-                        buildConfigURI=IDENTITY, buildConfigDigest=commit,
+                        buildConfigURI=identity, buildConfigDigest=commit,
                         runInvocationURI=REPOSITORY_URI + '/actions/runs/' + run_id + '/attempts/' + run_attempt,
                         sourceRepositoryVisibilityAtSigning='public')
         allowed = set(expected) | {'certificateIssuer', 'buildTrigger', 'githubWorkflowTrigger',
@@ -134,21 +146,23 @@ def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt)
         if (not isinstance(statement, dict) or set(statement) - {'_type', 'subject', 'predicateType', 'predicate'}
                 or statement.get('_type') != 'https://in-toto.io/Statement/v1'
                 or statement.get('predicateType') != PREDICATE
-                or statement.get('subject') != [{'name': 'dmg-qualification.json',
+                or statement.get('subject') != [{'name': filename,
                                                'digest': {'sha256': qualification_sha256}}]):
             raise ValueError('subject')
         # Predicate fields are workflow-controlled; no OS, trigger, repository
         # identity, success or signature authority is obtained from them.
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError):
         raise ValueError('Verified native attestation does not match the exact reviewed origin and report.') from None
-    return dict(repository_id=REPOSITORY_ID, owner_id=OWNER_ID, workflow=WORKFLOW,
+    return dict(repository_id=REPOSITORY_ID, owner_id=OWNER_ID, workflow=workflow,
                 workflow_commit=commit, source_ref='refs/heads/main', runner='github-hosted',
                 trigger=certificate['buildTrigger'], run_id=run_id, run_attempt=run_attempt,
                 certificate_and_observer_time='cryptographically-verified')
 
-def _reconcile_job(claims):
+def _reconcile_job(claims, *, _windows=False):
     """Only called with this invocation's cryptographically verified claims."""
     from prepare_site_release import public_get
+    workflow, _, _, _, _, runner, qualify_step, _ = _policy(_windows)
+    required_steps = tuple(qualify_step if name == 'Qualify selected final DMG' else name for name in REQUIRED_JOB_STEPS)
 
     try:
         # This producer is deliberately dispatch-only and refuses reruns.
@@ -171,7 +185,7 @@ def _reconcile_job(claims):
                 or type(run.get('run_attempt')) is not int or run['run_attempt'] != int(claims['run_attempt'])
                 or run.get('head_sha') != claims['workflow_commit'] or run.get('head_branch') != 'main'
                 # GitHub documents the @main suffix and also returns bare paths.
-                or run.get('path') not in {WORKFLOW, WORKFLOW + '@main'}
+                or run.get('path') not in {workflow, workflow + '@main'}
                 or run.get('event') != claims['trigger']
                 or run.get('status') != 'completed' or run.get('conclusion') != 'success'
                 or run.get('pull_requests') != [] or not isinstance(run.get('head_commit'), dict)
@@ -204,7 +218,7 @@ def _reconcile_job(claims):
                     or job.get('status') != 'completed' or job.get('conclusion') != 'success'
                     or not isinstance(labels, list) or not 1 <= len(labels) <= 8
                     or any(type(label) is not str or not 0 < len(label) <= 64 for label in labels)
-                    or len(set(labels)) != len(labels) or 'macos-26' not in labels or 'self-hosted' in labels):
+                    or len(set(labels)) != len(labels) or runner not in labels or 'self-hosted' in labels):
                 raise ValueError('job')
             identifiers.append(job['id'])
         if len(set(identifiers)) != 2:
@@ -223,26 +237,27 @@ def _reconcile_job(claims):
             names.append(step['name'])
         if numbers != sorted(set(numbers)) or len(set(names)) != len(names):
             raise ValueError('step order')
-        selected = [steps[names.index(name)] for name in REQUIRED_JOB_STEPS]
+        selected = [steps[names.index(name)] for name in required_steps]
         if ([step['number'] for step in selected] != sorted(step['number'] for step in selected)
                 or any(step.get('status') != 'completed' or step.get('conclusion') != 'success' for step in selected)
                 or steps[names.index('Attest generated native qualification')]['number']
-                != steps[names.index('Qualify selected final DMG')]['number'] + 1):
+                != steps[names.index(qualify_step)]['number'] + 1):
             raise ValueError('required steps')
     except Exception:
         raise ValueError('Authenticated native qualification does not match a successful exact-attempt service readback.') from None
     return dict(api_host='api.github.com', run_id=claims['run_id'], run_attempt=claims['run_attempt'],
                 job_id=str(qualifier['id']), job_name='qualify', conclusion='success',
-                workflow=WORKFLOW, workflow_commit=claims['workflow_commit'], runner_label='macos-26',
-                required_steps=list(REQUIRED_JOB_STEPS))
+                workflow=workflow, workflow_commit=claims['workflow_commit'], runner_label=runner,
+                required_steps=list(required_steps))
 
 
 def authenticate(qualification, *, qualification_sha256, commit, version, bundle, bundle_sha256,
                  trusted_root, trusted_root_sha256, cli, cli_sha256, cli_version,
-                 workflow_commit, run_id, run_attempt, work, source_root, readback_job=False):
+                 workflow_commit, run_id, run_attempt, work, source_root, readback_job=False, _windows=False):
     """Explicit reviewed public trust inputs only; never fetch roots/bundles or use auth."""
+    _, identity, filename, report_format, origin_format, _, _, qualification_limit = _policy(_windows)
     selected = [qualification_sha256, bundle_sha256, trusted_root_sha256, cli_sha256]
-    if (not isinstance(qualification, bytes) or not 0 < len(qualification) <= LIMITS['qualification']
+    if (not isinstance(qualification, bytes) or not 0 < len(qualification) <= qualification_limit
             or any(type(value) is not str or not re.fullmatch('[0-9a-f]{64}', value) for value in selected)
             or hashlib.sha256(qualification).hexdigest() != qualification_sha256
             or type(commit) is not str or not re.fullmatch('[0-9a-f]{40}', commit)
@@ -259,7 +274,7 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
     # selected version. The aggregate independently enforces its complete schema.
     try:
         report = json.loads(qualification, object_pairs_hook=unique_fields)
-        if (not isinstance(report, dict) or report.get('format') != 'PeerBrushDmgQualificationV1'
+        if (not isinstance(report, dict) or report.get('format') != report_format
                 or report.get('commit') != commit or report.get('version') != version):
             raise ValueError('report')
     except (ValueError, UnicodeError, RecursionError):
@@ -283,7 +298,7 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
     # fallback or implicit TUF trust is allowed by this consumer.
     if not (work / 'trusted_root.jsonl').read_bytes().endswith(b'\n'):
         raise ValueError('Reviewed offline trusted-root JSONL requires its final newline.')
-    artifact = work / 'dmg-qualification.json'
+    artifact = work / filename
     with artifact.open('xb') as stream:
         stream.write(qualification)
     artifact.chmod(0o400)
@@ -295,21 +310,21 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
         raise ValueError('Native attestation requires the reviewed GitHub CLI 2.102.0 binary.')
     arguments = ['attestation', 'verify', str(artifact), '--bundle', str(work / 'bundle.jsonl'),
                  '--custom-trusted-root', str(work / 'trusted_root.jsonl'), '--repo', REPOSITORY,
-                 '--hostname', 'github.com', '--cert-identity', IDENTITY, '--cert-oidc-issuer', ISSUER,
+                 '--hostname', 'github.com', '--cert-identity', identity, '--cert-oidc-issuer', ISSUER,
                  '--source-ref', 'refs/heads/main', '--source-digest', commit, '--signer-digest', workflow_commit,
                  '--deny-self-hosted-runners', '--predicate-type', PREDICATE, '--digest-alg', 'sha256',
                  '--format', 'json']
     verified = _command(executable, arguments, work, 'verification')
     claims = _verified_claims(verified, commit=commit, qualification_sha256=qualification_sha256,
-                              run_id=run_id, run_attempt=run_attempt)
-    service = _reconcile_job(claims) if readback_job else None
+                              run_id=run_id, run_attempt=run_attempt, _windows=_windows)
+    service = _reconcile_job(claims, _windows=_windows) if readback_job else None
     private_inspection_directory(work, source_root, fresh=False)
     for source, destination, expected, limit in copies:
         if bounded_file(source, limit)[0] != expected or bounded_file(destination, limit)[0] != expected:
             raise ValueError('Native attestation input changed during verification; preserve private work.')
-    if bounded_file(artifact, LIMITS['qualification'])[0] != qualification_sha256:
+    if bounded_file(artifact, qualification_limit)[0] != qualification_sha256:
         raise ValueError('Native qualification changed during verification.')
-    result = dict(schema=1, format='PeerBrushMacosNativeOriginV1', version=version, commit=commit,
+    result = dict(schema=1, format=origin_format, version=version, commit=commit,
                 qualification_sha256=qualification_sha256, bundle_sha256=bundle_sha256,
                 verifier=dict(version=CLI_VERSION, sha256=cli_sha256), trusted_root_sha256=trusted_root_sha256,
                 native_producer_authentication='verified-pinned-workflow-oidc-attestation', origin=claims,

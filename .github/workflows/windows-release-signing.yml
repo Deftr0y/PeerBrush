@@ -1,0 +1,191 @@
+name: PeerBrush selected Windows EXE and MSIX signing
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full reviewed stable main and workflow SHA
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful exact first-attempt official main release run
+        required: true
+        type: string
+      artifact_id:
+        description: Exact candidate-Windows artifact ID
+        required: true
+        type: string
+      artifact_sha256:
+        description: Independently selected outer artifact SHA256
+        required: true
+        type: string
+      source_sha256:
+        description: Independently selected matching corresponding-source ZIP SHA256
+        required: true
+        type: string
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+concurrency:
+  group: windows-release-signing-${{ github.sha }}
+  cancel-in-progress: false
+env:
+  SELECTED_COMMIT: ${{ inputs.expected_commit }}
+  CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+  ARTIFACT_ID: ${{ inputs.artifact_id }}
+  ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
+  SOURCE_SHA256: ${{ inputs.source_sha256 }}
+  PEERBRUSH_WINDOWS_SIGNING_ENABLED: ${{ vars.PEERBRUSH_WINDOWS_SIGNING_ENABLED }}
+jobs:
+  gate:
+    name: gate
+    if: ${{ false }}
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          selected = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_REPOSITORY_ID': '1407648785', 'GITHUB_REPOSITORY_OWNER_ID': '21202494',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/windows-release-signing.yml@refs/heads/main',
+              'GITHUB_SHA': selected, 'GITHUB_WORKFLOW_SHA': selected, 'GITHUB_RUN_ATTEMPT': '1',
+              'RUNNER_ENVIRONMENT': 'github-hosted',
+              'RUNNER_OS': 'Windows', 'RUNNER_ARCH': 'X64', 'PEERBRUSH_WINDOWS_SIGNING_ENABLED': 'true',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(key) != value for key, value in required.items()):
+              raise SystemExit('Require reviewed exact main and approved native invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact main source
+        run: python -B scripts/release_gate.py --commit "$SELECTED_COMMIT"
+      - if: runner.os == 'Windows'
+        name: Initialize existing MSVC SDK for native codec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeTools = @{}
+          foreach ($name in @('clang-cl', 'cmake', 'ninja')) {
+            $nativeTools[$name] = (Get-Command $name -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Existing Visual Studio C++ tools unavailable' }
+          $launch = Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1'
+          & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          python -B scripts/jxl_build.py --github-env --selected-clang-cl ($nativeTools['clang-cl']) --selected-cmake ($nativeTools['cmake']) --selected-ninja ($nativeTools['ninja'])
+          if ($LASTEXITCODE -ne 0) { throw 'Native codec tool qualification failed' }
+      - if: runner.os != 'Windows'
+        name: Select existing native codec tools
+        run: python3 -B scripts/jxl_build.py --github-env
+      - name: Verify native codec tool selection regressions
+        run: python -B scripts/test_jxl_build.py
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy, rust-docs
+      - name: Test exact source without native attestation authority
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
+          rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
+          cargo build --locked --bin peerbrush
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets
+          python3 -B -m unittest discover -s scripts -p 'test_*.py'
+          python3 -B scripts/package.py --check-source
+
+  sign:
+    name: sign
+    needs: gate
+    if: ${{ false }}
+    # Proposed isolated profile only; no such runner/provider is configured here.
+    runs-on: [self-hosted, Windows, X64, peerbrush-signing]
+    environment: windows-release-signing
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      SIGNING_SELECTION_JSON: ${{ vars.PEERBRUSH_WINDOWS_SIGNING_SELECTION_JSON }}
+      SIGNING_SELECTION_SHA256: ${{ vars.PEERBRUSH_WINDOWS_SIGNING_SELECTION_SHA256 }}
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          selected = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_REPOSITORY_ID': '1407648785', 'GITHUB_REPOSITORY_OWNER_ID': '21202494',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/windows-release-signing.yml@refs/heads/main',
+              'GITHUB_SHA': selected, 'GITHUB_WORKFLOW_SHA': selected, 'GITHUB_RUN_ATTEMPT': '1',
+              'RUNNER_ENVIRONMENT': 'self-hosted',
+              'RUNNER_OS': 'Windows', 'RUNNER_ARCH': 'X64', 'PEERBRUSH_WINDOWS_SIGNING_ENABLED': 'true',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(key) != value for key, value in required.items()):
+              raise SystemExit('Require reviewed exact main and approved native invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Acquire reviewed original portable
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python -I - <<'PY'
+          import hashlib, os, pathlib, re, sys
+          sys.path.insert(0, 'scripts')
+          from acquire_windows_qualification_inputs import acquire_artifact, stable_source
+          from qualify_windows_installer import read_selection
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          version = stable_source(root, os.environ['SELECTED_COMMIT'])
+          data = os.environ['SIGNING_SELECTION_JSON'].encode('utf-8')
+          expected = os.environ['SIGNING_SELECTION_SHA256']
+          if not 0 < len(data) <= 32768 or not re.fullmatch('[0-9a-f]{64}', expected) or hashlib.sha256(data).hexdigest() != expected:
+              raise SystemExit('Existing-certificate public selection is absent or changed.')
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'windows-signing-selection.json'
+          with path.open('xb') as stream: stream.write(data)
+          selected = read_selection(path, expected)
+          if selected['commit'] != os.environ['SELECTED_COMMIT'] or selected['version'] != version:
+              raise SystemExit('Public signing selection differs from exact stable source.')
+          files = {f'PeerBrush-{version}-Windows-x64.zip': selected['portable_sha256'], f'PeerBrush-{version}-source.zip': os.environ['SOURCE_SHA256']}
+          acquire_artifact(root, pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-signing-inputs',
+              commit=os.environ['SELECTED_COMMIT'], run_id=os.environ['CANDIDATE_RUN'], artifact_id=os.environ['ARTIFACT_ID'],
+              artifact_sha256=os.environ['ARTIFACT_SHA256'], files=files, token=os.environ.pop('GITHUB_TOKEN', ''), portable=True)
+          PY
+      - name: Sign selected EXE then MSIX using existing certificate
+        run: |
+          python -I - <<'PY'
+          import os, pathlib, sys
+          sys.path.insert(0, 'scripts')
+          from produce_windows_installer import produce
+          from qualify_windows_installer import read_selection
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          selected = read_selection(pathlib.Path(os.environ['RUNNER_TEMP']) / 'windows-signing-selection.json', os.environ['SIGNING_SELECTION_SHA256'])
+          portable = pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-signing-inputs' / f"PeerBrush-{selected['version']}-Windows-x64.zip"
+          produce(root, portable, selected, work=pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-signing-work',
+              output=pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-signed-inputs', approve_existing_certificate_signing=True)
+          PY
+      - name: Retain exact signing inputs for independent hosted qualification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-signed-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-signed-inputs/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

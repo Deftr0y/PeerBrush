@@ -49,7 +49,7 @@ jobs:
           python -B scripts/test_publish_release.py
       - name: Report disabled production authority
         run: |
-          echo 'Final composition and immutable transaction are prepared. Authenticated Windows signing/installed producers and complete installed acceptance remain source work; publication and Store submission are disabled.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Final composition and immutable transaction are prepared. Windows signing/qualification handoff is prepared but inactive and unverified. Authenticated installed producers and complete native acceptance remain source work; publication and Store submission are disabled.' >> "$GITHUB_STEP_SUMMARY"
 
   compose:
     if: github.event_name == 'workflow_dispatch' && vars.PEERBRUSH_FINAL_INPUTS_CONFIGURED == 'true'

@@ -168,7 +168,7 @@ def windows_binding(root, base, directory, selection):
     required = {'unsigned', 'unsigned_sha256', 'package', 'package_sha256', 'runtime', 'runtime_sha256',
                 'identity', 'identity_sha256', 'package_family', 'descriptor', 'descriptor_sha256',
                 'descriptor_uri', 'package_uri', 'runtime_uri'}
-    if not isinstance(selection, dict) or set(selection) != required:
+    if not isinstance(selection, dict) or set(selection) not in [required, required | {'native'}]:
         raise ValueError('Select all exact Windows direct files, identities, hashes and immutable locations.')
     package, unsigned, runtime, descriptor, identity_path = [readiness.handoff_path(selection[name])
         for name in ['package', 'unsigned', 'runtime', 'descriptor', 'identity']]
@@ -196,6 +196,7 @@ def windows_binding(root, base, directory, selection):
             executable = stream.read(msix.PACKAGE_LIMIT + 1)
         if len(executable) != entry.file_size:
             raise ValueError('Windows direct executable differs from its declared size.')
+    original_executable = expected['peerbrush.exe']
     expected = msix.signed_executable_payload(expected, executable)
     msix.verify_payload(unsigned, expected)
     msix.verify_payload(package, expected, signed=True)
@@ -207,13 +208,27 @@ def windows_binding(root, base, directory, selection):
         selection['descriptor_uri'], selection['package_uri'], selection['runtime_uri'])
     if read(descriptor, 16 * 1024) != expected_descriptor:
         raise ValueError('Final App Installer differs from the exact shared descriptor serializer.')
-    # Content reconstruction is real; aggregate Linux cannot authenticate a
-    # Windows-native signature/installed producer from a supplied JSON report.
-    return [package, runtime, descriptor], dict(platform='Windows', file=descriptor.name,
-        dependencies=[package.name, runtime.name], installed_acceptance='unverified', ready=False), [
+    channel = dict(platform='Windows', file=descriptor.name,
+        dependencies=[package.name, runtime.name], installed_acceptance='unverified', ready=False)
+    originals = [
         (path, limit, selection[key + '_sha256']) for key, path, limit in [
             ('unsigned', unsigned, LIMIT), ('package', package, LIMIT), ('runtime', runtime, LIMIT),
             ('descriptor', descriptor, 16 * 1024), ('identity', identity_path, 16 * 1024)]]
+    origin = None
+    if 'native' in selection:
+        import verify_windows_qualification as native
+        if not isinstance(selection['native'], dict) or set(selection['native']) != native.FIELDS:
+            raise ValueError('Complete strict Windows native qualification selection required.')
+        qualification = read(selection['native']['qualification'], native.LIMITS['qualification'], selection['native']['qualification_sha256'])
+        origin = native.bind(root, selection['native'], qualification, commit=base['commit'], version=base['version'],
+            identity=identity, family=selection['package_family'], portable_sha256=portable['sha256'],
+            unsigned_sha256=selection['unsigned_sha256'], package=package, package_sha256=selection['package_sha256'],
+            original_executable=original_executable, executable=executable, identity_sha256=selection['identity_sha256'],
+            runtime=runtime, runtime_sha256=selection['runtime_sha256'], dependency=dependency,
+            descriptor=descriptor, descriptor_sha256=selection['descriptor_sha256'],
+            descriptor_uri=selection['descriptor_uri'], package_uri=selection['package_uri'], runtime_uri=selection['runtime_uri'])
+        originals += native.retained_inputs(selection['native'])
+    return [package, runtime, descriptor], channel, originals, origin
 
 
 def compose(root, directory, output, *, commit, version, macos, windows, maintainer,
@@ -246,7 +261,7 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
     linux = readiness.assess_deb(root, directory / portable['file'], directory / deb['file'], commit=commit,
         version=version, portable_sha256=portable['sha256'], package_sha256=deb['sha256'], maintainer=maintainer,
         installation_receipt=receipt)
-    direct, windows_channel, windows_originals = windows_binding(root, inventory, directory, windows)
+    direct, windows_channel, windows_originals, windows_origin = windows_binding(root, inventory, directory, windows)
     outputs = {record['file']: directory / record['file'] for record in inventory['assets']}
     outputs.update({path.name: path for path in direct})
     if len(outputs) != 9:
@@ -315,16 +330,23 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
                 raise ValueError('Native Mac original or owned authentication input changed after composition.')
     if bounded_file(Path(trust['work']) / 'dmg-qualification.json', readiness.MAX_DMG_QUALIFICATION_BYTES)[0] != macos['qualification_sha256']:
         raise ValueError('Owned native Mac qualification changed after composition.')
-    report['blockers'] += ['windows-native-final-producer-not-authenticated',
-        'windows-executable-signing-and-installed-acceptance-not-established',
+    if windows_origin is None:
+        report['blockers'] += ['windows-native-final-producer-not-authenticated',
+            'windows-executable-signing-and-installed-acceptance-not-established']
+    else:
+        report['blockers'].remove('windows-installed-distribution-and-signing-not-verified')
+        report['blockers'].append('windows-installed-acceptance-not-established')
+    report['blockers'] += [
         'windows-runtime-redistribution-approval-not-authenticated',
         'linux-installed-evidence-producer-not-authenticated',
         'installed-upgrade-interruption-and-visible-native-acceptance-not-established']
     report['publication_phases'] = readiness._publication_phases(report['blockers'])
     report.update(format='PeerBrushFinalCompositionAssessmentV1', production_ready=False,
-        final_files_bound=True, windows_native_signature='not-authenticated-by-aggregate',
+        final_files_bound=True, windows_native_signature=('verified-by-authenticated-native-qualification' if windows_origin else 'not-authenticated-by-aggregate'),
         linux_installation_binding=linux['installation_receipt_binding'],
         linux_installation_provenance=linux['installation_receipt_provenance'], store=store_channel())
+    if windows_origin is not None:
+        report['windows_native_origin'] = windows_origin
     candidate = Candidate(root, output, manifest, report, _CONSTRUCTED)
     candidate.verify()
     return candidate

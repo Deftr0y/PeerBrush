@@ -132,7 +132,9 @@ def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_lic
             portable_sha256, unsigned_sha256, package_sha256, certificate_sha256,
             runtime_sha256, runtime_certificate_sha256, runtime_license_sha256, descriptor_uri, package_uri, runtime_uri,
             signtool, signtool_sha256, powershell, powershell_sha256, work, output,
-            require_executable_signature=False):
+             require_executable_signature=False, return_qualification=False):
+    if type(return_qualification) is not bool or (return_qualification and require_executable_signature is not True):
+        raise ValueError('Native installer qualification requires strict signed-executable verification.')
     if sys.platform != 'win32':
         raise ValueError('App Installer preparation requires an actual Windows verification host.')
     if any(not signed._sha(value) for value in [runtime_sha256, runtime_certificate_sha256, runtime_license_sha256]):
@@ -189,7 +191,7 @@ def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_lic
     dependency = framework_identity(owned_package, owned_runtime)
     for tool, checksum in zip(tools, [signtool_sha256, powershell_sha256]):
         signed._selected_tool(tool, checksum, tool.name.casefold())
-    signed.verify_native_signature(owned_runtime, dependency['Publisher'], runtime_certificate_sha256,
+    runtime_metadata = signed.verify_native_signature(owned_runtime, dependency['Publisher'], runtime_certificate_sha256,
         tools[0], tools[1], runtime_work)
     # Emit no automatic-update configuration. Existing OS/provider policies can
     # still apply; association does not establish shared unsaved-work protection.
@@ -233,6 +235,19 @@ def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_lic
             or any(bounded_file(output / name, msix.PACKAGE_LIMIT)[0] != checksum for name, checksum in expected.items())
             or bounded_file(output / 'SHA256SUMS', 4096)[0] != hashlib.sha256(checksums).hexdigest()):
         raise ValueError('Exclusive candidate files changed before preparation completed.')
+    if return_qualification:
+        qualification = dict(schema=1, format='PeerBrushWindowsInstallerQualificationV1', commit=commit, version=version,
+            signed_package=result, identity_sha256=identity_hash,
+            runtime=dict(file=runtime.name, sha256=runtime_sha256, identity=dependency,
+                certificate_sha256=runtime_certificate_sha256,
+                timestamp_certificate_sha256=runtime_metadata['timestamp_certificate_sha256'],
+                license_sha256=runtime_license_sha256),
+            descriptor=dict(file=descriptor, sha256=expected[descriptor], uri=descriptor_uri,
+                package_uri=package_uri, runtime_uri=runtime_uri),
+            native_producer_authentication='unverified-requires-trusted-native-job',
+            installed_acceptance='not-performed', runtime_redistribution_approval='not-authenticated',
+            public_availability='unverified', ready=False, production_ready=False)
+        return output / descriptor, qualification
     return output / descriptor
 
 
