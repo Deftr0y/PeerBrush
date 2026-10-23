@@ -233,12 +233,16 @@ class Bundle(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "Exact Unix link/mode round trip runs on native macOS/Linux")
     def test_extraction_restores_exact_links_and_rejects_arbitrary_injection(self):
         destination = self.base / 'restored'
+        previous_umask = os.umask(0o077)
         try:
-            sign_macos.extract_archive(self.archive, destination)
-        except OSError as error:
-            if os.name == 'nt' and getattr(error, 'winerror', None) == 1314:
-                self.skipTest('Windows cannot create actual filesystem links without the required privilege')
-            raise
+            try:
+                sign_macos.extract_archive(self.archive, destination)
+            except OSError as error:
+                if os.name == 'nt' and getattr(error, 'winerror', None) == 1314:
+                    self.skipTest('Windows cannot create actual filesystem links without the required privilege')
+                raise
+        finally:
+            os.umask(previous_umask)
         root = destination / 'PeerBrush-fixture'
         values = bundle.disk_entries(root)
         self.assertEqual(set(values), {name for name, _, _ in self.files})
@@ -246,6 +250,10 @@ class Bundle(unittest.TestCase):
             actual, actual_mode, target = values[name]
             self.assertEqual(actual_mode, mode)
             self.assertEqual(target if target is not None else actual.read_bytes(), data)
+            if target is not None:
+                self.assertTrue(stat.S_ISLNK(actual.lstat().st_mode))
+                self.assertEqual(stat.S_IMODE(actual.lstat().st_mode), 0o777)
+                self.assertEqual(os.readlink(actual).encode('utf-8'), data)
         link = root / 'private'
         link.symlink_to('PeerBrush.app')
         with self.assertRaises(ValueError):

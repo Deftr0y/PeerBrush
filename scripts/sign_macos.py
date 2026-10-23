@@ -159,6 +159,11 @@ def extract_archive(archive_path, destination):
                 path.chmod(item.external_attr >> 16 & 0o777)
         for path, target in pending:
             path.symlink_to(target)
+            # Darwin applies umask to symlink modes; restore only the owned link.
+            if stat.S_IMODE(path.lstat().st_mode) != 0o777:
+                path.chmod(0o777, follow_symlinks=False)
+            if stat.S_IMODE(path.lstat().st_mode) != 0o777:
+                raise ValueError('Extracted Sparkle link mode differs from exact pin')
         for path, target in pending:
             if not path.resolve(strict=True).is_relative_to(destination.resolve(strict=True)):
                 raise ValueError('Extracted Sparkle link escapes selected payload')

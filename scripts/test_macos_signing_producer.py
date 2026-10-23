@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 import tarfile
 import tempfile
@@ -310,8 +311,14 @@ class AppleSigningProducer(unittest.TestCase):
         relative = prefix + '/PeerBrush.app/Contents/Frameworks/Sparkle.framework/'
         folder = self.parent / 'macos-zip-work/payload' / relative
         code = self.write('macos-zip-work/payload/' + relative + 'Versions/B/Sparkle', b'SYNTHETIC_PUBLIC_FRAMEWORK_CODE', 0o755)
-        (folder / 'Versions/Current').symlink_to('B', target_is_directory=True)
-        (folder / 'Sparkle').symlink_to('Versions/Current/Sparkle')
+        for name, target in [('Versions/Current', 'B'), ('Sparkle', 'Versions/Current/Sparkle')]:
+            link = folder / name
+            link.symlink_to(target, target_is_directory=name == 'Versions/Current')
+            # Match the exact extracted archive header, independent of host umask.
+            if stat.S_IMODE(link.lstat().st_mode) != 0o777:
+                link.chmod(0o777, follow_symlinks=False)
+            self.assertTrue(stat.S_ISLNK(link.lstat().st_mode))
+            self.assertEqual(stat.S_IMODE(link.lstat().st_mode), 0o777)
         state['bundle_hashes'][relative + 'Versions/B/Sparkle'] = digest(code.read_bytes())
         for name, target in [('Versions/Current', 'B'), ('Sparkle', 'Versions/Current/Sparkle')]:
             state['bundle_hashes'][relative + name] = digest(target.encode())
@@ -328,7 +335,24 @@ class AppleSigningProducer(unittest.TestCase):
                 self.assertTrue(member.issym())
                 self.assertEqual(member.linkname, target)
                 self.assertEqual(member.size, 0)
-        self.assertEqual((folder / 'Versions/B/Sparkle').read_bytes(), b'SYNTHETIC_PUBLIC_FRAMEWORK_CODE')
+                self.assertEqual(member.mode, 0o777)
+        code = folder / 'Versions/B/Sparkle'
+        self.assertEqual(code.read_bytes(), b'SYNTHETIC_PUBLIC_FRAMEWORK_CODE')
+        self.assertEqual(stat.S_IMODE(code.lstat().st_mode), 0o755)
+
+    @unittest.skipIf(os.name == 'nt', 'Actual Unix recovery symlink semantics run on macOS/Linux')
+    @unittest.skipUnless(os.chmod in os.supports_follow_symlinks,
+                         'Changing the link mode itself requires native no-follow chmod support')
+    def test_recovery_refuses_changed_link_mode_without_touching_its_target(self):
+        folder, _ = self.sparkle_recovery_fixture()
+        link, code = folder / 'Sparkle', folder / 'Versions/B/Sparkle'
+        link.chmod(0o755, follow_symlinks=False)
+        self.assertEqual(stat.S_IMODE(link.lstat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(code.lstat().st_mode), 0o755)
+        self.assertEqual(code.read_bytes(), b'SYNTHETIC_PUBLIC_FRAMEWORK_CODE')
+        with self.assertRaises(SystemExit):
+            self.execute('Preserve narrow credentials-free same-submission recovery')
+        self.assertFalse((self.parent / 'macos-signing-recovery.tar').exists())
 
     @unittest.skipIf(os.name == 'nt', 'Actual Unix recovery symlink semantics run on macOS/Linux')
     def test_recovery_refuses_escaped_or_regular_substitutes_even_with_same_target_bytes(self):
