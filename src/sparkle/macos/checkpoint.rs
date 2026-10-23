@@ -611,10 +611,28 @@ fn normalize_owned_link(path: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum TreeOwner {
+    PrivateCapture,
+    InstalledHost,
+}
+impl TreeOwner {
+    fn permits(self, uid: u32, current: u32) -> bool {
+        uid == current || (matches!(self, Self::InstalledHost) && uid == 0)
+    }
+}
 fn check_copy(
     root: &Path,
     entries: &BTreeMap<PathBuf, Entry>,
     cancel: &AtomicBool,
+) -> Result<Snapshot, String> {
+    check_tree(root, entries, cancel, TreeOwner::PrivateCapture)
+}
+fn check_tree(
+    root: &Path,
+    entries: &BTreeMap<PathBuf, Entry>,
+    cancel: &AtomicBool,
+    owner: TreeOwner,
 ) -> Result<Snapshot, String> {
     for relative in entries.keys() {
         bounded_relative(relative)?;
@@ -700,7 +718,9 @@ fn check_copy(
                 }
             }
         }
-        if value.uid != unsafe { libc::geteuid() } || Stamp::read(&path)? != Some(value.clone()) {
+        if !owner.permits(value.uid, unsafe { libc::geteuid() })
+            || Stamp::read(&path)? != Some(value.clone())
+        {
             return Err(HOLD.into());
         }
         result.stamps.insert(path, Some(value));
@@ -1179,6 +1199,36 @@ pub(super) fn owner_copy(
     Ok(app)
 }
 
+/// Paths derived only by the authenticated copied-owner consumer below. These
+/// describe bundle roles; they grant neither native startup nor replacement.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct OwnerBundles {
+    pub(super) owner: PathBuf,
+    pub(super) host: PathBuf,
+    pub(super) application: PathBuf,
+}
+impl OwnerBundles {
+    pub(super) fn require_running_copy(
+        &self,
+        executable: &Path,
+        main_bundle: &Path,
+    ) -> Result<(), String> {
+        if !self.owner.is_absolute()
+            || !self.host.is_absolute()
+            || self.owner == self.host
+            || self.application != self.host
+            || executable != self.owner.join("Contents/MacOS/peerbrush")
+            || main_bundle != self.owner
+        {
+            return Err(HOLD.into());
+        }
+        Ok(())
+    }
+    pub(super) fn framework(&self) -> PathBuf {
+        self.owner.join("Contents/Frameworks/Sparkle.framework")
+    }
+}
+
 pub(super) fn inspect_owner_copy(
     app: &Path,
     profile: &UpdateProfile,
@@ -1186,7 +1236,7 @@ pub(super) fn inspect_owner_copy(
     expected_manifest: &str,
     configuration: ApprovedCheck,
     cancel: Arc<AtomicBool>,
-) -> Result<(), String> {
+) -> Result<OwnerBundles, String> {
     inspect_owner_copy_with(
         app,
         profile,
@@ -1205,7 +1255,7 @@ fn inspect_owner_copy_with(
     configuration: &ApprovedCheck,
     cancel: &AtomicBool,
     mut verify_native: impl FnMut(PathBuf) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<OwnerBundles, String> {
     let attempt = app.parent().ok_or(HOLD)?;
     if Stamp::read(&attempt.join("native-start-intent.json"))?.is_some() {
         return Err(HOLD.into());
@@ -1227,13 +1277,29 @@ fn inspect_owner_copy_with(
     // Actual code identity comes from the kernel audit peer + Security checks.
     // Full signed app/resources/framework checks and independent byte parity
     // establish only this capture, never a future installation/rollback permit.
-    verify_native(manifest.target)?;
+    verify_native(manifest.target.clone())?;
     verify_native(app.into())?;
+    // A same-signer/same-version target is insufficient: authenticate the exact
+    // original source tree captured for this owner before choosing bundle roles.
+    let installed = check_tree(
+        &manifest.target,
+        &manifest.app,
+        cancel,
+        TreeOwner::InstalledHost,
+    )?;
     let app_copy = check_copy(app, &manifest.app, cancel)?;
     let preferences = check_copy(&attempt.join("profile"), &manifest.profile, cancel)?;
+    installed.recheck()?;
     app_copy.recheck()?;
     preferences.recheck()?;
-    Ok(())
+    if manifest.target == app {
+        return Err(HOLD.into());
+    }
+    Ok(OwnerBundles {
+        owner: app.into(),
+        host: manifest.target.clone(),
+        application: manifest.target,
+    })
 }
 
 #[cfg(test)]

@@ -1025,6 +1025,7 @@ fn authenticated_capture_consumer_uses_exact_derived_roles_and_refuses_damage_wi
         "wrong-digest",
         "armed",
         "changed-copy",
+        "changed-original",
         "native-refusal",
     ] {
         let f = Fixture::new();
@@ -1061,8 +1062,14 @@ fn authenticated_capture_consumer_uses_exact_derived_roles_and_refuses_damage_wi
             "wrong-digest" => expected = "f".repeat(64),
             "armed" => record_intent(&attempt, &bytes).unwrap(),
             "changed-copy" => fs::write(copy.join("Contents/MacOS/peerbrush"), b"changed").unwrap(),
+            "changed-original" => fs::write(
+                original.join("Contents/MacOS/peerbrush"),
+                [0, 1, 3, 254, 255],
+            )
+            .unwrap(),
             _ => {}
         }
+        let current_original = fs::read(original.join("Contents/MacOS/peerbrush")).unwrap();
         // Explicit fake native boundary; it supplies no signature authority.
         let configuration = ApprovedCheck {
             feed_url: crate::sparkle::PROPOSED_FEED_URL.into(),
@@ -1090,13 +1097,27 @@ fn authenticated_capture_consumer_uses_exact_derived_roles_and_refuses_damage_wi
         assert_eq!(result.is_ok(), damage == "none", "{damage}");
         if damage == "none" {
             assert_eq!(roles, vec![original.clone(), copy.clone()]);
+            let selected = result.as_ref().unwrap();
+            assert_eq!(selected.owner, copy);
+            assert_eq!(selected.host, original);
+            assert_eq!(selected.application, original);
+            assert_eq!(
+                selected.framework(),
+                copy.join("Contents/Frameworks/Sparkle.framework")
+            );
+            selected
+                .require_running_copy(&copy.join("Contents/MacOS/peerbrush"), &copy)
+                .unwrap();
+            assert!(selected
+                .require_running_copy(&parent_exe, &original)
+                .is_err());
         }
         if matches!(damage, "foreign-parent" | "wrong-digest" | "armed") {
             assert!(roles.is_empty());
         }
         assert_eq!(
             fs::read(original.join("Contents/MacOS/peerbrush")).unwrap(),
-            [0, 1, 2, 254, 255]
+            current_original
         );
         assert_eq!(
             fs::read(profile.locations.profile().join("tool-settings.json")).unwrap(),
@@ -1601,5 +1622,57 @@ fn final_authentication_failure_after_durable_record_keeps_concrete_capture_reti
         assert!(!attempt.join("native-start-intent.json").exists());
         assert!(!attempt.join("native-not-started.json").exists());
         assert!(require_captured_handoff().is_err());
+    }
+}
+
+#[test]
+fn copied_owner_roles_refuse_target_running_bundle_role_swaps_and_nonabsolute_paths() {
+    let f = Fixture::new();
+    let owner = f.0.join("capture/PeerBrush.app");
+    let target = f.0.join("original.app");
+    let selected = || OwnerBundles {
+        owner: owner.clone(),
+        host: target.clone(),
+        application: target.clone(),
+    };
+    let executable = owner.join("Contents/MacOS/peerbrush");
+    selected()
+        .require_running_copy(&executable, &owner)
+        .unwrap();
+    for swapped in [
+        "owner",
+        "host",
+        "application",
+        "relative",
+        "main",
+        "executable",
+    ] {
+        let mut bundles = selected();
+        let mut running = executable.clone();
+        let mut main = owner.clone();
+        match swapped {
+            "owner" => bundles.owner = target.clone(),
+            "host" => bundles.host = owner.clone(),
+            "application" => bundles.application = owner.clone(),
+            "relative" => bundles.host = "original.app".into(),
+            "main" => main = target.clone(),
+            "executable" => running = target.join("Contents/MacOS/peerbrush"),
+            _ => unreachable!(),
+        }
+        assert!(
+            bundles.require_running_copy(&running, &main).is_err(),
+            "{swapped}"
+        );
+    }
+    // Role checks alone are never captured-handoff/native start authority.
+    assert!(require_captured_handoff().is_err());
+    assert!(!owner.exists() && !target.exists());
+}
+
+#[test]
+fn installed_host_root_ownership_does_not_relax_private_capture_ownership() {
+    for (uid, installed, copied) in [(0, true, false), (501, true, true), (502, false, false)] {
+        assert_eq!(TreeOwner::InstalledHost.permits(uid, 501), installed);
+        assert_eq!(TreeOwner::PrivateCapture.permits(uid, 501), copied);
     }
 }

@@ -436,6 +436,8 @@ pub struct Probe {
     delegate: Retained<PreparationDelegate>,
     _driver: Retained<driver::CheckDriver>,
     _framework: Retained<NSBundle>,
+    _host_bundle: Retained<NSBundle>,
+    _application_bundle: Retained<NSBundle>,
 }
 
 impl Probe {
@@ -547,6 +549,10 @@ impl Probe {
         driver::assert_guarded(MainThreadMarker::new().expect("Main-thread component probe"));
         self.assert_no_update_sequence();
         self.assert_native_start_guard();
+        self.assert_external_bundle_constructor();
+        coordinator::assert_native_termination_refusal(
+            MainThreadMarker::new().expect("Main-thread component probe"),
+        );
         let updater: Retained<AnyObject> = self.controller.clone();
         let profiles: Retained<AnyObject> = objc2::rc::autoreleasepool(|_| unsafe {
             msg_send![&*self.delegate, allowedSystemProfileKeysForUpdater: &*updater]
@@ -787,6 +793,71 @@ impl Probe {
         }
     }
 
+    /// ABI/component-only: fake unsigned target metadata proves argument routing,
+    /// never publisher validation, installed application roles or update startup.
+    fn assert_external_bundle_constructor(&self) {
+        let marker = MainThreadMarker::new().expect("Main-thread component probe");
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("peerbrush-owner-bundles-{}", uuid::Uuid::new_v4(),));
+        let target = base.join("Target.app");
+        std::fs::create_dir_all(target.join("Contents")).unwrap();
+        std::fs::write(target.join("Contents/Info.plist"), br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.peerbrush.OwnerBundleFixture</string><key>CFBundleVersion</key><string>0.30.0</string><key>CFBundleShortVersionString</key><string>0.30.0</string><key>SUEnableAutomaticChecks</key><false/><key>SUAutomaticallyUpdate</key><false/></dict></plist>"#).unwrap();
+        let host = NSBundle::bundleWithPath(&NSString::from_str(target.to_str().unwrap())).unwrap();
+        let copied_owner = base.join("CopiedOwner.app");
+        std::fs::create_dir_all(copied_owner.join("Contents")).unwrap();
+        std::fs::copy(
+            target.join("Contents/Info.plist"),
+            copied_owner.join("Contents/Info.plist"),
+        )
+        .unwrap();
+        let copied_bundle =
+            NSBundle::bundleWithPath(&NSString::from_str(copied_owner.to_str().unwrap())).unwrap();
+        assert_eq!(copied_bundle.bundleIdentifier(), host.bundleIdentifier());
+        let same: Bool = unsafe { msg_send![&*host, isEqualTo: &*copied_bundle] };
+        assert!(
+            !same.as_bool(),
+            "Distinct bundle locations must keep external-owner roles even with equal identifiers"
+        );
+        let framework = PathBuf::from(self._framework.bundlePath().to_string());
+        let owner = construct_with_bundles(
+            &framework,
+            marker,
+            Rc::new(driver::State::default()),
+            host.clone(),
+            host,
+        )
+        .unwrap();
+        let actual: Retained<NSBundle> = unsafe { msg_send![&*owner.controller, hostBundle] };
+        assert_eq!(PathBuf::from(actual.bundlePath().to_string()), target);
+        assert_eq!(
+            PathBuf::from(owner._host_bundle.bundlePath().to_string()),
+            target
+        );
+        assert_eq!(
+            PathBuf::from(owner._application_bundle.bundlePath().to_string()),
+            target
+        );
+        assert_ne!(
+            NSBundle::mainBundle().bundlePath(),
+            owner._host_bundle.bundlePath()
+        );
+        let class = owner
+            ._framework
+            .classNamed(&NSString::from_str("SPUUpdater"))
+            .unwrap();
+        require_class_bundle(class, &framework).unwrap();
+        assert!(require_class_bundle(class, &base.join("Foreign.framework")).is_err());
+        let can_check: Bool = unsafe { msg_send![&*owner.controller, canCheckForUpdates] };
+        let session: Bool = unsafe { msg_send![&*owner.controller, sessionInProgress] };
+        assert!(!can_check.as_bool() && !session.as_bool());
+        drop(owner);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     fn assert_native_start_guard(&self) {
         let framework = PathBuf::from(self._framework.bundlePath().to_string());
         for (fresh, kind) in [(false, 0_isize), (true, 1), (true, 0)] {
@@ -851,6 +922,30 @@ fn construct_with_state(
     marker: MainThreadMarker,
     checks: Rc<driver::State>,
 ) -> Result<Probe, String> {
+    let host = NSBundle::mainBundle();
+    construct_with_bundles(root, marker, checks, host.clone(), host)
+}
+
+fn require_class_bundle(class: &objc2::runtime::AnyClass, root: &Path) -> Result<(), String> {
+    let actual = unsafe { NSBundle::bundleForClass(class) };
+    if Path::new(&actual.bundlePath().to_string()) != root {
+        return Err("A different Sparkle class image is already loaded".into());
+    }
+    Ok(())
+}
+
+/// All callers verify code/resources before this explicit load. Construction
+/// owns the delegate/driver/bundles but exposes no start or installation method.
+fn construct_with_bundles(
+    root: &Path,
+    marker: MainThreadMarker,
+    checks: Rc<driver::State>,
+    host: Retained<NSBundle>,
+    application: Retained<NSBundle>,
+) -> Result<Probe, String> {
+    if let Some(class) = objc2::runtime::AnyClass::get(c"SPUUpdater") {
+        require_class_bundle(class, root)?;
+    }
     unsafe {
         let _: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
     }
@@ -859,6 +954,9 @@ fn construct_with_state(
             .ok_or("Sparkle preparation needs a Unicode staging path")?,
     );
     let framework = NSBundle::bundleWithPath(&path).ok_or("Invalid Sparkle framework bundle")?;
+    if Path::new(&framework.bundlePath().to_string()) != root {
+        return Err("Sparkle framework bundle path changed".into());
+    }
     // All executable/resource bytes, symlink targets and native code signatures
     // above are verified before this explicit native component load.
     unsafe {
@@ -869,6 +967,7 @@ fn construct_with_state(
     let controller_class = framework
         .classNamed(&NSString::from_str("SPUUpdater"))
         .ok_or("Pinned Sparkle updater is unavailable")?;
+    require_class_bundle(controller_class, root)?;
     let domain = NSString::from_str("com.peerbrush.SparklePreparation");
     let message = NSString::from_str("Sparkle updates remain disabled until feed, public key and native safety acceptance are configured and verified.");
     let key = NSString::from_str("NSLocalizedDescription");
@@ -889,16 +988,22 @@ fn construct_with_state(
     let delegate: Retained<PreparationDelegate> = unsafe { msg_send![super(delegate), init] };
     let allocated: Allocated<AnyObject> = unsafe { msg_send![controller_class, alloc] };
     let user_driver = driver::create(marker, checks);
-    let host = NSBundle::mainBundle();
     let controller: Option<Retained<AnyObject>> = unsafe {
-        msg_send![allocated, initWithHostBundle: &*host, applicationBundle: &*host,
+        msg_send![allocated, initWithHostBundle: &*host, applicationBundle: &*application,
         userDriver: &*user_driver, delegate: &*delegate]
     };
+    let controller = controller.ok_or("Sparkle preparation controller could not initialize")?;
+    let actual_host: Retained<NSBundle> = unsafe { msg_send![&*controller, hostBundle] };
+    if actual_host.bundlePath() != host.bundlePath() {
+        return Err("Sparkle targeted a different host bundle".into());
+    }
     Ok(Probe {
-        controller: controller.ok_or("Sparkle preparation controller could not initialize")?,
+        controller,
         delegate,
         _driver: user_driver,
         _framework: framework,
+        _host_bundle: host,
+        _application_bundle: application,
     })
 }
 

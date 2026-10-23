@@ -1,6 +1,11 @@
-//! Same-signed-binary capture owner. It cannot start Sparkle or authorize exit.
-use super::{checkpoint, process_identity};
+//! Authenticated copied capture/native lifetime. Native startup remains disabled.
+use super::{checkpoint, driver, process_identity, Probe};
 use crate::{settings::UpdateProfile, sparkle::check::ApprovedCheck};
+use objc2::{
+    class, define_class, msg_send, rc::Retained, runtime::AnyObject, MainThreadMarker,
+    MainThreadOnly,
+};
+use objc2_foundation::{NSBundle, NSDate, NSObject, NSObjectProtocol};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -468,6 +473,154 @@ pub(super) fn launch(
     Ok(owner)
 }
 
+// Only this copied process owns its application delegate; the ordinary UI keeps
+// winit's delegate. No completion/EOF callback can authorize native termination.
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ()]
+    struct NativeOwnerTermination;
+
+    unsafe impl NSObjectProtocol for NativeOwnerTermination {}
+
+    impl NativeOwnerTermination {
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn should_terminate(&self, _application: &AnyObject) -> usize { 0 }
+    }
+);
+
+/// Credential-free component assertion only; do not replace the UI delegate.
+pub(super) fn assert_native_termination_refusal(marker: MainThreadMarker) {
+    let delegate = NativeOwnerTermination::alloc(marker).set_ivars(());
+    let delegate: Retained<NativeOwnerTermination> = unsafe { msg_send![super(delegate), init] };
+    let application: Retained<AnyObject> =
+        unsafe { msg_send![class!(NSApplication), sharedApplication] };
+    let reply: usize = unsafe { msg_send![&*delegate, applicationShouldTerminate: &*application] };
+    assert_eq!(
+        reply, 0,
+        "Unknown native outcome cannot permit ordinary owner Quit"
+    );
+}
+
+/// Main-thread lifetime for the copied native owner. There is intentionally no
+/// start/check/installer method or successful retirement API in this increment.
+struct NativeOwner {
+    _updater: Probe,
+    _profile: UpdateProfile,
+    _channel: UnixStream,
+    _bundles: checkpoint::OwnerBundles,
+    _application: Retained<AnyObject>,
+    _termination: Retained<NativeOwnerTermination>,
+    run_loop: Retained<AnyObject>,
+}
+impl NativeOwner {
+    fn load(
+        bundles: checkpoint::OwnerBundles,
+        profile: UpdateProfile,
+        channel: UnixStream,
+        parent: u32,
+        manifest: &str,
+        configuration: ApprovedCheck,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        // Public pins/capture replies cannot replace the unfinished surviving
+        // native handoff/final exit/outcome/health/recovery contract.
+        checkpoint::require_captured_handoff()?;
+        let marker = MainThreadMarker::new().ok_or(FAILED)?;
+        process_identity::authenticate(&channel, parent, &configuration.publisher_team_id)?;
+        let parent_executable = process_identity::executable(parent)?;
+        let fresh = checkpoint::inspect_owner_copy(
+            &bundles.owner,
+            &profile,
+            &parent_executable,
+            manifest,
+            configuration.clone(),
+            cancel.clone(),
+        )?;
+        if fresh != bundles {
+            return Err(FAILED.into());
+        }
+        let running = std::env::current_exe().map_err(|_| FAILED)?;
+        let running_bundle = NSBundle::mainBundle();
+        let main_bundle = PathBuf::from(running_bundle.bundlePath().to_string());
+        bundles.require_running_copy(&running, &main_bundle)?;
+        let host = NSBundle::bundleWithPath(&super::NSString::from_str(
+            bundles.host.to_str().ok_or(FAILED)?,
+        ))
+        .ok_or(FAILED)?;
+        if Path::new(&host.bundlePath().to_string()) != bundles.host {
+            return Err(FAILED.into());
+        }
+        let same_as_owner: objc2::runtime::Bool =
+            unsafe { msg_send![&*host, isEqualTo: &*running_bundle] };
+        if same_as_owner.as_bool() {
+            return Err(FAILED.into());
+        }
+        // Both public initializer arguments target the original installed app;
+        // the SPUUpdater class must come from the verified copied framework.
+        let updater = super::construct_with_bundles(
+            &bundles.framework(),
+            marker,
+            std::rc::Rc::new(driver::State::default()),
+            host.clone(),
+            host,
+        )?;
+        let after = checkpoint::inspect_owner_copy(
+            &bundles.owner,
+            &profile,
+            &parent_executable,
+            manifest,
+            configuration.clone(),
+            cancel,
+        )?;
+        if after != bundles || process_identity::executable(parent)? != parent_executable {
+            return Err(FAILED.into());
+        }
+        process_identity::authenticate(&channel, parent, &configuration.publisher_team_id)?;
+        let application: Retained<AnyObject> =
+            unsafe { msg_send![class!(NSApplication), sharedApplication] };
+        let existing: Option<Retained<AnyObject>> = unsafe { msg_send![&*application, delegate] };
+        if existing.is_some() {
+            return Err(FAILED.into());
+        }
+        let termination = NativeOwnerTermination::alloc(marker).set_ivars(());
+        let termination: Retained<NativeOwnerTermination> =
+            unsafe { msg_send![super(termination), init] };
+        unsafe {
+            let accepted: objc2::runtime::Bool =
+                msg_send![&*application, setActivationPolicy: 2_isize];
+            if !accepted.as_bool() {
+                return Err(FAILED.into());
+            }
+            let _: () = msg_send![&*application, setDelegate: &*termination];
+        }
+        let run_loop: Retained<AnyObject> = unsafe { msg_send![class!(NSRunLoop), mainRunLoop] };
+        Ok(Self {
+            _updater: updater,
+            _profile: profile,
+            _channel: channel,
+            _bundles: bundles,
+            _application: application,
+            _termination: termination,
+            run_loop,
+        })
+    }
+    fn retain_unknown_outcome(self) -> ! {
+        // No verified native outcome/health retirement exists yet. In particular,
+        // parent EOF, deadline, NoUpdate and cycle finish cannot release this owner.
+        loop {
+            objc2::rc::autoreleasepool(|_| {
+                let until = NSDate::dateWithTimeIntervalSinceNow(0.05);
+                unsafe {
+                    let _: () = msg_send![&*self.run_loop, runUntilDate: &*until];
+                }
+            });
+            // Foundation can return early when no source is ready.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 /// Reserved process entry, dispatched before activation/profile/UI/MCP work.
 /// No handoff target, profile file or dynamic secret is accepted through argv.
 #[doc(hidden)]
@@ -561,7 +714,7 @@ fn run() -> Result<(), String> {
         })
         .map_err(|_| FAILED)?;
     let result = (|| {
-        checkpoint::inspect_owner_copy(
+        let bundles = checkpoint::inspect_owner_copy(
             &copy,
             &profile,
             &parent_executable,
@@ -578,17 +731,30 @@ fn run() -> Result<(), String> {
             &Captured {
                 kind: ReplyKind::Captured,
                 schema: 1,
-                nonce: request.nonce,
+                nonce: request.nonce.clone(),
                 owner_pid: std::process::id(),
-                checkpoint: request.checkpoint,
-                manifest_sha256: request.manifest_sha256,
+                checkpoint: request.checkpoint.clone(),
+                manifest_sha256: request.manifest_sha256.clone(),
                 build: crate::build_info::json().into(),
             },
             deadline,
             &cancel,
         )?;
-        // This process holds real preservation/profile-lock ownership only.
-        // No native controller, installer, exit, outcome or recovery authority.
+        // The independent refusal in load keeps today's authenticated process
+        // capture-only. No NativeReady reply, start or installer action is sent.
+        if let Ok(native) = NativeOwner::load(
+            bundles,
+            profile.clone(),
+            socket.try_clone().map_err(|_| FAILED)?,
+            parent,
+            &request.manifest_sha256,
+            configuration.clone(),
+            cancel.clone(),
+        ) {
+            native.retain_unknown_outcome();
+        }
+        // Known-unstarted capture still cancels on parent loss. It does not
+        // establish absence/cancellation of any previous Sparkle installer.
         while remaining(deadline, &cancel).is_ok() && unsafe { libc::getppid() } as u32 == parent {
             std::thread::sleep(Duration::from_millis(50));
         }

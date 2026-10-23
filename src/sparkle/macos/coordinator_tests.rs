@@ -382,3 +382,63 @@ fn capture_reaper_child_entry() {
         38
     });
 }
+
+#[test]
+fn public_pins_and_capture_roles_cannot_activate_the_child_native_load_boundary() {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "peerbrush-native-owner-gate-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let legacy = root.join("legacy");
+    std::fs::create_dir(&legacy).unwrap();
+    let profile = crate::settings::Profile::open(
+        crate::settings::Locations {
+            config: root.join("config"),
+            data: root.join("data"),
+            cache: root.join("cache"),
+        },
+        &legacy,
+    )
+    .unwrap();
+    let before = std::fs::read(profile.locations.profile().join("profile.json")).unwrap();
+    let owner = root.join("copy/PeerBrush.app");
+    let target = root.join("original.app");
+    let bundles = checkpoint::OwnerBundles {
+        owner: owner.clone(),
+        host: target.clone(),
+        application: target.clone(),
+    };
+    let (channel, peer) = UnixStream::pair().unwrap();
+    let configuration = ApprovedCheck {
+        feed_url: crate::sparkle::PROPOSED_FEED_URL.into(),
+        public_ed_key: "public fixture; not installation authority".into(),
+        publisher_team_id: "ABCD123456".into(),
+        objects: std::collections::BTreeMap::new(),
+    };
+    let error = NativeOwner::load(
+        bundles,
+        profile.update_profile(),
+        channel,
+        std::process::id(),
+        &"a".repeat(64),
+        configuration,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .err()
+    .expect("Native ownership is source-disabled before bundle/API work");
+    assert_eq!(error, checkpoint::require_captured_handoff().unwrap_err());
+    assert!(!owner.exists() && !target.exists());
+    assert_eq!(
+        std::fs::read(profile.locations.profile().join("profile.json")).unwrap(),
+        before
+    );
+    assert!(!profile.locations.data.join("update-checkpoints").exists());
+    drop(peer);
+    drop(profile);
+    std::fs::remove_dir_all(root).unwrap();
+}
