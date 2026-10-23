@@ -29,6 +29,7 @@ NS = {
     'uap3': 'http://schemas.microsoft.com/appx/manifest/uap/windows10/3',
     'uap5': 'http://schemas.microsoft.com/appx/manifest/uap/windows10/5',
     'uap10': 'http://schemas.microsoft.com/appx/manifest/uap/windows10/10',
+    'uap17': 'http://schemas.microsoft.com/appx/manifest/uap/windows10/17',
     'rescap': 'http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities',
     'virtualization': 'http://schemas.microsoft.com/appx/manifest/virtualization/windows10',
 }
@@ -146,6 +147,16 @@ def package_version(version, revision=0, explicit=None, previous=None, developme
     return result
 
 
+def _root_namespaces(data):
+    namespaces = {}
+    for event, value in ET.iterparse(io.BytesIO(data), events=('start-ns', 'start')):
+        if event == 'start':
+            return namespaces
+        prefix, uri = value
+        namespaces[prefix] = uri
+    raise ValueError('Missing manifest root')
+
+
 def manifest_bytes(template, identity, version, extra_types=(), msix_version=None, development=False):
     if development:
         identity_values(identity, True)
@@ -164,11 +175,15 @@ def manifest_bytes(template, identity, version, extra_types=(), msix_version=Non
     if '{{' in text:
         raise ValueError('Unresolved manifest placeholder')
     data = text.encode('utf-8')
-    validate_manifest(data, identity, version, extra, msix_version, development)
+    # Exact selected source templates retain their historical layout. A current
+    # namespace declaration requires its policy, even if its element was removed.
+    namespaces = _root_namespaces(template)
+    defer_updates = 'uap17' in namespaces or NS['uap17'] in namespaces.values()
+    validate_manifest(data, identity, version, extra, msix_version, development, _defer_updates=defer_updates)
     return data
 
 
-def validate_manifest(data, identity, version, extra_types=(), msix_version=None, development=False):
+def validate_manifest(data, identity, version, extra_types=(), msix_version=None, development=False, *, _defer_updates=True):
     if development:
         identity_values(identity, True)
     root = ET.fromstring(data)
@@ -208,6 +223,18 @@ def validate_manifest(data, identity, version, extra_types=(), msix_version=None
     exclusions = [n.text for n in root.findall('f:Properties/virtualization:FileSystemWriteVirtualization/virtualization:ExcludedDirectories/virtualization:ExcludedDirectory', NS)]
     if exclusions or b'FileSystemWriteVirtualization' in data or b'RegistryWriteVirtualization' in data:
         raise ValueError('Package virtualization must remain enabled without exclusions')
+    namespaces = _root_namespaces(data)
+    policies = [node for node in root.iter() if node.tag.rsplit('}', 1)[-1] == 'UpdateWhileInUse']
+    expected = root.findall('f:Properties/uap17:UpdateWhileInUse', NS)
+    prefixes = {prefix for prefix, uri in namespaces.items() if uri == NS['uap17']}
+    ignorable = set(root.get('IgnorableNamespaces', '').split())
+    if _defer_updates:
+        if (len(policies) != 1 or policies != expected or expected[0].attrib
+                or len(expected[0]) or expected[0].text != 'defer'
+                or not prefixes or not prefixes <= ignorable):
+            raise ValueError('Package update deferral must match the current source policy')
+    elif policies or prefixes or 'uap17' in namespaces:
+        raise ValueError('Historical source must retain its original update policy layout')
 
 
 def verified_portable(root, archive_path, require_provenance=False):

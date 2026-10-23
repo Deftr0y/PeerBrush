@@ -90,6 +90,57 @@ class Msix(unittest.TestCase):
         self.assertNotIn('FileSystemWriteVirtualization',text)
         self.assertNotIn('>disabled<',text)
 
+    def test_update_deferral_is_source_bound_and_never_enables_an_updater(self):
+        data = msix.manifest_bytes(self.template, self.identity, '0.2.0')
+        root = ET.fromstring(data)
+        policy = root.find('f:Properties/uap17:UpdateWhileInUse', msix.NS)
+        self.assertEqual((policy.text, policy.attrib, len(policy)), ('defer', {}, 0))
+        self.assertEqual(root.find('f:Dependencies/f:TargetDeviceFamily', msix.NS).get('MinVersion'), '10.0.19041.0')
+        self.assertEqual({node.get('Name') for node in root.findall('f:Capabilities/rescap:Capability', msix.NS)}, {'runFullTrust'})
+        self.assertNotIn(b'AutoUpdate', data)
+        self.assertNotIn(b'packageManagement', data)
+        policy_xml = b'<uap17:UpdateWhileInUse>defer</uap17:UpdateWhileInUse>'
+        for changed in [
+            data.replace(policy_xml, b''),
+            data.replace(policy_xml, policy_xml + policy_xml),
+            data.replace(b'>defer</uap17:', b'>allow</uap17:'),
+            data.replace(b'>defer</uap17:', b'> defer </uap17:'),
+            data.replace(b'<uap17:UpdateWhileInUse>', b'<uap17:UpdateWhileInUse Mode="defer">'),
+            data.replace(b'>defer</uap17:', b'><Child /></uap17:'),
+            data.replace(b' uap17 rescap"', b' rescap"'),
+            data.replace(b'manifest/uap/windows10/17', b'manifest/uap/windows10/16'),
+            data.replace(b'    ' + policy_xml, b'').replace(b'</Properties>', b'</Properties>' + policy_xml),
+        ]:
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, 'update deferral'):
+                    msix.validate_manifest(changed, self.identity, '0.2.0')
+        # Missing policy in a current selected source template is not legacy.
+        with self.assertRaisesRegex(ValueError, 'update deferral'):
+            msix.manifest_bytes(self.template.replace(policy_xml, b''), self.identity, '0.2.0')
+        legacy = self.template.replace(b'\r\n', b'\n').replace(policy_xml, b'').replace(
+            b'         xmlns:uap17="http://schemas.microsoft.com/appx/manifest/uap/windows10/17"\n', b'').replace(
+            b' uap17 rescap"', b' rescap"')
+        old = msix.manifest_bytes(legacy, self.identity, '0.2.0')
+        self.assertNotIn(b'UpdateWhileInUse', old)
+        msix.validate_manifest(old, self.identity, '0.2.0', _defer_updates=False)
+        with self.assertRaisesRegex(ValueError, 'current source policy'):
+            msix.validate_manifest(old, self.identity, '0.2.0')
+        with self.assertRaisesRegex(ValueError, 'Historical source'):
+            msix.validate_manifest(data, self.identity, '0.2.0', _defer_updates=False)
+
+    def test_current_msix_payload_rejects_missing_update_deferral_even_with_valid_block_hashes(self):
+        files, _release = msix.expected_payload(self.root, self.archive, self.identity)
+        with tempfile.TemporaryDirectory() as temporary:
+            package = pathlib.Path(temporary) / 'changed.msix'
+            package.write_bytes(synthetic_package(files))
+            msix.verify_payload(package, files)
+            changed = dict(files)
+            changed['AppxManifest.xml'] = changed['AppxManifest.xml'].replace(
+                b'<uap17:UpdateWhileInUse>defer</uap17:UpdateWhileInUse>', b'')
+            package.write_bytes(synthetic_package(changed))
+            with self.assertRaises(ValueError):
+                msix.verify_payload(package, files)
+
     def test_staging_has_no_casefolded_directory_collisions_on_windows(self):
         self.stage()
         stage=self.root/'stage'
@@ -127,6 +178,8 @@ class Msix(unittest.TestCase):
         self.assertFalse(report['signed'])
         self.assertFalse(report['installed_tested'])
         self.assertTrue((self.root/'sdk-package'/report['package']).is_file())
+        with zipfile.ZipFile(self.root/'sdk-package'/report['package']) as package:
+            self.assertIn(b'<uap17:UpdateWhileInUse>defer</uap17:UpdateWhileInUse>', package.read('AppxManifest.xml'))
 
     def test_store_identity_is_required_and_local_identity_is_explicit(self):
         for identity in [{}, {'name':'x'}, {'name':'REPLACE_WITH_ID','publisher':'CN=Demo','publisher_display_name':'Demo'}]:
