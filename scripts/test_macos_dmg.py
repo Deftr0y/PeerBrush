@@ -192,7 +192,7 @@ class ImageRoundTrip(unittest.TestCase):
             inventory = dmg.payload_inventory(root)
             self.assertEqual(inventory['regular']['sha256'], digest(root / 'regular'))
             (root / 'unexpected').symlink_to('/Applications', target_is_directory=True)
-            with self.assertRaisesRegex(ValueError, 'Unexpected link'):
+            with self.assertRaisesRegex(ValueError, '^Unexpected release symlink; only nine exact Sparkle links are permitted$'):
                 dmg.payload_inventory(root)
 
 
