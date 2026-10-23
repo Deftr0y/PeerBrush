@@ -98,8 +98,6 @@ impl Panel {
         }
     }
     fn tick(&mut self, ctx: &egui::Context, allow_notification: bool) {
-        #[cfg(target_os = "macos")]
-        self.native_updater.tick(ctx);
         #[cfg(any(windows, test))]
         {
             self.store_check.tick(Instant::now());
@@ -172,10 +170,12 @@ impl Panel {
                 if self.native_updater.configured() {
                     use crate::sparkle::check::Phase;
                     ui.label("Signed macOS stable release information");
-                    let busy=self.native_updater.view().busy;
-                    if ui.add_enabled(!busy,egui::Button::new("Check app updates")).clicked() {
+                    let busy=self.native_updater.view().busy || self.native_updater.pending_installation();
+                    let enabled=self.native_updater.startup_enabled();
+                    if ui.add_enabled(enabled && !busy,egui::Button::new("Check app updates")).clicked() {
                         if let Err(error)=self.native_updater.check(ctx) { self.message=error; }
                     }
+                    if !enabled { ui.label("App update checking is not available in this development build."); }
                     let phase=self.native_updater.view().phase;
                     match phase {
                         Phase::Verifying | Phase::Checking => {
@@ -266,6 +266,11 @@ impl Panel {
 }
 
 impl PeerBrush {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn native_check_starting_for_test(&self) {
+        self.updates.native_updater.native_starting_for_test();
+    }
+
     #[cfg(target_os = "macos")]
     pub(super) fn native_update_quit(&mut self) -> bool {
         if !self.updates.native_updater.pending_installation() {
@@ -289,6 +294,12 @@ impl PeerBrush {
     }
 
     pub(super) fn updates_tick(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        if self.exit_approved || self.lifecycle.is_some() {
+            self.updates.native_updater.defer();
+        } else {
+            self.updates.native_updater.tick(ctx);
+        }
         let idle = !self.update_interaction_active()
             && !ctx.wants_keyboard_input()
             && !ctx.input(|i| i.pointer.any_down() || !i.events.is_empty());
@@ -506,6 +517,45 @@ mod tests {
         assert!(matches!(panel.result, Some(Err(_))));
         assert!(!panel.open);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_startup_waits_for_human_close_review_and_approved_exit() {
+        let (mut app, ctx) = super::super::tests::fixture();
+        {
+            let mut engine = app.shared.lock().unwrap();
+            let layer = engine.doc.layers[0].id.clone();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"layer.update","layer":layer,"name":"Keep review open"})],
+                    None,
+                    None,
+                    "Human work",
+                )
+                .unwrap();
+        }
+        let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+        app.updates.native_updater.queue_verification_for_test(&ctx);
+        app.request_close(super::super::lifecycle::Intent::Exit);
+        assert!(app.lifecycle.is_some());
+        let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
+        assert!(app.updates.native_updater.verification_pending_for_test());
+        assert!(app.updates.native_updater.view().cancelled);
+        app.lifecycle = None;
+        let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
+        assert!(!app.updates.native_updater.verification_pending_for_test());
+        assert!(!app.updates.native_updater.pending_installation());
+        app.updates.native_updater.queue_verification_for_test(&ctx);
+        app.exit_approved = true;
+        let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
+        assert!(app.updates.native_updater.verification_pending_for_test());
+        assert!(app.updates.native_updater.view().cancelled);
+        let engine = app.shared.lock().unwrap();
+        assert!(!engine.closed);
+        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+        assert_eq!(engine.undo.len(), 1);
     }
 
     fn newer_report() -> Report {

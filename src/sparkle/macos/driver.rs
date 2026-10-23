@@ -49,6 +49,13 @@ impl State {
         self.session.borrow_mut().checking();
         self.repaint();
     }
+    pub fn native_starting(&self) -> Result<(), String> {
+        self.session.borrow_mut().native_starting()
+    }
+    pub fn native_start_failed(&self) {
+        self.session.borrow_mut().native_start_failed();
+        self.repaint();
+    }
     pub fn may_check(&self, updater: &AnyObject, kind: isize) -> bool {
         self.updater.get() == updater as *const AnyObject
             && self.session.borrow_mut().may_check(kind)

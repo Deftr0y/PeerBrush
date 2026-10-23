@@ -171,11 +171,12 @@ pub(crate) struct Session {
     pub busy: bool,
     pub cancelled: bool,
     pub quarantine: bool,
+    pub native_cycle: bool,
     permit: bool,
 }
 impl Session {
     pub fn begin(&mut self) -> Result<(), String> {
-        if self.busy || self.quarantine {
+        if self.busy || self.quarantine || self.native_cycle {
             return Err("The current app update check must finish first".into());
         }
         *self = Self {
@@ -197,6 +198,28 @@ impl Session {
             && !self.cancelled
             && !self.quarantine
             && std::mem::take(&mut self.permit)
+    }
+    pub fn native_starting(&mut self) -> Result<(), String> {
+        if !self.busy
+            || self.phase != Phase::Checking
+            || self.cancelled
+            || self.quarantine
+            || self.native_cycle
+        {
+            return Err("The native app check cannot start in this state".into());
+        }
+        self.native_cycle = true;
+        Ok(())
+    }
+    pub fn native_start_failed(&mut self) {
+        // Only the actual startUpdater:NO result can reach this release path;
+        // it occurs before the pinned updater marks itself started/schedules work.
+        if self.native_cycle && !self.quarantine && self.phase == Phase::Checking {
+            self.native_cycle = false;
+            self.fail();
+        } else {
+            self.quarantine();
+        }
     }
     pub fn found(&mut self, version: String, notes: String) -> bool {
         if !self.busy
@@ -234,6 +257,11 @@ impl Session {
         }
     }
     pub fn finished(&mut self) {
+        if self.native_cycle {
+            // A fresh-check callback does not prove installer absence: the
+            // pinned status probe also reports NO on invalidation or timeout.
+            self.quarantine();
+        }
         self.busy = false;
         self.permit = false;
     }
@@ -242,7 +270,7 @@ impl Session {
         self.permit = false;
         self.phase = Phase::Quarantined;
         self.notice =
-            "App update checking stopped safely. Restart PeerBrush before checking again.";
+            "App update checking stopped safely. Quitting is paused to protect your projects.";
     }
 }
 
@@ -346,5 +374,65 @@ mod tests {
         state.begin().unwrap();
         state.checking();
         assert!(!state.found("0.30.1".into(), "x".repeat(NOTES_LIMIT + 1)));
+    }
+    #[test]
+    fn native_start_holds_quit_after_information_cycle_completion_or_cancel() {
+        for cancelled in [false, true] {
+            let mut state = Session::default();
+            assert!(state.native_starting().is_err());
+            state.begin().unwrap();
+            assert!(state.native_starting().is_err());
+            state.checking();
+            state.native_starting().unwrap();
+            assert!(state.native_cycle);
+            assert!(state.native_starting().is_err());
+            assert!(state.begin().is_err());
+            if cancelled {
+                state.cancel();
+            }
+            state.not_found();
+            state.finished();
+            assert!(state.native_cycle && state.quarantine);
+            assert_eq!(state.phase, Phase::Quarantined);
+            assert!(state.begin().is_err());
+        }
+    }
+    #[test]
+    fn unknown_or_quarantined_native_start_never_becomes_an_ordinary_exit() {
+        for quarantined in [false, true] {
+            let mut state = Session::default();
+            state.begin().unwrap();
+            state.checking();
+            state.native_starting().unwrap();
+            if quarantined {
+                state.quarantine();
+            }
+            state.cancel();
+            state.finished();
+            assert!(state.native_cycle && state.quarantine);
+            assert_eq!(state.phase, Phase::Quarantined);
+            assert!(!state.busy);
+            assert!(state.begin().is_err());
+            state.finished();
+            assert!(state.native_cycle && state.quarantine);
+        }
+        let mut state = Session::default();
+        state.begin().unwrap();
+        state.checking();
+        state.native_starting().unwrap();
+        state.native_start_failed();
+        state.finished();
+        assert!(!state.native_cycle && !state.quarantine);
+        assert_eq!(state.phase, Phase::Failed);
+        state.begin().unwrap();
+        state.checking();
+        state.native_starting().unwrap();
+        assert!(state.found(
+            "0.30.1".into(),
+            "Signed information is not an installer absence proof".into()
+        ));
+        state.native_start_failed();
+        state.finished();
+        assert!(state.native_cycle && state.quarantine);
     }
 }

@@ -536,6 +536,7 @@ impl Probe {
     pub fn assert_disabled(&self) {
         driver::assert_guarded(MainThreadMarker::new().expect("Main-thread component probe"));
         self.assert_no_update_sequence();
+        self.assert_native_start_guard();
         let updater: Retained<AnyObject> = self.controller.clone();
         let profiles: Retained<AnyObject> = objc2::rc::autoreleasepool(|_| unsafe {
             msg_send![&*self.delegate, allowedSystemProfileKeysForUpdater: &*updater]
@@ -776,6 +777,31 @@ impl Probe {
         }
     }
 
+    fn assert_native_start_guard(&self) {
+        let framework = PathBuf::from(self._framework.bundlePath().to_string());
+        for (fresh, kind) in [(false, 0_isize), (true, 1), (true, 0)] {
+            let marker = MainThreadMarker::new().expect("Main-thread component probe");
+            let checks = Rc::new(driver::State::default());
+            let owner = construct_with_state(&framework, marker, checks.clone()).unwrap();
+            checks.session.borrow_mut().begin().unwrap();
+            checks.checking(&owner.controller);
+            checks.native_starting().unwrap();
+            assert!(checks.view().native_cycle);
+            if fresh {
+                let cancellation = RcBlock::new(|| {});
+                unsafe {
+                    let _: () = msg_send![&*owner._driver, showUserInitiatedUpdateCheckWithCancellation: &*cancellation];
+                }
+                assert!(checks.view().native_cycle);
+            }
+            unsafe {
+                let _: () = msg_send![&*owner.delegate, updater: &*owner.controller, didFinishUpdateCycleForUpdateCheck: kind, error: std::ptr::null::<NSError>()];
+            }
+            assert!(checks.view().native_cycle && checks.view().quarantine);
+            assert!(checks.session.borrow_mut().begin().is_err());
+        }
+    }
+
     fn clear_unstarted_component_callbacks(&self) {
         // Component assertions only. Probe is constructed without calling startUpdater
         // and exposes no start method. This is not an application recovery API.
@@ -869,6 +895,31 @@ fn construct_with_state(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn public_configuration_cannot_activate_native_startup_before_safe_termination() {
+        let checks = std::rc::Rc::new(super::driver::State::default());
+        let mut app = super::Application {
+            controller: None,
+            message: "",
+            configuration: Some(crate::sparkle::check::ApprovedCheck {
+                feed_url: crate::sparkle::PROPOSED_FEED_URL.into(),
+                public_ed_key: "Public configuration is not a startup authority".into(),
+                publisher_team_id: "ABCD123456".into(),
+                objects: std::collections::BTreeMap::new(),
+            }),
+            verification: None,
+            checks: checks.clone(),
+        };
+        assert!(app.configured());
+        assert!(!app.startup_enabled());
+        assert!(app
+            .check(&eframe::egui::Context::default())
+            .unwrap_err()
+            .contains("not available"));
+        assert!(app.controller.is_none() && app.verification.is_none());
+        assert_eq!(checks.view().phase, crate::sparkle::check::Phase::Idle);
+        assert!(!checks.view().busy && !app.pending_installation());
+    }
+    #[test]
     fn system_sha256_matches_the_standard_vectors() {
         assert_eq!(
             super::sha256(b"").unwrap(),
@@ -901,8 +952,8 @@ pub fn probe_bundled(app: &Path, configuration: &Configuration) -> Result<Probe,
     construct(&framework, marker)
 }
 
-/// Main-thread application owner. Missing compiled pins load nothing; verified
-/// configured apps may run a manual information-only cycle, never installation.
+/// Main-thread application owner. Configured native startup remains disabled
+/// until safe termination/cancellation/recovery is implemented and verified.
 struct Verification {
     receiver: mpsc::Receiver<Result<installed::Verified, String>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -944,6 +995,11 @@ impl Application {
     pub(crate) fn configured(&self) -> bool {
         self.configuration.is_some()
     }
+    pub(crate) fn startup_enabled(&self) -> bool {
+        // Public feed/key/native facts cannot prove absence or safe cancellation
+        // of a prior installer. Complete termination/recovery must precede startup.
+        false
+    }
     pub(crate) fn view(&self) -> std::cell::Ref<'_, crate::sparkle::check::Session> {
         self.checks.view()
     }
@@ -954,7 +1010,8 @@ impl Application {
             .unwrap_or(self.message)
     }
     pub fn pending_installation(&self) -> bool {
-        self.checks.view().quarantine
+        self.checks.view().native_cycle
+            || self.checks.view().quarantine
             || self
                 .controller
                 .as_ref()
@@ -971,6 +1028,9 @@ impl Application {
         }
     }
     pub(crate) fn check(&mut self, ctx: &eframe::egui::Context) -> Result<(), String> {
+        if !self.startup_enabled() {
+            return Err("App update checking is not available in this development build.".into());
+        }
         let configuration = self
             .configuration
             .clone()
@@ -1009,6 +1069,14 @@ impl Application {
         Ok(())
     }
     pub(crate) fn tick(&mut self, ctx: &eframe::egui::Context) {
+        if !self.startup_enabled() {
+            if self.verification.is_some() {
+                self.defer();
+                self.verification = None;
+                self.checks.finished();
+            }
+            return;
+        }
         if self.checks.timed_out() && !self.checks.view().cancelled {
             self.defer();
         }
@@ -1034,12 +1102,14 @@ impl Application {
                             )?;
                             verified.recheck()?;
                             self.checks.checking(&owner.controller);
+                            self.checks.native_starting()?;
                             self.controller = Some(owner);
                             let owner = self.controller.as_ref().unwrap();
                             let mut error: *mut NSError = std::ptr::null_mut();
                             let started: Bool =
                                 unsafe { msg_send![&*owner.controller, startUpdater: &mut error] };
                             if !started.as_bool() {
+                                self.checks.native_start_failed();
                                 return Err("App update checking could not start".into());
                             }
                             unsafe {
@@ -1078,6 +1148,24 @@ impl Application {
                 "Finish or cancel the current edit/file operation before restarting.".into(),
             );
         }
+        if self.checks.view().quarantine {
+            return Err(
+                "App updating was interrupted. Quitting is paused to protect your projects.".into(),
+            );
+        }
+        if self.checks.view().native_cycle
+            && !self.checks.view().quarantine
+            && !self
+                .controller
+                .as_ref()
+                .is_some_and(|owner| owner.delegate.ivars().termination_inhibited.get())
+        {
+            self.defer();
+            return Err(
+                "App update checking is paused. Quitting is blocked to protect your projects."
+                    .into(),
+            );
+        }
         let owner = self
             .controller
             .as_ref()
@@ -1091,6 +1179,30 @@ impl Application {
         }
         state.ready_kind(kind)?;
         Err("Automatic updates are not available in this development build.".into())
+    }
+}
+
+#[cfg(test)]
+impl Application {
+    pub(crate) fn native_starting_for_test(&self) {
+        let mut state = self.checks.session.borrow_mut();
+        state.begin().unwrap();
+        state.checking();
+        state.native_starting().unwrap();
+    }
+    pub(crate) fn queue_verification_for_test(&mut self, ctx: &eframe::egui::Context) {
+        self.checks.begin(ctx).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Err("Synthetic stopped verification".into()))
+            .unwrap();
+        self.verification = Some(Verification {
+            receiver,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+    }
+    pub(crate) fn verification_pending_for_test(&self) -> bool {
+        self.verification.is_some()
     }
 }
 

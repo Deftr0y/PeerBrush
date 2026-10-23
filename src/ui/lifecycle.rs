@@ -97,6 +97,92 @@ mod tests {
         }
         panic!("Save reply did not arrive");
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn late_native_start_preserves_an_already_reviewed_human_exit_and_all_projects() {
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            for shared in [&root, &second] {
+                let mut engine = shared.lock().unwrap();
+                if depth == 16 {
+                    engine.doc.layers[0]
+                        .pixels
+                        .set16(0, 0, [1001, 3003, 5007, 0]);
+                } else {
+                    engine.doc.layers[0].pixels.set(0, 0, [17, 93, 207, 0]);
+                }
+            }
+            dirty(&root, "Keep reviewed first artwork");
+            dirty(&second, "Keep reviewed second artwork");
+            let before: Vec<_> = [&root, &second]
+                .into_iter()
+                .map(|shared| {
+                    let engine = shared.lock().unwrap();
+                    (
+                        serde_json::to_value(&engine.doc).unwrap(),
+                        engine.undo.len(),
+                        engine.redo.len(),
+                    )
+                })
+                .collect();
+            app.request_close(Intent::Exit);
+            let review = app.lifecycle.as_mut().unwrap();
+            for row in &mut review.entries {
+                row.decided = true;
+                row.source.discard = true;
+            }
+            assert!(review.current().is_none());
+            // Model a native startup arriving after human decisions but before
+            // the final close. This hook changes only the unavailable Session.
+            app.native_check_starting_for_test();
+            let mut output = frame(&mut app, &ctx, vec![]);
+            for _ in 0..3 {
+                output = frame(&mut app, &ctx, vec![]);
+            }
+            assert!(!app.exit_approved);
+            let review = app
+                .lifecycle
+                .as_ref()
+                .expect("The human review must remain open");
+            assert!(review.current().is_none());
+            assert!(review
+                .entries
+                .iter()
+                .all(|row| row.decided && row.source.discard));
+            assert!(review
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Quitting is blocked"));
+            assert!(
+                review.buttons[2].is_some(),
+                "Blocked review must render its real Cancel control"
+            );
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Quitting is blocked"));
+            click(&mut app, &ctx, 2);
+            assert!(
+                app.lifecycle.is_none(),
+                "Real Cancel must return to the workspace"
+            );
+            assert!(!app.exit_approved);
+            assert!(app.message.contains("Close canceled"));
+            for (shared, (document, undo, redo)) in [&root, &second].into_iter().zip(before) {
+                let engine = shared.lock().unwrap();
+                assert!(!engine.closed);
+                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), document);
+                assert_eq!((engine.undo.len(), engine.redo.len()), (undo, redo));
+            }
+        }
+    }
     #[test]
     fn shared_save_cancel_status_and_reply_keep_the_native_close_review_open() {
         for depth in [8, 16] {
@@ -1000,25 +1086,33 @@ impl PeerBrush {
                 }
             };
             if refreshed && review.current().is_none() {
-                let result = match &review.intent {
-                    Intent::Exit => crate::workspace::lifecycle::finish_exit(
-                        &self.workspace,
-                        &review
-                            .entries
-                            .iter()
-                            .map(|r| r.source.clone())
-                            .collect::<Vec<_>>(),
-                    ),
-                    Intent::Close(project) => {
-                        let row = &review.entries[0];
-                        crate::workspace::close_in(
+                #[cfg(target_os = "macos")]
+                let blocked = review.intent == Intent::Exit && self.native_update_quit();
+                #[cfg(not(target_os = "macos"))]
+                let blocked = false;
+                let result = if blocked {
+                    Err(self.message.clone())
+                } else {
+                    match &review.intent {
+                        Intent::Exit => crate::workspace::lifecycle::finish_exit(
                             &self.workspace,
-                            project,
-                            &row.source.document,
-                            row.source.revision,
-                            row.source.discard,
-                            "human",
-                        )
+                            &review
+                                .entries
+                                .iter()
+                                .map(|r| r.source.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                        Intent::Close(project) => {
+                            let row = &review.entries[0];
+                            crate::workspace::close_in(
+                                &self.workspace,
+                                project,
+                                &row.source.document,
+                                row.source.revision,
+                                row.source.discard,
+                                "human",
+                            )
+                        }
                     }
                 };
                 match result {
