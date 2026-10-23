@@ -24,6 +24,8 @@ pub(super) struct Panel {
     native_updater: crate::sparkle::macos::Application,
     #[cfg(any(windows, test))]
     store_check: store::Check,
+    #[cfg(any(windows, test))]
+    app_installer_check: store::Check,
 }
 impl Panel {
     pub fn load(directory: &Path) -> Self {
@@ -42,11 +44,14 @@ impl Panel {
             native_updater: crate::sparkle::macos::Application::load(),
             #[cfg(any(windows, test))]
             store_check: store::Check::default(),
+            #[cfg(any(windows, test))]
+            app_installer_check: store::Check::app_installer(),
         }
     }
     #[cfg(windows)]
     pub(super) fn native_window(&mut self, frame: &eframe::Frame) {
         self.store_check.window(frame);
+        self.app_installer_check.window(frame);
     }
     fn start(&mut self, ctx: &egui::Context, manual: bool) {
         if self.receiver.is_some() {
@@ -100,9 +105,11 @@ impl Panel {
     fn tick(&mut self, ctx: &egui::Context, allow_notification: bool) {
         #[cfg(any(windows, test))]
         {
-            self.store_check.tick(Instant::now());
-            if self.store_check.pending() {
-                ctx.request_repaint_after(Duration::from_millis(50));
+            for check in [&mut self.store_check, &mut self.app_installer_check] {
+                check.tick(Instant::now());
+                if check.pending() {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
             }
         }
         let events: Vec<_> = self
@@ -165,6 +172,10 @@ impl Panel {
                 #[cfg(any(windows, test))]
                 if self.owner == Owner::MicrosoftStore {
                     self.store_check.show(ui);
+                }
+                #[cfg(any(windows, test))]
+                if self.owner == Owner::WindowsAppInstaller {
+                    self.app_installer_check.show(ui);
                 }
                 #[cfg(target_os = "macos")]
                 if self.native_updater.configured() {
@@ -261,6 +272,8 @@ impl Panel {
             self.native_updater.defer();
             #[cfg(any(windows, test))]
             self.store_check.cancel();
+            #[cfg(any(windows, test))]
+            self.app_installer_check.cancel();
         }
     }
 }

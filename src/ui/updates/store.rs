@@ -1,4 +1,4 @@
-//! Read-only Store availability for this running package, on its owner window thread.
+//! Read-only native provider availability for this package on its owner window thread.
 use eframe::egui;
 use std::time::{Duration, Instant};
 
@@ -7,6 +7,25 @@ const TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_UPDATES: usize = 64;
 #[cfg(any(windows, test))]
 const MAX_IDENTITY: usize = 1024;
+
+// Native direct identity/provider and installed acceptance remain unqualified.
+// Public configuration alone cannot enable this prepared information-only path.
+const APP_INSTALLER_CHECK_ENABLED: bool = false;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Provider {
+    #[default]
+    Store,
+    AppInstaller,
+}
+impl Provider {
+    fn text(self, store: &'static str, app_installer: &'static str) -> &'static str {
+        match self {
+            Self::Store => store,
+            Self::AppInstaller => app_installer,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Availability {
@@ -27,6 +46,7 @@ enum Failure {
     Result,
     Timeout,
     Cancelled,
+    Disabled,
 }
 impl Failure {
     fn message(self) -> &'static str {
@@ -42,7 +62,50 @@ impl Failure {
             Self::Result => "Microsoft Store returned an unsupported or ambiguous package result; availability is unknown.",
             Self::Timeout => "The Store check timed out; availability is unknown.",
             Self::Cancelled => "The Store check was cancelled; availability is unknown.",
+            Self::Disabled => "App Installer checking is unavailable in this build.",
         }
+    }
+    fn for_provider(self, provider: Provider) -> &'static str {
+        if provider == Provider::Store {
+            return self.message();
+        }
+        match self {
+            #[cfg(any(not(windows), test))]
+            Self::Unsupported => "Native App Installer checking is unavailable on this platform.",
+            #[cfg(any(windows, test))]
+            Self::Window => {
+                "App Installer checking requires this app's current Windows window and thread."
+            }
+            #[cfg(any(windows, test))]
+            Self::Identity => {
+                "The current App Installer package association could not be verified."
+            }
+            Self::Service => {
+                "App Installer availability is unknown; its service could not complete the check."
+            }
+            #[cfg(any(windows, test))]
+            Self::Result => {
+                "App Installer returned an unsupported or failed result; availability is unknown."
+            }
+            Self::Timeout => "The App Installer check timed out; availability is unknown.",
+            Self::Cancelled => "The App Installer check was cancelled; availability is unknown.",
+            Self::Disabled => self.message(),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn app_installer_availability(value: i32, extended_error: i32) -> Result<Availability, Failure> {
+    // Unknown, Error, future enum values and even nonzero success HRESULTs are
+    // never interpreted as no update. Availability supplies no offered version.
+    if extended_error != 0 {
+        return Err(Failure::Result);
+    }
+    match value {
+        1 => Ok(Availability::NoUpdate),
+        2 => Ok(Availability::Available { mandatory: false }),
+        3 => Ok(Availability::Available { mandatory: true }),
+        _ => Err(Failure::Result),
     }
 }
 
@@ -118,6 +181,7 @@ impl Drop for Pending {
 
 #[derive(Default)]
 pub(super) struct Check {
+    provider: Provider,
     pending: Option<Pending>,
     result: Option<Result<Availability, Failure>>,
     #[cfg(windows)]
@@ -126,6 +190,19 @@ pub(super) struct Check {
     next: Option<Box<dyn Operation>>,
 }
 impl Check {
+    pub(super) fn app_installer() -> Self {
+        Self {
+            provider: Provider::AppInstaller,
+            ..Self::default()
+        }
+    }
+    fn allowed(&self) -> bool {
+        #[cfg(test)]
+        if self.next.is_some() {
+            return true;
+        }
+        self.provider == Provider::Store || APP_INSTALLER_CHECK_ENABLED
+    }
     #[cfg(windows)]
     pub(super) fn window(&mut self, frame: &eframe::Frame) {
         use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
@@ -164,13 +241,24 @@ impl Check {
             self.begin(operation, now);
             return;
         }
+        if !self.allowed() {
+            self.result = Some(Err(Failure::Disabled));
+            return;
+        }
         #[cfg(windows)]
-        match self
-            .window
-            .ok_or(Failure::Window)
-            .and_then(native::Native::start)
-        {
-            Ok(operation) => self.begin(Box::new(operation), now),
+        match self.window.ok_or(Failure::Window).and_then(
+            |window| -> Result<Box<dyn Operation>, Failure> {
+                match self.provider {
+                    Provider::Store => {
+                        native::Native::start(window).map(|value| Box::new(value) as _)
+                    }
+                    Provider::AppInstaller => {
+                        native::AppInstaller::start(window).map(|value| Box::new(value) as _)
+                    }
+                }
+            },
+        ) {
+            Ok(operation) => self.begin(operation, now),
             Err(error) => self.result = Some(Err(error)),
         }
         #[cfg(not(windows))]
@@ -217,7 +305,10 @@ impl Check {
         if !pending.rejected && Instant::now() >= pending.deadline {
             self.reject(Failure::Timeout);
         }
-        let pending = self.pending.as_ref().expect("Pending Store operation");
+        let pending = self
+            .pending
+            .as_ref()
+            .expect("Pending native provider operation");
         match observation {
             Observation::Pending => (),
             Observation::Unavailable => {
@@ -234,24 +325,46 @@ impl Check {
         }
     }
     pub(super) fn show(&mut self, ui: &mut egui::Ui) {
-        ui.label("Installed Microsoft Store package");
+        ui.label(self.provider.text(
+            "Installed Microsoft Store package",
+            "Associated Windows App Installer",
+        ));
+        if !self.allowed() && self.provider == Provider::AppInstaller {
+            ui.label(Failure::Disabled.message());
+        }
         if ui
-            .add_enabled(!self.pending(), egui::Button::new("Check Microsoft Store"))
+            .add_enabled(
+                !self.pending() && self.allowed(),
+                egui::Button::new(
+                    self.provider
+                        .text("Check Microsoft Store", "Check App Installer"),
+                ),
+            )
             .clicked()
         {
             self.start(Instant::now());
         }
         if let Some(pending) = &self.pending {
             if pending.rejected {
-                ui.label(
+                ui.label(self.provider.text(
                     "Cancellation requested; waiting for Microsoft Store before another check.",
-                );
+                    "Cancellation requested; waiting for App Installer before another check.",
+                ));
             } else {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Checking this installed package with Microsoft Store…");
+                    ui.label(self.provider.text(
+                        "Checking this installed package with Microsoft Store…",
+                        "Checking the associated App Installer for this installed package…",
+                    ));
                 });
-                if ui.button("Cancel Store check").clicked() {
+                if ui
+                    .button(
+                        self.provider
+                            .text("Cancel Store check", "Cancel App Installer check"),
+                    )
+                    .clicked()
+                {
                     self.cancel();
                 }
             }
@@ -259,20 +372,20 @@ impl Check {
         if let Some(result) = self.result {
             match result {
                 Ok(Availability::NoUpdate) => {
-                    ui.label("Microsoft Store reports no update for this installed app package.");
+                    ui.label(self.provider.text("Microsoft Store reports no update for this installed app package.", "The associated App Installer reports no update for this installed app package."));
                 }
                 Ok(Availability::Available { mandatory }) => {
-                    ui.label("Microsoft Store reports an update for this installed app package.");
+                    ui.label(self.provider.text("Microsoft Store reports an update for this installed app package.", "The associated App Installer reports an update for this installed app package."));
                     if mandatory {
-                        ui.label("Microsoft Store marks that update as mandatory; this check does not install it.");
+                        ui.label(self.provider.text("Microsoft Store marks that update as mandatory; this check does not install it.", "App Installer marks that update as required; this check does not install it."));
                     }
                 }
                 Err(error) => {
-                    ui.label(error.message());
+                    ui.label(error.for_provider(self.provider));
                 }
             }
         }
-        ui.label("Store results may be cached or delayed. This does not verify public listing or installation readiness.");
+        ui.label(self.provider.text("Store results may be cached or delayed. This does not verify public listing or installation readiness.", "Update availability only. Installation is unavailable in this build."));
     }
 }
 
@@ -281,8 +394,9 @@ mod native {
     use super::*;
     use windows::{
         core::{Interface, HSTRING},
-        ApplicationModel::{Package, PackageSignatureKind},
+        ApplicationModel::{Package, PackageSignatureKind, PackageUpdateAvailabilityResult},
         Foundation::{AsyncStatus, Collections::IVectorView, IAsyncOperation},
+        Management::Deployment::PackageManager,
         Services::Store::{StoreContext, StorePackageUpdate},
         Win32::{
             Foundation::HWND,
@@ -407,6 +521,141 @@ mod native {
             let _ = self.operation.Close();
         }
     }
+
+    #[derive(PartialEq, Eq)]
+    struct Association {
+        identity: Identity,
+        signature: i32,
+        // Private native UTF-16 only; never displayed, persisted or logged.
+        uri: Vec<u16>,
+    }
+    fn association(package: &Package) -> Result<Association, Failure> {
+        let signature = package.SignatureKind().map_err(|_| Failure::Identity)?;
+        if !matches!(
+            signature,
+            PackageSignatureKind::Developer | PackageSignatureKind::Enterprise
+        ) || package.IsFramework().map_err(|_| Failure::Identity)?
+            || package.IsResourcePackage().map_err(|_| Failure::Identity)?
+            || package.IsOptional().map_err(|_| Failure::Identity)?
+        {
+            return Err(Failure::Identity);
+        }
+        let uri = package
+            .GetAppInstallerInfo()
+            .and_then(|value| value.Uri())
+            .map_err(|_| Failure::Identity)?;
+        if uri.SchemeName().map_err(|_| Failure::Identity)?.to_string() != "https"
+            || uri.Host().map_err(|_| Failure::Identity)?.is_empty()
+            || !uri.UserName().map_err(|_| Failure::Identity)?.is_empty()
+            || !uri.Password().map_err(|_| Failure::Identity)?.is_empty()
+            || !uri.Query().map_err(|_| Failure::Identity)?.is_empty()
+            || !uri.Fragment().map_err(|_| Failure::Identity)?.is_empty()
+        {
+            return Err(Failure::Identity);
+        }
+        let uri = uri.AbsoluteUri().map_err(|_| Failure::Identity)?;
+        if uri.is_empty() || uri.len() > 4096 || uri.as_wide().iter().any(|value| *value < 32) {
+            return Err(Failure::Identity);
+        }
+        Ok(Association {
+            identity: identity(package)?,
+            signature: signature.0,
+            uri: uri.as_wide().to_vec(),
+        })
+    }
+    fn current_association() -> Result<Association, Failure> {
+        association(&Package::Current().map_err(|_| Failure::Identity)?)
+    }
+    pub(super) struct AppInstaller {
+        operation: IAsyncOperation<PackageUpdateAvailabilityResult>,
+        _package: Package,
+        expected: Association,
+        thread: std::thread::ThreadId,
+        _apartment: Apartment,
+    }
+    impl AppInstaller {
+        pub(super) fn start(window: Window) -> Result<Self, Failure> {
+            if !APP_INSTALLER_CHECK_ENABLED {
+                return Err(Failure::Disabled);
+            }
+            if window.hwnd == 0 || std::thread::current().id() != window.thread {
+                return Err(Failure::Window);
+            }
+            unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }.map_err(|_| Failure::Window)?;
+            let apartment = Apartment;
+            let expected = current_association()?;
+            let full =
+                HSTRING::from_wide(&expected.identity.full).map_err(|_| Failure::Identity)?;
+            let manager = PackageManager::new().map_err(|_| Failure::Service)?;
+            // Microsoft's Current-object AccessDenied workaround, current user
+            // and exact full name only; never enumerate other users or packages.
+            let package = manager
+                .FindPackageByUserSecurityIdPackageFullName(&HSTRING::new(), &full)
+                .map_err(|_| Failure::Identity)?;
+            // Release the lookup manager before the apartment moves into result.
+            drop(manager);
+            if association(&package)? != expected || current_association()? != expected {
+                return Err(Failure::Identity);
+            }
+            let operation = package
+                .CheckUpdateAvailabilityAsync()
+                .map_err(|_| Failure::Service)?;
+            let result = Self {
+                operation,
+                _package: package,
+                expected,
+                thread: window.thread,
+                _apartment: apartment,
+            };
+            if current_association()? != result.expected
+                || association(&result._package)? != result.expected
+            {
+                return Err(Failure::Identity);
+            }
+            Ok(result)
+        }
+        fn result(&self) -> Result<Availability, Failure> {
+            if current_association()? != self.expected
+                || association(&self._package)? != self.expected
+            {
+                return Err(Failure::Identity);
+            }
+            let result = self.operation.GetResults().map_err(|_| Failure::Service)?;
+            let availability = app_installer_availability(
+                result.Availability().map_err(|_| Failure::Result)?.0,
+                result.ExtendedError().map_err(|_| Failure::Result)?.0,
+            )?;
+            if current_association()? != self.expected
+                || association(&self._package)? != self.expected
+            {
+                return Err(Failure::Identity);
+            }
+            Ok(availability)
+        }
+    }
+    impl Operation for AppInstaller {
+        fn poll(&mut self) -> Observation {
+            if std::thread::current().id() != self.thread {
+                return Observation::Unavailable;
+            }
+            match self.operation.Status() {
+                Ok(AsyncStatus::Started) => Observation::Pending,
+                Ok(AsyncStatus::Completed) => Observation::Finished(self.result()),
+                Ok(AsyncStatus::Canceled) => Observation::Finished(Err(Failure::Cancelled)),
+                Ok(AsyncStatus::Error) => Observation::Finished(Err(Failure::Service)),
+                _ => Observation::Unavailable,
+            }
+        }
+        fn cancel(&mut self) {
+            let _ = self.operation.Cancel();
+        }
+    }
+    impl Drop for AppInstaller {
+        fn drop(&mut self) {
+            let _ = self.operation.Cancel();
+            let _ = self.operation.Close();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -448,6 +697,93 @@ mod tests {
             full: full.encode_utf16().collect(),
             family: family.encode_utf16().collect(),
         }
+    }
+
+    #[test]
+    fn app_installer_unknown_error_future_and_extended_failure_never_mean_up_to_date() {
+        assert_eq!(app_installer_availability(1, 0), Ok(Availability::NoUpdate));
+        assert_eq!(
+            app_installer_availability(2, 0),
+            Ok(Availability::Available { mandatory: false })
+        );
+        assert_eq!(
+            app_installer_availability(3, 0),
+            Ok(Availability::Available { mandatory: true })
+        );
+        for value in [i32::MIN, -1, 0, 4, 5, i32::MAX] {
+            assert_eq!(app_installer_availability(value, 0), Err(Failure::Result));
+        }
+        for extended in [i32::MIN, -1, 1, i32::MAX] {
+            for value in 0..=4 {
+                assert_eq!(
+                    app_installer_availability(value, extended),
+                    Err(Failure::Result)
+                );
+            }
+        }
+        let mut check = Check::app_installer();
+        assert!(!APP_INSTALLER_CHECK_ENABLED);
+        check.start(Instant::now());
+        assert_eq!(check.result, Some(Err(Failure::Disabled)));
+        assert!(!check.pending());
+    }
+
+    #[test]
+    fn app_installer_reuses_bounded_polling_quarantine_and_never_promotes_late_success() {
+        for failure in [
+            Failure::Cancelled,
+            Failure::Timeout,
+            Failure::Service,
+            Failure::Window,
+        ] {
+            let mut check = Check::app_installer();
+            let (first, fake) = operation();
+            let now = Instant::now();
+            check.begin(first, now);
+            check.tick(now);
+            match failure {
+                Failure::Cancelled => check.cancel(),
+                Failure::Timeout => check.tick(now + TIMEOUT),
+                Failure::Service => {
+                    fake.borrow_mut()
+                        .observations
+                        .push_back(Observation::Unavailable);
+                    check.tick(now);
+                }
+                Failure::Window => check.reject(Failure::Window),
+                _ => unreachable!(),
+            }
+            let (next, second) = operation();
+            check.next = Some(next);
+            check.start(now);
+            assert_eq!(second.borrow().polls, 0);
+            assert_eq!(fake.borrow().cancels, 1);
+            fake.borrow_mut()
+                .observations
+                .push_back(Observation::Finished(Ok(Availability::NoUpdate)));
+            check.tick(now);
+            assert!(!check.pending());
+            assert_eq!(check.result, Some(Err(failure)));
+            check.start(now);
+            assert_eq!(check.result, None);
+            second
+                .borrow_mut()
+                .observations
+                .push_back(Observation::Finished(Err(Failure::Result)));
+            check.tick(now);
+            assert_eq!(check.result, Some(Err(Failure::Result)));
+        }
+        let (operation, fake) = operation();
+        fake.borrow_mut()
+            .observations
+            .push_back(Observation::Finished(Ok(Availability::NoUpdate)));
+        let mut check = Check::app_installer();
+        let backdated = Instant::now() - TIMEOUT - Duration::from_secs(1);
+        check.begin(operation, backdated);
+        check.tick(backdated);
+        assert_eq!(check.result, Some(Err(Failure::Timeout)));
+        assert!(!check.pending());
+        assert_eq!((fake.borrow().polls, fake.borrow().drops), (1, 1));
     }
 
     #[test]
@@ -901,6 +1237,86 @@ mod tests {
             assert!(label(&output, "Check Microsoft Store").is_none());
             drop(app);
             std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn actual_app_installer_controls_are_disabled_by_default_and_keep_sources_and_store_separate() {
+        use crate::updates::Owner;
+        for depth in [8, 16] {
+            let (mut app, ctx) = crate::ui::workspace_tests::fixture(depth);
+            app.updates.owner = Owner::WindowsAppInstaller;
+            app.updates.open = true;
+            let before = snapshot(&app.shared.lock().unwrap());
+            frame(&mut app, &ctx, vec![]);
+            let output = frame(&mut app, &ctx, vec![]);
+            assert!(label(&output, "Check Microsoft Store").is_none());
+            assert!(label(&output, Failure::Disabled.message()).is_some());
+            frame(
+                &mut app,
+                &ctx,
+                click(label(&output, "Check App Installer").unwrap()),
+            );
+            assert!(!app.updates.app_installer_check.pending());
+            assert!(app.updates.store_check.result.is_none());
+            let (first, fake) = operation();
+            app.updates.app_installer_check.next = Some(first);
+            let output = frame(&mut app, &ctx, vec![]);
+            frame(
+                &mut app,
+                &ctx,
+                click(label(&output, "Check App Installer").unwrap()),
+            );
+            assert!(app.updates.app_installer_check.pending());
+            fake.borrow_mut()
+                .observations
+                .push_back(Observation::Finished(Ok(Availability::Available {
+                    mandatory: true,
+                })));
+            frame(&mut app, &ctx, vec![]);
+            let output = frame(&mut app, &ctx, vec![]);
+            assert!(label(
+                &output,
+                "The associated App Installer reports an update for this installed app package."
+            )
+            .is_some());
+            assert!(label(
+                &output,
+                "App Installer marks that update as required; this check does not install it."
+            )
+            .is_some());
+            assert!(app.updates.store_check.result.is_none());
+            let (next, fake) = operation();
+            app.updates.app_installer_check.next = Some(next);
+            let output = frame(&mut app, &ctx, vec![]);
+            frame(
+                &mut app,
+                &ctx,
+                click(label(&output, "Check App Installer").unwrap()),
+            );
+            let output = frame(&mut app, &ctx, vec![]);
+            frame(&mut app, &ctx, click(label(&output, "Later").unwrap()));
+            assert!(!app.updates.open);
+            assert_eq!(
+                app.updates.app_installer_check.result,
+                Some(Err(Failure::Cancelled))
+            );
+            fake.borrow_mut()
+                .observations
+                .push_back(Observation::Finished(Ok(Availability::NoUpdate)));
+            frame(&mut app, &ctx, vec![]);
+            assert_eq!(
+                app.updates.app_installer_check.result,
+                Some(Err(Failure::Cancelled))
+            );
+            assert_eq!(snapshot(&app.shared.lock().unwrap()), before);
+            assert!(app.update_restart_blocker().is_some());
+            assert!(app.updates.store.preferences.last_attempt.is_none());
+            app.updates.owner = Owner::MicrosoftStore;
+            app.updates.open = true;
+            let output = frame(&mut app, &ctx, vec![]);
+            assert!(label(&output, "Check App Installer").is_none());
+            assert!(label(&output, "Check Microsoft Store").is_some());
         }
     }
 }
