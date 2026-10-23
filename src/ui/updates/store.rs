@@ -1294,8 +1294,57 @@ mod tests {
                 &ctx,
                 click(label(&output, "Check App Installer").unwrap()),
             );
-            let output = frame(&mut app, &ctx, vec![]);
-            frame(&mut app, &ctx, click(label(&output, "Later").unwrap()));
+            // Observe each hover pass before egui swaps its widget tables.
+            let mut output = frame(&mut app, &ctx, vec![]);
+            let mut last = None;
+            let (id, at) = (0..16)
+                .find_map(|_| {
+                    let at = label(&output, "Later")?;
+                    let mut target = None;
+                    output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(ctx.screen_rect()),
+                            events: vec![egui::Event::PointerMoved(at)],
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            app.updates_tick(ctx);
+                            app.updates_dialog(ctx);
+                            let previous = last.take();
+                            target = None;
+                            let hovered: Vec<_> = ctx.interaction_snapshot(|state| {
+                                state.hovered.iter().copied().collect()
+                            });
+                            if let Some(response) = hovered
+                                .into_iter()
+                                .filter_map(|id| ctx.read_response(id))
+                                .find(|response| {
+                                    response.enabled()
+                                        && response.sense.senses_click()
+                                        && !response.sense.senses_drag()
+                                        && response.rect.contains(at)
+                                        && response.interact_rect.contains_rect(response.rect)
+                                        && ctx.screen_rect().contains_rect(response.rect)
+                                        && response.layer_id.id
+                                            == egui::Id::new("peerbrush_updates")
+                                        && ctx.layer_id_at(at) == Some(response.layer_id)
+                                })
+                            {
+                                let key = (response.id, response.rect, response.interact_rect);
+                                last = Some(key);
+                                target = (previous == Some(key)).then_some((response.id, at));
+                            }
+                        },
+                    );
+                    target
+                })
+                .expect("Later must be a stable, fully visible live button");
+            frame(&mut app, &ctx, click(at));
+            assert_eq!(
+                ctx.interaction_snapshot(|state| state.clicked),
+                Some(id),
+                "The actual Later button must receive the click"
+            );
             assert!(!app.updates.open);
             assert_eq!(
                 app.updates.app_installer_check.result,
