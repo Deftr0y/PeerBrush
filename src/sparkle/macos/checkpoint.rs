@@ -715,6 +715,7 @@ pub(super) struct Prepared {
     profile: Snapshot,
     copy: Snapshot,
     _profile: UpdateProfile,
+    _owner: super::coordinator::Owner,
 }
 impl Prepared {
     /// An advisory change detector, never current app/copy authentication.
@@ -958,6 +959,19 @@ pub(super) fn prepare(
         .sync_all()
         .map_err(|_| HOLD)?;
     let identity = Stamp::read(&path)?.ok_or(HOLD)?;
+    // This is the worker observation, not the final writer-locked publication.
+    // The child authenticates it through inherited IPC, never an argv path.
+    write_new(&path.join("capture.json"), &manifest)?;
+    let owner = super::coordinator::launch(
+        &path.join("PeerBrush.app"),
+        &profile,
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(HOLD)?,
+        digest(&manifest),
+        &configuration,
+        &cancel,
+    )?;
     Ok(Prepared {
         verified,
         path,
@@ -967,7 +981,87 @@ pub(super) fn prepare(
         profile: profile_snapshot,
         copy,
         _profile: profile,
+        _owner: owner,
     })
+}
+
+/// Only the authenticated same-binary child uses this derived private layout.
+/// Neither target nor storage paths are supplied through command arguments.
+pub(super) fn owner_copy(
+    executable: &Path,
+    locations: &Locations,
+    name: &str,
+) -> Result<PathBuf, String> {
+    if uuid::Uuid::parse_str(name).map_err(|_| HOLD)?.to_string() != name {
+        return Err(HOLD.into());
+    }
+    let root = checkpoints(locations);
+    let attempt = root.join(name);
+    let app = attempt.join("PeerBrush.app");
+    if !executable.is_absolute() || executable != app.join("Contents/MacOS/peerbrush") {
+        return Err(HOLD.into());
+    }
+    if !private(&root, false)? || !private(&attempt, false)? {
+        return Err(HOLD.into());
+    }
+    Ok(app)
+}
+
+pub(super) fn inspect_owner_copy(
+    app: &Path,
+    profile: &UpdateProfile,
+    parent_executable: &Path,
+    expected_manifest: &str,
+    configuration: ApprovedCheck,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    inspect_owner_copy_with(
+        app,
+        profile,
+        parent_executable,
+        expected_manifest,
+        &configuration,
+        &cancel,
+        |app| installed::verify(app, configuration.clone(), cancel.clone())?.recheck(),
+    )
+}
+fn inspect_owner_copy_with(
+    app: &Path,
+    profile: &UpdateProfile,
+    parent_executable: &Path,
+    expected_manifest: &str,
+    configuration: &ApprovedCheck,
+    cancel: &AtomicBool,
+    mut verify_native: impl FnMut(PathBuf) -> Result<(), String>,
+) -> Result<(), String> {
+    let attempt = app.parent().ok_or(HOLD)?;
+    if Stamp::read(&attempt.join("native-start-intent.json"))?.is_some() {
+        return Err(HOLD.into());
+    }
+    startup_guard(&profile.locations)?;
+    let bytes = read_private(&attempt.join("capture.json"), 1024 * 1024)?;
+    if digest(&bytes) != expected_manifest {
+        return Err(HOLD.into());
+    }
+    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| HOLD)?;
+    validate_manifest(&manifest)?;
+    if manifest.target.join("Contents/MacOS/peerbrush") != parent_executable
+        || manifest.build_record != crate::build_info::json()
+        || manifest.publisher_team_id != configuration.publisher_team_id
+    {
+        return Err(HOLD.into());
+    }
+    profile.validate()?;
+    // Actual code identity comes from the kernel audit peer + Security checks.
+    // Full signed app/resources/framework checks and independent byte parity
+    // establish only this capture, never a future installation/rollback permit.
+    verify_native(manifest.target)?;
+    verify_native(app.into())?;
+    let app_copy = check_copy(app, &manifest.app, cancel)?;
+    let preferences = check_copy(&attempt.join("profile"), &manifest.profile, cancel)?;
+    app_copy.recheck()?;
+    preferences.recheck()?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,6 +1,10 @@
 //! Owned manual information checks and the credential-free native component probe.
 use super::{require_supported_macos, Configuration};
 pub(crate) mod checkpoint;
+mod coordinator;
+mod process_identity;
+#[doc(hidden)]
+pub use coordinator::main_entry as coordinator_main_entry;
 mod driver;
 mod installed;
 use block2::{Block, RcBlock};

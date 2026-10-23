@@ -100,6 +100,43 @@ impl Profile {
 }
 #[cfg(target_os = "macos")]
 impl UpdateProfile {
+    pub(crate) fn inherited_lock(&self) -> Result<fs::File, String> {
+        self._lock
+            .0
+            .try_clone()
+            .map_err(|_| "Settings lock cannot be inherited".into())
+    }
+    /// The coordinator calls this only after authenticating its inherited peer.
+    /// The descriptor is the parent's actual lock, not a newly acquired lock.
+    pub(crate) fn from_inherited(locations: Locations, file: fs::File) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file
+            .metadata()
+            .map_err(|_| "Inherited settings lock unavailable")?;
+        let path = fs::symlink_metadata(locations.config.join("settings.lock"))
+            .map_err(|_| "Inherited settings lock path unavailable")?;
+        if !opened.is_file()
+            || !path.is_file()
+            || alias(&path)
+            || opened.nlink() != 1
+            || path.nlink() != 1
+            || opened.uid() != unsafe { libc::geteuid() }
+            || (opened.dev(), opened.ino()) != (path.dev(), path.ino())
+        {
+            return Err("Inherited settings lock differs from the actual profile lock".into());
+        }
+        use std::os::fd::AsRawFd;
+        // The pinned Darwin implementation uses flock's shared open description.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err("Inherited descriptor does not retain the parent's settings lock".into());
+        }
+        let profile = Self {
+            locations,
+            _lock: std::sync::Arc::new(Lock(file)),
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
     pub(crate) fn validate(&self) -> Result<(), String> {
         Profile {
             locations: self.locations.clone(),
@@ -141,6 +178,10 @@ fn alias(metadata: &fs::Metadata) -> bool {
 }
 impl Drop for Lock {
     fn drop(&mut self) {
+        // Darwin flock is shared by inherited copies of this open description.
+        // Closing the last descriptor releases it; explicit unlock would also
+        // release a surviving capture owner's protection.
+        #[cfg(not(target_os = "macos"))]
         let _ = self.0.unlock();
     }
 }

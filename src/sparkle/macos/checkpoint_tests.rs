@@ -970,3 +970,122 @@ fn final_profile_recheck_refuses_between_file_replacement_and_creation_without_p
         }
     }
 }
+
+#[test]
+fn inherited_real_profile_lock_survives_parent_lease_drop_and_refuses_independent_descriptor() {
+    let f = Fixture::new();
+    let profile = f.profile();
+    let lease = profile.update_profile();
+    let source = profile.locations.profile().join("tool-settings.json");
+    let bytes = fs::read(&source).unwrap();
+    let independent = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(profile.locations.config.join("settings.lock"))
+        .unwrap();
+    assert!(UpdateProfile::from_inherited(f.locations(), independent).is_err());
+    let inherited =
+        UpdateProfile::from_inherited(f.locations(), lease.inherited_lock().unwrap()).unwrap();
+    drop(lease);
+    drop(profile);
+    assert!(crate::settings::Profile::open(f.locations(), &f.0.join("legacy")).is_err());
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    drop(inherited);
+    let reopened = crate::settings::Profile::open(f.locations(), &f.0.join("legacy")).unwrap();
+    assert_eq!(fs::read(&source).unwrap(), bytes);
+    drop(reopened);
+}
+
+#[test]
+fn authenticated_capture_consumer_uses_exact_derived_roles_and_refuses_damage_without_mutation() {
+    for damage in [
+        "none",
+        "foreign-parent",
+        "wrong-digest",
+        "armed",
+        "changed-copy",
+        "native-refusal",
+    ] {
+        let f = Fixture::new();
+        let profile = f.profile();
+        let lease = profile.update_profile();
+        let profile_bytes =
+            fs::read(profile.locations.profile().join("tool-settings.json")).unwrap();
+        let attempt = f.attempt(&lease);
+        let copy = attempt.join("PeerBrush.app");
+        let original = f.0.join("original.app");
+        let bytes = read_private(&attempt.join("checkpoint.json"), 1024 * 1024).unwrap();
+        write_new(&attempt.join("capture.json"), &bytes).unwrap();
+        let name = attempt.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            owner_copy(&copy.join("Contents/MacOS/peerbrush"), &f.locations(), name).unwrap(),
+            copy
+        );
+        assert!(owner_copy(
+            &original.join("Contents/MacOS/peerbrush"),
+            &f.locations(),
+            name
+        )
+        .is_err());
+        assert!(owner_copy(
+            &copy.join("Contents/MacOS/peerbrush"),
+            &f.locations(),
+            "../foreign"
+        )
+        .is_err());
+        let mut parent_exe = original.join("Contents/MacOS/peerbrush");
+        let mut expected = digest(&bytes);
+        match damage {
+            "foreign-parent" => parent_exe = f.0.join("foreign/Contents/MacOS/peerbrush"),
+            "wrong-digest" => expected = "f".repeat(64),
+            "armed" => record_intent(&attempt, &bytes).unwrap(),
+            "changed-copy" => fs::write(copy.join("Contents/MacOS/peerbrush"), b"changed").unwrap(),
+            _ => {}
+        }
+        // Explicit fake native boundary; it supplies no signature authority.
+        let configuration = ApprovedCheck {
+            feed_url: crate::sparkle::PROPOSED_FEED_URL.into(),
+            public_ed_key: "fixture only".into(),
+            publisher_team_id: "ABCD123456".into(),
+            objects: BTreeMap::new(),
+        };
+        let mut roles = Vec::new();
+        let result = inspect_owner_copy_with(
+            &copy,
+            &lease,
+            &parent_exe,
+            &expected,
+            &configuration,
+            &AtomicBool::new(false),
+            |app| {
+                roles.push(app);
+                if damage == "native-refusal" {
+                    Err("native refusal fixture".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.is_ok(), damage == "none", "{damage}");
+        if damage == "none" {
+            assert_eq!(roles, vec![original.clone(), copy.clone()]);
+        }
+        if matches!(damage, "foreign-parent" | "wrong-digest" | "armed") {
+            assert!(roles.is_empty());
+        }
+        assert_eq!(
+            fs::read(original.join("Contents/MacOS/peerbrush")).unwrap(),
+            [0, 1, 2, 254, 255]
+        );
+        assert_eq!(
+            fs::read(profile.locations.profile().join("tool-settings.json")).unwrap(),
+            profile_bytes
+        );
+        assert_eq!(
+            read_private(&attempt.join("capture.json"), 1024 * 1024).unwrap(),
+            bytes
+        );
+        assert!(!attempt.join("native-not-started.json").exists());
+        assert!(require_captured_handoff().is_err());
+    }
+}

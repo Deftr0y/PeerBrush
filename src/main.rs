@@ -4,6 +4,10 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = peerbrush::sparkle::macos::coordinator_main_entry() {
+        std::process::exit(code);
+    }
     if let Some(code) = peerbrush::jpeg_xl::main_entry() {
         std::process::exit(code);
     }
