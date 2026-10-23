@@ -403,7 +403,7 @@ pub fn restore(
     if bytes.len() as u64 != entry.bytes || checksum(&bytes) != entry.checksum {
         return Err("Recovery version is incomplete or damaged; choose an earlier version".into());
     }
-    let mut doc = psd::decode_reader(&mut std::io::Cursor::new(bytes), control)?;
+    let mut doc = psd::decode_slice(&bytes, control)?;
     control.check()?;
     if doc.read_only || doc.bit_depth != entry.bit_depth {
         return Err(

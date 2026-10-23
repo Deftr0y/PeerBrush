@@ -7,7 +7,6 @@ use crate::{
 };
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -1868,10 +1867,13 @@ fn composite_rows<R: Read>(
 }
 
 pub fn decode(data: &[u8]) -> Result<Document, String> {
-    decode_reader(
-        &mut std::io::Cursor::new(data),
-        &crate::loading::Control::default(),
-    )
+    decode_slice(data, &crate::loading::Control::default())
+}
+pub(crate) fn decode_slice(
+    data: &[u8],
+    control: &crate::loading::Control,
+) -> Result<Document, String> {
+    decode_sections(&mut std::io::Cursor::new(data), control, borrowed_section)
 }
 fn stream_layer_channel(
     bytes: &[u8],
@@ -2084,6 +2086,21 @@ pub fn decode_reader<R: Read + std::io::Seek>(
     reader: &mut R,
     control: &crate::loading::Control,
 ) -> Result<Document, String> {
+    decode_sections(reader, control, |reader, length, large, control, stage| {
+        read_section(reader, length, large, control, stage).map(Cow::Owned)
+    })
+}
+fn decode_sections<'a, R: Read + std::io::Seek>(
+    reader: &mut R,
+    control: &crate::loading::Control,
+    mut section: impl FnMut(
+        &mut R,
+        u64,
+        bool,
+        &crate::loading::Control,
+        &str,
+    ) -> Result<Cow<'a, [u8]>, String>,
+) -> Result<Document, String> {
     use std::io::SeekFrom;
     let length = reader.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
     if length > 256 * 1024 * 1024 {
@@ -2112,15 +2129,15 @@ pub fn decode_reader<R: Read + std::io::Seek>(
     if ![8, 16].contains(&depth) || mode != 3 || !(3..=4).contains(&channel_count) {
         return Err("PeerBrush opens 8-bit and 16-bit RGB PSD/PSB documents (3 or 4 channels); unsupported Photoshop source features remain protected".into());
     }
-    read_section(reader, length, false, control, "Reading color data")?;
-    let resources = read_section(
+    section(reader, length, false, control, "Reading color data")?;
+    let resources = section(
         reader,
         length,
         false,
         control,
         "Reading Photoshop resources",
     )?;
-    let layer_section = read_section(
+    let layer_section = section(
         reader,
         length,
         layout.large(),
@@ -2166,13 +2183,11 @@ pub fn decode_reader<R: Read + std::io::Seek>(
         control,
     )
 }
-fn read_section<R: Read + std::io::Seek>(
+fn section_size<R: Read + std::io::Seek>(
     reader: &mut R,
     length: u64,
     large: bool,
-    control: &crate::loading::Control,
-    stage: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<usize, String> {
     let mut bytes = [0; 8];
     let size = if large { 8 } else { 4 };
     reader
@@ -2188,6 +2203,35 @@ fn read_section<R: Read + std::io::Seek>(
     if n as u64 > length.saturating_sub(position) {
         return Err("Truncated PSD section".into());
     }
+    Ok(n)
+}
+fn borrowed_section<'a>(
+    reader: &mut std::io::Cursor<&'a [u8]>,
+    length: u64,
+    large: bool,
+    control: &crate::loading::Control,
+    stage: &str,
+) -> Result<Cow<'a, [u8]>, String> {
+    let n = section_size(reader, length, large)?;
+    let start = usize::try_from(reader.position()).map_err(|_| "PSD length overflow")?;
+    let end = start.checked_add(n).ok_or("PSD length overflow")?;
+    let data = *reader.get_ref();
+    let bytes = data.get(start..end).ok_or("Truncated PSD section")?;
+    if n != 0 {
+        control.progress(stage, 0, n)?;
+    }
+    reader.set_position(end as u64);
+    control.progress(stage, n, n)?;
+    Ok(Cow::Borrowed(bytes))
+}
+fn read_section<R: Read + std::io::Seek>(
+    reader: &mut R,
+    length: u64,
+    large: bool,
+    control: &crate::loading::Control,
+    stage: &str,
+) -> Result<Vec<u8>, String> {
+    let n = section_size(reader, length, large)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(n)

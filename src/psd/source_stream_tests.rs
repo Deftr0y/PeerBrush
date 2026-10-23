@@ -389,6 +389,15 @@ fn bounded_editable_native_sources_match_legacy_reader_masks_png_history_and_sta
                 serde_json::to_value(&expected).unwrap()
             );
             let reopened = decode(&bytes).unwrap();
+            let owned = decode_reader(
+                &mut std::io::Cursor::new(&bytes),
+                &crate::loading::Control::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&owned).unwrap(),
+                serde_json::to_value(&reopened).unwrap()
+            );
             assert!(!reopened.read_only);
             assert_eq!(reopened.bit_depth, depth);
             assert_eq!(
@@ -513,7 +522,25 @@ fn invalid_streams_or_definition_gates_preserve_standard_protected_fallback_and_
                 failures.push(compressed(&serde_json::to_vec(&altered).unwrap()));
             }
             for zipped in failures {
-                let loaded = decode(&replaced(&bytes, &zipped)).unwrap();
+                let altered = replaced(&bytes, &zipped);
+                let loaded = decode(&altered).unwrap();
+                let owned = decode_reader(
+                    &mut std::io::Cursor::new(&altered),
+                    &crate::loading::Control::default(),
+                )
+                .unwrap();
+                assert!(owned.read_only);
+                assert_eq!(owned.bit_depth, loaded.bit_depth);
+                assert_eq!(owned.warnings, loaded.warnings);
+                assert_eq!(owned.export_png().unwrap(), loaded.export_png().unwrap());
+                assert_eq!(owned.layers.len(), loaded.layers.len());
+                for (owned, borrowed) in owned.layers.iter().zip(&loaded.layers) {
+                    assert_eq!(
+                        (owned.x, owned.y, &owned.source),
+                        (borrowed.x, borrowed.y, &borrowed.source)
+                    );
+                    assert_eq!(owned.pixels, borrowed.pixels);
+                }
                 assert!(loaded.read_only);
                 assert_eq!(loaded.bit_depth, depth);
                 assert!(loaded.layers.iter().all(|layer| layer.source.is_none()));
@@ -888,4 +915,324 @@ fn actual_dense_psd_open_phase_diagnostic() {
         "note":"Observer/test-profile overhead included. Generation, correctness checks and encoding excluded. Cache, allocation and fixed depth order are uncontrolled. Final source intervals include lock acquisition and checks; these are not total lock-held times. No normal-main/input/memory/16k claim.",
         "records":records})
     );
+}
+
+#[test]
+fn borrowed_sections_alias_input_and_keep_size_truncation_and_cancel_checks() {
+    for large in [false, true] {
+        for size in [0usize, 1, 64 * 1024 + 3] {
+            let mut bytes = if large {
+                (size as u64).to_be_bytes().to_vec()
+            } else {
+                (size as u32).to_be_bytes().to_vec()
+            };
+            let start = bytes.len();
+            bytes.extend((0..size).map(|n| n as u8));
+            bytes.extend(b"tail");
+            let control = crate::loading::Control::default();
+            let mut reader = std::io::Cursor::new(bytes.as_slice());
+            let section =
+                borrowed_section(&mut reader, bytes.len() as u64, large, &control, "Section")
+                    .unwrap();
+            assert!(matches!(&section, Cow::Borrowed(_)));
+            assert_eq!(section.as_ptr(), bytes[start..].as_ptr());
+            assert_eq!(section.as_ref(), &bytes[start..start + size]);
+            assert_eq!(reader.position(), (start + size) as u64);
+            assert_eq!(&bytes[reader.position() as usize..], b"tail");
+            let status = control.status();
+            assert_eq!(
+                (status.stage.as_str(), status.completed, status.total),
+                ("Section", size, size)
+            );
+            let mut owned_reader = std::io::Cursor::new(bytes.as_slice());
+            let owned = read_section(
+                &mut owned_reader,
+                bytes.len() as u64,
+                large,
+                &Default::default(),
+                "Section",
+            )
+            .unwrap();
+            assert_eq!(section.as_ref(), owned);
+            assert_eq!(reader.position(), owned_reader.position());
+            let canceled = crate::loading::Control::default();
+            canceled.cancel();
+            assert!(borrowed_section(
+                &mut std::io::Cursor::new(bytes.as_slice()),
+                bytes.len() as u64,
+                large,
+                &canceled,
+                "Section"
+            )
+            .unwrap_err()
+            .contains("Opening canceled"));
+        }
+        let width = if large { 8 } else { 4 };
+        for bytes in [vec![0; width - 1], vec![255; width], {
+            let mut bytes = if large {
+                2u64.to_be_bytes().to_vec()
+            } else {
+                2u32.to_be_bytes().to_vec()
+            };
+            bytes.push(0);
+            bytes
+        }] {
+            let borrowed = borrowed_section(
+                &mut std::io::Cursor::new(bytes.as_slice()),
+                bytes.len() as u64,
+                large,
+                &Default::default(),
+                "Section",
+            )
+            .unwrap_err();
+            let owned = read_section(
+                &mut std::io::Cursor::new(bytes.as_slice()),
+                bytes.len() as u64,
+                large,
+                &Default::default(),
+                "Section",
+            )
+            .unwrap_err();
+            assert_eq!(borrowed, owned);
+        }
+    }
+}
+
+#[test]
+fn borrowed_and_owned_restoration_cancel_before_native_acceptance() {
+    for depth in [8, 16] {
+        let engine = fixture(depth);
+        let before = serde_json::to_value(&engine.doc).unwrap();
+        for layout in [Layout::Psd, Layout::Psb] {
+            let bytes = encode_layout(&engine.doc, layout).unwrap();
+            for borrowed in [false, true] {
+                for phase in ["sections_read", "json_inflated"] {
+                    let control = crate::loading::Control::default();
+                    let cancel = control.clone();
+                    let observed = std::rc::Rc::new(Cell::new(false));
+                    let seen = observed.clone();
+                    let watch = WatchOpen::new(move |actual, _| {
+                        if actual == phase {
+                            seen.set(true);
+                            cancel.cancel();
+                        }
+                    });
+                    let result = if borrowed {
+                        decode_slice(&bytes, &control)
+                    } else {
+                        decode_reader(&mut std::io::Cursor::new(&bytes), &control)
+                    };
+                    drop(watch);
+                    assert!(observed.get());
+                    assert!(result.unwrap_err().contains("Opening canceled"));
+                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                    assert_eq!(engine.undo.len(), 1);
+                    assert!(engine.redo.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn recovery_reuses_verified_bytes_and_keeps_native_sources_history_and_recovery_file() {
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+    };
+    for depth in [8, 16] {
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let dir = temp.join(format!("pb-borrowed-recovery-{}", id()));
+        fs::create_dir(&dir).unwrap();
+        let shared = Arc::new(Mutex::new(fixture(depth)));
+        let registry = crate::workspace::attach(&shared);
+        let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+        let png = shared.lock().unwrap().doc.export_png().unwrap();
+        let mut versions = crate::recovery::Versions::new();
+        crate::recovery::checkpoint(&registry, &dir, &mut versions);
+        let catalog = crate::recovery::catalog(&dir);
+        assert_eq!(catalog.len(), 1);
+        let entry = &catalog[0];
+        let path = dir.join(&entry.file);
+        let bytes = fs::read(&path).unwrap();
+        let version = crate::file_safety::version(&path).unwrap();
+        let restored =
+            crate::recovery::restore(&registry, &dir, &entry.snapshot, &Default::default(), None)
+                .unwrap();
+        {
+            let engine = restored.lock().unwrap();
+            assert!(!engine.doc.read_only);
+            assert_eq!(engine.doc.bit_depth, depth);
+            let mut actual = serde_json::to_value(&engine.doc).unwrap();
+            assert_ne!(actual["id"], before["id"]);
+            actual["id"] = before["id"].clone();
+            assert_eq!(actual, before);
+            assert_eq!(engine.doc.export_png().unwrap(), png);
+            assert_eq!(engine.saved_revision, u64::MAX);
+            assert!(
+                engine.path.is_none()
+                    && engine.file_version.is_none()
+                    && engine.file_ownership.is_none()
+            );
+            assert!(engine.undo.is_empty() && engine.redo.is_empty());
+        }
+        let entries = crate::workspace::entries_in(&registry).len();
+        let canceled = crate::loading::Control::default();
+        canceled.cancel();
+        assert!(
+            crate::recovery::restore(&registry, &dir, &entry.snapshot, &canceled, None)
+                .err()
+                .unwrap()
+                .contains("Opening canceled")
+        );
+        assert_eq!(crate::workspace::entries_in(&registry).len(), entries);
+        assert_eq!(crate::file_safety::version(&path).unwrap(), version);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(crate::recovery::catalog(&dir).len(), 1);
+        let mut damaged = bytes.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        fs::write(&path, &damaged).unwrap();
+        assert!(crate::recovery::restore(
+            &registry,
+            &dir,
+            &entry.snapshot,
+            &Default::default(),
+            None
+        )
+        .err()
+        .unwrap()
+        .contains("incomplete or damaged"));
+        assert_eq!(crate::workspace::entries_in(&registry).len(), entries);
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+        {
+            let engine = shared.lock().unwrap();
+            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+            assert_eq!(engine.doc.export_png().unwrap(), png);
+            assert_eq!(engine.undo.len(), 1);
+            assert!(engine.redo.is_empty());
+        }
+        drop(restored);
+        drop(shared);
+        drop(registry);
+        let metadata = fs::symlink_metadata(&dir).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            assert_eq!(metadata.file_attributes() & 0x400, 0);
+        }
+        assert_eq!(dir.canonicalize().unwrap().parent(), Some(temp.as_path()));
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(path.with_extension("json")).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+}
+
+#[test]
+fn normal_file_open_keeps_final_content_scan_for_same_inode_size_and_restored_mtime() {
+    use std::{
+        fs,
+        rc::Rc,
+        sync::{Arc, Mutex},
+    };
+    for depth in [8, 16] {
+        for rewrite in [false, true] {
+            let temp = std::env::temp_dir().canonicalize().unwrap();
+            let dir = temp.join(format!("pb-open-content-check-{}", id()));
+            fs::create_dir(&dir).unwrap();
+            let path = dir.join("Original.psd");
+            let original = encode(&fixture(depth).doc).unwrap();
+            fs::write(&path, &original).unwrap();
+            let version = crate::file_safety::version(&path).unwrap();
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            let shared = Arc::new(Mutex::new(fixture(depth)));
+            let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+            let request = json!({"action":"open","actor":"human","path":path,
+                "document_id":before["id"],"expected_revision":before["revision"],"discard":true});
+            let observed = Rc::new(Cell::new(false));
+            let seen = observed.clone();
+            let verified = Rc::new(Cell::new(false));
+            let checked = verified.clone();
+            let watched = shared.clone();
+            let selected = path.clone();
+            let changed_last = *original.last().unwrap() ^ 1;
+            let watch = WatchOpen::new(move |phase, _| {
+                if phase == "decoder_returned" {
+                    assert!(watched.try_lock().is_ok());
+                    seen.set(true);
+                    if rewrite {
+                        let mut writer =
+                            fs::OpenOptions::new().write(true).open(&selected).unwrap();
+                        writer.seek(SeekFrom::End(-1)).unwrap();
+                        writer.write_all(&[changed_last]).unwrap();
+                        writer.sync_all().unwrap();
+                        writer.set_modified(modified).unwrap();
+                        drop(writer);
+                        assert_eq!(
+                            crate::file_safety::identity(&fs::File::open(&selected).unwrap())
+                                .unwrap(),
+                            version.identity
+                        );
+                        let metadata = fs::metadata(&selected).unwrap();
+                        assert_eq!(metadata.len(), version.bytes);
+                        assert_eq!(metadata.modified().unwrap(), modified);
+                        assert_ne!(crate::file_safety::version(&selected).unwrap(), version);
+                    }
+                }
+                if phase == "source_verified" {
+                    assert!(
+                        watched.try_lock().is_err(),
+                        "The existing final byte check/publication guard still owns the engine"
+                    );
+                    checked.set(true);
+                }
+            });
+            let result = crate::server::dispatch(&shared, "document", &request);
+            drop(watch);
+            assert!(observed.get());
+            if rewrite {
+                assert!(result
+                    .unwrap_err()
+                    .contains("Photoshop file changed during decoding"));
+                assert!(!verified.get());
+                let engine = shared.lock().unwrap();
+                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                assert_eq!(engine.undo.len(), 1);
+                assert!(
+                    engine.redo.is_empty()
+                        && engine.path.is_none()
+                        && engine.file_version.is_none()
+                );
+                assert!(engine.file_ownership.is_none() && engine.loading.is_none());
+                drop(engine);
+                let mut changed = original.clone();
+                *changed.last_mut().unwrap() = changed_last;
+                assert_eq!(fs::read(&path).unwrap(), changed);
+                // Failed Open must not retain a path/physical ownership claim.
+                let owner = crate::file_ownership::Ownership::open(&path, &id()).unwrap();
+                drop(owner);
+            } else {
+                result.unwrap();
+                assert!(verified.get());
+                assert_eq!(crate::file_safety::version(&path).unwrap(), version);
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let engine = shared.lock().unwrap();
+                assert_eq!(engine.doc.bit_depth, depth);
+                assert!(engine.undo.is_empty() && engine.redo.is_empty());
+                assert_eq!(engine.file_version, Some(version));
+                assert!(engine.file_ownership.is_some() && engine.loading.is_none());
+            }
+            drop(shared);
+            let metadata = fs::symlink_metadata(&dir).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                assert_eq!(metadata.file_attributes() & 0x400, 0);
+            }
+            assert_eq!(dir.canonicalize().unwrap().parent(), Some(temp.as_path()));
+            fs::remove_file(&path).unwrap();
+            fs::remove_dir(&dir).unwrap();
+        }
+    }
 }
