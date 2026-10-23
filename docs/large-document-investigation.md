@@ -64,3 +64,16 @@ Before enabling that target, measure native8/16 sparse, dense, thin, masked, eff
 The next PB-068/PB-108 transient-memory slice replaces the native8/native16 deserializers' all-entry encoded vectors with ordinary Serde sequence visitors. Each tuple is validated and decoded before the next is requested, retaining the existing base64/legacy8 representation, native16 words, duplicate policy and caller protection. Supplementary restoration still uses the capped full JSON buffer and `serde_json::from_slice`; the previously slower per-byte reader is not restored. No source format, admission limit or backing store is changed.
 
 This removes one aggregate encoded-entry container, not the JSON buffer or native source residency. Per-entry parser/legacy/decode allocations remain, including allocation before malformed oversized input is rejected; unique tile count and document memory still rely on their existing caller checks. Earlier tuple validation can report a semantic error before a later structural error, and never exposes a partially decoded raster. Prepared correctness/protected-fallback tests and balanced normal-main elapsed/observed-memory measurements must pass before claiming a practical improvement. The measured historical investigation above remains unchanged and does not qualify this new implementation or a 16000-square envelope.
+
+
+## Native16 spatial-kernel locality preparation (unreleased)
+
+A focused PB-108 candidate keeps the premultiplied CPU blur/bloom kernel's adjacent RGBA channels together during each sliding-window traversal. The previous channel-major loop scanned every strided column four times; four independent integer accumulators now share one pixel traversal and one radius-sized four-channel ring. The per-channel sums, rounding, clamped boundaries, pass/radius order and native16 projection are unchanged. The existing 1040-byte ring allowance already covers all four channels at the maximum supported radius, and no cap, dependency, source representation, cache identity or effect/compositor ordering changes.
+
+This is prepared source, not a measured responsiveness improvement. Exact independent premultiplied references cover thin/tall/non-tile-aligned dimensions, large radii, faint alpha and native low bits; a masked clipped folder fixture also checks shared full preview/render and source/history restoration. An opt-in CPU-only same-process benchmark retains the previous kernel, alternates execution order, excludes cloning/equality work from timers, places both the input and complete mutated output behind black_box barriers inside each timed interval, checks every resulting word and prints six samples plus medians for the existing 2048-square radius-4 case:
+
+```sh
+cargo test --locked --release --lib native16_spatial_kernel_performance -- --ignored --nocapture
+```
+
+The benchmark isolates the blur/bloom kernel; it does not measure mask construction, compositor cost, GUI latency, GPU execution, memory peaks or installed behavior. Run correctness, balanced benchmark and normal shared-preview cold/warm checks on the same qualified machine/profile before accepting the candidate or claiming a gain; preserve the original 1475 ms historical observation above. Native and cross-platform acceptance remain pending.

@@ -212,6 +212,143 @@ fn native_gaussian_matches_independent_premultiplied_reference_including_faint_a
     );
 }
 #[test]
+fn native_cpu_spatial_passes_match_reference_across_rows_columns_and_tile_edges() {
+    for (width, height) in [(1, 263), (263, 1), (3, 259), (259, 3), (263, 17)] {
+        let source = Image16 {
+            width,
+            height,
+            words: (0..width * height)
+                .flat_map(|n| {
+                    [
+                        ((n * 317 + 12001) % 65536) as u16,
+                        ((n * 179 + 45679) % 65536) as u16,
+                        32123,
+                        [0, 1, 33, 12345, 65535][n as usize % 5],
+                    ]
+                })
+                .collect(),
+        };
+        for radius in [0.5, 4.0, 64.0] {
+            let mut actual = source.clone();
+            color::apply_cpu(&mut actual, "blur", &json!({"radius":radius})).unwrap();
+            assert_eq!(
+                actual.words,
+                brute_blur(&source, radius),
+                "{width}x{height}, radius {radius}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_spatial_preparation_keeps_masked_clipped_folder_preview_and_history() {
+    let (width, height) = (19, 13);
+    let mut engine = Engine::new();
+    engine.doc = Document::new_depth(width, height, 16).unwrap();
+    let mut base = engine.doc.layers.remove(0);
+    for y in 0..height {
+        for x in 0..width {
+            base.pixels.set16(
+                x as i32,
+                y as i32,
+                [
+                    12001 + x as u16 * 317,
+                    30003 + y as u16 * 173,
+                    50007,
+                    [0, 1, 33, 12345, 65535][(x + y) as usize % 5],
+                ],
+            );
+        }
+    }
+    let mut group = Layer::new("Spatial folder", "group", width, height);
+    group.pixels.promote16();
+    group.opacity = 0.73;
+    group.mask = Some(paint_mask(width, height, 50001));
+    for y in 0..height {
+        for x in 0..width {
+            let value = 50001 - x as u16 * 173 - y as u16 * 97;
+            group.mask.as_mut().unwrap().steps[1].pixels.set16(
+                x as i32,
+                y as i32,
+                [value, value, value, 65535],
+            );
+        }
+    }
+    group.mask.as_mut().unwrap().steps.push(MaskStep {
+        id: id(),
+        kind: "gaussian".into(),
+        enabled: true,
+        weight: 0.7,
+        value: 1.0,
+        pixels: Raster::new_depth(width, height, 16),
+        settings: json!({"radius":4}),
+    });
+    base.parent = Some(group.id.clone());
+    let mut clip = Layer::new("Clipped color", "fill", width, height);
+    clip.pixels.promote16();
+    clip.color = [173, 93, 207, 211];
+    clip.parent = Some(group.id.clone());
+    clip.clip_to = Some(base.id.clone());
+    clip.opacity = 0.41;
+    let mut background = Layer::new("Background", "fill", width, height);
+    background.pixels.promote16();
+    background.color = [31, 43, 59, 255];
+    let target = base.id.clone();
+    engine.doc.layers = vec![group, clip, base, background];
+    let original = engine.doc.layers[2].pixels.rgba16();
+    let baseline = depth16::render(&engine.doc).unwrap().words;
+    engine.edit("human", &[
+        json!({"op":"effect.add","layer":target,"kind":"blur","settings":{"radius":4},"weight":0.7}),
+        json!({"op":"effect.add","layer":target,"kind":"invert"}),
+    ], None, None, "Spatial preview").unwrap();
+    let mut reference = engine.doc.clone();
+    let mut prepared = Image16 {
+        width,
+        height,
+        words: original.clone(),
+    };
+    for effect in &reference.layers[2].effects {
+        let before = prepared.words.clone();
+        if effect.kind == "blur" {
+            prepared.words = brute_blur(&prepared, 4.0);
+        } else {
+            for pixel in prepared.words.chunks_exact_mut(4).filter(|p| p[3] != 0) {
+                for channel in &mut pixel[..3] {
+                    *channel = 65535 - *channel;
+                }
+            }
+        }
+        for (source, pixel) in before
+            .chunks_exact(4)
+            .zip(prepared.words.chunks_exact_mut(4))
+        {
+            pixel.copy_from_slice(&effects::weighted_pixel(
+                source.try_into().unwrap(),
+                (&*pixel).try_into().unwrap(),
+                effect.weight,
+            ));
+        }
+    }
+    reference.layers[2].effects.clear();
+    reference.layers[2].pixels = Raster::from_rgba16(width, height, &prepared.words).unwrap();
+    let expected = depth16::render(&reference).unwrap().words;
+    let actual = depth16::render(&engine.doc).unwrap().words;
+    assert_eq!(actual, expected);
+    assert!(actual.iter().any(|value| value % 257 != 0));
+    assert_eq!(
+        depth16::preview16(&engine.doc, None, width, None, false)
+            .unwrap()
+            .2,
+        actual
+    );
+    assert_eq!(engine.doc.layers[2].pixels.rgba16(), original);
+    assert_eq!(engine.undo.len(), 1);
+    engine.undo("human").unwrap();
+    assert_eq!(engine.doc.layers[2].pixels.rgba16(), original);
+    assert_eq!(depth16::render(&engine.doc).unwrap().words, baseline);
+}
+
+#[test]
 fn local_and_spatial_masks_keep_native_precision_and_disabled_raw_source() {
     let mut doc = Document::new_depth(3, 1, 16).unwrap();
     for x in 0..3 {
