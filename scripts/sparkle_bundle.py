@@ -4,6 +4,7 @@ Upstream bytes and native normalization policy are distinct authorities. A nativ
 audit emits review candidates only; it never edits the committed policy.
 """
 import hashlib
+import base64
 import json
 import os
 import pathlib
@@ -16,6 +17,10 @@ import tempfile
 PREFIX = 'PeerBrush.app/Contents/Frameworks/Sparkle.framework/'
 PIN_NAME = 'packaging/sparkle/sparkle-2.10.0.json'
 POLICY_NAME = 'packaging/sparkle/native-policy.json'
+CHECK_CONFIGURATION = 'packaging/sparkle/check-configuration.json'
+CHECK_MARKER = b'pub const CHECK_LAYOUT: u32 = 1;'
+CHECK_SOURCES = {CHECK_CONFIGURATION, 'src/sparkle/check.rs', 'src/sparkle/macos/driver.rs',
+                 'src/sparkle/macos/installed.rs'}
 NOTICE = 'licenses/sparkle-2.10.0/LICENSE'
 OBJECTS = (
     ('Versions/B/XPCServices/Installer.xpc', 'Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer'),
@@ -34,7 +39,7 @@ CODE = frozenset(code for _, code in OBJECTS)
 DISABLED_INFO = dict(SUEnableAutomaticChecks=False, SUAutomaticallyUpdate=False,
     SUAllowsAutomaticUpdates=False, SUEnableSystemProfiling=False,
     SUVerifyUpdateBeforeExtraction=True, SURequireSignedFeed=True,
-    SUSignedFeedFailureExpiration=0)
+    SUSignedFeedFailureExpirationInterval=0)
 
 
 def pin(sources=None):
@@ -49,11 +54,11 @@ def pin(sources=None):
     return result
 
 
-def reviewed_policy(root=None):
+def reviewed_policy(root=None, sources=None):
     root = root or pathlib.Path(__file__).resolve().parents[1]
-    policy = json.loads((root / POLICY_NAME).read_text(encoding='utf-8'))
+    policy = json.loads(sources[POLICY_NAME] if sources is not None else (root / POLICY_NAME).read_bytes())
     if (not isinstance(policy, dict) or set(policy) != {'schema', 'archive_sha256', 'objects'} or policy['schema'] != 1
-            or policy['archive_sha256'] != pin()['archive_sha256'] or policy['objects'] is None):
+            or policy['archive_sha256'] != pin(sources)['archive_sha256'] or policy['objects'] is None):
         raise ValueError('Sparkle native signing/load policy awaits independent review; updater remains disabled')
     objects = policy['objects']
     if not isinstance(objects, dict) or set(objects) != {name for name, _ in OBJECTS}:
@@ -69,6 +74,42 @@ def reviewed_policy(root=None):
                 or (name != 'Versions/B/XPCServices/Downloader.xpc' and value['entitlements'] != {})):
             raise ValueError('Unreviewed Sparkle identifier, normalization or entitlement policy')
     return objects
+
+
+def check_pins(sources, version):
+    """Exact committed public check-only configuration; no service availability claim."""
+    if CHECK_MARKER not in sources.get('src/sparkle.rs', b''):
+        return None  # Historical dormant bundle sources retain their original plist.
+    if not CHECK_SOURCES <= set(sources):
+        raise ValueError('Manual Sparkle check source contract is incomplete')
+    pins = json.loads(sources[CHECK_CONFIGURATION])
+    if (not isinstance(pins, dict) or set(pins) != {'schema', 'feed_url', 'public_ed_key', 'publisher_team_id'}
+            or type(pins['schema']) is not int or pins['schema'] != 1):
+        raise ValueError('Invalid public Sparkle check configuration')
+    fields = [pins[name] for name in ('feed_url', 'public_ed_key', 'publisher_team_id')]
+    if fields == [None, None, None]:
+        return None
+    if (not all(isinstance(value, str) for value in fields)
+            or pins['feed_url'] != 'https://peerbrush.com/updates/macos/stable/appcast.xml'
+            or not re.fullmatch(r'[A-Z0-9]{10}', pins['publisher_team_id'])
+            or not re.fullmatch(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', version)):
+        raise ValueError('Manual Sparkle checks require complete reviewed public pins and a stable version')
+    try:
+        key = base64.b64decode(pins['public_ed_key'], validate=True)
+    except ValueError as error:
+        raise ValueError('Expected a canonical public Ed25519 key') from error
+    if (len(key) != 32 or not any(key)
+            or base64.b64encode(key).decode('ascii') != pins['public_ed_key']):
+        raise ValueError('Expected a canonical public Ed25519 key')
+    reviewed_policy(sources=sources)
+    return pins
+
+
+def check_publisher(root, commit, version, team):
+    from package import source_files
+    pins = check_pins({name: data for name, data, _ in source_files(root, commit)}, version)
+    if pins is not None and pins['publisher_team_id'] != team:
+        raise ValueError('Selected publisher differs from the compiled manual-check Team ID')
 
 
 def links(sources=None):

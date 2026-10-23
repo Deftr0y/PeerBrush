@@ -1,8 +1,12 @@
-//! Dormant package/native preparation. No application path starts an updater.
+//! Disabled-by-default manual appcast checks; installation remains unavailable.
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 pub const BUNDLED_LAYOUT: u32 = 1;
+pub const CHECK_LAYOUT: u32 = 1;
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod check;
 
 pub const PROPOSED_FEED_URL: &str = "https://peerbrush.com/updates/macos/stable/appcast.xml";
 

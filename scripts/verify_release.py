@@ -169,7 +169,10 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             if info.get('CFBundleShortVersionString') != short_version or info.get('CFBundleExecutable') != 'peerbrush' or info.get('CFBundleIdentifier') != 'com.peerbrush.PeerBrush' or info.get('CFBundlePackageType') != 'APPL':
                 raise ValueError('macOS app bundle version or executable mismatch')
             if manifest.get('macos_bundle_resources') == 1:
-                if info != macos_info(version, sparkle=sparkle_required):
+                from sparkle_bundle import CHECK_MARKER, check_pins
+                pins = check_pins(expected_source, version) if sparkle_required else None
+                check_layout = CHECK_MARKER in expected_source.get('src/sparkle.rs', b'')
+                if info != macos_info(version, sparkle=sparkle_required, check_pins=pins, check_layout=check_layout):
                     raise ValueError('macOS document consent, icon or bundle metadata differs from source')
                 if archive.read(prefix + MACOS_RESOURCES + 'PeerBrush.icns') != expected_source['assets/peerbrush.icns']:
                     raise ValueError('macOS icon differs from committed artwork')

@@ -1,5 +1,6 @@
 """Offline exact Sparkle payload tests; native commands are synthetic doubles."""
 import copy
+import base64
 import contextlib
 import hashlib
 import io
@@ -105,13 +106,50 @@ class Bundle(unittest.TestCase):
             self.assertFalse(output.exists())
 
     def test_disabled_plist_has_no_feed_key_or_raised_app_minimum(self):
-        info = package.macos_info('0.30.0-dev.1', sparkle=True)
+        info = package.macos_info('0.30.0-dev.1', sparkle=True, check_layout=True)
         self.assertEqual(info['LSMinimumSystemVersion'], '11.0')
         self.assertNotIn('SUFeedURL', info)
         self.assertNotIn('SUPublicEDKey', info)
         for key, value in bundle.DISABLED_INFO.items():
             self.assertEqual(info[key], value)
+        self.assertEqual(info['SUSignedFeedFailureExpirationInterval'], 0)
+        self.assertNotIn('SUSignedFeedFailureExpiration', info)
+        historical = package.macos_info('0.30.0-dev.1', sparkle=True)
+        self.assertEqual(historical['SUSignedFeedFailureExpiration'], 0)
+        self.assertNotIn('SUSignedFeedFailureExpirationInterval', historical)
         self.assertNotIn('SUEnableAutomaticChecks', package.macos_info('0.2.0'))
+
+    def test_manual_check_public_pins_fail_closed_and_preserve_historical_contract(self):
+        sources = {bundle.PIN_NAME: json.dumps(self.pin).encode(), 'src/sparkle.rs': bundle.CHECK_MARKER,
+                   **{name: b'// Synthetic source only' for name in bundle.CHECK_SOURCES}}
+        missing = dict(schema=1, feed_url=None, public_ed_key=None, publisher_team_id=None)
+        sources[bundle.CHECK_CONFIGURATION] = json.dumps(missing).encode()
+        self.assertIsNone(bundle.check_pins(sources, 'development'))
+        historical = {bundle.PIN_NAME: sources[bundle.PIN_NAME], 'src/sparkle.rs': b'pub const BUNDLED_LAYOUT: u32 = 1;'}
+        self.assertIsNone(bundle.check_pins(historical, '0.2.0'))
+        pins = dict(schema=1, feed_url='https://peerbrush.com/updates/macos/stable/appcast.xml',
+                    public_ed_key=base64.b64encode(bytes([1]) * 32).decode(), publisher_team_id='ABCD123456')
+        sources[bundle.POLICY_NAME] = json.dumps(dict(schema=1, archive_sha256=self.pin['archive_sha256'],
+            objects={name: dict(identifier='org.synthetic.helper', unsigned_sha256='a' * 64, entitlements={})
+                     for name, _ in bundle.OBJECTS})).encode()
+        for change in [dict(public_ed_key=None), dict(feed_url='https://evil.invalid/appcast.xml'),
+                       dict(public_ed_key=base64.b64encode(bytes(32)).decode()), dict(publisher_team_id='wrong')]:
+            sources[bundle.CHECK_CONFIGURATION] = json.dumps(pins | change).encode()
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                bundle.check_pins(sources, '0.30.0')
+        sources[bundle.CHECK_CONFIGURATION] = json.dumps(pins).encode()
+        with self.assertRaises(ValueError):
+            bundle.check_pins(sources, '0.30.0-dev.1')
+        self.assertEqual(bundle.check_pins(sources, '0.30.0'), pins)
+        info = package.macos_info('0.30.0', sparkle=True, check_pins=pins, check_layout=True)
+        self.assertEqual(info['SUFeedURL'], pins['feed_url'])
+        self.assertEqual(info['SUPublicEDKey'], pins['public_ed_key'])
+        self.assertEqual(info['LSMinimumSystemVersion'], '11.0')
+        for key, value in bundle.DISABLED_INFO.items():
+            self.assertEqual(info[key], value)
+        del sources[bundle.POLICY_NAME]
+        with self.assertRaises(KeyError):
+            bundle.check_pins(sources, '0.30.0')
 
     def test_committed_unreviewed_policy_blocks_before_any_native_signing(self):
         with self.assertRaisesRegex(ValueError, 'awaits independent review'):
@@ -251,6 +289,9 @@ class Bundle(unittest.TestCase):
             bundle.PIN_NAME: json.dumps(selected).encode(),
             bundle.POLICY_NAME: b'{"schema":1,"objects":null}\n',
             'packaging/sparkle/LICENSE': notice,
+            'src/sparkle.rs': b'pub const BUNDLED_LAYOUT: u32 = 1;\n' + bundle.CHECK_MARKER,
+            **{name: b'// Synthetic source sentinel, never executed\n' for name in bundle.CHECK_SOURCES},
+            bundle.CHECK_CONFIGURATION: b'{"schema":1,"feed_url":null,"public_ed_key":null,"publisher_team_id":null}',
         }.items():
             target = fixture.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +304,21 @@ class Bundle(unittest.TestCase):
         binary = fixture.root / 'synthetic-binary'
         binary.write_bytes(header)
         args = (fixture.root, binary, fixture.output, fixture.root / 'registry', 'macOS')
+        # Real writer/inspector must preserve the exact old ignored-key layout
+        # when inspecting historical source without the new capability marker.
+        marker = (fixture.root / 'src/sparkle.rs').read_bytes()
+        (fixture.root / 'src/sparkle.rs').write_bytes(b'pub const BUNDLED_LAYOUT: u32 = 1;')
+        fixture.commit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            historical = package.package(*args, verify_binary=False, rust_docs=fixture.rust_docs, sparkle_archive=upstream)
+        old_commit = package.git(fixture.root, 'rev-parse', 'HEAD').decode().strip()
+        old = verify_release.inspect_archive(historical, old_commit, '0.2.0', fixture.root)
+        with zipfile.ZipFile(historical) as zipped:
+            info = plistlib.loads(zipped.read(old['prefix'] + 'PeerBrush.app/Contents/Info.plist'))
+        self.assertEqual(info['SUSignedFeedFailureExpiration'], 0)
+        self.assertNotIn('SUSignedFeedFailureExpirationInterval', info)
+        (fixture.root / 'src/sparkle.rs').write_bytes(marker)
+        fixture.commit()
         with self.assertRaisesRegex(ValueError, 'explicitly selected pinned'):
             package.package(*args, verify_binary=False, rust_docs=fixture.rust_docs)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -272,14 +328,50 @@ class Bundle(unittest.TestCase):
         self.assertEqual(result['manifest']['macos_sparkle_layout'], 1)
         with zipfile.ZipFile(archive) as zipped:
             prefix = result['prefix']
+            info = plistlib.loads(zipped.read(prefix + 'PeerBrush.app/Contents/Info.plist'))
+            self.assertEqual(info['SUSignedFeedFailureExpirationInterval'], 0)
+            self.assertNotIn('SUSignedFeedFailureExpiration', info)
             self.assertEqual(zipped.read(prefix + bundle.NOTICE), notice)
             self.assertEqual(zipped.read(prefix + 'PeerBrush.app/Contents/Resources/' + bundle.NOTICE), notice)
             self.assertEqual(sum(stat.S_ISLNK(item.external_attr >> 16) for item in zipped.infolist()), 9)
+            original = [(item.filename, zipped.read(item), item.external_attr >> 16) for item in zipped.infolist()]
+        # Source capability, not the global helper revision, selects the exact
+        # new plist. Replacing it with the historical ignored key must refuse.
+        replaced = dict(info)
+        replaced['SUSignedFeedFailureExpiration'] = replaced.pop('SUSignedFeedFailureExpirationInterval')
+        info_name = result['prefix'] + 'PeerBrush.app/Contents/Info.plist'
+        package.write_zip(archive, [(name, plistlib.dumps(replaced) if name == info_name else data, mode)
+                                    for name, data, mode in original], 0)
+        with self.assertRaisesRegex(ValueError, 'bundle metadata differs from source'):
+            verify_release.inspect_archive(archive, commit, '0.2.0', fixture.root)
+        package.write_zip(archive, original, 0)
         native = mock.Mock()
         with mock.patch.object(sign_macos.sys, 'platform', 'darwin'), mock.patch.object(sign_macos, 'preflight', native):
             with self.assertRaisesRegex(ValueError, 'awaits independent review'):
                 sign_macos.sign_archive(archive, self.base / 'signed', self.base / 'sign-work', commit,
                     '0.2.0', package.digest(archive), 'ABCD123456', 'A' * 40, 'synthetic-existing-profile',
+                    '1', source_root=fixture.root)
+        native.assert_not_called()
+        # The same real writer/inspector binds reviewed public pins to source;
+        # no native provider is reached for a mismatching publisher.
+        pins = dict(schema=1, feed_url='https://peerbrush.com/updates/macos/stable/appcast.xml',
+                    public_ed_key=base64.b64encode(bytes([1]) * 32).decode(), publisher_team_id='ABCD123456')
+        (fixture.root / bundle.CHECK_CONFIGURATION).write_text(json.dumps(pins))
+        (fixture.root / bundle.POLICY_NAME).write_text(json.dumps(dict(schema=1, archive_sha256=selected['archive_sha256'],
+            objects={name: dict(identifier='org.synthetic.helper', unsigned_sha256='a' * 64, entitlements={})
+                     for name, _ in bundle.OBJECTS})))
+        fixture.commit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            archive = package.package(*args, verify_binary=False, rust_docs=fixture.rust_docs, sparkle_archive=upstream)
+        commit = package.git(fixture.root, 'rev-parse', 'HEAD').decode().strip()
+        result = verify_release.inspect_archive(archive, commit, '0.2.0', fixture.root)
+        with zipfile.ZipFile(archive) as zipped:
+            info = plistlib.loads(zipped.read(result['prefix'] + 'PeerBrush.app/Contents/Info.plist'))
+        self.assertEqual(info, package.macos_info('0.2.0', sparkle=True, check_pins=pins, check_layout=True))
+        with mock.patch.object(sign_macos.sys, 'platform', 'darwin'), mock.patch.object(sign_macos, 'preflight', native):
+            with self.assertRaisesRegex(ValueError, 'compiled manual-check Team ID'):
+                sign_macos.sign_archive(archive, self.base / 'wrong-team', self.base / 'wrong-team-work', commit,
+                    '0.2.0', package.digest(archive), 'ZZZZ123456', 'A' * 40, 'synthetic-existing-profile',
                     '1', source_root=fixture.root)
         native.assert_not_called()
         # A manifest cannot relabel this source as the historical regular layout.
@@ -345,6 +437,11 @@ class Bundle(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'incomplete'):
             package.macos_sparkle_required(sources)
         self.assertFalse(package.macos_sparkle_required([('src/sparkle.rs', b'// Historical probe', 0o644)]))
+        complete = {name: b'' for name in ['scripts/sparkle_bundle.py', bundle.POLICY_NAME,
+                    'packaging/sparkle/LICENSE', bundle.PIN_NAME]}
+        complete['src/sparkle.rs'] = bundle.CHECK_MARKER
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            package.macos_sparkle_required([(name,data,0o644) for name,data in complete.items()])
 
     def test_native_verifier_rejects_publisher_timestamp_entitlement_and_code_changes(self):
         app = self.base / 'PeerBrush.app'

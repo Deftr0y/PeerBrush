@@ -38,10 +38,14 @@ def macos_sparkle_required(sources):
     if required and not {'scripts/sparkle_bundle.py', 'packaging/sparkle/native-policy.json',
                          'packaging/sparkle/LICENSE', 'packaging/sparkle/sparkle-2.10.0.json'} <= set(values):
         raise ValueError('Dormant Sparkle source policy is incomplete; do not downgrade its bundle layout')
+    if b'pub const CHECK_LAYOUT: u32 = 1;' in values.get('src/sparkle.rs', b''):
+        from sparkle_bundle import CHECK_SOURCES
+        if not required or not CHECK_SOURCES <= set(values):
+            raise ValueError('Manual Sparkle check source contract is incomplete')
     return required
 
 
-def macos_info(version, sparkle=False):
+def macos_info(version, sparkle=False, check_pins=None, check_layout=False):
     numeric = r'(?:0|[1-9][0-9]*)'
     parsed = re.fullmatch(r'(' + numeric + r'\.' + numeric + r'\.' + numeric + r')(-dev\.' + numeric + r')?', version)
     if not parsed:
@@ -64,6 +68,14 @@ def macos_info(version, sparkle=False):
     if sparkle:
         from sparkle_bundle import DISABLED_INFO
         info.update(DISABLED_INFO)
+        if not check_layout:
+            # Exact historical BUNDLED_LAYOUT1 sources used this ignored key.
+            # Preserve their byte contract; CHECK_LAYOUT1 corrects the policy.
+            info['SUSignedFeedFailureExpiration'] = info.pop('SUSignedFeedFailureExpirationInterval')
+        if check_pins is not None:
+            if not check_layout:
+                raise ValueError('Configured manual-check pins require the corrected source layout')
+            info.update(SUFeedURL=check_pins['feed_url'], SUPublicEDKey=check_pins['public_ed_key'])
     if parsed[2]:
         info['PeerBrushDevelopmentVersion'] = version
     return info
@@ -501,6 +513,12 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
     if binary_source_commit != commit:
         equivalent_build_inputs(root, sources, binary_source_commit)
     version = tomllib.loads(next(data for name, data, _ in sources if name == 'Cargo.toml').decode('utf-8'))['package']['version']
+    check_pins = None
+    check_layout = False
+    if sparkle:
+        from sparkle_bundle import CHECK_MARKER, check_pins as selected_check_pins
+        check_layout = CHECK_MARKER in dict((name, data) for name, data, _ in sources).get('src/sparkle.rs', b'')
+        check_pins = selected_check_pins({name: data for name, data, _ in sources}, version)
     binary = regular_file(binary.absolute().parent, binary.name)
     executable = binary.read_bytes()
     validate_binary(executable)
@@ -534,7 +552,7 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             contents = bundle / 'PeerBrush.app' / 'Contents'
             (contents / 'MacOS').mkdir(parents=True)
             with (contents / 'Info.plist').open('wb') as stream:
-                plistlib.dump(macos_info(version, sparkle=sparkle), stream)
+                plistlib.dump(macos_info(version, sparkle=sparkle, check_pins=check_pins, check_layout=check_layout), stream)
         staged_binary = bundle / relative
         staged_binary.write_bytes(executable)
         staged_binary.chmod(0o755)

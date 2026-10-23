@@ -1,5 +1,7 @@
-//! Credential-free native bridge probe. No start/check/install method is exposed.
+//! Owned manual information checks and the credential-free native component probe.
 use super::{require_supported_macos, Configuration};
+mod driver;
+mod installed;
 use block2::{Block, RcBlock};
 use objc2::{
     class, define_class, msg_send,
@@ -13,6 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::{
     collections::BTreeSet, ffi::c_void, fs, os::unix::fs::MetadataExt, path::Path, process::Command,
 };
+use std::{path::PathBuf, rc::Rc, sync::mpsc};
 
 // CommonCrypto is supplied by libSystem, already part of macOS. No crypto crate
 // or build-time tool is added just to hash these small pinned framework files.
@@ -45,6 +48,11 @@ pub fn verify_framework(root: &Path) -> Result<(), String> {
 }
 
 fn verify_framework_with_notice(root: &Path, notice: &Path) -> Result<(), String> {
+    verify_inventory(root, notice, false)?;
+    verify_upstream_signatures(root)
+}
+
+fn verify_inventory(root: &Path, notice: &Path, signed: bool) -> Result<(), String> {
     if !root.is_absolute() {
         return Err("Sparkle preparation requires an absolute external framework path".into());
     }
@@ -69,7 +77,7 @@ fn verify_framework_with_notice(root: &Path, notice: &Path) -> Result<(), String
     if !notice_metadata.is_file()
         || notice_metadata.nlink() != 1
         || notice_metadata.len() > 64 * 1024
-        || sha256(&fs::read(notice).map_err(|_| "Unreadable Sparkle notice")?)?
+        || sha256(&installed::bounded(notice, 64 * 1024)?)?
             != pin["license_sha256"]
                 .as_str()
                 .ok_or("Missing compiled Sparkle notice hash")?
@@ -82,6 +90,7 @@ fn verify_framework_with_notice(root: &Path, notice: &Path) -> Result<(), String
         path: &Path,
         expected: &serde_json::Map<String, Value>,
         visited: &mut BTreeSet<String>,
+        signed: bool,
     ) -> Result<(), String> {
         let relative = path
             .strip_prefix(root)
@@ -111,12 +120,26 @@ fn verify_framework_with_notice(root: &Path, notice: &Path) -> Result<(), String
             json!({"kind":"directory", "mode":metadata.mode() & 0o7777})
         } else if metadata.is_file() && metadata.nlink() == 1 && metadata.len() <= 16 * 1024 * 1024
         {
-            let bytes = fs::read(path).map_err(|_| "Unreadable Sparkle code/resource")?;
+            let bytes = installed::bounded(path, 16 * 1024 * 1024)?;
             json!({"kind":"file", "mode":metadata.mode() & 0o7777, "bytes":bytes.len(), "sha256":sha256(&bytes)?})
         } else {
             return Err("Unexpected Sparkle entry type, hard link or file size".into());
         };
-        if expected.get(name) != Some(&actual) || !visited.insert(name.into()) {
+        let transformed = signed
+            && (crate::sparkle::check::OBJECTS
+                .iter()
+                .any(|(_, code)| *code == name)
+                || crate::sparkle::check::SEALS.contains(&name));
+        let matches = if transformed {
+            expected.get(name).is_some_and(|entry| {
+                entry["kind"] == "file"
+                    && actual["kind"] == "file"
+                    && actual["mode"] == entry["mode"]
+            })
+        } else {
+            expected.get(name) == Some(&actual)
+        };
+        if !matches || !visited.insert(name.into()) {
             return Err("Sparkle framework differs from its exact committed pin".into());
         }
         if metadata.is_dir() {
@@ -128,15 +151,20 @@ fn verify_framework_with_notice(root: &Path, notice: &Path) -> Result<(), String
                         .path(),
                     expected,
                     visited,
+                    signed,
                 )?;
             }
         }
         Ok(())
     }
-    visit(root, root, expected, &mut visited)?;
+    visit(root, root, expected, &mut visited, signed)?;
     if visited.len() != expected.len() {
         return Err("Incomplete Sparkle framework inventory".into());
     }
+    Ok(())
+}
+
+fn verify_upstream_signatures(root: &Path) -> Result<(), String> {
     // Verify each precise pinned code object, never a wildcard or --deep signing.
     // The upstream signatures are ad hoc: this establishes integrity of pinned
     // CI inputs, not our Developer ID or distribution/notarization acceptance.
@@ -194,6 +222,7 @@ impl PendingCycle {
 }
 
 struct DelegateState {
+    checks: Rc<driver::State>,
     error: Retained<NSError>,
     pending: RefCell<Option<PendingCycle>>,
     revision: Cell<u64>,
@@ -325,7 +354,8 @@ define_class!(
 
     impl PreparationDelegate {
         #[unsafe(method(updater:mayPerformUpdateCheck:error:))]
-        fn may_check(&self, _updater: &AnyObject, _kind: isize, error: *mut *mut NSError) -> Bool {
+        fn may_check(&self, updater: &AnyObject, kind: isize, error: *mut *mut NSError) -> Bool {
+            if self.ivars().checks.may_check(updater, kind) { return Bool::YES; }
             if !error.is_null() {
                 // Sparkle's NSError** is an autoreleasing out parameter; the
                 // delegate owns the error for the controller's whole lifetime.
@@ -335,7 +365,8 @@ define_class!(
         }
 
         #[unsafe(method(updater:shouldProceedWithUpdate:updateCheck:error:))]
-        fn may_proceed(&self, _updater: &AnyObject, _item: &AnyObject, _kind: isize, error: *mut *mut NSError) -> Bool {
+        fn may_proceed(&self, updater: &AnyObject, item: &AnyObject, kind: isize, error: *mut *mut NSError) -> Bool {
+            if self.ivars().checks.may_proceed(updater, item, kind) { return Bool::YES; }
             if !error.is_null() {
                 unsafe { *error = Retained::as_ptr(&self.ivars().error).cast_mut(); }
             }
@@ -355,13 +386,35 @@ define_class!(
         }
 
         #[unsafe(method(updater:didAbortWithError:))]
-        fn aborted(&self, _updater: &AnyObject, _error: &NSError) {
-            self.ivars().invalidate("The update was interrupted. Automatic installation remains disabled.");
+        fn aborted(&self, updater: &AnyObject, error: &NSError) {
+            let checks=&self.ivars().checks;
+            if checks.has_owner() && !checks.owns(updater) { return; }
+            // The user driver's no-update acknowledgement causes Sparkle to
+            // abort with SUNoUpdateError before its normal finish callback.
+            let no_update=checks.owns(updater)
+                && checks.view().phase==crate::sparkle::check::Phase::NoUpdate
+                && driver::no_update(error);
+            if checks.owns(updater) && !no_update { checks.failed(); }
+            self.ivars().invalidate(if no_update { "No compatible signed app update was found." }
+                else { "The update was interrupted. Automatic installation remains disabled." });
         }
 
         #[unsafe(method(updater:didFinishUpdateCycleForUpdateCheck:error:))]
-        fn finished(&self, _updater: &AnyObject, _kind: isize, _error: Option<&NSError>) {
+        fn finished(&self, updater: &AnyObject, _kind: isize, _error: Option<&NSError>) {
+            if self.ivars().checks.has_owner() && !self.ivars().checks.owns(updater) { return; }
+            self.ivars().checks.finished();
             self.ivars().invalidate("The update cycle ended. Automatic installation remains disabled.");
+        }
+
+        #[unsafe(method(updater:shouldDownloadReleaseNotesForUpdate:))]
+        fn download_notes(&self, _updater: &AnyObject, _item: &AnyObject) -> Bool { Bool::NO }
+
+        #[unsafe(method(allowedSystemProfileKeysForUpdater:))]
+        fn profile_keys(&self, _updater: &AnyObject) -> Retained<AnyObject> { unsafe { msg_send![class!(NSArray), array] } }
+
+        #[unsafe(method(feedURLStringForUpdater:))]
+        fn feed_url(&self, updater: &AnyObject) -> Option<Retained<NSString>> {
+            self.ivars().checks.owns(updater).then(|| NSString::from_str(crate::sparkle::PROPOSED_FEED_URL))
         }
 
         #[unsafe(method(updaterShouldRelaunchApplication:))]
@@ -376,17 +429,22 @@ define_class!(
 pub struct Probe {
     controller: Retained<AnyObject>,
     delegate: Retained<PreparationDelegate>,
+    _driver: Retained<driver::CheckDriver>,
     _framework: Retained<NSBundle>,
 }
 
 impl Probe {
     /// Credential-free native component assertion. No continuation is invoked
-    /// and no document closes. The passive application owner type holds Probe
+    /// and no document closes. The application owner type holds Probe
     /// here; this is not a configured application update cycle.
     pub fn assert_application_guards(self) {
+        let checks = self.delegate.ivars().checks.clone();
         let mut application = Application {
             controller: Some(self),
             message: "Prepared updates remain disabled",
+            configuration: None,
+            verification: None,
+            checks,
         };
         for depth in [8, 16] {
             let mut engine = crate::engine::Engine::new();
@@ -405,8 +463,7 @@ impl Probe {
             let block = RcBlock::new(move || counter.set(counter.get() + 1));
             {
                 let owner = application.controller.as_ref().unwrap();
-                let updater: Retained<AnyObject> =
-                    unsafe { msg_send![&*owner.controller, updater] };
+                let updater: Retained<AnyObject> = owner.controller.clone();
                 let item: Retained<AnyObject> =
                     unsafe { msg_send![class!(SUAppcastItem), emptyAppcastItem] };
                 let postponed: Bool = unsafe {
@@ -444,8 +501,7 @@ impl Probe {
             }
             {
                 let owner = application.controller.as_ref().unwrap();
-                let updater: Retained<AnyObject> =
-                    unsafe { msg_send![&*owner.controller, updater] };
+                let updater: Retained<AnyObject> = owner.controller.clone();
                 let error = Retained::as_ptr(&owner.delegate.ivars().error);
                 unsafe {
                     let _: () =
@@ -478,7 +534,9 @@ impl Probe {
 
     /// Exercise real selectors while asserting all operations stay vetoed.
     pub fn assert_disabled(&self) {
-        let updater: Retained<AnyObject> = unsafe { msg_send![&*self.controller, updater] };
+        driver::assert_guarded(MainThreadMarker::new().expect("Main-thread component probe"));
+        self.assert_no_update_sequence();
+        let updater: Retained<AnyObject> = self.controller.clone();
         let actual_delegate: Option<Retained<AnyObject>> =
             unsafe { msg_send![&*updater, delegate] };
         assert_eq!(
@@ -607,10 +665,97 @@ impl Probe {
         self.clear_unstarted_component_callbacks();
     }
 
+    fn assert_no_update_sequence(&self) {
+        use crate::sparkle::check::Phase;
+        let framework = PathBuf::from(self._framework.bundlePath().to_string());
+        for (shown_domain, abort_domain, abort_code, cancelled, expected) in [
+            (
+                "SUSparkleErrorDomain",
+                "SUSparkleErrorDomain",
+                1001_isize,
+                false,
+                Phase::NoUpdate,
+            ),
+            (
+                "SUSparkleErrorDomain",
+                "OtherErrorDomain",
+                1001,
+                false,
+                Phase::Failed,
+            ),
+            (
+                "SUSparkleErrorDomain",
+                "SUSparkleErrorDomain",
+                1002,
+                false,
+                Phase::Failed,
+            ),
+            (
+                "OtherErrorDomain",
+                "SUSparkleErrorDomain",
+                1001,
+                false,
+                Phase::Failed,
+            ),
+            (
+                "SUSparkleErrorDomain",
+                "SUSparkleErrorDomain",
+                1001,
+                true,
+                Phase::Cancelled,
+            ),
+        ] {
+            let marker = MainThreadMarker::new().expect("Main-thread component probe");
+            let checks = Rc::new(driver::State::default());
+            let owner = construct_with_state(&framework, marker, checks.clone()).unwrap();
+            let error = |domain: &str, code: isize| -> Retained<NSError> {
+                unsafe {
+                    msg_send![class!(NSError), errorWithDomain: &*NSString::from_str(domain), code: code, userInfo: std::ptr::null::<AnyObject>()]
+                }
+            };
+            let shown = error(shown_domain, 1001);
+            let abort = error(abort_domain, abort_code);
+            checks.session.borrow_mut().begin().unwrap();
+            checks.checking(&owner.controller);
+            // Another updater cannot abort/finish this owned manual cycle.
+            unsafe {
+                let _: () = msg_send![&*owner.delegate, updater: &*self.controller, didAbortWithError: &*abort];
+                let _: () = msg_send![&*owner.delegate, updater: &*self.controller, didFinishUpdateCycleForUpdateCheck: 0_isize, error: &*abort];
+            }
+            assert_eq!(checks.view().phase, Phase::Checking);
+            assert!(checks.view().busy);
+            if cancelled {
+                checks.cancel();
+            }
+            let calls = Rc::new(Cell::new(0));
+            let count = calls.clone();
+            let delegate = owner.delegate.clone();
+            let updater = owner.controller.clone();
+            let acknowledgement = RcBlock::new(move || {
+                count.set(count.get() + 1);
+                // Reproduce the real user-driver acknowledgement -> abort ->
+                // finish selector order without starting any native updater.
+                unsafe {
+                    let _: () =
+                        msg_send![&*delegate, updater: &*updater, didAbortWithError: &*abort];
+                    let _: () = msg_send![&*delegate, updater: &*updater, didFinishUpdateCycleForUpdateCheck: 0_isize, error: &*abort];
+                }
+            });
+            unsafe {
+                let _: () = msg_send![&*owner._driver, showUpdateNotFoundWithError: &*shown, acknowledgement: &*acknowledgement];
+            }
+            assert_eq!(calls.get(), 1);
+            assert_eq!(checks.view().phase, expected);
+            assert!(!checks.view().busy);
+            let ready: Bool = unsafe { msg_send![&*owner.controller, canCheckForUpdates] };
+            assert!(!ready.as_bool());
+        }
+    }
+
     fn clear_unstarted_component_callbacks(&self) {
-        // Component assertions only. Probe is constructed with startingUpdater:NO
+        // Component assertions only. Probe is constructed without calling startUpdater
         // and exposes no start method. This is not an application recovery API.
-        let updater: Retained<AnyObject> = unsafe { msg_send![&*self.controller, updater] };
+        let updater: Retained<AnyObject> = self.controller.clone();
         let ready: Bool = unsafe { msg_send![&*updater, canCheckForUpdates] };
         assert!(!ready.as_bool());
         let state = self.delegate.ivars();
@@ -638,6 +783,14 @@ pub fn probe(root: &Path, configuration: &Configuration) -> Result<Probe, String
 }
 
 fn construct(root: &Path, marker: MainThreadMarker) -> Result<Probe, String> {
+    construct_with_state(root, marker, Rc::new(driver::State::default()))
+}
+
+fn construct_with_state(
+    root: &Path,
+    marker: MainThreadMarker,
+    checks: Rc<driver::State>,
+) -> Result<Probe, String> {
     unsafe {
         let _: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
     }
@@ -654,8 +807,8 @@ fn construct(root: &Path, marker: MainThreadMarker) -> Result<Probe, String> {
             .map_err(|_| "Verified Sparkle framework could not load")?;
     }
     let controller_class = framework
-        .classNamed(&NSString::from_str("SPUStandardUpdaterController"))
-        .ok_or("Pinned Sparkle standard controller is unavailable")?;
+        .classNamed(&NSString::from_str("SPUUpdater"))
+        .ok_or("Pinned Sparkle updater is unavailable")?;
     let domain = NSString::from_str("com.peerbrush.SparklePreparation");
     let message = NSString::from_str("Sparkle updates remain disabled until feed, public key and native safety acceptance are configured and verified.");
     let key = NSString::from_str("NSLocalizedDescription");
@@ -665,6 +818,7 @@ fn construct(root: &Path, marker: MainThreadMarker) -> Result<Probe, String> {
         msg_send![class!(NSError), errorWithDomain: &*domain, code: 1_isize, userInfo: &*info]
     };
     let delegate = PreparationDelegate::alloc(marker).set_ivars(DelegateState {
+        checks: checks.clone(),
         error,
         pending: RefCell::new(None),
         revision: Cell::new(0),
@@ -674,14 +828,16 @@ fn construct(root: &Path, marker: MainThreadMarker) -> Result<Probe, String> {
     });
     let delegate: Retained<PreparationDelegate> = unsafe { msg_send![super(delegate), init] };
     let allocated: Allocated<AnyObject> = unsafe { msg_send![controller_class, alloc] };
+    let user_driver = driver::create(marker, checks);
+    let host = NSBundle::mainBundle();
     let controller: Option<Retained<AnyObject>> = unsafe {
-        msg_send![allocated,
-        initWithStartingUpdater: Bool::NO, updaterDelegate: &*delegate,
-        userDriverDelegate: std::ptr::null::<AnyObject>()]
+        msg_send![allocated, initWithHostBundle: &*host, applicationBundle: &*host,
+        userDriver: &*user_driver, delegate: &*delegate]
     };
     Ok(Probe {
         controller: controller.ok_or("Sparkle preparation controller could not initialize")?,
         delegate,
+        _driver: user_driver,
         _framework: framework,
     })
 }
@@ -721,22 +877,34 @@ pub fn probe_bundled(app: &Path, configuration: &Configuration) -> Result<Probe,
     construct(&framework, marker)
 }
 
-/// Application-owned passive lifetime. Configured app loading/update execution
-/// is not implemented. The default owner loads nothing, preserves macOS 11 and
-/// adds no codesign startup work; only the explicit native component owns Probe.
+/// Main-thread application owner. Missing compiled pins load nothing; verified
+/// configured apps may run a manual information-only cycle, never installation.
+struct Verification {
+    receiver: mpsc::Receiver<Result<installed::Verified, String>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 pub struct Application {
     controller: Option<Probe>,
     message: &'static str,
+    configuration: Option<crate::sparkle::check::ApprovedCheck>,
+    verification: Option<Verification>,
+    checks: Rc<driver::State>,
 }
 
 impl Application {
-    pub fn dormant() -> Self {
+    pub fn load() -> Self {
         let supported = require_supported_macos(
             NSProcessInfo::processInfo()
                 .operatingSystemVersion()
                 .majorVersion,
         )
         .is_ok();
+        let configuration = if supported {
+            crate::sparkle::check::compiled().ok().flatten()
+        } else {
+            None
+        };
         Self {
             controller: None,
             message: if supported {
@@ -744,28 +912,135 @@ impl Application {
             } else {
                 "Automatic updates are unavailable on macOS 11. PeerBrush remains supported."
             },
+            configuration,
+            verification: None,
+            checks: Rc::new(driver::State::default()),
         }
     }
-
+    pub(crate) fn configured(&self) -> bool {
+        self.configuration.is_some()
+    }
+    pub(crate) fn view(&self) -> std::cell::Ref<'_, crate::sparkle::check::Session> {
+        self.checks.view()
+    }
     pub fn message(&self) -> &'static str {
         self.controller
             .as_ref()
             .and_then(|owner| owner.delegate.ivars().message.get())
             .unwrap_or(self.message)
     }
-
     pub fn pending_installation(&self) -> bool {
-        self.controller
-            .as_ref()
-            .is_some_and(|owner| owner.delegate.ivars().termination_inhibited.get())
+        self.checks.view().quarantine
+            || self
+                .controller
+                .as_ref()
+                .is_some_and(|owner| owner.delegate.ivars().termination_inhibited.get())
     }
-
     pub fn defer(&self) {
+        if let Some(work) = &self.verification {
+            work.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.checks.cancel();
         if let Some(owner) = &self.controller {
             owner.delegate.ivars().defer();
         }
     }
-
+    pub(crate) fn check(&mut self, ctx: &eframe::egui::Context) -> Result<(), String> {
+        let configuration = self
+            .configuration
+            .clone()
+            .ok_or("App update checking is not available in this build")?;
+        if self.verification.is_some() || self.checks.view().busy || self.pending_installation() {
+            return Err("The current app update check must finish first".into());
+        }
+        if let Some(owner) = &self.controller {
+            let busy: Bool = unsafe { msg_send![&*owner.controller, sessionInProgress] };
+            if busy.as_bool() {
+                return Err("The current app update check must finish first".into());
+            }
+        }
+        let app = PathBuf::from(NSBundle::mainBundle().bundlePath().to_string());
+        let executable = std::env::current_exe().map_err(|_| "Running app path unavailable")?;
+        if !app.is_absolute() || executable != app.join("Contents/MacOS/peerbrush") {
+            return Err("App update checking requires the running installed bundle".into());
+        }
+        let checks = Rc::new(driver::State::default());
+        checks.begin(ctx)?;
+        let (sender, receiver) = mpsc::channel();
+        let repaint = ctx.clone();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        std::thread::Builder::new()
+            .name("peerbrush-app-update-verification".into())
+            .spawn(move || {
+                let result = installed::verify(app, configuration, worker_cancel);
+                let _ = sender.send(result);
+                repaint.request_repaint();
+            })
+            .map_err(|_| "Could not start app update verification")?;
+        self.controller = None;
+        self.checks = checks;
+        self.verification = Some(Verification { receiver, cancel });
+        Ok(())
+    }
+    pub(crate) fn tick(&mut self, ctx: &eframe::egui::Context) {
+        if self.checks.timed_out() && !self.checks.view().cancelled {
+            self.defer();
+        }
+        let result = self
+            .verification
+            .as_ref()
+            .map(|work| work.receiver.try_recv());
+        if let Some(result) = result {
+            match result {
+                Ok(result) => {
+                    self.verification = None;
+                    if self.checks.view().cancelled {
+                        self.checks.finished();
+                    } else {
+                        let result = result.and_then(|verified| {
+                            verified.recheck()?;
+                            let marker = MainThreadMarker::new()
+                                .ok_or("App update checking requires the main thread")?;
+                            let owner = construct_with_state(
+                                &verified.framework,
+                                marker,
+                                self.checks.clone(),
+                            )?;
+                            verified.recheck()?;
+                            self.checks.checking(&owner.controller);
+                            self.controller = Some(owner);
+                            let owner = self.controller.as_ref().unwrap();
+                            let mut error: *mut NSError = std::ptr::null_mut();
+                            let started: Bool =
+                                unsafe { msg_send![&*owner.controller, startUpdater: &mut error] };
+                            if !started.as_bool() {
+                                return Err("App update checking could not start".into());
+                            }
+                            unsafe {
+                                let _: () = msg_send![&*owner.controller, checkForUpdates];
+                            }
+                            Ok(())
+                        });
+                        if result.is_err() {
+                            self.checks.failed();
+                            self.checks.finished();
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.verification = None;
+                    self.checks.failed();
+                    self.checks.finished();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.verification.is_some() || self.checks.view().busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
     /// Read-only preparation guard. The application has no installation,
     /// relaunch or recovery executor; no project closes and no block is invoked.
     pub fn request_installation(
@@ -792,5 +1067,11 @@ impl Application {
         }
         state.ready_kind(kind)?;
         Err("Automatic updates are not available in this development build.".into())
+    }
+}
+
+impl Drop for Application {
+    fn drop(&mut self) {
+        self.defer();
     }
 }

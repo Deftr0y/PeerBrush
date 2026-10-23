@@ -252,8 +252,9 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
         # automatically; reconcile notarytool history before another upload.
         state = {'configuration': configuration}
     if manifest.get('macos_sparkle_layout') == 1:
-        from sparkle_bundle import reviewed_policy
+        from sparkle_bundle import reviewed_policy, check_publisher
         reviewed_policy(root)
+        check_publisher(root, commit, version, team_id)
     preflight(team_id, identity, profile, keychain)
     prefix = inspected['prefix'].rstrip('/')
     bundle = work / 'payload' / prefix
@@ -388,8 +389,9 @@ def sign_dmg(archive, output, work, commit, version, expected_sha256,
             or manifest['macos_signing']['team_id'] != team_id):
         raise ValueError('DMG signing requires an already signed, notarized and stapled app from this Team ID')
     if manifest.get('macos_sparkle_layout') == 1:
-        from sparkle_bundle import reviewed_policy
+        from sparkle_bundle import reviewed_policy, check_publisher
         reviewed_policy(root)
+        check_publisher(root, commit, version, team_id)
     work, output = outside_checkout(work, root), outside_checkout(output, root)
     if output.resolve().is_relative_to(work.resolve()) or work.resolve().is_relative_to(output.resolve()):
         raise ValueError('Signing work and final output directories must be separate')

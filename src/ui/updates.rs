@@ -39,7 +39,7 @@ impl Panel {
             last_notification: None,
             defer_current: false,
             #[cfg(target_os = "macos")]
-            native_updater: crate::sparkle::macos::Application::dormant(),
+            native_updater: crate::sparkle::macos::Application::load(),
             #[cfg(any(windows, test))]
             store_check: store::Check::default(),
         }
@@ -98,6 +98,8 @@ impl Panel {
         }
     }
     fn tick(&mut self, ctx: &egui::Context, allow_notification: bool) {
+        #[cfg(target_os = "macos")]
+        self.native_updater.tick(ctx);
         #[cfg(any(windows, test))]
         {
             self.store_check.tick(Instant::now());
@@ -165,6 +167,35 @@ impl Panel {
                 #[cfg(any(windows, test))]
                 if self.owner == Owner::MicrosoftStore {
                     self.store_check.show(ui);
+                }
+                #[cfg(target_os = "macos")]
+                if self.native_updater.configured() {
+                    use crate::sparkle::check::Phase;
+                    ui.label("Signed macOS stable release information");
+                    let busy=self.native_updater.view().busy;
+                    if ui.add_enabled(!busy,egui::Button::new("Check app updates")).clicked() {
+                        if let Err(error)=self.native_updater.check(ctx) { self.message=error; }
+                    }
+                    let phase=self.native_updater.view().phase;
+                    match phase {
+                        Phase::Verifying | Phase::Checking => {
+                            ui.horizontal(|ui| { ui.spinner(); ui.label(if phase==Phase::Verifying { "Verifying this app for secure update checking…" } else { "Checking signed release information…" }); });
+                            if ui.button("Cancel app check").clicked() { self.native_updater.defer(); }
+                        }
+                        Phase::Found => {
+                            let state=self.native_updater.view();
+                            if let Some(version)=&state.version { ui.label(format!("New app version {version}")); }
+                            if !state.notes.is_empty() { egui::ScrollArea::vertical().id_salt("sparkle_notes").max_height(180.).show(ui,|ui| { ui.label(&state.notes); }); } else { ui.label("Plain-text release notes are not embedded in this update."); }
+                            ui.label("Package download is unavailable in this build.");
+                        }
+                        Phase::NoUpdate => { ui.label("No compatible signed app update was found."); }
+                        Phase::Cancelled => { ui.label("App update check cancelled."); }
+                        Phase::Failed => { ui.label("App update checking could not complete. Try again later."); }
+                        Phase::Quarantined => {}
+                        Phase::Idle => {}
+                    }
+                    let state=self.native_updater.view();
+                    if !state.notice.is_empty() { ui.label(state.notice); }
                 }
                 ui.label("Official GitHub release notes and portable package metadata");
                 let mut preferences = self.store.preferences.clone();
