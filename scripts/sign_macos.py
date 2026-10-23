@@ -13,6 +13,7 @@ import pathlib
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,9 @@ def preflight(team_id, identity, profile, keychain=None):
 
 def verify_native(app, team_id, notarized=False):
     """Actual Apple validation is mandatory before releasing a final artifact."""
+    if (app / 'Contents/Frameworks/Sparkle.framework').exists():
+        from sparkle_bundle import reviewed_policy
+        reviewed_policy()
     requirement = ('=anchor apple generic and certificate leaf[subject.OU] = '
                    f'"{team_id}" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists')
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', '--verbose=2',
@@ -110,6 +114,8 @@ def verify_native(app, team_id, notarized=False):
             raise ValueError('Unable to inspect signed entitlements') from error
         if parsed != {}:
             raise ValueError('Unexpected entitlements; the reviewed PeerBrush bundle requires no hardened-runtime exceptions')
+    from sparkle_bundle import verify_native as verify_sparkle
+    verify_sparkle(app, team_id, run)
     if notarized:
         run(['/usr/bin/xcrun', 'stapler', 'validate', str(app)])
         assessed = run(['/usr/sbin/spctl', '--assess', '--type', 'execute', '--verbose=4', str(app)])
@@ -118,31 +124,44 @@ def verify_native(app, team_id, notarized=False):
 
 
 def tree_files(root):
-    """Reject links, extra metadata and nonregular entries before packaging."""
-    files = {}
-    for path in sorted(root.rglob('*')):
-        if path.is_symlink() or getattr(path.lstat(), 'st_file_attributes', 0) & 0x400:
-            raise ValueError('Signing work must not contain links or reparse points')
-        if path.is_dir():
-            continue
-        name = path.relative_to(root).as_posix()
-        files[name] = regular_file(root, name)
-    return files
+    from sparkle_bundle import disk_entries
+    return {name: path for name, (path, _, _) in disk_entries(root).items()}
 
 
 def tree_hashes(root):
-    return {name: digest(path) for name, path in tree_files(root).items()}
+    from sparkle_bundle import disk_entries
+    return {name: hashlib.sha256(target).hexdigest() if target is not None else digest(regular_file(root, name))
+            for name, (_, _, target) in disk_entries(root).items()}
 
 
 def extract_archive(archive_path, destination):
-    """Call only after inspect_archive; never use general ZIP extractall."""
+    """Only after inspect_archive; regular members first, nine exact links last."""
+    from sparkle_bundle import validate_link
     destination.mkdir()
+    pending = []
     with zipfile.ZipFile(archive_path) as archive:
         for item in archive.infolist():
             path = destination / relative_path(item.filename)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(archive.read(item))
-            path.chmod(item.external_attr >> 16 & 0o777)
+            # Exact framework directory modes are reconstructed explicitly,
+            # independent of the private work directory's inherited umask.
+            from sparkle_bundle import PREFIX
+            for parent in path.parents:
+                if parent == destination:
+                    break
+                if 'PeerBrush.app/Contents/Frameworks' in parent.as_posix():
+                    parent.chmod(0o755)
+            if stat.S_ISLNK(item.external_attr >> 16):
+                pending.append((path, validate_link(item.filename, archive.read(item))))
+            else:
+                with path.open('xb') as stream:
+                    stream.write(archive.read(item))
+                path.chmod(item.external_attr >> 16 & 0o777)
+        for path, target in pending:
+            path.symlink_to(target)
+        for path, target in pending:
+            if not path.resolve(strict=True).is_relative_to(destination.resolve(strict=True)):
+                raise ValueError('Extracted Sparkle link escapes selected payload')
 
 
 def outside_checkout(path, root):
@@ -232,15 +251,18 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
         # A failed/ambiguous submit leaves this directory in place. Do not retry
         # automatically; reconcile notarytool history before another upload.
         state = {'configuration': configuration}
+    if manifest.get('macos_sparkle_layout') == 1:
+        from sparkle_bundle import reviewed_policy
+        reviewed_policy(root)
     preflight(team_id, identity, profile, keychain)
     prefix = inspected['prefix'].rstrip('/')
     bundle = work / 'payload' / prefix
     app = bundle / APP
     if not resume:
         extract_archive(archive, work / 'payload')
-        # One Mach-O executable in this deliberately narrow bundle layout.
-        # Signing the bundle signs its main executable. --deep is verification
-        # only; newly introduced helpers require an explicit inside-out review.
+        from sparkle_bundle import sign_nested
+        sign_nested(app, identity, keychain, run)
+        # The exact five pinned children are signed inside-out above.
         run(['/usr/bin/codesign', '--force', '--sign', identity, '--options', 'runtime',
              '--timestamp', '--identifier', BUNDLE_ID]
             + (['--keychain', str(keychain)] if keychain is not None else []) + [str(app)])
@@ -249,7 +271,9 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
         allowed = set(MACOS_SIGNING_FILES) - {'PeerBrush.app/Contents/CodeResources'}
         with zipfile.ZipFile(archive) as unsigned:
             original = {i.filename[len(inspected['prefix']):]: hashlib.sha256(unsigned.read(i)).hexdigest() for i in unsigned.infolist()}
-        if set(before) != set(original) | allowed or any(before[name] != checksum for name, checksum in original.items() if name != manifest['executable']):
+        from sparkle_bundle import PREFIX, CODE, SEALS
+        transformed = {PREFIX + name for name in CODE | SEALS} if manifest.get('macos_sparkle_layout') == 1 else set()
+        if set(before) != set(original) | allowed or any(before[name] != checksum for name, checksum in original.items() if name not in transformed | {manifest['executable']}):
             raise ValueError('Code signing changed files outside the reviewed executable and resource seal')
         run(['/usr/bin/ditto', '-c', '-k', '--keepParent', str(app), str(work / 'submission.zip')])
         state['submission_sha256'] = digest(regular_file(work, 'submission.zip'))
@@ -263,7 +287,7 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
     # step can be retried with the same submission rather than uploaded again.
     with tempfile.TemporaryDirectory(prefix='.finalize-', dir=work) as temporary:
         stage = pathlib.Path(temporary)
-        shutil.copytree(work / 'payload', stage / 'payload')
+        shutil.copytree(work / 'payload', stage / 'payload', symlinks=True)
         bundle = stage / 'payload' / prefix
         app = bundle / APP
         run(['/usr/bin/xcrun', 'stapler', 'staple', str(app)])
@@ -272,8 +296,9 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
         expected = {name[len(prefix) + 1:] for name in state['bundle_hashes']} | MACOS_SIGNING_FILES
         if set(files) != expected:
             raise ValueError('Unexpected files after stapling; refuse an unreviewed signing metadata layout')
+        finalized_hashes = tree_hashes(stage / 'payload')
         for name, checksum in state['bundle_hashes'].items():
-            if digest(regular_file(stage / 'payload', name)) != checksum:
+            if finalized_hashes.get(name) != checksum:
                 raise ValueError('Stapling changed an existing payload file')
         manifest['executable_sha256'] = digest(files[manifest['executable']])
         manifest['native_publisher_signing'] = MACOS_SIGNING_KIND
@@ -289,8 +314,13 @@ def sign_archive(archive, output, work, commit, version, expected_sha256,
         (bundle / 'release.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
         final = stage / filename
         epoch = int(git(root, 'show', '-s', '--format=%ct', commit))
-        write_zip(final, [(f'{prefix}/{name}', path.read_bytes(), 0o755 if name == manifest['executable'] else 0o644)
-                          for name, path in tree_files(bundle).items()], epoch)
+        from sparkle_bundle import disk_entries, PREFIX
+        # Retain the historical portable file modes, including synthetic Windows
+        # qualification where chmod cannot represent Unix execute bits. Only the
+        # exact native framework carries its pinned original modes/link types.
+        write_zip(final, [(f'{prefix}/{name}', target if target is not None else path.read_bytes(), mode if name.startswith(PREFIX)
+                          else 0o755 if name == manifest['executable'] else 0o644)
+                          for name, (path, mode, target) in disk_entries(bundle).items()], epoch)
         checked = inspect_archive(final, commit, version, root)
         # Native verification must use the *final ZIP's extracted bytes*, not just
         # the pre-archive staging bundle. This also detects ticket-loss in ZIP tools.
@@ -357,6 +387,9 @@ def sign_dmg(archive, output, work, commit, version, expected_sha256,
     if (manifest['platform'] != 'macOS' or manifest['native_publisher_signing'] != MACOS_SIGNING_KIND
             or manifest['macos_signing']['team_id'] != team_id):
         raise ValueError('DMG signing requires an already signed, notarized and stapled app from this Team ID')
+    if manifest.get('macos_sparkle_layout') == 1:
+        from sparkle_bundle import reviewed_policy
+        reviewed_policy(root)
     work, output = outside_checkout(work, root), outside_checkout(output, root)
     if output.resolve().is_relative_to(work.resolve()) or work.resolve().is_relative_to(output.resolve()):
         raise ValueError('Signing work and final output directories must be separate')

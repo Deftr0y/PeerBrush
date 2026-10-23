@@ -118,8 +118,17 @@ jobs:
           python3 -B scripts/test_macos_qualification_producer.py
           python3 -B scripts/test_macos_qualification_attestation.py
           python3 -B scripts/test_macos_qualification_job.py
+          python3 -B scripts/test_prepare_sparkle.py
+          python3 -B scripts/test_sparkle_bundle.py
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/Sparkle-2.10.0.zip" 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip'
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --verify-only
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --native-audit-output "$RUNNER_TEMP/peerbrush-sparkle-native-audit"
+          cat "$RUNNER_TEMP/peerbrush-sparkle-native-audit/native-policy-candidate.json"
           python3 -B scripts/build_release.py
-          python3 -B scripts/package.py
+          python3 -B scripts/package.py --sparkle-archive "$RUNNER_TEMP/Sparkle-2.10.0.zip"
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          python3 -B scripts/check_bundled_sparkle.py --archive "dist/PeerBrush-$VERSION-macOS-arm64.zip" --work "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture" --commit "$SELECTED_COMMIT" --version "$VERSION"
+          cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture/payload/PeerBrush.app" --bundled
       - name: Inspect the exact unsigned ZIP
         id: inspect
         run: |
@@ -206,9 +215,13 @@ jobs:
           archive = parent / f'PeerBrush-{version}-macOS-arm64.zip'
           if set(path.name for path in parent.iterdir()) != {archive.name} or bounded_file(archive, 512 * 1024 * 1024)[0] != expected:
               raise SystemExit('Same-workflow unsigned bytes differ.')
-          record = inspect_archive(archive, os.environ['SELECTED_COMMIT'], version)['record']
+          checked = inspect_archive(archive, os.environ['SELECTED_COMMIT'], version)
+          record = checked['record']
           if record['native_publisher_signing'] != 'not-configured':
               raise SystemExit('Expected unsigned Mac input before credential setup.')
+          if checked['manifest'].get('macos_sparkle_layout') == 1:
+              from sparkle_bundle import reviewed_policy
+              reviewed_policy()
           PY
           umask 077
           mkdir "$RUNNER_TEMP/apple-credentials"
@@ -375,12 +388,36 @@ jobs:
               stage.chmod(0o700)
               private_inspection_directory(stage, source, fresh=False)
               selected = []
+              selected_links = {}
               total = 0
+              def selected_bytes(path, name):
+                  from sparkle_bundle import link_target
+                  expected_link = link_target(name.removeprefix('zip/payload/')) if name.startswith('zip/payload/') else None
+                  if expected_link is not None and not path.is_symlink():
+                      raise ValueError('An exact Sparkle recovery link became a regular file.')
+                  if path.is_symlink():
+                      from sparkle_bundle import validate_link
+                      if not name.startswith('zip/payload/'):
+                          raise ValueError('Only exact ZIP payload Sparkle links belong in recovery.')
+                      if path.lstat().st_nlink != 1:
+                          raise ValueError('Sparkle recovery links must not have hard links.')
+                      target = os.readlink(path)
+                      if not path.resolve(strict=True).is_relative_to(parent / 'macos-zip-work' / 'payload'):
+                          raise ValueError('Sparkle recovery link escapes its exact payload.')
+                      validate_link(name.removeprefix('zip/payload/'), target.encode('utf-8'))
+                      if (path.lstat().st_mode & 0o777) != 0o777:
+                          raise ValueError('Sparkle recovery link mode changed.')
+                      selected_links[name] = target
+                      data = target.encode('utf-8')
+                      return hashlib.sha256(data).hexdigest(), len(data)
+                  if name in selected_links:
+                      raise ValueError('Sparkle recovery link became a regular file.')
+                  return bounded_file(path, 512 * 1024 * 1024)
               def add(path, name, expected=None):
                   global total
                   if len(selected) >= 32768:
                       raise ValueError('Recovery file count exceeds the reviewed scope.')
-                  digest, size = bounded_file(path, 512 * 1024 * 1024)
+                  digest, size = selected_bytes(path, name)
                   if expected is not None and digest != expected:
                       raise ValueError('Recovery bytes differ from their original submission journal.')
                   total += size
@@ -425,6 +462,10 @@ jobs:
                           if ((entry == {'directory': True} and type(entry.get('directory')) is bool)
                                   or (name == 'Applications' and entry == {'link': '/Applications'})):
                               continue
+                          if set(entry) == {'link'}:
+                              from sparkle_bundle import validate_link
+                              validate_link(name, str(entry['link']).encode('utf-8'))
+                              continue
                           if (set(entry) != {'sha256', 'mode'} or not re.fullmatch('[0-9a-f]{64}', str(entry['sha256']))
                                   or type(entry['mode']) is not int or entry['mode'] not in [0o644, 0o755]):
                               raise ValueError('Unexpected DMG recovery layout metadata.')
@@ -451,9 +492,14 @@ jobs:
                   owned = []
                   for index, (path, name, digest, size) in enumerate(selected):
                       copy = stage / str(index)
-                      if bounded_file(path, 512 * 1024 * 1024, copy) != (digest, size):
+                      if name in selected_links:
+                          if selected_bytes(path, name) != (digest, size):
+                              raise ValueError('Recovery link changed during owned copy.')
+                          with copy.open('xb') as stream:
+                              stream.write(selected_links[name].encode('utf-8'))
+                      elif bounded_file(path, 512 * 1024 * 1024, copy) != (digest, size):
                           raise ValueError('Recovery input changed during owned copy.')
-                      owned.append((copy, name, digest, size, path.stat().st_mode & 0o777))
+                      owned.append((copy, name, digest, size, path.lstat().st_mode & 0o777))
                   destination = parent / 'macos-signing-recovery.tar'
                   temporary = parent / 'macos-signing-recovery.tar.partial'
                   class CheckedRead:
@@ -471,6 +517,12 @@ jobs:
                           info = tarfile.TarInfo(name)
                           info.size, info.mode, info.mtime = size, mode, 0
                           info.uid = info.gid = 0
+                          if name in selected_links:
+                              if path.read_bytes() != selected_links[name].encode('utf-8'):
+                                  raise ValueError('Owned recovery link changed before retention.')
+                              info.type, info.linkname, info.size = tarfile.SYMTYPE, selected_links[name], 0
+                              archive.addfile(info)
+                              continue
                           with path.open('rb') as stream:
                               reader = CheckedRead(stream)
                               archive.addfile(info, reader)
@@ -478,7 +530,7 @@ jobs:
                                   raise ValueError('Actual recovery member reads differ from the selected payload.')
                   temporary.chmod(0o600)
                   for path, name, digest, size in selected:
-                      if bounded_file(path, 512 * 1024 * 1024) != (digest, size):
+                      if selected_bytes(path, name) != (digest, size):
                           raise ValueError('Original recovery payload changed during retention.')
                   # An incomplete recovery file must never become an upload input.
                   os.link(temporary, destination)

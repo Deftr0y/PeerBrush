@@ -20,6 +20,8 @@ pub(super) struct Panel {
     next_auto: Instant,
     last_notification: Option<String>,
     defer_current: bool,
+    #[cfg(target_os = "macos")]
+    native_updater: crate::sparkle::macos::Application,
     #[cfg(any(windows, test))]
     store_check: store::Check,
 }
@@ -36,6 +38,8 @@ impl Panel {
             next_auto: Instant::now() + Duration::from_secs(2),
             last_notification: None,
             defer_current: false,
+            #[cfg(target_os = "macos")]
+            native_updater: crate::sparkle::macos::Application::dormant(),
             #[cfg(any(windows, test))]
             store_check: store::Check::default(),
         }
@@ -150,6 +154,11 @@ impl Panel {
             .open(&mut open).resizable(true).default_width(480.).show(ctx, |ui| {
                 ui.label(format!("Installed version {}", env!("CARGO_PKG_VERSION")));
                 ui.label(self.owner.description());
+                #[cfg(target_os = "macos")]
+                {
+                    let message = self.native_updater.message();
+                    if !message.is_empty() { ui.label(message); }
+                }
                 if self.owner != Owner::Direct {
                     ui.label("Public release notes do not establish your Store or package provider's update availability.");
                 }
@@ -217,6 +226,8 @@ impl Panel {
         self.open = open && !later;
         if !self.open {
             self.defer_current = true;
+            #[cfg(target_os = "macos")]
+            self.native_updater.defer();
             #[cfg(any(windows, test))]
             self.store_check.cancel();
         }
@@ -224,6 +235,28 @@ impl Panel {
 }
 
 impl PeerBrush {
+    #[cfg(target_os = "macos")]
+    pub(super) fn native_update_quit(&mut self) -> bool {
+        if !self.updates.native_updater.pending_installation() {
+            return false;
+        }
+        let blocked = self.update_interaction_active();
+        // A pending updater may never enter the ordinary Don't Save exit path.
+        self.message = self
+            .updates
+            .native_updater
+            .request_installation(
+                &self.workspace,
+                blocked,
+                crate::sparkle::macos::ContinuationKind::InstallOnQuit,
+            )
+            .err()
+            .unwrap_or_else(|| {
+                "Automatic updates are not available in this development build.".into()
+            });
+        true
+    }
+
     pub(super) fn updates_tick(&mut self, ctx: &egui::Context) {
         let idle = !self.update_interaction_active()
             && !ctx.wants_keyboard_input()

@@ -103,7 +103,7 @@ class Preparation(unittest.TestCase):
     def test_unsupported_os_is_rejected_before_output(self):
         for version in ['11.0', '10.15']:
             with mock.patch.object(sparkle.platform, 'mac_ver', return_value=(version, (), 'arm64')):
-                with self.assertRaisesRegex(ValueError, 'requires macOS12'):
+                with self.assertRaisesRegex(ValueError, 'requires macOS 12'):
                     sparkle.prepare(self.archive, self.output, self.root)
         self.assertFalse(self.output.exists())
 

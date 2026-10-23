@@ -1,6 +1,8 @@
-//! Offline preparation only. No application path starts a Sparkle updater.
+//! Dormant package/native preparation. No application path starts an updater.
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+
+pub const BUNDLED_LAYOUT: u32 = 1;
 
 pub const PROPOSED_FEED_URL: &str = "https://peerbrush.com/updates/macos/stable/appcast.xml";
 
@@ -38,7 +40,7 @@ impl Configuration {
 
 pub fn require_supported_macos(major: isize) -> Result<(), String> {
     if major < 12 {
-        return Err("Sparkle2.10 preparation requires macOS12+; the disabled core app still supports macOS11".into());
+        return Err("Sparkle 2.10.0 preparation requires macOS 12+; the disabled core app still supports macOS 11".into());
     }
     Ok(())
 }

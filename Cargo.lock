@@ -2300,6 +2300,7 @@ dependencies = [
  "ab_glyph",
  "arboard",
  "base64 0.22.1",
+ "block2 0.6.2",
  "bytemuck",
  "clipboard-win",
  "eframe",

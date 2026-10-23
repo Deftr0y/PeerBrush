@@ -732,6 +732,10 @@ impl Review {
 
 impl PeerBrush {
     pub(super) fn request_close(&mut self, intent: Intent) {
+        #[cfg(target_os = "macos")]
+        if intent == Intent::Exit && self.native_update_quit() {
+            return;
+        }
         if self.lifecycle.is_some() || self.save_loss_review.is_some() || self.exit_approved {
             return;
         }
@@ -933,6 +937,11 @@ impl PeerBrush {
         }
         let native_quit = crate::activation::take_quit(&self.workspace);
         if (ctx.input(|i| i.viewport().close_requested()) || native_quit) && !self.exit_approved {
+            #[cfg(target_os = "macos")]
+            if self.native_update_quit() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                return;
+            }
             self.request_close(Intent::Exit);
         }
         if self.exit_approved {

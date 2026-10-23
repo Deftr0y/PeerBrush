@@ -31,7 +31,17 @@ MAX_CRATE_NOTICE_BYTES = 4 * 1024 * 1024
 MAX_CRATE_NOTICES_BYTES = 16 * 1024 * 1024
 
 
-def macos_info(version):
+def macos_sparkle_required(sources):
+    values = dict((name, data) for name, data, _ in sources)
+    required = ('scripts/sparkle_bundle.py' in values
+                or b'pub const BUNDLED_LAYOUT: u32 = 1;' in values.get('src/sparkle.rs', b''))
+    if required and not {'scripts/sparkle_bundle.py', 'packaging/sparkle/native-policy.json',
+                         'packaging/sparkle/LICENSE', 'packaging/sparkle/sparkle-2.10.0.json'} <= set(values):
+        raise ValueError('Dormant Sparkle source policy is incomplete; do not downgrade its bundle layout')
+    return required
+
+
+def macos_info(version, sparkle=False):
     numeric = r'(?:0|[1-9][0-9]*)'
     parsed = re.fullmatch(r'(' + numeric + r'\.' + numeric + r'\.' + numeric + r')(-dev\.' + numeric + r')?', version)
     if not parsed:
@@ -51,6 +61,9 @@ def macos_info(version):
                                             'UTTypeDescription': 'Photoshop Large Document',
                                             'UTTypeTagSpecification': {'public.filename-extension': ['psb'],
                                                                        'public.mime-type': 'image/vnd.adobe.photoshop'}}]}
+    if sparkle:
+        from sparkle_bundle import DISABLED_INFO
+        info.update(DISABLED_INFO)
     if parsed[2]:
         info['PeerBrushDevelopmentVersion'] = version
     return info
@@ -302,8 +315,11 @@ def architecture_from_stream(stream, platform):
 
 def write_zip(path, files, epoch, compression=zipfile.ZIP_DEFLATED):
     files = list(files)
-    for name, _, _ in files:
+    for name, data, mode in files:
         relative_path(name)
+        if mode & 0o170000 == 0o120000:
+            from sparkle_bundle import validate_link
+            validate_link(name, data)
     if len({name.casefold() for name, _, _ in files}) != len(files):
         raise ValueError("Ambiguous duplicate archive paths")
     stamp = time.gmtime(max(epoch, 315532800))[:6]
@@ -311,7 +327,12 @@ def write_zip(path, files, epoch, compression=zipfile.ZIP_DEFLATED):
         for name, data, mode in sorted(files):
             info = zipfile.ZipInfo(name, stamp)
             info.create_system = 3
-            info.external_attr = (0o100000 | mode) << 16
+            if mode & 0o170000 == 0o120000:
+                from sparkle_bundle import validate_link
+                validate_link(name, data)
+                info.external_attr = mode << 16
+            else:
+                info.external_attr = (0o100000 | mode) << 16
             info.compress_type = compression
             archive.writestr(info, data)
 
@@ -346,6 +367,7 @@ def source_files(root, commit=None):
             raise ValueError('Truncated source object')
         files.append((name, data, mode))
     values = {name: data for name, data, _ in files}
+    macos_sparkle_required(files)
     version = tomllib.loads(values['Cargo.toml'].decode('utf-8'))['package']['version']
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', version):
         raise ValueError('Unsupported release version')
@@ -456,7 +478,7 @@ def equivalent_build_inputs(root, sources, original_commit):
             raise ValueError('Executable source inputs differ from package source')
 
 
-def package(root, binary, output, registry, platform, verify_binary=True, rust_docs=None, binary_source_commit=None):
+def package(root, binary, output, registry, platform, verify_binary=True, rust_docs=None, binary_source_commit=None, sparkle_archive=None):
     root = root.resolve(strict=True)
     if git(root, 'status', '--porcelain', '--untracked-files=no').strip():
         raise ValueError('Commit tracked changes before packaging a release')
@@ -464,6 +486,13 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
     epoch = int(git(root, 'show', '-s', '--format=%ct', commit))
     sources = source_files(root, commit)
     policy = policy_from_sources(sources)
+    sparkle = platform == 'macOS' and macos_sparkle_required(sources)
+    framework = []
+    if sparkle:
+        if sparkle_archive is None:
+            raise ValueError('Dormant macOS layout requires the explicitly selected pinned --sparkle-archive')
+        from sparkle_bundle import entries
+        framework = entries(sparkle_archive, {name: data for name, data, _ in sources})
     if policy['version'] == 2 and git(root, 'status', '--porcelain', '--untracked-files=normal').strip():
         raise ValueError('Commit or remove untracked source inputs before release packaging')
     if policy['version'] == 2 and hidden_index_inputs(root):
@@ -499,7 +528,7 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             contents = bundle / 'PeerBrush.app' / 'Contents'
             (contents / 'MacOS').mkdir(parents=True)
             with (contents / 'Info.plist').open('wb') as stream:
-                plistlib.dump(macos_info(version), stream)
+                plistlib.dump(macos_info(version, sparkle=sparkle), stream)
         staged_binary = bundle / relative
         staged_binary.write_bytes(executable)
         staged_binary.chmod(0o755)
@@ -520,6 +549,15 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             (bundle / 'Start PeerBrush.cmd').write_bytes(launcher)
         shutil.copy2(source, bundle / source.name)
         notices = add_notices(source_root, bundle, registry, policy, rust_docs)
+        if sparkle:
+            from sparkle_bundle import NOTICE
+            notice = next(data for filename, data, _ in sources if filename == 'packaging/sparkle/LICENSE')
+            destination = bundle / NOTICE
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(notice)
+            notices[NOTICE] = digest(destination)
+            with (bundle / 'THIRD_PARTY_NOTICES.md').open('a', encoding='utf-8') as stream:
+                stream.write('\n- Sparkle 2.10.0: complete upstream/external notice in licenses/sparkle-2.10.0/LICENSE; exact upstream source revision and public source URL in the included packaging/sparkle/sparkle-2.10.0.json.\n')
         manifest = {'schema': 1, 'product': 'PeerBrush', 'version': version, 'commit': commit, 'binary_source_commit': binary_source_commit, 'platform': platform, 'architecture': architecture, 'executable': relative, 'executable_sha256': digest(staged_binary), 'source': source.name, 'source_sha256': digest(source), 'notice_files': notices, 'license': 'GPL-3.0-only', 'native_publisher_signing': 'not-configured', 'package_signature': 'See the matching external Sigstore bundle when supplied; this manifest alone is not a signature.'}
         if platform == 'macOS':
             resources = bundle / MACOS_RESOURCES
@@ -531,10 +569,13 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             for filename in ['LICENSE', 'THIRD_PARTY_NOTICES.md', *notices]:
                 copy_file(bundle, filename, resources / filename)
             manifest['macos_bundle_resources'] = 1
+            if sparkle:
+                manifest['macos_sparkle_layout'] = 1
         if build_info is not None:
             manifest['build_info'] = build_info
         (bundle / 'release.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
         files = [(f'{name}/{p.relative_to(bundle).as_posix()}', p.read_bytes(), 0o755 if p == staged_binary else 0o644) for p in bundle.rglob('*') if p.is_file()]
+        files.extend((f'{name}/{relative}', data, mode) for relative, data, mode in framework)
         archive = stage / (name + '.zip')
         write_zip(archive, files, epoch)
         sums = stage / f'{name}.sha256'
@@ -556,6 +597,7 @@ def main():
     parser.add_argument('--output', type=pathlib.Path)
     parser.add_argument('--registry', type=pathlib.Path)
     parser.add_argument('--binary', type=pathlib.Path)
+    parser.add_argument('--sparkle-archive', type=pathlib.Path, help='Explicit exact-pinned upstream archive for dormant macOS bundling')
     parser.add_argument('--binary-source-commit', help='Explicit packaging-only correction: require identical application/build inputs to this original binary commit')
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -567,7 +609,7 @@ def main():
             sources = source_files(root)
             print(f'Package source policy valid: {len(sources)} files')
             return
-        package(root, args.binary or root / 'target' / 'release' / exe, (args.output or root / 'dist').resolve(), args.registry or cargo_home / 'registry' / 'src', platform, binary_source_commit=args.binary_source_commit)
+        package(root, args.binary or root / 'target' / 'release' / exe, (args.output or root / 'dist').resolve(), args.registry or cargo_home / 'registry' / 'src', platform, binary_source_commit=args.binary_source_commit, sparkle_archive=args.sparkle_archive)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         message = str(error) if isinstance(error, ValueError) else 'Input/output validation failed; check required files and permissions'
         parser.exit(1, 'Packaging failed: ' + message + '\n')

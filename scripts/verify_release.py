@@ -7,8 +7,9 @@ import pathlib
 import plistlib
 import re
 import shutil
+import stat
 import zipfile
-from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, MACOS_RESOURCES, macos_info, binary_build_info
+from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, MACOS_RESOURCES, macos_info, binary_build_info, macos_sparkle_required
 
 
 MACOS_SIGNING_FILES = frozenset({
@@ -91,8 +92,11 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             raise ValueError('Ambiguous duplicate release entries')
         for item in archive.infolist():
             name = relative_path(item.filename)
-            if item.external_attr >> 16 & 0o170000 not in [0, 0o100000]:
-                raise ValueError('Release entries must be regular files')
+            if item.external_attr >> 16 & 0o170000 == 0o120000:
+                from sparkle_bundle import validate_link
+                validate_link(item.filename[len(prefix):], archive.read(item), expected_source)
+            elif item.external_attr >> 16 & 0o170000 not in [0, 0o100000]:
+                raise ValueError('Release entries must be regular files or exact pinned Sparkle links')
             if not item.filename.startswith(prefix) or '..' in name.parts or '\\' in item.filename:
                 raise ValueError('Invalid release archive path')
             if name.name in ['connection.json', 'recovery.psd', '.env'] or '.git' in name.parts or '.runtime' in name.parts:
@@ -135,6 +139,16 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
                 if manifest['macos_bundle_resources'] != 1:
                     raise ValueError('Unsupported macOS bundle resource layout')
                 expected_entries.update(MACOS_RESOURCES + name for name in ['PeerBrush.icns', 'LICENSE', 'THIRD_PARTY_NOTICES.md', *notices])
+        sparkle_required = platform == 'macOS' and macos_sparkle_required(selected_sources)
+        if sparkle_required != (type(manifest.get('macos_sparkle_layout')) is int and manifest.get('macos_sparkle_layout') == 1):
+            raise ValueError('macOS Sparkle layout must match the exact committed source contract')
+        if manifest.get('macos_sparkle_layout') is not None:
+            if not sparkle_required or manifest['macos_sparkle_layout'] != 1:
+                raise ValueError('Unsupported macOS Sparkle layout')
+            from sparkle_bundle import inspect_members, NOTICE
+            expected_entries.update(inspect_members(archive, prefix, expected_source, bool(signing_suffix)))
+            if notices.get(NOTICE) != sha(expected_source['packaging/sparkle/LICENSE']):
+                raise ValueError('Missing exact Sparkle upstream/external notice')
         expected_entries.update(validate_signing_metadata(manifest, archive, prefix, signing_suffix))
         if set(archive.namelist()) != {prefix + name for name in expected_entries}:
             raise ValueError('Unexpected or missing release entries')
@@ -155,7 +169,7 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             if info.get('CFBundleShortVersionString') != short_version or info.get('CFBundleExecutable') != 'peerbrush' or info.get('CFBundleIdentifier') != 'com.peerbrush.PeerBrush' or info.get('CFBundlePackageType') != 'APPL':
                 raise ValueError('macOS app bundle version or executable mismatch')
             if manifest.get('macos_bundle_resources') == 1:
-                if info != macos_info(version):
+                if info != macos_info(version, sparkle=sparkle_required):
                     raise ValueError('macOS document consent, icon or bundle metadata differs from source')
                 if archive.read(prefix + MACOS_RESOURCES + 'PeerBrush.icns') != expected_source['assets/peerbrush.icns']:
                     raise ValueError('macOS icon differs from committed artwork')

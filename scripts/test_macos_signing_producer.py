@@ -304,5 +304,49 @@ class AppleSigningProducer(unittest.TestCase):
         self.assertFalse((self.parent / 'macos-signing-recovery.tar').exists())
 
 
+    def sparkle_recovery_fixture(self):
+        original, payload, state = self.zip_state()
+        prefix = f'PeerBrush-{VERSION}-macOS-arm64'
+        relative = prefix + '/PeerBrush.app/Contents/Frameworks/Sparkle.framework/'
+        folder = self.parent / 'macos-zip-work/payload' / relative
+        code = self.write('macos-zip-work/payload/' + relative + 'Versions/B/Sparkle', b'SYNTHETIC_PUBLIC_FRAMEWORK_CODE', 0o755)
+        (folder / 'Versions/Current').symlink_to('B', target_is_directory=True)
+        (folder / 'Sparkle').symlink_to('Versions/Current/Sparkle')
+        state['bundle_hashes'][relative + 'Versions/B/Sparkle'] = digest(code.read_bytes())
+        for name, target in [('Versions/Current', 'B'), ('Sparkle', 'Versions/Current/Sparkle')]:
+            state['bundle_hashes'][relative + name] = digest(target.encode())
+        self.write('macos-zip-work/state.json', json.dumps(state).encode())
+        return folder, relative
+
+    @unittest.skipIf(os.name == 'nt', 'Actual Unix recovery symlink semantics run on macOS/Linux')
+    def test_recovery_retains_exact_sparkle_link_headers_without_following_them(self):
+        folder, relative = self.sparkle_recovery_fixture()
+        self.execute('Preserve narrow credentials-free same-submission recovery')
+        with tarfile.open(self.parent / 'macos-signing-recovery.tar') as archive:
+            for name, target in [('Versions/Current', 'B'), ('Sparkle', 'Versions/Current/Sparkle')]:
+                member = archive.getmember('zip/payload/' + relative + name)
+                self.assertTrue(member.issym())
+                self.assertEqual(member.linkname, target)
+                self.assertEqual(member.size, 0)
+        self.assertEqual((folder / 'Versions/B/Sparkle').read_bytes(), b'SYNTHETIC_PUBLIC_FRAMEWORK_CODE')
+
+    @unittest.skipIf(os.name == 'nt', 'Actual Unix recovery symlink semantics run on macOS/Linux')
+    def test_recovery_refuses_escaped_or_regular_substitutes_even_with_same_target_bytes(self):
+        for damage in ['escape', 'regular-substitute']:
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory(prefix='peerbrush-sparkle-recovery-negative-') as temporary:
+                self.parent = Path(temporary).resolve()
+                self.environment['RUNNER_TEMP'] = str(self.parent)
+                folder, relative = self.sparkle_recovery_fixture()
+                link = folder / 'Sparkle'
+                link.unlink()
+                if damage == 'escape':
+                    link.symlink_to('../../../../outside')
+                else:
+                    link.write_bytes(b'Versions/Current/Sparkle')
+                with self.assertRaises(SystemExit):
+                    self.execute('Preserve narrow credentials-free same-submission recovery')
+                self.assertFalse((self.parent / 'macos-signing-recovery.tar').exists())
+
+
 if __name__ == '__main__':
     unittest.main()

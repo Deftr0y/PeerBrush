@@ -134,7 +134,7 @@ def prepare(archive, output, root=ROOT):
     # All bytes and archive paths are checked before creating an output.
     archive = inspect(archive, pin)
     if sys.platform != 'darwin' or int(platform.mac_ver()[0].split('.')[0] or 0) < 12:
-        raise ValueError('Native Sparkle preparation requires macOS12 or later; the disabled core app still supports macOS11')
+        raise ValueError('Native Sparkle preparation requires macOS 12 or later; the disabled core app still supports macOS 11')
     output = external_output(output, root)
     output.mkdir(parents=True, mode=0o700)
     os.chmod(output, 0o700)
@@ -171,10 +171,22 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--archive', required=True, type=pathlib.Path)
     parser.add_argument('--output', type=pathlib.Path)
+    parser.add_argument('--native-audit-output', type=pathlib.Path, help='Fresh private directory for bounded native policy facts; no signing, loading or activation')
     parser.add_argument('--verify-only', action='store_true', help='Verify the exact official archive without staging or native calls')
     args = parser.parse_args()
     try:
-        if args.verify_only:
+        if args.native_audit_output is not None:
+            if args.verify_only or args.output is not None:
+                raise ValueError('Select exactly one Sparkle preparation mode')
+            from sparkle_bundle import audit_native
+            from sign_macos import run
+            output = external_output(args.native_audit_output, ROOT)
+            facts = audit_native(args.archive, output, run)
+            with (output / 'native-policy-candidate.json').open('x', encoding='utf-8') as stream:
+                json.dump(facts, stream, indent=2, sort_keys=True)
+                stream.write('\n')
+            print('Native policy facts prepared for independent review; no authority, signing, loading or updater activation')
+        elif args.verify_only:
             inspect(args.archive, load_pin())
             print('Verified the pinned Sparkle archive; no code loaded or updater started')
         else:

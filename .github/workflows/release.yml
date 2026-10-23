@@ -145,6 +145,7 @@ jobs:
         if: runner.os == 'macOS'
         run: python3 -B scripts/test_macos_dmg_native.py
       - run: python -B scripts/test_prepare_sparkle.py
+      - run: python -B scripts/test_sparkle_bundle.py
       - name: Verify disabled native Sparkle preparation
         if: runner.os == 'macOS'
         shell: bash
@@ -152,6 +153,8 @@ jobs:
           curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/Sparkle-2.10.0.zip" 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip'
           python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --output "$RUNNER_TEMP/peerbrush-sparkle-preparation"
           cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-preparation/Sparkle.framework"
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --native-audit-output "$RUNNER_TEMP/peerbrush-sparkle-native-audit"
+          cat "$RUNNER_TEMP/peerbrush-sparkle-native-audit/native-policy-candidate.json"
       - run: python scripts/test_submit_store_release.py
       - run: python -B scripts/test_store_workflow.py
       - run: python scripts/test_store_release_state.py
@@ -162,7 +165,22 @@ jobs:
       - run: python -B scripts/test_readback_site_release.py
       - run: python scripts/build_release.py
       - run: python scripts/test_msix_runtime_tests.py
-      - run: python scripts/package.py
+      - name: Package exact platform with dormant macOS dependency
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            python scripts/package.py --sparkle-archive "$RUNNER_TEMP/Sparkle-2.10.0.zip"
+          else
+            python scripts/package.py
+          fi
+      - name: Round-trip exact dormant app framework and native continuations
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          COMMIT=$(git rev-parse HEAD)
+          python3 -B scripts/check_bundled_sparkle.py --archive "dist/PeerBrush-$VERSION-macOS-arm64.zip" --work "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture" --commit "$COMMIT" --version "$VERSION"
+          cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture/payload/PeerBrush.app" --bundled
       - name: Build and test Ubuntu installation candidate in a disposable container
         if: runner.os == 'Linux'
         shell: bash

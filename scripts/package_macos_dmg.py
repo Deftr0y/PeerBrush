@@ -118,7 +118,7 @@ def bounded_file(path, limit, destination=None, *, executable=False):
 
 
 def payload_inventory(root):
-    """Only the top-level Applications shortcut may be a link."""
+    """Applications plus exactly the nine pinned Sparkle framework links."""
     inventory = {}
     total = 0
     def visit(path):
@@ -128,9 +128,16 @@ def payload_inventory(root):
         if len(inventory) >= MAX_PAYLOAD_ENTRIES or len(name) > 1024 or len(path.relative_to(root).parts) > 32:
             raise ValueError('DMG payload exceeds its entry or path budget')
         if stat.S_ISLNK(info.st_mode):
-            if name != 'Applications' or os.readlink(path) != '/Applications':
-                raise ValueError('Unexpected link in DMG payload')
-            inventory[name] = {'link': '/Applications'}
+            target = os.readlink(path)
+            if name == 'Applications':
+                if target != '/Applications':
+                    raise ValueError('Unexpected Applications link in DMG payload')
+            else:
+                from sparkle_bundle import validate_link
+                validate_link(name, target.encode('utf-8'))
+                if not path.resolve(strict=True).is_relative_to(root.resolve(strict=True)):
+                    raise ValueError('DMG Sparkle link escapes payload')
+            inventory[name] = {'link': target}
         elif getattr(info, 'st_file_attributes', 0) & 0x400:
             raise ValueError('DMG payload must not contain reparse points')
         elif stat.S_ISDIR(info.st_mode):
@@ -210,6 +217,14 @@ def inspect_final(root, archive, image, *, commit, version, archive_sha256, imag
         for entry in source.infolist():
             relative = pathlib.PurePosixPath(entry.filename[len(checked['prefix']):])
             mapped = relative if relative.parts[0] == APP else pathlib.PurePosixPath(SUPPORT) / relative
+            if stat.S_ISLNK(entry.external_attr >> 16):
+                from sparkle_bundle import validate_link
+                target = validate_link(relative.as_posix(), source.read(entry))
+                expected[mapped.as_posix()] = {'link': target}
+                for parent in mapped.parents:
+                    if parent != pathlib.PurePosixPath('.'):
+                        expected[parent.as_posix()] = {'directory': True}
+                continue
             checksum, size = hashlib.sha256(), 0
             with source.open(entry) as stream:
                 while chunk := stream.read(min(64 * 1024, entry.file_size + 1 - size)):
@@ -373,7 +388,7 @@ def prepare(archive, output, commit, version, expected_sha256, revision, source_
     verify_native(app, manifest['macos_signing']['team_id'], notarized=True)
     payload = work / 'payload'
     payload.mkdir()
-    shutil.copytree(app, payload / APP, copy_function=shutil.copy2)
+    shutil.copytree(app, payload / APP, copy_function=shutil.copy2, symlinks=True)
     support = payload / SUPPORT
     support.mkdir()
     for path in bundle.iterdir():
@@ -388,12 +403,17 @@ def prepare(archive, output, commit, version, expected_sha256, revision, source_
     image = work / filename
     # Prove that repackaging did not alter a signed app, its ticket or support
     # material, before asking the OS to create the image.
-    for original in bundle.rglob('*'):
-        if original.is_file():
-            relative = original.relative_to(bundle)
-            copied = payload / relative if relative.parts[0] == APP else support / relative
-            if digest(original) != digest(copied) or stat.S_IMODE(original.stat().st_mode) != stat.S_IMODE(copied.stat().st_mode):
-                raise ValueError('DMG staging changed original archive bytes or modes')
+    from sparkle_bundle import disk_entries
+    for relative, (original, mode, target) in disk_entries(bundle).items():
+        path = pathlib.PurePosixPath(relative)
+        copied = payload / path if path.parts[0] == APP else support / path
+        if target is not None:
+            if (not original.is_symlink() or os.readlink(original).encode('utf-8') != target
+                    or not copied.is_symlink() or os.readlink(copied).encode('utf-8') != target):
+                raise ValueError('DMG staging changed an exact Sparkle link')
+        elif (copied.is_symlink() or digest(regular_file(bundle, relative)) != digest(copied)
+              or stat.S_IMODE(copied.stat().st_mode) != mode):
+            raise ValueError('DMG staging changed original archive bytes or modes')
     expected = create_image(payload, image, work / 'mounted', f'PeerBrush {version}',
                             verify_app=lambda mounted_app: verify_native(mounted_app, manifest['macos_signing']['team_id'], notarized=True))
     if digest(archive) != expected_sha256:

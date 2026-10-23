@@ -1,7 +1,7 @@
 //! Load a pinned external Sparkle framework without starting any update operation.
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    println!("Sparkle native preparation requires macOS12+");
+    println!("Sparkle native preparation requires macOS 12+");
 }
 
 #[cfg(target_os = "macos")]
@@ -27,9 +27,15 @@ fn main() {
             macos::probe(&path, &blocked).is_err(),
             "installation must fail before code load"
         );
-        let probe = macos::probe(&path, &Configuration::default())
+        let probe =
+            if std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("--bundled")) {
+                macos::probe_bundled(&path, &Configuration::default())
+            } else {
+                macos::probe(&path, &Configuration::default())
+            }
             .expect("pinned native Sparkle preparation");
         probe.assert_disabled();
-        println!("Verified Sparkle2.10.0 loaded; native controller created without starting; checks and relaunch vetoed; no feed/key/install configured");
+        probe.assert_application_guards();
+        println!("Verified Sparkle 2.10.0 loaded; native controller created without starting; checks and relaunch vetoed; no feed/key/install configured");
     });
 }

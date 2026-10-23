@@ -172,3 +172,9 @@ Seven-day artifact retention and best-effort failure steps do not guarantee
 recovery. Never rerun or resubmit after uncertainty without reconciling the
 original notarization and preserving its exact work. Native issuance, installed
 drag/quarantine/update acceptance and all publication gates remain open.
+
+### Dormant Sparkle preparation (unreleased)
+
+New source-defined dormant Sparkle layouts preserve nine exact framework links and five nested objects. The signer refuses them before provider preflight while packaging/sparkle/native-policy.json lacks independently reviewed native facts. Signing is explicit inside-out and all final objects must pass publisher/runtime/timestamp/identifier/exact-entitlement checks plus exact owned-copy unsigned normalization. Recovery, stapling and mounted image inspection preserve controlled link targets and modes. Historical source/layouts retain their original contract. See [the dependency audit, setup and pending native acceptance](sparkle-preparation.md); no new signing/installation result is claimed.
+
+PB-147 remains open. This prepares dormant packaging and a guarded native component, not a working application updater. Remaining source work includes trusted configured app-owned framework loading, an actual update cycle and progress/release-notes/cancellation UI, verified installation and relaunch outcome, the complete update-specific native termination handoff, and failed/interrupted installation with last-working-app recovery. The final handoff must use the existing atomic finish_update_exit contract; this preparation never calls it, closes a project or invokes an installer block. Supplying a feed, public key or native object policy cannot activate these missing implementations.
