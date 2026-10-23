@@ -33,13 +33,26 @@ pub fn request_close(
 /// engines in the same order as transfers, then checks the registry at commit.
 /// No engine is closed when any source, save, reservation or project set changed.
 pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), String> {
-    finish(workspace, reviewed, false)
+    finish(workspace, reviewed, false, true, || Ok(()))
 }
 
 /// Future verified native installers must use this path, never a discard-capable
 /// ordinary close. The native caller must also reject unfinished UI gestures.
 pub fn finish_update_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), String> {
-    finish(workspace, reviewed, true)
+    finish(workspace, reviewed, true, true, || Ok(()))
+}
+
+/// Publish a pre-native-start checkpoint under the same complete workspace,
+/// source, reservation and file-operation validation as atomic update exit.
+/// The owning UI thread also serializes direct native preference controls.
+/// Publication failure and success both leave every project open.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn publish_update_checkpoint(
+    workspace: &Registry,
+    reviewed: &[Reviewed],
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    finish(workspace, reviewed, true, false, publish)
 }
 
 fn update_project_ready(e: &Engine) -> Result<(), String> {
@@ -93,10 +106,21 @@ pub fn update_readiness(workspace: &Registry) -> Result<Vec<Reviewed>, String> {
                 .into(),
         );
     }
+    state
+        .tool_settings
+        .try_lock()
+        .map_err(|_| "Tool preferences are still working")?
+        .update_checkpoint_ready()?;
     Ok(reviewed)
 }
 
-fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(), String> {
+fn finish(
+    workspace: &Registry,
+    reviewed: &[Reviewed],
+    update: bool,
+    close: bool,
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let mut entries = entries_in(workspace);
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut reviewed: Vec<_> = reviewed.iter().collect();
@@ -167,6 +191,24 @@ fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(
     {
         return Err("The workspace changed during exit review. All projects remain open.".into());
     }
+    let tools = if update {
+        Some(
+            registry
+                .tool_settings
+                .try_lock()
+                .map_err(|_| "Tool preferences are still working")?,
+        )
+    } else {
+        None
+    };
+    if let Some(tools) = &tools {
+        tools.update_checkpoint_ready()?;
+    }
+    publish()?;
+    drop(tools);
+    if !close {
+        return Ok(());
+    }
     registry.exiting = true;
     for e in &mut engines {
         if let Some(control) = e.loading.take() {
@@ -182,6 +224,141 @@ fn finish(workspace: &Registry, reviewed: &[Reviewed], update: bool) -> Result<(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn checkpoint_publication_reuses_atomic_source_and_write_guards_without_closing() {
+        let directory = std::env::temp_dir().join(format!(
+            "peerbrush-checkpoint-workspace-{}",
+            crate::engine::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        {
+            let mut engine = Engine::new();
+            engine.doc = Document::new_depth(8, 6, 8).unwrap();
+            let root = Arc::new(Mutex::new(engine));
+            let workspace = attach(&root);
+            let second = new_project(&root, 8, 6, 16, None).unwrap();
+            let projects = [&root, &second];
+            let paths: Vec<_> = [8, 16]
+                .into_iter()
+                .map(|depth| directory.join(format!("art-{depth}.psd")))
+                .collect();
+            for (shared, path) in projects.into_iter().zip(&paths) {
+                {
+                    let mut e = shared.lock().unwrap();
+                    if e.doc.bit_depth == 16 {
+                        e.doc.layers[0].pixels.set16(0, 0, [1001, 3003, 5007, 0]);
+                    } else {
+                        e.doc.layers[0].pixels.set(0, 0, [17, 93, 207, 0]);
+                    }
+                    let layer = e.doc.layers[0].id.clone();
+                    e.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,1,3,3],"color":[41,83,127,173]})],None,None,"Keep real undo").unwrap();
+                    e.edit(
+                        "human",
+                        &[json!({"op":"layer.update","layer":layer,"name":"Keep real redo"})],
+                        None,
+                        None,
+                        "Keep real redo",
+                    )
+                    .unwrap();
+                    e.undo("human").unwrap();
+                    assert!(!e.undo.is_empty() && !e.redo.is_empty());
+                    e.reserve("human", "Keep human ownership", vec![Scope::layer(&layer)])
+                        .unwrap();
+                }
+                crate::server::save(shared, path).unwrap();
+            }
+            let snapshot = || {
+                projects.iter().zip(&paths).map(|(shared,path)| {
+                let e = shared.lock().unwrap();
+                let history = |entries: &[crate::engine::History]| entries.iter().map(|h|json!({
+                    "before":h.before,"after":h.after,"actor":h.actor,"label":h.label,"task":h.task,
+                    "scopes":h.scopes,"gesture":h.gesture,"reverted":h.reverted
+                })).collect::<Vec<_>>();
+                assert!(!e.undo.is_empty() && !e.redo.is_empty() && !e.leases.is_empty());
+                json!({"project":e.project_id,"document":e.doc,"undo":history(&e.undo),"redo":history(&e.redo),
+                    "leases":e.leases,"saved":e.saved_revision,"path":e.path,
+                    "closed":e.closed,"file_bytes":std::fs::read(path).unwrap(),
+                    "owner_path":e.file_ownership.as_ref().map(|owner|&owner.path),
+                    "owner_project":crate::file_ownership::local_project(path)})
+            }).collect::<Vec<_>>()
+            };
+            let expected = snapshot();
+            let owners: Vec<_> = projects
+                .iter()
+                .map(|shared| shared.lock().unwrap().file_ownership.clone().unwrap())
+                .collect();
+            let versions: Vec<_> = projects
+                .iter()
+                .map(|shared| shared.lock().unwrap().file_version)
+                .collect();
+            let unchanged = || {
+                assert_eq!(snapshot(), expected);
+                assert_eq!(entries_in(&workspace).len(), 2);
+                assert!(!workspace.lock().unwrap().exiting);
+                for (index, ((shared, path), owner)) in
+                    projects.iter().zip(&paths).zip(&owners).enumerate()
+                {
+                    let e = shared.lock().unwrap();
+                    assert_eq!(e.file_version, versions[index]);
+                    assert!(Arc::ptr_eq(e.file_ownership.as_ref().unwrap(), owner));
+                    assert!(
+                        crate::file_ownership::Ownership::open(path, "unrelated-project").is_err()
+                    );
+                }
+            };
+            let reviewed = update_readiness(&workspace).unwrap();
+            let published = std::cell::Cell::new(false);
+            let tools = workspace.lock().unwrap().tool_settings.clone();
+            {
+                let mut store = tools.lock().unwrap();
+                *store = crate::tool_settings::Store::load(directory.join("tool-settings.json"));
+                let before = store.get("brush").unwrap().profile;
+                let mut after = before.clone();
+                after.settings.radius += 1.;
+                store.human_delta("brush", &before, &after).unwrap();
+            }
+            assert!(update_readiness(&workspace).is_err());
+            assert!(publish_update_checkpoint(&workspace, &reviewed, || {
+                published.set(true);
+                Ok(())
+            })
+            .is_err());
+            assert!(!published.get());
+            unchanged();
+            tools.lock().unwrap().flush().unwrap();
+            update_readiness(&workspace).unwrap();
+            let operation = crate::server::FileOperation::begin_workspace(&workspace).unwrap();
+            assert!(publish_update_checkpoint(&workspace, &reviewed, || {
+                published.set(true);
+                Ok(())
+            })
+            .is_err());
+            assert!(!published.get());
+            unchanged();
+            drop(operation);
+            assert_eq!(
+                publish_update_checkpoint(&workspace, &reviewed, || Err(
+                    "Durable publication failed".into()
+                ))
+                .unwrap_err(),
+                "Durable publication failed"
+            );
+            unchanged();
+            publish_update_checkpoint(&workspace, &reviewed, || {
+                assert!(root.try_lock().is_err());
+                assert!(second.try_lock().is_err());
+                assert!(workspace.try_lock().is_err());
+                assert!(tools.try_lock().is_err());
+                published.set(true);
+                Ok(())
+            })
+            .unwrap();
+            assert!(published.get());
+            unchanged();
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn update_exit_keeps_original_operation_diagnostics_and_precedence_without_closing_projects() {

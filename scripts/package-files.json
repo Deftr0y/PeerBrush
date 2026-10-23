@@ -288,6 +288,8 @@
     "src/sparkle.rs",
     "src/sparkle/macos.rs",
     "src/sparkle/check.rs",
+    "src/sparkle/macos/checkpoint.rs",
+    "src/sparkle/macos/checkpoint_tests.rs",
     "src/sparkle/macos/driver.rs",
     "src/sparkle/macos/installed.rs",
     "src/svg.rs",

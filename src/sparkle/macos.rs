@@ -1,5 +1,6 @@
 //! Owned manual information checks and the credential-free native component probe.
 use super::{require_supported_macos, Configuration};
+pub(crate) mod checkpoint;
 mod driver;
 mod installed;
 use block2::{Block, RcBlock};
@@ -444,6 +445,8 @@ impl Probe {
             message: "Prepared updates remain disabled",
             configuration: None,
             verification: None,
+            profile: None,
+            checkpoint: None,
             checks,
         };
         for depth in [8, 16] {
@@ -907,12 +910,16 @@ mod tests {
                 objects: std::collections::BTreeMap::new(),
             }),
             verification: None,
+            profile: None,
+            checkpoint: None,
             checks: checks.clone(),
         };
         assert!(app.configured());
         assert!(!app.startup_enabled());
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
+        let workspace = crate::workspace::attach(&shared);
         assert!(app
-            .check(&eframe::egui::Context::default())
+            .check(&eframe::egui::Context::default(), &workspace)
             .unwrap_err()
             .contains("not available"));
         assert!(app.controller.is_none() && app.verification.is_none());
@@ -955,7 +962,7 @@ pub fn probe_bundled(app: &Path, configuration: &Configuration) -> Result<Probe,
 /// Main-thread application owner. Configured native startup remains disabled
 /// until safe termination/cancellation/recovery is implemented and verified.
 struct Verification {
-    receiver: mpsc::Receiver<Result<installed::Verified, String>>,
+    receiver: mpsc::Receiver<Result<checkpoint::Prepared, String>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -965,6 +972,8 @@ pub struct Application {
     configuration: Option<crate::sparkle::check::ApprovedCheck>,
     verification: Option<Verification>,
     checks: Rc<driver::State>,
+    profile: Option<crate::settings::UpdateProfile>,
+    checkpoint: Option<checkpoint::Prepared>,
 }
 
 impl Application {
@@ -989,8 +998,13 @@ impl Application {
             },
             configuration,
             verification: None,
+            profile: None,
+            checkpoint: None,
             checks: Rc::new(driver::State::default()),
         }
+    }
+    pub(crate) fn set_update_profile(&mut self, profile: Option<crate::settings::UpdateProfile>) {
+        self.profile = profile;
     }
     pub(crate) fn configured(&self) -> bool {
         self.configuration.is_some()
@@ -1027,7 +1041,11 @@ impl Application {
             owner.delegate.ivars().defer();
         }
     }
-    pub(crate) fn check(&mut self, ctx: &eframe::egui::Context) -> Result<(), String> {
+    pub(crate) fn check(
+        &mut self,
+        ctx: &eframe::egui::Context,
+        workspace: &crate::workspace::Registry,
+    ) -> Result<(), String> {
         if !self.startup_enabled() {
             return Err("App update checking is not available in this development build.".into());
         }
@@ -1049,6 +1067,11 @@ impl Application {
         if !app.is_absolute() || executable != app.join("Contents/MacOS/peerbrush") {
             return Err("App update checking requires the running installed bundle".into());
         }
+        crate::workspace::lifecycle::update_readiness(workspace)?;
+        let profile = self
+            .profile
+            .clone()
+            .ok_or("App updates require the locked default settings profile")?;
         let checks = Rc::new(driver::State::default());
         checks.begin(ctx)?;
         let (sender, receiver) = mpsc::channel();
@@ -1058,7 +1081,7 @@ impl Application {
         std::thread::Builder::new()
             .name("peerbrush-app-update-verification".into())
             .spawn(move || {
-                let result = installed::verify(app, configuration, worker_cancel);
+                let result = checkpoint::prepare(app, configuration, profile, worker_cancel);
                 let _ = sender.send(result);
                 repaint.request_repaint();
             })
@@ -1068,7 +1091,12 @@ impl Application {
         self.verification = Some(Verification { receiver, cancel });
         Ok(())
     }
-    pub(crate) fn tick(&mut self, ctx: &eframe::egui::Context) {
+    pub(crate) fn tick(
+        &mut self,
+        ctx: &eframe::egui::Context,
+        workspace: &crate::workspace::Registry,
+        ui_blocked: bool,
+    ) {
         if !self.startup_enabled() {
             if self.verification.is_some() {
                 self.defer();
@@ -1091,17 +1119,26 @@ impl Application {
                     if self.checks.view().cancelled {
                         self.checks.finished();
                     } else {
-                        let result = result.and_then(|verified| {
-                            verified.recheck()?;
+                        let result = result.and_then(|prepared| {
+                            if ui_blocked { return Err("Finish or cancel the current edit/file operation before app update checking".into()); }
+                            // Capture-only publication cannot authorize loading a
+                            // mutable live app/framework after worker verification.
+                            prepared.publish(workspace)?;
+                            checkpoint::require_captured_handoff()?;
+                            prepared.recheck_metadata()?;
                             let marker = MainThreadMarker::new()
                                 .ok_or("App update checking requires the main thread")?;
                             let owner = construct_with_state(
-                                &verified.framework,
+                                &prepared.verified.framework,
                                 marker,
                                 self.checks.clone(),
                             )?;
-                            verified.recheck()?;
+                            prepared.recheck_metadata()?;
                             self.checks.checking(&owner.controller);
+                            // Publish intent durably before Sparkle can resume any
+                            // previous installer. Every ambiguous outcome stays held.
+                            prepared.arm_native_intent()?;
+                            self.checkpoint = Some(prepared);
                             self.checks.native_starting()?;
                             self.controller = Some(owner);
                             let owner = self.controller.as_ref().unwrap();
@@ -1109,6 +1146,7 @@ impl Application {
                             let started: Bool =
                                 unsafe { msg_send![&*owner.controller, startUpdater: &mut error] };
                             if !started.as_bool() {
+                                self.checkpoint.as_ref().unwrap().not_started()?;
                                 self.checks.native_start_failed();
                                 return Err("App update checking could not start".into());
                             }

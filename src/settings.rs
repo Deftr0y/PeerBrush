@@ -79,7 +79,50 @@ struct Manifest {
 /// Kept alive for the application session, serializing profile edits and migration.
 pub struct Profile {
     pub locations: Locations,
-    _lock: Lock,
+    _lock: std::sync::Arc<Lock>,
+}
+/// A default-profile lease can only come from the session holding settings.lock.
+/// Explicit --state-dir sessions cannot request an installed-app checkpoint.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub struct UpdateProfile {
+    pub(crate) locations: Locations,
+    _lock: std::sync::Arc<Lock>,
+}
+#[cfg(target_os = "macos")]
+impl Profile {
+    pub fn update_profile(&self) -> UpdateProfile {
+        UpdateProfile {
+            locations: self.locations.clone(),
+            _lock: self._lock.clone(),
+        }
+    }
+}
+#[cfg(target_os = "macos")]
+impl UpdateProfile {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        Profile {
+            locations: self.locations.clone(),
+            _lock: self._lock.clone(),
+        }
+        .validate_manifest()?;
+        for name in FILES {
+            let path = self.locations.profile().join(name);
+            if read_legacy(&path)?.is_some() {
+                validate(name, &path)?;
+            }
+        }
+        Ok(())
+    }
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn update_files() -> Vec<std::path::PathBuf> {
+    let mut paths = vec![std::path::PathBuf::from("profile.json")];
+    for name in FILES {
+        paths.push((*name).into());
+        paths.push(std::path::Path::new("migration-backup").join(name));
+    }
+    paths
 }
 struct Lock(fs::File);
 
@@ -162,9 +205,11 @@ impl Profile {
     fn lock(locations: Locations) -> Result<Self, String> {
         private_directory(&locations.config)?;
         let lock = Lock::acquire(&locations.config.join("settings.lock"))?;
+        #[cfg(target_os = "macos")]
+        crate::sparkle::macos::checkpoint::startup_guard(&locations)?;
         Ok(Self {
             locations,
-            _lock: lock,
+            _lock: std::sync::Arc::new(lock),
         })
     }
     fn validate_manifest(&self) -> Result<(), String> {

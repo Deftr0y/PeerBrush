@@ -259,6 +259,14 @@ impl Store {
         self.save_error = None;
         Ok(())
     }
+    pub(crate) fn update_checkpoint_ready(&self) -> Result<(), String> {
+        if self.dirty || self.save_error.is_some() {
+            return Err(
+                "Finish saving tool preferences before app update checking or restart".into(),
+            );
+        }
+        Ok(())
+    }
     pub fn flush(&mut self) -> Result<(), String> {
         if !self.dirty {
             return Ok(());

@@ -176,6 +176,10 @@ fn run() -> Result<(), String> {
     let preferences = profile
         .as_ref()
         .map_or_else(|| state_dir.clone(), |p| p.locations.profile());
+    #[cfg(target_os = "macos")]
+    let update_profile = profile
+        .as_ref()
+        .map(peerbrush::settings::Profile::update_profile);
     let cache = profile
         .as_ref()
         .map_or_else(|| state_dir.clone(), |p| p.locations.cache.clone());
@@ -248,12 +252,11 @@ fn run() -> Result<(), String> {
         Box::new(move |cc| {
             #[cfg(target_os = "macos")]
             activation::macos::install_termination(&shared, &cc.egui_ctx)?;
-            Ok(Box::new(PeerBrush::new_with_preferences(
-                cc,
-                shared,
-                connection,
-                &preferences,
-            )))
+            #[allow(unused_mut)]
+            let mut app = PeerBrush::new_with_preferences(cc, shared, connection, &preferences);
+            #[cfg(target_os = "macos")]
+            app.set_update_profile(update_profile);
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| e.to_string())

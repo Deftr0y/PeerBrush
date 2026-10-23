@@ -28,6 +28,10 @@ pub(super) struct Panel {
     app_installer_check: store::Check,
 }
 impl Panel {
+    #[cfg(target_os = "macos")]
+    pub(super) fn set_update_profile(&mut self, profile: Option<crate::settings::UpdateProfile>) {
+        self.native_updater.set_update_profile(profile);
+    }
     pub fn load(directory: &Path) -> Self {
         Self {
             open: false,
@@ -151,7 +155,12 @@ impl Panel {
             ctx.request_repaint_after(self.next_auto.saturating_duration_since(Instant::now()));
         }
     }
-    fn show(&mut self, ctx: &egui::Context, restart_blocker: Option<String>) {
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        restart_blocker: Option<String>,
+        _workspace: &crate::workspace::Registry,
+    ) {
         if !self.open {
             return;
         }
@@ -184,7 +193,7 @@ impl Panel {
                     let busy=self.native_updater.view().busy || self.native_updater.pending_installation();
                     let enabled=self.native_updater.startup_enabled();
                     if ui.add_enabled(enabled && !busy,egui::Button::new("Check app updates")).clicked() {
-                        if let Err(error)=self.native_updater.check(ctx) { self.message=error; }
+                        if let Err(error)=self.native_updater.check(ctx, _workspace) { self.message=error; }
                     }
                     if !enabled { ui.label("App update checking is not available in this development build."); }
                     let phase=self.native_updater.view().phase;
@@ -307,15 +316,17 @@ impl PeerBrush {
     }
 
     pub(super) fn updates_tick(&mut self, ctx: &egui::Context) {
+        let idle = !self.update_interaction_active()
+            && !ctx.wants_keyboard_input()
+            && !ctx.input(|i| i.pointer.any_down() || !i.events.is_empty());
         #[cfg(target_os = "macos")]
         if self.exit_approved || self.lifecycle.is_some() {
             self.updates.native_updater.defer();
         } else {
-            self.updates.native_updater.tick(ctx);
+            self.updates
+                .native_updater
+                .tick(ctx, &self.workspace, !idle);
         }
-        let idle = !self.update_interaction_active()
-            && !ctx.wants_keyboard_input()
-            && !ctx.input(|i| i.pointer.any_down() || !i.events.is_empty());
         self.updates.tick(ctx, idle);
     }
     pub(super) fn update_interaction_active(&self) -> bool {
@@ -364,7 +375,7 @@ impl PeerBrush {
             return;
         }
         let blocker = self.update_restart_blocker();
-        self.updates.show(ctx, blocker);
+        self.updates.show(ctx, blocker, &self.workspace);
     }
 }
 

@@ -557,6 +557,11 @@ pub struct PeerBrush {
     gizmo_bounds: Option<(String, u64, [i32; 4])>,
 }
 impl PeerBrush {
+    #[cfg(target_os = "macos")]
+    pub fn set_update_profile(&mut self, profile: Option<crate::settings::UpdateProfile>) {
+        self.updates.set_update_profile(profile);
+    }
+
     pub fn new_with_preferences(
         cc: &eframe::CreationContext<'_>,
         shared: Shared,
