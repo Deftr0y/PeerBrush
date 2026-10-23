@@ -53,7 +53,14 @@ class Bundle(unittest.TestCase):
                 old_data = old_data if data is None else data
                 old_mode = old_mode if mode is None else mode
             result.append(('PeerBrush-fixture/' + path, old_data, old_mode))
-        package.write_zip(self.archive, result, 0)
+        # Malicious fixtures must reach the inspector independently of the
+        # production writer, which correctly refuses these links before output.
+        with zipfile.ZipFile(self.archive, 'w') as archive:
+            for path, data, mode in result:
+                entry = zipfile.ZipInfo(path)
+                entry.create_system = 3
+                entry.external_attr = (mode if stat.S_IFMT(mode) else stat.S_IFREG | mode) << 16
+                archive.writestr(entry, data)
 
     def test_exact_unsigned_inventory_and_nine_link_types(self):
         names = self.inspect()

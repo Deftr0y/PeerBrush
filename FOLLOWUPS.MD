@@ -565,3 +565,8 @@ Prepared Windows direct-signing source adds an explicit existing-certificate EXE
 
 
 Prepared final Windows release binding now consumes the signed-EXE MSIX producer's exact payload transformation and refuses unsigned PE or changed original code/overlay, without granting native trust. The actual strict descriptor consumer is reached by the strengthened synthetic composition fixture; focused refusal coverage is prepared, not executed. Existing native producer, installed/runtime and publication gates remain open.
+
+
+Prepared release-fixture corrections address the closed combined checkpoint: exact generated DEB stage/package ignore rules precede synthetic version-2 provenance, and structural PE rewrites preserve original ZIP permissions/metadata in both Windows producer and final composition fixtures. Production validation and native/readiness gates are unchanged. Corrected combined execution is pending; the observed original failures and separate Sparkle fixture correction remain recorded.
+
+Unreleased 75fa8b7 combined checkpoint: all-target compile, 1,253 local Rust passes (three explicit provider filters), auxiliary checks and all 18 actual-main fidelity cases passed. Python failed: 483 methods, 461 passes, 12 failed/errored parent methods and ten skips. Reviewed fixture-only corrections retain strict production provenance, ZIP permissions and malformed-link inspection. Ubuntu CI524 separately found invalid effect-color cancellation adding undo history; investigation/replay remain open. This checkpoint grants no performance, native input, installed, update or release readiness. Details and preserved history are in the development record.

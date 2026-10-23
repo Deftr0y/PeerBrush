@@ -107,6 +107,7 @@ class WindowsProducer(unittest.TestCase):
         fixture = self.fixture
         # Upgrade the existing source/provenance fixture to a structural PE32+.
         with zipfile.ZipFile(fixture.portable) as archive:
+            metadata = {item.filename: item for item in archive.infolist()}
             entries = {name: archive.read(name) for name in archive.namelist()}
         name = next(name for name in entries if name.endswith('/peerbrush.exe'))
         self.before = executable(entries[name][128:])
@@ -117,7 +118,7 @@ class WindowsProducer(unittest.TestCase):
         entries[manifest] = (json.dumps(release, indent=2) + '\n').encode()
         with zipfile.ZipFile(fixture.portable, 'w') as archive:
             for name, data in entries.items():
-                archive.writestr(name, data)
+                archive.writestr(metadata[name], data)
         self.makeappx = fixture.signtool.with_name('MakeAppx.exe')
         self.makeappx.write_bytes(b'not-a-real-makeappx')
         self.options = {key: value for key, value in fixture.options.items()

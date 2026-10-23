@@ -36,6 +36,10 @@ class Composition(unittest.TestCase):
             policy = 'packaging/release-policy.json'
             (instance.root / policy).write_bytes((ROOT / policy).read_bytes())
             instance.fixture.policy['source'].append(policy)
+            # final_package owns these generated outputs before later platform
+            # builds; keep the version-2 source checkout clean without packaging them.
+            with (instance.root / '.gitignore').open('a', encoding='utf-8') as stream:
+                stream.write('/final-deb-stage/\n/peerbrush_0.2.0-1_amd64.deb\n')
             instance.fixture.save_policy()
             instance.fixture.commit()
             instance.fixture.require_provenance()
@@ -46,6 +50,7 @@ class Composition(unittest.TestCase):
                 if platform != 'Windows':
                     return archive
                 with zipfile.ZipFile(archive) as source:
+                    metadata = {item.filename: item for item in source.infolist()}
                     entries = {name: source.read(name) for name in source.namelist()}
                 name = next(name for name in entries if name.endswith('/peerbrush.exe'))
                 entries[name] = executable_fixtures.executable(entries[name][128:])
@@ -55,7 +60,7 @@ class Composition(unittest.TestCase):
                 entries[manifest] = final.encode(release)
                 with zipfile.ZipFile(archive, 'w') as destination:
                     for name, data in entries.items():
-                        destination.writestr(name, data)
+                        destination.writestr(metadata[name], data)
                 return archive
             instance.fixture.build = structural_windows
         self.fixture = test_dmg_handoff.Handoff(methodName='runTest')
