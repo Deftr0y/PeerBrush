@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import zipfile
 
 from package import regular_file
 from package_macos_dmg import bounded_file, private_inspection_directory
@@ -187,6 +188,15 @@ def windows_binding(root, base, directory, selection):
     expected, release = msix.expected_payload(root, directory / portable['file'], identity, require_provenance=True)
     if (release['version'], release['commit']) != (base['version'], base['commit']):
         raise ValueError('Windows direct content has a different embedded source/version.')
+    with zipfile.ZipFile(unsigned) as archive:
+        entry = archive.getinfo('peerbrush.exe')
+        if not 0 < entry.file_size <= msix.PACKAGE_LIMIT:
+            raise ValueError('Windows direct executable exceeds the existing byte budget.')
+        with archive.open(entry) as stream:
+            executable = stream.read(msix.PACKAGE_LIMIT + 1)
+        if len(executable) != entry.file_size:
+            raise ValueError('Windows direct executable differs from its declared size.')
+    expected = msix.signed_executable_payload(expected, executable)
     msix.verify_payload(unsigned, expected)
     msix.verify_payload(package, expected, signed=True)
     signed._unsigned_binding(unsigned, package)

@@ -562,3 +562,6 @@ PB-147 remains open. This prepares dormant packaging and a guarded native compon
 
 
 Prepared Windows direct-signing source adds an explicit existing-certificate EXE-to-MSIX producer, strict original-byte PE comparison, separate native EXE/package verification and an opt-in descriptor consumer path. Offline whole-chain/refusal fixtures and callers are prepared, not executed. Public identity/provider, Windows version resources, trusted producer, native installation/update/unsaved-work acceptance and activation remain open; Store submission and direct update publication stay disabled.
+
+
+Prepared final Windows release binding now consumes the signed-EXE MSIX producer's exact payload transformation and refuses unsigned PE or changed original code/overlay, without granting native trust. The actual strict descriptor consumer is reached by the strengthened synthetic composition fixture; focused refusal coverage is prepared, not executed. Existing native producer, installed/runtime and publication gates remain open.
