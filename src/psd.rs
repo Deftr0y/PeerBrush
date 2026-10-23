@@ -1407,17 +1407,22 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     let compressed = z.inner.finish().map_err(|e| e.to_string())?;
     progress("Assembling verified Photoshop output", 0, 0)?;
     check()?;
-    let mut resources = vec![];
-    resources.extend_from_slice(b"8BIM");
-    u16b(&mut resources, 4000);
-    resources.push(12);
-    resources.extend_from_slice(b"PeerBrush.v1");
-    resources.push(0);
-    let mut payload = b"PBR1".to_vec();
-    payload.extend(compressed);
-    block(&mut resources, &payload);
-    if payload.len() % 2 != 0 {
-        resources.push(0);
+    let payload_length = compressed
+        .len()
+        .checked_add(4)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or("PSD resource length overflow")?;
+    let mut resource_start = vec![];
+    resource_start.extend_from_slice(b"8BIM");
+    u16b(&mut resource_start, 4000);
+    resource_start.push(12);
+    resource_start.extend_from_slice(b"PeerBrush.v1");
+    resource_start.push(0);
+    u32b(&mut resource_start, payload_length);
+    resource_start.extend_from_slice(b"PBR1");
+    let mut resource_end = vec![];
+    if payload_length % 2 != 0 {
+        resource_end.push(0);
     }
     let mut header = b"8BPS".to_vec();
     u16b(&mut header, if layout.large() { 2 } else { 1 });
@@ -1430,16 +1435,20 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     u32b(&mut header, 0);
     if doc.srgb_tagged {
         let profile = crate::color_profile::srgb_profile();
-        resources.extend_from_slice(b"8BIM");
-        u16b(&mut resources, 1039);
-        resources.extend([0; 2]);
-        block(&mut resources, profile);
+        resource_end.extend_from_slice(b"8BIM");
+        u16b(&mut resource_end, 1039);
+        resource_end.extend([0; 2]);
+        block(&mut resource_end, profile);
         if profile.len() % 2 != 0 {
-            resources.push(0);
+            resource_end.push(0);
         }
     }
-    let resource_length =
-        u32::try_from(resources.len()).map_err(|_| "PSD resource length overflow")?;
+    let resource_length = resource_start
+        .len()
+        .checked_add(compressed.len())
+        .and_then(|n| n.checked_add(resource_end.len()))
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or("PSD resource length overflow")?;
     u32b(&mut header, resource_length);
     let mut out = BoundedWriter {
         inner: output,
@@ -1449,7 +1458,12 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
         error: "Photoshop output exceeds the initial 256 MiB file limit",
     };
     out.write_all(&header).map_err(|e| e.to_string())?;
-    out.write_all(&resources).map_err(|e| e.to_string())?;
+    out.write_all(&resource_start).map_err(|e| e.to_string())?;
+    for chunk in compressed.chunks(64 * 1024) {
+        out.write_all(chunk).map_err(|e| e.to_string())?;
+    }
+    drop(compressed);
+    out.write_all(&resource_end).map_err(|e| e.to_string())?;
     layout.write_length(&mut out, layer_length)?;
     let total = layer_length
         .checked_add(composite_length)
@@ -3371,6 +3385,223 @@ pub fn validate(doc: &Document) -> Result<(), String> {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn source_resource_framing_keeps_native_sources_history_and_standard_bytes() {
+        for depth in [8, 16] {
+            for tagged in [false, true] {
+                let mut engine = crate::engine::Engine::new();
+                engine.doc = streamed_fixture(depth);
+                engine.doc.srgb_tagged = tagged;
+                let layer = &mut engine.doc.layers[0];
+                layer.pixels.retained =
+                    Some(Box::new(crate::retained::Original::from(&layer.pixels)));
+                let mask = &mut layer.mask.as_mut().unwrap().steps[0].pixels;
+                mask.retained = Some(Box::new(crate::retained::Original::from(mask)));
+                let layer_id = layer.id.clone();
+                for opacity in [0.5, 1.0, 0.25] {
+                    engine.edit(
+                        "human",
+                        &[serde_json::json!({"op":"layer.update","layer":layer_id,"opacity":opacity})],
+                        Some(engine.doc.revision),
+                        None,
+                        "Resource fixture opacity",
+                    ).unwrap();
+                }
+                engine.undo("human").unwrap();
+                assert_eq!((engine.undo.len(), engine.redo.len()), (2, 1));
+                assert_eq!(engine.doc.layers[0].opacity, 1.0);
+                let history = |engine: &crate::engine::Engine| {
+                    let entries = |items: &[crate::engine::History]| {
+                        items.iter().map(|h| {
+                        serde_json::json!({"before":h.before,"after":h.after,"actor":h.actor,
+                            "label":h.label,"task":h.task,"scopes":h.scopes,"gesture":h.gesture,
+                            "reverted":h.reverted})
+                    }).collect::<Vec<_>>()
+                    };
+                    serde_json::json!({"undo":entries(&engine.undo),"redo":entries(&engine.redo),
+                        "saved_revision":engine.saved_revision,"leases":engine.leases})
+                };
+                let before = serde_json::to_value(&engine.doc).unwrap();
+                let history_before = history(&engine);
+                for layout in [Layout::Psd, Layout::Psb] {
+                    let bytes = encode_layout(&engine.doc, layout).unwrap();
+                    let mut file = Cursor::new(&bytes);
+                    assert_eq!(file.bytes(4).unwrap(), b"8BPS");
+                    assert_eq!(file.u16().unwrap(), if layout.large() { 2 } else { 1 });
+                    file.bytes(20).unwrap();
+                    assert!(file.block().unwrap().is_empty());
+                    let resources = file.block().unwrap();
+                    assert_eq!(&resources[..20], b"8BIM\x0f\xa0\x0cPeerBrush.v1\0");
+                    let payload_length =
+                        u32::from_be_bytes(resources[20..24].try_into().unwrap()) as usize;
+                    assert_eq!(&resources[24..28], b"PBR1");
+                    let compressed = &resources[28..24 + payload_length];
+                    let mut expected = b"8BIM\x0f\xa0\x0cPeerBrush.v1\0".to_vec();
+                    let payload = [b"PBR1".as_slice(), compressed].concat();
+                    expected.extend((payload.len() as u32).to_be_bytes());
+                    expected.extend(&payload);
+                    if payload.len() % 2 != 0 {
+                        expected.push(0);
+                    }
+                    if tagged {
+                        let profile = crate::color_profile::srgb_profile();
+                        expected.extend(b"8BIM\x04\x0f\0\0");
+                        expected.extend((profile.len() as u32).to_be_bytes());
+                        expected.extend(profile);
+                        if profile.len() % 2 != 0 {
+                            expected.push(0);
+                        }
+                    }
+                    assert_eq!(resources, expected);
+                    let mut json = Vec::new();
+                    ZlibDecoder::new(compressed).read_to_end(&mut json).unwrap();
+                    let embedded: Embedded = serde_json::from_slice(&json).unwrap();
+                    assert_eq!(embedded.format, 29);
+                    assert_eq!(serde_json::to_value(&embedded.document).unwrap(), before);
+                    let section = layout.block(&mut file).unwrap();
+                    let merged = &bytes[file.pos..];
+                    let standard = expected_standard(&engine.doc, layout.large());
+                    assert_eq!(section, standard.0);
+                    assert_eq!(merged, standard.1);
+                    let hash = |data: &[u8]| {
+                        data.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+                            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+                        })
+                    };
+                    assert_eq!(embedded.standard_hash, hash(section) ^ hash(merged));
+                    let restored = decode(&bytes).unwrap();
+                    assert!(!restored.read_only);
+                    assert_eq!(restored.bit_depth, depth);
+                    assert_eq!(serde_json::to_value(&restored).unwrap(), before);
+                    assert!(restored.layers[0].pixels.retained.is_some());
+                    assert!(restored.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .retained
+                        .is_some());
+                    let png = restored.export_png().unwrap();
+                    let actual = image::load_from_memory(&png).unwrap();
+                    assert_eq!(
+                        actual.color(),
+                        if depth == 16 {
+                            image::ColorType::Rgba16
+                        } else {
+                            image::ColorType::Rgba8
+                        }
+                    );
+                    assert_eq!(png, engine.doc.export_png().unwrap());
+                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                    assert_eq!(history(&engine), history_before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_source_transfer_is_chunked_and_keeps_short_write_error_and_cancel_guards() {
+        struct Output<'a> {
+            bytes: Vec<u8>,
+            largest: usize,
+            stop_at: Option<usize>,
+            cancel: bool,
+            control: &'a crate::saving::Control,
+        }
+        impl Write for Output<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.largest = self.largest.max(bytes.len());
+                if self.stop_at.is_some_and(|limit| self.bytes.len() >= limit) {
+                    return Err(std::io::Error::other(
+                        "Injected compressed source write failure",
+                    ));
+                }
+                let n = bytes.len().min(997);
+                self.bytes.extend_from_slice(&bytes[..n]);
+                if self.cancel && self.stop_at.is_some_and(|limit| self.bytes.len() >= limit) {
+                    assert!(self.control.cancel());
+                }
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(257, 193, depth).unwrap();
+            let mut random = 0xD31B49A7u32;
+            for y in 0..193 {
+                for x in 0..257 {
+                    let mut words = [0u16; 4];
+                    for word in &mut words {
+                        random ^= random << 13;
+                        random ^= random >> 17;
+                        random ^= random << 5;
+                        *word = random as u16;
+                    }
+                    doc.layers[0].pixels.set16(x, y, words);
+                }
+            }
+            doc.layers[0].pixels.set16(0, 0, [12347, 23459, 34571, 0]);
+            let before = serde_json::to_value(&doc).unwrap();
+            for layout in [Layout::Psd, Layout::Psb] {
+                let expected = encode_layout(&doc, layout).unwrap();
+                let payload_length =
+                    u32::from_be_bytes(expected[54..58].try_into().unwrap()) as usize;
+                assert!(
+                    payload_length > 2 * 64 * 1024,
+                    "The fixture reaches multiple source chunks"
+                );
+                let control = crate::saving::Control::default();
+                control.begin(doc.id.clone(), doc.revision).unwrap();
+                let mut complete = Output {
+                    bytes: vec![],
+                    largest: 0,
+                    stop_at: None,
+                    cancel: false,
+                    control: &control,
+                };
+                let mut spool = std::io::Cursor::new(Vec::new());
+                encode_layout_to(&doc, layout, &mut complete, &mut spool, &|| control.check())
+                    .unwrap();
+                assert!(complete.largest <= 64 * 1024);
+                assert_eq!(complete.bytes, expected);
+                let standard = spool.into_inner();
+                for cancel in [false, true] {
+                    let control = crate::saving::Control::default();
+                    control.begin(doc.id.clone(), doc.revision).unwrap();
+                    let mut incomplete = Output {
+                        bytes: vec![],
+                        largest: 0,
+                        stop_at: Some(62 + 64 * 1024),
+                        cancel,
+                        control: &control,
+                    };
+                    let mut spool = std::io::Cursor::new(Vec::new());
+                    let error =
+                        encode_layout_to(&doc, layout, &mut incomplete, &mut spool, &|| {
+                            control.check()
+                        })
+                        .unwrap_err();
+                    assert_eq!(
+                        error,
+                        if cancel {
+                            "Save canceled; current work and destination preserved"
+                        } else {
+                            "Injected compressed source write failure"
+                        }
+                    );
+                    assert_eq!(control.status().cancel_requested, cancel);
+                    assert!(incomplete.largest <= 64 * 1024);
+                    assert!(incomplete.bytes.len() >= 62 + 64 * 1024);
+                    assert!(incomplete.bytes.len() < expected.len());
+                    assert_eq!(incomplete.bytes, expected[..incomplete.bytes.len()]);
+                    assert_eq!(spool.into_inner(), standard);
+                    assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+                }
+                assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            }
+        }
+    }
+
     #[test]
     fn bounded_source_and_final_writers_keep_short_write_limits_and_cancellation() {
         struct Short {

@@ -85,3 +85,10 @@ Five focused serialization methods cover both native depths, legacy8/compact mix
 ## Native16 PNG encoding transfer (unreleased, verification pending)
 
 The existing PNG helper borrows the validated native16 word slice as native-endian bytes for the same image encoder, removing PeerBrush's separate full-frame byte-copy vector. Native samples, dimensions, length checks, ICC handling and encoder settings remain unchanged. The encoder still allocates its own endian-conversion buffer on little-endian hosts and its output; source materialization and other callers' allocations remain separate. Existing native16 PNG, ICC, clipboard, pattern and hidden-RGB checks require combined/native replay. This is a removed transfer allocation, not a measured whole-process memory bound or larger-document qualification.
+
+
+## Supplementary-source output transfer (unreleased preparation)
+
+The PSD/PSB writer can emit its unchanged PBR1 resource prefix, existing compressed source bytes in 64 KiB slices and the original padding/ICC suffix directly to the bounded output. This removes the intermediate complete PBR1 payload and aggregate resource byte vectors, and drops the compressed vector before copying the verified standard spool. Resource lengths, source JSON/compression/version, standard native raster/mask data, current merged composite, historical checksums and all Save publication guards remain unchanged.
+
+The compressed source vector still exists. Full decoded JSON restoration, native and retained originals, history/tab ownership, full composite/effect/filter preparation, returned Vec APIs and the existing file/document admission limits remain separate. This is bounded output transfer, not out-of-core storage, a measured whole-process memory or latency improvement, or 16000-square qualification. Prepared framing/native8/16 PSD/PSB/source/history/composite, short-write, error and cancellation checks require integrated execution before accepting the change.
