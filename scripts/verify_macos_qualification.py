@@ -42,9 +42,14 @@ REQUIRED_JOB_STEPS = (
 )
 
 
-def _policy(windows):
-    if type(windows) is not bool:
+def _policy(windows, linux=False):
+    if type(windows) is not bool or type(linux) is not bool or (windows and linux):
         raise ValueError('Native platform policy must be selected by its fixed adapter.')
+    if linux:
+        workflow = '.github/workflows/linux-qualification.yml'
+        return (workflow, REPOSITORY_URI + '/' + workflow + '@refs/heads/main',
+                'linux-deb-qualification.json', 'PeerBrushLinuxDebQualificationV1',
+                'PeerBrushLinuxNativeOriginV1', 'ubuntu-24.04', 'Qualify selected final Linux DEB', 16 * 1024)
     if windows:
         workflow = '.github/workflows/windows-qualification.yml'
         return (workflow, REPOSITORY_URI + '/' + workflow + '@refs/heads/main',
@@ -90,9 +95,9 @@ def _command(executable, arguments, work, label):
     return output.read_bytes()
 
 
-def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt, _windows=False):
+def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt, _windows=False, _linux=False):
     """Only inspect output from the successful, pinned cryptographic verifier process."""
-    workflow, identity, filename, *_ = _policy(_windows)
+    workflow, identity, filename, *_ = _policy(_windows, _linux)
     if not isinstance(data, bytes) or not 0 < len(data) <= OUTPUT_LIMIT:
         raise ValueError('Native attestation verifier returned unsupported output.')
     try:
@@ -158,11 +163,12 @@ def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt,
                 trigger=certificate['buildTrigger'], run_id=run_id, run_attempt=run_attempt,
                 certificate_and_observer_time='cryptographically-verified')
 
-def _reconcile_job(claims, *, _windows=False):
+def _reconcile_job(claims, *, _windows=False, _linux=False):
     """Only called with this invocation's cryptographically verified claims."""
     from prepare_site_release import public_get
-    workflow, _, _, _, _, runner, qualify_step, _ = _policy(_windows)
-    required_steps = tuple(qualify_step if name == 'Qualify selected final DMG' else name for name in REQUIRED_JOB_STEPS)
+    workflow, _, _, _, _, runner, qualify_step, _ = _policy(_windows, _linux)
+    required_steps = tuple('Acquire selected Linux assets' if _linux and name == 'Acquire selected signed assets'
+                           else qualify_step if name == 'Qualify selected final DMG' else name for name in REQUIRED_JOB_STEPS)
 
     try:
         # This producer is deliberately dispatch-only and refuses reruns.
@@ -253,9 +259,9 @@ def _reconcile_job(claims, *, _windows=False):
 
 def authenticate(qualification, *, qualification_sha256, commit, version, bundle, bundle_sha256,
                  trusted_root, trusted_root_sha256, cli, cli_sha256, cli_version,
-                 workflow_commit, run_id, run_attempt, work, source_root, readback_job=False, _windows=False):
+                 workflow_commit, run_id, run_attempt, work, source_root, readback_job=False, _windows=False, _linux=False):
     """Explicit reviewed public trust inputs only; never fetch roots/bundles or use auth."""
-    _, identity, filename, report_format, origin_format, _, _, qualification_limit = _policy(_windows)
+    _, identity, filename, report_format, origin_format, _, _, qualification_limit = _policy(_windows, _linux)
     selected = [qualification_sha256, bundle_sha256, trusted_root_sha256, cli_sha256]
     if (not isinstance(qualification, bytes) or not 0 < len(qualification) <= qualification_limit
             or any(type(value) is not str or not re.fullmatch('[0-9a-f]{64}', value) for value in selected)
@@ -316,8 +322,8 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
                  '--format', 'json']
     verified = _command(executable, arguments, work, 'verification')
     claims = _verified_claims(verified, commit=commit, qualification_sha256=qualification_sha256,
-                              run_id=run_id, run_attempt=run_attempt, _windows=_windows)
-    service = _reconcile_job(claims, _windows=_windows) if readback_job else None
+                              run_id=run_id, run_attempt=run_attempt, _windows=_windows, _linux=_linux)
+    service = _reconcile_job(claims, _windows=_windows, _linux=_linux) if readback_job else None
     private_inspection_directory(work, source_root, fresh=False)
     for source, destination, expected, limit in copies:
         if bounded_file(source, limit)[0] != expected or bounded_file(destination, limit)[0] != expected:

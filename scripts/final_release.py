@@ -232,7 +232,7 @@ def windows_binding(root, base, directory, selection):
 
 
 def compose(root, directory, output, *, commit, version, macos, windows, maintainer,
-            linux_receipt, linux_receipt_sha256, previous=None):
+            linux_receipt, linux_receipt_sha256, previous=None, linux_native=None):
     root, directory = readiness.handoff_path(root), readiness.handoff_path(directory)
     signed._source(root, commit)
     inventory_bytes = readiness.read_inventory(directory)
@@ -261,6 +261,11 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
     linux = readiness.assess_deb(root, directory / portable['file'], directory / deb['file'], commit=commit,
         version=version, portable_sha256=portable['sha256'], package_sha256=deb['sha256'], maintainer=maintainer,
         installation_receipt=receipt)
+    linux_origin, linux_originals = None, []
+    if linux_native is not None:
+        import verify_linux_qualification as linux_verifier
+        linux_origin, linux_originals = linux_verifier.bind(root, linux_native, installation=receipt,
+            assessment=linux, commit=commit, version=version, portable_sha256=portable['sha256'], maintainer=maintainer)
     direct, windows_channel, windows_originals, windows_origin = windows_binding(root, inventory, directory, windows)
     outputs = {record['file']: directory / record['file'] for record in inventory['assets']}
     outputs.update({path.name: path for path in direct})
@@ -315,9 +320,9 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
             raise ValueError('Original final input changed after composition; preserve partial output.')
     if readiness.read_inventory(directory) != inventory_bytes:
         raise ValueError('Original base inventory changed during composition.')
-    for path, limit, expected in windows_originals:
+    for path, limit, expected in [*windows_originals, *linux_originals]:
         if bounded_file(path, limit)[0] != expected:
-            raise ValueError('Original Windows binding input changed after composition.')
+            raise ValueError('Original or owned native binding input changed after composition.')
     if (read(macos['qualification'], readiness.MAX_DMG_QUALIFICATION_BYTES, macos['qualification_sha256']) != qualification
             or read(linux_receipt, readiness.MAX_INSTALLATION_RECEIPT_BYTES, linux_receipt_sha256) != receipt):
         raise ValueError('Original native evidence changed after composition.')
@@ -340,6 +345,12 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
         'windows-runtime-redistribution-approval-not-authenticated',
         'linux-installed-evidence-producer-not-authenticated',
         'installed-upgrade-interruption-and-visible-native-acceptance-not-established']
+    if linux_origin is not None:
+        report['blockers'].remove('linux-installed-evidence-producer-not-authenticated')
+        linux['installation_receipt_provenance'] = 'verified-pinned-workflow-oidc-attestation-and-successful-job'
+        report['installed_candidates']['Linux']['producer_provenance'] = linux['installation_receipt_provenance']
+        report['linux_bound_installation'] = linux
+        report['linux_native_origin'] = linux_origin
     report['publication_phases'] = readiness._publication_phases(report['blockers'])
     report.update(format='PeerBrushFinalCompositionAssessmentV1', production_ready=False,
         final_files_bound=True, windows_native_signature=('verified-by-authenticated-native-qualification' if windows_origin else 'not-authenticated-by-aggregate'),
@@ -355,7 +366,8 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
 def from_selection(root, directory, output, selection, selection_sha256):
     selected = json.loads(read(selection, 64 * 1024, selection_sha256), object_pairs_hook=readiness.unique_fields)
     required = {'commit', 'version', 'macos', 'windows', 'maintainer', 'linux_receipt', 'linux_receipt_sha256'}
-    if not isinstance(selected, dict) or set(selected) != required:
+    if (not isinstance(selected, dict) or set(selected) not in [required, required | {'linux_native'}]
+            or ('linux_native' in selected and not isinstance(selected['linux_native'], dict))):
         raise ValueError('Strict reviewed final selection required; reports cannot grant authority.')
     return compose(root, directory, output, **selected)
 

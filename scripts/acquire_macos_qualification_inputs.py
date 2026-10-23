@@ -141,11 +141,13 @@ def request(host, target, limit, *, token=None, destination=None, redirect=False
         connection.close()
 
 
-def metadata(run, artifact, *, commit, run_id, artifact_id, artifact_sha256, _windows=False, _portable=False):
-    if type(_windows) is not bool or type(_portable) is not bool or (_windows and _portable):
+def metadata(run, artifact, *, commit, run_id, artifact_id, artifact_sha256, _windows=False, _portable=False, _linux=False):
+    if (type(_windows) is not bool or type(_portable) is not bool or type(_linux) is not bool
+            or (_windows and (_portable or _linux))):
         raise ValueError('Native predecessor uses a fixed platform adapter.')
-    workflow = '.github/workflows/release.yml' if _portable else '.github/workflows/windows-release-signing.yml' if _windows else SIGNING_WORKFLOW
-    artifact_name = 'candidate-Windows' if _portable else ('windows-signed-inputs-' if _windows else 'macos-signed-pair-') + run_id + '-1'
+    workflow = '.github/workflows/release.yml' if (_portable or _linux) else '.github/workflows/windows-release-signing.yml' if _windows else SIGNING_WORKFLOW
+    artifact_name = ('candidate-Linux' if _portable else 'DEB-installation-candidate') if _linux else (
+        'candidate-Windows' if _portable else ('windows-signed-inputs-' if _windows else 'macos-signed-pair-') + run_id + '-1')
     repo = dict(id=REPOSITORY_ID, full_name=REPOSITORY)
     if not isinstance(run, dict) or not isinstance(artifact, dict):
         raise ValueError('Native predecessor metadata must be objects.')

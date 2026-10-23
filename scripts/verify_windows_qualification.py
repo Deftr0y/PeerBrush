@@ -15,7 +15,7 @@ FIELDS = {'qualification', 'qualification_sha256', 'certificate_sha256', 'timest
 
 
 def authenticate(qualification, **inputs):
-    if '_windows' in inputs:
+    if '_windows' in inputs or '_linux' in inputs:
         raise ValueError('Windows native origin uses its fixed reviewed workflow policy.')
     return native.authenticate(qualification, **inputs, _windows=True)
 

@@ -1,0 +1,217 @@
+name: PeerBrush native Linux DEB qualification
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full reviewed stable main and workflow SHA
+        required: true
+        type: string
+      selection_json:
+        description: Reviewed public exact candidate artifact and byte selections; no credentials
+        required: true
+        type: string
+      selection_sha256:
+        description: Independently reviewed SHA256 of exact UTF8 selection JSON
+        required: true
+        type: string
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+concurrency:
+  group: linux-native-qualification-${{ github.sha }}
+  cancel-in-progress: false
+env:
+  SELECTED_COMMIT: ${{ inputs.expected_commit }}
+  SELECTION_JSON: ${{ inputs.selection_json }}
+  SELECTION_SHA256: ${{ inputs.selection_sha256 }}
+  PEERBRUSH_LINUX_QUALIFICATION_ENABLED: ${{ vars.PEERBRUSH_LINUX_QUALIFICATION_ENABLED }}
+jobs:
+  gate:
+    name: gate
+    # Literal hold: variables/dispatch alone cannot activate this producer.
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python3 -I - <<'PY'
+          import os, re
+          selected = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_REPOSITORY_ID': '1407648785', 'GITHUB_REPOSITORY_OWNER_ID': '21202494',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/linux-qualification.yml@refs/heads/main',
+              'GITHUB_SHA': selected, 'GITHUB_WORKFLOW_SHA': selected, 'GITHUB_RUN_ATTEMPT': '1',
+              'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_OS': 'Linux', 'RUNNER_ARCH': 'X64',
+              'PEERBRUSH_LINUX_QUALIFICATION_ENABLED': 'true',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(key) != value for key, value in required.items()):
+              raise SystemExit('Require reviewed exact main and approved native invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact main source
+        run: python3 -B scripts/release_gate.py --commit "$SELECTED_COMMIT"
+      - name: Test fixed native authentication contracts without authority
+        run: |
+          python3 -B scripts/test_linux_qualification.py
+          python3 -B scripts/test_macos_qualification_attestation.py
+          python3 -B scripts/test_macos_qualification_job.py
+          python3 -B scripts/test_windows_qualification.py
+          python3 -B scripts/package.py --check-source
+
+  qualify:
+    name: qualify
+    needs: gate
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
+    environment: linux-native-qualification
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python3 -I - <<'PY'
+          import os, re
+          selected = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_REPOSITORY_ID': '1407648785', 'GITHUB_REPOSITORY_OWNER_ID': '21202494',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/linux-qualification.yml@refs/heads/main',
+              'GITHUB_SHA': selected, 'GITHUB_WORKFLOW_SHA': selected, 'GITHUB_RUN_ATTEMPT': '1',
+              'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_OS': 'Linux', 'RUNNER_ARCH': 'X64',
+              'PEERBRUSH_LINUX_QUALIFICATION_ENABLED': 'true',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(key) != value for key, value in required.items()):
+              raise SystemExit('Require reviewed exact main and approved native invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact main source
+        run: |
+          python3 -B scripts/release_gate.py --commit "$SELECTED_COMMIT"
+          python3 -I - <<'PY'
+          import hashlib, os, pathlib, re
+          data, expected = os.environ['SELECTION_JSON'].encode('utf-8'), os.environ['SELECTION_SHA256']
+          if not 0 < len(data) <= 32768 or not re.fullmatch('[0-9a-f]{64}', expected) or hashlib.sha256(data).hexdigest() != expected:
+              raise SystemExit('Reviewed bounded public selection differs from its independent digest.')
+          with (pathlib.Path(os.environ['RUNNER_TEMP']) / 'linux-native-selection.json').open('xb') as stream:
+              stream.write(data)
+          PY
+      - name: Acquire selected Linux assets
+        id: acquire
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          selected=$(python3 -B scripts/acquire_linux_qualification_inputs.py --source-root "$GITHUB_WORKSPACE" \
+            --selection "$RUNNER_TEMP/linux-native-selection.json" --selection-sha256 "$SELECTION_SHA256" \
+            --output "$RUNNER_TEMP/peerbrush-linux-inputs")
+          if [[ ! "$selected" =~ ^[0-9a-f]{64}$ ]]; then exit 1; fi
+          echo "sha256=$selected" >> "$GITHUB_OUTPUT"
+      - name: Qualify selected final Linux DEB
+        env:
+          QUALIFICATION_SELECTION_SHA256: ${{ steps.acquire.outputs.sha256 }}
+        run: |
+          read -r VERSION PORTABLE_SHA DEB_SHA EXECUTABLE_SHA SOURCE_SHA < <(python3 -I - <<'PY'
+          import os, pathlib, sys
+          sys.path.insert(0, 'scripts')
+          import qualify_linux_deb as q
+          values = q.read_selection(pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-linux-inputs/qualification-selection.json', os.environ['QUALIFICATION_SELECTION_SHA256'])
+          checked = q.inputs(pathlib.Path(os.environ['GITHUB_WORKSPACE']), values)
+          print(values['version'], values['portable_sha256'], values['package_sha256'], checked['executable_sha256'], checked['record']['source_sha256'])
+          PY
+          )
+          test -n "$SOURCE_SHA"
+          DEB="$RUNNER_TEMP/peerbrush-linux-inputs/media/peerbrush_${VERSION}-1_amd64.deb"
+          EVIDENCE="$RUNNER_TEMP/peerbrush-linux-checks"
+          mkdir -m 700 "$EVIDENCE"
+          docker run --rm --mount "type=bind,src=$DEB,dst=/input/peerbrush_${VERSION}-1_amd64.deb,readonly" \
+            --mount "type=bind,src=$PWD/scripts,dst=/checks,readonly" --mount "type=bind,src=$EVIDENCE,dst=/evidence" \
+            -e PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 -e DEBIAN_FRONTEND=noninteractive \
+            -e VERSION="$VERSION" -e SOURCE_COMMIT="$SELECTED_COMMIT" -e DEB_SHA="$DEB_SHA" \
+            -e EXECUTABLE_SHA="$EXECUTABLE_SHA" -e SOURCE_SHA="$SOURCE_SHA" ubuntu:24.04 bash -euc '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends python3 xdg-utils ca-certificates
+              python3 -B /checks/test_deb_installation.py --package /input/peerbrush_${VERSION}-1_amd64.deb --package-sha256 "$DEB_SHA" \
+                --commit "$SOURCE_COMMIT" --version "$VERSION" --executable-sha256 "$EXECUTABLE_SHA" \
+                --source-sha256 "$SOURCE_SHA" --output /evidence/installation.json'
+          HISTORICAL_ROOT="$RUNNER_TEMP/peerbrush-linux-historical"
+          git init -q "$HISTORICAL_ROOT"
+          git -C "$HISTORICAL_ROOT" fetch --depth=1 https://github.com/Deftr0y/PeerBrush.git a00cf47accde87400fad3f0fcfc5fe96fc4f5be1
+          git -C "$HISTORICAL_ROOT" checkout --detach FETCH_HEAD
+          docker run --rm --mount "type=bind,src=$DEB,dst=/input/peerbrush_${VERSION}-1_amd64.deb,readonly" \
+            --mount "type=bind,src=$PWD/scripts,dst=/checks,readonly" \
+            --mount "type=bind,src=$HISTORICAL_ROOT,dst=/old-source,readonly" --mount "type=bind,src=$EVIDENCE,dst=/evidence" \
+            -e PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 -e PEERBRUSH_DISPOSABLE_REAL_UPGRADE_TEST=1 -e DEBIAN_FRONTEND=noninteractive \
+            -e VERSION="$VERSION" -e SOURCE_COMMIT="$SELECTED_COMMIT" -e DEB_SHA="$DEB_SHA" \
+            -e EXECUTABLE_SHA="$EXECUTABLE_SHA" -e SOURCE_SHA="$SOURCE_SHA" ubuntu:24.04 bash -euc '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends python3 git ca-certificates xdg-utils
+              git config --global --add safe.directory /old-source
+              python3 -B /checks/test_deb_version_upgrade.py --old-source-root /old-source \
+                --package /input/peerbrush_${VERSION}-1_amd64.deb --package-sha256 "$DEB_SHA" --commit "$SOURCE_COMMIT" --version "$VERSION" \
+                --executable-sha256 "$EXECUTABLE_SHA" --source-sha256 "$SOURCE_SHA" --output /evidence/portable-to-deb.json'
+          INSTALL_SHA=$(sha256sum "$EVIDENCE/installation.json" | cut -d ' ' -f 1)
+          UPGRADE_SHA=$(sha256sum "$EVIDENCE/portable-to-deb.json" | cut -d ' ' -f 1)
+          python3 -B scripts/qualify_linux_deb.py --source-root "$GITHUB_WORKSPACE" \
+            --selection "$RUNNER_TEMP/peerbrush-linux-inputs/qualification-selection.json" --selection-sha256 "$QUALIFICATION_SELECTION_SHA256" \
+            --installation "$EVIDENCE/installation.json" --installation-sha256 "$INSTALL_SHA" \
+            --upgrade "$EVIDENCE/portable-to-deb.json" --upgrade-sha256 "$UPGRADE_SHA" --output "$RUNNER_TEMP/peerbrush-linux-report"
+      - name: Attest generated native qualification
+        id: attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ runner.temp }}/peerbrush-linux-report/linux-deb-qualification.json
+          subject-name: linux-deb-qualification.json
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+      - name: Retain qualification and bundle
+        env:
+          SELECTED_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          python3 -I - <<'PY'
+          import os, pathlib, sys
+          sys.path.insert(0, 'scripts')
+          from package_macos_dmg import bounded_file, private_inspection_directory
+          base, root = pathlib.Path(os.environ['RUNNER_TEMP']), pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          output = private_inspection_directory(base / 'peerbrush-linux-evidence', root, fresh=True)
+          output.mkdir(mode=0o700)
+          try:
+              for path, name, limit in [
+                  (base / 'peerbrush-linux-report/linux-deb-qualification.json', 'linux-deb-qualification.json', 16384),
+                  (base / 'peerbrush-linux-checks/installation.json', 'installation.json', 65536),
+                  (base / 'peerbrush-linux-checks/portable-to-deb.json', 'portable-to-deb.json', 65536),
+                  (pathlib.Path(os.environ['SELECTED_BUNDLE']), 'linux-deb-qualification.sigstore.json', 2097152),
+              ]:
+                  checksum, size = bounded_file(path, limit, output / name)
+                  if bounded_file(path, limit) != (checksum, size) or bounded_file(output / name, limit) != (checksum, size):
+                      raise ValueError('Native evidence copy changed.')
+          except Exception:
+              raise SystemExit('Native Linux evidence could not be retained; no handoff is available.') from None
+          PY
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-native-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-linux-evidence/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
