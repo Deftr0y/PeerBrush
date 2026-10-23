@@ -570,6 +570,18 @@ mod tests {
             candidate_ms.push(times[1]);
         }
         println!("2048-square CPU premultiplied radius4: channel-major ms {baseline_ms:?}; pixel-major ms {candidate_ms:?}");
+        let build: serde_json::Value = serde_json::from_str(crate::build_info::json()).unwrap();
+        println!(
+            "{}",
+            serde_json::json!({
+                "format":"PeerBrushNative16SpatialV1", "build":build,
+                "group":"native16-premultiplied-radius4", "width":edge, "height":edge,
+                "radius":4, "pairs":6,
+                "order":["channel-pixel", "pixel-channel", "channel-pixel", "pixel-channel", "channel-pixel", "pixel-channel"],
+                "channel_major_ms":baseline_ms, "pixel_major_ms":candidate_ms,
+                "native_window":false, "cpu_used":true, "gpu_used":false
+            })
+        );
         baseline_ms.sort_by(f64::total_cmp);
         candidate_ms.sort_by(f64::total_cmp);
         let median = |times: &[f64]| (times[2] + times[3]) * 0.5;

@@ -602,6 +602,51 @@ exit $LASTEXITCODE
         self.assertIn("rows[0]['build'].get('tree') != 'clean'", text)
         self.assertIn('caches/scheduling uncontrolled', text)
 
+    def test_native16_kernel_ci_runs_after_regressions_and_reads_only_exact_bounded_metrics(self):
+        import textwrap
+        text = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        name = '      - name: Record balanced native16 CPU kernel baseline\n'
+        step = text.split(name, 1)[1].split('\n      - ', 1)[0]
+        self.assertEqual(text.count(name), 1)
+        self.assertNotIn('if:', step)
+        self.assertGreater(text.index(name), text.index('name: Run regression tests and summarize failures'))
+        self.assertIn('depth16::color::tests::native16_spatial_kernel_performance -- --exact --ignored --nocapture --test-threads=1', step)
+        program = compile(textwrap.dedent(step.split("<<'PY'\n", 1)[1].split('\n          PY', 1)[0]), '<native16-ci-readback>', 'exec')
+        commit = '1' * 40
+        valid = dict(format='PeerBrushNative16SpatialV1', group='native16-premultiplied-radius4',
+            build=dict(format='PeerBrushBuildInfoV1', schema=1, product='PeerBrush', version='0.30.0-dev.1', commit=commit, tree='clean', end='PeerBrushBuildInfoEnd'),
+            width=2048, height=2048, radius=4, pairs=6, order=['channel-pixel', 'pixel-channel'] * 3,
+            channel_major_ms=[1, 2, 3, 4, 5, 6], pixel_major_ms=[7, 8, 9, 10, 11, 12],
+            native_window=False, cpu_used=True, gpu_used=False)
+        # Slower candidate samples remain valid: CI enforces fidelity/format, no speed threshold.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'diagnostic.log'
+            path.write_text('ordinary harness output\n' + json.dumps(valid) + '\n', encoding='utf-8')
+            with mock.patch.object(sys, 'argv', ['readback', str(path), commit, '0']), mock.patch('builtins.print') as output:
+                exec(program, {})
+            self.assertEqual(json.loads(output.call_args_list[-1].args[0]), valid)
+            variants = [('', '0'), (json.dumps(valid), '1'), (json.dumps(valid) + '\n' + json.dumps(valid), '0'),
+                        ('{', '0'), ('{"format":' + ' ' * 4096 + '}', '0'), ('x' * (2 * 1024 * 1024 + 1), '0'),
+                        (json.dumps(valid)[:-1] + ',"pairs":6}', '0')]
+            for field, changed in [('format', 'wrong'), ('group', 'wrong'), ('width', 1024), ('pairs', 5),
+                    ('order', ['pixel-channel', 'channel-pixel'] * 3), ('native_window', 0), ('cpu_used', False), ('gpu_used', True),
+                    ('channel_major_ms', [1] * 5), ('channel_major_ms', [True] * 6),
+                    ('channel_major_ms', [0] * 6), ('channel_major_ms', [-1] * 6),
+                    ('channel_major_ms', [float('nan')] * 6), ('pixel_major_ms', [float('inf')] * 6),
+                    ('private_extra', 'NEVER_PRINT_PRIVATE_DATA')]:
+                row = dict(valid, **{field: changed})
+                variants.append((json.dumps(row), '0'))
+            for field, changed in [('commit', '2' * 40), ('tree', 'dirty'), ('format', 'wrong'), ('schema', True),
+                    ('version', 'NEVER_PRINT_PRIVATE_DATA'), ('private_extra', 'NEVER_PRINT_PRIVATE_DATA')]:
+                variants.append((json.dumps(dict(valid, build=dict(valid['build'], **{field: changed}))), '0'))
+            for index, (body, status) in enumerate(variants):
+                path.write_text(body, encoding='utf-8')
+                with self.subTest(case=index), mock.patch.object(sys, 'argv', ['readback', str(path), commit, status]), \
+                        mock.patch('builtins.print') as output, self.assertRaises(SystemExit) as caught:
+                    exec(program, {})
+                self.assertEqual(str(caught.exception), 'Native16 CPU kernel diagnostic failed; no timing comparison established')
+                output.assert_not_called()
+
     def test_ci_cache_saves_after_main_without_bypassing_tests_or_release_source(self):
         root = Path(__file__).resolve().parents[1] / '.github/workflows'
         text = (root / 'ci.yml').read_text(encoding='utf-8')

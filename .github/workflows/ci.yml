@@ -253,6 +253,56 @@ jobs:
           print('CPU component metrics only; caches/scheduling uncontrolled; compiler/platform changes are not controlled before/after comparisons.')
           print(json.dumps(rows[0], sort_keys=True, separators=(',', ':')))
           PY
+      - name: Record balanced native16 CPU kernel baseline
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --lib depth16::color::tests::native16_spatial_kernel_performance -- --exact --ignored --nocapture --test-threads=1 > "$RUNNER_TEMP/peerbrush-native16-cpu.log" 2>&1
+          diagnostic_status=$?
+          python - "$RUNNER_TEMP/peerbrush-native16-cpu.log" "$(git rev-parse HEAD)" "$diagnostic_status" <<'PY'
+          import json, math, re, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          failure = 'Native16 CPU kernel diagnostic failed; no timing comparison established'
+          if int(sys.argv[3]) or path.stat().st_size > 2 * 1024 * 1024:
+              raise SystemExit(failure)
+          rows = [line for line in path.read_text(encoding='utf-8', errors='strict').splitlines() if line.startswith('{')]
+          if len(rows) != 1 or len(rows[0]) > 4096:
+              raise SystemExit(failure)
+          def unique_fields(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError('Duplicate metric field')
+                  result[key] = value
+              return result
+          try:
+              value = json.loads(rows[0], object_pairs_hook=unique_fields)
+              fixed = dict(format='PeerBrushNative16SpatialV1', group='native16-premultiplied-radius4',
+                  width=2048, height=2048, radius=4, pairs=6,
+                  order=['channel-pixel', 'pixel-channel'] * 3)
+              if (not isinstance(value, dict) or set(value) != set(fixed) | {'build', 'channel_major_ms', 'pixel_major_ms', 'native_window', 'cpu_used', 'gpu_used'}
+                      or any(value[key] != expected for key, expected in fixed.items())
+                      or value['native_window'] is not False or value['cpu_used'] is not True or value['gpu_used'] is not False):
+                  raise ValueError('Wrong kernel metric scope')
+              build = value['build']
+              if (not isinstance(build, dict) or set(build) != {'format', 'schema', 'product', 'version', 'commit', 'tree', 'end'}
+                      or build['format'] != 'PeerBrushBuildInfoV1' or type(build['schema']) is not int or build['schema'] != 1
+                      or build['product'] != 'PeerBrush' or build['end'] != 'PeerBrushBuildInfoEnd'
+                      or build['commit'] != sys.argv[2] or not re.fullmatch('[0-9a-f]{40}', sys.argv[2]) or build['tree'] != 'clean'
+                      or not isinstance(build['version'], str) or len(build['version']) > 80
+                      or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', build['version'])):
+                  raise ValueError('Wrong kernel build binding')
+              for name in ['channel_major_ms', 'pixel_major_ms']:
+                  samples = value[name]
+                  if (not isinstance(samples, list) or len(samples) != 6
+                          or any(type(sample) not in [int, float] or not math.isfinite(sample) or sample <= 0 for sample in samples)):
+                      raise ValueError('Invalid kernel samples')
+          except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+              raise SystemExit(failure) from None
+          print('Native16 CPU kernel metrics only; full-word parity asserted; caches/scheduling uncontrolled; no application/GUI/GPU/peak-memory or isolated-causation claim.')
+          print(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False))
+          PY
       - name: Verify native installed-font inventory without registration
         run: cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact
       - run: cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
