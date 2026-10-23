@@ -63,24 +63,36 @@ mod tiles_serde {
             Compact(String),
             Legacy(Vec<u8>),
         }
-        let items = Vec::<(u32, u32, TileData)>::deserialize(d)?;
-        let mut out = BTreeMap::new();
-        for (x, y, data) in items {
-            let data = match data {
-                TileData::Compact(s) => {
-                    if s.len() > ((TILE * TILE * 4 + 2) / 3 * 4) as usize {
-                        return Err(serde::de::Error::custom("Oversized tile"));
-                    }
-                    STANDARD.decode(s).map_err(serde::de::Error::custom)?
-                }
-                TileData::Legacy(bytes) => bytes,
-            };
-            if data.len() != (TILE * TILE * 4) as usize {
-                return Err(serde::de::Error::custom("Invalid tile length"));
+        struct Tiles;
+        impl<'de> serde::de::Visitor<'de> for Tiles {
+            type Value = BTreeMap<(u32, u32), Arc<Vec<u8>>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a sequence")
             }
-            out.insert((x, y), Arc::new(data));
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((x, y, data)) = sequence.next_element::<(u32, u32, TileData)>()? {
+                    let data = match data {
+                        TileData::Compact(s) => {
+                            if s.len() > ((TILE * TILE * 4 + 2) / 3 * 4) as usize {
+                                return Err(serde::de::Error::custom("Oversized tile"));
+                            }
+                            STANDARD.decode(s).map_err(serde::de::Error::custom)?
+                        }
+                        TileData::Legacy(bytes) => bytes,
+                    };
+                    if data.len() != (TILE * TILE * 4) as usize {
+                        return Err(serde::de::Error::custom("Invalid tile length"));
+                    }
+                    out.insert((x, y), Arc::new(data));
+                }
+                Ok(out)
+            }
         }
-        Ok(out)
+        d.deserialize_seq(Tiles)
     }
 }
 
@@ -102,25 +114,37 @@ mod samples16_serde {
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         d: D,
     ) -> Result<BTreeMap<(u32, u32), Arc<Vec<u16>>>, D::Error> {
-        let entries = Vec::<(u32, u32, String)>::deserialize(d)?;
-        let mut tiles = BTreeMap::new();
-        for (x, y, data) in entries {
-            if data.len() > ((TILE * TILE * 8 + 2) / 3 * 4) as usize {
-                return Err(serde::de::Error::custom("Oversized16-bit tile"));
+        struct Tiles;
+        impl<'de> serde::de::Visitor<'de> for Tiles {
+            type Value = BTreeMap<(u32, u32), Arc<Vec<u16>>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a sequence")
             }
-            let bytes = STANDARD.decode(&data).map_err(serde::de::Error::custom)?;
-            if bytes.len() != (TILE * TILE * 8) as usize {
-                return Err(serde::de::Error::custom("Invalid16-bit tile length"));
-            }
-            let words = bytes
-                .chunks_exact(2)
-                .map(|v| u16::from_be_bytes([v[0], v[1]]))
-                .collect();
-            if tiles.insert((x, y), Arc::new(words)).is_some() {
-                return Err(serde::de::Error::custom("Duplicate16-bit tile"));
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut tiles = BTreeMap::new();
+                while let Some((x, y, data)) = sequence.next_element::<(u32, u32, String)>()? {
+                    if data.len() > ((TILE * TILE * 8 + 2) / 3 * 4) as usize {
+                        return Err(serde::de::Error::custom("Oversized16-bit tile"));
+                    }
+                    let bytes = STANDARD.decode(data).map_err(serde::de::Error::custom)?;
+                    if bytes.len() != (TILE * TILE * 8) as usize {
+                        return Err(serde::de::Error::custom("Invalid16-bit tile length"));
+                    }
+                    let words = bytes
+                        .chunks_exact(2)
+                        .map(|v| u16::from_be_bytes([v[0], v[1]]))
+                        .collect();
+                    if tiles.insert((x, y), Arc::new(words)).is_some() {
+                        return Err(serde::de::Error::custom("Duplicate16-bit tile"));
+                    }
+                }
+                Ok(tiles)
             }
         }
-        Ok(tiles)
+        d.deserialize_seq(Tiles)
     }
 }
 
@@ -919,7 +943,6 @@ pub fn png16_with_profile(
         return Err("Wrong16-bit PNG pixel length".into());
     }
     // image's encoder expects native-endian words and writes PNG's big-endian samples.
-    let bytes: Vec<u8> = rgba.iter().flat_map(|v| v.to_ne_bytes()).collect();
     let mut out = vec![];
     let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
     if let Some(profile) = profile {
@@ -928,7 +951,12 @@ pub fn png16_with_profile(
             .map_err(|e| e.to_string())?;
     }
     encoder
-        .write_image(&bytes, w, h, image::ExtendedColorType::Rgba16)
+        .write_image(
+            bytemuck::cast_slice(rgba),
+            w,
+            h,
+            image::ExtendedColorType::Rgba16,
+        )
         .map_err(|e| e.to_string())?;
     Ok(out)
 }

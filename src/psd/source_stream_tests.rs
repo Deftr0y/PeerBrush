@@ -490,6 +490,28 @@ fn invalid_streams_or_definition_gates_preserve_standard_protected_fallback_and_
                 altered["document"][key] = value;
                 failures.push(compressed(&serde_json::to_vec(&altered).unwrap()));
             }
+            let storage = if depth == 16 { "samples16" } else { "tiles" };
+            for entries in [json!([[0, 0, ""]]), json!([[0, 0, "!"]]), json!([[0, 0]])] {
+                let mut altered = json.clone();
+                altered["document"]["layers"][0]["pixels"][storage] = entries;
+                failures.push(compressed(&serde_json::to_vec(&altered).unwrap()));
+            }
+            let original = json["document"]["layers"][0]["pixels"][storage]
+                .as_array()
+                .unwrap();
+            assert!(!original.is_empty());
+            let mut outside = original[0].clone();
+            outside[0] = json!(u32::MAX);
+            outside[1] = json!(u32::MAX);
+            let mut altered = json.clone();
+            altered["document"]["layers"][0]["pixels"][storage] = json!([outside]);
+            failures.push(compressed(&serde_json::to_vec(&altered).unwrap()));
+            if depth == 16 {
+                let mut altered = json.clone();
+                altered["document"]["layers"][0]["pixels"][storage] =
+                    json!([original[0], original[0]]);
+                failures.push(compressed(&serde_json::to_vec(&altered).unwrap()));
+            }
             for zipped in failures {
                 let loaded = decode(&replaced(&bytes, &zipped)).unwrap();
                 assert!(loaded.read_only);
