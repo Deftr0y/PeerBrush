@@ -162,6 +162,7 @@ jobs:
       - run: python scripts/test_store_release_state.py
       - run: python scripts/test_production_readiness.py
       - run: python -B scripts/test_final_release.py
+      - run: python -B scripts/test_final_inputs.py
       - run: python -B scripts/test_publish_release.py
       - run: python -B scripts/test_prepare_site_release.py
       - run: python -B scripts/test_readback_site_release.py

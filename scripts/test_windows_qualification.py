@@ -339,5 +339,50 @@ class WindowsWorkflow(unittest.TestCase):
                 self.assertNotIn('PFX', text)
 
 
+
+class WindowsDescriptorRetention(unittest.TestCase):
+    def test_actual_retention_keeps_original_descriptor_and_rejects_missing_or_changed_media(self):
+        fixture = WindowsFacts(methodName='runTest')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.qualify()
+        f = fixture.f
+        workflow = (ROOT / '.github/workflows/windows-qualification.yml').read_text()
+        section = workflow.split('      - name: Retain qualification and bundle\n', 1)[1].split('      - name: Upload qualification evidence\n', 1)[0]
+        inline = section.split("python -I - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
+        program = compile(textwrap.dedent(inline), '<actual-windows-descriptor-retention>', 'exec')
+        descriptor_source = f.fixture.base / ('windows-descriptor-' + str(fixture.serial)) / f.descriptor.name
+        original = descriptor_source.read_bytes()
+        report = fixture.report_path.read_bytes()
+        for case in ['original', 'missing', 'changed']:
+            base = f.fixture.base / ('retention-' + case)
+            base.mkdir(mode=0o700)
+            reports, descriptors = base / 'peerbrush-windows-report', base / 'peerbrush-windows-descriptor'
+            reports.mkdir(mode=0o700)
+            descriptors.mkdir(mode=0o700)
+            (reports / qualifier.REPORT).write_bytes(report)
+            bundle = base / 'attestation.json'
+            bundle.write_bytes(b'SYNTHETIC_UNTRUSTED_ATTESTATION')
+            if case != 'missing':
+                (descriptors / f.descriptor.name).write_bytes(original if case == 'original' else original + b' ')
+            environment = dict(GITHUB_WORKSPACE=str(f.root), RUNNER_TEMP=str(base), SELECTED_COMMIT=f.fixture.commit,
+                               SELECTED_BUNDLE=str(bundle))
+            with self.subTest(case=case), mock.patch.dict(acquisition.os.environ, environment), \
+                    mock.patch.object(acquisition.sys, 'path', list(acquisition.sys.path)):
+                if case == 'original':
+                    exec(program, {})
+                    output = base / 'peerbrush-windows-evidence'
+                    self.assertEqual({path.name for path in output.iterdir()},
+                        {qualifier.REPORT, 'windows-installer-qualification.sigstore.json', f.descriptor.name})
+                    self.assertEqual((output / f.descriptor.name).read_bytes(), original)
+                    self.assertEqual((output / qualifier.REPORT).read_bytes(), report)
+                    self.assertEqual((output / 'windows-installer-qualification.sigstore.json').read_bytes(), bundle.read_bytes())
+                else:
+                    with self.assertRaises(SystemExit):
+                        exec(program, {})
+            self.assertEqual(descriptor_source.read_bytes(), original)
+            self.assertEqual(fixture.report_path.read_bytes(), report)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -181,20 +181,33 @@ jobs:
           SELECTED_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
           python -I - <<'PY'
-          import os, pathlib, sys
+          import json, os, pathlib, sys
           sys.path.insert(0, 'scripts')
           from package_macos_dmg import bounded_file, private_inspection_directory
+          from acquire_windows_qualification_inputs import stable_source
+          from package_msix import package_version
+          from production_readiness import unique_fields
+          from final_release import read
           source = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          version = stable_source(source, os.environ['SELECTED_COMMIT'])
+          descriptor = 'PeerBrush-' + package_version(version) + '-Windows-x64.appinstaller'
           output = private_inspection_directory(pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-windows-evidence', source, fresh=True)
           output.mkdir(mode=0o700)
           try:
               for path, name, limit in [
                   (pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-windows-report/windows-installer-qualification.json', 'windows-installer-qualification.json', 16384),
                   (pathlib.Path(os.environ['SELECTED_BUNDLE']), 'windows-installer-qualification.sigstore.json', 2097152),
+                  (pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-windows-descriptor' / descriptor, descriptor, 16384),
               ]:
                   checksum, size = bounded_file(path, limit, output / name)
+                  if name == 'windows-installer-qualification.json':
+                      report_sha256 = checksum
                   if bounded_file(output / name, limit) != (checksum, size):
                       raise ValueError('Native evidence copy changed.')
+              native = json.loads(read(output / 'windows-installer-qualification.json', 16384, report_sha256), object_pairs_hook=unique_fields)
+              if (native['descriptor']['file'] != descriptor
+                      or bounded_file(output / descriptor, 16384)[0] != native['descriptor']['sha256']):
+                  raise ValueError('Actual descriptor differs from its native qualification binding.')
           except Exception:
               raise SystemExit('Native Windows evidence could not be retained; no handoff is available.') from None
           PY

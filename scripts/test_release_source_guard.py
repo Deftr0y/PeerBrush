@@ -195,5 +195,49 @@ class WebsiteInvocation(unittest.TestCase):
             self.assertEqual(fetch.call_count, int(head == expected))
 
 
+
+class FinalInputInvocation(unittest.TestCase):
+    def test_actual_data_workflow_guards_are_fixed_and_run_before_checkout(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / '.github/workflows/final-inputs.yml').read_text(encoding='utf-8')
+        for name in ['gate', 'prepare']:
+            body = workflow.split('\n  ' + name + ':\n', 1)[1]
+            guard = body.split("python -I - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
+            program = compile(textwrap.dedent(guard), '<fixed-final-input-invocation>', 'exec')
+            environment = dict(EXPECTED_COMMIT=COMMIT, GITHUB_SHA=COMMIT, GITHUB_WORKFLOW_SHA=COMMIT,
+                GITHUB_REPOSITORY=REPOSITORY, GITHUB_REF='refs/heads/main', GITHUB_EVENT_NAME='workflow_dispatch',
+                GITHUB_WORKFLOW_REF=REPOSITORY + '/.github/workflows/final-inputs.yml@refs/heads/main', GITHUB_RUN_ATTEMPT='1')
+            with mock.patch.dict(os.environ, environment, clear=True):
+                exec(program, {})
+            for key, value in [('GITHUB_SHA', '2' * 40), ('GITHUB_WORKFLOW_SHA', '2' * 40),
+                               ('GITHUB_REPOSITORY', 'fork/PeerBrush'), ('GITHUB_EVENT_NAME', 'pull_request'),
+                               ('GITHUB_REF', 'refs/pull/1/merge'), ('GITHUB_RUN_ATTEMPT', '2'),
+                               ('GITHUB_WORKFLOW_REF', REPOSITORY + '/.github/workflows/release.yml@refs/heads/main')]:
+                with self.subTest(job=name, field=key), mock.patch.dict(os.environ, dict(environment, **{key: value}), clear=True), self.assertRaises(SystemExit):
+                    exec(program, {})
+            self.assertLess(body.index('Require exact dormant data-producer invocation'), body.index('actions/checkout@'))
+            self.assertIn('if: ${{ false }}', body.split('    steps:', 1)[0])
+
+    def test_actual_production_composition_guard_precedes_checkout_and_requires_exact_main(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / '.github/workflows/production.yml').read_text(encoding='utf-8')
+        body = workflow.split('\n  compose:\n', 1)[1].split('\n  publish:\n', 1)[0]
+        guard = body.split("python -I - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
+        program = compile(textwrap.dedent(guard), '<fixed-final-consumer-invocation>', 'exec')
+        environment = dict(EXPECTED_COMMIT=COMMIT, GITHUB_SHA=COMMIT, GITHUB_WORKFLOW_SHA=COMMIT,
+            GITHUB_REPOSITORY=REPOSITORY, GITHUB_REF='refs/heads/main', GITHUB_EVENT_NAME='workflow_dispatch',
+            GITHUB_WORKFLOW_REF=REPOSITORY + '/.github/workflows/production.yml@refs/heads/main')
+        with mock.patch.dict(os.environ, environment, clear=True):
+            exec(program, {})
+        for key, value in [('GITHUB_SHA', '2' * 40), ('GITHUB_WORKFLOW_SHA', '2' * 40),
+                           ('GITHUB_REPOSITORY', 'fork/PeerBrush'), ('GITHUB_EVENT_NAME', 'pull_request'),
+                           ('GITHUB_REF', 'refs/pull/1/merge'),
+                           ('GITHUB_WORKFLOW_REF', REPOSITORY + '/.github/workflows/release.yml@refs/heads/main')]:
+            with self.subTest(field=key), mock.patch.dict(os.environ, dict(environment, **{key: value}), clear=True), self.assertRaises(SystemExit):
+                exec(program, {})
+        self.assertLess(body.index('Require exact reviewed production invocation'), body.index('actions/checkout@'))
+        self.assertIn('if: ${{ false }}', body.split('    steps:', 1)[0])
+
+
 if __name__ == '__main__':
     unittest.main()
