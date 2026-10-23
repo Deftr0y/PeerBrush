@@ -2303,6 +2303,9 @@ fn small_projective_window_scrolls_to_reference_corner_apply_and_cancel() {
     let x = app.free_transform.as_ref().unwrap().corners()[0][0] + 0.25;
     enter(&mut app, true, 0, &format!("{x:.6}"));
     assert!((app.free_transform.as_ref().unwrap().corners()[0][0] - x).abs() < 1e-5);
+    // Preview completion removes its status row; measure buttons after that layout.
+    let output = settle_size(&mut app, &ctx, size);
+    actual_preview(&app, &output);
     scroll_to(&mut app, "Apply", None);
     let at = scroll_to(&mut app, "Cancel", None);
     workspace::click(&mut app, &ctx, size, at);

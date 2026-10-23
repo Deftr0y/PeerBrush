@@ -1053,3 +1053,9 @@ PB-147 app-owned manual-check source (unreleased; execution pending): null compi
 
 
 PB-147 pending source-review correction: exact owned Sparkle NoUpdate1001 completion now survives the real acknowledgement/abort/finish sequence while foreign owners, other domains/codes and cancelled/finished cycles remain distinct. CHECK_LAYOUT1 emits/inspects the correct upstream signed-feed failure-expiration interval key; historical source preserves its original exact artifact contract. Native callback-sequence and actual source-derived old/new plist/tamper fixtures are prepared, not executed. Default public pins/native policy remain absent and installation/termination/recovery source remains unfinished.
+
+### Native CI526 closure and transform fixture synchronization (unreleased)
+
+All three CI526 native jobs failed in the strengthened HEX method; Windows additionally failed the small-window projective fixture at its post-Cancel closure assertion. Its numeric/reference/corner and scroll checks had already completed. The GitHub merge tree was independently matched to b411 source. Later packaging and aggregate inspection were skipped; no native platform passed this complete batch.
+
+A source-backed fixture race allows shared-preview completion to remove the status row above Apply/Cancel after geometry measurement. The test now uses the existing preview completion helper and verifies actual shared-engine pixels before measuring the final controls. This adds three test-only lines and preserves all prior assertions. The actual CI interleaving remains unobserved; corrected combined/native replay is pending. Native desktop input remains unperformed, with installation, signatures/provider activation, updates/recovery and production/Store readiness still separate gates.
