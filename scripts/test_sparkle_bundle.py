@@ -25,7 +25,7 @@ class Bundle(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='peerbrush-sparkle-bundle-')
         self.addCleanup(self.temporary.cleanup)
-        self.base = pathlib.Path(self.temporary.name)
+        self.base = pathlib.Path(self.temporary.name).resolve()
         self.pin = bundle.pin()
         self.sources = {bundle.PIN_NAME: json.dumps(self.pin).encode()}
         self.files = []
@@ -62,6 +62,25 @@ class Bundle(unittest.TestCase):
                 entry.create_system = 3
                 entry.external_attr = (mode if stat.S_IFMT(mode) else stat.S_IFREG | mode) << 16
                 archive.writestr(entry, data)
+
+    @unittest.skipIf(os.name == "nt", "Actual linked work/output paths are checked on native macOS/Linux")
+    def test_explicit_linked_work_and_output_paths_still_refuse(self):
+        import prepare_sparkle
+        parent = self.base / 'owned-parent'
+        parent.mkdir()
+        marker = parent / 'original'
+        marker.write_bytes(b'SYNTHETIC_ORIGINAL')
+        alias = self.base / 'linked-parent'
+        alias.symlink_to(parent, target_is_directory=True)
+        for selected in [alias, alias / 'future-output']:
+            with self.subTest(path=selected.name):
+                with self.assertRaisesRegex(ValueError, 'must not use links or reparse points'):
+                    prepare_sparkle.external_output(selected, prepare_sparkle.ROOT)
+                with self.assertRaisesRegex(ValueError, 'must not use links'):
+                    sign_macos.outside_checkout(selected, prepare_sparkle.ROOT)
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(marker.read_bytes(), b'SYNTHETIC_ORIGINAL')
+        self.assertEqual({path.name for path in parent.iterdir()}, {'original'})
 
     def test_exact_unsigned_inventory_and_nine_link_types(self):
         names = self.inspect()
