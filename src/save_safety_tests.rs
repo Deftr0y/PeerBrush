@@ -755,6 +755,8 @@ fn controlled_save_cancellation_and_writer_errors_preserve_native_work_and_origi
             for selected in [
                 "Preparing layer masks",
                 "Writing standard layer channels",
+                "Writing editable sources",
+                "Assembling verified Photoshop output",
                 "Verifying native spool",
                 "Verifying save output",
                 "writer failure",
@@ -813,9 +815,13 @@ fn controlled_save_cancellation_and_writer_errors_preserve_native_work_and_origi
                         if selected.starts_with("Verifying") {
                             read_checks += 1;
                         }
-                        if (selected == "Preparing layer masks")
-                            || (selected == "Writing standard layer channels"
-                                && status.completed >= 2)
+                        if matches!(
+                            selected,
+                            "Preparing layer masks"
+                                | "Writing editable sources"
+                                | "Assembling verified Photoshop output"
+                        ) || (selected == "Writing standard layer channels"
+                            && status.completed >= 2)
                             || (selected.starts_with("Verifying") && read_checks == 3)
                         {
                             assert!(observed_control.cancel());
@@ -1121,6 +1127,114 @@ fn queued_save_rejects_early_cancel_or_newer_human_source_before_serialization()
             drop(e);
             drop(shared);
             fs::remove_dir_all(directory).unwrap();
+        }
+    }
+}
+
+#[test]
+fn source_compression_and_replay_refuse_newer_human_work_without_publication() {
+    for depth in [8, 16] {
+        for extension in ["psd", "psb"] {
+            for selected in [
+                "Writing editable sources",
+                "Assembling verified Photoshop output",
+            ] {
+                let parent = std::env::temp_dir().canonicalize().unwrap();
+                let directory = parent.join(format!("pb-source-spool-{}", engine::id()));
+                fs::create_dir(&directory).unwrap();
+                assert_eq!(
+                    directory.canonicalize().unwrap().parent(),
+                    Some(parent.as_path())
+                );
+                let path = directory.join(format!("art.{extension}"));
+                let shared =
+                    native_save_fixture(depth, path.file_name().unwrap().to_str().unwrap());
+                save(&shared, &path).unwrap();
+                let original = fs::read(&path).unwrap();
+                let (saved, version) = {
+                    let e = shared.lock().unwrap();
+                    (e.saved_revision, e.file_version)
+                };
+                let control = crate::saving::Control::default();
+                let observed = control.clone();
+                let actual = shared.clone();
+                let hit = std::rc::Rc::new(std::cell::Cell::new(false));
+                let reached = hit.clone();
+                let retained = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let expected = retained.clone();
+                let history = |e: &Engine| {
+                    let entries = |items: &[engine::History]| {
+                        items
+                            .iter()
+                            .map(|h| {
+                                json!({"before":h.before,"after":h.after,
+                            "actor":h.actor,"label":h.label,"task":h.task,"scopes":h.scopes,
+                            "gesture":h.gesture,"reverted":h.reverted})
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    json!({"undo":entries(&e.undo),"redo":entries(&e.redo),"leases":e.leases})
+                };
+                let mut source_start = None;
+                let watch = WatchSave::new(move |phase, output, spool| {
+                    if phase != "encoding" || observed.status().stage != selected || reached.get() {
+                        return Ok(());
+                    }
+                    let started = if selected == "Writing editable sources" {
+                        let bytes = fs::metadata(spool).unwrap().len();
+                        bytes > *source_start.get_or_insert(bytes)
+                    } else {
+                        // Header + PBR1 prefix are 62 bytes; a larger output
+                        // reaches the real compressed-source replay, before standards.
+                        fs::metadata(output).unwrap().len() > 62
+                    };
+                    if started {
+                        reached.set(true);
+                        let mut e = actual.lock().unwrap();
+                        let layer = e.doc.layers[0].id.clone();
+                        let revision = e.doc.revision;
+                        e.edit(
+                            "human",
+                            &[json!({"op":"layer.update","layer":layer,"opacity":0.5})],
+                            Some(revision),
+                            None,
+                            "Human edit during source transfer",
+                        )
+                        .unwrap();
+                        *expected.borrow_mut() =
+                            Some((serde_json::to_value(&e.doc).unwrap(), history(&e)));
+                    }
+                    Ok(())
+                });
+                let error =
+                    save_controlled(&shared, &path, &json!({}), &control, || {}).unwrap_err();
+                drop(watch);
+                assert!(
+                    hit.get(),
+                    "The actual selected source phase must be reached"
+                );
+                assert!(error.contains("source changed"), "{selected}: {error}");
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let e = shared.lock().unwrap();
+                let expected = retained.borrow();
+                let (document, histories) = expected.as_ref().unwrap();
+                assert_eq!(&serde_json::to_value(&e.doc).unwrap(), document);
+                assert_eq!(&history(&e), histories);
+                assert_eq!(e.saved_revision, saved);
+                assert_eq!(e.file_version, version);
+                assert_ne!(e.saved_revision, e.doc.revision);
+                assert!(e.file_ownership.is_some());
+                assert!(crate::file_ownership::Ownership::open(&path, "other project").is_err());
+                assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
+                assert!(control.status().finished && control.status().error.is_some());
+                assert!(!fs::read_dir(&directory).unwrap().any(|entry| matches!(
+                    entry.unwrap().path().extension().and_then(|s| s.to_str()),
+                    Some("tmp" | "psd-spool")
+                )));
+                drop(e);
+                drop(shared);
+                fs::remove_dir_all(directory).unwrap();
+            }
         }
     }
 }

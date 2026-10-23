@@ -1391,8 +1391,20 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
         standard_hash: layer_hash ^ composite_hash,
         document: doc.clone(),
     };
+    let total = layer_length
+        .checked_add(composite_length)
+        .ok_or("Photoshop section length overflow")?;
+    if spool.stream_position().map_err(|e| e.to_string())? != total
+        || spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != total
+    {
+        return Err("Photoshop standard spool length changed".into());
+    }
+    let mut source = StandardWriter::new(&mut *spool, check);
+    // Count the existing standard bytes against the same spool/file limit;
+    // the fresh hash covers only the appended compressed source segment.
+    source.bytes = total;
     let mut z = BoundedWriter {
-        inner: ZlibEncoder::new(Vec::new(), Compression::fast()),
+        inner: ZlibEncoder::new(source, Compression::fast()),
         written: 0,
         limit: if high {
             512 * 1024 * 1024
@@ -1403,11 +1415,15 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
         error: "Editable PSD source data exceeds its bounded serialization budget",
     };
     serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
-    let compressed = z.inner.finish().map_err(|e| e.to_string())?;
+    let mut source = z.inner.finish().map_err(|e| e.to_string())?;
+    source.flush().map_err(|e| e.to_string())?;
+    let compressed_length = source.bytes - total;
+    let compressed_hash = source.hash;
+    let spool_length = source.bytes;
+    drop(source);
     progress("Assembling verified Photoshop output", 0, 0)?;
     check()?;
-    let payload_length = compressed
-        .len()
+    let payload_length = compressed_length
         .checked_add(4)
         .and_then(|n| u32::try_from(n).ok())
         .ok_or("PSD resource length overflow")?;
@@ -1444,7 +1460,9 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     }
     let resource_length = resource_start
         .len()
-        .checked_add(compressed.len())
+        .checked_add(
+            usize::try_from(compressed_length).map_err(|_| "PSD resource length overflow")?,
+        )
         .and_then(|n| n.checked_add(resource_end.len()))
         .and_then(|n| u32::try_from(n).ok())
         .ok_or("PSD resource length overflow")?;
@@ -1458,20 +1476,27 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     };
     out.write_all(&header).map_err(|e| e.to_string())?;
     out.write_all(&resource_start).map_err(|e| e.to_string())?;
-    for chunk in compressed.chunks(64 * 1024) {
-        out.write_all(chunk).map_err(|e| e.to_string())?;
+    if spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != spool_length {
+        return Err("Photoshop standard spool length changed".into());
     }
-    drop(compressed);
+    spool
+        .seek(SeekFrom::Start(total))
+        .map_err(|e| e.to_string())?;
+    let mut copy = [0u8; 64 * 1024];
+    copy_standard(
+        spool,
+        &mut out,
+        compressed_length,
+        compressed_hash,
+        &mut copy,
+        check,
+    )?;
     out.write_all(&resource_end).map_err(|e| e.to_string())?;
     layout.write_length(&mut out, layer_length)?;
-    let total = layer_length
-        .checked_add(composite_length)
-        .ok_or("Photoshop section length overflow")?;
-    if spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != total {
+    if spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != spool_length {
         return Err("Photoshop standard spool length changed".into());
     }
     spool.rewind().map_err(|e| e.to_string())?;
-    let mut copy = [0u8; 64 * 1024];
     copy_standard(spool, &mut out, layer_length, layer_hash, &mut copy, check)?;
     copy_standard(
         spool,
@@ -1481,7 +1506,7 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
         &mut copy,
         check,
     )?;
-    if spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != total {
+    if spool.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? != spool_length {
         return Err("Photoshop standard spool length changed".into());
     }
     out.flush().map_err(|e| e.to_string())?;
@@ -3503,6 +3528,17 @@ mod storage_tests {
                     let embedded: Embedded = serde_json::from_slice(&json).unwrap();
                     assert_eq!(embedded.format, 29);
                     assert_eq!(serde_json::to_value(&embedded.document).unwrap(), before);
+                    // Independent previous Vec-compressor route, same source and
+                    // settings: append/replay must preserve actual PBR1 bytes.
+                    let original = Embedded {
+                        format: embedded.format,
+                        standard_hash: embedded.standard_hash,
+                        document: engine.doc.clone(),
+                    };
+                    assert_eq!(json, serde_json::to_vec(&original).unwrap());
+                    let mut old = ZlibEncoder::new(Vec::new(), Compression::fast());
+                    serde_json::to_writer(&mut old, &original).unwrap();
+                    assert_eq!(compressed, old.finish().unwrap());
                     let section = layout.block(&mut file).unwrap();
                     let merged = &bytes[file.pos..];
                     let standard = expected_standard(&engine.doc, layout.large());
@@ -4073,13 +4109,20 @@ mod storage_tests {
                     let mut cursor = Cursor::new(&bytes);
                     cursor.bytes(26).unwrap();
                     cursor.block().unwrap();
-                    cursor.block().unwrap();
+                    let resources = cursor.block().unwrap();
+                    let payload_length =
+                        u32::from_be_bytes(resources[20..24].try_into().unwrap()) as usize;
+                    let compressed = &resources[28..24 + payload_length];
                     let section = layout.block(&mut cursor).unwrap();
                     let merged = &bytes[cursor.pos..];
                     let expected = expected_standard(&doc, layout.large());
                     assert_eq!(section, expected.0);
                     assert_eq!(merged, expected.1);
-                    assert_eq!(spool.get_ref(), &[section, merged].concat());
+                    assert_eq!(spool.get_ref(), &[section, merged, compressed].concat());
+                    let overhead = 34 + resources.len() - compressed.len()
+                        + if layout.large() { 8 } else { 4 };
+                    assert_eq!(bytes.len(), spool.get_ref().len() + overhead);
+                    assert!(overhead >= if layout.large() { 70 } else { 66 });
                     let loaded = decode(&bytes).unwrap();
                     assert!(!loaded.read_only);
                     assert_eq!(serde_json::to_value(&loaded).unwrap(), before);
@@ -4106,6 +4149,171 @@ mod storage_tests {
             }
         }
     }
+    #[test]
+    fn appended_source_segment_is_bound_and_source_spool_failures_keep_native_input() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct SourceSpool<'a> {
+            data: std::io::Cursor<Vec<u8>>,
+            source: Rc<Cell<bool>>,
+            source_start: usize,
+            first_source: bool,
+            injected: bool,
+            fault: &'static str,
+            largest: usize,
+            control: &'a crate::saving::Control,
+        }
+        impl Write for SourceSpool<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.largest = self.largest.max(bytes.len());
+                if self.source.get() {
+                    if !self.first_source {
+                        assert_eq!(self.data.position(), self.source_start as u64);
+                        self.first_source = true;
+                    }
+                    if self.fault == "write" {
+                        self.injected = true;
+                        return Err(std::io::Error::other("Injected source spool write failure"));
+                    }
+                    if self.fault == "cancel" && !self.injected {
+                        self.injected = true;
+                        assert!(self.control.cancel());
+                    }
+                }
+                self.data.write(&bytes[..bytes.len().min(997)])
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.source.get() && self.fault == "flush" {
+                    self.injected = true;
+                    return Err(std::io::Error::other("Injected source spool flush failure"));
+                }
+                Ok(())
+            }
+        }
+        impl Read for SourceSpool<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let source = self.data.position() >= self.source_start as u64;
+                let n = self.data.read(bytes)?;
+                if source && self.fault == "corrupt" && n != 0 {
+                    bytes[0] ^= 1;
+                    self.injected = true;
+                }
+                Ok(n)
+            }
+        }
+        impl Seek for SourceSpool<'_> {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                if self.source.get()
+                    && self.fault == "truncate"
+                    && matches!(from, SeekFrom::Start(at) if at == self.source_start as u64)
+                {
+                    self.data.get_mut().truncate(self.source_start);
+                    self.injected = true;
+                }
+                self.data.seek(from)
+            }
+        }
+        for depth in [8, 16] {
+            let doc = streamed_fixture(depth);
+            let before = serde_json::to_value(&doc).unwrap();
+            for layout in [Layout::Psd, Layout::Psb] {
+                let expected = encode_layout(&doc, layout).unwrap();
+                let native = expected_standard(&doc, layout.large());
+                let standard = [native.0.as_slice(), native.1.as_slice()].concat();
+                let mut cursor = Cursor::new(&expected);
+                cursor.bytes(26).unwrap();
+                cursor.block().unwrap();
+                let resource = cursor.block().unwrap();
+                let length = u32::from_be_bytes(resource[20..24].try_into().unwrap()) as usize;
+                let compressed = &resource[28..24 + length];
+                for fault in ["none", "write", "flush", "cancel", "corrupt", "truncate"] {
+                    let control = crate::saving::Control::default();
+                    control.begin(doc.id.clone(), doc.revision).unwrap();
+                    let source = Rc::new(Cell::new(false));
+                    let mut spool = SourceSpool {
+                        data: std::io::Cursor::new(vec![]),
+                        source: source.clone(),
+                        source_start: standard.len(),
+                        first_source: false,
+                        injected: false,
+                        fault,
+                        largest: 0,
+                        control: &control,
+                    };
+                    let mut output = Vec::new();
+                    let result = encode_layout_progress_to(
+                        &doc,
+                        layout,
+                        &mut output,
+                        &mut spool,
+                        &|| control.check(),
+                        &|stage, _, _| {
+                            if stage == "Writing editable sources" {
+                                source.set(true);
+                            }
+                            Ok(())
+                        },
+                    );
+                    assert!(source.get() && spool.first_source, "{fault}");
+                    assert!(spool.largest <= 64 * 1024);
+                    assert_eq!(&spool.data.get_ref()[..standard.len()], standard);
+                    if fault == "none" {
+                        result.unwrap();
+                        assert_eq!(output, expected);
+                        assert_eq!(&spool.data.get_ref()[standard.len()..], compressed);
+                        assert_eq!(
+                            serde_json::to_value(decode(&output).unwrap()).unwrap(),
+                            before
+                        );
+                    } else {
+                        let error = result.unwrap_err();
+                        assert!(
+                            spool.injected,
+                            "The actual source segment must be reached: {fault}"
+                        );
+                        assert!(
+                            error.contains(match fault {
+                                "write" => "source spool write failure",
+                                "flush" => "source spool flush failure",
+                                "cancel" => "canceled",
+                                "corrupt" => "spool changed",
+                                "truncate" => "truncated",
+                                _ => unreachable!(),
+                            }),
+                            "{fault}: {error}"
+                        );
+                        assert!(output.len() < expected.len());
+                        if matches!(fault, "write" | "flush" | "cancel") {
+                            assert!(output.is_empty());
+                        }
+                    }
+                    assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+                }
+            }
+        }
+        // Count preexisting standard bytes without allocating a near-limit file;
+        // only the appended segment belongs to its independent hash.
+        let mut bytes = Vec::new();
+        let check = || Ok(());
+        let mut source = StandardWriter::new(&mut bytes, &check);
+        source.bytes = 256 * 1024 * 1024 - 3;
+        source.write_all(&[17, 29, 43]).unwrap();
+        assert_eq!(source.bytes, 256 * 1024 * 1024);
+        let expected_hash = [17u8, 29, 43]
+            .into_iter()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        assert_eq!(source.hash, expected_hash);
+        assert!(source
+            .write_all(&[59])
+            .unwrap_err()
+            .to_string()
+            .contains("256 MiB"));
+        drop(source);
+        assert_eq!(bytes, [17, 29, 43]);
+    }
+
     #[test]
     fn standard_transfer_is_bounded_and_spool_copy_rejects_corruption_and_interruption() {
         struct ShortSpool {
