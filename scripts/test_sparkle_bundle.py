@@ -368,7 +368,12 @@ class Bundle(unittest.TestCase):
         with zipfile.ZipFile(archive) as zipped:
             info = plistlib.loads(zipped.read(result['prefix'] + 'PeerBrush.app/Contents/Info.plist'))
         self.assertEqual(info, package.macos_info('0.2.0', sparkle=True, check_pins=pins, check_layout=True))
-        with mock.patch.object(sign_macos.sys, 'platform', 'darwin'), mock.patch.object(sign_macos, 'preflight', native):
+        original_pin = bundle.pin
+        # Bind the global native-policy pin to this synthetic archive only.
+        with (mock.patch.object(sign_macos.sys, 'platform', 'darwin'),
+              mock.patch.object(sign_macos, 'preflight', native),
+              mock.patch.object(bundle, 'pin', side_effect=lambda sources=None:
+                                selected if sources is None else original_pin(sources))):
             with self.assertRaisesRegex(ValueError, 'compiled manual-check Team ID'):
                 sign_macos.sign_archive(archive, self.base / 'wrong-team', self.base / 'wrong-team-work', commit,
                     '0.2.0', package.digest(archive), 'ZZZZ123456', 'A' * 40, 'synthetic-existing-profile',
