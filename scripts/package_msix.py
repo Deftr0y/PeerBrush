@@ -319,6 +319,23 @@ def expected_payload(root, archive, identity, extra_types=(), msix_version=None,
     return files, release
 
 
+def signed_executable_payload(files, executable):
+    """Source-derived signing-only replacement; native trust is checked separately."""
+    from pe_signing import signing_only
+    original = files['peerbrush.exe']
+    signing_only(original, executable)
+    release = json.loads(files['release.json'])
+    if release['executable_sha256'] != sha(original) or 'windows_executable_signing' in release:
+        raise ValueError('Unexpected original executable provenance.')
+    release['executable_sha256'] = sha(executable)
+    release['windows_executable_signing'] = dict(schema=1, unsigned_sha256=sha(original),
+                                               signed_sha256=sha(executable))
+    result = dict(files)
+    result['peerbrush.exe'] = executable
+    result['release.json'] = (json.dumps(release, indent=2) + '\n').encode('utf-8')
+    return result
+
+
 def _write_payload(files, destination):
     if destination.exists():
         raise ValueError('MSIX staging destination must be new')

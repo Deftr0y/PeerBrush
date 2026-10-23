@@ -48,6 +48,7 @@ python scripts/jxl_build.py -- build --locked --bin peerbrush
 python scripts/jxl_build.py -- test --locked
 python scripts/jxl_build.py -- clippy --all-targets --locked
 python scripts/test_package.py
+python -B scripts/test_windows_executable_signing.py
 ```
 
 ```powershell

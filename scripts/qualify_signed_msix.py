@@ -29,7 +29,7 @@ TYPES_NS = '{http://schemas.openxmlformats.org/package/2006/content-types}'
 # Microsoft's native cmdlet exposes verified provider state. Catalog results are
 # expressly rejected. SignTool, not SignatureStatus.Valid alone, supplies trust.
 # https://github.com/PowerShell/PowerShell/blob/v7.6.5/src/System.Management.Automation/security/Authenticode.cs
-CERTIFICATE_SCRIPT = r'''
+SIGNATURE_METADATA_PREFIX = r'''
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $PSModuleAutoLoadingPreference = 'None'
@@ -43,6 +43,9 @@ try {
         [int]$signature.Status -ne 0 -or [int]$signature.SignatureType -ne 1 -or
         $null -eq $signature.SignerCertificate -or $null -eq $signature.TimeStamperCertificate) { throw 'signature' }
     [void][Reflection.Assembly]::Load('System.Security.Cryptography.Pkcs')
+'''
+
+MSIX_CERTIFICATE_READER = r'''
     [void][Reflection.Assembly]::Load('System.IO.Compression.ZipFile')
     $archive = [IO.Compression.ZipFile]::OpenRead($env:PEERBRUSH_MSIX_INPUT)
     try {
@@ -56,6 +59,9 @@ try {
     if ([BitConverter]::ToUInt32($bytes, 0) -ne 0x58434b50) { throw 'header' }
     $cms = [Security.Cryptography.Pkcs.SignedCms]::new()
     $cms.Decode([byte[]]($bytes[4..($bytes.Length-1)]))
+'''
+
+SIGNATURE_METADATA_SCRIPT = r'''
     if ($cms.SignerInfos.Count -ne 1 -or $cms.ContentInfo.ContentType.Value -cne '1.3.6.1.4.1.311.2.1.4') { throw 'signers' }
     $signerInfo = $cms.SignerInfos[0]
     if ($null -eq $signerInfo.Certificate -or $signerInfo.DigestAlgorithm.Value -cne '2.16.840.1.101.3.4.2.1' -or
@@ -92,6 +98,17 @@ try {
 '''
 
 
+
+
+CERTIFICATE_SCRIPT = SIGNATURE_METADATA_PREFIX + MSIX_CERTIFICATE_READER + SIGNATURE_METADATA_SCRIPT
+EXECUTABLE_CERTIFICATE_SCRIPT = SIGNATURE_METADATA_PREFIX + r'''
+
+    $bytes = [IO.File]::ReadAllBytes($env:PEERBRUSH_CERTIFICATE_INPUT)
+    $cms = [Security.Cryptography.Pkcs.SignedCms]::new()
+    $cms.Decode($bytes)
+''' + SIGNATURE_METADATA_SCRIPT
+
+
 def _sha(value):
     return type(value) is str and re.fullmatch('[0-9a-f]{64}', value) is not None
 
@@ -112,7 +129,7 @@ def _selected_tool(path, checksum, name):
     return path
 
 
-def _command(executable, arguments, work, label, *, package=None):
+def _command(executable, arguments, work, label, *, package=None, certificate=None, thumbprint=None):
     """Fixed commands, redacted failures, output polling guards and owned child cleanup."""
     environment = dict(PATH=os.defpath, HOME=str(work), USERPROFILE=str(work),
                        APPDATA=str(work), LOCALAPPDATA=str(work), TEMP=str(work), TMP=str(work),
@@ -123,6 +140,10 @@ def _command(executable, arguments, work, label, *, package=None):
             environment[name] = value
     if package is not None:
         environment['PEERBRUSH_MSIX_INPUT'] = str(package)
+    if certificate is not None:
+        environment['PEERBRUSH_CERTIFICATE_INPUT'] = str(certificate)
+    if thumbprint is not None:
+        environment['PEERBRUSH_CERTIFICATE_THUMBPRINT'] = thumbprint
     output = work / (label + '.stdout')
     with output.open('xb') as stream:
         try:
@@ -203,9 +224,29 @@ def verify_native_signature(package, publisher, certificate_sha256, signtool, po
         publisher, certificate_sha256)
 
 
+def verify_native_executable(data, publisher, certificate_sha256, signtool, powershell, work):
+    from pe_signing import certificate
+    cms = certificate(data)
+    work.mkdir(mode=0o700)
+    executable, signature = work / 'peerbrush.exe', work / 'certificate.der'
+    for path, value in [(executable, data), (signature, cms)]:
+        with path.open('xb') as stream:
+            stream.write(value)
+        path.chmod(0o400)
+    _command(signtool, ['verify', '/pa', '/all', '/tw', '/q', str(executable)], work, 'signtool')
+    metadata = _certificate(_command(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive',
+        '-Command', EXECUTABLE_CERTIFICATE_SCRIPT], work, 'certificate',
+        package=executable, certificate=signature), publisher, certificate_sha256)
+    for path, value in [(executable, data), (signature, cms)]:
+        if bounded_file(path, msix.PACKAGE_LIMIT, executable=path == executable)[0] != hashlib.sha256(value).hexdigest():
+            raise ValueError('Owned executable or certificate changed during native verification.')
+    return metadata
+
+
 def inspect_final(root, portable, unsigned, package, *, commit, version, identity,
                   package_family, portable_sha256, unsigned_sha256, package_sha256,
-                  certificate_sha256, signtool, signtool_sha256, powershell, powershell_sha256, work):
+                  certificate_sha256, signtool, signtool_sha256, powershell, powershell_sha256, work,
+                  require_executable_signature=False):
     """Reconstruct source-derived content, then authenticate actual selected final bytes.
 
     This is Windows-native acceptance of these bytes on this host, not native-job
@@ -247,9 +288,23 @@ def inspect_final(root, portable, unsigned, package, *, commit, version, identit
     expected, release = msix.expected_payload(root, copies[0], identity, require_provenance=True)
     if release['commit'] != commit or release['version'] != version:
         raise ValueError('Final MSIX source or embedded build differs from selection.')
+    executable_metadata = None
+    if type(require_executable_signature) is not bool:
+        raise ValueError('Executable signature selection must be explicit.')
+    if require_executable_signature:
+        with zipfile.ZipFile(copies[1]) as archive:
+            entry = archive.getinfo('peerbrush.exe')
+            if not 0 < entry.file_size <= msix.PACKAGE_LIMIT:
+                raise ValueError('Packaged executable exceeds its byte budget.')
+            executable = archive.read(entry)
+        original_executable = expected['peerbrush.exe']
+        expected = msix.signed_executable_payload(expected, executable)
     msix.verify_payload(copies[1], expected)
     msix.verify_payload(copies[2], expected, signed=True)
     _unsigned_binding(copies[1], copies[2])
+    if require_executable_signature:
+        executable_metadata = verify_native_executable(executable, identity['publisher'], certificate_sha256,
+            tools[0], tools[1], work / 'executable')
     metadata = verify_native_signature(copies[2], identity['publisher'], certificate_sha256,
         tools[0], tools[1], work)
     _source(root, commit)
@@ -259,7 +314,7 @@ def inspect_final(root, portable, unsigned, package, *, commit, version, identit
             raise ValueError('Final MSIX input changed during native verification; preserve private work.')
     for tool, checksum in zip(tools, [signtool_sha256, powershell_sha256]):
         _selected_tool(tool, checksum, tool.name.casefold())
-    return dict(schema=1, format='PeerBrushSignedMsixQualificationV1', commit=commit, version=version,
+    result = dict(schema=1, format='PeerBrushSignedMsixQualificationV1', commit=commit, version=version,
         package_version=target, package=dict(file=paths[2].name, sha256=package_sha256),
         unsigned_sha256=unsigned_sha256, portable_sha256=portable_sha256,
         identity=dict(identity), package_family_name=family, certificate_sha256=certificate_sha256,
@@ -271,6 +326,12 @@ def inspect_final(root, portable, unsigned, package, *, commit, version, identit
         native_producer_authentication='unverified-requires-trusted-native-job',
         executable_signing='not-established', installed_acceptance='not-performed',
         appinstaller='not-configured', public_availability='unverified', ready=False, production_ready=False)
+    if executable_metadata is not None:
+        result['executable_signing'] = 'verified-embedded-default-authentication-policy'
+        result['executable'] = dict(unsigned_sha256=hashlib.sha256(original_executable).hexdigest(),
+            sha256=hashlib.sha256(executable).hexdigest(), certificate_sha256=certificate_sha256,
+            timestamp_certificate_sha256=executable_metadata['timestamp_certificate_sha256'])
+    return result
 
 
 def write_report(result, output, root):
@@ -291,6 +352,8 @@ def main():
     for name in ['commit', 'version', 'package-family', 'portable-sha256', 'unsigned-sha256', 'package-sha256',
                  'certificate-sha256', 'signtool-sha256', 'powershell-sha256']:
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--require-executable-signature', action='store_true',
+                        help='Require source-bound, separately Authenticode-signed and timestamped PE payload')
     arguments = vars(parser.parse_args())
     root, output, identity = arguments.pop('source_root'), arguments.pop('output'), arguments.pop('identity')
     try:

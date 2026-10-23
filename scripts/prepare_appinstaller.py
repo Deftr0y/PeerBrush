@@ -131,7 +131,8 @@ def descriptor_bytes_for_selection(identity, dependency, version, descriptor_uri
 def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_license, commit, version, package_family,
             portable_sha256, unsigned_sha256, package_sha256, certificate_sha256,
             runtime_sha256, runtime_certificate_sha256, runtime_license_sha256, descriptor_uri, package_uri, runtime_uri,
-            signtool, signtool_sha256, powershell, powershell_sha256, work, output):
+            signtool, signtool_sha256, powershell, powershell_sha256, work, output,
+            require_executable_signature=False):
     if sys.platform != 'win32':
         raise ValueError('App Installer preparation requires an actual Windows verification host.')
     if any(not signed._sha(value) for value in [runtime_sha256, runtime_certificate_sha256, runtime_license_sha256]):
@@ -168,7 +169,8 @@ def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_lic
         commit=commit, version=version, identity=selected_identity, package_family=package_family,
         portable_sha256=portable_sha256, unsigned_sha256=unsigned_sha256, package_sha256=package_sha256,
         certificate_sha256=certificate_sha256, signtool=tools[0], signtool_sha256=signtool_sha256,
-        powershell=tools[1], powershell_sha256=powershell_sha256, work=work / 'peerbrush')
+        powershell=tools[1], powershell_sha256=powershell_sha256, work=work / 'peerbrush',
+        require_executable_signature=require_executable_signature)
     descriptor = 'PeerBrush-' + result['package_version'] + '-Windows-x64.appinstaller'
     canonical_uri(descriptor_uri, descriptor)
     canonical_uri(package_uri, package.name)
@@ -242,6 +244,8 @@ def main():
                  'certificate-sha256', 'runtime-sha256', 'runtime-certificate-sha256', 'runtime-license-sha256',
                  'descriptor-uri', 'package-uri', 'runtime-uri', 'signtool-sha256', 'powershell-sha256']:
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--require-executable-signature', action='store_true',
+                        help='Require separate source-bound executable Authenticode verification')
     arguments = vars(parser.parse_args())
     root = arguments.pop('source_root')
     try:

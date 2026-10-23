@@ -126,6 +126,7 @@ jobs:
       - run: python scripts/test_package.py
       - run: python scripts/test_msix.py
       - run: python -B scripts/test_signed_msix.py
+      - run: python -B scripts/test_windows_executable_signing.py
       - run: python -B scripts/test_appinstaller.py
       - run: python -B scripts/test_store_msix_preflight.py
       - run: python -B scripts/test_store_msix_handoff.py
