@@ -336,6 +336,12 @@ impl PeerBrush {
         if self.exit_approved || self.lifecycle.is_some() {
             self.updates.native_updater.defer();
         } else {
+            if idle && self.updates.native_updater.profile_capture_pending() {
+                if let Err(error) = self.flush_update_tool_profile() {
+                    self.message = format!("Tool settings not saved · {error}");
+                    self.updates.native_updater.defer();
+                }
+            }
             self.updates
                 .native_updater
                 .tick(ctx, &self.workspace, !idle);

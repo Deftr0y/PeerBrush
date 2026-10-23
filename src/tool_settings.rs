@@ -267,6 +267,18 @@ impl Store {
         }
         Ok(())
     }
+    /// Called with the actual Store writer mutex held at checkpoint publication.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn authenticate_update_profile(&self, root: &Path) -> Result<(), String> {
+        self.update_checkpoint_ready()?;
+        if self.error.is_some()
+            || self.path.as_deref() != Some(root.join("tool-settings.json").as_path())
+            || read_owned(&root.join("tool-settings.json"))? != self.original
+        {
+            return Err("Current tool preferences do not match the flushed profile".into());
+        }
+        Ok(())
+    }
     pub fn flush(&mut self) -> Result<(), String> {
         if !self.dirty {
             return Ok(());
@@ -316,5 +328,43 @@ impl Snapshot {
             serde_json::to_value(self.profile.settings).unwrap()
         };
         json!({"tool":tool,"profile":{"settings":settings,"preset":self.profile.preset},"revision":self.revision,"actor":self.actor,"persistence":if self.persistent{"configured preferences directory"}else{"current instance"}})
+    }
+}
+
+#[cfg(test)]
+mod update_profile_tests {
+    use super::*;
+    #[test]
+    fn current_profile_binding_requires_the_configured_flushed_bytes_and_explicit_absence() {
+        let root = std::env::temp_dir().join(format!(
+            "peerbrush-tool-profile-binding-{}",
+            crate::engine::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("tool-settings.json");
+        let mut store = Store::load(file.clone());
+        store.authenticate_update_profile(&root).unwrap();
+        assert!(Store::default().authenticate_update_profile(&root).is_err());
+        assert!(store
+            .authenticate_update_profile(&root.join("other"))
+            .is_err());
+        fs::write(&file, br#"{"version":1,"tools":{}}"#).unwrap();
+        assert!(store.authenticate_update_profile(&root).is_err());
+        store = Store::load(file.clone());
+        store.authenticate_update_profile(&root).unwrap();
+        let before = store.get("brush").unwrap().profile;
+        let mut after = before.clone();
+        after.settings.radius = 53.;
+        store.human_delta("brush", &before, &after).unwrap();
+        assert!(store.authenticate_update_profile(&root).is_err());
+        store.flush().unwrap();
+        store.authenticate_update_profile(&root).unwrap();
+        let protected = fs::read(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        assert!(store.authenticate_update_profile(&root).is_err());
+        fs::write(&file, &protected).unwrap();
+        store.authenticate_update_profile(&root).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), protected);
+        fs::remove_dir_all(root).unwrap();
     }
 }

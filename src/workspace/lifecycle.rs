@@ -33,13 +33,13 @@ pub fn request_close(
 /// engines in the same order as transfers, then checks the registry at commit.
 /// No engine is closed when any source, save, reservation or project set changed.
 pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), String> {
-    finish(workspace, reviewed, false, true, || Ok(()))
+    finish(workspace, reviewed, false, true, |_| Ok(()))
 }
 
 /// Future verified native installers must use this path, never a discard-capable
 /// ordinary close. The native caller must also reject unfinished UI gestures.
 pub fn finish_update_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), String> {
-    finish(workspace, reviewed, true, true, || Ok(()))
+    finish(workspace, reviewed, true, true, |_| Ok(()))
 }
 
 /// Publish a pre-native-start checkpoint under the same complete workspace,
@@ -50,9 +50,11 @@ pub fn finish_update_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result
 pub(crate) fn publish_update_checkpoint(
     workspace: &Registry,
     reviewed: &[Reviewed],
-    publish: impl FnOnce() -> Result<(), String>,
+    publish: impl FnOnce(&crate::tool_settings::Store) -> Result<(), String>,
 ) -> Result<(), String> {
-    finish(workspace, reviewed, true, false, publish)
+    finish(workspace, reviewed, true, false, |tools| {
+        publish(tools.ok_or("Tool preference writer authority is unavailable")?)
+    })
 }
 
 fn update_project_ready(e: &Engine) -> Result<(), String> {
@@ -119,7 +121,7 @@ fn finish(
     reviewed: &[Reviewed],
     update: bool,
     close: bool,
-    publish: impl FnOnce() -> Result<(), String>,
+    publish: impl FnOnce(Option<&crate::tool_settings::Store>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut entries = entries_in(workspace);
     entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -204,7 +206,7 @@ fn finish(
     if let Some(tools) = &tools {
         tools.update_checkpoint_ready()?;
     }
-    publish()?;
+    publish(tools.as_deref())?;
     drop(tools);
     if !close {
         return Ok(());
@@ -319,7 +321,7 @@ mod tests {
                 store.human_delta("brush", &before, &after).unwrap();
             }
             assert!(update_readiness(&workspace).is_err());
-            assert!(publish_update_checkpoint(&workspace, &reviewed, || {
+            assert!(publish_update_checkpoint(&workspace, &reviewed, |_| {
                 published.set(true);
                 Ok(())
             })
@@ -329,7 +331,7 @@ mod tests {
             tools.lock().unwrap().flush().unwrap();
             update_readiness(&workspace).unwrap();
             let operation = crate::server::FileOperation::begin_workspace(&workspace).unwrap();
-            assert!(publish_update_checkpoint(&workspace, &reviewed, || {
+            assert!(publish_update_checkpoint(&workspace, &reviewed, |_| {
                 published.set(true);
                 Ok(())
             })
@@ -338,14 +340,14 @@ mod tests {
             unchanged();
             drop(operation);
             assert_eq!(
-                publish_update_checkpoint(&workspace, &reviewed, || Err(
+                publish_update_checkpoint(&workspace, &reviewed, |_| Err(
                     "Durable publication failed".into()
                 ))
                 .unwrap_err(),
                 "Durable publication failed"
             );
             unchanged();
-            publish_update_checkpoint(&workspace, &reviewed, || {
+            publish_update_checkpoint(&workspace, &reviewed, |_| {
                 assert!(root.try_lock().is_err());
                 assert!(second.try_lock().is_err());
                 assert!(workspace.try_lock().is_err());

@@ -346,3 +346,143 @@ fn agent_preferences_commit_immediately_animate_only_controls_and_human_input_in
     assert_eq!(app.brush.flow, 0.6);
     assert_eq!(app.brush.opacity, 0.7);
 }
+
+#[test]
+fn update_profile_flush_merges_deferred_human_controls_with_newer_agent_settings_without_document_edits(
+) {
+    for depth in [8, 16] {
+        let directory =
+            std::env::temp_dir().join(format!("peerbrush-profile-flush-{}", crate::engine::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let (mut app, _) = super::tests::fixture();
+        *app.tool_settings_store.lock().unwrap() =
+            crate::tool_settings::Store::load(directory.join("tool-settings.json"));
+        app.restore_tool_profile(Tool::Brush);
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new_depth(4, 3, depth).unwrap();
+            let layer = e.doc.layers[0].id.clone();
+            e.doc.layers[0].pixels.set16(0, 0, [1001, 3003, 5007, 0]);
+            e.edit(
+                "human",
+                &[json!({"op":"layer.update","layer":layer,"name":"Undo retained"})],
+                None,
+                None,
+                "Undo retained",
+            )
+            .unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.update","layer":layer,"name":"Redo retained"})],
+                None,
+                None,
+                "Redo retained",
+            )
+            .unwrap();
+            e.undo("human").unwrap();
+        }
+        let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+        let brush = app
+            .tool_settings_store
+            .lock()
+            .unwrap()
+            .get("brush")
+            .unwrap();
+        server::dispatch(&app.shared, "tool_settings", &json!({"action":"set","tool":"brush","actor":"artist","expected_tool_revision":brush.revision,"settings":{"radius":43,"flow":0.29}})).unwrap();
+        // UI still displays its older cached snapshot. Only opacity changed by
+        // the human, so merging cannot replace the newer agent radius or flow.
+        app.brush.opacity = 0.61;
+        app.flush_update_tool_profile().unwrap();
+        let current = app
+            .tool_settings_store
+            .lock()
+            .unwrap()
+            .get("brush")
+            .unwrap();
+        assert_eq!(current.profile.settings.radius, 43.);
+        assert_eq!(current.profile.settings.flow, 0.29);
+        assert_eq!(current.profile.settings.opacity, 0.61);
+        app.tool_settings_store
+            .lock()
+            .unwrap()
+            .authenticate_update_profile(&directory)
+            .unwrap();
+        let disk = crate::tool_settings::Store::load(directory.join("tool-settings.json"));
+        assert_eq!(disk.get("brush").unwrap().profile, current.profile);
+        let e = app.shared.lock().unwrap();
+        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+        assert_eq!((e.undo.len(), e.redo.len()), (1, 1));
+        assert!(!e.closed);
+        drop(e);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn update_profile_flush_reports_protected_disk_bytes_and_pending_values_without_closing_unsaved_work(
+) {
+    let directory = std::env::temp_dir().join(format!(
+        "peerbrush-profile-flush-error-{}",
+        crate::engine::id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let file = directory.join("tool-settings.json");
+    let (mut app, _) = super::tests::fixture();
+    *app.tool_settings_store.lock().unwrap() = crate::tool_settings::Store::load(file.clone());
+    app.restore_tool_profile(Tool::Brush);
+    app.radius = 43.;
+    app.flush_update_tool_profile().unwrap();
+    let mut changed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    changed["tools"]["brush"]["settings"]["radius"] = json!(44.);
+    let external = serde_json::to_vec_pretty(&changed).unwrap();
+    std::fs::write(&file, &external).unwrap();
+    app.brush.opacity = 0.63;
+    app.shared.lock().unwrap().doc.revision += 1;
+    let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+    assert!(app.flush_update_tool_profile().is_err());
+    assert!(app
+        .tool_settings_store
+        .lock()
+        .unwrap()
+        .update_checkpoint_ready()
+        .is_err());
+    assert_eq!(app.brush.opacity, 0.63);
+    assert_eq!(std::fs::read(&file).unwrap(), external);
+    assert_eq!(
+        serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+        before
+    );
+    assert!(!app.shared.lock().unwrap().closed);
+    assert!(!app.workspace.lock().unwrap().exiting);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn ordinary_on_exit_still_flushes_its_last_ui_delta_and_preserves_document_sources() {
+    let directory = std::env::temp_dir().join(format!(
+        "peerbrush-profile-normal-exit-{}",
+        crate::engine::id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let (mut app, _) = super::tests::fixture();
+    app.connection.state_dir = directory.clone();
+    *app.tool_settings_store.lock().unwrap() =
+        crate::tool_settings::Store::load(directory.join("tool-settings.json"));
+    app.restore_tool_profile(Tool::Brush);
+    app.radius = 47.;
+    app.brush.opacity = 0.67;
+    let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+    eframe::App::on_exit(&mut app);
+    let disk = crate::tool_settings::Store::load(directory.join("tool-settings.json"));
+    assert!(disk.error.is_none());
+    let current = disk.get("brush").unwrap().profile;
+    assert_eq!(current.settings.radius, 47.);
+    assert_eq!(current.settings.opacity, 0.67);
+    assert_eq!(
+        serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+        before
+    );
+    assert!(!app.shared.lock().unwrap().closed);
+    std::fs::remove_dir_all(directory).unwrap();
+}

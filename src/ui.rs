@@ -6075,10 +6075,11 @@ impl eframe::App for PeerBrush {
     }
     fn on_exit(&mut self) {
         crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
-        self.store_current_tool_profile();
-        if let Err(error) = self.tool_settings_store.lock().unwrap().flush() {
-            eprintln!("PeerBrush: tool settings not saved: {error}");
+        #[cfg(target_os = "macos")]
+        if let Err(error) = self.updates.native_updater.retire_profile_capture() {
+            eprintln!("PeerBrush: app update profile capture remains unusable: {error}");
         }
+        self.exit_tool_profile();
         server::checkpoint_projects(
             &self.workspace,
             &self.connection.state_dir,

@@ -480,6 +480,9 @@ impl Probe {
                 assert!(postponed.as_bool());
             }
             assert!(application.pending_installation());
+            assert!(application.retire_profile_capture().is_err());
+            assert!(application.pending_installation());
+            assert!(application.controller.is_some());
             assert!(application
                 .controller
                 .as_ref()
@@ -1035,6 +1038,21 @@ impl Application {
                 .as_ref()
                 .is_some_and(|owner| owner.delegate.ivars().termination_inhibited.get())
     }
+    pub(crate) fn profile_capture_pending(&self) -> bool {
+        self.verification.is_some() && !self.checks.view().cancelled
+    }
+    /// Ordinary on_exit will still merge/flush tool preferences. Retire the
+    /// capture-only current-profile observation before any of those writes.
+    pub(crate) fn retire_profile_capture(&mut self) -> Result<(), String> {
+        if self.pending_installation() {
+            return Err("An app update remains held; its preservation owner was retained".into());
+        }
+        if let Some(prepared) = &self.checkpoint {
+            prepared.retire_profile_capture()?;
+        }
+        self.checkpoint = None;
+        Ok(())
+    }
     pub fn defer(&self) {
         if let Some(work) = &self.verification {
             work.cancel
@@ -1066,6 +1084,7 @@ impl Application {
                 return Err("The current app update check must finish first".into());
             }
         }
+        self.retire_profile_capture()?;
         let app = PathBuf::from(NSBundle::mainBundle().bundlePath().to_string());
         let executable = std::env::current_exe().map_err(|_| "Running app path unavailable")?;
         if !app.is_absolute() || executable != app.join("Contents/MacOS/peerbrush") {
@@ -1125,9 +1144,13 @@ impl Application {
                     } else {
                         let result = result.and_then(|prepared| {
                             if ui_blocked { return Err("Finish or cancel the current edit/file operation before app update checking".into()); }
+                            // Retain the actual owner before publication can create
+                            // an observation, including on every later error.
+                            self.checkpoint = Some(prepared);
+                            let prepared = self.checkpoint.as_mut().unwrap();
+                            prepared.publish(workspace)?;
                             // Capture-only publication cannot authorize loading a
                             // mutable live app/framework after worker verification.
-                            prepared.publish(workspace)?;
                             checkpoint::require_captured_handoff()?;
                             prepared.recheck_metadata()?;
                             let marker = MainThreadMarker::new()
@@ -1142,7 +1165,6 @@ impl Application {
                             // Publish intent durably before Sparkle can resume any
                             // previous installer. Every ambiguous outcome stays held.
                             prepared.arm_native_intent()?;
-                            self.checkpoint = Some(prepared);
                             self.checks.native_starting()?;
                             self.controller = Some(owner);
                             let owner = self.controller.as_ref().unwrap();

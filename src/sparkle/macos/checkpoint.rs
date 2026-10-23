@@ -104,7 +104,7 @@ fn private(path: &Path, create: bool) -> Result<bool, String> {
     }
     Ok(true)
 }
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut out = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -114,6 +114,10 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|_| HOLD)?;
     out.write_all(bytes).map_err(|_| HOLD)?;
     out.sync_all().map_err(|_| HOLD)?;
+    Ok(())
+}
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_new_file(path, bytes)?;
     crate::server::sync_parent(path)
 }
 fn read_private(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
@@ -716,6 +720,7 @@ pub(super) struct Prepared {
     copy: Snapshot,
     _profile: UpdateProfile,
     _owner: super::coordinator::Owner,
+    current_profile: Option<ProfileCapture>,
 }
 impl Prepared {
     /// An advisory change detector, never current app/copy authentication.
@@ -723,7 +728,9 @@ impl Prepared {
         self.check_identity()?;
         self.verified.recheck()?;
         self.app.recheck()?;
-        self.profile.recheck()?;
+        if self.current_profile.is_none() {
+            self.profile.recheck()?;
+        }
         self.copy.recheck()?;
         Ok(())
     }
@@ -739,18 +746,28 @@ impl Prepared {
         }
         Ok(())
     }
-    pub fn publish(&self, workspace: &crate::workspace::Registry) -> Result<(), String> {
+    pub fn publish(&mut self, workspace: &crate::workspace::Registry) -> Result<(), String> {
         let reviewed = crate::workspace::lifecycle::update_readiness(workspace)?;
-        crate::workspace::lifecycle::publish_update_checkpoint(workspace, &reviewed, || {
+        crate::workspace::lifecycle::publish_update_checkpoint(workspace, &reviewed, |tools| {
             self.check_identity()?;
-            self.profile.recheck()?;
-            publish_profile_checkpoint(
-                &self.profile,
-                &self._profile.locations.profile(),
+            capture_current_profile(
+                &self._profile,
+                tools,
                 &self.path,
                 &self.manifest,
+                &mut self.current_profile,
             )
         })
+    }
+    pub fn retire_profile_capture(&self) -> Result<(), String> {
+        self.check_identity()?;
+        if Stamp::read(&self.path.join("native-start-intent.json"))?.is_some() {
+            return Err(HOLD.into());
+        }
+        match &self.current_profile {
+            Some(capture) => capture.retire(&self.path),
+            None => Ok(()),
+        }
     }
     /// Unreachable before the separate captured-handoff refusal is replaced by
     /// a complete native contract. Publishing a checkpoint cannot call this.
@@ -770,6 +787,160 @@ impl Prepared {
         }
         record_unstarted(&self.path, &self.manifest)
     }
+}
+
+/// A bounded current-profile observation, not a committed exit or restore grant.
+/// Initial worker app/profile/capture.json remain immutable and independently bound.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentProfile {
+    schema: u32,
+    initial_manifest_sha256: String,
+    profile: BTreeMap<PathBuf, Entry>,
+}
+struct ProfileCapture {
+    record: Vec<u8>,
+}
+impl ProfileCapture {
+    fn retire(&self, path: &Path) -> Result<(), String> {
+        self.retire_with_sync(path, crate::server::sync_parent)
+    }
+    fn retire_with_sync(
+        &self,
+        path: &Path,
+        sync_parent: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if read_private(&path.join("current-profile.json"), 1024 * 1024)? != self.record {
+            return Err(HOLD.into());
+        }
+        let value = serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "current_profile_sha256": digest(&self.record),
+        }))
+        .map_err(|_| HOLD)?;
+        let retired = path.join("current-profile-retired.json");
+        if let Some(witness) = Stamp::read(&retired)? {
+            if read_marker(&retired)? != value {
+                return Err(HOLD.into());
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&retired)
+                .map_err(|_| HOLD)?;
+            let opened = file.metadata().map_err(|_| HOLD)?;
+            if opened.dev() != witness.device || opened.ino() != witness.inode {
+                return Err(HOLD.into());
+            }
+            // A prior attempt may have failed file sync or directory sync. An
+            // existing matching byte string alone never proves publication.
+            file.sync_all().map_err(|_| HOLD)?;
+            if Stamp::read(&retired)? != Some(witness) {
+                return Err(HOLD.into());
+            }
+        } else {
+            write_new_file(&retired, &value)?;
+        }
+        sync_parent(&retired)?;
+        if read_marker(&retired)? != value
+            || read_private(&path.join("current-profile.json"), 1024 * 1024)? != self.record
+        {
+            return Err(HOLD.into());
+        }
+        Ok(())
+    }
+}
+fn validate_current_profile(value: &CurrentProfile, initial: &[u8]) -> Result<(), String> {
+    if value.schema != 1 || value.initial_manifest_sha256 != digest(initial) {
+        return Err(HOLD.into());
+    }
+    let mut original: Manifest = serde_json::from_slice(initial).map_err(|_| HOLD)?;
+    validate_manifest(&original)?;
+    original.profile = value.profile.clone();
+    validate_manifest(&original)
+}
+/// Strict actual backup consumer used before returning a current-profile capture.
+/// No caller can turn this observation into native start/exit/restore authority.
+fn read_current_profile(path: &Path, initial: &[u8]) -> Result<Vec<u8>, String> {
+    if read_private(&path.join("capture.json"), 1024 * 1024)? != initial
+        || read_private(&path.join("checkpoint.json"), 1024 * 1024)? != initial
+        || Stamp::read(&path.join("current-profile-retired.json"))?.is_some()
+    {
+        return Err(HOLD.into());
+    }
+    let bytes = read_private(&path.join("current-profile.json"), 1024 * 1024)?;
+    let value: CurrentProfile = serde_json::from_slice(&bytes).map_err(|_| HOLD)?;
+    validate_current_profile(&value, initial)?;
+    check_copy(
+        &path.join("current-profile"),
+        &value.profile,
+        &AtomicBool::new(false),
+    )?;
+    if read_private(&path.join("current-profile.json"), 1024 * 1024)? != bytes {
+        return Err(HOLD.into());
+    }
+    Ok(bytes)
+}
+/// Runs only on the owning idle UI thread inside the shared final validator:
+/// sorted engines -> registry (no admitted file writers) -> actual ToolStore.
+/// Each bounded file pass totals <=56 MiB; app copying/native checks stay outside.
+fn capture_current_profile(
+    profile: &UpdateProfile,
+    tools: &crate::tool_settings::Store,
+    path: &Path,
+    initial: &[u8],
+    capture: &mut Option<ProfileCapture>,
+) -> Result<(), String> {
+    if capture.is_some()
+        || read_private(&path.join("capture.json"), 1024 * 1024)? != initial
+        || Stamp::read(&path.join("checkpoint.json"))?.is_some()
+        || Stamp::read(&path.join("current-profile.json"))?.is_some()
+        || Stamp::read(&path.join("current-profile-retired.json"))?.is_some()
+        || Stamp::read(&path.join("native-start-intent.json"))?.is_some()
+        || Stamp::read(&path.join("native-not-started.json"))?.is_some()
+    {
+        return Err(HOLD.into());
+    }
+    let root = profile.locations.profile();
+    tools.authenticate_update_profile(&root)?;
+    let destination = path.join("current-profile");
+    let current = copy_profile(profile, &destination, &AtomicBool::new(false))?;
+    let value = CurrentProfile {
+        schema: 1,
+        initial_manifest_sha256: digest(initial),
+        profile: current.entries.clone(),
+    };
+    validate_current_profile(&value, initial)?;
+    let record = serde_json::to_vec(&value).map_err(|_| HOLD)?;
+    if record.len() > 1024 * 1024 {
+        return Err(HOLD.into());
+    }
+    check_copy(&destination, &current.entries, &AtomicBool::new(false))?;
+    crate::server::sync_parent(&destination.join("migration-backup"))?;
+    crate::server::sync_parent(&destination)?;
+    current.authenticate_profile(&root)?;
+    tools.authenticate_update_profile(&root)?;
+    // Advisory only: catches ordinary between-file replacement after byte reads,
+    // not a simultaneous epoch against an uncooperating/coarse-time same-user writer.
+    current.recheck()?;
+    // The application's retained Prepared already owns this exact capture. Set
+    // its record before publication: every later error must remain retireable.
+    *capture = Some(ProfileCapture {
+        record: record.clone(),
+    });
+    write_new(&path.join("checkpoint.json"), initial)?;
+    write_new(&path.join("current-profile.json"), &record)?;
+    // Read back the actual durable copy and strict record before success.
+    if read_current_profile(path, initial)? != record {
+        return Err(HOLD.into());
+    }
+    #[cfg(test)]
+    tests::after_current_profile_record()?;
+    // The owning writer locks still exclude all admitted app writers here.
+    tools.authenticate_update_profile(&root)?;
+    current.recheck()?;
+    Ok(())
 }
 
 fn publish_profile_checkpoint(
@@ -982,6 +1153,7 @@ pub(super) fn prepare(
         copy,
         _profile: profile,
         _owner: owner,
+        current_profile: None,
     })
 }
 
