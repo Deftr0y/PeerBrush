@@ -479,6 +479,41 @@ class Published(unittest.TestCase):
         self.assertIn(self.dmg_name + '.qualification.json', requests)
         self.assertNotIn(self.dmg_name + '.verification.json', requests)
 
+    def test_public_dmg_canonicalizes_owned_temp_root_without_accepting_selected_links(self):
+        from production_readiness import handoff_path
+
+        self.final_dmg()
+        with tempfile.TemporaryDirectory(prefix='peerbrush-public-alias-test-', dir=self.root.parent) as directory:
+            real = pathlib.Path(directory).resolve() / 'actual'
+            real.mkdir(mode=0o700)
+            alias = real.parent / 'alias'
+            try:
+                alias.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest('Directory symlink creation is unavailable on this host')
+            selected = real / 'selected-input'
+            selected.write_bytes(b'unchanged')
+            with self.assertRaisesRegex(ValueError, 'links or reparse points'):
+                handoff_path(alias / selected.name)
+            with mock.patch.object(site.tempfile, 'tempdir', str(alias)), \
+                    mock.patch.object(self, 'get', wraps=self.get) as fetched, \
+                    mock.patch('verify_macos_qualification.authenticate') as authenticate:
+                entry, excluded = self.published(maintainer=test_deb.MAINTAINER)
+            authenticate.assert_not_called()
+            destinations = [call.kwargs['destination'] for call in fetched.call_args_list if 'destination' in call.kwargs]
+            self.assertTrue(destinations)
+            self.assertTrue(all(path.is_relative_to(real) for path in destinations))
+            proof = next(row for row in excluded if row.get('file') == self.dmg_name)
+            self.assertTrue(proof['asset_binding_verified'])
+            self.assertFalse(proof['ready'])
+            self.assertFalse(proof['production_ready'])
+            self.assertEqual(proof['native_producer_authentication'], 'not-verified-by-website')
+            self.assertEqual(proof['installed_acceptance'], 'unverified')
+            self.assertEqual(entry['platforms'], [])
+            self.assertEqual(selected.read_bytes(), b'unchanged')
+            with self.assertRaisesRegex(ValueError, 'links or reparse points'):
+                handoff_path(alias / selected.name)
+
     def test_public_typed_dmg_qualification_rejects_forged_malformed_and_overclaiming_reports(self):
         self.final_dmg()
         original = self.assets[self.dmg_name + '.qualification.json']

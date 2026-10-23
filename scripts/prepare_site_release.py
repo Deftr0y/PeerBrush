@@ -300,7 +300,9 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
     # Reuse the source validator inside each eligible portable archive; no code
     # from the downloaded release is executed or extracted into the checkout.
     platforms, excluded, seen = [], [], set()
-    with tempfile.TemporaryDirectory(prefix='peerbrush-public-') as temporary:
+    # System temp roots can be OS aliases; owned handoff paths must be canonical.
+    temporary_root = pathlib.Path(tempfile.gettempdir()).resolve(strict=True)
+    with tempfile.TemporaryDirectory(prefix='peerbrush-public-', dir=temporary_root) as temporary:
         source_path = pathlib.Path(temporary) / source_name
         download(source_name, min(records[source_name]['bytes'], 64 * 1024 * 1024), destination=source_path)
         if source_path.stat().st_size != records[source_name]['bytes'] or file_sha(source_path) != records[source_name]['sha256']:
