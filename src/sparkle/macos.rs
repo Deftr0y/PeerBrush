@@ -409,10 +409,10 @@ define_class!(
         #[unsafe(method(updater:shouldDownloadReleaseNotesForUpdate:))]
         fn download_notes(&self, _updater: &AnyObject, _item: &AnyObject) -> Bool { Bool::NO }
 
-        #[unsafe(method(allowedSystemProfileKeysForUpdater:))]
+        #[unsafe(method_id(allowedSystemProfileKeysForUpdater:))]
         fn profile_keys(&self, _updater: &AnyObject) -> Retained<AnyObject> { unsafe { msg_send![class!(NSArray), array] } }
 
-        #[unsafe(method(feedURLStringForUpdater:))]
+        #[unsafe(method_id(feedURLStringForUpdater:))]
         fn feed_url(&self, updater: &AnyObject) -> Option<Retained<NSString>> {
             self.ivars().checks.owns(updater).then(|| NSString::from_str(crate::sparkle::PROPOSED_FEED_URL))
         }
@@ -537,6 +537,20 @@ impl Probe {
         driver::assert_guarded(MainThreadMarker::new().expect("Main-thread component probe"));
         self.assert_no_update_sequence();
         let updater: Retained<AnyObject> = self.controller.clone();
+        let profiles: Retained<AnyObject> = objc2::rc::autoreleasepool(|_| unsafe {
+            msg_send![&*self.delegate, allowedSystemProfileKeysForUpdater: &*updater]
+        });
+        let count: usize = unsafe { msg_send![&*profiles, count] };
+        assert_eq!(
+            count, 0,
+            "The retained result remains valid after its return pool drains"
+        );
+        let absent_feed: Option<Retained<NSString>> =
+            unsafe { msg_send![&*self.delegate, feedURLStringForUpdater: &*updater] };
+        assert!(
+            absent_feed.is_none(),
+            "An unbound updater has no feed override"
+        );
         let actual_delegate: Option<Retained<AnyObject>> =
             unsafe { msg_send![&*updater, delegate] };
         assert_eq!(
@@ -717,6 +731,16 @@ impl Probe {
             let abort = error(abort_domain, abort_code);
             checks.session.borrow_mut().begin().unwrap();
             checks.checking(&owner.controller);
+            let feed: Retained<NSString> = objc2::rc::autoreleasepool(|_| {
+                let value: Option<Retained<NSString>> = unsafe {
+                    msg_send![&*owner.delegate, feedURLStringForUpdater: &*owner.controller]
+                };
+                value.expect("The exact bound updater receives its source-defined feed override")
+            });
+            assert_eq!(feed.to_string(), crate::sparkle::PROPOSED_FEED_URL);
+            let foreign_feed: Option<Retained<NSString>> =
+                unsafe { msg_send![&*owner.delegate, feedURLStringForUpdater: &*self.controller] };
+            assert!(foreign_feed.is_none());
             // Another updater cannot abort/finish this owned manual cycle.
             unsafe {
                 let _: () = msg_send![&*owner.delegate, updater: &*self.controller, didAbortWithError: &*abort];
