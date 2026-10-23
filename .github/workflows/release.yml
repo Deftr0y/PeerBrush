@@ -165,6 +165,7 @@ jobs:
       - run: python -B scripts/test_prepare_site_release.py
       - run: python -B scripts/test_readback_site_release.py
       - run: python scripts/build_release.py
+      - run: python -B scripts/test_windows_version.py
       - run: python scripts/test_msix_runtime_tests.py
       - name: Package exact platform with dormant macOS dependency
         shell: bash

@@ -493,16 +493,20 @@ exit $LASTEXITCODE
             destination = Path(temporary) / 'step.env'
             environment = {'CC': 'cc', 'CXX': 'cxx', 'CMAKE': 'cmake', 'CMAKE_MAKE_PROGRAM': 'selected ninja', 'PATH': 'fixture-path',
                            'INCLUDE': 'headers', 'LIB': 'libraries', 'LIBPATH': 'sdk',
+                           'WINDOWSSDKVERBINPATH': 'selected-sdk-bin', 'WINDOWSSDKVERSION': '10.0.26100.0', 'VSCMD_ARG_HOST_ARCH': 'x64',
                            'UNRELATED_FIXTURE': 'must not be exported'}
             jxl_build.write_github_environment(destination, environment)
             before = destination.read_bytes()
             self.assertNotIn(b'UNRELATED_FIXTURE', before)
             self.assertIn(b'INCLUDE=headers', before)
             self.assertIn(b'CMAKE_MAKE_PROGRAM=selected ninja\n', before)
-            environment['PATH'] = 'line\nINJECTED=1'
-            with self.assertRaisesRegex(ValueError, 'multiline'):
-                jxl_build.write_github_environment(destination, environment)
-            self.assertEqual(destination.read_bytes(), before)
+            for key in ['WINDOWSSDKVERBINPATH', 'WINDOWSSDKVERSION', 'VSCMD_ARG_HOST_ARCH']:
+                self.assertIn((key + '=' + environment[key] + '\n').encode(), before)
+            for key in ['PATH', 'WINDOWSSDKVERBINPATH', 'WINDOWSSDKVERSION', 'VSCMD_ARG_HOST_ARCH']:
+                changed = dict(environment, **{key:'line\nINJECTED=1'})
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'multiline'):
+                    jxl_build.write_github_environment(destination, changed)
+                self.assertEqual(destination.read_bytes(), before)
 
     def test_exact_nested_native_notices_and_gpl_text_are_copied_from_source(self):
         with tempfile.TemporaryDirectory() as temporary:

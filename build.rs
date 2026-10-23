@@ -128,6 +128,121 @@ fn provenance(root: &Path) -> Option<(String, &'static str)> {
     ))
 }
 
+fn windows_version_resource(version: &str, debug: bool) -> Result<String, &'static str> {
+    if version.len() > 128
+        || !version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+    {
+        return Err("Windows version metadata requires bounded Cargo SemVer text");
+    }
+    let numeric = version.split(['-', '+']).next().unwrap();
+    let parts = numeric
+        .split('.')
+        .map(str::parse::<u16>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Windows version components must fit u16")?;
+    if parts.len() != 3 {
+        return Err("Windows version metadata requires three numeric components");
+    }
+    let fixed = format!("{},{},{},0", parts[0], parts[1], parts[2]);
+    let flags = u8::from(debug)
+        | if version.split('+').next().unwrap().contains('-') {
+            2
+        } else {
+            0
+        };
+    Ok(include_str!("packaging/windows/version.rc.in")
+        .replace("@FIXED_VERSION@", &fixed)
+        .replace("@FLAGS@", &flags.to_string())
+        .replace("@VERSION@", version))
+}
+
+fn windows_resource_tools(
+    bin: &Path,
+    version: &str,
+    host: &str,
+) -> Result<[PathBuf; 2], &'static str> {
+    if !["10.0.18362.0", "10.0.26100.0"].contains(&version)
+        || !bin.is_absolute()
+        || bin.file_name().and_then(|s| s.to_str()) != Some(version)
+        || host != "x64"
+    {
+        return Err("Use an initialized qualified Windows SDK resource compiler (18362 or 26100)");
+    }
+    Ok([
+        bin.join(host).join("rc.exe"),
+        bin.join(host).join("rcdll.dll"),
+    ])
+}
+
+fn link_windows_version(root: &Path, version: &str) {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    assert_eq!(
+        env::var("CARGO_CFG_TARGET_ENV").as_deref(),
+        Ok("msvc"),
+        "Windows version resources require the supported MSVC target"
+    );
+    for key in [
+        "WINDOWSSDKVERBINPATH",
+        "WINDOWSSDKVERSION",
+        "VSCMD_ARG_HOST_ARCH",
+        "DEBUG",
+    ] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    watch(&root.join("packaging/windows/version.rc.in"));
+    let bin = PathBuf::from(
+        env::var_os("WINDOWSSDKVERBINPATH")
+            .expect("Initialize the Windows SDK/MSVC environment before Cargo"),
+    );
+    let sdk = env::var("WINDOWSSDKVERSION").expect("Missing initialized Windows SDK version");
+    let sdk = sdk.trim_end_matches(['\\', '/']);
+    let host = env::var("VSCMD_ARG_HOST_ARCH").expect("Missing initialized MSVC host architecture");
+    let [compiler, support] = windows_resource_tools(&bin, sdk, &host).unwrap();
+    for path in [&compiler, &support] {
+        assert!(
+            path.is_file() && !path.is_symlink(),
+            "Selected Windows SDK resource tool is missing or linked"
+        );
+        watch(path);
+    }
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let script = output.join("peerbrush-version.rc");
+    let resource = output.join("peerbrush-version.res");
+    fs::write(
+        &script,
+        windows_version_resource(version, env::var("DEBUG").as_deref() == Ok("true")).unwrap(),
+    )
+    .unwrap();
+    if resource.exists() {
+        assert!(
+            resource.is_file() && !resource.is_symlink(),
+            "Unexpected prior resource output"
+        );
+        fs::remove_file(&resource).unwrap();
+    }
+    let status = Command::new(compiler)
+        .args(["/nologo", "/c65001", "/l0x0409", "/fo"])
+        .arg(&resource)
+        .arg(&script)
+        .status()
+        .expect("Windows SDK resource compiler could not start");
+    assert!(
+        status.success(),
+        "Windows version resource compilation failed"
+    );
+    let metadata =
+        fs::symlink_metadata(&resource).expect("Windows resource compiler produced no resource");
+    assert!(
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= 65536,
+        "Windows resource output is invalid or exceeds its bound"
+    );
+    println!("cargo:rustc-link-arg-bin=peerbrush={}", resource.display());
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     // Trusted release tooling computes this invalidator. Never use it as a label.
@@ -136,6 +251,7 @@ fn main() {
     let root = Path::new(&root);
     let (commit, tree) = provenance(root).unwrap_or_else(|| ("unknown".into(), "unknown"));
     let version = env::var("CARGO_PKG_VERSION").unwrap();
+    link_windows_version(root, &version);
     let json = format!("{{\"format\":\"PeerBrushBuildInfoV1\",\"schema\":1,\"product\":\"PeerBrush\",\"version\":\"{version}\",\"commit\":\"{commit}\",\"tree\":\"{tree}\",\"end\":\"PeerBrushBuildInfoEnd\"}}");
     fs::write(
         Path::new(&env::var_os("OUT_DIR").unwrap()).join("build-info.json"),
@@ -147,6 +263,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn windows_resource_versions_flags_and_sdk_selection_are_explicit() {
+        let stable = windows_version_resource("0.30.0", false).unwrap();
+        assert!(stable.contains("FILEVERSION 0,30,0,0"));
+        assert!(stable.contains("PRODUCTVERSION 0,30,0,0"));
+        assert!(stable.contains("FILEFLAGS 0L"));
+        assert!(stable.contains("\"ProductVersion\", \"0.30.0\\0\""));
+        let pre = windows_version_resource("0.30.0-dev.1+source", true).unwrap();
+        assert!(pre.contains("FILEFLAGS 3L"));
+        assert!(pre.contains("\"FileVersion\", \"0.30.0-dev.1+source\\0\""));
+        for invalid in ["65536.0.0", "0.30", "0.30.0\"", "0.30.0\n"] {
+            assert!(windows_version_resource(invalid, false).is_err());
+        }
+        let base = env::temp_dir().join("10.0.26100.0");
+        assert_eq!(
+            windows_resource_tools(&base, "10.0.26100.0", "x64").unwrap()[0],
+            base.join("x64/rc.exe")
+        );
+        assert!(windows_resource_tools(&base, "10.0.18362.0", "x64").is_err());
+        assert!(
+            windows_resource_tools(Path::new("relative/10.0.26100.0"), "10.0.26100.0", "x64")
+                .is_err()
+        );
+        assert!(windows_resource_tools(&base, "10.0.26100.0", "unknown").is_err());
+    }
     #[test]
     fn source_labels_follow_git_state_and_reject_archive_parent_repositories() {
         let directory = env::temp_dir().join(format!(

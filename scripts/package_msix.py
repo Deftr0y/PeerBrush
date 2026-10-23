@@ -327,6 +327,12 @@ def signed_executable_payload(files, executable):
     release = json.loads(files['release.json'])
     if release['executable_sha256'] != sha(original) or 'windows_executable_signing' in release:
         raise ValueError('Unexpected original executable provenance.')
+    if release.get('windows_version_resource') is not None:
+        from windows_version import inspect
+        if type(release['windows_version_resource']) is not int or release['windows_version_resource'] != 1:
+            raise ValueError('Unsupported source-bound Windows resource layout.')
+        if inspect(original, release['version']) != inspect(executable, release['version']):
+            raise ValueError('Signing changed standard Windows version metadata.')
     release['executable_sha256'] = sha(executable)
     release['windows_executable_signing'] = dict(schema=1, unsigned_sha256=sha(original),
                                                signed_sha256=sha(executable))

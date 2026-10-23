@@ -506,6 +506,12 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
     validate_binary(executable)
     architecture = architecture_from_stream(io.BytesIO(executable), platform)
     build_info = binary_build_info(executable, version, binary_source_commit) if policy['version'] == 2 else None
+    windows_resource = False
+    if platform == 'Windows':
+        from windows_version import inspect, required
+        windows_resource = required(sources)
+        if windows_resource:
+            inspect(executable, version)
     output.mkdir(parents=True, exist_ok=True)
     name = f'PeerBrush-{version}-{platform}-{architecture}'
     # Stage all outputs before replacing final files. Never reuse an old
@@ -559,6 +565,8 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             with (bundle / 'THIRD_PARTY_NOTICES.md').open('a', encoding='utf-8') as stream:
                 stream.write('\n- Sparkle 2.10.0: complete upstream/external notice in licenses/sparkle-2.10.0/LICENSE; exact upstream source revision and public source URL in the included packaging/sparkle/sparkle-2.10.0.json.\n')
         manifest = {'schema': 1, 'product': 'PeerBrush', 'version': version, 'commit': commit, 'binary_source_commit': binary_source_commit, 'platform': platform, 'architecture': architecture, 'executable': relative, 'executable_sha256': digest(staged_binary), 'source': source.name, 'source_sha256': digest(source), 'notice_files': notices, 'license': 'GPL-3.0-only', 'native_publisher_signing': 'not-configured', 'package_signature': 'See the matching external Sigstore bundle when supplied; this manifest alone is not a signature.'}
+        if windows_resource:
+            manifest['windows_version_resource'] = 1
         if platform == 'macOS':
             resources = bundle / MACOS_RESOURCES
             resources.mkdir()

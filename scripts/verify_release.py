@@ -182,6 +182,9 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             raise ValueError('Missing third-party license notices')
         executable = archive.read(prefix + manifest['executable'])
         validate_binary(executable)
+        if platform == 'Windows':
+            from windows_version import check
+            check(executable, version, selected_sources, manifest)
         if policy_from_sources(selected_sources)['version'] == 2:
             info = binary_build_info(executable, version, original_commit)
             if manifest.get('build_info') != info:

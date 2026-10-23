@@ -97,7 +97,7 @@ def write_github_environment(path, environment):
     names = ['CC', 'CXX', 'CMAKE', 'CMAKE_MAKE_PROGRAM', 'CMAKE_GENERATOR', 'CARGO_BUILD_JOBS',
              'CMAKE_BUILD_PARALLEL_LEVEL', 'PATH']
     if platform.system() == 'Windows':
-        names += ['INCLUDE', 'LIB', 'LIBPATH']
+        names += ['INCLUDE', 'LIB', 'LIBPATH', 'WINDOWSSDKVERBINPATH', 'WINDOWSSDKVERSION', 'VSCMD_ARG_HOST_ARCH']
     rows = []
     for key in names:
         value = environment.get(key, '')
