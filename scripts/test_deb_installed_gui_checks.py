@@ -102,13 +102,22 @@ class InstalledGuiContracts(unittest.TestCase):
 
     def test_actual_tiny_native_decoder_is_unchanged_by_explicit_fixed_capture_case(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-gui-png-') as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve(strict=True)
             for depth in [8, 16]:
                 pixel = bytes([19, 37, 73, 255]) if depth == 8 else b'\x27\x11\x4e\x23\x75\x37\xff\xff'
                 data = pixel * (32 * 24)
                 path = root / ('native-' + str(depth) + '.png')
                 path.write_bytes(png(32, 24, depth, data))
+                self.assertEqual(path.resolve(strict=True), path)
                 self.assertEqual(upgrade.png_samples(path), (32, 24, depth, data))
+                if os.name == 'posix':
+                    alias = root / ('linked-' + path.name)
+                    alias.symlink_to(path.name)
+                    self.assertTrue(alias.samefile(path))
+                    with self.assertRaisesRegex(ValueError, 'paths cannot use links or reparse points'):
+                        upgrade.png_samples(alias)
+                    self.assertEqual(path.read_bytes(), png(32, 24, depth, data))
+                    self.assertEqual(upgrade.png_samples(path), (32, 24, depth, data))
             capture = root / 'window.png'
             expected = screen(gui.palette(0), thumbnails=True)
             capture.write_bytes(png(*expected))
