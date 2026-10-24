@@ -161,6 +161,21 @@ impl CheckCommand {
         Ok(())
     }
 }
+/// Actual SDK callback facts, never installation/health or cancellation proof.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum NativeOutcome {
+    #[default]
+    Unknown,
+    Installing {
+        application_terminated: bool,
+    },
+    Installed {
+        relaunched: bool,
+    },
+    Aborted,
+    CycleEnded,
+}
 /// Observation only. A held callback is neither an install permit nor readiness.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,9 +194,22 @@ pub(crate) struct NativeStatus {
     pub(crate) extraction: Option<f64>,
     pub(super) download_complete: bool,
     pub(super) final_profile: Option<checkpoint::FinalProfileBinding>,
+    pub(super) outcome: NativeOutcome,
 }
 impl NativeStatus {
     fn validate(&self) -> Result<(), String> {
+        if self.outcome != NativeOutcome::Unknown
+            && (!self.native_cycle || !self.quarantine || self.final_profile.is_some())
+        {
+            return Err(FAILED.into());
+        }
+        if matches!(
+            self.outcome,
+            NativeOutcome::Installing { .. } | NativeOutcome::Installed { .. }
+        ) && self.held_generation.is_none()
+        {
+            return Err(FAILED.into());
+        }
         if let Some(binding) = &self.final_profile {
             binding.validate()?;
             if self.cancelled || self.held_generation != Some(binding.ready_generation) {
@@ -723,6 +751,27 @@ pub(super) struct Owner {
     request: Option<Request>,
 }
 impl Owner {
+    pub(super) fn take_exited(&mut self) -> Result<Option<u32>, String> {
+        let Some((child, _)) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        match child.try_wait() {
+            Ok(None) => return Ok(None),
+            Ok(Some(_)) => {}
+            Err(_) => {
+                // An unqueryable child remains owned by the existing waiter;
+                // stop retrying this failed observation without claiming death.
+                if let Some((child, reaper)) = self.child.take() {
+                    reaper.handoff(child);
+                }
+                return Err(FAILED.into());
+            }
+        }
+        let (child, reaper) = self.child.take().ok_or(FAILED)?;
+        let pid = child.id();
+        reaper.handoff(child);
+        Ok(Some(pid))
+    }
     pub(super) fn authenticate(&self, team: &str) -> Result<(), String> {
         process_identity::authenticate(&self.socket, self.pid()?, team)
     }
@@ -968,6 +1017,8 @@ struct NativeOwner {
     armed: Option<checkpoint::ArmedCheck>,
     final_profile: Option<checkpoint::FinalProfileBinding>,
     final_control: Option<checkpoint::FinalProfileBinding>,
+    parent_exit_recorded: bool,
+    outcome_recorded: NativeOutcome,
 }
 impl NativeOwner {
     fn load(
@@ -1069,6 +1120,8 @@ impl NativeOwner {
             armed: None,
             final_profile: None,
             final_control: None,
+            parent_exit_recorded: false,
+            outcome_recorded: NativeOutcome::Unknown,
         })
     }
     fn check(&mut self) -> Result<(), String> {
@@ -1229,7 +1282,8 @@ impl NativeOwner {
             .final_profile
             .as_ref()
             .filter(|binding| {
-                self.checks.held_is_current(binding.ready_generation)
+                self.checks.native_outcome() == NativeOutcome::Unknown
+                    && self.checks.held_is_current(binding.ready_generation)
                     && self.final_control.as_ref().is_none_or(|control| {
                         control == *binding
                             && self.checks.final_control_current(binding.ready_generation)
@@ -1242,6 +1296,36 @@ impl NativeOwner {
         // No verified native outcome/health retirement exists yet. In particular,
         // parent EOF, deadline, NoUpdate and cycle finish cannot release this owner.
         loop {
+            // Only kernel reparenting establishes this direct parent's exit.
+            // Socket EOF/deadline alone can never stand in for process death.
+            let parent = unsafe { libc::getppid() };
+            if !self.parent_exit_recorded && parent > 0 && parent as u32 != self.parent {
+                self.parent_exit_recorded = true;
+                if let Some(armed) = &self.armed {
+                    let _ = armed.record_event(
+                        &self._profile,
+                        checkpoint::NativeEvent::ParentExited,
+                        self.checks.held_generation(),
+                    );
+                }
+                self.checks.quarantine();
+            }
+            let outcome = self.checks.native_outcome();
+            if outcome != self.outcome_recorded {
+                self.outcome_recorded = outcome;
+                if let Some(armed) = &self.armed {
+                    if armed
+                        .record_event(
+                            &self._profile,
+                            checkpoint::NativeEvent::Callback { outcome },
+                            self.checks.held_generation(),
+                        )
+                        .is_err()
+                    {
+                        self.checks.quarantine();
+                    }
+                }
+            }
             if self.cancel.load(Ordering::Acquire) {
                 self.checks.quarantine();
             }

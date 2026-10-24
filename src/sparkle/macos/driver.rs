@@ -33,6 +33,7 @@ pub(super) struct State {
     lifecycle_revision: Cell<u64>,
     installing: RefCell<Option<HeldInstalling>>,
     installed: RefCell<Option<HeldInstalled>>,
+    outcome: Cell<super::coordinator::NativeOutcome>,
 }
 struct HeldFound {
     updater: Retained<AnyObject>,
@@ -92,6 +93,7 @@ impl Default for State {
             lifecycle_revision: Cell::new(0),
             installing: RefCell::new(None),
             installed: RefCell::new(None),
+            outcome: Cell::new(super::coordinator::NativeOutcome::Unknown),
         }
     }
 }
@@ -254,6 +256,10 @@ impl State {
             owner,
             application_terminated,
         });
+        self.outcome
+            .set(super::coordinator::NativeOutcome::Installing {
+                application_terminated,
+            });
         drop(previous);
     }
     fn retain_installed(&self, relaunched: bool, acknowledgement: &Block<dyn Fn()>) {
@@ -264,7 +270,45 @@ impl State {
             .installed
             .borrow_mut()
             .replace(HeldInstalled { owner, relaunched });
+        self.outcome
+            .set(super::coordinator::NativeOutcome::Installed { relaunched });
         drop(previous);
+    }
+    pub(super) fn native_outcome(&self) -> super::coordinator::NativeOutcome {
+        use super::coordinator::NativeOutcome;
+        if !self.has_owner() || !self.view().native_cycle {
+            return NativeOutcome::Unknown;
+        }
+        let matches = |owner: &OwnedNativeCallback| {
+            owner.revision == self.lifecycle_revision.get()
+                && owner.ready_generation.is_some()
+                && owner.ready_generation == self.held_generation()
+                && Retained::as_ptr(&owner.updater) == self.updater.get()
+                && owner.item.as_ref().map(Retained::as_ptr)
+                    == self.item.borrow().as_ref().map(Retained::as_ptr)
+        };
+        let outcome = self.outcome.get();
+        match outcome {
+            NativeOutcome::Installing { .. }
+                if !self
+                    .installing
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|held| matches(&held.owner)) =>
+            {
+                NativeOutcome::Unknown
+            }
+            NativeOutcome::Installed { .. }
+                if !self
+                    .installed
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|held| matches(&held.owner)) =>
+            {
+                NativeOutcome::Unknown
+            }
+            _ => outcome,
+        }
     }
     fn retain_found(&self, item: &AnyObject, reply: &Block<dyn Fn(isize)>, downloadable: bool) {
         if self.found.borrow().is_some() || self.choice_sent.get() || !self.has_owner() {
@@ -424,6 +468,7 @@ impl State {
             extraction: self.extraction.get(),
             download_complete: self.download_complete.get(),
             final_profile: None,
+            outcome: self.native_outcome(),
         }
     }
     pub(super) fn observe_owner(&self, status: super::coordinator::NativeStatus) {
@@ -520,12 +565,21 @@ impl State {
         }
     }
     pub fn failed(&self) {
+        self.outcome.set(super::coordinator::NativeOutcome::Aborted);
         self.control_requested.set(true);
         self.prepared_generation.set(None);
         self.session.borrow_mut().fail();
         self.repaint();
     }
     pub fn finished(&self) {
+        if !matches!(
+            self.outcome.get(),
+            super::coordinator::NativeOutcome::Aborted
+                | super::coordinator::NativeOutcome::Installed { .. }
+        ) {
+            self.outcome
+                .set(super::coordinator::NativeOutcome::CycleEnded);
+        }
         self.control_requested.set(true);
         self.prepared_generation.set(None);
         let cancellation = self.cancellation.borrow_mut().take();
@@ -850,6 +904,12 @@ pub(super) fn assert_owned_final_control(marker: MainThreadMarker, updater: &Any
         let held = held.as_ref().unwrap();
         assert!(!held.application_terminated);
         assert_eq!(
+            state.native_outcome(),
+            super::coordinator::NativeOutcome::Installing {
+                application_terminated: false
+            }
+        );
+        assert_eq!(
             Retained::as_ptr(&held.owner.updater),
             updater as *const AnyObject
         );
@@ -878,6 +938,12 @@ pub(super) fn assert_owned_final_control(marker: MainThreadMarker, updater: &Any
         let held = state.installing.borrow();
         let held = held.as_ref().unwrap();
         assert!(held.application_terminated);
+        assert_eq!(
+            state.native_outcome(),
+            super::coordinator::NativeOutcome::Installing {
+                application_terminated: true
+            }
+        );
         assert_eq!(held.owner.revision, 2);
         assert!(std::ptr::eq::<Block<dyn Fn()>>(
             &*held.owner.handler,
@@ -893,6 +959,10 @@ pub(super) fn assert_owned_final_control(marker: MainThreadMarker, updater: &Any
         let held = state.installed.borrow();
         let held = held.as_ref().unwrap();
         assert!(held.relaunched);
+        assert_eq!(
+            state.native_outcome(),
+            super::coordinator::NativeOutcome::Installed { relaunched: true }
+        );
         assert_eq!(
             Retained::as_ptr(&held.owner.updater),
             updater as *const AnyObject

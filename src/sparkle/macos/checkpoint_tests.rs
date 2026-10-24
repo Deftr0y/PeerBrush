@@ -1975,6 +1975,7 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
             extraction: None,
             download_complete: false,
             final_profile: None,
+            outcome: coordinator::NativeOutcome::Unknown,
         };
         checks.observe_owner(status.clone());
         {
@@ -2716,6 +2717,7 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
             extraction: None,
             download_complete: false,
             final_profile: Some(binding.clone()),
+            outcome: coordinator::NativeOutcome::Unknown,
         };
         if outcome == "quarantined" {
             status.final_profile = None;
@@ -2820,4 +2822,108 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
         assert!(require_captured_handoff().is_err());
         drop(operation);
     }
+}
+
+#[test]
+fn native_death_and_callback_records_explain_recovery_without_releasing_saved_work_or_settings() {
+    use super::super::coordinator::NativeOutcome;
+    let f = Fixture::new();
+    let profile = f.profile();
+    let lease = profile.update_profile();
+    let attempt = f.attempt(&lease);
+    let initial = fs::read(attempt.join("checkpoint.json")).unwrap();
+    fs::rename(
+        attempt.join("checkpoint.json"),
+        attempt.join("capture.json"),
+    )
+    .unwrap();
+    let (workspace, projects, paths) = current_profile_workspace(&f);
+    let before = current_workspace_bytes(&projects, &paths);
+    let tools = workspace.lock().unwrap().tool_settings.clone();
+    *tools.lock().unwrap() =
+        crate::tool_settings::Store::load(profile.locations.profile().join("tool-settings.json"));
+    let reviewed = crate::workspace::lifecycle::update_readiness(&workspace).unwrap();
+    let mut captured = None;
+    crate::workspace::lifecycle::publish_update_checkpoint(&workspace, &reviewed, |store| {
+        capture_current_profile(&lease, store, &attempt, &initial, &mut captured)
+    })
+    .unwrap();
+    record_intent(&attempt, &initial).unwrap();
+    let armed = ArmedCheck {
+        app: attempt.join("PeerBrush.app"),
+        manifest: initial.clone(),
+        intent: read_marker(&attempt.join("native-start-intent.json")).unwrap(),
+        owner_pid: std::process::id(),
+    };
+    let settings = fs::read(profile.locations.profile().join("tool-settings.json")).unwrap();
+    let installed = NativeEvent::Callback {
+        outcome: NativeOutcome::Installed { relaunched: true },
+    };
+    assert!(armed.record_event(&lease, installed, None).is_err());
+    assert!(!attempt.join(installed.marker().unwrap()).exists());
+    assert!(record_native_event(
+        &attempt,
+        &initial,
+        std::process::id() + 1,
+        NativeEvent::OwnerExited,
+        None
+    )
+    .is_err());
+    assert!(!attempt.join("native-owner-exited.json").exists());
+    for event in [
+        NativeEvent::Callback {
+            outcome: NativeOutcome::Installing {
+                application_terminated: false,
+            },
+        },
+        NativeEvent::Callback {
+            outcome: NativeOutcome::Installing {
+                application_terminated: true,
+            },
+        },
+        installed,
+        NativeEvent::Callback {
+            outcome: NativeOutcome::Aborted,
+        },
+        NativeEvent::Callback {
+            outcome: NativeOutcome::CycleEnded,
+        },
+        NativeEvent::ParentExited,
+        NativeEvent::OwnerExited,
+    ] {
+        armed.record_event(&lease, event, Some(7)).unwrap();
+        let marker = attempt.join(event.marker().unwrap());
+        let bytes = read_marker(&marker).unwrap();
+        armed.record_event(&lease, event, Some(7)).unwrap();
+        assert_eq!(read_marker(&marker).unwrap(), bytes);
+        assert!(
+            armed.record_event(&lease, event, Some(8)).is_err(),
+            "An observation cannot be overwritten by another generation"
+        );
+        assert_eq!(read_marker(&marker).unwrap(), bytes);
+        assert!(startup_guard(&profile.locations).is_err());
+        assert!(!workspace.lock().unwrap().exiting);
+        assert!(!tools.lock().unwrap().update_exit_committed());
+        assert_eq!(current_workspace_bytes(&projects, &paths), before);
+        assert_eq!(
+            fs::read(profile.locations.profile().join("tool-settings.json")).unwrap(),
+            settings
+        );
+    }
+    assert!(native_recovery_message(&attempt)
+        .unwrap()
+        .contains("owner exited"));
+    let marker = attempt.join("native-owner-exited.json");
+    let bytes = read_marker(&marker).unwrap();
+    let mut forged: NativeRecord = serde_json::from_slice(&bytes).unwrap();
+    forged.intent_sha256 = "a".repeat(64);
+    fs::write(&marker, serde_json::to_vec(&forged).unwrap()).unwrap();
+    assert!(native_recovery_message(&attempt).is_err());
+    assert!(startup_guard(&profile.locations).is_err());
+    assert!(armed
+        .record_event(&lease, NativeEvent::OwnerExited, Some(7))
+        .is_err());
+    assert!(!attempt.join("native-not-started.json").exists());
+    assert_eq!(current_workspace_bytes(&projects, &paths), before);
+    assert!(require_captured_handoff().is_err());
 }

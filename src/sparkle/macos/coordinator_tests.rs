@@ -297,6 +297,7 @@ fn observation() -> NativeStatus {
         extraction: None,
         download_complete: false,
         final_profile: None,
+        outcome: NativeOutcome::Unknown,
     }
 }
 #[test]
@@ -801,6 +802,89 @@ fn native_download_observations_reject_unbound_counters_and_invalid_extraction()
     }
     let status = observation();
     assert!(serde_json::to_vec(&status).unwrap().len() <= FRAME_LIMIT);
+    assert!(checkpoint::require_captured_handoff().is_err());
+}
+
+#[test]
+fn native_outcome_frames_remain_observations_and_refuse_exit_binding_or_missing_owner_holds() {
+    for outcome in [
+        NativeOutcome::Installing {
+            application_terminated: false,
+        },
+        NativeOutcome::Installed { relaunched: true },
+        NativeOutcome::Aborted,
+        NativeOutcome::CycleEnded,
+    ] {
+        let mut status = observation();
+        status.outcome = outcome;
+        status.validate().unwrap();
+        let raw = serde_json::to_vec(&status).unwrap();
+        assert!(raw.len() <= FRAME_LIMIT);
+        let decoded: NativeStatus = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(decoded.outcome, outcome);
+        status.final_profile = Some(final_binding());
+        assert!(status.validate().is_err());
+        status.final_profile = None;
+        status.native_cycle = false;
+        assert!(status.validate().is_err());
+        status.native_cycle = true;
+        status.quarantine = false;
+        assert!(status.validate().is_err());
+    }
+    assert!(checkpoint::require_captured_handoff().is_err());
+}
+
+#[test]
+fn exact_owned_child_exit_is_observed_and_reaped_once_without_interpreting_it_as_update_success() {
+    let (parent, peer) = UnixStream::pair().unwrap();
+    let child_fd: OwnedFd = peer.into();
+    let (done, waited) = mpsc::channel();
+    let mut owner = spawn_owned(
+        parent,
+        || {
+            Reaper::with_wait(move |mut child| {
+                let _ = done.send((child.id(), child.wait().unwrap().code()));
+            })
+        },
+        || {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sparkle::macos::coordinator::tests::capture_reaper_child_entry",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--color=never",
+                ])
+                .env_clear()
+                .env("PEERBRUSH_CAPTURE_REAPER_CHILD", "1")
+                .stdin(Stdio::from(child_fd))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| FAILED.to_string())
+        },
+    )
+    .unwrap();
+    let pid = owner.pid().unwrap();
+    assert_eq!(owner.take_exited().unwrap(), None);
+    owner.socket.shutdown(std::net::Shutdown::Both).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let observed = loop {
+        if let Some(pid) = owner.take_exited().unwrap() {
+            break pid;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(observed, pid);
+    assert!(owner.pid().is_err());
+    assert_eq!(owner.take_exited().unwrap(), None);
+    assert_eq!(
+        waited.recv_timeout(Duration::from_secs(30)).unwrap(),
+        (pid, Some(37))
+    );
+    drop(owner);
     assert!(checkpoint::require_captured_handoff().is_err());
 }
 

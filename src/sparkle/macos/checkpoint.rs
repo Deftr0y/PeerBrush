@@ -157,6 +157,150 @@ struct Unstarted {
     owner_pid: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum NativeEvent {
+    ParentExited,
+    OwnerExited,
+    Callback {
+        outcome: super::coordinator::NativeOutcome,
+    },
+}
+impl NativeEvent {
+    fn marker(self) -> Option<&'static str> {
+        use super::coordinator::NativeOutcome;
+        match self {
+            Self::ParentExited => Some("native-parent-exited.json"),
+            Self::OwnerExited => Some("native-owner-exited.json"),
+            Self::Callback {
+                outcome: NativeOutcome::Unknown,
+            } => None,
+            Self::Callback {
+                outcome:
+                    NativeOutcome::Installing {
+                        application_terminated: false,
+                    },
+            } => Some("native-installing-running.json"),
+            Self::Callback {
+                outcome:
+                    NativeOutcome::Installing {
+                        application_terminated: true,
+                    },
+            } => Some("native-installing-terminated.json"),
+            Self::Callback {
+                outcome: NativeOutcome::Installed { relaunched: false },
+            } => Some("native-installed-not-relaunched.json"),
+            Self::Callback {
+                outcome: NativeOutcome::Installed { relaunched: true },
+            } => Some("native-installed-relaunched.json"),
+            Self::Callback {
+                outcome: NativeOutcome::Aborted,
+            } => Some("native-aborted.json"),
+            Self::Callback {
+                outcome: NativeOutcome::CycleEnded,
+            } => Some("native-cycle-ended.json"),
+        }
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeRecord {
+    schema: u32,
+    manifest_sha256: String,
+    intent_sha256: String,
+    owner_pid: u32,
+    ready_generation: Option<u64>,
+    observation: NativeEvent,
+}
+fn record_native_event(
+    path: &Path,
+    initial: &[u8],
+    owner_pid: u32,
+    observation: NativeEvent,
+    ready_generation: Option<u64>,
+) -> Result<(), String> {
+    let Some(marker) = observation.marker() else {
+        return Ok(());
+    };
+    final_intent(path, initial, owner_pid)?;
+    validate_native_generation(observation, ready_generation)?;
+    let bytes = serde_json::to_vec(&NativeRecord {
+        schema: 1,
+        manifest_sha256: digest(initial),
+        intent_sha256: digest(&read_marker(&path.join("native-start-intent.json"))?),
+        owner_pid,
+        ready_generation,
+        observation,
+    })
+    .map_err(|_| HOLD)?;
+    let destination = path.join(marker);
+    if Stamp::read(&destination)?.is_none() {
+        write_new(&destination, &bytes)?;
+    }
+    if read_marker(&destination)? != bytes {
+        return Err(HOLD.into());
+    }
+    final_intent(path, initial, owner_pid)
+}
+fn validate_native_generation(
+    observation: NativeEvent,
+    generation: Option<u64>,
+) -> Result<(), String> {
+    use super::coordinator::NativeOutcome;
+    if generation == Some(0)
+        || (matches!(
+            observation,
+            NativeEvent::Callback {
+                outcome: NativeOutcome::Installing { .. } | NativeOutcome::Installed { .. }
+            }
+        ) && generation.is_none())
+    {
+        return Err(HOLD.into());
+    }
+    Ok(())
+}
+fn native_recovery_message(path: &Path) -> Result<&'static str, String> {
+    use super::coordinator::NativeOutcome;
+    let initial = read_private(&path.join("capture.json"), 1024 * 1024)?;
+    let intent = read_marker(&path.join("native-start-intent.json"))?;
+    let expected: Intent = serde_json::from_slice(&intent).map_err(|_| HOLD)?;
+    final_intent(path, &initial, expected.owner_pid)?;
+    for marker in [
+        "native-owner-exited.json",
+        "native-parent-exited.json",
+        "native-aborted.json",
+        "native-installed-relaunched.json",
+        "native-installed-not-relaunched.json",
+        "native-cycle-ended.json",
+        "native-installing-terminated.json",
+        "native-installing-running.json",
+    ] {
+        if Stamp::read(&path.join(marker))?.is_none() {
+            continue;
+        }
+        let value: NativeRecord =
+            serde_json::from_slice(&read_marker(&path.join(marker))?).map_err(|_| HOLD)?;
+        if value.schema != 1
+            || value.owner_pid != expected.owner_pid
+            || value.manifest_sha256 != digest(&initial)
+            || value.intent_sha256 != digest(&intent)
+            || value.observation.marker() != Some(marker)
+        {
+            return Err(HOLD.into());
+        }
+        validate_native_generation(value.observation, value.ready_generation)?;
+        // These records only explain an existing hold. None permits profile
+        // migration, installer acknowledgement, recovery or barrier retirement.
+        return Ok(match value.observation {
+            NativeEvent::OwnerExited => "The app update preservation owner exited before verified completion. Keep the previous app and preserved settings for recovery.",
+            NativeEvent::ParentExited => "The previous application exited during an app update. Its update outcome and preserved settings require recovery verification.",
+            NativeEvent::Callback { outcome: NativeOutcome::Installed { .. } } => "The updater reported installation, but the new signed version and launch health are not verified. Preserved settings remain protected.",
+            _ => "The app update was interrupted or has no verified installed outcome. Keep the previous app and preserved settings for recovery.",
+        });
+    }
+    Err(HOLD.into())
+}
+
 fn checkpoints(locations: &Locations) -> PathBuf {
     locations.data.join("update-checkpoints")
 }
@@ -189,7 +333,9 @@ pub(crate) fn startup_guard(locations: &Locations) -> Result<(), String> {
         return Ok(());
     }
     for path in entries(&root)? {
-        inspect_unstarted_attempt(&path)?;
+        if inspect_unstarted_attempt(&path).is_err() {
+            return Err(native_recovery_message(&path).unwrap_or(HOLD).into());
+        }
     }
     Ok(())
 }
@@ -749,6 +895,21 @@ pub(super) struct Prepared {
     final_profile: Option<FinalCapture>,
 }
 impl Prepared {
+    pub(super) fn observe_owner_exit(&mut self) -> Result<bool, String> {
+        let Some(pid) = self._owner.take_exited()? else {
+            return Ok(false);
+        };
+        self.check_identity()?;
+        record_native_event(
+            &self.path,
+            &self.manifest,
+            pid,
+            NativeEvent::OwnerExited,
+            None,
+        )?;
+        self.check_identity()?;
+        Ok(true)
+    }
     /// An advisory change detector, never current app/copy authentication.
     pub fn recheck_metadata(&self) -> Result<(), String> {
         self.check_identity()?;
@@ -1381,6 +1542,15 @@ pub(super) struct ArmedCheck {
     owner_pid: u32,
 }
 impl ArmedCheck {
+    pub(super) fn record_event(
+        &self,
+        profile: &UpdateProfile,
+        event: NativeEvent,
+        generation: Option<u64>,
+    ) -> Result<(), String> {
+        let path = self.check_records(profile)?;
+        record_native_event(&path, &self.manifest, self.owner_pid, event, generation)
+    }
     fn check_records(&self, profile: &UpdateProfile) -> Result<PathBuf, String> {
         profile.validate()?;
         let path = self.app.parent().ok_or(HOLD)?;

@@ -1460,6 +1460,25 @@ impl Application {
         workspace: &crate::workspace::Registry,
         ui_blocked: bool,
     ) {
+        if self.remote.is_some() {
+            if let Some(prepared) = self.checkpoint.as_mut() {
+                match prepared.observe_owner_exit() {
+                    Ok(false) => {}
+                    result => {
+                        self.final_control_accepted = false;
+                        self.checks.quarantine();
+                        if let Some(remote) = &self.remote {
+                            remote.cancel();
+                        }
+                        self.message = if result.is_ok() {
+                            "The app update preservation owner exited. Projects remain open; recovery verification is required."
+                        } else {
+                            "Native update ownership could not be reconciled. Projects and preserved settings remain protected."
+                        };
+                    }
+                }
+            }
+        }
         if !self.startup_enabled() {
             if self.verification.is_some() {
                 self.defer();
@@ -1517,6 +1536,7 @@ impl Application {
         if let Some(remote) = &self.remote {
             match remote.receiver.try_recv() {
                 Ok(Ok(status)) => {
+                    let outcome = status.outcome;
                     self.checks.observe_owner(status.clone());
                     let result = accept_final_observation(
                         &self.checks,
@@ -1541,6 +1561,14 @@ impl Application {
                         };
                     }
                     self.owner_status = Some(status);
+                    if outcome != coordinator::NativeOutcome::Unknown {
+                        self.final_control_accepted = false;
+                        self.message = match outcome {
+                            coordinator::NativeOutcome::Installing { .. } => "The native updater reported installation progress. Projects remain protected until the outcome is verified.",
+                            coordinator::NativeOutcome::Installed { .. } => "The native updater reported installation. The new signed version and launch health still require verification.",
+                            _ => "The native update cycle ended or was interrupted. Preserved app and settings remain held for recovery verification.",
+                        };
+                    }
                 }
                 Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
                     self.final_reply_processed = true;
@@ -1584,7 +1612,7 @@ impl Application {
                 }
             }
         }
-        if self.verification.is_some() || self.checks.view().busy {
+        if self.verification.is_some() || self.checks.view().busy || self.pending_installation() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
@@ -1676,7 +1704,8 @@ fn request_final_control(
         || checks.view().cancelled
         || !checks.view().native_cycle
         || !status.is_some_and(|status| {
-            !status.cancelled
+            status.outcome == coordinator::NativeOutcome::Unknown
+                && !status.cancelled
                 && status.held_generation == Some(binding.ready_generation)
                 && status.final_profile.as_ref() == Some(binding)
         })
@@ -1709,7 +1738,8 @@ fn accept_final_control(
         || checks.view().cancelled
         || !checks.view().native_cycle
         || !status.is_some_and(|status| {
-            !status.cancelled
+            status.outcome == coordinator::NativeOutcome::Unknown
+                && !status.cancelled
                 && status.held_generation == Some(reply.ready_generation)
                 && status.final_profile.as_ref() == Some(reply)
         })
@@ -1736,6 +1766,7 @@ fn accept_final_observation(
         || checks.view().cancelled
         || !checks.view().native_cycle
         || status.cancelled
+        || status.outcome != coordinator::NativeOutcome::Unknown
         || status.held_generation != Some(requested.ready_generation)
     {
         *processed = true;
@@ -1787,6 +1818,7 @@ impl Application {
             extraction,
             download_complete: extraction.is_some() || ready,
             final_profile: None,
+            outcome: coordinator::NativeOutcome::Unknown,
         };
         self.checks.observe_owner(status.clone());
         self.owner_status = Some(status);
