@@ -18,6 +18,11 @@ class Preparation(unittest.TestCase):
         self.signing = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')
         self.signing.setUp()
         self.addCleanup(self.signing.doCleanups)
+        self.signing.fixture.require_installed_macos_source()
+        self.signing.archive = self.signing.fixture.build('macOS')
+        self.signing.commit = dmg.git(self.signing.fixture.root, 'rev-parse', 'HEAD').decode().strip()
+        self.signing.kwargs.update(archive=self.signing.archive, commit=self.signing.commit,
+                                   expected_sha256=digest(self.signing.archive))
         self.archive = self.signing.sign()
         self.output = self.signing.base / 'dmg-output'
         self.kwargs = dict(archive=self.archive, output=self.output, commit=self.signing.commit,
@@ -38,6 +43,12 @@ class Preparation(unittest.TestCase):
         self.assertTrue((payload / dmg.SUPPORT / 'PeerBrush-0.2.0-source.zip').is_file())
         self.assertTrue((payload / dmg.SUPPORT / 'LICENSE').is_file())
         self.assertTrue((payload / dmg.SUPPORT / 'THIRD_PARTY_NOTICES.md').is_file())
+        resources = payload / dmg.APP / 'Contents/Resources'
+        identity = json.loads((resources / 'installed-release.json').read_bytes())
+        self.assertEqual(identity['source_sha256'], digest(resources / identity['source']))
+        self.assertEqual((resources / identity['source']).read_bytes(),
+                         (payload / dmg.SUPPORT / identity['source']).read_bytes())
+        self.assertEqual(identity['commit'], self.signing.commit)
         with zipfile.ZipFile(self.archive) as source:
             for entry in source.infolist():
                 relative = pathlib.PurePosixPath(entry.filename).relative_to('PeerBrush-0.2.0-macOS-arm64')

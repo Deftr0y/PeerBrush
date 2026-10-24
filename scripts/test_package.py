@@ -230,6 +230,57 @@ class Packages(unittest.TestCase):
         self.save_policy()
         self.commit()
 
+    def require_installed_macos_source(self):
+        self.require_provenance()
+        name = 'src/sparkle/macos/installed.rs'
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('const INSTALLED_RELEASE_LAYOUT: u32 = 1;\n', encoding='utf-8')
+        self.policy['source'].append(name)
+        self.save_policy()
+        self.commit()
+
+    def test_installed_macos_identity_and_source_survive_app_only_install_and_reject_mutations(self):
+        self.require_installed_macos_source()
+        archive = self.build('macOS')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        checked = verify_release.inspect_archive(archive, commit, '0.2.0', self.root)
+        with zipfile.ZipFile(archive) as bundle:
+            original = [(i.filename, bundle.read(i), i.external_attr >> 16 & 0o777) for i in bundle.infolist()]
+            root = archive.stem + '/'
+            resources = root + packaging.MACOS_RESOURCES
+            metadata_name = resources + packaging.MACOS_INSTALLED_RELEASE
+            source_name = resources + checked['manifest']['source']
+            identity = json.loads(bundle.read(metadata_name))
+            self.assertEqual(identity, packaging.macos_installed_release(checked['manifest']))
+            self.assertEqual(bundle.read(source_name), checked['source'])
+            self.assertEqual(identity['build_info'], self.build_info())
+            self.assertNotIn('executable_sha256', identity)
+            self.assertNotIn('macos_signing', identity)
+            # These two files are inside the .app copied to Applications, not
+            # dependent on the outer ZIP/DMG Support directory being retained.
+            self.assertTrue(all(name.startswith(root + 'PeerBrush.app/') for name in [metadata_name, source_name]))
+        for damage in ['source', 'version', 'commit', 'schema', 'extra', 'missing']:
+            with self.subTest(damage=damage):
+                changed = dict(identity)
+                if damage == 'version':
+                    changed['version'] = '0.2.1'
+                elif damage == 'commit':
+                    changed['commit'] = '0' * 40
+                elif damage == 'schema':
+                    changed['schema'] = True
+                elif damage == 'extra':
+                    changed['health'] = True
+                files = [(name, data + b'changed' if damage == 'source' and name == source_name
+                          else json.dumps(changed, indent=2).encode() + b'\n' if name == metadata_name
+                          else data, mode) for name, data, mode in original
+                         if not (damage == 'missing' and name == source_name)]
+                packaging.write_zip(archive, files, 1700000000)
+                with self.assertRaisesRegex(ValueError, 'Installed macOS|missing release entries'):
+                    verify_release.inspect_archive(archive, commit, '0.2.0', self.root)
+        # Historical archives without the source-derived marker retain their
+        # existing outer manifest/source layout (covered by the original suite).
+
     def test_embedded_provenance_rejects_missing_duplicate_dirty_unknown_and_malformed_labels(self):
         info = self.build_info()
         encoded = json.dumps(info, separators=(',', ':')).encode()

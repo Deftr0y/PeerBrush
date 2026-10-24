@@ -298,6 +298,7 @@ fn observation() -> NativeStatus {
         download_complete: false,
         final_profile: None,
         outcome: NativeOutcome::Unknown,
+        installed_target: None,
     }
 }
 #[test]
@@ -831,6 +832,33 @@ fn native_outcome_frames_remain_observations_and_refuse_exit_binding_or_missing_
         status.quarantine = false;
         assert!(status.validate().is_err());
     }
+    assert!(checkpoint::require_captured_handoff().is_err());
+}
+
+#[test]
+fn installed_target_identity_is_an_installed_only_observation_and_cannot_authorize_exit() {
+    let mut status = observation();
+    status.installed_target = Some(super::super::installed::InstalledRelease {
+        version: "0.31.0".into(),
+        commit: "a".repeat(40),
+        binary_source_commit: "a".repeat(40),
+        source_sha256: "b".repeat(64),
+    });
+    assert!(status.validate().is_err());
+    status.outcome = NativeOutcome::Installed { relaunched: true };
+    status.validate().unwrap();
+    let raw = serde_json::to_vec(&status).unwrap();
+    assert!(raw.len() < FRAME_LIMIT);
+    let decoded: NativeStatus = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(decoded.installed_target, status.installed_target);
+    status.cancelled = true;
+    assert!(status.validate().is_err());
+    status.cancelled = false;
+    status.final_profile = Some(final_binding());
+    assert!(status.validate().is_err());
+    status.final_profile = None;
+    status.held_generation = None;
+    assert!(status.validate().is_err());
     assert!(checkpoint::require_captured_handoff().is_err());
 }
 

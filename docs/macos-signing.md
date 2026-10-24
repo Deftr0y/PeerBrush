@@ -1,5 +1,27 @@
 # macOS Developer ID signing and notarization
 
+Current-source packages also place `installed-release.json` and the matching
+GPL source ZIP inside `PeerBrush.app/Contents/Resources` before signing. The
+small installed identity binds the source checksum, application version and
+clean embedded build provenance. These resource bytes remain unchanged through
+signing, notarization, stapling and DMG creation, and travel with an app dragged
+to Applications. The original outer source ZIP and final `release.json` remain
+available in the distribution. The outer manifest includes final signing and
+executable hashes; it is not itself covered by the app signature and is never
+copied back into the signed resources.
+
+After an actual retained Sparkle Installed callback, the copied native owner
+can inspect the local target in a worker. It requires the retained signed
+appcast item's `versionString`, the exact installed bundle version, approved
+Developer ID Team ID and bundle identifier, existing pinned framework policy,
+and the signed installed identity/source and actual executable build record.
+Changed files, callbacks or selected generations invalidate the observation.
+The old same-code-hash control-channel authentication is unchanged. This verifies
+local code/source identity only: it does not establish launch health, permit
+profile migration, release the old application/settings copy, or authorize
+installation. Activation remains disabled pending the remaining source work,
+approved feed/public key, signing configuration and installed acceptance tests.
+
 This is a prepared, explicit native workflow for direct distribution of the arm64 `PeerBrush.app`. It does not create an Apple account, install credentials, configure a runner, publish a release, or prove that any existing download is signed. Running it requires a separately authorized Mac and Apple submission. Portable tests use synthetic packages and mocked subprocesses; real signing, notarization, Gatekeeper and native launch tests remain release gates.
 
 ## Prerequisites and secure setup

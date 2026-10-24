@@ -1976,6 +1976,7 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
             download_complete: false,
             final_profile: None,
             outcome: coordinator::NativeOutcome::Unknown,
+            installed_target: None,
         };
         checks.observe_owner(status.clone());
         {
@@ -2718,6 +2719,7 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
             download_complete: false,
             final_profile: Some(binding.clone()),
             outcome: coordinator::NativeOutcome::Unknown,
+            installed_target: None,
         };
         if outcome == "quarantined" {
             status.final_profile = None;

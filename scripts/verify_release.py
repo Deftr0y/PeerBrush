@@ -9,7 +9,7 @@ import re
 import shutil
 import stat
 import zipfile
-from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, MACOS_RESOURCES, macos_info, binary_build_info, macos_sparkle_required
+from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, MACOS_RESOURCES, macos_info, binary_build_info, macos_sparkle_required, macos_installed_release_required, macos_installed_release, MACOS_INSTALLED_RELEASE
 
 
 MACOS_SIGNING_FILES = frozenset({
@@ -139,6 +139,13 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
                 if manifest['macos_bundle_resources'] != 1:
                     raise ValueError('Unsupported macOS bundle resource layout')
                 expected_entries.update(MACOS_RESOURCES + name for name in ['PeerBrush.icns', 'LICENSE', 'THIRD_PARTY_NOTICES.md', *notices])
+            installed_source = macos_installed_release_required(selected_sources)
+            if installed_source != (type(manifest.get('macos_installed_release')) is int
+                                    and manifest['macos_installed_release'] == 1) or (
+                    'macos_installed_release' in manifest and not installed_source):
+                raise ValueError('Installed macOS source layout must match the committed source')
+            if installed_source:
+                expected_entries.update(MACOS_RESOURCES + name for name in [MACOS_INSTALLED_RELEASE, manifest['source']])
         sparkle_required = platform == 'macOS' and macos_sparkle_required(selected_sources)
         if sparkle_required != (type(manifest.get('macos_sparkle_layout')) is int and manifest.get('macos_sparkle_layout') == 1):
             raise ValueError('macOS Sparkle layout must match the exact committed source contract')
@@ -197,6 +204,13 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
         source = archive.read(prefix + manifest['source'])
         if sha(executable) != manifest['executable_sha256'] or sha(source) != manifest['source_sha256']:
             raise ValueError('Executable/source checksum mismatch')
+        if platform == 'macOS' and installed_source:
+            identity = archive.read(prefix + MACOS_RESOURCES + MACOS_INSTALLED_RELEASE)
+            enclosed = archive.getinfo(prefix + MACOS_RESOURCES + manifest['source'])
+            if (len(identity) > 4096 or enclosed.file_size > 128 * 1024 * 1024
+                    or identity != (json.dumps(macos_installed_release(manifest), indent=2) + '\n').encode()
+                    or archive.read(enclosed) != source):
+                raise ValueError('Installed macOS identity/source differs from the verified distribution')
         with zipfile.ZipFile(io.BytesIO(source)) as sources:
             if sum(i.file_size for i in sources.infolist()) > 512 * 1024 * 1024:
                 raise ValueError('Source archive exceeds the inspection budget')

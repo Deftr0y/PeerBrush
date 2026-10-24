@@ -139,6 +139,27 @@ class Signing(unittest.TestCase):
         self.assertFalse(any(any(x in c for x in ['store-credentials', 'import', 'unlock-keychain', 'set-key-partition-list']) for c in self.calls))
         self.assertNotIn(self.kwargs['profile'], final.read_bytes().decode('latin1'))
 
+    def test_installed_source_identity_is_sealed_before_signing_and_never_rewritten(self):
+        self.fixture.require_installed_macos_source()
+        self.archive = self.fixture.build('macOS')
+        self.commit = packaging.git(self.fixture.root, 'rev-parse', 'HEAD').decode().strip()
+        self.kwargs.update(archive=self.archive, commit=self.commit,
+                           expected_sha256=packaging.digest(self.archive))
+        with zipfile.ZipFile(self.archive) as archive:
+            resources = self.archive.stem + '/' + packaging.MACOS_RESOURCES
+            names = [resources + packaging.MACOS_INSTALLED_RELEASE,
+                     resources + 'PeerBrush-0.2.0-source.zip']
+            before = {name: archive.read(name) for name in names}
+        final = self.sign()
+        inspected = verify_release.inspect_archive(final, self.commit, '0.2.0', self.fixture.root)
+        with zipfile.ZipFile(final) as archive:
+            self.assertEqual(before, {name: archive.read(name) for name in names})
+            identity = json.loads(before[names[0]])
+            self.assertEqual(identity, packaging.macos_installed_release(inspected['manifest']))
+            self.assertNotIn('macos_signing', identity)
+            self.assertEqual(identity['source_sha256'], packaging.digest(
+                self.work / 'payload' / self.archive.stem / 'PeerBrush.app/Contents/Resources/PeerBrush-0.2.0-source.zip'))
+
     def test_missing_identity_team_profile_and_runner_fail_before_native_commands(self):
         for overrides in [dict(team_id=''), dict(identity='-'), dict(profile=''), dict(revision='0')]:
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):

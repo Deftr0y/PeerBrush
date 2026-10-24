@@ -62,6 +62,12 @@ struct HeldInstalled {
     owner: OwnedNativeCallback,
     relaunched: bool,
 }
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct InstalledSelection {
+    pub version: String,
+    generation: u64,
+    revision: u64,
+}
 impl Default for State {
     fn default() -> Self {
         Self {
@@ -310,6 +316,35 @@ impl State {
             _ => outcome,
         }
     }
+    pub(super) fn installed_selection(&self) -> Option<InstalledSelection> {
+        if !matches!(
+            self.native_outcome(),
+            super::coordinator::NativeOutcome::Installed { .. }
+        ) || self.view().cancelled
+        {
+            return None;
+        }
+        let item = self.item.borrow().clone()?;
+        // Never hold a RefCell borrow across a native property getter.
+        let version: Option<Retained<NSString>> = unsafe { msg_send![&*item, versionString] };
+        let signed: isize = unsafe { msg_send![&*item, signingValidationStatus] };
+        let version = text(version, 128)?;
+        if signed != 1
+            || !super::installed::machine_version(&version)
+            || !matches!(
+                self.native_outcome(),
+                super::coordinator::NativeOutcome::Installed { .. }
+            )
+            || self.item.borrow().as_ref().map(Retained::as_ptr) != Some(Retained::as_ptr(&item))
+        {
+            return None;
+        }
+        Some(InstalledSelection {
+            version,
+            generation: self.held_generation()?,
+            revision: self.lifecycle_revision.get(),
+        })
+    }
     fn retain_found(&self, item: &AnyObject, reply: &Block<dyn Fn(isize)>, downloadable: bool) {
         if self.found.borrow().is_some() || self.choice_sent.get() || !self.has_owner() {
             self.quarantine();
@@ -469,6 +504,7 @@ impl State {
             download_complete: self.download_complete.get(),
             final_profile: None,
             outcome: self.native_outcome(),
+            installed_target: None,
         }
     }
     pub(super) fn observe_owner(&self, status: super::coordinator::NativeStatus) {

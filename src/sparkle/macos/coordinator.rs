@@ -195,9 +195,16 @@ pub(crate) struct NativeStatus {
     pub(super) download_complete: bool,
     pub(super) final_profile: Option<checkpoint::FinalProfileBinding>,
     pub(super) outcome: NativeOutcome,
+    pub(super) installed_target: Option<super::installed::InstalledRelease>,
 }
 impl NativeStatus {
     fn validate(&self) -> Result<(), String> {
+        if let Some(target) = &self.installed_target {
+            target.validate()?;
+            if !matches!(self.outcome, NativeOutcome::Installed { .. }) || self.cancelled {
+                return Err(FAILED.into());
+            }
+        }
         if self.outcome != NativeOutcome::Unknown
             && (!self.native_cycle || !self.quarantine || self.final_profile.is_some())
         {
@@ -1019,6 +1026,12 @@ struct NativeOwner {
     final_control: Option<checkpoint::FinalProfileBinding>,
     parent_exit_recorded: bool,
     outcome_recorded: NativeOutcome,
+    target_attempted: bool,
+    target_verification: Option<(
+        driver::InstalledSelection,
+        mpsc::Receiver<Result<super::installed::Verified, String>>,
+    )>,
+    verified_target: Option<(driver::InstalledSelection, super::installed::Verified)>,
 }
 impl NativeOwner {
     fn load(
@@ -1122,6 +1135,9 @@ impl NativeOwner {
             final_control: None,
             parent_exit_recorded: false,
             outcome_recorded: NativeOutcome::Unknown,
+            target_attempted: false,
+            target_verification: None,
+            verified_target: None,
         })
     }
     fn check(&mut self) -> Result<(), String> {
@@ -1290,7 +1306,64 @@ impl NativeOwner {
                     })
             })
             .cloned();
+        status.installed_target = self
+            .verified_target
+            .as_ref()
+            .and_then(|(selection, proof)| {
+                (self.checks.installed_selection().as_ref() == Some(selection)
+                    && proof.recheck().is_ok())
+                .then(|| proof.release.clone())
+                .flatten()
+            });
         status
+    }
+    fn observe_installed_target(&mut self) {
+        if !self.target_attempted {
+            if let Some(selection) = self.checks.installed_selection() {
+                self.target_attempted = true;
+                let app = self._bundles.application.clone();
+                let configuration = self.configuration.clone();
+                let version = selection.version.clone();
+                let (sender, receiver) = mpsc::sync_channel(1);
+                // Read-only inspection continues after parent death. It cannot
+                // invoke the retained acknowledgement, release the profile or exit.
+                if std::thread::Builder::new()
+                    .name("peerbrush-installed-target".into())
+                    .spawn(move || {
+                        let result = super::installed::verify_selected(
+                            app,
+                            configuration,
+                            version,
+                            Arc::new(AtomicBool::new(false)),
+                        );
+                        let _ = sender.send(result);
+                    })
+                    .is_ok()
+                {
+                    self.target_verification = Some((selection, receiver));
+                }
+            }
+        }
+        if let Some((selection, receiver)) = &self.target_verification {
+            match receiver.try_recv() {
+                Ok(Ok(proof))
+                    if self.checks.installed_selection().as_ref() == Some(selection)
+                        && proof.recheck().is_ok() =>
+                {
+                    self.verified_target = Some((selection.clone(), proof));
+                    self.target_verification = None;
+                }
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.target_verification = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.verified_target.as_ref().is_some_and(|(selection, _)| {
+            self.checks.installed_selection().as_ref() != Some(selection)
+        }) {
+            self.verified_target = None;
+        }
     }
     fn retain_unknown_outcome(mut self, commands: mpsc::Receiver<NativeCommand>) -> ! {
         // No verified native outcome/health retirement exists yet. In particular,
@@ -1329,6 +1402,7 @@ impl NativeOwner {
             if self.cancel.load(Ordering::Acquire) {
                 self.checks.quarantine();
             }
+            self.observe_installed_target();
             // No blocking socket read/write or channel wait on this native thread.
             // One command per turn leaves Foundation callbacks an opportunity to run.
             match commands.try_recv() {

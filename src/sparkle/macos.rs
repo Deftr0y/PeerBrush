@@ -1537,6 +1537,7 @@ impl Application {
             match remote.receiver.try_recv() {
                 Ok(Ok(status)) => {
                     let outcome = status.outcome;
+                    let installed_target_verified = status.installed_target.is_some();
                     self.checks.observe_owner(status.clone());
                     let result = accept_final_observation(
                         &self.checks,
@@ -1565,6 +1566,7 @@ impl Application {
                         self.final_control_accepted = false;
                         self.message = match outcome {
                             coordinator::NativeOutcome::Installing { .. } => "The native updater reported installation progress. Projects remain protected until the outcome is verified.",
+                            coordinator::NativeOutcome::Installed { .. } if installed_target_verified => "The installed app signature and corresponding source were verified. Launch health and recovery remain unverified.",
                             coordinator::NativeOutcome::Installed { .. } => "The native updater reported installation. The new signed version and launch health still require verification.",
                             _ => "The native update cycle ended or was interrupted. Preserved app and settings remain held for recovery verification.",
                         };
@@ -1819,6 +1821,7 @@ impl Application {
             download_complete: extraction.is_some() || ready,
             final_profile: None,
             outcome: coordinator::NativeOutcome::Unknown,
+            installed_target: None,
         };
         self.checks.observe_owner(status.clone());
         self.owner_status = Some(status);

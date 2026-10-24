@@ -24,11 +24,27 @@ import zlib
 
 MANIFEST = "scripts/package-files.json"
 MACOS_RESOURCES = 'PeerBrush.app/Contents/Resources/'
+MACOS_INSTALLED_RELEASE = 'installed-release.json'
 MAX_CRATE_COMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_CRATE_DECODED_BYTES = 128 * 1024 * 1024
 MAX_CRATE_MEMBERS = 10000
 MAX_CRATE_NOTICE_BYTES = 4 * 1024 * 1024
 MAX_CRATE_NOTICES_BYTES = 16 * 1024 * 1024
+
+
+def macos_installed_release_required(sources):
+    return any(name == 'src/sparkle/macos/installed.rs'
+               and b'const INSTALLED_RELEASE_LAYOUT: u32 = 1;' in data
+               for name, data, _ in sources)
+
+
+def macos_installed_release(manifest):
+    # This identity is sealed before codesign. Final executable/seal/notary
+    # hashes belong only to the outer release.json, avoiding a signing cycle.
+    return dict(format='PeerBrushInstalledReleaseV1', schema=1,
+                **{key: manifest[key] for key in ['product', 'version', 'commit',
+                    'binary_source_commit', 'platform', 'architecture', 'source',
+                    'source_sha256', 'license', 'build_info']})
 
 
 def macos_sparkle_required(sources):
@@ -599,6 +615,13 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
                 manifest['macos_sparkle_layout'] = 1
         if build_info is not None:
             manifest['build_info'] = build_info
+        if platform == 'macOS' and macos_installed_release_required(sources):
+            if build_info is None or source.stat().st_size > 128 * 1024 * 1024:
+                raise ValueError('Installed macOS source requires bounded matching build provenance')
+            shutil.copy2(source, resources / source.name)
+            (resources / MACOS_INSTALLED_RELEASE).write_text(
+                json.dumps(macos_installed_release(manifest), indent=2) + '\n', encoding='utf-8')
+            manifest['macos_installed_release'] = 1
         (bundle / 'release.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
         files = [(f'{name}/{p.relative_to(bundle).as_posix()}', p.read_bytes(), 0o755 if p == staged_binary else 0o644) for p in bundle.rglob('*') if p.is_file()]
         files.extend((f'{name}/{relative}', data, mode) for relative, data, mode in framework)

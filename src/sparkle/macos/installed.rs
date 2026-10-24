@@ -15,6 +15,95 @@ use std::{
     time::{Duration, Instant},
 };
 
+const INSTALLED_RELEASE_LAYOUT: u32 = 1;
+const INSTALLED_RELEASE: &str = "Contents/Resources/installed-release.json";
+const SOURCE_LIMIT: u64 = 128 * 1024 * 1024;
+
+/// Authenticated local code/source identity, never launch health or retirement.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct InstalledRelease {
+    pub version: String,
+    pub commit: String,
+    pub binary_source_commit: String,
+    pub source_sha256: String,
+}
+fn hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+pub(super) fn machine_version(value: &str) -> bool {
+    value.len() <= 128
+        && semver::Version::parse(value).is_ok_and(|parsed| {
+            parsed.pre.is_empty() && parsed.build.is_empty() && parsed.to_string() == value
+        })
+}
+impl InstalledRelease {
+    pub(super) fn validate(&self) -> Result<(), String> {
+        if !machine_version(&self.version)
+            || !hex(&self.commit, 40)
+            || !hex(&self.binary_source_commit, 40)
+            || !hex(&self.source_sha256, 64)
+        {
+            return Err("Installed release identity is invalid".into());
+        }
+        Ok(())
+    }
+}
+
+fn release_identity(
+    metadata: &[u8],
+    selected: &str,
+    source_sha256: String,
+    executable: &[u8],
+) -> Result<InstalledRelease, String> {
+    let value: Value =
+        serde_json::from_slice(metadata).map_err(|_| "Installed release metadata is invalid")?;
+    let identity = InstalledRelease {
+        version: selected.into(),
+        commit: value["commit"].as_str().unwrap_or_default().into(),
+        binary_source_commit: value["binary_source_commit"]
+            .as_str()
+            .unwrap_or_default()
+            .into(),
+        source_sha256,
+    };
+    identity.validate()?;
+    let build = json!({"format":"PeerBrushBuildInfoV1","schema":1,"product":"PeerBrush",
+        "version":selected,"commit":identity.binary_source_commit,"tree":"clean","end":"PeerBrushBuildInfoEnd"});
+    // The same unique, bounded embedded record inspected by package.py. It is
+    // an identity label only after the enclosing executable is codesign-verified.
+    // Borrow the prefix from our existing embedded record instead of adding a
+    // duplicate marker to this executable's constant data (the packager rejects it).
+    let running_record = crate::build_info::json();
+    let prefix = &running_record[..running_record
+        .find(',')
+        .ok_or("Invalid running build label")?
+        + 1];
+    let record = format!("{prefix}\"schema\":1,\"product\":\"PeerBrush\",\"version\":\"{selected}\",\"commit\":\"{}\",\"tree\":\"clean\",\"end\":\"PeerBrushBuildInfoEnd\"}}",identity.binary_source_commit);
+    if executable
+        .windows(prefix.len())
+        .filter(|bytes| *bytes == prefix.as_bytes())
+        .count()
+        != 1
+        || !executable
+            .windows(record.len())
+            .any(|bytes| bytes == record.as_bytes())
+        || executable.get(..8) != Some([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1].as_slice())
+        || value
+            != json!({"format":"PeerBrushInstalledReleaseV1","schema":INSTALLED_RELEASE_LAYOUT,
+            "product":"PeerBrush","version":selected,"commit":identity.commit,
+            "binary_source_commit":identity.binary_source_commit,"platform":"macOS","architecture":"arm64",
+            "source":format!("PeerBrush-{selected}-source.zip"),"source_sha256":identity.source_sha256,
+            "license":"GPL-3.0-only","build_info":build})
+    {
+        return Err("Installed code/source does not match the selected signed release".into());
+    }
+    Ok(identity)
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct Stamp {
     device: u64,
@@ -84,6 +173,7 @@ fn safe_ancestor(path: &Path, app: &Path, value: &Stamp, user: u32, admin: Optio
 
 pub(super) struct Verified {
     pub framework: PathBuf,
+    pub release: Option<InstalledRelease>,
     snapshots: Vec<(PathBuf, Stamp)>,
 }
 impl Verified {
@@ -360,6 +450,34 @@ pub(super) fn verify(
     configuration: ApprovedCheck,
     cancel: Arc<AtomicBool>,
 ) -> Result<Verified, String> {
+    verify_app(app, configuration, cancel, env!("CARGO_PKG_VERSION"), false)
+}
+
+pub(super) fn verify_selected(
+    app: PathBuf,
+    configuration: ApprovedCheck,
+    selected: String,
+    cancel: Arc<AtomicBool>,
+) -> Result<Verified, String> {
+    if !machine_version(&selected) {
+        return Err("The selected native update version is invalid".into());
+    }
+    if semver::Version::parse(&selected).map_err(|_| "Invalid selected version")?
+        <= semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .map_err(|_| "Invalid running version")?
+    {
+        return Err("The installed selection is not newer than this owner".into());
+    }
+    verify_app(app, configuration, cancel, &selected, true)
+}
+
+fn verify_app(
+    app: PathBuf,
+    configuration: ApprovedCheck,
+    cancel: Arc<AtomicBool>,
+    version: &str,
+    selected: bool,
+) -> Result<Verified, String> {
     objc2::rc::autoreleasepool(|_| {
         if cancel.load(Ordering::Acquire) {
             return Err("App update verification cancelled".into());
@@ -401,11 +519,19 @@ pub(super) fn verify(
             snapshots.push((ancestor.into(), value));
         }
         snapshot_tree(&framework, &mut snapshots)?;
-        for path in [
+        let mut files = vec![
             app.join("Contents/Info.plist"),
             app.join("Contents/MacOS/peerbrush"),
             notice.clone(),
-        ] {
+        ];
+        if selected {
+            files.extend([
+                app.join(INSTALLED_RELEASE),
+                app.join(format!("Contents/Resources/PeerBrush-{version}-source.zip")),
+                app.join("Contents/_CodeSignature/CodeResources"),
+            ]);
+        }
+        for path in files {
             let value = stamp(&path)?;
             if value.mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG)
                 || value.links != 1
@@ -435,18 +561,16 @@ pub(super) fn verify(
             }
             snapshots.push((path.clone(), value));
         }
-        let verified = Verified {
+        let mut verified = Verified {
             framework: framework.clone(),
+            release: None,
             snapshots,
         };
         super::verify_inventory(&framework, &notice, true)?;
         let info = plist(&bounded(&app.join("Contents/Info.plist"), 256 * 1024)?)?;
         for (key, value) in [
             ("CFBundleIdentifier", Value::from("com.peerbrush.PeerBrush")),
-            (
-                "CFBundleShortVersionString",
-                Value::from(env!("CARGO_PKG_VERSION")),
-            ),
+            ("CFBundleShortVersionString", Value::from(version)),
             ("SUFeedURL", Value::from(configuration.feed_url.as_str())),
             (
                 "SUPublicEDKey",
@@ -465,6 +589,9 @@ pub(super) fn verify(
                     "Installed app update configuration differs from reviewed source".into(),
                 );
             }
+        }
+        if selected && info["CFBundleVersion"] != version {
+            return Err("Installed app differs from the native selected version".into());
         }
         let mut scratch = Scratch::new(cancel.clone())?;
         // A signed file at a replaced path is insufficient to identify the
@@ -496,6 +623,22 @@ pub(super) fn verify(
                 );
             }
         }
+        if selected {
+            let metadata = bounded(&app.join(INSTALLED_RELEASE), 4096)?;
+            let source = bounded(
+                &app.join(format!("Contents/Resources/PeerBrush-{version}-source.zip")),
+                SOURCE_LIMIT,
+            )?;
+            let source_hash = sha256(&source)?;
+            drop(source);
+            let executable = bounded(&app.join("Contents/MacOS/peerbrush"), SOURCE_LIMIT)?;
+            verified.release = Some(release_identity(
+                &metadata,
+                version,
+                source_hash,
+                &executable,
+            )?);
+        }
         if cancel.load(Ordering::Acquire) {
             return Err("App update verification cancelled".into());
         }
@@ -507,6 +650,102 @@ pub(super) fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_release_binds_signed_metadata_source_and_actual_clean_executable() {
+        let version = "0.31.0";
+        let commit = "a".repeat(40);
+        let source_hash = sha256(b"corresponding source archive fixture").unwrap();
+        let build = json!({"format":"PeerBrushBuildInfoV1","schema":1,"product":"PeerBrush",
+            "version":version,"commit":commit,"tree":"clean","end":"PeerBrushBuildInfoEnd"});
+        let identity = json!({"format":"PeerBrushInstalledReleaseV1","schema":1,"product":"PeerBrush",
+            "version":version,"commit":commit,"binary_source_commit":commit,"platform":"macOS",
+            "architecture":"arm64","source":format!("PeerBrush-{version}-source.zip"),
+            "source_sha256":source_hash,"license":"GPL-3.0-only","build_info":build});
+        let record = format!("{{\"format\":\"{}\",\"schema\":1,\"product\":\"PeerBrush\",\"version\":\"{version}\",\"commit\":\"{commit}\",\"tree\":\"clean\",\"end\":\"PeerBrushBuildInfoEnd\"}}", "PeerBrushBuildInfoV1");
+        let mut executable = vec![0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1];
+        executable.extend(record.as_bytes());
+        let metadata = serde_json::to_vec(&identity).unwrap();
+        let observed =
+            release_identity(&metadata, version, source_hash.clone(), &executable).unwrap();
+        assert_eq!(observed.version, version);
+        assert_eq!(observed.commit, commit);
+        assert_eq!(observed.source_sha256, source_hash);
+        for (key, value) in [
+            ("version", json!("0.32.0")),
+            ("commit", json!("0".repeat(40))),
+            ("binary_source_commit", json!("0".repeat(40))),
+            ("schema", json!(true)),
+            ("source", json!("../source.zip")),
+            ("source_sha256", json!("0".repeat(64))),
+            ("architecture", json!("x64")),
+            ("health", json!(true)),
+        ] {
+            let mut changed = identity.clone();
+            changed[key] = value;
+            // A packaging-only source commit can legitimately differ, but the
+            // machine-code provenance and enclosed source hash must match.
+            let result = release_identity(
+                &serde_json::to_vec(&changed).unwrap(),
+                version,
+                source_hash.clone(),
+                &executable,
+            );
+            assert_eq!(result.is_ok(), key == "commit", "{key}");
+        }
+        assert!(release_identity(&metadata, "0.32.0", source_hash.clone(), &executable).is_err());
+        assert!(release_identity(&metadata, version, "0".repeat(64), &executable).is_err());
+        let mut duplicate = executable.clone();
+        duplicate.extend(record.as_bytes());
+        assert!(release_identity(&metadata, version, source_hash.clone(), &duplicate).is_err());
+        let mut wrong_code = executable.clone();
+        wrong_code[4] = 7;
+        assert!(release_identity(&metadata, version, source_hash.clone(), &wrong_code).is_err());
+        let dirty = String::from_utf8(executable[8..].to_vec())
+            .unwrap()
+            .replace("clean", "dirty");
+        let dirty = [&executable[..8], dirty.as_bytes()].concat();
+        assert!(release_identity(&metadata, version, source_hash, &dirty).is_err());
+        for invalid in [
+            "",
+            "0.31",
+            "0.31.0-dev.1",
+            "0.31.0+build",
+            "00.31.0",
+            "0.31.0\n",
+        ] {
+            assert!(!machine_version(invalid), "{invalid:?}");
+        }
+        assert!(machine_version(version));
+        assert!(crate::sparkle::check::compiled().unwrap().is_none());
+        assert!(super::super::checkpoint::require_captured_handoff().is_err());
+    }
+
+    #[test]
+    fn selected_identity_file_changes_invalidate_the_retained_native_verification_snapshot() {
+        let directory = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "peerbrush-installed-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("installed-release.json");
+        fs::write(&file, b"original source identity").unwrap();
+        let proof = Verified {
+            framework: directory.clone(),
+            release: None,
+            snapshots: vec![(file.clone(), stamp(&file).unwrap())],
+        };
+        proof.recheck().unwrap();
+        fs::rename(&file, directory.join("original")).unwrap();
+        fs::write(&file, b"original source identity").unwrap();
+        assert!(
+            proof.recheck().is_err(),
+            "equal bytes at a replaced route are not the verified file"
+        );
+        fs::remove_file(file).unwrap();
+        fs::remove_file(directory.join("original")).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
     #[test]
     fn only_exact_root_admin_system_application_container_can_be_group_writable() {
         let app = Path::new("/Applications/PeerBrush.app");
