@@ -21,7 +21,10 @@ impl Drop for Temp {
 }
 pub(super) fn policy() -> Policy {
     Policy {
-        descriptor: "https://example.invalid/windows/current.appinstaller".into(),
+        descriptor: "https://example.invalid/windows/PeerBrush-1.30.0.0-Windows-x64.appinstaller"
+            .into(),
+        discovery: "https://example.invalid/stable/PeerBrush-Windows-x64.appinstaller".into(),
+        archive_root: "https://example.invalid/windows/".into(),
         name: "PeerBrush.Synthetic".into(),
         publisher: "CN=Public Synthetic".into(),
         publisher_display: "Synthetic Publisher".into(),
@@ -58,9 +61,12 @@ fn selected_target() -> Target {
         },
     }
 }
+fn new_descriptor() -> String {
+    "https://example.invalid/windows/PeerBrush-1.30.1.0-Windows-x64.appinstaller".into()
+}
 fn xml() -> Vec<u8> {
     let p = policy();
-    format!("<?xml version=\"1.0\" encoding=\"utf-8\"?><AppInstaller xmlns=\"http://schemas.microsoft.com/appx/appinstaller/2017\" Version=\"1.30.1.0\" Uri=\"{}\"><MainPackage Name=\"{}\" Publisher=\"{}\" Version=\"1.30.1.0\" ProcessorArchitecture=\"x64\" Uri=\"https://example.invalid/windows/PeerBrush-1.30.1.0.msix\"/><Dependencies><Package Name=\"{}\" Publisher=\"{}\" Version=\"14.0.30704.0\" ProcessorArchitecture=\"x64\" Uri=\"{}\"/></Dependencies></AppInstaller>", p.descriptor, p.name, p.publisher, p.runtime_name, p.runtime_publisher, p.runtime_uri).into_bytes()
+    format!("<?xml version=\"1.0\" encoding=\"utf-8\"?><AppInstaller xmlns=\"http://schemas.microsoft.com/appx/appinstaller/2017\" Version=\"1.30.1.0\" Uri=\"{}\"><MainPackage Name=\"{}\" Publisher=\"{}\" Version=\"1.30.1.0\" ProcessorArchitecture=\"x64\" Uri=\"https://example.invalid/windows/PeerBrush-1.30.1.0.msix\"/><Dependencies><Package Name=\"{}\" Publisher=\"{}\" Version=\"14.0.30704.0\" ProcessorArchitecture=\"x64\" Uri=\"{}\"/></Dependencies></AppInstaller>", new_descriptor(), p.name, p.publisher, p.runtime_name, p.runtime_publisher, p.runtime_uri).into_bytes()
 }
 fn control() -> Control {
     Control {
@@ -77,6 +83,8 @@ impl HttpFake {
     fn new() -> Self {
         let files = [
             (policy().descriptor, xml()),
+            (policy().discovery, xml()),
+            (new_descriptor(), xml()),
             (
                 "https://example.invalid/windows/PeerBrush-1.30.1.0.msix".into(),
                 b"main-native-bytes".to_vec(),
@@ -257,7 +265,7 @@ fn actual_streams_publish_only_verified_bytes_and_reopen_revalidates_without_net
     let transport = HttpFake::new();
     let native = NativeFake::new();
     let prepared = prepare(&temp.0, &policy(), &transport, &native, &control()).unwrap();
-    assert_eq!(transport.calls.lock().unwrap().len(), 3);
+    assert_eq!(transport.calls.lock().unwrap().len(), 4);
     assert_eq!(native.media_calls.load(Ordering::Relaxed), 2);
     assert_eq!(prepared.package.sha256, hash(b"main-native-bytes"));
     assert_eq!(
@@ -346,7 +354,7 @@ fn truncated_extra_oversized_and_canceled_streams_remain_unprepared_and_preserve
     for adjustment in [-1, 1, 2] {
         let temp = Temp::new();
         let mut transport = HttpFake::new();
-        let (_, declared) = transport.files.get_mut(&policy().descriptor).unwrap();
+        let (_, declared) = transport.files.get_mut(&new_descriptor()).unwrap();
         *declared = match adjustment {
             -1 => *declared - 1,
             1 => *declared + 1,
@@ -419,7 +427,7 @@ fn truncated_extra_oversized_and_canceled_streams_remain_unprepared_and_preserve
 fn interrupted_acquisition_retries_only_in_fresh_owned_attempt_and_reopens_without_get() {
     let temp = Temp::new();
     let mut interrupted = HttpFake::new();
-    interrupted.files.get_mut(&policy().descriptor).unwrap().1 += 1;
+    interrupted.files.get_mut(&new_descriptor()).unwrap().1 += 1;
     assert!(acquire(
         &temp.0,
         &policy(),
@@ -449,7 +457,7 @@ fn interrupted_acquisition_retries_only_in_fresh_owned_attempt_and_reopens_witho
         &control(),
     )
     .unwrap();
-    assert_eq!(transport.calls.lock().unwrap().len(), 3);
+    assert_eq!(transport.calls.lock().unwrap().len(), 4);
     assert_eq!(attempts().len(), 2);
     assert_eq!(
         fs::read(original[0].join("selected.appinstaller")).unwrap(),
@@ -498,7 +506,7 @@ fn interrupted_acquisition_retries_only_in_fresh_owned_attempt_and_reopens_witho
 fn retained_attempt_budget_and_real_acquisition_lease_refuse_without_deleting_or_get() {
     let temp = Temp::new();
     let mut interrupted = HttpFake::new();
-    interrupted.files.get_mut(&policy().descriptor).unwrap().1 += 1;
+    interrupted.files.get_mut(&new_descriptor()).unwrap().1 += 1;
     for _ in 0..3 {
         assert!(acquire(
             &temp.0,
@@ -519,7 +527,7 @@ fn retained_attempt_budget_and_real_acquisition_lease_refuse_without_deleting_or
         })
         .collect::<Vec<_>>();
     assert_eq!(retained.len(), 3);
-    assert_eq!(interrupted.calls.lock().unwrap().len(), 3);
+    assert_eq!(interrupted.calls.lock().unwrap().len(), 6);
     let no_network = HttpFake {
         files: BTreeMap::new(),
         calls: Mutex::new(vec![]),
@@ -1006,6 +1014,7 @@ fn actual_progress_interleaving_cannot_accept_a_terminal_observed_during_native_
         let attempt = stage_attempt(&root);
         let before: Vec<_> = [
             "selected.appinstaller",
+            "discovery.appinstaller",
             "main.msix",
             "runtime.appx",
             "prepared.json",
@@ -1337,6 +1346,7 @@ fn retained_inspection_reopens_actual_stage_bytes_without_claiming_installation_
     let attempt = completed_stage(&temp.0);
     let before: Vec<_> = [
         "selected.appinstaller",
+        "discovery.appinstaller",
         "main.msix",
         "runtime.appx",
         "prepared.json",
@@ -1536,6 +1546,7 @@ fn selected_running_target_requires_verified_payload_bytes_and_never_changes_old
         let native = RunningNative::new(&temp.0.join("installed-target"));
         let names = [
             "selected.appinstaller",
+            "discovery.appinstaller",
             "main.msix",
             "runtime.appx",
             "prepared.json",
@@ -1929,6 +1940,7 @@ fn current_archive_signature_manifest_identity_and_signed_payload_mismatches_rem
             "main.msix",
             "runtime.appx",
             "selected.appinstaller",
+            "discovery.appinstaller",
             "stage-intent.json",
             "stage-outcome.json",
         ]
@@ -2076,6 +2088,110 @@ fn current_http() -> HttpFake {
     );
     http
 }
+
+#[test]
+fn stable_new_and_immutable_current_routes_work_without_an_opportunistic_prior_capture() {
+    let temp = Temp::new();
+    let root = temp.0.join("windows-prepared");
+    fs::create_dir(&root).unwrap();
+    let native = initial_current_native(&temp.0.join("installed"));
+    // The stable route already offers NEW; the original association still
+    // serves CURRENT. No versioned URL is synthesized by the consumer.
+    let http = current_http();
+    let prepared = acquire_with_current(&root, &policy(), &http, &native, &control()).unwrap();
+    assert_eq!(prepared, receipt());
+    assert_eq!(
+        *http.calls.lock().unwrap(),
+        vec![
+            policy().descriptor,
+            "https://example.invalid/windows/PeerBrush-1.30.0.0.msix".into(),
+            policy().runtime_uri,
+            policy().discovery,
+            new_descriptor(),
+            "https://example.invalid/windows/PeerBrush-1.30.1.0.msix".into(),
+            policy().runtime_uri,
+        ]
+    );
+    let current = captured_current(&root);
+    let new = attempts(&root).unwrap().1.unwrap();
+    assert_eq!(
+        fs::read(current.join("main.msix")).unwrap(),
+        b"main-native-bytes"
+    );
+    assert_eq!(fs::read(new.join("discovery.appinstaller")).unwrap(), xml());
+    assert_eq!(fs::read(new.join("selected.appinstaller")).unwrap(), xml());
+    assert!(current.join("current.json").exists());
+    assert!(!current.join("stage-intent.json").exists());
+    assert!(!new.join("stage-intent.json").exists());
+    assert!(!ENABLED && configured().is_none());
+}
+
+#[test]
+fn stable_discovery_requires_exact_immutable_readback_before_any_native_media_or_package_io() {
+    for bad in [
+        "different-bytes",
+        "missing",
+        "foreign-directory",
+        "stable-root",
+        "downgrade",
+    ] {
+        let temp = Temp::new();
+        let mut http = HttpFake::new();
+        match bad {
+            "different-bytes" => {
+                let entry = http.files.get_mut(&new_descriptor()).unwrap();
+                entry.0.push(b'\n');
+                entry.1 += 1;
+            }
+            "missing" => {
+                http.files.remove(&new_descriptor());
+            }
+            _ => {
+                let text = String::from_utf8(xml()).unwrap();
+                let bytes = match bad {
+                    "foreign-directory" => text.replace("/windows/", "/unapproved/"),
+                    "stable-root" => text.replace(&new_descriptor(), &policy().discovery),
+                    _ => text.replace("1.30.1.0", "1.30.0.0"),
+                }
+                .into_bytes();
+                http.files
+                    .insert(policy().discovery, (bytes.clone(), bytes.len() as u64));
+            }
+        }
+        let native = NativeFake::new();
+        assert!(
+            prepare(&temp.0, &policy(), &http, &native, &control()).is_err(),
+            "{bad}"
+        );
+        assert_eq!(native.media_calls.load(Ordering::Relaxed), 0, "{bad}");
+        assert!(!temp.0.join("main.msix").exists());
+        assert!(!temp.0.join("prepared.json").exists());
+        assert_eq!(http.calls.lock().unwrap()[0], policy().discovery);
+    }
+}
+
+#[test]
+fn reopened_new_selection_rechecks_the_retained_stable_bytes_without_network_or_json_authority() {
+    let temp = Temp::new();
+    prepare(
+        &temp.0,
+        &policy(),
+        &HttpFake::new(),
+        &NativeFake::new(),
+        &control(),
+    )
+    .unwrap();
+    let marker = fs::read(temp.0.join("prepared.json")).unwrap();
+    let path = temp.0.join("discovery.appinstaller");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.push(b'\n');
+    fs::write(&path, &bytes).unwrap();
+    let native = NativeFake::new();
+    assert!(reconcile(&temp.0, &policy(), &native, &control()).is_err());
+    assert_eq!(native.media_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(fs::read(temp.0.join("prepared.json")).unwrap(), marker);
+}
 fn captured_current(root: &Path) -> PathBuf {
     attempts_for(&current_root(root).unwrap(), MediaRole::Current)
         .unwrap()
@@ -2120,7 +2236,8 @@ fn explicit_capture_retains_exact_current_media_before_feed_advances_and_reuses_
     assert_eq!(
         *newer.calls.lock().unwrap(),
         vec![
-            policy().descriptor,
+            policy().discovery,
+            new_descriptor(),
             "https://example.invalid/windows/PeerBrush-1.30.1.0.msix".to_string(),
             policy().runtime_uri
         ]
@@ -2133,7 +2250,8 @@ fn explicit_capture_retains_exact_current_media_before_feed_advances_and_reuses_
 }
 
 #[test]
-fn advanced_feed_refuses_initial_capture_before_package_io_and_controller_reports_the_source_gap() {
+fn changed_immutable_association_refuses_initial_capture_before_package_io_and_controller_reports_it(
+) {
     let temp = Temp::new();
     let root = temp.0.join("windows-prepared");
     let native = initial_current_native(&temp.0.join("installed"));

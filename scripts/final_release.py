@@ -115,11 +115,14 @@ def validate_manifest(value):
             or not re.fullmatch(f'PeerBrush-{re.escape(target)}-Windows-x64-signed-r[1-9][0-9]*\\.msix', windows['dependencies'][0])
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,126}\.(?:appx|msix)', windows['dependencies'][1])):
         raise ValueError('Final Windows channel must bind its exact signed package and framework.')
+    stable = records.get(installer.STABLE_DESCRIPTOR)
+    if stable is None or any(stable[key] != records[windows['file']][key] for key in ['bytes', 'sha256']):
+        raise ValueError('Stable discovery must contain the exact immutable Windows descriptor bytes.')
     dmg = channels['macos-direct']['file']
     deb = channels['linux-direct']['file']
     if dmg not in base or deb not in base:
         raise ValueError('Selected Mac/Linux channels differ from the inspected base assets.')
-    expected = set(base) | {windows['file'], *windows['dependencies'], dmg + '.qualification.json',
+    expected = set(base) | {windows['file'], installer.STABLE_DESCRIPTOR, *windows['dependencies'], dmg + '.qualification.json',
                             dmg + '.sha256', deb + '.json', deb + '.sha256'}
     if set(records) != expected:
         raise ValueError('Final release permits only exact selected assets and reviewed public sidecars.')
@@ -276,7 +279,8 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
         binary_source_commit=commit, sha256=deb['sha256'], source_sha256=deb['source_sha256'],
         target='Ubuntu 24.04 amd64', update_owner='apt-dpkg', update_repository='not-configured',
         signing='not-performed', installation_test='not-performed', default_app='user-choice-only', release_ready=False)
-    sidecars = {dmg['file'] + '.qualification.json': qualification, deb['file'] + '.json': encode(deb_report)}
+    sidecars = {dmg['file'] + '.qualification.json': qualification, deb['file'] + '.json': encode(deb_report),
+                installer.STABLE_DESCRIPTOR: read(windows['descriptor'], 16 * 1024, windows['descriptor_sha256'])}
     for record in [dmg, deb]:
         sidecars[record['file'] + '.sha256'] = (record['sha256'] + '  ' + record['file'] + '\n').encode('ascii')
     if set(sidecars) & set(outputs):

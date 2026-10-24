@@ -91,15 +91,16 @@ class AppInstaller(unittest.TestCase):
             return installer.prepare(self.fixture.root, self.fixture.portable, self.fixture.unsigned,
                                      self.fixture.package, self.runtime, **selection)
 
-    def test_exact_four_files_bind_real_validators_and_emit_no_update_configuration(self):
+    def test_exact_files_and_stable_copy_bind_real_validators_without_update_configuration(self):
         inputs = [self.fixture.portable, self.fixture.unsigned, self.fixture.package, self.runtime, self.identity, self.license]
         original = {path: path.read_bytes() for path in inputs}
         descriptor = self.prepare()
         self.assertEqual(self.native_calls, [('signtool', self.fixture.package.name), ('certificate', self.fixture.package.name),
                                            ('signtool', self.runtime.name), ('certificate', self.runtime.name)])
         self.assertEqual({path.name for path in self.output.iterdir()},
-                         {descriptor.name, self.fixture.package.name, self.runtime.name, 'SHA256SUMS'})
+                         {descriptor.name, installer.STABLE_DESCRIPTOR, self.fixture.package.name, self.runtime.name, 'SHA256SUMS'})
         descriptor_bytes = descriptor.read_bytes()
+        self.assertEqual((self.output / installer.STABLE_DESCRIPTOR).read_bytes(), descriptor_bytes)
         self.assertTrue(descriptor_bytes.startswith(b"<?xml version='1.0' encoding='UTF-8'?>"))
         self.assertTrue(descriptor_bytes.isascii())
         self.assertNotIn(b'&', descriptor_bytes)
@@ -112,7 +113,8 @@ class AppInstaller(unittest.TestCase):
             Version='1.26.0.0', ProcessorArchitecture='x64', Uri=self.options['package_uri']))
         self.assertEqual(root[1][0].attrib, dict(Name='Microsoft.VCLibs.140.00.UWPDesktop', Publisher=PUBLISHER,
             Version='14.0.33519.0', ProcessorArchitecture='x64', Uri=self.options['runtime_uri']))
-        expected = {path.name: digest(self.output / path.name) for path in [descriptor, self.fixture.package, self.runtime]}
+        expected = {path.name: digest(self.output / path.name) for path in
+                    [descriptor, self.output / installer.STABLE_DESCRIPTOR, self.fixture.package, self.runtime]}
         self.assertEqual((self.output / 'SHA256SUMS').read_bytes(),
             ''.join(expected[name] + '  ' + name + '\n' for name in sorted(expected)).encode())
         self.assertEqual((self.output / self.fixture.package.name).read_bytes(), original[self.fixture.package])
@@ -314,7 +316,7 @@ class AppInstaller(unittest.TestCase):
             self.assertEqual(installer.main(), 0)
         self.assertIn('no automatic-update configuration emitted', message.getvalue())
         self.assertIn('remain unverified', message.getvalue())
-        self.assertEqual(len(list(self.output.iterdir())), 4)
+        self.assertEqual(len(list(self.output.iterdir())), 5)
 
 
 if __name__ == '__main__':

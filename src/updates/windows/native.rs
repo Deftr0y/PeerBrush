@@ -794,6 +794,8 @@ mod tests {
     fn exact_native_manifest_gate_preserves_capabilities_and_file_association_contract() {
         let policy = super::super::tests::policy();
         let selected = Selection {
+            descriptor:
+                "https://example.invalid/windows/PeerBrush-1.30.1.0-Windows-x64.appinstaller".into(),
             version: [1, 30, 1, 0],
             package: "https://example.invalid/windows/PeerBrush-1.30.1.0.msix".into(),
             runtime_version: [14, 0, 30704, 0],

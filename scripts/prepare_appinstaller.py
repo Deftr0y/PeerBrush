@@ -21,6 +21,7 @@ import qualify_signed_msix as signed
 
 INSTALLER_NS = 'http://schemas.microsoft.com/appx/appinstaller/2017'
 MANIFEST_LIMIT = 64 * 1024
+STABLE_DESCRIPTOR = 'PeerBrush-Windows-x64.appinstaller'
 
 
 def canonical_uri(value, filename):
@@ -108,6 +109,11 @@ def descriptor_bytes_for_selection(identity, dependency, version, descriptor_uri
 
     The caller validates identities/media; this function establishes no native trust.
     """
+    canonical_uri(descriptor_uri, 'PeerBrush-' + version + '-Windows-x64.appinstaller')
+    descriptor, package = urlsplit(descriptor_uri), urlsplit(package_uri)
+    if (descriptor.scheme, descriptor.netloc, descriptor.path.rsplit('/', 1)[0]) != (
+            package.scheme, package.netloc, package.path.rsplit('/', 1)[0]):
+        raise ValueError('The main package and immutable descriptor require the same HTTPS directory.')
     root_attributes = dict(xmlns=INSTALLER_NS, Version=version, Uri=descriptor_uri)
     main_attributes = dict(Name=identity['name'], Publisher=identity['publisher'],
         Version=version, ProcessorArchitecture='x64', Uri=package_uri)
@@ -177,7 +183,7 @@ def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_lic
     canonical_uri(descriptor_uri, descriptor)
     canonical_uri(package_uri, package.name)
     canonical_uri(runtime_uri, runtime.name)
-    msix.validate_casefold_paths([descriptor, package.name, runtime.name, 'SHA256SUMS'])
+    msix.validate_casefold_paths([descriptor, STABLE_DESCRIPTOR, package.name, runtime.name, 'SHA256SUMS'])
     runtime_work = work / 'framework'
     runtime_work.mkdir(mode=0o700)
     runtime_work.chmod(0o700)
@@ -218,14 +224,18 @@ def prepare(root, portable, unsigned, package, runtime, *, identity, runtime_lic
     output.chmod(0o700)
     private_inspection_directory(output, root, fresh=False)
     expected = {descriptor: hashlib.sha256(descriptor_bytes).hexdigest(),
+                STABLE_DESCRIPTOR: hashlib.sha256(descriptor_bytes).hexdigest(),
                 package.name: package_sha256, runtime.name: runtime_sha256}
     for original in [owned_package, owned_runtime]:
         copied = output / original.name
         if bounded_file(original, msix.PACKAGE_LIMIT, copied)[0] != expected[original.name]:
             raise ValueError('Candidate copy differs from its native-verified media.')
         copied.chmod(0o400)
-    with (output / descriptor).open('xb') as stream:
-        stream.write(descriptor_bytes)
+    # The stable discovery copy retains the immutable root Uri. It is never an
+    # installed association or an App Installer UpdateURIs fallback.
+    for name in [descriptor, STABLE_DESCRIPTOR]:
+        with (output / name).open('xb') as stream:
+            stream.write(descriptor_bytes)
     checksums = ''.join(expected[name] + '  ' + name + '\n' for name in sorted(expected)).encode('ascii')
     with (output / 'SHA256SUMS').open('xb') as stream:
         stream.write(checksums)

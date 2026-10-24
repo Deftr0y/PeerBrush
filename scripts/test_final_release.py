@@ -175,6 +175,7 @@ class Composition(unittest.TestCase):
         originals = {path: path.read_bytes() for path in [self.receipt, self.unsigned, self.package, self.runtime, self.descriptor]}
         candidate = self.compose()
         candidate.verify()
+        self.assertEqual((self.output / final.installer.STABLE_DESCRIPTOR).read_bytes(), self.descriptor.read_bytes())
         self.assertIs(candidate.assessment['production_ready'], False)
         self.assertEqual(candidate.assessment['linux_installation_binding'], 'verified')
         self.assertEqual(candidate.assessment['windows_native_signature'], 'not-authenticated-by-aggregate')
@@ -195,6 +196,40 @@ class Composition(unittest.TestCase):
         self.assertEqual(client.method_calls, [])
         with self.assertRaisesRegex(ValueError, 'JSON report'):
             publish_release.publish(dict(candidate.assessment, production_ready=True), client, 'notes', execute=True)
+
+    def test_stable_discovery_alias_is_immutable_exact_bytes_and_public_readback_cannot_omit_it(self):
+        candidate = self.compose()
+        alias = final.installer.STABLE_DESCRIPTOR
+        descriptor_bytes = self.descriptor.read_bytes()
+        path = self.output / alias
+        self.assertEqual(path.read_bytes(), descriptor_bytes)
+        altered = copy.deepcopy(candidate.manifest)
+        next(row for row in altered['files'] if row['file'] == alias)['sha256'] = 'f' * 64
+        with self.assertRaisesRegex(ValueError, 'exact immutable Windows descriptor'):
+            final.validate_manifest(altered)
+        missing = copy.deepcopy(candidate.manifest)
+        missing['files'] = [row for row in missing['files'] if row['file'] != alias]
+        with self.assertRaisesRegex(ValueError, 'exact immutable Windows descriptor'):
+            final.validate_manifest(missing)
+        path.chmod(0o600)
+        path.write_bytes(descriptor_bytes + b'\n')
+        with self.assertRaisesRegex(ValueError, 'changed after composition'):
+            candidate.verify()
+        path.write_bytes(descriptor_bytes)
+        candidate.verify()
+        from test_publish_release import Service
+        service = Service(candidate.manifest)
+        service.create('v' + candidate.manifest['version'], candidate.manifest['commit'], 'Fixture', 'Fixture')
+        for selected in candidate.directory.iterdir():
+            service.upload(17, selected)
+        service.publish(17)
+        def get(url, maximum, **options):
+            if url.endswith('/' + alias):
+                raise ValueError('Selected stable alias unavailable')
+            return service.public_get(url, maximum, **options)
+        with self.assertRaisesRegex(ValueError, 'Selected stable alias unavailable'):
+            publish_release.public_readback(candidate.manifest, get)
+        self.assertEqual(path.read_bytes(), descriptor_bytes)
 
     def test_native_origin_failure_or_missing_platform_cannot_prepare_final_output(self):
         with mock.patch('verify_macos_qualification.authenticate', side_effect=ValueError('unverified native origin')):

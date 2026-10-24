@@ -114,6 +114,10 @@ class Transactions(unittest.TestCase):
             data = ('opaque mechanical fixture ' + name).encode()
             (self.directory / name).write_bytes(data)
             files.append(dict(file=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
+        alias = final.installer.STABLE_DESCRIPTOR
+        data = (self.directory / descriptor).read_bytes()
+        (self.directory / alias).write_bytes(data)
+        files.append(dict(file=alias, bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
         channel = lambda platform, name, dependencies: dict(platform=platform, file=name, dependencies=dependencies, installed_acceptance='unverified', ready=False)
         self.manifest = dict(schema=1, format=final.FORMAT, version=version, commit=commit,
             base_inventory=dict(schema=1, version=version, commit=commit, binary_source_commit=commit, packaging_correction=None, assets=base),

@@ -35,6 +35,8 @@ fn configured() -> Option<Policy> {
 #[serde(deny_unknown_fields)]
 struct Policy {
     descriptor: String,
+    discovery: String,
+    archive_root: String,
     name: String,
     publisher: String,
     publisher_display: String,
@@ -59,6 +61,7 @@ struct Source {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
+    descriptor: String,
     version: [u16; 4],
     package: String,
     runtime_version: [u16; 4],
@@ -318,9 +321,17 @@ fn version_text(v: [u16; 4]) -> String {
 }
 impl Policy {
     fn validate(&self) -> Result<()> {
-        https(&self.descriptor)?;
+        let archive = https(&self.archive_root)?;
+        let discovery = https(&self.discovery)?;
+        self.archive_uri(&self.descriptor)?;
         https(&self.runtime_uri)?;
-        if !self.descriptor.ends_with(".appinstaller")
+        if !archive.path().ends_with('/')
+            || discovery.origin() != archive.origin()
+            || !discovery
+                .path()
+                .ends_with("/PeerBrush-Windows-x64.appinstaller")
+            || self.discovery == self.descriptor
+            || !self.descriptor.ends_with(".appinstaller")
             || !self.runtime_uri.ends_with(".appx")
             || !sha(&self.certificate)
             || !sha(&self.runtime_certificate)
@@ -341,6 +352,18 @@ impl Policy {
         }
         Ok(())
     }
+    fn archive_uri(&self, value: &str) -> Result<url::Url> {
+        let uri = https(value)?;
+        let root = https(&self.archive_root)?;
+        if !root.path().ends_with('/')
+            || uri.origin() != root.origin()
+            || !uri.path().starts_with(root.path())
+            || uri.path() == root.path()
+        {
+            return Err("Windows archive is outside the approved immutable directory.".into());
+        }
+        Ok(uri)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -356,7 +379,7 @@ impl MediaRole {
         }
     }
 }
-const CURRENT_MISSING: &str = "The download feed does not offer this exact installed Windows version. A recovery copy is unavailable; retrieving a verified older package is not implemented. No update was prepared or installed.";
+const CURRENT_MISSING: &str = "The immutable installed descriptor does not offer this exact Windows version. Its recovery copy is unavailable; no update was prepared or installed.";
 
 #[cfg(test)]
 fn descriptor(bytes: &[u8], policy: &Policy, source: &Source) -> Result<Selection> {
@@ -397,7 +420,6 @@ fn descriptor_for(
     if root.tag_name().namespace() != ns
         || root.tag_name().name() != "AppInstaller"
         || !attrs(root, &["Version", "Uri"])
-        || root.attribute("Uri") != Some(policy.descriptor.as_str())
         || children.len() != 2
         || children[0].tag_name().namespace() != ns
         || children[0].tag_name().name() != "MainPackage"
@@ -451,12 +473,21 @@ fn descriptor_for(
             .ok_or("Missing runtime version.")?,
     )?;
     let package = main.attribute("Uri").ok_or("Missing native package URI.")?;
-    let uri = https(package)?;
-    let approved = https(&policy.descriptor)?;
+    let uri = policy.archive_uri(package)?;
+    let descriptor = root
+        .attribute("Uri")
+        .ok_or("Missing immutable descriptor URI.")?;
+    let approved = policy.archive_uri(descriptor)?;
     if role == MediaRole::Current && v != source.version {
         return Err(CURRENT_MISSING.into());
     }
     if (role == MediaRole::New && v <= source.version)
+        || (role == MediaRole::Current && descriptor != source.association)
+        || descriptor == policy.discovery
+        || !approved.path().ends_with(&format!(
+            "/PeerBrush-{}-Windows-x64.appinstaller",
+            version_text(v)
+        ))
         || runtime_v < [14, 0, 30704, 0]
         || root.attribute("Version") != main.attribute("Version")
         || main.attribute("Name") != Some(&policy.name)
@@ -474,6 +505,7 @@ fn descriptor_for(
         return Err("App Installer target is not an approved newer package and runtime.".into());
     }
     Ok(Selection {
+        descriptor: descriptor.into(),
         version: v,
         package: package.into(),
         runtime_version: runtime_v,
@@ -733,6 +765,7 @@ struct RetainedSelection {
     owned: Directory,
     journal: Held,
     descriptor: Held,
+    discovery: Option<Held>,
     package: Held,
     runtime: Held,
     prepared: Prepared,
@@ -747,6 +780,9 @@ impl RetainedSelection {
             &self.runtime,
         ] {
             file.check(control)?;
+        }
+        if let Some(discovery) = &self.discovery {
+            discovery.check(control)?;
         }
         self.owned.check()?;
         Ok(())
@@ -904,6 +940,17 @@ fn authenticate_media_for(
     let (owned, journal, prepared) = input;
     let root = &owned.path;
     let descriptor_file = Held::open(&root.join("selected.appinstaller"), SMALL, control)?;
+    let discovery = if role == MediaRole::New {
+        let file = Held::open(&root.join("discovery.appinstaller"), SMALL, control)?;
+        if file.media != descriptor_file.media
+            || small(&file, control)? != small(&descriptor_file, control)?
+        {
+            return Err("Retained stable and immutable Windows descriptors differ.".into());
+        }
+        Some(file)
+    } else {
+        None
+    };
     if descriptor_file.media != prepared.descriptor
         || descriptor_for(
             &small(&descriptor_file, control)?,
@@ -935,6 +982,7 @@ fn authenticate_media_for(
         owned,
         journal,
         descriptor: descriptor_file,
+        discovery,
         package,
         runtime,
         prepared,
@@ -1015,9 +1063,28 @@ fn prepare_for(
         }
     }
     let source = verifier.source(policy)?;
+    let discovery = if role == MediaRole::New {
+        Some(download(
+            transport,
+            &policy.discovery,
+            &root.join("discovery.appinstaller"),
+            SMALL,
+            control,
+            "Reading approved stable Windows discovery",
+        )?)
+    } else {
+        None
+    };
+    let selected = discovery
+        .as_ref()
+        .map(|file| descriptor_for(&small(file, control)?, policy, &source, role))
+        .transpose()?;
+    let descriptor_uri = selected
+        .as_ref()
+        .map_or(policy.descriptor.as_str(), |s| s.descriptor.as_str());
     let descriptor_file = download(
         transport,
-        &policy.descriptor,
+        descriptor_uri,
         &root.join("selected.appinstaller"),
         SMALL,
         control,
@@ -1028,6 +1095,15 @@ fn prepare_for(
         },
     )?;
     let selection = descriptor_for(&small(&descriptor_file, control)?, policy, &source, role)?;
+    if let Some(discovery) = &discovery {
+        if Some(&selection) != selected.as_ref()
+            || discovery.media != descriptor_file.media
+            || small(discovery, control)? != small(&descriptor_file, control)?
+        {
+            return Err("Stable discovery differs from the immutable Windows descriptor.".into());
+        }
+        discovery.check(control)?;
+    }
     let package = download(
         transport,
         &selection.package,
@@ -1071,6 +1147,9 @@ fn prepare_for(
     for file in [&descriptor_file, &package, &runtime] {
         file.check(control)?;
     }
+    if let Some(discovery) = &discovery {
+        discovery.check(control)?;
+    }
     if verifier.source(policy)? != source {
         return Err("Installed Windows source changed during download.".into());
     }
@@ -1103,6 +1182,7 @@ fn prepare_for(
         owned,
         journal: saved,
         descriptor: descriptor_file,
+        discovery,
         package,
         runtime,
         prepared,
@@ -2034,6 +2114,7 @@ impl Controller {
             Err(DISABLED.into())
         }
     }
+    #[cfg(test)]
     fn launch(
         &mut self,
         work: impl FnOnce(&Control) -> Result<Prepared> + Send + 'static,
@@ -2180,7 +2261,7 @@ impl Controller {
         if !self.allowed() {
             ui.label(DISABLED);
         }
-        ui.label("Prepare a copy of the current version before its download feed changes. This may download up to 512 MiB each for the app and runtime; recovery remains unavailable.");
+        ui.label("Prepare an authenticated copy of the current version from its immutable installed descriptor. This may download up to 512 MiB each for the app and runtime; recovery remains unavailable.");
         if ui
             .add_enabled(
                 self.allowed()
