@@ -88,7 +88,8 @@ mod tests {
         }
     }
     fn waiting(app: &mut PeerBrush, ctx: &egui::Context) {
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             frame(app, ctx, vec![]);
             if app.lifecycle.as_ref().is_none_or(|r| r.saving.is_none()) {
                 return;
