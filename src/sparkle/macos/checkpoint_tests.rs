@@ -1804,6 +1804,12 @@ fn retained_armed_owner_rechecks_its_exact_records_without_relaxing_new_owner_ad
         assert!(!workspace.lock().unwrap().exiting);
         assert!(attempt.join("native-start-intent.json").exists());
         assert!(require_captured_handoff().is_err());
-        assert!(startup_guard(&profile.locations).is_err());
+        // Only the exact never-started outcome permits a later profile startup;
+        // all active, unknown or damaged attempts remain held.
+        assert_eq!(
+            startup_guard(&profile.locations).is_ok(),
+            damage == "unstarted",
+            "{damage}"
+        );
     }
 }
