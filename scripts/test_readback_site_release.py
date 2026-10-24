@@ -36,6 +36,7 @@ class Readback(unittest.TestCase):
         data.update({k: v for k, v in retained.items() if k not in {'kind', 'notes', 'publishedAt'}})
         data['history'] = [retained]
         previous['downloads.json'] = json.dumps(data)
+        self.previous = copy.deepcopy(previous)
         self.files = site.render(previous, self.entry)
         self.temporary = tempfile.TemporaryDirectory(prefix='peerbrush-site-readback-')
         self.addCleanup(self.temporary.cleanup)
@@ -144,6 +145,70 @@ class Readback(unittest.TestCase):
         self.assertEqual(result['website']['status'], 'verified')
         self.assertEqual(result['downloads']['status'], 'unavailable')
         self.assertEqual(result['downloads']['reason'], 'public-release-inventory-unavailable')
+        self.independent(result)
+
+    def test_actual_final_public_layout_reaches_full_overlay_readback_with_only_an_eligible_portable(self):
+        import final_release as final
+        import test_final_release
+        from test_publish_release import Service
+        composition = test_final_release.Composition(methodName='runTest')
+        composition.release_policy = dict(schema=1, formats={'Windows': 'zip', 'macOS': 'dmg', 'Linux': 'deb'})
+        self.addCleanup(composition.doCleanups)
+        composition.setUp()
+        candidate = composition.compose()
+        service = Service(candidate.manifest)
+        tag = 'v' + candidate.manifest['version']
+        service.create(tag, candidate.manifest['commit'], 'PeerBrush ' + candidate.manifest['version'], 'Reviewed fixture notes')
+        for path in candidate.directory.iterdir(): service.upload(17, path)
+        service.publish(17)
+        entry, excluded = site.published(composition.root, candidate.manifest['base_inventory'], tag,
+            candidate.manifest['commit'], dict(notes=['Reviewed fixture notes'], caution='Native acceptance remains incomplete.'),
+            service.public_get)
+        self.assertEqual([p['id'] for p in entry['platforms']], ['windows'])
+        self.assertNotIn('release-inventory.json', service.data)
+        self.files = site.render(self.previous, entry)
+        for name, data in self.files.items(): (self.directory / 'public-site' / name).write_bytes(data)
+        self.report.update(version=tag, commit=candidate.manifest['commit'], excluded=excluded,
+            release_inventory_sha256=site.inventory_sha(candidate.manifest['base_inventory']),
+            files={name: site.sha(data) for name, data in self.files.items()})
+        self.save_report()
+        self.urls = readback.resource_urls(self.files)
+        self.requests.clear()
+        def get(url, limit, *, website=False, **options):
+            self.requests.append(url)
+            if website: return self.files[self.urls[url]]
+            return service.public_get(url, limit, **options)
+        result = readback.check(self.directory, composition.root, get)
+        self.assertEqual(result['status'], 'verified')
+        self.assertEqual(result['website']['status'], 'verified')
+        self.assertEqual(result['downloads']['verified_platforms'], ['windows'])
+        self.assertNotIn(site.DOWNLOAD + tag + '/release-inventory.json', self.requests)
+        self.independent(result)
+        name = next(r['file'] for r in candidate.manifest['base_inventory']['assets']
+                    if r.get('platform') == 'Windows')
+        del service.data[name]
+        result = readback.check(self.directory, composition.root, get)
+        self.assertEqual(result['website']['status'], 'verified')
+        self.assertEqual(result['downloads']['status'], 'unavailable')
+        self.assertNotIn('windows', result['downloads']['verified_platforms'])
+        self.assertFalse(any(channel['ready'] for channel in candidate.manifest['channels'].values()))
+        self.assertEqual(candidate.manifest['channels']['microsoft-store'], final.store_channel())
+        self.independent(result)
+
+    def test_present_invalid_final_manifest_cannot_fall_back_to_valid_legacy_inventory(self):
+        self.fixture.assets['final-release-inventory.json'] = b'{}'
+        self.fixture.metadata()
+        result = self.check()
+        self.assertEqual(result['website']['status'], 'verified')
+        self.assertEqual(result['downloads']['status'], 'mismatch')
+        self.assertNotIn(site.DOWNLOAD + self.report['version'] + '/release-inventory.json', self.requests)
+        self.independent(result)
+        del self.fixture.assets['final-release-inventory.json']
+        self.fixture.metadata()
+        self.requests.clear()
+        result = self.check()
+        self.assertEqual(result['downloads']['status'], 'verified')
+        self.assertIn(site.DOWNLOAD + self.report['version'] + '/release-inventory.json', self.requests)
         self.independent(result)
 
     def test_changed_public_inventory_digest_or_asset_metadata_cannot_pass(self):

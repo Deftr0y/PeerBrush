@@ -34,7 +34,10 @@ class Composition(unittest.TestCase):
                 path.write_bytes((ROOT / name).read_bytes())
                 instance.fixture.policy['source'].append(name)
             policy = 'packaging/release-policy.json'
-            (instance.root / policy).write_bytes((ROOT / policy).read_bytes())
+            policy_bytes = (ROOT / policy).read_bytes()
+            if hasattr(self, 'release_policy'):
+                policy_bytes = final.encode(self.release_policy)
+            (instance.root / policy).write_bytes(policy_bytes)
             instance.fixture.policy['source'].append(policy)
             # final_package owns these generated outputs before later platform
             # builds; keep the version-2 source checkout clean without packaging them.
@@ -301,6 +304,76 @@ class Composition(unittest.TestCase):
         self.assertEqual(direct['installed_acceptance'], 'unverified')
         self.assertEqual(direct['public_availability'], 'verified-by-exact-public-byte-readback')
         self.assertTrue(any(r.get('reason') == 'store-public-availability-unverified' for r in excluded))
+        import readback_site_release as readback
+        self.assertNotIn('release-inventory.json', service.data)
+        report = dict(version=tag, commit=candidate.manifest['commit'],
+                      release_inventory_sha256=website.inventory_sha(candidate.manifest['base_inventory']))
+        result = readback.downloads(self.root, report, entry, service.public_get)
+        self.assertEqual(result, dict(status='verified', reason='public-bytes-source-checksums-match', verified_platforms=[]))
+        self.assertFalse(any(channel['ready'] for channel in candidate.manifest['channels'].values()))
+
+    def test_final_public_readback_rejects_changed_identity_metadata_and_unavailable_bytes_without_legacy_fallback(self):
+        import prepare_site_release as website
+        import readback_site_release as readback
+        from test_publish_release import Service
+        candidate = self.compose()
+        tag = 'v' + candidate.manifest['version']
+        service = Service(candidate.manifest)
+        service.create(tag, candidate.manifest['commit'], 'PeerBrush ' + candidate.manifest['version'], 'Reviewed fixture notes')
+        for path in candidate.directory.iterdir(): service.upload(17, path)
+        service.publish(17)
+        entry, _ = website.published(self.root, candidate.manifest['base_inventory'], tag,
+            candidate.manifest['commit'], dict(notes=['Reviewed fixture notes'], caution='Native acceptance remains incomplete.'),
+            service.public_get, maintainer=test_deb.MAINTAINER)
+        report = dict(version=tag, commit=candidate.manifest['commit'],
+                      release_inventory_sha256=website.inventory_sha(candidate.manifest['base_inventory']))
+        metadata, data = copy.deepcopy(service.current), service.data.copy()
+        for change in ['base-digest', 'source', 'version', 'schema', 'duplicate-key', 'digest', 'size',
+                       'duplicate-asset', 'unavailable-final', 'missing-final', 'unavailable-media', 'changed-media', 'malformed-with-legacy']:
+            service.current, service.data = copy.deepcopy(metadata), data.copy()
+            selected = report.copy()
+            asset = next(a for a in service.current['assets'] if a['name'] == final.MANIFEST)
+            if change == 'base-digest': selected['release_inventory_sha256'] = '0' * 64
+            elif change == 'source': selected['commit'] = '0' * 40
+            elif change in ['version', 'schema', 'duplicate-key', 'malformed-with-legacy']:
+                value = copy.deepcopy(candidate.manifest)
+                if change == 'version': value['version'] = '0.2.1'
+                elif change == 'schema': value['format'] = 'unsupported'
+                raw = final.encode(value)
+                if change == 'duplicate-key': raw = b'{"schema":1,' + raw[1:]
+                if change == 'malformed-with-legacy':
+                    raw = b'{}'
+                    legacy = final.encode(candidate.manifest['base_inventory'])
+                    service.data['release-inventory.json'] = legacy
+                    service.current['assets'].append(dict(id=900, name='release-inventory.json', state='uploaded',
+                        size=len(legacy), digest='sha256:' + hashlib.sha256(legacy).hexdigest()))
+                service.data[final.MANIFEST] = raw
+                asset.update(size=len(raw), digest='sha256:' + hashlib.sha256(raw).hexdigest())
+            elif change == 'digest': asset['digest'] = 'sha256:' + '0' * 64
+            elif change == 'size': asset['size'] += 1
+            elif change == 'duplicate-asset': service.current['assets'].append(copy.deepcopy(asset))
+            elif change == 'unavailable-final': service.data.pop(final.MANIFEST)
+            elif change == 'missing-final':
+                service.current['assets'].remove(asset)
+                service.data.pop(final.MANIFEST)
+            else:
+                name = candidate.manifest['channels']['windows-direct']['dependencies'][0]
+                if change == 'unavailable-media': service.data.pop(name)
+                else: service.data[name] = b'!' + service.data[name][1:]
+            requested = []
+            def get(url, limit, **options):
+                requested.append(url)
+                return service.public_get(url, limit, **options)
+            with self.subTest(change=change):
+                if change == 'missing-final':
+                    result = readback.downloads(self.root, selected, entry, get)
+                    self.assertEqual(result, dict(status='unavailable', reason='public-release-inventory-unavailable', verified_platforms=[]))
+                else:
+                    error = website.Unavailable if change in ['unavailable-final', 'unavailable-media'] else ValueError
+                    with self.assertRaises(error): readback.downloads(self.root, selected, entry, get)
+                self.assertNotIn(website.DOWNLOAD + tag + '/release-inventory.json', requested)
+                self.assertFalse(any(channel['ready'] for channel in candidate.manifest['channels'].values()))
+                self.assertEqual(final.store_channel(), candidate.manifest['channels']['microsoft-store'])
 
     def test_cli_recomposes_inputs_and_cannot_use_a_report_or_request_credentials_when_native_gates_block(self):
         candidate = self.compose()

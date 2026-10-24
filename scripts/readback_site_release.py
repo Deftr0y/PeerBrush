@@ -141,17 +141,28 @@ def downloads(root, report, entry, get):
     assets = release.get('assets') if isinstance(release, dict) else None
     if not isinstance(assets, list) or len(assets) > 100 or any(not isinstance(a, dict) for a in assets):
         raise ValueError('Malformed public release asset collection.')
-    found = [a for a in assets if a.get('name') == 'release-inventory.json']
+    # Final releases embed their base inventory; legacy releases publish it alone.
+    name = ('final-release-inventory.json' if any(a.get('name') == 'final-release-inventory.json' for a in assets)
+            else 'release-inventory.json')
+    found = [a for a in assets if a.get('name') == name]
     if not found:
         return dict(status='unavailable', reason='public-release-inventory-unavailable', verified_platforms=[])
-    url = DOWNLOAD + report['version'] + '/release-inventory.json'
+    maximum = 128 * 1024 if name == 'final-release-inventory.json' else LIMIT
+    url = DOWNLOAD + report['version'] + '/' + name
     if (len(found) != 1 or found[0].get('browser_download_url') != url or found[0].get('state') != 'uploaded'
-            or type(found[0].get('size')) is not int or not 0 < found[0]['size'] <= LIMIT):
+            or type(found[0].get('size')) is not int or not 0 < found[0]['size'] <= maximum):
         raise ValueError('Unexpected public release inventory metadata.')
-    raw = get(url, LIMIT)
+    raw = get(url, maximum)
     if len(raw) != found[0]['size'] or (found[0].get('digest') is not None and found[0]['digest'] != 'sha256:' + sha(raw)):
         raise ValueError('Public release inventory differs from its asset digest/length.')
-    inventory = json.loads(raw)
+    if name == 'final-release-inventory.json':
+        from production_readiness import unique_fields
+        final = json.loads(raw, object_pairs_hook=unique_fields)
+        if not isinstance(final, dict) or not isinstance(final.get('base_inventory'), dict):
+            raise ValueError('Public final manifest has no base inventory.')
+        inventory = final['base_inventory']
+    else:
+        inventory = json.loads(raw)
     if inventory_sha(inventory) != report['release_inventory_sha256']:
         raise ValueError('Public source/asset inventory differs from the prepared comparison target.')
     actual, _ = published(root, inventory, report['version'], report['commit'],
