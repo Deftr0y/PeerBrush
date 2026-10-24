@@ -157,7 +157,7 @@ fn effect(enabled: bool) -> Effect {
         kind: "invert".into(),
         enabled,
         weight: 1.,
-        settings: json!({}),
+        settings: json!({}).into(),
     }
 }
 fn ordinary(bytes: &[u8]) -> Vec<u8> {

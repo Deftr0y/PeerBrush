@@ -675,7 +675,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<(), String> {
     }
     layer.parent = parent.map(String::from);
     layer.pixels = source.render(source.width, source.height, doc.bit_depth)?;
-    layer.source = Some(source);
+    layer.source = Some(source.into());
     doc.layers.insert(0, layer);
     Ok(())
 }
@@ -737,7 +737,7 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
                 if effect.kind == "liquify" {
                     crate::geometry::map_effect(
                         &effect.kind,
-                        &mut effect.settings,
+                        std::sync::Arc::make_mut(&mut effect.settings),
                         [1., 1.],
                         [-left as i32, -top as i32],
                         true,
@@ -746,19 +746,19 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
             }
         }
         replacement.pixels = source.render(width, height, layer.pixels.depth)?;
-        replacement.source = Some(source);
+        replacement.source = Some(source.into());
         replacement.effect_key = id();
         *layer = replacement;
         return Ok(());
     }
     let pixels = source.render(layer.pixels.width, layer.pixels.height, layer.pixels.depth)?;
-    layer.source = Some(source);
+    layer.source = Some(source.into());
     layer.pixels = pixels;
     layer.effect_key = id();
     Ok(())
 }
 pub fn transformed(before: &Layer, after: &mut Layer, c: &Value) -> Result<(), String> {
-    let Some(mut source) = before.source.clone() else {
+    let Some(mut source) = before.source.as_deref().cloned() else {
         return Ok(());
     };
     if crate::projective::parse(c)?.is_some() || crate::warp::parse(c)?.is_some() {
@@ -808,7 +808,7 @@ pub fn transformed(before: &Layer, after: &mut Layer, c: &Value) -> Result<(), S
     }
     source.prepend(delta);
     after.pixels = source.render(after.pixels.width, after.pixels.height, after.pixels.depth)?;
-    after.source = Some(source);
+    after.source = Some(source.into());
     Ok(())
 }
 
@@ -878,7 +878,7 @@ mod tests {
             source.height,
         );
         layer.pixels = source.render(source.width, source.height, depth).unwrap();
-        layer.source = Some(text(font));
+        layer.source = Some(text(font).into());
         engine.doc.layers.insert(0, layer);
         engine
     }
@@ -974,7 +974,7 @@ mod tests {
             let mut engine = fixture(depth, TextFont::Installed(reference.clone()));
             let guard = fonts::test_fonts(vec![(reference.clone(), Err(FontError::Missing))]);
             let id = engine.doc.layers[0].id.clone();
-            let mut updated = engine.doc.layers[0].source.clone().unwrap();
+            let mut updated = engine.doc.layers[0].source.as_deref().cloned().unwrap();
             if let Content::Text { text, .. } = &mut updated.content {
                 *text = "Changed human text".into();
             }
@@ -1149,7 +1149,7 @@ mod tests {
         for depth in [8, 16] {
             let mut engine = fixture(depth, TextFont::Installed(reference.clone()));
             if let Content::Text { text, .. } =
-                &mut engine.doc.layers[0].source.as_mut().unwrap().content
+                &mut std::sync::Arc::make_mut(engine.doc.layers[0].source.as_mut().unwrap()).content
             {
                 *text = "שלום مرحبا हिन्दी \u{1820} A\u{0301}\u{1ab0}".into();
             }

@@ -68,7 +68,7 @@ fn native_text_shape_projection_preview_psd_and_single_undo_preserve_source() {
             edit(&mut e, command);
             assert_eq!(e.undo.len(), 1);
             assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
-            assert_eq!(e.doc.layers[0].source, Some(source.clone()));
+            assert_eq!(e.doc.layers[0].source, Some(source.clone().into()));
             assert!(e.doc.layers[0].pixels.bytes() > 0);
             assert_eq!(e.state()["layers"][0]["source"], json!(source));
             if let Content::Shape { .. } = source.content {
@@ -89,7 +89,7 @@ fn native_text_shape_projection_preview_psd_and_single_undo_preserve_source() {
             e.undo("human").unwrap();
             assert_eq!(e.doc.export_png().unwrap(), before);
             e.redo("human").unwrap();
-            assert_eq!(e.doc.layers[0].source, Some(source));
+            assert_eq!(e.doc.layers[0].source, Some(source.into()));
         }
     }
 }
@@ -109,7 +109,7 @@ fn editable_source_masks_effects_native_clipboard_and_updates_stay_coherent() {
     );
     let original = e.doc.export_png().unwrap();
     let original_source = e.doc.layers[0].source.clone();
-    let mut updated = original_source.clone().unwrap();
+    let mut updated = original_source.as_deref().cloned().unwrap();
     if let Content::Shape { fill, .. } = &mut updated.content {
         *fill = [51001, 16003, 8007, 65535];
     }
@@ -151,7 +151,7 @@ fn transforms_and_geometry_keep_editable_sources_and_native_precision() {
         original.as_ref().unwrap().content
     );
     assert_eq!(rotated.pixels.get16(20, 20), [12345, 23457, 34569, 65535]);
-    let mut source = rotated.source.clone().unwrap();
+    let mut source = rotated.source.as_deref().cloned().unwrap();
     if let Content::Shape { fill, .. } = &mut source.content {
         *fill = [11111, 22223, 33337, 65535];
     }
@@ -488,7 +488,7 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
             );
             let before = e.doc.clone();
             let original = before.layers[0].clone();
-            let mut source = original.source.clone().unwrap();
+            let mut source = original.source.as_deref().cloned().unwrap();
             source.width = 220;
             source.height = 150;
             if let Content::Text { letter_spacing, .. } = &mut source.content {
@@ -614,7 +614,7 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
             assert_eq!(artwork(&e.doc), artwork(&before));
             e.redo("human").unwrap();
             assert_eq!(artwork(&e.doc), artwork(&grown));
-            let mut smaller = e.doc.layers[0].source.clone().unwrap();
+            let mut smaller = e.doc.layers[0].source.as_deref().cloned().unwrap();
             smaller.width = 96;
             smaller.height = 70;
             edit(
@@ -717,7 +717,7 @@ fn unavailable_installed_definitions_survive_group_clipboard_and_task_compensati
         // A saved fixture's font identity is absent here; its existing projection
         // comes from the real bundled font rather than an invented raster.
         if let Content::Text { font, .. } =
-            &mut engine.doc.layers[0].source.as_mut().unwrap().content
+            &mut std::sync::Arc::make_mut(engine.doc.layers[0].source.as_mut().unwrap()).content
         {
             *font = installed_fixture_font();
         }
@@ -893,7 +893,7 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
         layer.x = -99999;
         let mut mirrored = text();
         mirrored.matrix = [-1., 0., 0., 1., 180., 0.];
-        layer.source = Some(mirrored.clone());
+        layer.source = Some(mirrored.clone().into());
         mirrored.width = 182;
         let before = json!(layer);
         assert!(
@@ -907,13 +907,13 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
         layer.mask.as_mut().unwrap().steps.truncate(2);
         let mut mirrored = text();
         mirrored.matrix = [-1., 0., 0., 1., 180., 0.];
-        layer.source = Some(mirrored.clone());
+        layer.source = Some(mirrored.clone().into());
         layer.effects.push(peerbrush::effects::Effect {
             id: "far-control".into(),
             kind: "liquify".into(),
             enabled: true,
             weight: 1.,
-            settings: json!({"strokes":[{"mode":"push","points":[[99990.,10.]]}]}),
+            settings: json!({"strokes":[{"mode":"push","points":[[99990.,10.]]}]}).into(),
         });
         mirrored.width = 220;
         let before = json!(layer);
@@ -942,7 +942,7 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
         ] {
             let mut layer = peerbrush::engine::Layer::new("Vector", "paint", source.width, source.height);
             layer.pixels = source.render(source.width, source.height, depth).unwrap();
-            layer.source = Some(source.clone());
+            layer.source = Some(source.clone().into());
             let before = json!(layer);
             let mut resized = source;
             resized.width += 1;

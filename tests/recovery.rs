@@ -39,7 +39,7 @@ fn fixture(depth: u16) -> server::Shared {
         kind: "invert".into(),
         enabled: true,
         weight: 0.4,
-        settings: json!({}),
+        settings: json!({}).into(),
     });
     let mut mask = Raster::new_depth(16, 12, depth);
     mask.set16(2, 3, [45679, 45679, 45679, 65535]);

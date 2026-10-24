@@ -239,7 +239,7 @@ mod tests {
                         kind: "invert".into(),
                         enabled: true,
                         weight: 0.417,
-                        settings: serde_json::json!({}),
+                        settings: serde_json::json!({}).into(),
                     });
                     doc.layers.insert(0, adjustment);
                     let before = serde_json::to_vec(&doc).unwrap();

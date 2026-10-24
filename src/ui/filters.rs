@@ -317,7 +317,7 @@ impl Editor {
         if let Some(f) = doc.filters.last() {
             editor.target = Some(f.id.clone());
             editor.kind = f.kind.clone();
-            editor.settings = f.settings.clone();
+            editor.settings = f.settings.as_ref().clone();
             editor.weight = f.weight;
             editor.preset = None;
             editor.name = effects::effect_name(&f.kind).into();
@@ -527,7 +527,7 @@ impl PeerBrush {
                             ui.push_id(&f.id,|ui|ui.horizontal(|ui| {
                                 let mut enabled=f.enabled;
                                 if ui.checkbox(&mut enabled,"").on_hover_text("Bypass filter").changed(){stack_edit=Some(json!({"op":"filter.update","filter":f.id,"enabled":enabled}));}
-                                if ui.selectable_label(editor.target.as_deref()==Some(&f.id),effects::effect_name(&f.kind)).clicked(){editor.target=Some(f.id.clone());editor.kind=f.kind.clone();editor.settings=f.settings.clone();editor.weight=f.weight;editor.preset=None;editor.name=effects::effect_name(&f.kind).into();editor.category=crate::effects::catalog::get(&f.kind).map_or("Custom",|e|e.category).into();editor.error=None;}
+                                if ui.selectable_label(editor.target.as_deref()==Some(&f.id),effects::effect_name(&f.kind)).clicked(){editor.target=Some(f.id.clone());editor.kind=f.kind.clone();editor.settings=f.settings.as_ref().clone();editor.weight=f.weight;editor.preset=None;editor.name=effects::effect_name(&f.kind).into();editor.category=crate::effects::catalog::get(&f.kind).map_or("Custom",|e|e.category).into();editor.error=None;}
                                 ui.label(format!("{:.0}%",f.weight*100.));
                                 if index+1<doc.filters.len()&&icons::small_button(ui,Icon::Up,"Move filter up").clicked(){stack_edit=Some(json!({"op":"filter.reorder","filter":f.id,"index":index+1}));}
                                 if index>0&&icons::small_button(ui,Icon::Down,"Move filter down").clicked(){stack_edit=Some(json!({"op":"filter.reorder","filter":f.id,"index":index-1}));}

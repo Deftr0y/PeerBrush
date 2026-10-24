@@ -47,7 +47,7 @@ fn fixture(depth: u16, effects: bool) -> (Engine, String) {
             id: id(),
             kind: "invert".into(),
             enabled: true,
-            settings: json!({}),
+            settings: json!({}).into(),
         });
     }
     let mut nested = Layer::new("Nested folder", "group", 40, 32);
@@ -385,7 +385,7 @@ fn default_folder_pivot_uses_descendants_and_adjustment_masks_retain_native_fram
         id: id(),
         kind: "levels".into(),
         enabled: true,
-        settings: json!({"gamma":1.1}),
+        settings: json!({"gamma":1.1}).into(),
     });
     adjustment.mask = e.doc.layers[0].mask.clone();
     e.doc.layers.insert(2, adjustment);

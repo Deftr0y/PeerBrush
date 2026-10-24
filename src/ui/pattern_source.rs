@@ -120,7 +120,7 @@ pub(super) fn control(
             layer: layer.id.clone(),
             effect: effect.id.clone(),
             kind: effect.kind.clone(),
-            settings: effect.settings.clone(),
+            settings: effect.settings.as_ref().clone(),
             receiver: Arc::new(Mutex::new(rx)),
         };
         ui.ctx().data_mut(|d| d.insert_temp(key(), pending));
@@ -176,7 +176,7 @@ mod tests {
             layer,
             effect: effect.id.clone(),
             kind: effect.kind.clone(),
-            settings: effect.settings.clone(),
+            settings: effect.settings.as_ref().clone(),
             receiver: Arc::new(Mutex::new(rx)),
         };
         let png =

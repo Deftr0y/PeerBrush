@@ -86,7 +86,7 @@ fn text_tracking_requires_new_sources_and_keeps_current_standard_pixels() {
             )
             .unwrap();
         assert_eq!(source_format(&psd::encode(&engine.doc).unwrap()), 29);
-        let mut source = engine.doc.layers[0].source.clone().unwrap();
+        let mut source = engine.doc.layers[0].source.as_deref().cloned().unwrap();
         if let peerbrush::source::Content::Text { letter_spacing, .. } = &mut source.content {
             *letter_spacing = 2.25;
         }

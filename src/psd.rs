@@ -2957,7 +2957,8 @@ fn decode_parts(
                         && effect.enabled
                         && effect.settings["pixel_grid"] != true
                     {
-                        effect.settings["pixel_grid"] = serde_json::json!(true);
+                        std::sync::Arc::make_mut(&mut effect.settings)["pixel_grid"] =
+                            serde_json::json!(true);
                         changed = true;
                     }
                 }
@@ -4521,7 +4522,7 @@ mod storage_tests {
             kind: "invert".into(),
             enabled: false,
             weight: 1.,
-            settings: serde_json::json!({}),
+            settings: serde_json::json!({}).into(),
         });
         validate(&doc).unwrap();
         // Whole-document filters additionally retain standard source records.
@@ -4547,7 +4548,7 @@ mod storage_tests {
             kind: "invert".into(),
             enabled: false,
             weight: 1.,
-            settings: serde_json::json!({}),
+            settings: serde_json::json!({}).into(),
         });
         validate(&doc).unwrap();
         assert_eq!(encode(&doc).unwrap_err(), "Too many PSD layer records");

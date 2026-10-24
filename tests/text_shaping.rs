@@ -79,7 +79,7 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
             .iter()
             .find(|layer| layer.id == pasted[0])
             .unwrap();
-        assert_eq!(copied.source, Some(source()));
+        assert_eq!(copied.source, Some(source().into()));
         assert_eq!(copied.pixels.depth, depth);
         assert_eq!(
             (copied.x, copied.y),
@@ -164,7 +164,7 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
             .unwrap();
         assert_eq!(engine.undo.len(), 2);
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].source, Some(source()));
+        assert_eq!(engine.doc.layers[0].source, Some(source().into()));
         assert_eq!(
             engine.doc.export_png().unwrap(),
             expected.export_png().unwrap()

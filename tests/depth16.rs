@@ -406,7 +406,7 @@ fn clipped_adjustments_apply_native_base_mask_opacity_and_folder_scope_once() {
         id: id(),
         kind: "invert".into(),
         enabled: true,
-        settings: json!({}),
+        settings: json!({}).into(),
     });
     let mut background = Layer::new("Backdrop", "paint", 1, 1);
     background.pixels = Raster::from_rgba16(1, 1, &[33001, 22001, 11001, 65535]).unwrap();

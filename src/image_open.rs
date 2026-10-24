@@ -79,7 +79,7 @@ impl Prepared {
             .to_string_lossy()
             .into();
         doc.layers[0].pixels = pixels;
-        doc.layers[0].source = prepared.source;
+        doc.layers[0].source = prepared.source.map(Into::into);
         doc.srgb_tagged = true;
         control.preview(&doc.layers[0].pixels, None)?;
         control.progress("Image decoded", 1, 1)?;

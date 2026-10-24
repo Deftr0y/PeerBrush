@@ -404,7 +404,7 @@ fn lossless_exports_match_shared_native_png_with_crop_padding_resampling_and_cur
             kind: "invert".into(),
             enabled: true,
             weight: 0.7,
-            settings: json!({}),
+            settings: json!({}).into(),
         });
         let before = serde_json::to_value(&doc).unwrap();
         let current = doc.export_png().unwrap();

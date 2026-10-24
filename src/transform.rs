@@ -684,7 +684,7 @@ fn selection_impl(
             if effect.kind == "liquify" {
                 crate::geometry::map_effect(
                     &effect.kind,
-                    &mut effect.settings,
+                    std::sync::Arc::make_mut(&mut effect.settings),
                     [1., 1.],
                     [ox - left, oy - top],
                     true,

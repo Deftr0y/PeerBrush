@@ -32,7 +32,7 @@ enum Kind {
     Handle(&'static str),
 }
 fn nodes(l: &Layer) -> Option<(&[crate::path::Anchor], bool)> {
-    match &l.source {
+    match l.source.as_deref() {
         Some(Source {
             content: Content::Bezier { nodes, closed, .. },
             ..

@@ -360,7 +360,7 @@ fn text_toolbar_canvas_draft_controls_render_native_pixels_then_apply_once() {
         let mut e = app.shared.lock().unwrap();
         assert_eq!(e.undo.len(), 2);
         assert!(e.redo.is_empty());
-        assert_eq!(e.doc.layers[0].source.as_ref(), Some(&draft));
+        assert_eq!(e.doc.layers[0].source.as_deref(), Some(&draft));
         assert_eq!(e.doc.bit_depth, depth);
         assert_eq!(e.doc.export_png().unwrap(), expected.export_png().unwrap());
         assert_eq!(
@@ -628,7 +628,7 @@ fn explicit_shaped_layout_control_previews_native_pixels_caches_unchanged_valida
                 .iter()
                 .find(|layer| layer.id == id)
                 .unwrap();
-            assert_eq!(applied.source, Some(draft));
+            assert_eq!(applied.source, Some(draft.into()));
             assert_eq!(applied.pixels.depth, depth);
             assert_eq!(
                 engine.doc.export_png().unwrap(),

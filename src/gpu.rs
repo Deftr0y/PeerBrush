@@ -1191,21 +1191,21 @@ mod tests {
                     kind: "hsl".into(),
                     enabled: true,
                     weight: 0.7,
-                    settings: json!({"hue":23,"saturation":0.2}),
+                    settings: json!({"hue":23,"saturation":0.2}).into(),
                 },
                 Effect {
                     id: id(),
                     kind: "blur".into(),
                     enabled: true,
                     weight: 0.6,
-                    settings: json!({"radius":3}),
+                    settings: json!({"radius":3}).into(),
                 },
                 Effect {
                     id: id(),
                     kind: "bloom".into(),
                     enabled: true,
                     weight: 0.4,
-                    settings: json!({"spread":4,"threshold":0.3,"strength":0.8}),
+                    settings: json!({"spread":4,"threshold":0.3,"strength":0.8}).into(),
                 },
             ];
             let original = base.layers[0].pixels.clone();

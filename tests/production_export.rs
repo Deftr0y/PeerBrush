@@ -29,7 +29,7 @@ fn effect() -> Effect {
         kind: "invert".into(),
         enabled: true,
         weight: 0.7,
-        settings: json!({}),
+        settings: json!({}).into(),
     }
 }
 fn fixture(depth: u16) -> Document {

@@ -868,7 +868,7 @@ pub fn apply(
     }
     let mut layer = Layer::new(&name, "paint", pixels.width, pixels.height);
     layer.pixels = pixels;
-    layer.source = source;
+    layer.source = source.map(Into::into);
     layer.parent = parent.map(str::to_owned);
     layer.x = x;
     layer.y = y;

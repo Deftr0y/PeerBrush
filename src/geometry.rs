@@ -87,7 +87,7 @@ pub fn plan(doc: &Document, c: &Value) -> Result<Plan, String> {
     let radius_scale = (scale[0] * scale[1]).sqrt();
     let mut filter_settings = vec![];
     for filter in &doc.filters {
-        let mut settings = filter.settings.clone();
+        let mut settings = filter.settings.as_ref().clone();
         map_effect(&filter.kind, &mut settings, scale, offset, proportional)?;
         filter_settings.push(settings);
     }
@@ -124,7 +124,7 @@ pub fn plan(doc: &Document, c: &Value) -> Result<Plan, String> {
         let world = ["group", "adjustment"].contains(&layer.kind.as_str());
         let mut effects = vec![];
         for effect in &layer.effects {
-            let mut settings = effect.settings.clone();
+            let mut settings = effect.settings.as_ref().clone();
             map_effect(
                 &effect.kind,
                 &mut settings,
@@ -350,6 +350,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
             let (w, h) = scaled_size(&layer.pixels, p.scale)?;
             layer.pixels = resized(&layer.pixels, w, h);
             if let Some(source) = &mut layer.source {
+                let source = std::sync::Arc::make_mut(source);
                 source.prepend([p.scale[0], 0., 0., p.scale[1], 0., 0.]);
                 layer.pixels = source.render(w, h, layer.pixels.depth)?;
             }
@@ -371,12 +372,12 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
         layer.x = (layer.x as f64 * p.scale[0] as f64).round() as i32 + p.offset[0];
         layer.y = (layer.y as f64 * p.scale[1] as f64).round() as i32 + p.offset[1];
         for (effect, settings) in layer.effects.iter_mut().zip(&p.effect_settings[index]) {
-            effect.settings = settings.clone();
+            effect.settings = settings.clone().into();
         }
         layer.effect_key = id();
     }
     for (filter, settings) in doc.filters.iter_mut().zip(&p.filter_settings) {
-        filter.settings = settings.clone();
+        filter.settings = settings.clone().into();
     }
     doc.width = p.width;
     doc.height = p.height;

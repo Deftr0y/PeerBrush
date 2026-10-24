@@ -148,7 +148,7 @@ fn installed_text_format_31_retains_native_standard_channels_masks_composite_and
             });
         }
         source.validate_structure().unwrap();
-        layer.source = Some(source.clone());
+        layer.source = Some(source.clone().into());
         let mut mask = Raster::new_depth(76, 38, depth);
         mask.set16(4, 7, [45679, 45679, 45679, 65535]);
         layer.mask = Some(Mask {
@@ -205,7 +205,7 @@ fn installed_text_format_31_retains_native_standard_channels_masks_composite_and
             assert!(!reopened.read_only);
             assert_eq!(reopened.bit_depth, depth);
             assert_eq!(reopened.layers[0].id, id);
-            assert_eq!(reopened.layers[0].source, Some(source.clone()));
+            assert_eq!(reopened.layers[0].source, Some(source.clone().into()));
             assert_eq!(reopened.layers[0].pixels.rgba16(), native);
             assert_eq!(json!(reopened.layers[0].mask), json!(mask));
             assert_eq!(reopened.export_png().unwrap(), current);
@@ -352,7 +352,7 @@ fn native_float_effect_sources_retain_exact_json_values_save_reopen_and_undo() {
         for (key, value) in settings.as_object().unwrap() {
             assert_eq!(&engine.doc.layers[0].effects[0].settings[key], value);
         }
-        let settings = engine.doc.layers[0].effects[0].settings.clone();
+        let settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
         assert_eq!(engine.doc.layers[0].pixels.rgba16(), original);
         let current = engine.doc.export_png().unwrap();
         assert_ne!(current, baseline);
@@ -363,7 +363,7 @@ fn native_float_effect_sources_retain_exact_json_values_save_reopen_and_undo() {
             let reopened = psd::decode(&bytes).unwrap();
             assert!(!reopened.read_only);
             assert_eq!(reopened.bit_depth, depth);
-            assert_eq!(reopened.layers[0].effects[0].settings, settings);
+            assert_eq!(*reopened.layers[0].effects[0].settings, settings);
             assert_eq!(reopened.layers[0].pixels.rgba16(), original);
             assert_eq!(reopened.export_png().unwrap(), current);
             let standard = psd::decode(&remove_resources(&bytes)).unwrap();

@@ -90,7 +90,7 @@ fn gradient_color_smoothness_keeps_native_sources_alpha_history_and_standard_out
         let original = engine.doc.export_png().unwrap();
         let effect = engine.doc.layers[0].effects[0].id.clone();
         for strength in [0.375, 1.] {
-            let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+            let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
             settings["smoothness"] = json!(strength);
             let command =
                 json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
@@ -413,7 +413,7 @@ fn gradient_pixel_grid_retains_legacy_sources_history_and_current_standard_saves
         let source = engine.doc.layers[0].pixels.rgba16();
         let original = engine.doc.export_png().unwrap();
         let effect = engine.doc.layers[0].effects[0].id.clone();
-        let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+        let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
         settings["pixel_grid"] = json!(true);
         settings["align_layer"] = json!(false);
         let command =
@@ -434,7 +434,7 @@ fn gradient_pixel_grid_retains_legacy_sources_history_and_current_standard_saves
         let words = native(&engine.doc);
         for enabled in [false, true] {
             for grid in [false, true] {
-                let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+                let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
                 settings["pixel_grid"] = json!(grid);
                 let doc = Engine::preview_edits(engine.doc.clone(), &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":enabled,"settings":settings})]).unwrap();
                 let current = doc.export_png().unwrap();
@@ -494,7 +494,7 @@ fn gradient_pixel_grid_retains_legacy_sources_history_and_current_standard_saves
         for kind in ["color_overlay", "pattern_overlay", "drop_shadow"] {
             assert!(effects::validate(kind, &json!({"pixel_grid":true})).is_err());
         }
-        let legacy = engine.doc.layers[0].effects[0].settings.clone();
+        let legacy = engine.doc.layers[0].effects[0].settings.as_ref().clone();
         let mut disabled = legacy.clone();
         disabled["pixel_grid"] = json!(false);
         let mut removed = disabled.clone();
@@ -542,7 +542,7 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
             engine.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"size":0.,"distance":distance,"angle":angle,"opacity":0.37,"color":tint.map(|v|f64::from(v)/65535.),"pixel_snap":true,"source_knockout":false}})], None, None, "Legacy cast").unwrap();
             let original = engine.doc.export_png().unwrap();
             let effect = engine.doc.layers[0].effects[0].id.clone();
-            let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+            let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
             settings["source_knockout"] = json!(true);
             let command =
                 json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
@@ -616,7 +616,7 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
                     let reopened = psd::decode(&bytes).unwrap();
                     assert!(!reopened.read_only);
                     assert_eq!(reopened.layers[0].pixels.rgba16(), source);
-                    assert_eq!(reopened.layers[0].effects[0].settings, settings);
+                    assert_eq!(*reopened.layers[0].effects[0].settings, settings);
                     assert_eq!(reopened.export_png().unwrap(), current);
                     assert_eq!(
                         psd::decode(&strip(&bytes)).unwrap().export_png().unwrap(),
@@ -737,7 +737,7 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
                 .unwrap();
                 let fractional = e.doc.export_png().unwrap();
                 let effect = e.doc.layers[0].effects[0].id.clone();
-                let mut settings = e.doc.layers[0].effects[0].settings.clone();
+                let mut settings = e.doc.layers[0].effects[0].settings.as_ref().clone();
                 settings["pixel_snap"] = json!(true);
                 let command =
                     json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});

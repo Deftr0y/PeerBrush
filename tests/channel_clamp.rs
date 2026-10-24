@@ -315,7 +315,7 @@ fn adjustment_targets_reject_clamps_atomically_in_engine_preview_and_psd_validat
             kind: "channel_clamp".into(),
             enabled: false,
             weight: 0.0,
-            settings: effects::defaults("channel_clamp"),
+            settings: effects::defaults("channel_clamp").into(),
         });
         assert!(psd::validate(&e.doc).is_err());
     }

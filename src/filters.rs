@@ -133,7 +133,7 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
                 kind: kind.into(),
                 enabled: true,
                 weight: effects::command_weight(command)?,
-                settings: self::settings(kind, &settings)?,
+                settings: self::settings(kind, &settings)?.into(),
             });
         }
         "filter.update" => {
@@ -149,7 +149,7 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
                 }
                 if kind != filter.kind {
                     filter.kind = kind.into();
-                    filter.settings = effects::defaults(kind);
+                    filter.settings = effects::defaults(kind).into();
                 }
             }
             if let Some(enabled) = command.get("enabled") {
@@ -161,7 +161,7 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
                 filter.weight = effects::command_weight(command)?;
             }
             if let Some(settings) = command.get("settings") {
-                filter.settings = self::settings(&filter.kind, settings)?;
+                filter.settings = self::settings(&filter.kind, settings)?.into();
             }
         }
         "filter.delete" | "filter.reorder" => {

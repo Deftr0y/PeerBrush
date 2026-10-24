@@ -9948,7 +9948,7 @@ mod tests {
                     kind: "invert".into(),
                     enabled: true,
                     weight: 1.,
-                    settings: json!({}),
+                    settings: json!({}).into(),
                 });
                 app.selected = engine.doc.layers[0].id.clone();
             }
@@ -10938,21 +10938,24 @@ mod tests {
             engine.doc.layers[0]
                 .pixels
                 .set16(2, 3, [12347, 33659, 51237, 65535]);
-            engine.doc.layers[0].source = Some(crate::source::Source {
-                width: 32,
-                height: 32,
-                matrix: [1., 0., 0., 1., 0., 0.],
-                content: crate::source::Content::Text {
-                    text: "Hi".into(),
-                    layout: crate::source::TextLayout::Legacy,
-                    font: TextFont::Installed(font),
-                    size: 16.,
-                    line_height: 1.2,
-                    letter_spacing: 0.,
-                    align: "left".into(),
-                    color: [53471, 12679, 33457, 65535],
-                },
-            });
+            engine.doc.layers[0].source = Some(
+                crate::source::Source {
+                    width: 32,
+                    height: 32,
+                    matrix: [1., 0., 0., 1., 0., 0.],
+                    content: crate::source::Content::Text {
+                        text: "Hi".into(),
+                        layout: crate::source::TextLayout::Legacy,
+                        font: TextFont::Installed(font),
+                        size: 16.,
+                        line_height: 1.2,
+                        letter_spacing: 0.,
+                        align: "left".into(),
+                        color: [53471, 12679, 33457, 65535],
+                    },
+                }
+                .into(),
+            );
             engine.doc.clone()
         };
         app.select_content(&original.layers[0].id);
@@ -11077,21 +11080,24 @@ mod tests {
                     engine.doc.layers[0]
                         .pixels
                         .set16(1, 2, [21347, 41259, 31357, 65535]);
-                    engine.doc.layers[0].source = Some(crate::source::Source {
-                        width: 32,
-                        height: 32,
-                        matrix: [1., 0., 0., 1., 0., 0.],
-                        content: crate::source::Content::Text {
-                            text: "Hi".into(),
-                            layout: crate::source::TextLayout::Legacy,
-                            font: TextFont::Installed(font.clone()),
-                            size: 16.,
-                            line_height: 1.2,
-                            letter_spacing: 0.,
-                            align: "left".into(),
-                            color: [53471, 12679, 33457, 65535],
-                        },
-                    });
+                    engine.doc.layers[0].source = Some(
+                        crate::source::Source {
+                            width: 32,
+                            height: 32,
+                            matrix: [1., 0., 0., 1., 0., 0.],
+                            content: crate::source::Content::Text {
+                                text: "Hi".into(),
+                                layout: crate::source::TextLayout::Legacy,
+                                font: TextFont::Installed(font.clone()),
+                                size: 16.,
+                                line_height: 1.2,
+                                letter_spacing: 0.,
+                                align: "left".into(),
+                                color: [53471, 12679, 33457, 65535],
+                            },
+                        }
+                        .into(),
+                    );
                     engine.doc.clone()
                 };
                 app.select_content(&original.layers[0].id);

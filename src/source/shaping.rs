@@ -594,7 +594,7 @@ mod tests {
                 let mut engine = shared.lock().unwrap();
                 assert_eq!(guard.requests(), 2, "Apply takes one new exact snapshot");
                 assert_eq!(engine.undo.len(), 1);
-                assert_eq!(engine.doc.layers[0].source, Some(definition.clone()));
+                assert_eq!(engine.doc.layers[0].source, Some(definition.clone().into()));
                 assert_eq!(engine.doc.layers[0].pixels.depth, depth);
                 assert_eq!(
                     engine.doc.export_png().unwrap(),
@@ -619,7 +619,7 @@ mod tests {
                     let reopened = crate::psd::decode(&bytes).unwrap();
                     assert!(!reopened.read_only);
                     assert_eq!(reopened.bit_depth, depth);
-                    assert_eq!(reopened.layers[0].source, Some(definition.clone()));
+                    assert_eq!(reopened.layers[0].source, Some(definition.clone().into()));
                     assert_eq!(
                         reopened.layers[0].pixels.rgba16(),
                         preview.layers[0].pixels.rgba16()
@@ -709,7 +709,7 @@ mod tests {
                 ] {
                     let reopened = crate::psd::decode(&bytes).unwrap();
                     assert!(!reopened.read_only);
-                    assert_eq!(reopened.layers[0].source, Some(definition.clone()));
+                    assert_eq!(reopened.layers[0].source, Some(definition.clone().into()));
                     assert_eq!(
                         reopened.layers[0].pixels.rgba16(),
                         saved.layers[0].pixels.rgba16()
@@ -806,7 +806,7 @@ mod tests {
             let mut engine = crate::engine::Engine::new();
             engine.doc = crate::engine::Document::new_depth(256, 96, depth).unwrap();
             engine.doc.layers[0].pixels = baked;
-            engine.doc.layers[0].source = Some(installed.clone());
+            engine.doc.layers[0].source = Some(installed.clone().into());
             for error in [
                 FontError::Missing,
                 FontError::Changed,
@@ -825,7 +825,7 @@ mod tests {
                 ] {
                     let reopened = crate::psd::decode(&bytes).unwrap();
                     assert!(!reopened.read_only);
-                    assert_eq!(reopened.layers[0].source, Some(installed.clone()));
+                    assert_eq!(reopened.layers[0].source, Some(installed.clone().into()));
                     assert_eq!(reopened.layers[0].pixels.rgba16(), expected.rgba16());
                     assert_eq!(
                         reopened.export_png().unwrap(),

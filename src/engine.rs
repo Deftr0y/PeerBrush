@@ -63,7 +63,7 @@ pub struct Layer {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub psd_metadata: Vec<crate::psd::LayerMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<crate::source::Source>,
+    pub source: Option<Arc<crate::source::Source>>,
     #[serde(skip, default = "id")]
     pub effect_key: String,
 }
@@ -2158,7 +2158,7 @@ impl Engine {
                         id: id(),
                         kind: kind.into(),
                         enabled: true,
-                        settings,
+                        settings: settings.into(),
                     });
                 }
                 "effect.update" => {
@@ -2174,7 +2174,7 @@ impl Engine {
                         e.weight = crate::effects::command_weight(c)?;
                     }
                     if let Some(settings) = c.get("settings") {
-                        e.settings = crate::effects::normalized(&e.kind, settings)?;
+                        e.settings = crate::effects::normalized(&e.kind, settings)?.into();
                     }
                 }
                 "effect.delete" => {
@@ -2369,7 +2369,7 @@ impl Engine {
                     id: id(),
                     kind: "liquify".into(),
                     enabled: true,
-                    settings: crate::liquify::defaults(),
+                    settings: crate::liquify::defaults().into(),
                 });
                 l.effects.len() - 1
             };
@@ -2379,7 +2379,7 @@ impl Engine {
                 .ok_or("Invalid liquify stroke list")?
                 .push(stroke);
             crate::liquify::validate(&settings)?;
-            l.effects[at].settings = settings;
+            l.effects[at].settings = settings.into();
             return Ok(());
         }
         if op == "paint.fill" {

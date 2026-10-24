@@ -310,3 +310,187 @@ fn actual_workspace_control_and_navigation_components() {
         "limits":"CPU egui only; caches and background scheduling uncontrolled; no first-present or physical input latency"})
     );
 }
+
+#[test]
+#[ignore = "Opt-in embedded-source CPU egui timings; run alone with --exact --ignored --nocapture"]
+fn actual_workspace_embedded_source_snapshot_and_inspector_components() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let build: Value = serde_json::from_str(crate::build_info::json()).unwrap();
+    assert_eq!(
+        build["tree"], "clean",
+        "Record only a clean source-bound build"
+    );
+    assert_eq!(build["commit"].as_str().unwrap().len(), 40);
+    let mut cases = Vec::new();
+    for depth in [8, 16] {
+        let mut random = 0x98765432u32;
+        let words: Vec<u16> = (0..256 * 256 * 4)
+            .map(|index| {
+                random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                if index % 4 == 3 {
+                    65535
+                } else {
+                    (random >> 16) as u16
+                }
+            })
+            .collect();
+        let png = STANDARD.encode(if depth == 16 {
+            crate::raster::png16(256, 256, &words).unwrap()
+        } else {
+            crate::raster::png(
+                256,
+                256,
+                &words
+                    .iter()
+                    .copied()
+                    .map(crate::raster::project16)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        });
+        assert!(png.len() > 128 * 1024);
+        let svg = format!("<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><!--{}--><rect x='1' y='1' width='14' height='14' fill='#123456'/></svg>", "embedded source ".repeat(8192));
+        for mode in [
+            "plain_paint",
+            "embedded_unselected",
+            "embedded_expanded_inspector",
+        ] {
+            let (_state, mut app, ctx, init_ms) = fixture(depth, true);
+            let embedded = mode != "plain_paint";
+            let expanded = mode == "embedded_expanded_inspector";
+            let original_paint = app.selected.clone();
+            let mut embedded_id = String::new();
+            let mut effect_id = String::new();
+            if embedded {
+                let mut e = app.shared.lock().unwrap();
+                e.edit(
+                    "human",
+                    &[json!({"op":"source.add","source":{
+                        "width":16,"height":16,"content":{"kind":"svg","svg":svg}
+                    }})],
+                    None,
+                    None,
+                    "Diagnostic embedded source",
+                )
+                .unwrap();
+                embedded_id = e.doc.layers[0].id.clone();
+                e.edit("human", &[json!({"op":"effect.add","layer":embedded_id,
+                    "kind":"pattern_overlay","settings":{"pattern":"bitmap","bitmap_png":png,"opacity":1.}
+                })], None, None, "Diagnostic embedded pattern").unwrap();
+                effect_id = e.doc.layers[0].effects[0].id.clone();
+                e.undo.clear();
+                e.redo.clear();
+                drop(e);
+                app.selected = if expanded {
+                    embedded_id.clone()
+                } else {
+                    original_paint.clone()
+                };
+                app.selection_layers.clear();
+                app.selection_layers.insert(app.selected.clone());
+                if expanded {
+                    app.select_effect(&embedded_id, false, &effect_id);
+                }
+            }
+            let settle_ms = canvas_ready(&mut app, &ctx);
+            if embedded {
+                assert_eq!(app.selected == embedded_id, expanded);
+                assert_eq!(
+                    app.effect_is_expanded(&embedded_id, false, &effect_id),
+                    expanded
+                );
+            }
+            let before = app.shared.lock().unwrap().doc.clone();
+            let wire = serde_json::to_value(&before).unwrap();
+            let (w, h, actual) = app.canvas_pixels.as_ref().unwrap();
+            assert_eq!(
+                actual,
+                &before.preview(None, (*w).max(*h), None, false).unwrap().2,
+                "Accepted real workspace canvas must show shared-engine pixels"
+            );
+            let native: Vec<_> = before
+                .layers
+                .iter()
+                .map(|layer| layer.pixels.rgba16())
+                .collect();
+            let idle = timings(|| frame(&mut app, &ctx, vec![]));
+            let clone = timings(|| {
+                let started = Instant::now();
+                std::hint::black_box(before.clone());
+                started.elapsed().as_secs_f64() * 1000.
+            });
+            let at = app.view_rect.expect("Actual workspace canvas").center();
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    button(at, egui::PointerButton::Middle, true),
+                ],
+            );
+            let original_pan = app.pan;
+            let mut step = 0.;
+            let pan = timings(|| {
+                step += 1.;
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(at + Vec2::new(step * 3., 0.))],
+                )
+            });
+            assert_ne!(
+                app.pan, original_pan,
+                "Actual middle-button canvas navigation must run"
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![button(
+                    at + Vec2::new(step * 3., 0.),
+                    egui::PointerButton::Middle,
+                    false,
+                )],
+            );
+            let e = app.shared.lock().unwrap();
+            assert_eq!(serde_json::to_value(&e.doc).unwrap(), wire);
+            assert_eq!(
+                e.doc
+                    .layers
+                    .iter()
+                    .map(|layer| layer.pixels.rgba16())
+                    .collect::<Vec<_>>(),
+                native
+            );
+            assert!(e.undo.is_empty() && e.redo.is_empty() && e.leases.is_empty());
+            if embedded {
+                assert!(Arc::ptr_eq(
+                    &e.doc.layers[0].effects[0].settings,
+                    &before.layers[0].effects[0].settings
+                ));
+                assert!(Arc::ptr_eq(
+                    &app.doc_snapshot.layers[0].effects[0].settings,
+                    &e.doc.layers[0].effects[0].settings
+                ));
+                assert!(Arc::ptr_eq(
+                    app.doc_snapshot.layers[0].source.as_ref().unwrap(),
+                    e.doc.layers[0].source.as_ref().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    e.doc.layers[0].source.as_ref().unwrap(),
+                    before.layers[0].source.as_ref().unwrap()
+                ));
+            }
+            cases.push(json!({"depth":depth,"mode":mode,"width":512,"height":512,
+                "layers":before.layers.len(),"embedded_png_base64_bytes":if embedded {png.len()} else {0},
+                "embedded_svg_bytes":if embedded {svg.len()} else {0},"inspector_expanded":expanded,
+                "init_cpu_ms":init_ms,"canvas_settle_wall_ms":settle_ms,"idle_frame_ms":idle,
+                "document_clone_ms":clone,"pan_frame_ms":pan}));
+        }
+    }
+    println!(
+        "\n{}",
+        json!({"format":"PeerBrushEmbeddedSourceCpuDiagnosticV1","build":build,
+        "samples_per_series":SAMPLES,"cases":cases,"native_window":false,
+        "limits":"CPU egui only; caches and background scheduling uncontrolled; expanded inspector still owns a mutable settings draft each frame; no first-present, physical input latency or speed threshold"})
+    );
+}

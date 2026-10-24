@@ -19,14 +19,14 @@ fn fixture(edge: u32, effects: bool, depth: u16) -> Document {
                 id: id(),
                 kind: "levels".into(),
                 enabled: true,
-                settings: json!({"gamma":0.9}),
+                settings: json!({"gamma":0.9}).into(),
             },
             Effect {
                 weight: 1.0,
                 id: id(),
                 kind: "blur".into(),
                 enabled: true,
-                settings: json!({"radius":4}),
+                settings: json!({"radius":4}).into(),
             },
         ];
     }
@@ -83,7 +83,7 @@ fn main() {
                     kind: "posterize".into(),
                     enabled: true,
                     weight: if depth == 16 && edge == 4096 { 1. } else { 0.7 },
-                    settings: json!({"levels":5}),
+                    settings: json!({"levels":5}).into(),
                 });
                 if let Err(error) = peerbrush::effects::validate_budget(&doc) {
                     println!("{edge}² {depth}-bit whole-image {}: unavailable under existing limits: {error}",if heavy {"levels+blur+posterize"} else {"posterize"});

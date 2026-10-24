@@ -102,7 +102,7 @@ impl PeerBrush {
             };
             (
                 Some(layer.id.clone()),
-                layer.source.clone().unwrap(),
+                layer.source.as_deref().cloned().unwrap(),
                 layer.x,
                 layer.y,
                 layer.parent.clone(),

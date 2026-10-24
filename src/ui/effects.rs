@@ -882,7 +882,7 @@ impl PeerBrush {
                                 {
                                     self.activate_liquify(Some(effect.id.clone()));
                                 }
-                                let mut values = effect.settings.clone();
+                                let mut values = effect.settings.as_ref().clone();
                                 let document_id = self.doc_snapshot.id.clone();
                                 let response = ui
                                     .push_id(("settings source", document_id), |ui| {

@@ -179,7 +179,7 @@ fn import_retains_source_native_human_samples_single_undo_and_standard_psd12_pix
         let preview = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
         edit(&mut e, &[command]);
         assert_eq!(e.undo.len(), 1);
-        assert_eq!(e.doc.layers[0].source, Some(source(ART)));
+        assert_eq!(e.doc.layers[0].source, Some(source(ART).into()));
         assert_eq!((e.doc.layers[0].x, e.doc.layers[0].y), (7, 9));
         assert_eq!(e.doc.layers[1].pixels.rgba16(), human);
         assert_eq!(preview.export_png().unwrap(), e.doc.export_png().unwrap());
@@ -203,7 +203,7 @@ fn import_retains_source_native_human_samples_single_undo_and_standard_psd12_pix
         e.undo("human").unwrap();
         assert_eq!(e.doc.export_png().unwrap(), before);
         e.redo("human").unwrap();
-        assert_eq!(e.doc.layers[0].source, Some(source(ART)));
+        assert_eq!(e.doc.layers[0].source, Some(source(ART).into()));
     }
 }
 
@@ -320,7 +320,7 @@ fn vector_updates_transforms_and_internal_clipboard_preserve_editable_source() {
     assert!(destination
         .layers
         .iter()
-        .any(|l| l.source == Some(source(ART))));
+        .any(|l| l.source == Some(source(ART).into())));
     edit(
         &mut e,
         &[json!({"op":"transform","layer":target,"angle":90.,"selection_only":false})],
