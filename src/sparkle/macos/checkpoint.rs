@@ -746,6 +746,7 @@ pub(super) struct Prepared {
     _profile: UpdateProfile,
     _owner: super::coordinator::Owner,
     current_profile: Option<ProfileCapture>,
+    final_profile: Option<FinalCapture>,
 }
 impl Prepared {
     /// An advisory change detector, never current app/copy authentication.
@@ -783,6 +784,47 @@ impl Prepared {
                 &mut self.current_profile,
             )
         })
+    }
+    pub(super) fn observe_final_profile(
+        &mut self,
+        workspace: &crate::workspace::Registry,
+        ready_generation: u64,
+    ) -> Result<FinalProfileBinding, String> {
+        self.check_identity()?;
+        let reviewed = crate::workspace::lifecycle::update_readiness(workspace)?;
+        let owner = self._owner.pid()?;
+        crate::workspace::lifecycle::publish_update_checkpoint(workspace, &reviewed, |tools| {
+            self.check_identity()?;
+            capture_final_profile(
+                &self._profile,
+                tools,
+                &self.path,
+                &self.manifest,
+                owner,
+                ready_generation,
+                &reviewed,
+                &mut self.final_profile,
+            )
+        })?;
+        self.check_identity()?;
+        Ok(self.final_profile.as_ref().ok_or(HOLD)?.binding.clone())
+    }
+    pub(super) fn accept_final_profile(
+        &self,
+        workspace: &crate::workspace::Registry,
+        binding: &FinalProfileBinding,
+    ) -> Result<(), String> {
+        self.check_identity()?;
+        let capture = self.final_profile.as_ref().ok_or(HOLD)?;
+        capture.accept(
+            workspace,
+            &self._profile,
+            &self.path,
+            &self.manifest,
+            self._owner.pid()?,
+            binding,
+        )?;
+        self.check_identity()
     }
     pub fn retire_profile_capture(&self) -> Result<(), String> {
         self.check_identity()?;
@@ -978,6 +1020,210 @@ fn capture_current_profile(
     Ok(())
 }
 
+/// A compact reference to copied settings/source observation, never exit authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FinalProfileBinding {
+    pub ready_generation: u64,
+    pub sources_sha256: String,
+    pub record_sha256: String,
+}
+impl FinalProfileBinding {
+    pub(super) fn validate(&self) -> Result<(), String> {
+        if self.ready_generation == 0
+            || [&self.sources_sha256, &self.record_sha256]
+                .iter()
+                .any(|value| {
+                    value.len() != 64
+                        || !value
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+        {
+            return Err(HOLD.into());
+        }
+        Ok(())
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinalProfileRecord {
+    schema: u32,
+    initial_manifest_sha256: String,
+    owner_pid: u32,
+    ready_generation: u64,
+    sources_sha256: String,
+    profile: BTreeMap<PathBuf, Entry>,
+}
+struct FinalCapture {
+    binding: FinalProfileBinding,
+    reviewed: Vec<crate::workspace::lifecycle::Reviewed>,
+    current: Snapshot,
+}
+fn reviewed_sources(reviewed: &[crate::workspace::lifecycle::Reviewed]) -> Result<String, String> {
+    if reviewed.len() > crate::workspace::MAX_PROJECTS
+        || reviewed.iter().any(|r| {
+            r.discard
+                || [&r.project, &r.document]
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
+        })
+    {
+        return Err(HOLD.into());
+    }
+    // Only bounded runtime source identities, never serialized project contents.
+    let mut values: Vec<_> = reviewed
+        .iter()
+        .map(|r| (&r.project, &r.document, r.revision))
+        .collect();
+    values.sort_by(|a, b| a.0.cmp(b.0));
+    if values.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(HOLD.into());
+    }
+    Ok(digest(&serde_json::to_vec(&values).map_err(|_| HOLD)?))
+}
+fn final_intent(path: &Path, initial: &[u8], owner_pid: u32) -> Result<(), String> {
+    if owner_pid <= 1
+        || !private(path, false)?
+        || Stamp::read(&path.join("native-not-started.json"))?.is_some()
+    {
+        return Err(HOLD.into());
+    }
+    read_current_profile(path, initial)?;
+    let intent: Intent =
+        serde_json::from_slice(&read_marker(&path.join("native-start-intent.json"))?)
+            .map_err(|_| HOLD)?;
+    if intent.schema != 1
+        || intent.owner_pid != owner_pid
+        || intent.manifest_sha256 != digest(initial)
+        || path.file_name().and_then(|name| name.to_str()) != Some(intent.checkpoint.as_str())
+    {
+        return Err(HOLD.into());
+    }
+    Ok(())
+}
+fn read_final_profile(
+    path: &Path,
+    initial: &[u8],
+    owner_pid: u32,
+    binding: &FinalProfileBinding,
+) -> Result<(), String> {
+    binding.validate()?;
+    final_intent(path, initial, owner_pid)?;
+    let bytes = read_private(&path.join("final-profile.json"), 1024 * 1024)?;
+    if digest(&bytes) != binding.record_sha256 {
+        return Err(HOLD.into());
+    }
+    let value: FinalProfileRecord = serde_json::from_slice(&bytes).map_err(|_| HOLD)?;
+    if value.schema != 1
+        || value.owner_pid != owner_pid
+        || value.ready_generation != binding.ready_generation
+        || value.sources_sha256 != binding.sources_sha256
+        || value.initial_manifest_sha256 != digest(initial)
+    {
+        return Err(HOLD.into());
+    }
+    validate_current_profile(
+        &CurrentProfile {
+            schema: 1,
+            initial_manifest_sha256: value.initial_manifest_sha256,
+            profile: value.profile.clone(),
+        },
+        initial,
+    )?;
+    check_copy(
+        &path.join("final-profile"),
+        &value.profile,
+        &AtomicBool::new(false),
+    )?;
+    if read_private(&path.join("final-profile.json"), 1024 * 1024)? != bytes {
+        return Err(HOLD.into());
+    }
+    final_intent(path, initial, owner_pid)
+}
+fn capture_final_profile(
+    profile: &UpdateProfile,
+    tools: &crate::tool_settings::Store,
+    path: &Path,
+    initial: &[u8],
+    owner_pid: u32,
+    ready_generation: u64,
+    reviewed: &[crate::workspace::lifecycle::Reviewed],
+    capture: &mut Option<FinalCapture>,
+) -> Result<(), String> {
+    if capture.is_some()
+        || ready_generation == 0
+        || Stamp::read(&path.join("final-profile.json"))?.is_some()
+        || Stamp::read(&path.join("final-profile"))?.is_some()
+    {
+        return Err(HOLD.into());
+    }
+    let sources_sha256 = reviewed_sources(reviewed)?;
+    profile.validate()?;
+    final_intent(path, initial, owner_pid)?;
+    let root = profile.locations.profile();
+    tools.authenticate_update_profile(&root)?;
+    let destination = path.join("final-profile");
+    let current = copy_profile(profile, &destination, &AtomicBool::new(false))?;
+    let record = serde_json::to_vec(&FinalProfileRecord {
+        schema: 1,
+        initial_manifest_sha256: digest(initial),
+        owner_pid,
+        ready_generation,
+        sources_sha256: sources_sha256.clone(),
+        profile: current.entries.clone(),
+    })
+    .map_err(|_| HOLD)?;
+    if record.len() > 1024 * 1024 {
+        return Err(HOLD.into());
+    }
+    check_copy(&destination, &current.entries, &AtomicBool::new(false))?;
+    crate::server::sync_parent(&destination.join("migration-backup"))?;
+    crate::server::sync_parent(&destination)?;
+    current.authenticate_profile(&root)?;
+    tools.authenticate_update_profile(&root)?;
+    current.recheck()?;
+    // Retain the concrete copy before any publication/final readback may fail.
+    *capture = Some(FinalCapture {
+        binding: FinalProfileBinding {
+            ready_generation,
+            sources_sha256,
+            record_sha256: digest(&record),
+        },
+        reviewed: reviewed.to_vec(),
+        current,
+    });
+    write_new(&path.join("final-profile.json"), &record)?;
+    let saved = capture.as_ref().ok_or(HOLD)?;
+    read_final_profile(path, initial, owner_pid, &saved.binding)?;
+    tools.authenticate_update_profile(&root)?;
+    saved.current.authenticate_profile(&root)?;
+    saved.current.recheck()
+}
+impl FinalCapture {
+    fn accept(
+        &self,
+        workspace: &crate::workspace::Registry,
+        profile: &UpdateProfile,
+        path: &Path,
+        initial: &[u8],
+        owner_pid: u32,
+        binding: &FinalProfileBinding,
+    ) -> Result<(), String> {
+        if binding != &self.binding || reviewed_sources(&self.reviewed)? != binding.sources_sha256 {
+            return Err(HOLD.into());
+        }
+        crate::workspace::lifecycle::publish_update_checkpoint(workspace, &self.reviewed, |tools| {
+            profile.validate()?;
+            read_final_profile(path, initial, owner_pid, binding)?;
+            let root = profile.locations.profile();
+            tools.authenticate_update_profile(&root)?;
+            self.current.authenticate_profile(&root)?;
+            self.current.recheck()
+        })
+    }
+}
+
 fn publish_profile_checkpoint(
     profile: &Snapshot,
     root: &Path,
@@ -1070,6 +1316,14 @@ impl ArmedCheck {
         }
         read_current_profile(path, &self.manifest)?;
         Ok(path.into())
+    }
+    pub(super) fn observe_final_profile(
+        &self,
+        profile: &UpdateProfile,
+        binding: &FinalProfileBinding,
+    ) -> Result<(), String> {
+        let path = self.check_records(profile)?;
+        read_final_profile(&path, &self.manifest, self.owner_pid, binding)
     }
     pub(super) fn not_started(&self) -> Result<(), String> {
         owner_check_not_started(&self.app, &self.manifest)
@@ -1323,6 +1577,7 @@ pub(super) fn prepare(
         _profile: profile,
         _owner: owner,
         current_profile: None,
+        final_profile: None,
     })
 }
 

@@ -352,6 +352,21 @@ impl PeerBrush {
             return false;
         }
         let blocked = self.update_interaction_active();
+        if !blocked && self.updates.native_updater.may_observe_final_profile() {
+            // Match ordinary on_exit's UI delta before taking shared writer locks.
+            self.message = match self.flush_update_tool_profile().and_then(|()| {
+                self.updates
+                    .native_updater
+                    .observe_final_profile(&self.workspace, blocked)
+            }) {
+                Ok(()) => {
+                    "Settings observation requested. Installation and restart remain unavailable."
+                        .into()
+                }
+                Err(error) => error,
+            };
+            return true;
+        }
         // A pending updater may never enter the ordinary Don't Save exit path.
         self.message = self
             .updates

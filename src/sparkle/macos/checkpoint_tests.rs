@@ -1813,3 +1813,535 @@ fn retained_armed_owner_rechecks_its_exact_records_without_relaxing_new_owner_ad
         );
     }
 }
+
+#[test]
+fn actual_final_profile_observation_reuses_writer_authority_and_preserves_current_joint_native_work(
+) {
+    use super::super::{accept_final_observation, coordinator, driver, request_final_observation};
+    use crate::source::{Content, Source};
+    use serde_json::json;
+    for outcome in [
+        "success",
+        "blocked-before",
+        "dirty-before",
+        "unsaved-before",
+        "operation-before",
+        "copy-error",
+        "post-record-error",
+        "send-error",
+        "newer-source",
+        "dirty-after",
+        "present-after",
+        "absent-after",
+        "removed-after",
+        "receipt-damage",
+        "copy-damage",
+        "intent-damage",
+        "wrong-ready",
+        "wrong-sources",
+        "wrong-record",
+        "cancel-after",
+        "blocked-after",
+    ] {
+        let f = Fixture::new();
+        let profile = f.profile();
+        let lease = profile.update_profile();
+        let root = profile.locations.profile();
+        let attempt = f.attempt(&lease);
+        let initial = fs::read(attempt.join("checkpoint.json")).unwrap();
+        fs::rename(
+            attempt.join("checkpoint.json"),
+            attempt.join("capture.json"),
+        )
+        .unwrap();
+        let original_profile = fs::read(attempt.join("profile/tool-settings.json")).unwrap();
+        let original_app =
+            fs::read(attempt.join("PeerBrush.app/Contents/MacOS/peerbrush")).unwrap();
+        let (workspace, projects, paths) = current_profile_workspace(&f);
+        // Keep a real editable source as well as hidden native pixels and both
+        // nonempty histories; saves use the real source/revision consent route.
+        for (project, path) in projects.iter().zip(&paths) {
+            let (project_id, document, revision) = {
+                let mut e = project.lock().unwrap();
+                let raster = e.doc.layers[0].id.clone();
+                let source = Source {
+                    width: 4,
+                    height: 3,
+                    matrix: [1., 0., 0., 1., 0., 0.],
+                    content: Content::Shape {
+                        shape: "rectangle".into(),
+                        bounds: [1., 1., 2., 2.],
+                        points: vec![],
+                        closed: true,
+                        fill: [12501, 23003, 34507, 45611],
+                        stroke: [0; 4],
+                        stroke_width: 0.,
+                    },
+                };
+                e.edit(
+                    "human",
+                    &[json!({"op":"source.add","source":source,"x":0,"y":0})],
+                    None,
+                    None,
+                    "Keep editable source",
+                )
+                .unwrap();
+                for name in ["Keep current name", "Undo temporary name"] {
+                    e.edit(
+                        "human",
+                        &[json!({"op":"layer.update","layer":raster,"name":name})],
+                        None,
+                        None,
+                        "Human name",
+                    )
+                    .unwrap();
+                }
+                e.undo("human").unwrap();
+                assert!(e.doc.layers.iter().any(|layer| layer.source.is_some()));
+                let hidden = e
+                    .doc
+                    .layers
+                    .iter()
+                    .find(|layer| layer.id == raster)
+                    .unwrap()
+                    .pixels
+                    .get16(0, 0);
+                assert_eq!(hidden[3], 0);
+                assert!(hidden[..3].iter().any(|v| *v != 0));
+                if e.doc.bit_depth == 16 {
+                    assert!(hidden[..3].iter().any(|v| v % 257 != 0));
+                }
+                (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+            };
+            let report = crate::server::dispatch(
+                project,
+                "document",
+                &json!({"action":"save_report",
+                "project_id":project_id,"document_id":document,"expected_revision":revision}),
+            )
+            .unwrap();
+            assert_eq!(report["document_id"], document);
+            assert_eq!(report["revision"], revision);
+            assert_eq!(report["save_allowed"], true);
+            assert!(report["losses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|loss| loss["code"] == "editable_source_rasterized"));
+            crate::server::save_accepted_source(project, path, &document, revision, false).unwrap();
+            let e = project.lock().unwrap();
+            let reopened = crate::psd::decode(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(reopened.bit_depth, e.doc.bit_depth);
+            assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+        }
+        let tools = workspace.lock().unwrap().tool_settings.clone();
+        *tools.lock().unwrap() = crate::tool_settings::Store::load(root.join("tool-settings.json"));
+        let reviewed = crate::workspace::lifecycle::update_readiness(&workspace).unwrap();
+        let mut current = None;
+        crate::workspace::lifecycle::publish_update_checkpoint(&workspace, &reviewed, |store| {
+            capture_current_profile(&lease, store, &attempt, &initial, &mut current)
+        })
+        .unwrap();
+        let pre_cycle = fs::read(attempt.join("current-profile/tool-settings.json")).unwrap();
+        // Only the process/native boundary is injected. The production factory
+        // remains unconditionally refused; these files cannot authorize startup.
+        record_intent(&attempt, &initial).unwrap();
+        let armed = ArmedCheck {
+            app: attempt.join("PeerBrush.app"),
+            manifest: initial.clone(),
+            intent: read_marker(&attempt.join("native-start-intent.json")).unwrap(),
+            owner_pid: std::process::id(),
+        };
+        let checks = driver::State::default();
+        checks.session.borrow_mut().begin().unwrap();
+        checks.session.borrow_mut().checking();
+        checks.native_starting().unwrap();
+        let status = coordinator::NativeStatus {
+            phase: crate::sparkle::check::Phase::Quarantined,
+            version: Some("0.30.1".into()),
+            busy: false,
+            cancelled: false,
+            quarantine: true,
+            native_cycle: true,
+            held_generation: Some(7),
+            found_generation: None,
+            download_generation: None,
+            expected_bytes: None,
+            received_bytes: 0,
+            extraction: None,
+            download_complete: false,
+            final_profile: None,
+        };
+        checks.observe_owner(status.clone());
+        {
+            let mut store = tools.lock().unwrap();
+            let before = store.get("brush").unwrap().profile;
+            let mut after = before.clone();
+            after.settings.radius = 49.;
+            store.human_delta("brush", &before, &after).unwrap();
+            if outcome != "dirty-before" {
+                store.flush().unwrap();
+            }
+        }
+        let mut updates = crate::updates::Store::load(&root);
+        let mut preferences = updates.preferences.clone();
+        preferences.channel = crate::updates::Channel::Preview;
+        updates.save(preferences).unwrap();
+        let current_tools = fs::read(root.join("tool-settings.json")).unwrap();
+        let current_updates = fs::read(root.join("updates.json")).unwrap();
+        assert_eq!(current_tools == pre_cycle, outcome == "dirty-before");
+        assert_eq!(
+            tools.lock().unwrap().state()["pending_save"],
+            outcome == "dirty-before"
+        );
+        if outcome == "unsaved-before" {
+            projects[1].lock().unwrap().doc.revision += 1;
+        }
+        if outcome == "copy-error" {
+            fs::create_dir(attempt.join("final-profile")).unwrap();
+        }
+        let operation = (outcome == "operation-before")
+            .then(|| crate::server::FileOperation::begin_workspace(&workspace).unwrap());
+        let record_path = attempt.join("final-profile.json");
+        let _watch = (outcome == "post-record-error").then(|| {
+            WatchProfile::new(move |_| {
+                if record_path.exists() {
+                    Err("Injected final post-record authentication failure".into())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        let workspace_before = current_workspace_bytes(&projects, &paths);
+        let owners_before: Vec<_> = projects
+            .iter()
+            .map(|p| p.lock().unwrap().file_ownership.clone().unwrap())
+            .collect();
+        let versions_before: Vec<_> = projects
+            .iter()
+            .map(|p| p.lock().unwrap().file_version)
+            .collect();
+        let mut final_capture = None;
+        let mut retained = None;
+        let sends = std::cell::Cell::new(0);
+        let result = request_final_observation(
+            &checks,
+            Some(&status),
+            &mut retained,
+            outcome == "blocked-before",
+            |generation| {
+                let reviewed = crate::workspace::lifecycle::update_readiness(&workspace)?;
+                crate::workspace::lifecycle::publish_update_checkpoint(
+                    &workspace,
+                    &reviewed,
+                    |store| {
+                        assert!(tools.try_lock().is_err());
+                        capture_final_profile(
+                            &lease,
+                            store,
+                            &attempt,
+                            &initial,
+                            std::process::id(),
+                            generation,
+                            &reviewed,
+                            &mut final_capture,
+                        )
+                    },
+                )?;
+                Ok(final_capture.as_ref().unwrap().binding.clone())
+            },
+            |binding| {
+                sends.set(sends.get() + 1);
+                // Exercise the actual strict copied-owner consumer, not a fabricated
+                // successful acknowledgement of settings bytes.
+                armed.observe_final_profile(&lease, &binding)?;
+                if outcome == "send-error" {
+                    return Err("Injected lost observation reply".into());
+                }
+                Ok(())
+            },
+        );
+        drop(_watch);
+        drop(operation);
+        assert_eq!(
+            current_workspace_bytes(&projects, &paths),
+            workspace_before,
+            "{outcome}"
+        );
+        for (index, project) in projects.iter().enumerate() {
+            let e = project.lock().unwrap();
+            assert!(!e.closed);
+            assert!(Arc::ptr_eq(
+                e.file_ownership.as_ref().unwrap(),
+                &owners_before[index]
+            ));
+            assert_eq!(e.file_version, versions_before[index]);
+        }
+        let before_refusal = matches!(
+            outcome,
+            "blocked-before"
+                | "dirty-before"
+                | "unsaved-before"
+                | "operation-before"
+                | "copy-error"
+                | "post-record-error"
+        );
+        assert_eq!(
+            result.is_ok(),
+            !before_refusal && outcome != "send-error",
+            "{outcome}: {result:?}"
+        );
+        if outcome == "post-record-error" {
+            assert!(final_capture.is_some() && retained.is_none());
+            read_final_profile(
+                &attempt,
+                &initial,
+                std::process::id(),
+                &final_capture.as_ref().unwrap().binding,
+            )
+            .unwrap();
+        }
+        if let Some(capture) = &final_capture {
+            assert_eq!(
+                fs::read(attempt.join("final-profile/tool-settings.json")).unwrap(),
+                current_tools
+            );
+            assert_eq!(
+                fs::read(attempt.join("final-profile/updates.json")).unwrap(),
+                current_updates
+            );
+            assert!(capture
+                .current
+                .entries
+                .get(Path::new("brushes.json"))
+                .is_none());
+            assert!(request_final_observation(
+                &checks,
+                Some(&status),
+                &mut retained,
+                false,
+                |generation| {
+                    let reviewed = crate::workspace::lifecycle::update_readiness(&workspace)?;
+                    crate::workspace::lifecycle::publish_update_checkpoint(
+                        &workspace,
+                        &reviewed,
+                        |store| {
+                            capture_final_profile(
+                                &lease,
+                                store,
+                                &attempt,
+                                &initial,
+                                std::process::id(),
+                                generation,
+                                &reviewed,
+                                &mut final_capture,
+                            )
+                        },
+                    )?;
+                    unreachable!("A retained concrete capture cannot be republished")
+                },
+                |_| panic!("Repeated final observation reached transport")
+            )
+            .is_err());
+        }
+        let published = fs::read(attempt.join("final-profile.json")).ok();
+        let source_before = current_workspace_bytes(&projects, &paths);
+        if result.is_ok() {
+            let mut processed = false;
+            assert!(accept_final_observation(
+                &checks,
+                &status,
+                retained.as_ref(),
+                &mut processed,
+                false,
+                |_| panic!("Absent reply reached consumer")
+            )
+            .is_none());
+            let mut reply = status.clone();
+            reply.final_profile = retained.clone();
+            match outcome {
+                "newer-source" => {
+                    let mut e = projects[1].lock().unwrap();
+                    let raster = e
+                        .doc
+                        .layers
+                        .iter()
+                        .find(|l| l.source.is_none())
+                        .unwrap()
+                        .id
+                        .clone();
+                    for name in ["Newer human work", "Undo newer temporary"] {
+                        e.edit(
+                            "human",
+                            &[json!({"op":"layer.update","layer":raster,"name":name})],
+                            None,
+                            None,
+                            "Newer work",
+                        )
+                        .unwrap();
+                    }
+                    e.undo("human").unwrap();
+                }
+                "dirty-after" => {
+                    let mut store = tools.lock().unwrap();
+                    let before = store.get("brush").unwrap().profile;
+                    let mut after = before.clone();
+                    after.settings.opacity = 0.63;
+                    store.human_delta("brush", &before, &after).unwrap();
+                }
+                "present-after" => {
+                    let mut preferences = updates.preferences.clone();
+                    preferences.channel = crate::updates::Channel::Stable;
+                    updates.save(preferences).unwrap();
+                }
+                "absent-after" => write_new(&root.join("brushes.json"), b"[]").unwrap(),
+                "removed-after" => fs::remove_file(root.join("updates.json")).unwrap(),
+                "receipt-damage" => {
+                    fs::write(attempt.join("final-profile.json"), b"damaged record").unwrap()
+                }
+                "copy-damage" => fs::write(
+                    attempt.join("final-profile/tool-settings.json"),
+                    b"damaged copy",
+                )
+                .unwrap(),
+                "intent-damage" => {
+                    fs::write(attempt.join("native-start-intent.json"), b"changed intent").unwrap()
+                }
+                "wrong-ready" => {
+                    reply.held_generation = Some(8);
+                    reply.final_profile.as_mut().unwrap().ready_generation = 8;
+                }
+                "wrong-sources" => {
+                    reply.final_profile.as_mut().unwrap().sources_sha256 = "c".repeat(64)
+                }
+                "wrong-record" => {
+                    reply.final_profile.as_mut().unwrap().record_sha256 = "d".repeat(64)
+                }
+                "cancel-after" => checks.cancel(),
+                _ => {}
+            }
+            let expected = current_workspace_bytes(&projects, &paths);
+            let owners: Vec<_> = projects
+                .iter()
+                .map(|p| p.lock().unwrap().file_ownership.clone().unwrap())
+                .collect();
+            let versions: Vec<_> = projects
+                .iter()
+                .map(|p| p.lock().unwrap().file_version)
+                .collect();
+            let current_disk: Vec<_> = crate::settings::update_files()
+                .iter()
+                .map(|name| (name.clone(), fs::read(root.join(name)).ok()))
+                .collect();
+            let accepted = accept_final_observation(
+                &checks,
+                &reply,
+                retained.as_ref(),
+                &mut processed,
+                outcome == "blocked-after",
+                |binding| {
+                    final_capture.as_ref().unwrap().accept(
+                        &workspace,
+                        &lease,
+                        &attempt,
+                        &initial,
+                        std::process::id(),
+                        binding,
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                accepted.is_ok(),
+                outcome == "success",
+                "{outcome}: {accepted:?}"
+            );
+            assert!(processed);
+            assert!(accept_final_observation(
+                &checks,
+                &reply,
+                retained.as_ref(),
+                &mut processed,
+                false,
+                |_| panic!("Repeated reply reached consumer")
+            )
+            .is_none());
+            assert_eq!(
+                current_workspace_bytes(&projects, &paths),
+                expected,
+                "{outcome}"
+            );
+            for (index, project) in projects.iter().enumerate() {
+                let e = project.lock().unwrap();
+                assert!(!e.closed);
+                assert!(Arc::ptr_eq(
+                    e.file_ownership.as_ref().unwrap(),
+                    &owners[index]
+                ));
+                assert_eq!(e.file_version, versions[index]);
+                assert!(crate::file_ownership::Ownership::open(&paths[index], "foreign").is_err());
+            }
+            for (name, bytes) in current_disk {
+                assert_eq!(fs::read(root.join(name)).ok(), bytes);
+            }
+            if outcome == "success" {
+                assert_eq!(expected, source_before);
+                // No-later-writer exclusion is deliberately still unfinished:
+                // a later real preference write remains available and makes the
+                // old observation fail if explicitly reauthenticated.
+                let mut store = tools.lock().unwrap();
+                let before = store.get("brush").unwrap().profile;
+                let mut after = before.clone();
+                after.settings.opacity = 0.57;
+                store.human_delta("brush", &before, &after).unwrap();
+                store.flush().unwrap();
+                drop(store);
+                assert!(final_capture
+                    .as_ref()
+                    .unwrap()
+                    .accept(
+                        &workspace,
+                        &lease,
+                        &attempt,
+                        &initial,
+                        std::process::id(),
+                        retained.as_ref().unwrap()
+                    )
+                    .is_err());
+                assert_eq!(current_workspace_bytes(&projects, &paths), expected);
+            }
+        } else {
+            assert_eq!(current_workspace_bytes(&projects, &paths), source_before);
+        }
+        if outcome != "receipt-damage" {
+            assert_eq!(fs::read(attempt.join("final-profile.json")).ok(), published);
+        }
+        assert_eq!(fs::read(attempt.join("capture.json")).unwrap(), initial);
+        assert_eq!(
+            fs::read(attempt.join("profile/tool-settings.json")).unwrap(),
+            original_profile
+        );
+        assert_eq!(
+            fs::read(attempt.join("current-profile/tool-settings.json")).unwrap(),
+            pre_cycle
+        );
+        assert_eq!(
+            fs::read(attempt.join("PeerBrush.app/Contents/MacOS/peerbrush")).unwrap(),
+            original_app
+        );
+        assert!(checks.view().native_cycle && checks.view().quarantine);
+        assert!(!workspace.lock().unwrap().exiting);
+        assert_eq!(crate::workspace::entries_in(&workspace).len(), 2);
+        assert!(!attempt.join("native-not-started.json").exists());
+        assert!(startup_guard(&profile.locations).is_err());
+        assert!(require_captured_handoff().is_err());
+        assert_eq!(
+            sends.get(),
+            if result.is_ok() || outcome == "send-error" {
+                1
+            } else {
+                0
+            }
+        );
+    }
+}

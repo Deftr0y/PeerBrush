@@ -861,6 +861,13 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
             .contains("not available"));
         assert!(!app.updates.native_updater.download_requested());
         assert!(!app.updates.native_updater.startup_enabled());
+        assert!(!app.updates.native_updater.may_observe_final_profile());
+        assert!(app
+            .updates
+            .native_updater
+            .observe_final_profile(&app.workspace, false)
+            .unwrap_err()
+            .contains("not available"));
         assert_eq!(snapshot(&app), before);
         app.updates
             .native_updater
@@ -901,6 +908,13 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
         let output = frame(&mut app, &ctx, vec![]);
         assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text=="Native update preparation is held. Installation and restart remain unavailable.")));
         assert!(app.updates.native_updater.view().cancelled);
+        assert!(!app.updates.native_updater.may_observe_final_profile());
+        assert!(app
+            .updates
+            .native_updater
+            .observe_final_profile(&app.workspace, false)
+            .is_err());
+        assert_eq!(snapshot(&app), newer);
         click_button(&mut app, &ctx, "Later", true);
         assert!(!app.updates.open);
         app.request_close(crate::ui::lifecycle::Intent::Exit);

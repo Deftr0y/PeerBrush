@@ -102,6 +102,7 @@ enum CheckAction {
     Status,
     Cancel,
     Download,
+    ObserveFinalProfile,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +114,7 @@ struct CheckCommand {
     sequence: u64,
     action: CheckAction,
     found_generation: Option<u64>,
+    final_profile: Option<checkpoint::FinalProfileBinding>,
 }
 impl CheckCommand {
     fn new(request: &Request, sequence: u64, action: CheckAction) -> Self {
@@ -124,6 +126,7 @@ impl CheckCommand {
             sequence,
             action,
             found_generation: None,
+            final_profile: None,
         }
     }
     fn validate(&self, request: &Request, sequence: u64) -> Result<(), String> {
@@ -135,11 +138,19 @@ impl CheckCommand {
             || sequence == 0
             || (sequence == 1 && self.action == CheckAction::Status)
             || (sequence != 1 && self.action == CheckAction::Check)
-            || (sequence == 1 && self.action == CheckAction::Download)
+            || (sequence == 1
+                && matches!(
+                    self.action,
+                    CheckAction::Download | CheckAction::ObserveFinalProfile
+                ))
+            || (self.action == CheckAction::ObserveFinalProfile) != self.final_profile.is_some()
             || (self.action == CheckAction::Download) != self.found_generation.is_some()
             || self.found_generation == Some(0)
         {
             return Err(FAILED.into());
+        }
+        if let Some(binding) = &self.final_profile {
+            binding.validate()?;
         }
         Ok(())
     }
@@ -161,9 +172,16 @@ pub(crate) struct NativeStatus {
     pub(crate) received_bytes: u64,
     pub(crate) extraction: Option<f64>,
     pub(super) download_complete: bool,
+    pub(super) final_profile: Option<checkpoint::FinalProfileBinding>,
 }
 impl NativeStatus {
     fn validate(&self) -> Result<(), String> {
+        if let Some(binding) = &self.final_profile {
+            binding.validate()?;
+            if self.cancelled || self.held_generation != Some(binding.ready_generation) {
+                return Err(FAILED.into());
+            }
+        }
         if self.version.as_ref().is_some_and(|version| {
             version.is_empty() || version.len() > 128 || version.chars().any(char::is_control)
         }) || self
@@ -209,23 +227,30 @@ impl CheckReply {
         sequence: u64,
         action: CheckAction,
         found_generation: Option<u64>,
+        final_profile: Option<&checkpoint::FinalProfileBinding>,
     ) -> Result<(), String> {
         self.binding.validate(request, sequence)?;
         if child <= 1
             || self.owner_pid != child
             || self.binding.action != action
             || self.binding.found_generation != found_generation
+            || self.binding.final_profile.as_ref() != final_profile
         {
             return Err(FAILED.into());
         }
         self.status.validate()
     }
 }
+enum OwnerRequest {
+    Download(u64),
+    ObserveFinalProfile(checkpoint::FinalProfileBinding),
+}
 pub(super) struct RemoteCheck {
     pub(super) receiver: mpsc::Receiver<Result<NativeStatus, String>>,
     cancel: Arc<AtomicBool>,
-    downloads: mpsc::SyncSender<u64>,
+    requests: mpsc::SyncSender<OwnerRequest>,
     download_requested: AtomicBool,
+    final_profile_requested: AtomicBool,
 }
 impl RemoteCheck {
     pub(super) fn cancel(&self) {
@@ -242,8 +267,25 @@ impl RemoteCheck {
         {
             return Err("A native download request is already held".into());
         }
-        self.downloads
-            .try_send(generation)
+        self.requests
+            .try_send(OwnerRequest::Download(generation))
+            .map_err(|_| FAILED.into())
+    }
+    pub(super) fn observe_final_profile(
+        &self,
+        binding: checkpoint::FinalProfileBinding,
+    ) -> Result<(), String> {
+        binding.validate()?;
+        if self.cancel.load(Ordering::Acquire)
+            || self
+                .final_profile_requested
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err("A final profile observation is already held or cancelled".into());
+        }
+        self.requests
+            .try_send(OwnerRequest::ObserveFinalProfile(binding))
             .map_err(|_| FAILED.into())
     }
     pub(super) fn download_requested(&self) -> bool {
@@ -272,6 +314,7 @@ fn accept_check_command(
 struct NativeCommand {
     action: CheckAction,
     found_generation: Option<u64>,
+    final_profile: Option<checkpoint::FinalProfileBinding>,
     reply: mpsc::SyncSender<NativeStatus>,
 }
 fn check_reader(
@@ -298,6 +341,7 @@ fn check_reader(
                 .try_send(NativeCommand {
                     action: command.action,
                     found_generation: command.found_generation,
+                    final_profile: command.final_profile.clone(),
                     reply,
                 })
                 .map_err(|_| FAILED)?;
@@ -617,6 +661,13 @@ pub(super) struct Owner {
     request: Option<Request>,
 }
 impl Owner {
+    pub(super) fn pid(&self) -> Result<u32, String> {
+        self.child
+            .as_ref()
+            .map(|(child, _)| child.id())
+            .filter(|pid| *pid > 1)
+            .ok_or_else(|| FAILED.into())
+    }
     pub(super) fn check(
         &mut self,
         team: String,
@@ -632,7 +683,7 @@ impl Owner {
         let cancel = Arc::new(AtomicBool::new(false));
         let requested_cancel = cancel.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
-        let (downloads, requests) = mpsc::sync_channel(1);
+        let (requests, pending) = mpsc::sync_channel(1);
         let repaint = ctx.clone();
         std::thread::Builder::new()
             .name("peerbrush-native-check-status".into())
@@ -642,24 +693,39 @@ impl Owner {
                     let transport = AtomicBool::new(false);
                     let mut sequence = 1_u64;
                     loop {
-                        let (action, generation) = if requested_cancel.load(Ordering::Acquire) {
-                            (CheckAction::Cancel, None)
+                        let (action, generation, final_profile) = if requested_cancel
+                            .load(Ordering::Acquire)
+                        {
+                            (CheckAction::Cancel, None, None)
                         } else if sequence == 1 {
-                            (CheckAction::Check, None)
+                            (CheckAction::Check, None, None)
                         } else {
-                            match requests.try_recv() {
-                                Ok(generation) => (CheckAction::Download, Some(generation)),
-                                Err(mpsc::TryRecvError::Empty) => (CheckAction::Status, None),
+                            match pending.try_recv() {
+                                Ok(OwnerRequest::Download(generation)) => {
+                                    (CheckAction::Download, Some(generation), None)
+                                }
+                                Ok(OwnerRequest::ObserveFinalProfile(binding)) => {
+                                    (CheckAction::ObserveFinalProfile, None, Some(binding))
+                                }
+                                Err(mpsc::TryRecvError::Empty) => (CheckAction::Status, None, None),
                                 Err(mpsc::TryRecvError::Disconnected) => return Err(FAILED.into()),
                             }
                         };
                         let mut command = CheckCommand::new(&request, sequence, action);
                         command.found_generation = generation;
+                        command.final_profile = final_profile.clone();
                         command.validate(&request, sequence)?;
                         process_identity::authenticate(&socket, child, &team)?;
                         send(&mut socket, &command, deadline, &transport)?;
                         let reply: CheckReply = receive(&mut socket, deadline, &transport)?;
-                        reply.validate(&request, child, sequence, action, generation)?;
+                        reply.validate(
+                            &request,
+                            child,
+                            sequence,
+                            action,
+                            generation,
+                            final_profile.as_ref(),
+                        )?;
                         process_identity::authenticate(&socket, child, &team)?;
                         // Bounded observations may coalesce; none carries an install permit.
                         match sender.try_send(Ok(reply.status)) {
@@ -683,8 +749,9 @@ impl Owner {
         Ok(RemoteCheck {
             receiver,
             cancel,
-            downloads,
+            requests,
             download_requested: AtomicBool::new(false),
+            final_profile_requested: AtomicBool::new(false),
         })
     }
 }
@@ -828,6 +895,7 @@ struct NativeOwner {
     cancel: Arc<AtomicBool>,
     check_attempted: bool,
     armed: Option<checkpoint::ArmedCheck>,
+    final_profile: Option<checkpoint::FinalProfileBinding>,
 }
 impl NativeOwner {
     fn load(
@@ -927,6 +995,7 @@ impl NativeOwner {
             cancel,
             check_attempted: false,
             armed: None,
+            final_profile: None,
         })
     }
     fn check(&mut self) -> Result<(), String> {
@@ -1011,6 +1080,48 @@ impl NativeOwner {
         }
         self.checks.download(generation)
     }
+    fn observe_final_profile(
+        &mut self,
+        binding: checkpoint::FinalProfileBinding,
+    ) -> Result<(), String> {
+        checkpoint::require_captured_handoff()?;
+        if self.final_profile.is_some()
+            || self.cancel.load(Ordering::Acquire)
+            || !self.checks.held_is_current(binding.ready_generation)
+        {
+            return Err(FAILED.into());
+        }
+        process_identity::authenticate(
+            &self._channel,
+            self.parent,
+            &self.configuration.publisher_team_id,
+        )?;
+        self.armed
+            .as_ref()
+            .ok_or(FAILED)?
+            .observe_final_profile(&self._profile, &binding)?;
+        process_identity::authenticate(
+            &self._channel,
+            self.parent,
+            &self.configuration.publisher_team_id,
+        )?;
+        if self.cancel.load(Ordering::Acquire)
+            || !self.checks.held_is_current(binding.ready_generation)
+        {
+            return Err(FAILED.into());
+        }
+        self.final_profile = Some(binding);
+        Ok(())
+    }
+    fn status(&self) -> NativeStatus {
+        let mut status = self.checks.observed_status();
+        status.final_profile = self
+            .final_profile
+            .as_ref()
+            .filter(|binding| self.checks.held_is_current(binding.ready_generation))
+            .cloned();
+        status
+    }
     fn retain_unknown_outcome(mut self, commands: mpsc::Receiver<NativeCommand>) -> ! {
         // No verified native outcome/health retirement exists yet. In particular,
         // parent EOF, deadline, NoUpdate and cycle finish cannot release this owner.
@@ -1029,6 +1140,17 @@ impl NativeOwner {
                             }
                         }
                         CheckAction::Status => {}
+                        CheckAction::ObserveFinalProfile => {
+                            if command
+                                .final_profile
+                                .ok_or_else(|| FAILED.to_string())
+                                .and_then(|binding| self.observe_final_profile(binding))
+                                .is_err()
+                            {
+                                self.final_profile = None;
+                                self.checks.quarantine();
+                            }
+                        }
                         CheckAction::Cancel => self.checks.cancel(),
                         CheckAction::Download => {
                             if command
@@ -1041,7 +1163,7 @@ impl NativeOwner {
                             }
                         }
                     }
-                    let _ = command.reply.try_send(self.checks.observed_status());
+                    let _ = command.reply.try_send(self.status());
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.checks.quarantine(),
                 Err(mpsc::TryRecvError::Empty) => {}

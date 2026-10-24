@@ -296,6 +296,7 @@ fn observation() -> NativeStatus {
         received_bytes: 0,
         extraction: None,
         download_complete: false,
+        final_profile: None,
     }
 }
 #[test]
@@ -328,7 +329,7 @@ fn native_observations_bind_exact_child_sequence_action_and_never_clear_unknown_
         }
         assert_eq!(
             reply
-                .validate(&request, 17, 3, CheckAction::Status, None)
+                .validate(&request, 17, 3, CheckAction::Status, None, None)
                 .is_ok(),
             damage == "none",
             "{damage}"
@@ -677,14 +678,14 @@ fn download_command_and_reply_bind_exact_found_generation_on_the_actual_frame_pa
         status: observation(),
     };
     reply
-        .validate(&request, 17, 2, CheckAction::Download, Some(11))
+        .validate(&request, 17, 2, CheckAction::Download, Some(11), None)
         .unwrap();
     assert!(reply
-        .validate(&request, 17, 2, CheckAction::Download, Some(12))
+        .validate(&request, 17, 2, CheckAction::Download, Some(12), None)
         .is_err());
     reply.binding.found_generation = Some(12);
     assert!(reply
-        .validate(&request, 17, 2, CheckAction::Download, Some(11))
+        .validate(&request, 17, 2, CheckAction::Download, Some(11), None)
         .is_err());
     for damage in [
         "first",
@@ -718,24 +719,25 @@ fn download_command_and_reply_bind_exact_found_generation_on_the_actual_frame_pa
 #[test]
 fn download_request_queue_is_one_shot_even_after_consumption_and_cancel_is_only_a_request() {
     let (_result, receiver) = mpsc::channel();
-    let (downloads, requests) = mpsc::sync_channel(1);
+    let (requests, pending) = mpsc::sync_channel(1);
     let cancel = Arc::new(AtomicBool::new(false));
     let remote = RemoteCheck {
         receiver,
         cancel: cancel.clone(),
-        downloads,
+        requests,
         download_requested: AtomicBool::new(false),
+        final_profile_requested: AtomicBool::new(false),
     };
     assert!(remote.download(0).is_err());
     assert!(!remote.download_requested());
     remote.download(11).unwrap();
     assert!(remote.download_requested());
-    assert_eq!(requests.try_recv().unwrap(), 11);
-    assert!(remote.download(11).is_err() && remote.download(12).is_err());
     assert!(matches!(
-        requests.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
+        pending.try_recv().unwrap(),
+        OwnerRequest::Download(11)
     ));
+    assert!(remote.download(11).is_err() && remote.download(12).is_err());
+    assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
     remote.cancel();
     assert!(cancel.load(Ordering::Acquire));
     assert!(remote.download(11).is_err());
@@ -793,4 +795,179 @@ fn native_download_observations_reject_unbound_counters_and_invalid_extraction()
     let status = observation();
     assert!(serde_json::to_vec(&status).unwrap().len() <= FRAME_LIMIT);
     assert!(checkpoint::require_captured_handoff().is_err());
+}
+
+fn final_binding() -> checkpoint::FinalProfileBinding {
+    checkpoint::FinalProfileBinding {
+        ready_generation: 7,
+        sources_sha256: "a".repeat(64),
+        record_sha256: "b".repeat(64),
+    }
+}
+#[test]
+fn final_profile_command_and_reply_bind_actual_frames_to_ready_sources_record_and_owner() {
+    let request = request();
+    let binding = final_binding();
+    let mut command = CheckCommand::new(&request, 4, CheckAction::ObserveFinalProfile);
+    command.final_profile = Some(binding.clone());
+    let (mut parent, mut child) = UnixStream::pair().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let cancel = AtomicBool::new(false);
+    send(&mut parent, &command, deadline, &cancel).unwrap();
+    let authenticated = std::cell::Cell::new(false);
+    let actual = accept_check_command(&mut child, &request, 4, deadline, &cancel, |_| {
+        authenticated.set(true);
+        Ok(())
+    })
+    .unwrap();
+    assert!(authenticated.get());
+    assert_eq!(actual.final_profile.as_ref(), Some(&binding));
+    let mut status = observation();
+    status.final_profile = Some(binding.clone());
+    send(
+        &mut child,
+        &CheckReply {
+            binding: actual,
+            owner_pid: 17,
+            status,
+        },
+        deadline,
+        &cancel,
+    )
+    .unwrap();
+    let reply: CheckReply = receive(&mut parent, deadline, &cancel).unwrap();
+    reply
+        .validate(
+            &request,
+            17,
+            4,
+            CheckAction::ObserveFinalProfile,
+            None,
+            Some(&binding),
+        )
+        .unwrap();
+    for damage in [
+        "first",
+        "missing",
+        "action",
+        "found",
+        "zero",
+        "sources",
+        "record",
+        "uppercase",
+        "nonce",
+        "checkpoint",
+        "manifest",
+    ] {
+        let mut command: CheckCommand =
+            serde_json::from_slice(&serde_json::to_vec(&command).unwrap()).unwrap();
+        match damage {
+            "first" => command.sequence = 1,
+            "missing" => command.final_profile = None,
+            "action" => command.action = CheckAction::Status,
+            "found" => command.found_generation = Some(3),
+            "zero" => command.final_profile.as_mut().unwrap().ready_generation = 0,
+            "sources" => command.final_profile.as_mut().unwrap().sources_sha256 = "a".repeat(63),
+            "record" => {
+                command.final_profile.as_mut().unwrap().record_sha256 = "not a digest".into()
+            }
+            "uppercase" => command.final_profile.as_mut().unwrap().record_sha256 = "B".repeat(64),
+            "nonce" => command.nonce = "c".repeat(64),
+            "checkpoint" => command.checkpoint = uuid::Uuid::new_v4().to_string(),
+            "manifest" => command.manifest_sha256 = "d".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(
+            command.validate(&request, command.sequence).is_err(),
+            "{damage}"
+        );
+    }
+    for damage in [
+        "owner",
+        "ready",
+        "sources",
+        "record",
+        "cancelled",
+        "cycle",
+        "quarantine",
+    ] {
+        let mut reply: CheckReply =
+            serde_json::from_slice(&serde_json::to_vec(&reply).unwrap()).unwrap();
+        match damage {
+            "owner" => reply.owner_pid = 18,
+            "ready" => reply.status.held_generation = Some(8),
+            "sources" => {
+                reply.binding.final_profile.as_mut().unwrap().sources_sha256 = "c".repeat(64)
+            }
+            "record" => {
+                reply.binding.final_profile.as_mut().unwrap().record_sha256 = "d".repeat(64)
+            }
+            "cancelled" => reply.status.cancelled = true,
+            "cycle" => reply.status.native_cycle = false,
+            "quarantine" => reply.status.quarantine = false,
+            _ => unreachable!(),
+        }
+        assert!(
+            reply
+                .validate(
+                    &request,
+                    17,
+                    4,
+                    CheckAction::ObserveFinalProfile,
+                    None,
+                    Some(&binding)
+                )
+                .is_err(),
+            "{damage}"
+        );
+    }
+    assert!(checkpoint::require_captured_handoff().is_err());
+}
+#[test]
+fn final_profile_request_uses_the_sole_bounded_queue_once_and_retains_cancelled_or_failed_requests()
+{
+    for outcome in ["success", "full", "disconnected", "cancelled"] {
+        let (_result, receiver) = mpsc::channel();
+        let (requests, pending) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let remote = RemoteCheck {
+            receiver,
+            cancel: cancel.clone(),
+            requests,
+            download_requested: AtomicBool::new(false),
+            final_profile_requested: AtomicBool::new(false),
+        };
+        if outcome == "full" {
+            remote.download(3).unwrap();
+        }
+        if outcome == "cancelled" {
+            remote.cancel();
+        }
+        let mut pending = Some(pending);
+        if outcome == "disconnected" {
+            drop(pending.take());
+        }
+        assert_eq!(
+            remote.observe_final_profile(final_binding()).is_ok(),
+            outcome == "success",
+            "{outcome}"
+        );
+        if let Some(pending) = pending {
+            match pending.try_recv() {
+                Ok(OwnerRequest::ObserveFinalProfile(binding)) => {
+                    assert_eq!(binding, final_binding())
+                }
+                Ok(OwnerRequest::Download(3)) => assert_eq!(outcome, "full"),
+                Err(mpsc::TryRecvError::Empty) => assert_eq!(outcome, "cancelled"),
+                _ => panic!("Wrong queued request"),
+            }
+        }
+        assert!(
+            remote.observe_final_profile(final_binding()).is_err(),
+            "{outcome}"
+        );
+        remote.cancel();
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(remote.observe_final_profile(final_binding()).is_err());
+    }
 }

@@ -163,6 +163,12 @@ impl State {
             .as_ref()
             .and_then(|held| held._item.as_ref().and(held.generation))
     }
+    pub(super) fn held_is_current(&self, generation: u64) -> bool {
+        generation != 0
+            && self.held_generation() == Some(generation)
+            && self.view().native_cycle
+            && !self.view().cancelled
+    }
     fn retain_found(&self, item: &AnyObject, reply: &Block<dyn Fn(isize)>, downloadable: bool) {
         if self.found.borrow().is_some() || self.choice_sent.get() || !self.has_owner() {
             self.quarantine();
@@ -320,6 +326,7 @@ impl State {
             received_bytes: self.received_bytes.get(),
             extraction: self.extraction.get(),
             download_complete: self.download_complete.get(),
+            final_profile: None,
         }
     }
     pub(super) fn observe_owner(&self, status: super::coordinator::NativeStatus) {
@@ -674,6 +681,9 @@ pub(super) fn assert_owned_ready(marker: MainThreadMarker, updater: &AnyObject) 
             let _: () = msg_send![&*driver, showReadyToInstallAndRelaunch: &*ready];
         }
         assert_eq!(state.held_generation(), Some(generation));
+        assert_eq!(state.held_is_current(generation), generation == 1);
+        assert!(!state.held_is_current(0));
+        assert!(!state.held_is_current(generation + 1));
         {
             let held = state.held_ready.borrow();
             let held = held.as_ref().unwrap();
@@ -688,6 +698,7 @@ pub(super) fn assert_owned_ready(marker: MainThreadMarker, updater: &AnyObject) 
         }
         state.cancel();
         state.finished();
+        assert!(!state.held_is_current(generation));
         assert!(state.view().native_cycle && state.view().quarantine);
         assert_eq!(state.held_generation(), Some(generation));
         assert_eq!(calls.get(), 0);
