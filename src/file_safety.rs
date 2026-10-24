@@ -17,6 +17,19 @@ pub struct Version {
     fingerprint: [u8; 32],
 }
 
+pub(crate) fn open_for_identity(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const OPEN_REPARSE_POINT: u32 = 0x00200000;
+        // Repeated identity checks need metadata, without acquiring file-data access.
+        options.access_mode(0).custom_flags(OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
 #[cfg(unix)]
 pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
     use std::os::unix::fs::MetadataExt;
@@ -418,6 +431,46 @@ pub fn previous_versions(path: &Path) -> Result<Vec<PreviousVersion>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn identity_handle_denies_data_access_and_distinguishes_replaced_names() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let directory = parent.join(format!("pb-identity-access-{}", crate::engine::id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("owned.bin");
+        let moved = directory.join("moved.bin");
+        let original = b"owned native bytes\x27\x11\x4e\x23\x75\x37";
+        fs::write(&path, original).unwrap();
+        let held = fs::File::open(&path).unwrap();
+        let original_identity = identity(&held).unwrap();
+        let mut named = open_for_identity(&path).unwrap();
+        assert_eq!(identity(&named).unwrap(), original_identity);
+        assert_eq!(named.metadata().unwrap().len(), original.len() as u64);
+        assert_eq!(
+            named.read(&mut [0; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            named.write(b"forbidden").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"foreign bytes retained").unwrap();
+        let foreign = open_for_identity(&path).unwrap();
+        assert_ne!(identity(&foreign).unwrap(), original_identity);
+        assert_eq!(identity(&named).unwrap(), original_identity);
+        assert_eq!(identity(&held).unwrap(), original_identity);
+        assert_eq!(fs::read(&path).unwrap(), b"foreign bytes retained");
+        assert_eq!(fs::read(&moved).unwrap(), original);
+        drop(foreign);
+        drop(named);
+        drop(held);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(moved).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
     #[test]
     fn save_leases_release_before_duplicated_descriptors_close() {
         let dir = std::env::temp_dir().join(format!("pb-duplicated-lease-{}", crate::engine::id()));

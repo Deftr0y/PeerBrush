@@ -600,7 +600,7 @@ impl SaveTemporary {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err("Save temporary path is not a regular file".into());
         }
-        let named = fs::File::open(&self.path).map_err(|e| e.to_string())?;
+        let named = crate::file_safety::open_for_identity(&self.path).map_err(|e| e.to_string())?;
         if crate::file_safety::identity(&self.file)? != self.identity
             || crate::file_safety::identity(&named)? != self.identity
         {
