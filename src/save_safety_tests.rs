@@ -1238,3 +1238,110 @@ fn source_compression_and_replay_refuse_newer_human_work_without_publication() {
         }
     }
 }
+
+#[test]
+fn buffered_source_flush_failure_and_cancel_keep_actual_native_save_and_history() {
+    for depth in [8, 16] {
+        for extension in ["psd", "psb"] {
+            for cancel in [false, true] {
+                let directory =
+                    std::env::temp_dir().join(format!("pb-source-flush-{}", engine::id()));
+                fs::create_dir(&directory).unwrap();
+                let path = directory.join(format!("art.{extension}"));
+                let shared =
+                    native_save_fixture(depth, path.file_name().unwrap().to_str().unwrap());
+                save(&shared, &path).unwrap();
+                let original = fs::read(&path).unwrap();
+                {
+                    let mut e = shared.lock().unwrap();
+                    let layer = e.doc.layers[0].id.clone();
+                    for opacity in [0.5, 0.25] {
+                        e.edit(
+                            "human",
+                            &[json!({"op":"layer.update","layer":layer,"opacity":opacity})],
+                            None,
+                            None,
+                            "Human settings before Save",
+                        )
+                        .unwrap();
+                    }
+                    e.undo("human").unwrap();
+                    assert!(!e.undo.is_empty() && !e.redo.is_empty());
+                }
+                let history = |e: &Engine| {
+                    let entries = |items: &[engine::History]| {
+                        items
+                            .iter()
+                            .map(|h| {
+                                json!({"before":h.before,"after":h.after,
+                            "actor":h.actor,"label":h.label,"task":h.task,"scopes":h.scopes,
+                            "gesture":h.gesture,"reverted":h.reverted})
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    json!({"undo":entries(&e.undo),"redo":entries(&e.redo),"leases":e.leases})
+                };
+                let (document, histories, saved, version) = {
+                    let e = shared.lock().unwrap();
+                    (
+                        serde_json::to_value(&e.doc).unwrap(),
+                        history(&e),
+                        e.saved_revision,
+                        e.file_version,
+                    )
+                };
+                let control = crate::saving::Control::default();
+                let observed = control.clone();
+                let hit = std::rc::Rc::new(std::cell::Cell::new(false));
+                let reached = hit.clone();
+                let watch = WatchSave::new(move |phase, temporary, _| {
+                    if phase == "write"
+                        && observed.status().stage == "Writing editable sources"
+                        && temporary.extension().is_some_and(|e| e == "psd-spool")
+                        && !reached.replace(true)
+                    {
+                        if cancel {
+                            assert!(observed.cancel());
+                        } else {
+                            return Err("Injected compressed source physical flush failure".into());
+                        }
+                    }
+                    Ok(())
+                });
+                let error =
+                    save_controlled(&shared, &path, &json!({}), &control, || {}).unwrap_err();
+                drop(watch);
+                assert!(
+                    hit.get(),
+                    "The real guarded compressed-source file writer must be reached"
+                );
+                assert!(
+                    error.contains(if cancel {
+                        "canceled"
+                    } else {
+                        "physical flush failure"
+                    }),
+                    "{error}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let e = shared.lock().unwrap();
+                assert_eq!(serde_json::to_value(&e.doc).unwrap(), document);
+                assert_eq!(history(&e), histories);
+                assert_eq!(e.saved_revision, saved);
+                assert_eq!(e.file_version, version);
+                assert!(e.file_ownership.is_some());
+                assert!(crate::file_ownership::Ownership::open(&path, "other project").is_err());
+                assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
+                assert!(control.status().finished && control.status().error.is_some());
+                assert_eq!(control.status().cancel_requested, cancel);
+                assert!(!fs::read_dir(&directory).unwrap().any(|entry| matches!(
+                    entry.unwrap().path().extension().and_then(|s| s.to_str()),
+                    Some("tmp" | "psd-spool")
+                )));
+                drop(e);
+                drop(shared);
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+}

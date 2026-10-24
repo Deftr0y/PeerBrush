@@ -1400,7 +1400,10 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
         return Err("Photoshop standard spool length changed".into());
     }
     let (compressed_length, compressed_hash, spool_length) = {
-        let mut source = StandardWriter::new(&mut *spool, check);
+        let mut source = StandardWriter::new(
+            std::io::BufWriter::with_capacity(64 * 1024, &mut *spool),
+            check,
+        );
         // Count the existing standard bytes against the same spool/file limit;
         // the fresh hash covers only the appended compressed source segment.
         source.bytes = total;
@@ -1418,6 +1421,7 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
         serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
         let mut source = z.inner.finish().map_err(|e| e.to_string())?;
         source.flush().map_err(|e| e.to_string())?;
+        check()?;
         (source.bytes - total, source.hash, source.bytes)
     };
     progress("Assembling verified Photoshop output", 0, 0)?;
@@ -4149,6 +4153,124 @@ mod storage_tests {
             }
         }
     }
+    #[test]
+    fn compressed_source_spool_batches_actual_writes_without_changing_native_output() {
+        use std::{cell::Cell, rc::Rc};
+        struct PhysicalSpool {
+            data: std::io::Cursor<Vec<u8>>,
+            source: Rc<Cell<bool>>,
+            writes: Vec<usize>,
+        }
+        impl Write for PhysicalSpool {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.source.get() {
+                    self.writes.push(bytes.len());
+                }
+                self.data.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.data.flush()
+            }
+        }
+        impl Read for PhysicalSpool {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.data.read(bytes)
+            }
+        }
+        impl Seek for PhysicalSpool {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(from)
+            }
+        }
+        for depth in [8, 16] {
+            let mut doc = streamed_fixture(depth);
+            doc.width = 256;
+            doc.height = 256;
+            let pixels = &mut doc.layers[0].pixels;
+            *pixels = Raster::new_depth(256, 256, depth);
+            let mut seed = 0x5b37_19d1u32;
+            for y in 0..256 {
+                for x in 0..256 {
+                    let pixel = std::array::from_fn(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        seed as u16
+                    });
+                    pixels.set16(x, y, pixel);
+                }
+            }
+            pixels.set16(0, 0, [12347, 23459, 34571, 0]);
+            let before = serde_json::to_value(&doc).unwrap();
+            let png = doc.export_png().unwrap();
+            for layout in [Layout::Psd, Layout::Psb] {
+                let source = Rc::new(Cell::new(false));
+                let mut spool = PhysicalSpool {
+                    data: std::io::Cursor::new(Vec::new()),
+                    source: source.clone(),
+                    writes: Vec::new(),
+                };
+                let mut output = Vec::new();
+                encode_layout_progress_to(
+                    &doc,
+                    layout,
+                    &mut output,
+                    &mut spool,
+                    &|| Ok(()),
+                    &|stage, _, _| {
+                        source.set(stage == "Writing editable sources");
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                let mut file = Cursor::new(&output);
+                file.bytes(26).unwrap();
+                file.block().unwrap();
+                let resources = file.block().unwrap();
+                let length = u32::from_be_bytes(resources[20..24].try_into().unwrap()) as usize;
+                let compressed = &resources[28..24 + length];
+                let section = layout.block(&mut file).unwrap();
+                let merged = &output[file.pos..];
+                assert!(compressed.len() > 64 * 1024);
+                assert!(spool.writes.len() >= 2);
+                assert_eq!(spool.writes.iter().sum::<usize>(), compressed.len());
+                assert!(spool.writes.iter().all(|n| *n > 0 && *n <= 64 * 1024));
+                // The pinned compressor emits at most 32 KiB per write, including
+                // a small zlib header. Physical writes coalesce those fragments.
+                assert!(spool.writes[..spool.writes.len() - 1]
+                    .iter()
+                    .all(|n| *n >= 32 * 1024));
+                assert_eq!(
+                    spool.data.get_ref(),
+                    &[section, merged, compressed].concat()
+                );
+                let original = Embedded {
+                    format: 29,
+                    standard_hash: hash(section) ^ hash(merged),
+                    document: doc.clone(),
+                };
+                let mut previous = ZlibEncoder::new(Vec::new(), Compression::fast());
+                serde_json::to_writer(&mut previous, &original).unwrap();
+                assert_eq!(compressed, previous.finish().unwrap());
+                let restored = decode(&output).unwrap();
+                assert!(!restored.read_only);
+                assert_eq!(serde_json::to_value(&restored).unwrap(), before);
+                assert_eq!(restored.export_png().unwrap(), png);
+                let mut standard_only = output[..30].to_vec();
+                standard_only.extend([0; 4]);
+                standard_only.extend(&output[34 + resources.len()..]);
+                let standard = decode(&standard_only).unwrap();
+                assert_eq!(standard.bit_depth, depth);
+                assert_eq!(
+                    standard.layers[0].pixels.rgba16(),
+                    doc.layers[0].pixels.rgba16()
+                );
+                assert_eq!(standard.export_png().unwrap(), png);
+                assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            }
+        }
+    }
+
     #[test]
     fn appended_source_segment_is_bound_and_source_spool_failures_keep_native_input() {
         use std::cell::Cell;
