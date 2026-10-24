@@ -1404,7 +1404,7 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
         // Count the existing standard bytes against the same spool/file limit;
         // the fresh hash covers only the appended compressed source segment.
         source.bytes = total;
-        let mut z = BoundedWriter {
+        let z = BoundedWriter {
             // Batch the compressor's small fragments before guarded writes too.
             inner: ZlibEncoder::new(
                 std::io::BufWriter::with_capacity(64 * 1024, source),
@@ -1419,7 +1419,11 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
             check,
             error: "Editable PSD source data exceeds its bounded serialization budget",
         };
-        serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
+        // JSON emits tiny fragments; check shared state at bounded input writes
+        // instead of contending with the UI for every number and delimiter.
+        let mut json = std::io::BufWriter::with_capacity(64 * 1024, z);
+        serde_json::to_writer(&mut json, &embedded).map_err(|e| e.to_string())?;
+        let z = json.into_inner().map_err(|e| e.to_string())?;
         let mut buffered = z.inner.finish().map_err(|e| e.to_string())?;
         buffered.flush().map_err(|e| e.to_string())?;
         let source = buffered.into_inner().map_err(|e| e.to_string())?;
@@ -4275,12 +4279,17 @@ mod storage_tests {
                 };
                 serde_json::to_writer(&mut previous, &original).unwrap();
                 assert_eq!(compressed, previous.inner.finish().unwrap());
-                assert!(source_checks.get() >= input_checks.get());
+                let input_chunks = serde_json::to_vec(&original)
+                    .unwrap()
+                    .len()
+                    .div_ceil(64 * 1024);
+                assert!(source_checks.get() >= input_chunks);
                 assert!(
-                    source_checks.get() <= input_checks.get() + spool.writes.len() + 8,
-                    "Compressed-source guards must follow buffered writes, retaining every input check: {} source, {} input, {} physical writes",
-                    source_checks.get(), input_checks.get(), spool.writes.len()
+                    source_checks.get() <= input_chunks + spool.writes.len() + 8,
+                    "Source guards must cover bounded input and physical writes: {} source, {} chunks, {} physical writes",
+                    source_checks.get(), input_chunks, spool.writes.len()
                 );
+                assert!(source_checks.get() < input_checks.get());
                 let restored = decode(&output).unwrap();
                 assert!(!restored.read_only);
                 assert_eq!(serde_json::to_value(&restored).unwrap(), before);
