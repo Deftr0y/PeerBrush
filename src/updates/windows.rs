@@ -1,4 +1,4 @@
-//! Downloaded signed Windows media only. No deployment, registration or restart.
+//! Signed Windows media and dormant native staging. No registration or restart.
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -90,6 +90,10 @@ pub(crate) struct View {
     pub phase: &'static str,
     pub message: String,
     pub version: Option<[u16; 4]>,
+    pub staged_version: Option<[u16; 4]>,
+    pub percentage: Option<u32>,
+    pub installed_version: Option<[u16; 4]>,
+    pub recorded_staging: bool,
 }
 
 struct Control {
@@ -622,12 +626,57 @@ fn small(file: &Held, control: &Control) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+struct RetainedSelection {
+    owned: Directory,
+    journal: Held,
+    descriptor: Held,
+    package: Held,
+    runtime: Held,
+    prepared: Prepared,
+}
+impl RetainedSelection {
+    fn check(&self, verifier: &dyn Verifier, control: &Control) -> Result<()> {
+        for file in [
+            &self.journal,
+            &self.descriptor,
+            &self.package,
+            &self.runtime,
+        ] {
+            file.check(control)?;
+        }
+        self.owned.check()?;
+        if verifier.source(&self.prepared.policy)? != self.prepared.source {
+            return Err("Installed Windows source changed; staging evidence is retained.".into());
+        }
+        Ok(())
+    }
+}
 fn reconcile(
     root: &Path,
     policy: &Policy,
     verifier: &dyn Verifier,
     control: &Control,
 ) -> Result<Prepared> {
+    Ok(retain_selection(root, policy, verifier, control)?.prepared)
+}
+
+fn retain_selection(
+    root: &Path,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<RetainedSelection> {
+    no_stage_evidence(root)?;
+    let retained = authenticate_retained_media(root, policy, verifier, control)?;
+    no_stage_evidence(root)?;
+    Ok(retained)
+}
+fn authenticate_retained_media(
+    root: &Path,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<RetainedSelection> {
     let owned = Directory::open(root)?;
     let journal = Held::open(&root.join("prepared.json"), SMALL, control)?;
     let prepared: Prepared = serde_json::from_slice(&small(&journal, control)?)
@@ -665,7 +714,14 @@ fn reconcile(
     }
     owned.check()?;
     control.check()?;
-    Ok(prepared)
+    Ok(RetainedSelection {
+        owned,
+        journal,
+        descriptor: descriptor_file,
+        package,
+        runtime,
+        prepared,
+    })
 }
 
 fn prepare(
@@ -777,24 +833,24 @@ fn prepare(
     Ok(prepared)
 }
 
-fn acquire(
-    root: &Path,
-    policy: &Policy,
-    transport: &dyn Transport,
-    verifier: &dyn Verifier,
-    control: &Control,
-) -> Result<Prepared> {
-    policy.validate()?;
-    let owned = Directory::open(root)?;
-    let versions = root.join(".peerbrush-versions");
-    if fs::symlink_metadata(&versions).is_ok() {
-        directory(&versions)?;
+fn no_stage_evidence(root: &Path) -> Result<()> {
+    for marker in ["stage-intent.json", "stage-outcome.json"] {
+        match fs::symlink_metadata(root.join(marker)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(STAGE_HOLD.into()),
+        }
     }
-    // One existing lease guards selection across all attempts, including a
-    // canceled native verification whose owning Controller has been dropped.
-    let lease = crate::file_safety::Lease::acquire(&root.join("acquisition.json"))
-        .map_err(|_| "Another Windows acquisition owns this cache or its lease is unavailable.")?;
-    directory(&versions)?;
+    Ok(())
+}
+
+fn attempts(root: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    let result = attempt_inventory(root)?;
+    for path in &result.0 {
+        no_stage_evidence(path)?;
+    }
+    Ok(result)
+}
+fn attempt_inventory(root: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
     let mut attempts = Vec::new();
     let mut prepared = None;
     for item in fs::read_dir(root).map_err(|_| "Cannot inspect Windows acquisition state.")? {
@@ -815,11 +871,18 @@ fn acquire(
             return Err("Unrecognized Windows acquisition directory; files retained.".into());
         }
         directory(&item.path())?;
-        if fs::symlink_metadata(item.path().join("prepared.json")).is_ok() {
-            if prepared.replace(item.path()).is_some() {
-                return Err(
-                    "Multiple retained Windows selections are ambiguous; none was accepted.".into(),
-                );
+        match fs::symlink_metadata(item.path().join("prepared.json")) {
+            Ok(_) => {
+                if prepared.replace(item.path()).is_some() {
+                    return Err(
+                        "Multiple retained Windows selections are ambiguous; none was accepted."
+                            .into(),
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err("Cannot inspect retained Windows selection; files retained.".into())
             }
         }
         attempts.push(item.path());
@@ -827,6 +890,28 @@ fn acquire(
             return Err("Windows acquisition state exceeds its retained-attempt budget.".into());
         }
     }
+    Ok((attempts, prepared))
+}
+
+fn acquire(
+    root: &Path,
+    policy: &Policy,
+    transport: &dyn Transport,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<Prepared> {
+    policy.validate()?;
+    let owned = Directory::open(root)?;
+    let versions = root.join(".peerbrush-versions");
+    if fs::symlink_metadata(&versions).is_ok() {
+        directory(&versions)?;
+    }
+    // One existing lease guards selection across all attempts, including a
+    // canceled native verification whose owning Controller has been dropped.
+    let lease = crate::file_safety::Lease::acquire(&root.join("acquisition.json"))
+        .map_err(|_| "Another Windows acquisition owns this cache or its lease is unavailable.")?;
+    directory(&versions)?;
+    let (attempts, prepared) = attempts(root)?;
     if let Some(path) = prepared {
         let result = reconcile(&path, policy, verifier, control)?;
         owned.check()?;
@@ -859,39 +944,489 @@ fn acquire(
     Ok(result)
 }
 
+const STAGE_HOLD: &str =
+    "Windows staging state is retained; registration and restart remain unavailable.";
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StageTerminal {
+    hresult: Option<i32>,
+    registered: Option<bool>,
+    canceled: bool,
+    invalid_progress: bool,
+}
+enum StageObservation {
+    Pending,
+    Uncertain,
+    Terminal(StageTerminal),
+}
+// Progress and terminal delivery share a linearization point. Never hold this
+// lock across native Status/GetResults, which can invoke the progress handler.
+struct StageProgress {
+    state: Mutex<StageProgressState>,
+    view: Arc<Mutex<View>>,
+}
+#[derive(Default)]
+struct StageProgressState {
+    invalid: bool,
+    finished: bool,
+}
+impl StageProgress {
+    fn new(view: Arc<Mutex<View>>) -> Self {
+        Self {
+            state: Mutex::new(StageProgressState::default()),
+            view,
+        }
+    }
+    fn percentage(&self, percentage: u32) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.finished || state.invalid {
+            return;
+        }
+        if percentage > 100 {
+            state.invalid = true;
+            return;
+        }
+        let mut view = self.view.lock().unwrap_or_else(|p| p.into_inner());
+        view.phase = "Staging signed Windows package with Windows";
+        view.percentage = Some(percentage);
+    }
+    fn invalidate(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.finished {
+            state.invalid = true;
+        }
+    }
+    fn poll(&self, read: impl FnOnce() -> StageObservation) -> StageObservation {
+        let observed = read();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match observed {
+            StageObservation::Terminal(mut terminal) => {
+                state.finished = true;
+                terminal.invalid_progress |= state.invalid;
+                StageObservation::Terminal(terminal)
+            }
+            _ if state.invalid => StageObservation::Uncertain,
+            other => other,
+        }
+    }
+}
+trait StageOperation {
+    fn poll(&mut self) -> StageObservation;
+    fn cancel(&mut self);
+}
+trait Stager {
+    fn submit(
+        &self,
+        selection: &RetainedSelection,
+        view: Arc<Mutex<View>>,
+    ) -> Result<Box<dyn StageOperation>>;
+}
+#[derive(Serialize)]
+struct StageIntent<'a> {
+    schema: u32,
+    prepared_sha256: &'a str,
+    prepared: &'a Prepared,
+}
+#[derive(Serialize)]
+struct StageOutcome<'a> {
+    schema: u32,
+    intent_sha256: &'a str,
+    terminal: &'a StageTerminal,
+    rejected: bool,
+}
+struct Staged {
+    version: [u16; 4],
+    accepted: bool,
+}
+fn stage_record(path: &Path, value: &impl Serialize, control: &Control) -> Result<Held> {
+    let lease = crate::file_safety::Lease::acquire(path)?;
+    if lease.expected.is_some() {
+        return Err(STAGE_HOLD.into());
+    }
+    let bytes = serde_json::to_vec(value).map_err(|_| STAGE_HOLD)?;
+    if bytes.len() as u64 > SMALL {
+        return Err(STAGE_HOLD.into());
+    }
+    crate::server::atomic_write_checked(path, &bytes, |_| lease.validate())?;
+    let saved = Held::open(path, SMALL, control)?;
+    if small(&saved, control)? != bytes {
+        return Err(STAGE_HOLD.into());
+    }
+    Ok(saved)
+}
+fn stage(
+    root: &Path,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    stager: &dyn Stager,
+    control: &Control,
+) -> Result<Staged> {
+    policy.validate()?;
+    control.check()?;
+    let owned = Directory::open(root)?;
+    let versions = root.join(".peerbrush-versions");
+    if fs::symlink_metadata(&versions).is_ok() {
+        directory(&versions)?;
+    }
+    let acquisition = crate::file_safety::Lease::acquire(&root.join("acquisition.json"))?;
+    directory(&versions)?;
+    let (_, selected) = attempts(root)?;
+    let selected = selected.ok_or("Prepare signed Windows media before staging.")?;
+    let transaction_versions = selected.join(".peerbrush-versions");
+    directory(&transaction_versions)?;
+    let transaction = crate::file_safety::Lease::acquire(&selected.join("prepared.json"))?;
+    directory(&transaction_versions)?;
+    let retained = retain_selection(&selected, policy, verifier, control)?;
+    retained.check(verifier, control)?;
+    owned.check()?;
+    acquisition.validate()?;
+    transaction.validate()?;
+    let intent = stage_record(
+        &selected.join("stage-intent.json"),
+        &StageIntent {
+            schema: 1,
+            prepared_sha256: &retained.journal.media.sha256,
+            prepared: &retained.prepared,
+        },
+        control,
+    )?;
+    // A durable intent precedes the provider boundary. No automatic retirement,
+    // cleanup or retry is safe after submission, including after process loss.
+    control.check()?;
+    retained.check(verifier, control)?;
+    let mut operation = stager.submit(&retained, control.view.clone())?;
+    let mut rejected = false;
+    let mut cancellation_sent = false;
+    let terminal = loop {
+        if control.cancelled.load(Ordering::Acquire) || Instant::now() >= control.deadline {
+            rejected = true;
+        }
+        if rejected && !cancellation_sent {
+            operation.cancel();
+            cancellation_sent = true;
+        }
+        match operation.poll() {
+            StageObservation::Pending => {}
+            StageObservation::Uncertain => {
+                rejected = true;
+            }
+            StageObservation::Terminal(value) => {
+                rejected |= value.invalid_progress;
+                break value;
+            }
+        }
+        if rejected {
+            let mut view = control.view.lock().unwrap_or_else(|p| p.into_inner());
+            view.phase = "Waiting for the owned Windows staging operation";
+            view.message = STAGE_HOLD.into();
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    rejected |= control.cancelled.load(Ordering::Acquire) || Instant::now() >= control.deadline;
+    // Late terminal observations are retained even after Cancel/timeout. A new
+    // independent bounded readback is not canceled by the old UI request.
+    let readback = Control {
+        cancelled: Arc::new(AtomicBool::new(false)),
+        deadline: Instant::now() + TIMEOUT,
+        view: control.view.clone(),
+    };
+    let _outcome = stage_record(
+        &selected.join("stage-outcome.json"),
+        &StageOutcome {
+            schema: 1,
+            intent_sha256: &intent.media.sha256,
+            terminal: &terminal,
+            rejected,
+        },
+        &readback,
+    )?;
+    retained.check(verifier, &readback)?;
+    intent.check(&readback)?;
+    owned.check()?;
+    acquisition.validate()?;
+    transaction.validate()?;
+    // shortcut: submitted staging attempts are never automatically retried or
+    // retired; add reviewed outcome/retirement before selecting another update.
+    Ok(Staged {
+        version: retained.prepared.selection.version,
+        accepted: !rejected
+            && !terminal.canceled
+            && terminal.hresult == Some(0)
+            && terminal.registered == Some(false),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedIntent {
+    schema: u32,
+    prepared_sha256: String,
+    prepared: Prepared,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedOutcome {
+    schema: u32,
+    intent_sha256: String,
+    terminal: StageTerminal,
+    rejected: bool,
+}
+enum Reconciled {
+    Empty,
+    Prepared(Prepared),
+    RecordedStaging([u16; 4]),
+}
+// Retained observations grant no installation, OS-stage, cancellation or cleanup
+// authority. A native current-user query is separate from this record's target.
+fn inspect_retained(
+    root: &Path,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<Reconciled> {
+    policy.validate()?;
+    control.check()?;
+    let current = verifier.source(policy)?;
+    control.view.lock().unwrap().installed_version = Some(current.version);
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Reconciled::Empty),
+        Err(_) => return Err(STAGE_HOLD.into()),
+        Ok(_) => {}
+    }
+    let owned = Directory::open(root)?;
+    let versions = root.join(".peerbrush-versions");
+    if fs::symlink_metadata(&versions).is_ok() {
+        directory(&versions)?;
+    }
+    let acquisition = crate::file_safety::Lease::acquire(&root.join("acquisition.json"))?;
+    directory(&versions)?;
+    let (mut attempts, selected) = attempt_inventory(root)?;
+    for path in &attempts {
+        if selected.as_ref() != Some(path) {
+            no_stage_evidence(path)?;
+        }
+    }
+    let mut authenticated = None;
+    let mut evidence = Vec::new();
+    let mut transaction_owner = None;
+    let result = if let Some(selected) = &selected {
+        directory(&selected.join(".peerbrush-versions"))?;
+        let transaction = crate::file_safety::Lease::acquire(&selected.join("prepared.json"))?;
+        directory(&selected.join(".peerbrush-versions"))?;
+        let retained = authenticate_retained_media(selected, policy, verifier, control)?;
+        if current != retained.prepared.source {
+            return Err(STAGE_HOLD.into());
+        }
+        let result = if no_stage_evidence(selected).is_ok() {
+            let prepared = retained.prepared.clone();
+            retained.check(verifier, control)?;
+            no_stage_evidence(selected)?;
+            Reconciled::Prepared(prepared)
+        } else {
+            let intent_file = Held::open(&selected.join("stage-intent.json"), SMALL, control)?;
+            let intent: RecordedIntent =
+                serde_json::from_slice(&small(&intent_file, control)?).map_err(|_| STAGE_HOLD)?;
+            if intent.schema != 1
+                || intent.prepared_sha256 != retained.journal.media.sha256
+                || intent.prepared != retained.prepared
+            {
+                return Err(STAGE_HOLD.into());
+            }
+            let outcome_file = Held::open(&selected.join("stage-outcome.json"), SMALL, control)?;
+            let outcome: RecordedOutcome =
+                serde_json::from_slice(&small(&outcome_file, control)?).map_err(|_| STAGE_HOLD)?;
+            if outcome.schema != 1
+                || outcome.intent_sha256 != intent_file.media.sha256
+                || outcome.rejected
+                || outcome.terminal.canceled
+                || outcome.terminal.invalid_progress
+                || outcome.terminal.hresult != Some(0)
+                || outcome.terminal.registered != Some(false)
+            {
+                return Err(STAGE_HOLD.into());
+            }
+            retained.check(verifier, control)?;
+            intent_file.check(control)?;
+            outcome_file.check(control)?;
+            evidence.push(intent_file);
+            evidence.push(outcome_file);
+            Reconciled::RecordedStaging(retained.prepared.selection.version)
+        };
+        transaction.validate()?;
+        transaction_owner = Some(transaction);
+        authenticated = Some(retained);
+        result
+    } else {
+        Reconciled::Empty
+    };
+    let (mut after, after_selected) = attempt_inventory(root)?;
+    attempts.sort();
+    after.sort();
+    if attempts != after || selected != after_selected || verifier.source(policy)? != current {
+        return Err(STAGE_HOLD.into());
+    }
+    if let Some(retained) = &authenticated {
+        retained.check(verifier, control)?;
+    }
+    for file in &evidence {
+        file.check(control)?;
+    }
+    if let Some(transaction) = &transaction_owner {
+        transaction.validate()?;
+    }
+    owned.check()?;
+    acquisition.validate()?;
+    control.check()?;
+    Ok(result)
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeploymentState {
+    Unchecked,
+    Clear,
+    Recorded,
+    Unknown,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkKind {
+    Download,
+    Stage,
+    Reconcile,
+}
+enum Completed {
+    Download(Prepared),
+    Stage(Staged),
+    Reconciled(Reconciled),
+}
+
 struct Pending {
-    receiver: mpsc::Receiver<Result<Prepared>>,
+    receiver: mpsc::Receiver<Result<Completed>>,
+    kind: WorkKind,
     cancel: Arc<AtomicBool>,
     view: Arc<Mutex<View>>,
     deadline: Instant,
 }
 #[cfg(test)]
 type FakeWork = Box<dyn FnOnce(&Control) -> Result<Prepared> + Send>;
+#[cfg(test)]
+type FakeStage = Box<dyn FnOnce(&Control) -> Result<Staged> + Send>;
+#[cfg(test)]
+type FakeReconcile = Box<dyn FnOnce(&Control) -> Result<Reconciled> + Send>;
 pub(crate) struct Controller {
     root: PathBuf,
+    profile: Option<crate::settings::UpdateProfile>,
     pub view: View,
     active: Option<Pending>,
+    deployment: DeploymentState,
     #[cfg(test)]
     next: Option<FakeWork>,
+    #[cfg(test)]
+    next_stage: Option<FakeStage>,
+    #[cfg(test)]
+    next_reconcile: Option<FakeReconcile>,
 }
 impl Controller {
     pub fn load(state: &Path) -> Self {
         Self {
             root: state.join("windows-prepared"),
+            profile: None,
             view: View::default(),
             active: None,
+            deployment: DeploymentState::Unchecked,
             #[cfg(test)]
             next: None,
+            #[cfg(test)]
+            next_stage: None,
+            #[cfg(test)]
+            next_reconcile: None,
+        }
+    }
+    pub(crate) fn set_profile(&mut self, profile: Option<crate::settings::UpdateProfile>) {
+        self.profile = profile;
+    }
+    fn staging_profile(&self) -> Result<crate::settings::UpdateProfile> {
+        let profile = self
+            .profile
+            .clone()
+            .ok_or("Native Windows staging requires this app's default profile lease.")?;
+        if !self.root.is_absolute()
+            || self.root != profile.locations.profile().join("windows-prepared")
+        {
+            return Err(
+                "Native Windows staging cannot use an isolated or foreign profile root.".into(),
+            );
+        }
+        Ok(profile)
+    }
+    pub(crate) fn deployment_blocker(&self) -> Option<&'static str> {
+        match self.deployment {
+            DeploymentState::Unknown => Some("Windows update state is unresolved. Update installation and restart are unavailable."),
+            DeploymentState::Recorded => Some("A prior staging result is retained. Update installation and restart are unavailable."),
+            _ => None,
+        }
+    }
+    pub(crate) fn startup(&mut self) {
+        if self.deployment != DeploymentState::Unchecked || self.active.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        if self.next_reconcile.is_some() {
+            if let Err(error) = self.start_reconciliation() {
+                self.view.message = error;
+            }
+            return;
+        }
+        if ENABLED && configured().is_some() && self.staging_profile().is_ok() {
+            if let Err(error) = self.start_reconciliation() {
+                self.view.message = error;
+            }
+        }
+    }
+    pub fn start_reconciliation(&mut self) -> Result<()> {
+        if self.active.is_some() {
+            return Err(STAGE_HOLD.into());
+        }
+        #[cfg(test)]
+        if let Some(work) = self.next_reconcile.take() {
+            self.deployment = DeploymentState::Unknown;
+            return self.launch_task(WorkKind::Reconcile, move |c| {
+                work(c).map(Completed::Reconciled)
+            });
+        }
+        if !ENABLED {
+            return Err(DISABLED.into());
+        }
+        #[cfg(windows)]
+        {
+            let policy = configured().ok_or(DISABLED)?;
+            let profile = self.staging_profile()?;
+            let root = self.root.clone();
+            self.deployment = DeploymentState::Unknown;
+            self.launch_task(WorkKind::Reconcile, move |control| {
+                let _profile = profile;
+                _profile.validate()?;
+                native::session(|| inspect_retained(&root, &policy, &native::Verifier, control))
+                    .map(Completed::Reconciled)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(DISABLED.into())
         }
     }
     pub fn allowed(&self) -> bool {
         #[cfg(test)]
-        if self.next.is_some() {
+        if self.next.is_some() || self.next_stage.is_some() || self.next_reconcile.is_some() {
             return true;
         }
         ENABLED && configured().is_some()
     }
     pub fn start(&mut self) -> Result<()> {
+        if matches!(
+            self.deployment,
+            DeploymentState::Unknown | DeploymentState::Recorded
+        ) {
+            return Err(STAGE_HOLD.into());
+        }
         #[cfg(test)]
         if let Some(work) = self.next.take() {
             return self.launch(work);
@@ -936,9 +1471,68 @@ impl Controller {
             Err(DISABLED.into())
         }
     }
+    fn staging_allowed(&self) -> bool {
+        #[cfg(test)]
+        if self.next_stage.is_some() {
+            return true;
+        }
+        self.allowed()
+            && self.staging_profile().is_ok()
+            && !matches!(
+                self.deployment,
+                DeploymentState::Unknown | DeploymentState::Recorded
+            )
+    }
+    pub fn start_staging(&mut self) -> Result<()> {
+        if matches!(
+            self.deployment,
+            DeploymentState::Unknown | DeploymentState::Recorded
+        ) {
+            return Err(STAGE_HOLD.into());
+        }
+        #[cfg(test)]
+        if let Some(work) = self.next_stage.take() {
+            return self.launch_task(WorkKind::Stage, move |control| {
+                work(control).map(Completed::Stage)
+            });
+        }
+        if !self.staging_allowed() {
+            return Err(DISABLED.into());
+        }
+        #[cfg(windows)]
+        {
+            let policy = configured().ok_or(DISABLED)?;
+            let profile = self.staging_profile()?;
+            let root = self.root.clone();
+            self.launch_task(WorkKind::Stage, move |control| {
+                if !ENABLED {
+                    return Err(DISABLED.into());
+                }
+                let _profile = profile;
+                _profile.validate()?;
+                native::session(|| {
+                    stage(&root, &policy, &native::Verifier, &native::Stager, control)
+                })
+                .map(Completed::Stage)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(DISABLED.into())
+        }
+    }
     fn launch(
         &mut self,
         work: impl FnOnce(&Control) -> Result<Prepared> + Send + 'static,
+    ) -> Result<()> {
+        self.launch_task(WorkKind::Download, move |control| {
+            work(control).map(Completed::Download)
+        })
+    }
+    fn launch_task(
+        &mut self,
+        kind: WorkKind,
+        work: impl FnOnce(&Control) -> Result<Completed> + Send + 'static,
     ) -> Result<()> {
         if self.active.is_some() {
             return Err("A Windows download is already retained.".into());
@@ -947,7 +1541,11 @@ impl Controller {
         let cancel = Arc::new(AtomicBool::new(false));
         let view = Arc::new(Mutex::new(View {
             busy: true,
-            phase: "Starting signed Windows download",
+            phase: match kind {
+                WorkKind::Stage => "Starting native Windows staging",
+                WorkKind::Reconcile => "Verifying retained Windows staging state",
+                WorkKind::Download => "Starting signed Windows download",
+            },
             ..View::default()
         }));
         let deadline = Instant::now() + TIMEOUT;
@@ -956,14 +1554,18 @@ impl Controller {
             deadline,
             view: view.clone(),
         };
-        std::thread::Builder::new().name("peerbrush-windows-download".into()).spawn(move || {
+        std::thread::Builder::new().name(if kind != WorkKind::Download { "peerbrush-windows-stage" } else { "peerbrush-windows-download" }.into()).spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&control)))
                 .unwrap_or_else(|_| Err("Windows preparation stopped unexpectedly; retained media needs revalidation.".into()));
             let _ = tx.send(result);
         }).map_err(|_| "Could not start signed Windows download.")?;
         self.view = view.lock().unwrap().clone();
+        if kind != WorkKind::Download {
+            self.deployment = DeploymentState::Unknown;
+        }
         self.active = Some(Pending {
             receiver: rx,
+            kind,
             cancel,
             view,
             deadline,
@@ -980,7 +1582,9 @@ impl Controller {
             pending.cancel.store(true, Ordering::Release);
         }
         if pending.cancel.load(Ordering::Acquire) {
-            self.view.message = if timeout {
+            self.view.message = if pending.kind != WorkKind::Download {
+                STAGE_HOLD
+            } else if timeout {
                 "Windows preparation exceeded its deadline; waiting for its owned native operation."
             } else {
                 "Canceling signed Windows preparation; waiting for its owned operation."
@@ -996,18 +1600,46 @@ impl Controller {
         };
         if let Some(result) = result {
             let canceled = pending.cancel.load(Ordering::Acquire);
+            let kind = pending.kind;
             self.active = None;
             self.view.busy = false;
             self.view.version = None;
-            self.view.message = if canceled {
+            self.view.staged_version = None;
+            self.view.recorded_staging = false;
+            self.view.message = if canceled && kind != WorkKind::Download {
+                STAGE_HOLD.into()
+            } else if canceled {
                 "Windows preparation was canceled. Retained bytes must be revalidated before reuse; nothing was installed.".into()
             } else {
                 match result {
-                    Ok(prepared) => {
+                    Ok(Completed::Reconciled(Reconciled::Empty)) => {
+                        self.deployment = DeploymentState::Clear;
+                        "No retained staging record was found. Installation remains unavailable."
+                            .into()
+                    }
+                    Ok(Completed::Reconciled(Reconciled::Prepared(prepared))) => {
+                        self.deployment = DeploymentState::Clear;
+                        self.view.version = Some(prepared.selection.version);
+                        "Retained signed Windows media revalidated. Installation and restart remain unavailable.".into()
+                    }
+                    Ok(Completed::Reconciled(Reconciled::RecordedStaging(version))) => {
+                        self.deployment = DeploymentState::Recorded;
+                        self.view.staged_version = Some(version);
+                        self.view.recorded_staging = true;
+                        "Prior staging result verified. Installation is unverified; retries remain unavailable.".into()
+                    }
+                    Ok(Completed::Stage(staged)) if staged.accepted => {
+                        self.deployment = DeploymentState::Recorded;
+                        self.view.staged_version = Some(staged.version);
+                        "Signed Windows package staged. Registration and restart remain unavailable.".into()
+                    }
+                    Ok(Completed::Download(prepared)) => {
                         self.view.version = Some(prepared.selection.version);
                         "Signed Windows media prepared locally. Installation and restart remain unavailable.".into()
                     }
+                    _ if kind != WorkKind::Download => STAGE_HOLD.into(),
                     Err(error) => error,
+                    _ => STAGE_HOLD.into(),
                 }
             };
         }
@@ -1026,12 +1658,40 @@ impl Controller {
         }
         if ui
             .add_enabled(
-                self.allowed() && !self.view.busy,
+                self.allowed()
+                    && !self.view.busy
+                    && !matches!(
+                        self.deployment,
+                        DeploymentState::Unknown | DeploymentState::Recorded
+                    ),
                 eframe::egui::Button::new("Prepare signed Windows update"),
             )
             .clicked()
         {
             if let Err(error) = self.start() {
+                self.view.message = error;
+            }
+        }
+        if ui
+            .add_enabled(
+                self.staging_allowed() && !self.view.busy && self.view.version.is_some(),
+                eframe::egui::Button::new("Stage verified Windows package"),
+            )
+            .clicked()
+        {
+            if let Err(error) = self.start_staging() {
+                self.view.message = error;
+            }
+        }
+        if self.deployment != DeploymentState::Unchecked
+            && ui
+                .add_enabled(
+                    self.allowed() && !self.view.busy,
+                    eframe::egui::Button::new("Recheck retained Windows state"),
+                )
+                .clicked()
+        {
+            if let Err(error) = self.start_reconciliation() {
                 self.view.message = error;
             }
         }
@@ -1042,6 +1702,9 @@ impl Controller {
                 self.view.phase,
                 self.view.bytes / 1024
             ));
+            if let Some(percentage) = self.view.percentage {
+                ui.label(format!("Native staging {percentage}%"));
+            }
             if ui.button("Cancel Windows preparation").clicked() {
                 self.later();
             }
@@ -1049,9 +1712,68 @@ impl Controller {
         if let Some(v) = self.view.version {
             ui.label(format!("Prepared native package {}", version_text(v)));
         }
+        if let Some(v) = self.view.staged_version {
+            ui.label(format!(
+                "{} native package {}",
+                if self.view.recorded_staging {
+                    "Recorded staging result for"
+                } else {
+                    "Staged"
+                },
+                version_text(v)
+            ));
+        }
+        if let Some(v) = self.view.installed_version {
+            ui.label(format!(
+                "Current registered native package {}",
+                version_text(v)
+            ));
+        }
         if !self.view.message.is_empty() {
             ui.label(&self.view.message);
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn fake_staging(
+        &mut self,
+        uncertain: bool,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
+        let (tx, rx) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let root = self.root.clone();
+        let profile = self.profile.clone();
+        self.next_stage = Some(Box::new(move |control| {
+            let result = (|| {
+                if let Some(profile) = &profile {
+                    profile.validate()?;
+                }
+                tests::stage_fixture(&root, control, rx, uncertain)
+            })();
+            drop(profile);
+            let _ = finished.send(());
+            result
+        }));
+        (tx, done)
+    }
+    #[cfg(test)]
+    pub(crate) fn fake_reconciliation(
+        &mut self,
+    ) -> (mpsc::Sender<()>, mpsc::Receiver<()>, mpsc::Receiver<()>) {
+        let (release, resume) = mpsc::channel();
+        let (entered, ready) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let root = self.root.clone();
+        let profile = self.staging_profile();
+        self.next_reconcile = Some(Box::new(move |control| {
+            let result = (|| {
+                let profile = profile?;
+                profile.validate()?;
+                tests::inspect_fixture(&root, control, resume, entered)
+            })();
+            let _ = finished.send(());
+            result
+        }));
+        (release, ready, done)
     }
     #[cfg(test)]
     pub(crate) fn fake_prepare(&mut self) -> mpsc::Sender<()> {

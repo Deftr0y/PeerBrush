@@ -1,9 +1,12 @@
-//! SDK-free read-only package trust. No deployment API, shell launch or settings.
+//! SDK-free package trust and dormant staging. No registration, shutdown or restart.
 use super::*;
 use ::windows::{
     core::{w, PCWSTR, PWSTR},
     ApplicationModel::{Package, PackageSignatureKind},
-    Management::Deployment::PackageManager,
+    Foundation::{AsyncOperationProgressHandler, AsyncStatus, IAsyncOperationWithProgress, Uri},
+    Management::Deployment::{
+        DeploymentProgress, DeploymentResult, PackageManager, StagePackageOptions,
+    },
     Win32::{
         Foundation::HANDLE,
         Security::{
@@ -132,6 +135,104 @@ impl super::Verifier for Verifier {
             verify(file, policy, selected, runtime, control)?;
         }
         file.check(control)
+    }
+}
+
+fn staging<T>(value: ::windows::core::Result<T>) -> Result<T> {
+    value.map_err(|_| STAGE_HOLD.into())
+}
+fn local_uri(path: &Path) -> Result<Uri> {
+    let value = url::Url::from_file_path(path).map_err(|_| STAGE_HOLD)?;
+    if !path.is_absolute()
+        || value.host_str().is_some()
+        || value.to_file_path().map_err(|_| STAGE_HOLD)? != path
+    {
+        return Err(STAGE_HOLD.into());
+    }
+    staging(Uri::CreateUri(&::windows::core::HSTRING::from(
+        value.as_str(),
+    )))
+}
+pub(super) struct Stager;
+struct Stage {
+    operation: IAsyncOperationWithProgress<DeploymentResult, DeploymentProgress>,
+    _progress: AsyncOperationProgressHandler<DeploymentResult, DeploymentProgress>,
+    _manager: PackageManager,
+    progress: Arc<StageProgress>,
+}
+impl super::Stager for Stager {
+    fn submit(
+        &self,
+        selected: &RetainedSelection,
+        view: Arc<Mutex<View>>,
+    ) -> Result<Box<dyn StageOperation>> {
+        if !ENABLED {
+            return Err(DISABLED.into());
+        }
+        let main = local_uri(&selected.package.path)?;
+        let runtime = local_uri(&selected.runtime.path)?;
+        let manager = staging(PackageManager::new())?;
+        let options = staging(StagePackageOptions::new())?;
+        staging(options.SetAllowUnsigned(false))?;
+        staging(options.SetDeveloperMode(false))?;
+        staging(options.SetForceUpdateFromAnyVersion(false))?;
+        staging(options.SetStageInPlace(false))?;
+        staging(staging(options.DependencyPackageUris())?.Append(&runtime))?;
+        let state = Arc::new(StageProgress::new(view));
+        let callback_state = state.clone();
+        let progress =
+            AsyncOperationProgressHandler::new(move |_, progress: &DeploymentProgress| {
+                callback_state.percentage(progress.percentage);
+                Ok(())
+            });
+        // All other fallible setup precedes submission. A callback-registration
+        // failure afterwards returns an owned operation to quarantine/poll.
+        let operation = staging(manager.StagePackageByUriAsync(&main, &options))?;
+        if operation.SetProgress(&progress).is_err() {
+            state.invalidate();
+        }
+        Ok(Box::new(Stage {
+            operation,
+            _progress: progress,
+            _manager: manager,
+            progress: state,
+        }))
+    }
+}
+impl StageOperation for Stage {
+    fn poll(&mut self) -> StageObservation {
+        self.progress.poll(|| match self.operation.Status() {
+            Ok(AsyncStatus::Started) => StageObservation::Pending,
+            Ok(AsyncStatus::Completed) => {
+                let terminal = match self.operation.GetResults() {
+                    Ok(result) => StageTerminal {
+                        hresult: result.ExtendedErrorCode().ok().map(|v| v.0),
+                        registered: result.IsRegistered().ok(),
+                        canceled: false,
+                        invalid_progress: false,
+                    },
+                    Err(error) => StageTerminal {
+                        hresult: Some(error.code().0),
+                        registered: None,
+                        canceled: false,
+                        invalid_progress: false,
+                    },
+                };
+                StageObservation::Terminal(terminal)
+            }
+            Ok(status) if status == AsyncStatus::Canceled || status == AsyncStatus::Error => {
+                StageObservation::Terminal(StageTerminal {
+                    hresult: self.operation.ErrorCode().ok().map(|value| value.0),
+                    registered: None,
+                    canceled: status == AsyncStatus::Canceled,
+                    invalid_progress: false,
+                })
+            }
+            _ => StageObservation::Uncertain,
+        })
+    }
+    fn cancel(&mut self) {
+        let _ = self.operation.Cancel();
     }
 }
 

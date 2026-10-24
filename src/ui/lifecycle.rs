@@ -825,6 +825,10 @@ impl PeerBrush {
         if self.lifecycle.is_some() || self.save_loss_review.is_some() || self.exit_approved {
             return;
         }
+        #[cfg(any(windows, test))]
+        if intent == Intent::Exit {
+            self.updates.defer_windows_for_close();
+        }
         let working = match &intent {
             Intent::Close(project) => self.jobs.contains(project),
             Intent::Exit => !self.jobs.is_empty() || self.tab_transfer_committing,

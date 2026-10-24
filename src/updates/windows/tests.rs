@@ -687,3 +687,831 @@ fn every_default_entry_is_disabled_and_has_no_storage_or_native_side_effect() {
         assert_eq!(native::Verifier.source(&policy()).unwrap_err(), DISABLED);
     }
 }
+
+// A narrow native staging boundary: real files, native-source/media consumer,
+// leases, durable records, controller and panel remain in the production path.
+struct StageFake {
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+    uncertain: bool,
+    submissions: Arc<AtomicUsize>,
+    cancellations: Arc<AtomicUsize>,
+}
+struct StageFakeOperation {
+    release: mpsc::Receiver<()>,
+    uncertain: bool,
+    cancellations: Arc<AtomicUsize>,
+}
+impl Stager for StageFake {
+    fn submit(
+        &self,
+        selected: &RetainedSelection,
+        view: Arc<Mutex<View>>,
+    ) -> Result<Box<dyn StageOperation>> {
+        self.submissions.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(selected.prepared, receipt());
+        assert_eq!(selected.package.media.sha256, hash(b"main-native-bytes"));
+        assert_eq!(selected.runtime.media.sha256, hash(b"runtime-native-bytes"));
+        let root = selected.owned.path.parent().unwrap();
+        assert!(crate::file_safety::Lease::acquire(&root.join("acquisition.json")).is_err());
+        assert!(crate::file_safety::Lease::acquire(&selected.journal.path).is_err());
+        let intent: serde_json::Value = serde_json::from_slice(
+            &fs::read(selected.owned.path.join("stage-intent.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(intent["prepared_sha256"], selected.journal.media.sha256);
+        assert_eq!(
+            intent["prepared"],
+            serde_json::to_value(&selected.prepared).unwrap()
+        );
+        #[cfg(windows)]
+        {
+            assert!(OpenOptions::new()
+                .write(true)
+                .open(&selected.package.path)
+                .is_err());
+            assert!(OpenOptions::new()
+                .write(true)
+                .open(&selected.runtime.path)
+                .is_err());
+            assert!(fs::rename(
+                &selected.owned.path,
+                selected.owned.path.with_extension("moved")
+            )
+            .is_err());
+        }
+        {
+            let mut view = view.lock().unwrap();
+            view.phase = "Staging synthetic Windows media at the native boundary";
+            view.percentage = Some(17);
+        }
+        Ok(Box::new(StageFakeOperation {
+            release: self.release.lock().unwrap().take().unwrap(),
+            uncertain: self.uncertain,
+            cancellations: self.cancellations.clone(),
+        }))
+    }
+}
+impl StageOperation for StageFakeOperation {
+    fn poll(&mut self) -> StageObservation {
+        if self.uncertain {
+            self.uncertain = false;
+            return StageObservation::Uncertain;
+        }
+        match self.release.try_recv() {
+            Ok(()) => StageObservation::Terminal(StageTerminal {
+                hresult: Some(0),
+                registered: Some(false),
+                canceled: false,
+                invalid_progress: false,
+            }),
+            Err(mpsc::TryRecvError::Empty) => StageObservation::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => StageObservation::Uncertain,
+        }
+    }
+    fn cancel(&mut self) {
+        assert_eq!(
+            self.cancellations.fetch_add(1, Ordering::AcqRel),
+            0,
+            "The owned native operation receives cancellation only once"
+        );
+    }
+}
+pub(super) fn stage_fixture(
+    root: &Path,
+    control: &Control,
+    release: mpsc::Receiver<()>,
+    uncertain: bool,
+) -> Result<Staged> {
+    fs::create_dir_all(root).unwrap();
+    acquire(
+        root,
+        &policy(),
+        &HttpFake::new(),
+        &NativeFake::new(),
+        control,
+    )?;
+    stage(
+        root,
+        &policy(),
+        &NativeFake::new(),
+        &StageFake {
+            release: Mutex::new(Some(release)),
+            uncertain,
+            submissions: Arc::new(AtomicUsize::new(0)),
+            cancellations: Arc::new(AtomicUsize::new(0)),
+        },
+        control,
+    )
+}
+fn wait_controller(controller: &mut Controller, ready: impl Fn(&Controller) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        controller.tick();
+        if ready(controller) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Actual staging worker did not reach its bounded fixture milestone"
+        );
+        std::thread::yield_now();
+    }
+}
+fn stage_attempt(root: &Path) -> PathBuf {
+    fs::read_dir(root)
+        .unwrap()
+        .map(|v| v.unwrap())
+        .find(|v| {
+            v.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("attempt-"))
+        })
+        .unwrap()
+        .path()
+}
+#[test]
+fn actual_staging_retains_real_media_leases_and_durable_outcomes_without_retry_or_registration() {
+    for mode in ["success", "cancel", "timeout", "uncertain"] {
+        let temp = Temp::new();
+        let mut controller = Controller::load(&temp.0);
+        let (release, _done) = controller.fake_staging(mode == "uncertain");
+        controller.start_staging().unwrap();
+        wait_controller(&mut controller, |v| v.view.percentage == Some(17));
+        assert!(controller.view.busy && controller.view.staged_version.is_none());
+        let root = temp.0.join("windows-prepared");
+        let attempt = stage_attempt(&root);
+        let before_main = fs::read(attempt.join("main.msix")).unwrap();
+        let before_runtime = fs::read(attempt.join("runtime.appx")).unwrap();
+        let before_prepared = fs::read(attempt.join("prepared.json")).unwrap();
+        let before_intent = fs::read(attempt.join("stage-intent.json")).unwrap();
+        assert!(!attempt.join("stage-outcome.json").exists());
+        assert!(crate::file_safety::Lease::acquire(&root.join("acquisition.json")).is_err());
+        assert!(controller.start_staging().is_err());
+        if mode == "cancel" {
+            controller.later();
+        }
+        if mode == "timeout" {
+            controller.active.as_mut().unwrap().deadline = Instant::now();
+            controller.tick();
+        }
+        release.send(()).unwrap();
+        wait_controller(&mut controller, |v| !v.view.busy);
+        assert_eq!(
+            controller.view.staged_version,
+            (mode == "success").then_some([1, 30, 1, 0])
+        );
+        assert!(controller.view.version.is_none());
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(attempt.join("stage-outcome.json")).unwrap()).unwrap();
+        assert_eq!(record["terminal"]["registered"], false);
+        assert_eq!(record["rejected"], mode != "success");
+        assert_eq!(fs::read(attempt.join("main.msix")).unwrap(), before_main);
+        assert_eq!(
+            fs::read(attempt.join("runtime.appx")).unwrap(),
+            before_runtime
+        );
+        assert_eq!(
+            fs::read(attempt.join("prepared.json")).unwrap(),
+            before_prepared
+        );
+        assert_eq!(
+            fs::read(attempt.join("stage-intent.json")).unwrap(),
+            before_intent
+        );
+        let no_network = HttpFake {
+            files: BTreeMap::new(),
+            calls: Mutex::new(vec![]),
+        };
+        assert!(acquire(
+            &root,
+            &policy(),
+            &no_network,
+            &NativeFake::new(),
+            &control()
+        )
+        .is_err());
+        assert!(no_network.calls.lock().unwrap().is_empty());
+        assert!(stage(
+            &root,
+            &policy(),
+            &NativeFake::new(),
+            &StageFake {
+                release: Mutex::new(None),
+                uncertain: false,
+                submissions: Arc::new(AtomicUsize::new(0)),
+                cancellations: Arc::new(AtomicUsize::new(0))
+            },
+            &control()
+        )
+        .is_err());
+    }
+}
+#[test]
+fn actual_progress_interleaving_cannot_accept_a_terminal_observed_during_native_readback() {
+    struct InterleavedStager {
+        ready: mpsc::Sender<Arc<StageProgress>>,
+        resume: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+    struct InterleavedOperation {
+        progress: Arc<StageProgress>,
+        ready: Option<mpsc::Sender<Arc<StageProgress>>>,
+        resume: mpsc::Receiver<()>,
+    }
+    impl Stager for InterleavedStager {
+        fn submit(
+            &self,
+            selected: &RetainedSelection,
+            view: Arc<Mutex<View>>,
+        ) -> Result<Box<dyn StageOperation>> {
+            assert_eq!(selected.prepared, receipt());
+            assert!(selected.owned.path.join("stage-intent.json").is_file());
+            assert!(crate::file_safety::Lease::acquire(&selected.journal.path).is_err());
+            let progress = Arc::new(StageProgress::new(view));
+            progress.percentage(17);
+            Ok(Box::new(InterleavedOperation {
+                progress,
+                ready: Some(self.ready.clone()),
+                resume: self.resume.lock().unwrap().take().unwrap(),
+            }))
+        }
+    }
+    impl StageOperation for InterleavedOperation {
+        fn poll(&mut self) -> StageObservation {
+            let progress = self.progress.clone();
+            // The actual adapter uses this same method around Status/GetResults.
+            // Pause after raw native fields exist but before terminal delivery.
+            progress.poll(|| {
+                let terminal = StageTerminal {
+                    hresult: Some(0),
+                    registered: Some(false),
+                    canceled: false,
+                    invalid_progress: false,
+                };
+                self.ready.take().unwrap().send(progress.clone()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                StageObservation::Terminal(terminal)
+            })
+        }
+        fn cancel(&mut self) {
+            panic!(
+                "The first native readback is terminal; no earlier pending/uncertain poll exists"
+            );
+        }
+    }
+    for fault in ["none", "percentage", "registration"] {
+        let temp = Temp::new();
+        let mut controller = Controller::load(&temp.0);
+        let root = controller.root.clone();
+        let worker_root = root.clone();
+        let (ready, receive) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        controller.next_stage = Some(Box::new(move |control| {
+            fs::create_dir(&worker_root).unwrap();
+            acquire(
+                &worker_root,
+                &policy(),
+                &HttpFake::new(),
+                &NativeFake::new(),
+                control,
+            )?;
+            stage(
+                &worker_root,
+                &policy(),
+                &NativeFake::new(),
+                &InterleavedStager {
+                    ready,
+                    resume: Mutex::new(Some(resume)),
+                },
+                control,
+            )
+        }));
+        controller.start_staging().unwrap();
+        let progress = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        let attempt = stage_attempt(&root);
+        let before: Vec<_> = [
+            "selected.appinstaller",
+            "main.msix",
+            "runtime.appx",
+            "prepared.json",
+            "stage-intent.json",
+        ]
+        .into_iter()
+        .map(|name| (name, fs::read(attempt.join(name)).unwrap()))
+        .collect();
+        assert!(crate::file_safety::Lease::acquire(&root.join("acquisition.json")).is_err());
+        assert!(!attempt.join("stage-outcome.json").exists());
+        match fault {
+            "none" => progress.percentage(64),
+            "percentage" => progress.percentage(101),
+            "registration" => progress.invalidate(),
+            _ => unreachable!(),
+        }
+        controller.tick();
+        assert!(controller.view.busy && controller.view.staged_version.is_none());
+        release.send(()).unwrap();
+        wait_controller(&mut controller, |v| !v.view.busy);
+        assert_eq!(
+            controller.view.staged_version,
+            (fault == "none").then_some([1, 30, 1, 0])
+        );
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(attempt.join("stage-outcome.json")).unwrap()).unwrap();
+        assert_eq!(record["terminal"]["hresult"], 0);
+        assert_eq!(record["terminal"]["registered"], false);
+        assert_eq!(record["terminal"]["canceled"], false);
+        assert_eq!(record["terminal"]["invalid_progress"], fault != "none");
+        assert_eq!(record["rejected"], fault != "none");
+        let closed = progress.view.lock().unwrap().clone();
+        progress.percentage(99);
+        progress.percentage(101);
+        progress.invalidate();
+        let after = progress.view.lock().unwrap();
+        assert_eq!(after.phase, closed.phase);
+        assert_eq!(after.percentage, closed.percentage);
+        drop(after);
+        for (name, bytes) in before {
+            assert_eq!(fs::read(attempt.join(name)).unwrap(), bytes);
+        }
+        assert!(crate::file_safety::Lease::acquire(&root.join("acquisition.json")).is_ok());
+        assert!(reconcile(&attempt, &policy(), &NativeFake::new(), &control()).is_err());
+        let no_network = HttpFake {
+            files: BTreeMap::new(),
+            calls: Mutex::new(vec![]),
+        };
+        assert!(acquire(
+            &root,
+            &policy(),
+            &no_network,
+            &NativeFake::new(),
+            &control()
+        )
+        .is_err());
+        assert!(no_network.calls.lock().unwrap().is_empty());
+    }
+}
+#[test]
+fn dropped_staging_controller_keeps_the_worker_and_unknown_evidence_until_real_terminal() {
+    let temp = Temp::new();
+    let mut controller = Controller::load(&temp.0);
+    let (release, done) = controller.fake_staging(false);
+    controller.start_staging().unwrap();
+    wait_controller(&mut controller, |v| v.view.percentage == Some(17));
+    let root = temp.0.join("windows-prepared");
+    let attempt = stage_attempt(&root);
+    drop(controller);
+    assert!(crate::file_safety::Lease::acquire(&root.join("acquisition.json")).is_err());
+    assert!(!attempt.join("stage-outcome.json").exists());
+    release.send(()).unwrap();
+    done.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(crate::file_safety::Lease::acquire(&root.join("acquisition.json")).is_ok());
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(attempt.join("stage-outcome.json")).unwrap()).unwrap();
+    assert_eq!(record["rejected"], true);
+    assert!(attempt.join("prepared.json").is_file() && attempt.join("main.msix").is_file());
+}
+#[test]
+fn stage_only_default_gate_prevents_filesystem_or_native_submission() {
+    let temp = Temp::new();
+    let mut controller = Controller::load(&temp.0);
+    assert!(!controller.allowed());
+    assert!(controller.start_staging().is_err());
+    assert!(!temp.0.join("windows-prepared").exists());
+    assert!(configured().is_none() && !ENABLED);
+}
+
+#[test]
+fn staging_revalidates_changed_bytes_source_and_signatures_before_native_submission() {
+    for damage in ["main", "runtime", "journal", "source", "signature"] {
+        let temp = Temp::new();
+        acquire(
+            &temp.0,
+            &policy(),
+            &HttpFake::new(),
+            &NativeFake::new(),
+            &control(),
+        )
+        .unwrap();
+        let attempt = stage_attempt(&temp.0);
+        match damage {
+            "main" => fs::write(attempt.join("main.msix"), b"changed-code").unwrap(),
+            "runtime" => fs::write(attempt.join("runtime.appx"), b"changed-runtime").unwrap(),
+            "journal" => fs::write(attempt.join("prepared.json"), b"{}").unwrap(),
+            _ => {}
+        }
+        let files: Vec<_> = ["main.msix", "runtime.appx", "prepared.json"]
+            .into_iter()
+            .map(|name| (name, fs::read(attempt.join(name)).unwrap()))
+            .collect();
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let mut verifier = NativeFake::new();
+        verifier.changes = damage == "source";
+        verifier.reject = damage == "signature";
+        assert!(stage(
+            &temp.0,
+            &policy(),
+            &verifier,
+            &StageFake {
+                release: Mutex::new(None),
+                uncertain: false,
+                submissions: submissions.clone(),
+                cancellations: Arc::new(AtomicUsize::new(0)),
+            },
+            &control()
+        )
+        .is_err());
+        assert_eq!(submissions.load(Ordering::Acquire), 0);
+        assert!(!attempt.join("stage-intent.json").exists());
+        for (name, bytes) in files {
+            assert_eq!(fs::read(attempt.join(name)).unwrap(), bytes);
+        }
+    }
+}
+struct FaultStage(&'static str);
+struct FaultOperation(&'static str);
+impl Stager for FaultStage {
+    fn submit(
+        &self,
+        selection: &RetainedSelection,
+        _: Arc<Mutex<View>>,
+    ) -> Result<Box<dyn StageOperation>> {
+        assert!(selection.owned.path.join("stage-intent.json").is_file());
+        if self.0 == "submit-error" {
+            return Err("Synthetic provider submission is unknown".into());
+        }
+        if self.0 == "outcome-damage" {
+            fs::write(
+                selection.owned.path.join("stage-outcome.json"),
+                b"keep foreign bytes",
+            )
+            .unwrap();
+        }
+        Ok(Box::new(FaultOperation(self.0)))
+    }
+}
+impl StageOperation for FaultOperation {
+    fn poll(&mut self) -> StageObservation {
+        StageObservation::Terminal(StageTerminal {
+            hresult: if self.0 == "missing-code" {
+                None
+            } else if self.0 == "provider-error" {
+                Some(-1)
+            } else {
+                Some(0)
+            },
+            registered: Some(self.0 == "registered"),
+            canceled: false,
+            invalid_progress: false,
+        })
+    }
+    fn cancel(&mut self) {
+        panic!("Terminal synthetic operation needs no cancellation");
+    }
+}
+#[test]
+fn staging_failed_unknown_registered_or_damaged_outcomes_keep_intent_and_block_retries() {
+    for fault in [
+        "submit-error",
+        "provider-error",
+        "missing-code",
+        "registered",
+        "outcome-damage",
+    ] {
+        let temp = Temp::new();
+        acquire(
+            &temp.0,
+            &policy(),
+            &HttpFake::new(),
+            &NativeFake::new(),
+            &control(),
+        )
+        .unwrap();
+        let attempt = stage_attempt(&temp.0);
+        let media: Vec<_> = ["main.msix", "runtime.appx", "prepared.json"]
+            .into_iter()
+            .map(|name| (name, fs::read(attempt.join(name)).unwrap()))
+            .collect();
+        let result = stage(
+            &temp.0,
+            &policy(),
+            &NativeFake::new(),
+            &FaultStage(fault),
+            &control(),
+        );
+        assert!(
+            result.as_ref().is_err() || !result.unwrap().accepted,
+            "{fault}"
+        );
+        assert!(attempt.join("stage-intent.json").is_file());
+        assert!(reconcile(&attempt, &policy(), &NativeFake::new(), &control()).is_err());
+        assert!(acquire(
+            &temp.0,
+            &policy(),
+            &HttpFake::new(),
+            &NativeFake::new(),
+            &control()
+        )
+        .is_err());
+        if fault == "outcome-damage" {
+            assert_eq!(
+                fs::read(attempt.join("stage-outcome.json")).unwrap(),
+                b"keep foreign bytes"
+            );
+        }
+        for (name, bytes) in media {
+            assert_eq!(fs::read(attempt.join(name)).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn production_staging_root_requires_real_default_profile_and_worker_retains_its_session_lock() {
+    let temp = Temp::new();
+    let locations = crate::settings::Locations {
+        config: temp.0.join("config"),
+        data: temp.0.join("data"),
+        cache: temp.0.join("cache"),
+    };
+    let legacy = temp.0.join("legacy");
+    fs::create_dir(&legacy).unwrap();
+    let profile = crate::settings::Profile::open(locations.clone(), &legacy).unwrap();
+    let mut foreign = Controller::load(&temp.0.join("foreign"));
+    assert!(foreign.staging_profile().is_err());
+    foreign.set_profile(Some(profile.update_profile()));
+    assert!(foreign.staging_profile().is_err());
+    assert!(!temp.0.join("foreign").exists());
+    drop(foreign);
+    let mut controller = Controller::load(&locations.profile());
+    controller.set_profile(Some(profile.update_profile()));
+    assert!(controller.staging_profile().is_ok());
+    let (release, done) = controller.fake_staging(false);
+    controller.start_staging().unwrap();
+    wait_controller(&mut controller, |v| v.view.percentage == Some(17));
+    drop(profile);
+    drop(controller);
+    assert!(
+        crate::settings::Profile::open(locations.clone(), &legacy).is_err(),
+        "An owned native operation must retain the actual profile lease after the UI owner drops"
+    );
+    release.send(()).unwrap();
+    done.recv_timeout(Duration::from_secs(5)).unwrap();
+    let reopened = crate::settings::Profile::open(locations, &legacy).unwrap();
+    assert!(reopened
+        .locations
+        .profile()
+        .join("windows-prepared")
+        .exists());
+    drop(reopened);
+}
+
+// Only native signature/source polling is controlled. The records/media reader,
+// default-profile binding, retained handles/leases and controller are actual.
+pub(super) fn inspect_fixture(
+    root: &Path,
+    control: &Control,
+    resume: mpsc::Receiver<()>,
+    entered: mpsc::Sender<()>,
+) -> Result<Reconciled> {
+    struct NativeGate {
+        native: NativeFake,
+        resume: Mutex<Option<mpsc::Receiver<()>>>,
+        entered: mpsc::Sender<()>,
+    }
+    impl Verifier for NativeGate {
+        fn source(&self, policy: &Policy) -> Result<Source> {
+            self.native.source(policy)
+        }
+        fn media(
+            &self,
+            file: &Held,
+            policy: &Policy,
+            selection: &Selection,
+            runtime: bool,
+            control: &Control,
+        ) -> Result<()> {
+            if let Some(resume) = self.resume.lock().unwrap().take() {
+                self.entered.send(()).unwrap();
+                resume
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| "Synthetic native readback was not released.")?;
+            }
+            self.native.media(file, policy, selection, runtime, control)
+        }
+    }
+    inspect_retained(
+        root,
+        &policy(),
+        &NativeGate {
+            native: NativeFake::new(),
+            resume: Mutex::new(Some(resume)),
+            entered,
+        },
+        control,
+    )
+}
+fn completed_stage(root: &Path) -> PathBuf {
+    let (release, resume) = mpsc::channel();
+    release.send(()).unwrap();
+    let result = stage_fixture(root, &control(), resume, false).unwrap();
+    assert!(result.accepted);
+    stage_attempt(root)
+}
+#[test]
+fn retained_inspection_reopens_actual_stage_bytes_without_claiming_installation_or_retiring_them() {
+    let temp = Temp::new();
+    let attempt = completed_stage(&temp.0);
+    let before: Vec<_> = [
+        "selected.appinstaller",
+        "main.msix",
+        "runtime.appx",
+        "prepared.json",
+        "stage-intent.json",
+        "stage-outcome.json",
+    ]
+    .into_iter()
+    .map(|name| (name, fs::read(attempt.join(name)).unwrap()))
+    .collect();
+    let c = control();
+    assert!(matches!(
+        inspect_retained(&temp.0, &policy(), &NativeFake::new(), &c).unwrap(),
+        Reconciled::RecordedStaging([1, 30, 1, 0])
+    ));
+    assert_eq!(
+        c.view.lock().unwrap().installed_version,
+        Some([1, 30, 0, 0])
+    );
+    assert!(reconcile(&attempt, &policy(), &NativeFake::new(), &control()).is_err());
+    let network = HttpFake {
+        files: BTreeMap::new(),
+        calls: Mutex::new(vec![]),
+    };
+    assert!(acquire(&temp.0, &policy(), &network, &NativeFake::new(), &control()).is_err());
+    assert!(network.calls.lock().unwrap().is_empty());
+    let before_outcome = fs::read(attempt.join("stage-outcome.json")).unwrap();
+    for (name, bytes) in before {
+        assert_eq!(fs::read(attempt.join(name)).unwrap(), bytes);
+    }
+    let missing = temp.0.join("never-created");
+    assert!(matches!(
+        inspect_retained(&missing, &policy(), &NativeFake::new(), &control()).unwrap(),
+        Reconciled::Empty
+    ));
+    assert!(!missing.exists());
+    let current = control();
+    assert!(inspect_retained(&temp.0, &policy(), &SelectedSource, &current).is_err());
+    assert_eq!(
+        current.view.lock().unwrap().installed_version,
+        Some([1, 30, 1, 0])
+    );
+    assert_eq!(
+        fs::read(attempt.join("stage-outcome.json")).unwrap(),
+        before_outcome
+    );
+}
+struct SelectedSource;
+impl Verifier for SelectedSource {
+    fn source(&self, _: &Policy) -> Result<Source> {
+        let mut current = source();
+        current.version = [1, 30, 1, 0];
+        current.full_name = "PeerBrush.Synthetic_1.30.1.0_x64__abc123".into();
+        current.build = "2".repeat(40);
+        Ok(current)
+    }
+    fn media(
+        &self,
+        file: &Held,
+        policy: &Policy,
+        selected: &Selection,
+        runtime: bool,
+        control: &Control,
+    ) -> Result<()> {
+        NativeFake::new().media(file, policy, selected, runtime, control)
+    }
+}
+#[test]
+fn damaged_missing_rejected_or_foreign_stage_records_never_become_reusable_or_installed() {
+    for damage in [
+        "intent",
+        "missing-outcome",
+        "outcome-binding",
+        "rejected",
+        "registered",
+        "progress",
+        "canceled",
+        "code",
+        "media",
+        "source",
+    ] {
+        let temp = Temp::new();
+        let attempt = completed_stage(&temp.0);
+        match damage {
+            "intent" => {
+                fs::write(attempt.join("stage-intent.json"), b"{").unwrap();
+            }
+            "missing-outcome" => {
+                fs::remove_file(attempt.join("stage-outcome.json")).unwrap();
+            }
+            "media" => {
+                fs::write(attempt.join("runtime.appx"), b"foreign bytes").unwrap();
+            }
+            "source" => {}
+            _ => {
+                let path = attempt.join("stage-outcome.json");
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                match damage {
+                    "outcome-binding" => value["intent_sha256"] = serde_json::json!("f".repeat(64)),
+                    "rejected" => value["rejected"] = true.into(),
+                    "registered" => value["terminal"]["registered"] = true.into(),
+                    "progress" => value["terminal"]["invalid_progress"] = true.into(),
+                    "canceled" => value["terminal"]["canceled"] = true.into(),
+                    "code" => value["terminal"]["hresult"] = serde_json::Value::Null,
+                    _ => unreachable!(),
+                }
+                fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+        }
+        let before: Vec<_> = fs::read_dir(&attempt)
+            .unwrap()
+            .map(|v| v.unwrap().path())
+            .filter(|p| p.is_file())
+            .map(|p| {
+                let b = fs::read(&p).unwrap();
+                (p, b)
+            })
+            .collect();
+        let mut verifier = NativeFake::new();
+        verifier.changes = damage == "source";
+        assert!(
+            inspect_retained(&temp.0, &policy(), &verifier, &control()).is_err(),
+            "{damage}"
+        );
+        assert!(reconcile(&attempt, &policy(), &NativeFake::new(), &control()).is_err());
+        for (path, bytes) in before {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert!(attempt.join("stage-intent.json").exists());
+    }
+}
+#[test]
+fn startup_reconciliation_retains_default_profile_and_cancel_cannot_promote_late_recorded_success()
+{
+    for mode in ["complete", "cancel-native", "cancel-after-readback"] {
+        let cancel = mode != "complete";
+        let temp = Temp::new();
+        let locations = crate::settings::Locations {
+            config: temp.0.join("config"),
+            data: temp.0.join("data"),
+            cache: temp.0.join("cache"),
+        };
+        let legacy = temp.0.join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        let profile = crate::settings::Profile::open(locations.clone(), &legacy).unwrap();
+        let root = locations.profile().join("windows-prepared");
+        let attempt = completed_stage(&root);
+        let original = fs::read(attempt.join("stage-outcome.json")).unwrap();
+        let mut controller = Controller::load(&locations.profile());
+        controller.set_profile(Some(profile.update_profile()));
+        let (release, ready, done) = controller.fake_reconciliation();
+        controller.startup();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        controller.set_profile(None);
+        drop(profile);
+        assert!(
+            crate::settings::Profile::open(locations.clone(), &legacy).is_err(),
+            "The real reader worker retains its captured default-profile lease"
+        );
+        assert!(controller.deployment_blocker().is_some());
+        assert!(controller.start().is_err() && controller.start_staging().is_err());
+        assert!(crate::file_safety::Lease::acquire(&root.join("acquisition.json")).is_err());
+        if mode == "cancel-native" {
+            controller.later();
+        }
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The complete real reader has returned before this cancellation, but
+        // the actual controller has not consumed its successful result yet.
+        if mode == "cancel-after-readback" {
+            controller.later();
+        }
+        wait_controller(&mut controller, |v| !v.view.busy);
+        assert_eq!(controller.view.recorded_staging, !cancel);
+        assert_eq!(
+            controller.view.staged_version,
+            (!cancel).then_some([1, 30, 1, 0])
+        );
+        assert!(controller.deployment_blocker().is_some());
+        assert!(controller.start().is_err() && controller.start_staging().is_err());
+        assert_eq!(
+            fs::read(attempt.join("stage-outcome.json")).unwrap(),
+            original
+        );
+        drop(controller);
+        drop(crate::settings::Profile::open(locations, &legacy).unwrap());
+    }
+    let temp = Temp::new();
+    let mut disabled = Controller::load(&temp.0);
+    disabled.startup();
+    assert!(disabled.start_reconciliation().is_err());
+    assert!(disabled.deployment_blocker().is_none() && !disabled.view.busy);
+    assert!(!temp.0.join("windows-prepared").exists());
+}

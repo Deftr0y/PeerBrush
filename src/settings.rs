@@ -82,14 +82,14 @@ pub struct Profile {
     _lock: std::sync::Arc<Lock>,
 }
 /// A default-profile lease can only come from the session holding settings.lock.
-/// Explicit --state-dir sessions cannot request an installed-app checkpoint.
-#[cfg(target_os = "macos")]
+/// Explicit --state-dir sessions cannot request installed-app native staging or checkpoints.
+#[cfg(any(windows, target_os = "macos", test))]
 #[derive(Clone)]
 pub struct UpdateProfile {
     pub(crate) locations: Locations,
     _lock: std::sync::Arc<Lock>,
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos", test))]
 impl Profile {
     pub fn update_profile(&self) -> UpdateProfile {
         UpdateProfile {
@@ -98,8 +98,9 @@ impl Profile {
         }
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos", test))]
 impl UpdateProfile {
+    #[cfg(target_os = "macos")]
     pub(crate) fn inherited_lock(&self) -> Result<fs::File, String> {
         self._lock
             .0
@@ -108,6 +109,7 @@ impl UpdateProfile {
     }
     /// The coordinator calls this only after authenticating its inherited peer.
     /// The descriptor is the parent's actual lock, not a newly acquired lock.
+    #[cfg(target_os = "macos")]
     pub(crate) fn from_inherited(locations: Locations, file: fs::File) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
         let opened = file

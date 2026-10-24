@@ -32,9 +32,18 @@ pub(super) struct Panel {
     windows_prepared: updates::windows::Controller,
 }
 impl Panel {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(windows, target_os = "macos", test))]
     pub(super) fn set_update_profile(&mut self, profile: Option<crate::settings::UpdateProfile>) {
-        self.native_updater.set_update_profile(profile);
+        #[cfg(target_os = "macos")]
+        self.native_updater.set_update_profile(profile.clone());
+        #[cfg(any(windows, test))]
+        self.windows_prepared.set_profile(profile);
+    }
+    #[cfg(any(windows, test))]
+    pub(super) fn defer_windows_for_close(&mut self) {
+        // Stage-only work cannot replace the app. Ordinary human exit remains
+        // available; its retained intent is not canceled/retired by this request.
+        self.windows_prepared.later();
     }
     #[cfg(target_os = "macos")]
     pub(super) fn retire_profile_capture(&mut self) -> Result<(), String> {
@@ -119,6 +128,9 @@ impl Panel {
     fn tick(&mut self, ctx: &egui::Context, allow_notification: bool) {
         #[cfg(any(windows, test))]
         {
+            if self.owner == Owner::WindowsAppInstaller {
+                self.windows_prepared.startup();
+            }
             self.windows_prepared.tick();
             if self.windows_prepared.view.busy {
                 ctx.request_repaint_after(Duration::from_millis(50));
@@ -384,6 +396,12 @@ impl PeerBrush {
             || self.export_editor.is_some()
     }
     pub(super) fn update_restart_blocker(&self) -> Option<String> {
+        #[cfg(any(windows, test))]
+        if self.updates.owner == Owner::WindowsAppInstaller {
+            if let Some(reason) = self.updates.windows_prepared.deployment_blocker() {
+                return Some(reason.into());
+            }
+        }
         if self.update_interaction_active() {
             Some(
                 "Finish or cancel the current tool, edit or file operation before restarting."
