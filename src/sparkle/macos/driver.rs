@@ -27,6 +27,12 @@ pub(super) struct State {
     expected_bytes: Cell<Option<u64>>,
     received_bytes: Cell<u64>,
     extraction: Cell<Option<f64>>,
+    control_requested: Cell<bool>,
+    prepared_generation: Cell<Option<u64>>,
+    native_lifecycle_started: Cell<bool>,
+    lifecycle_revision: Cell<u64>,
+    installing: RefCell<Option<HeldInstalling>>,
+    installed: RefCell<Option<HeldInstalled>>,
 }
 struct HeldFound {
     updater: Retained<AnyObject>,
@@ -39,6 +45,21 @@ struct HeldReady {
     _item: Option<Retained<AnyObject>>,
     _reply: RcBlock<dyn Fn(isize)>,
     generation: Option<u64>,
+}
+struct OwnedNativeCallback {
+    updater: Retained<AnyObject>,
+    item: Option<Retained<AnyObject>>,
+    ready_generation: Option<u64>,
+    handler: RcBlock<dyn Fn()>,
+    revision: u64,
+}
+struct HeldInstalling {
+    owner: OwnedNativeCallback,
+    application_terminated: bool,
+}
+struct HeldInstalled {
+    owner: OwnedNativeCallback,
+    relaunched: bool,
 }
 impl Default for State {
     fn default() -> Self {
@@ -65,6 +86,12 @@ impl Default for State {
             expected_bytes: Cell::new(None),
             received_bytes: Cell::new(0),
             extraction: Cell::new(None),
+            control_requested: Cell::new(false),
+            prepared_generation: Cell::new(None),
+            native_lifecycle_started: Cell::new(false),
+            lifecycle_revision: Cell::new(0),
+            installing: RefCell::new(None),
+            installed: RefCell::new(None),
         }
     }
 }
@@ -168,6 +195,76 @@ impl State {
             && self.held_generation() == Some(generation)
             && self.view().native_cycle
             && !self.view().cancelled
+            && !self.native_lifecycle_started.get()
+            && self.held_ready.borrow().as_ref().is_some_and(|held| {
+                Retained::as_ptr(&held._updater) == self.updater.get()
+                    && held._item.as_ref().map(Retained::as_ptr)
+                        == self.item.borrow().as_ref().map(Retained::as_ptr)
+            })
+    }
+    pub(super) fn prepare_final_control(&self, generation: u64) -> Result<(), String> {
+        if self.control_requested.replace(true)
+            || self.started.get().is_none()
+            || !self.held_is_current(generation)
+        {
+            return Err("The actual native Ready callback is no longer current".into());
+        }
+        self.prepared_generation.set(Some(generation));
+        Ok(())
+    }
+    pub(super) fn final_control_current(&self, generation: u64) -> bool {
+        self.prepared_generation.get() == Some(generation) && self.held_is_current(generation)
+    }
+    fn retain_native_lifecycle(&self, handler: &Block<dyn Fn()>) -> Option<OwnedNativeCallback> {
+        // Native progress invalidates preparation; it never proves completion or
+        // cancellation. No RefCell borrow spans copy/retain or release reentry.
+        self.native_lifecycle_started.set(true);
+        self.quarantine();
+        let revision = self.lifecycle_revision.get().checked_add(1)?;
+        self.lifecycle_revision.set(revision);
+        let generation = self.held_generation();
+        let item = self.item.borrow().as_ref().map(Retained::as_ptr);
+        let handler = unsafe { RcBlock::copy((handler as *const Block<dyn Fn()>).cast_mut()) }?;
+        let updater = unsafe { Retained::retain(self.updater.get().cast_mut()) }?;
+        let item = match item {
+            Some(item) => Some(unsafe { Retained::retain(item.cast_mut()) }?),
+            None => None,
+        };
+        if self.lifecycle_revision.get() != revision
+            || self.held_generation() != generation
+            || Retained::as_ptr(&updater) != self.updater.get()
+            || item.as_ref().map(Retained::as_ptr)
+                != self.item.borrow().as_ref().map(Retained::as_ptr)
+        {
+            return None;
+        }
+        Some(OwnedNativeCallback {
+            updater,
+            item,
+            ready_generation: generation,
+            handler,
+            revision,
+        })
+    }
+    fn retain_installing(&self, application_terminated: bool, retry: &Block<dyn Fn()>) {
+        let Some(owner) = self.retain_native_lifecycle(retry) else {
+            return;
+        };
+        let previous = self.installing.borrow_mut().replace(HeldInstalling {
+            owner,
+            application_terminated,
+        });
+        drop(previous);
+    }
+    fn retain_installed(&self, relaunched: bool, acknowledgement: &Block<dyn Fn()>) {
+        let Some(owner) = self.retain_native_lifecycle(acknowledgement) else {
+            return;
+        };
+        let previous = self
+            .installed
+            .borrow_mut()
+            .replace(HeldInstalled { owner, relaunched });
+        drop(previous);
     }
     fn retain_found(&self, item: &AnyObject, reply: &Block<dyn Fn(isize)>, downloadable: bool) {
         if self.found.borrow().is_some() || self.choice_sent.get() || !self.has_owner() {
@@ -396,6 +493,7 @@ impl State {
         signed == 1
     }
     pub fn cancel(&self) {
+        self.prepared_generation.set(None);
         self.session.borrow_mut().cancel();
         let cancellation = self.cancellation.borrow_mut().take();
         let choice = self.choice.borrow_mut().take();
@@ -417,10 +515,14 @@ impl State {
         }
     }
     pub fn failed(&self) {
+        self.control_requested.set(true);
+        self.prepared_generation.set(None);
         self.session.borrow_mut().fail();
         self.repaint();
     }
     pub fn finished(&self) {
+        self.control_requested.set(true);
+        self.prepared_generation.set(None);
         let cancellation = self.cancellation.borrow_mut().take();
         let choice = self.choice.borrow_mut().take();
         self.session.borrow_mut().finished();
@@ -432,6 +534,7 @@ impl State {
         self.repaint();
     }
     pub fn quarantine(&self) {
+        self.prepared_generation.set(None);
         self.session.borrow_mut().quarantine();
         self.repaint();
     }
@@ -575,9 +678,9 @@ define_class!(
         #[unsafe(method(showReadyToInstallAndRelaunch:))]
         fn install(&self, reply: &Block<dyn Fn(isize)>) { self.ivars().retain_ready(reply); }
         #[unsafe(method(showInstallingUpdateWithApplicationTerminated:retryTerminatingApplication:))]
-        fn installing(&self, _terminated: Bool, _retry: &Block<dyn Fn()>) { self.ivars().quarantine(); }
+        fn installing(&self, terminated: Bool, retry: &Block<dyn Fn()>) { self.ivars().retain_installing(terminated.as_bool(), retry); }
         #[unsafe(method(showUpdateInstalledAndRelaunched:acknowledgement:))]
-        fn installed(&self, _relaunched: Bool, _acknowledgement: &Block<dyn Fn()>) { self.ivars().quarantine(); }
+        fn installed(&self, relaunched: Bool, acknowledgement: &Block<dyn Fn()>) { self.ivars().retain_installed(relaunched.as_bool(), acknowledgement); }
         #[unsafe(method(dismissUpdateInstallation))]
         fn dismissed(&self) { self.ivars().repaint(); }
         #[unsafe(method(showUpdateInFocus))]
@@ -634,6 +737,209 @@ pub(super) fn assert_guarded(marker: MainThreadMarker) {
     state.finished();
     assert_eq!(choices.get(), 1);
     assert_eq!(installs.get(), 0);
+}
+
+/// Actual public selectors on an explicitly unstarted component. These retained
+/// callback facts never become permission to install, terminate or retire evidence.
+pub(super) fn assert_owned_final_control(marker: MainThreadMarker, updater: &AnyObject) {
+    let calls = Rc::new(Cell::new(0));
+    for change in [
+        "none", "cancel", "fail", "finish", "reissue", "updater", "item",
+    ] {
+        let state = Rc::new(State::default());
+        state.begin_in_owner(updater).unwrap();
+        let driver = create(marker, state.clone());
+        let item: Retained<AnyObject> =
+            unsafe { msg_send![class!(SUAppcastItem), emptyAppcastItem] };
+        assert!(state.remember_item(&item));
+        let count = calls.clone();
+        let ready = RcBlock::new(move |_choice: isize| count.set(count.get() + 1));
+        unsafe {
+            let _: () = msg_send![&*driver, showReadyToInstallAndRelaunch: &*ready];
+        }
+        state.prepare_final_control(1).unwrap();
+        assert!(state.final_control_current(1));
+        match change {
+            "cancel" => state.cancel(),
+            "fail" => state.failed(),
+            "finish" => state.finished(),
+            "reissue" => unsafe {
+                let _: () = msg_send![&*driver, showReadyToInstallAndRelaunch: &*ready];
+            },
+            "updater" => {
+                let foreign: Retained<AnyObject> = unsafe { msg_send![class!(NSObject), new] };
+                state.updater.set(Retained::as_ptr(&foreign));
+                assert!(!state.final_control_current(1));
+                state.updater.set(updater);
+                state.quarantine();
+            }
+            "item" => {
+                let foreign: Retained<AnyObject> = unsafe { msg_send![class!(SUAppcastItem), new] };
+                let old = state.item.borrow_mut().replace(foreign);
+                drop(old);
+            }
+            _ => {}
+        }
+        assert_eq!(state.final_control_current(1), change == "none", "{change}");
+        assert!(
+            state.prepare_final_control(1).is_err(),
+            "Every request remains one-shot"
+        );
+        assert!(state.view().native_cycle && state.view().quarantine);
+        assert_eq!(calls.get(), 0);
+    }
+    // Failure or cycle completion before a request invalidates preparation
+    // without releasing the unknown native owner or retained Ready callback.
+    for failure in [false, true] {
+        let ended = Rc::new(State::default());
+        ended.begin_in_owner(updater).unwrap();
+        let ended_driver = create(marker, ended.clone());
+        let item: Retained<AnyObject> =
+            unsafe { msg_send![class!(SUAppcastItem), emptyAppcastItem] };
+        assert!(ended.remember_item(&item));
+        let count = calls.clone();
+        let ready = RcBlock::new(move |_choice: isize| count.set(count.get() + 1));
+        unsafe {
+            let _: () = msg_send![&*ended_driver, showReadyToInstallAndRelaunch: &*ready];
+        }
+        if failure {
+            ended.failed();
+        } else {
+            ended.finished();
+        }
+        assert!(ended.prepare_final_control(1).is_err());
+        assert!(ended.held_ready.borrow().is_some());
+        assert!(ended.view().native_cycle && ended.view().quarantine);
+    }
+    struct CancelOnDrop(std::rc::Weak<State>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            if let Some(state) = self.0.upgrade() {
+                state.cancel();
+            }
+        }
+    }
+    let state = Rc::new(State::default());
+    state.begin_in_owner(updater).unwrap();
+    let driver = create(marker, state.clone());
+    let item: Retained<AnyObject> = unsafe { msg_send![class!(SUAppcastItem), emptyAppcastItem] };
+    assert!(state.remember_item(&item));
+    let count = calls.clone();
+    let ready = RcBlock::new(move |_choice: isize| count.set(count.get() + 1));
+    unsafe {
+        let _: () = msg_send![&*driver, showReadyToInstallAndRelaunch: &*ready];
+    }
+    state.prepare_final_control(1).unwrap();
+    let reenter = CancelOnDrop(Rc::downgrade(&state));
+    let count = calls.clone();
+    let retry = RcBlock::new(move || {
+        let _ = &reenter;
+        count.set(count.get() + 1);
+    });
+    unsafe {
+        let _: () = msg_send![&*driver, showInstallingUpdateWithApplicationTerminated: Bool::NO, retryTerminatingApplication: &*retry];
+    }
+    assert!(!state.final_control_current(1));
+    {
+        let held = state.installing.borrow();
+        let held = held.as_ref().unwrap();
+        assert!(!held.application_terminated);
+        assert_eq!(
+            Retained::as_ptr(&held.owner.updater),
+            updater as *const AnyObject
+        );
+        assert_eq!(
+            held.owner.item.as_ref().map(Retained::as_ptr),
+            Some(Retained::as_ptr(&item))
+        );
+        assert_eq!(held.owner.ready_generation, Some(1));
+        assert_eq!(held.owner.revision, 1);
+        assert!(std::ptr::eq::<Block<dyn Fn()>>(
+            &*held.owner.handler,
+            &*retry
+        ));
+    }
+    drop(retry);
+    let count = calls.clone();
+    let replacement = RcBlock::new(move || count.set(count.get() + 1));
+    unsafe {
+        let _: () = msg_send![&*driver, showInstallingUpdateWithApplicationTerminated: Bool::YES, retryTerminatingApplication: &*replacement];
+    }
+    assert!(
+        state.view().cancelled,
+        "Old callback release reenters after publishing and releasing the slot borrow"
+    );
+    {
+        let held = state.installing.borrow();
+        let held = held.as_ref().unwrap();
+        assert!(held.application_terminated);
+        assert_eq!(held.owner.revision, 2);
+        assert!(std::ptr::eq::<Block<dyn Fn()>>(
+            &*held.owner.handler,
+            &*replacement
+        ));
+    }
+    let count = calls.clone();
+    let acknowledgement = RcBlock::new(move || count.set(count.get() + 1));
+    unsafe {
+        let _: () = msg_send![&*driver, showUpdateInstalledAndRelaunched: Bool::YES, acknowledgement: &*acknowledgement];
+    }
+    {
+        let held = state.installed.borrow();
+        let held = held.as_ref().unwrap();
+        assert!(held.relaunched);
+        assert_eq!(
+            Retained::as_ptr(&held.owner.updater),
+            updater as *const AnyObject
+        );
+        assert_eq!(
+            held.owner.item.as_ref().map(Retained::as_ptr),
+            Some(Retained::as_ptr(&item))
+        );
+        assert_eq!(held.owner.ready_generation, Some(1));
+        assert_eq!(held.owner.revision, 3);
+        assert!(std::ptr::eq::<Block<dyn Fn()>>(
+            &*held.owner.handler,
+            &*acknowledgement
+        ));
+    }
+    state.lifecycle_revision.set(u64::MAX);
+    unsafe {
+        let _: () = msg_send![&*driver, showInstallingUpdateWithApplicationTerminated: Bool::NO, retryTerminatingApplication: &*replacement];
+    }
+    assert!(
+        state
+            .installing
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .application_terminated
+    );
+    state.cancel();
+    state.finished();
+    assert!(
+        state.held_ready.borrow().is_some()
+            && state.installing.borrow().is_some()
+            && state.installed.borrow().is_some()
+    );
+    assert!(state.view().native_cycle && state.view().quarantine);
+    assert!(!state.final_control_current(1));
+    assert_eq!(
+        calls.get(),
+        0,
+        "No Ready/retry/acknowledgement handler is invoked"
+    );
+    let checking: Bool = unsafe { msg_send![updater, canCheckForUpdates] };
+    assert!(
+        !checking.as_bool(),
+        "Cleanup belongs only to the known-unstarted component"
+    );
+    let installing = state.installing.borrow_mut().take();
+    let installed = state.installed.borrow_mut().take();
+    let ready = state.held_ready.borrow_mut().take();
+    drop(installing);
+    drop(installed);
+    drop(ready);
 }
 
 /// Known-unstarted component injection, not a configured update or Ready result.

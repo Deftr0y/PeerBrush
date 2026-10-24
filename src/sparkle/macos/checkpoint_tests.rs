@@ -1817,11 +1817,15 @@ fn retained_armed_owner_rechecks_its_exact_records_without_relaxing_new_owner_ad
 #[test]
 fn actual_final_profile_observation_reuses_writer_authority_and_preserves_current_joint_native_work(
 ) {
-    use super::super::{accept_final_observation, coordinator, driver, request_final_observation};
+    use super::super::{
+        accept_final_control, accept_final_observation, coordinator, driver, request_final_control,
+        request_final_observation,
+    };
     use crate::source::{Content, Source};
     use serde_json::json;
     for outcome in [
         "success",
+        "control-newer-source",
         "blocked-before",
         "dirty-before",
         "unsaved-before",
@@ -2253,7 +2257,7 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
             .unwrap();
             assert_eq!(
                 accepted.is_ok(),
-                outcome == "success",
+                matches!(outcome, "success" | "control-newer-source"),
                 "{outcome}: {accepted:?}"
             );
             assert!(processed);
@@ -2286,6 +2290,144 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
             }
             if outcome == "success" {
                 assert_eq!(expected, source_before);
+                let capture = final_capture.as_ref().unwrap();
+                let binding = retained.as_ref().unwrap();
+                for control_case in [
+                    "success",
+                    "blocked",
+                    "unaccepted",
+                    "send-error",
+                    "wrong-reply",
+                    "late-cancel",
+                    "newer-ready",
+                ] {
+                    let control_checks = driver::State::default();
+                    control_checks.session.borrow_mut().begin().unwrap();
+                    control_checks.session.borrow_mut().checking();
+                    control_checks.native_starting().unwrap();
+                    let mut requested = None;
+                    let control_sends = std::cell::Cell::new(0);
+                    let auth = std::cell::Cell::new(0);
+                    let authenticate = |selected: &FinalProfileBinding| {
+                        auth.set(auth.get() + 1);
+                        crate::workspace::lifecycle::publish_update_checkpoint(
+                            &workspace,
+                            &capture.reviewed,
+                            |store| {
+                                capture.authenticate_locked(
+                                    &lease,
+                                    &attempt,
+                                    &initial,
+                                    std::process::id(),
+                                    selected,
+                                    store,
+                                )
+                            },
+                        )
+                    };
+                    let result = request_final_control(
+                        &control_checks,
+                        Some(&reply),
+                        (control_case != "unaccepted").then_some(binding),
+                        &mut requested,
+                        control_case == "blocked",
+                        authenticate,
+                        |selected| {
+                            assert_eq!(&selected, binding);
+                            control_sends.set(control_sends.get() + 1);
+                            if control_case == "send-error" {
+                                Err("Ambiguous transport fixture".into())
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        !matches!(control_case, "blocked" | "unaccepted" | "send-error"),
+                        "{control_case}"
+                    );
+                    assert_eq!(
+                        requested.is_some(),
+                        !matches!(control_case, "blocked" | "unaccepted")
+                    );
+                    assert_eq!(
+                        auth.get(),
+                        usize::from(!matches!(control_case, "blocked" | "unaccepted"))
+                    );
+                    assert_eq!(control_sends.get(), auth.get());
+                    if result.is_ok() {
+                        let mut observed = reply.clone();
+                        let mut acknowledged = binding.clone();
+                        if control_case == "wrong-reply" {
+                            acknowledged.record_sha256 = "e".repeat(64);
+                        }
+                        if control_case == "late-cancel" {
+                            control_checks.cancel();
+                        }
+                        if control_case == "newer-ready" {
+                            observed.held_generation = Some(binding.ready_generation + 1);
+                        }
+                        let mut consumed = false;
+                        let accepted = accept_final_control(
+                            &control_checks,
+                            Some(&observed),
+                            requested.as_ref(),
+                            &acknowledged,
+                            &mut consumed,
+                            false,
+                            authenticate,
+                        );
+                        assert_eq!(
+                            accepted.is_ok(),
+                            control_case == "success",
+                            "{control_case}"
+                        );
+                        assert!(consumed);
+                        assert!(accept_final_control(
+                            &control_checks,
+                            Some(&reply),
+                            requested.as_ref(),
+                            binding,
+                            &mut consumed,
+                            false,
+                            |_| panic!("Repeated control reached writer authority")
+                        )
+                        .is_err());
+                    }
+                    if requested.is_some() {
+                        assert!(request_final_control(
+                            &control_checks,
+                            Some(&reply),
+                            Some(binding),
+                            &mut requested,
+                            false,
+                            |_| panic!("Repeated request reached writer authority"),
+                            |_| panic!("Repeated control reached transport")
+                        )
+                        .is_err());
+                    }
+                    assert_eq!(
+                        current_workspace_bytes(&projects, &paths),
+                        expected,
+                        "{control_case}"
+                    );
+                    assert!(!workspace.lock().unwrap().exiting);
+                    assert!(!tools.lock().unwrap().update_exit_committed());
+                    for (index, project) in projects.iter().enumerate() {
+                        let e = project.lock().unwrap();
+                        assert!(
+                            !e.closed
+                                && Arc::ptr_eq(e.file_ownership.as_ref().unwrap(), &owners[index])
+                        );
+                        assert_eq!(e.file_version, versions[index]);
+                        assert!(crate::file_ownership::Ownership::open(
+                            &paths[index],
+                            "control-foreign"
+                        )
+                        .is_err());
+                    }
+                }
                 // No-later-writer exclusion is deliberately still unfinished:
                 // a later real preference write remains available and makes the
                 // old observation fail if explicitly reauthenticated.
@@ -2308,7 +2450,123 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
                         retained.as_ref().unwrap()
                     )
                     .is_err());
+                let mut control = None;
+                assert!(request_final_control(
+                    &checks,
+                    Some(&reply),
+                    retained.as_ref(),
+                    &mut control,
+                    false,
+                    |binding| crate::workspace::lifecycle::publish_update_checkpoint(
+                        &workspace,
+                        &capture.reviewed,
+                        |store| {
+                            capture.authenticate_locked(
+                                &lease,
+                                &attempt,
+                                &initial,
+                                std::process::id(),
+                                binding,
+                                store,
+                            )
+                        }
+                    ),
+                    |_| panic!("Later human settings reached control transport")
+                )
+                .is_err());
+                assert!(control.is_none());
                 assert_eq!(current_workspace_bytes(&projects, &paths), expected);
+            }
+            if outcome == "control-newer-source" {
+                let capture = final_capture.as_ref().unwrap();
+                let binding = retained.as_ref().unwrap();
+                let authenticate = |selected: &FinalProfileBinding| {
+                    crate::workspace::lifecycle::publish_update_checkpoint(
+                        &workspace,
+                        &capture.reviewed,
+                        |store| {
+                            capture.authenticate_locked(
+                                &lease,
+                                &attempt,
+                                &initial,
+                                std::process::id(),
+                                selected,
+                                store,
+                            )
+                        },
+                    )
+                };
+                let mut requested = None;
+                request_final_control(
+                    &checks,
+                    Some(&reply),
+                    Some(binding),
+                    &mut requested,
+                    false,
+                    authenticate,
+                    |selected| {
+                        assert_eq!(&selected, binding);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                {
+                    let mut e = projects[1].lock().unwrap();
+                    let raster = e
+                        .doc
+                        .layers
+                        .iter()
+                        .find(|layer| layer.source.is_none())
+                        .unwrap()
+                        .id
+                        .clone();
+                    for name in [
+                        "Human work after final request",
+                        "Undo temporary control name",
+                    ] {
+                        e.edit(
+                            "human",
+                            &[json!({"op":"layer.update","layer":raster,"name":name})],
+                            None,
+                            None,
+                            "Newer human control work",
+                        )
+                        .unwrap();
+                    }
+                    e.undo("human").unwrap();
+                    assert!(!e.undo.is_empty() && !e.redo.is_empty());
+                }
+                let newer = current_workspace_bytes(&projects, &paths);
+                assert_ne!(newer, expected);
+                let mut consumed = false;
+                assert!(accept_final_control(
+                    &checks,
+                    Some(&reply),
+                    requested.as_ref(),
+                    binding,
+                    &mut consumed,
+                    false,
+                    authenticate,
+                )
+                .is_err());
+                assert!(consumed);
+                assert_eq!(current_workspace_bytes(&projects, &paths), newer);
+                assert!(!workspace.lock().unwrap().exiting);
+                assert!(!tools.lock().unwrap().update_exit_committed());
+                for (index, project) in projects.iter().enumerate() {
+                    let e = project.lock().unwrap();
+                    assert!(!e.closed);
+                    assert!(Arc::ptr_eq(
+                        e.file_ownership.as_ref().unwrap(),
+                        &owners[index]
+                    ));
+                    assert_eq!(e.file_version, versions[index]);
+                    assert!(crate::file_ownership::Ownership::open(
+                        &paths[index],
+                        "newer-control-foreign"
+                    )
+                    .is_err());
+                }
             }
         } else {
             assert_eq!(current_workspace_bytes(&projects, &paths), source_before);

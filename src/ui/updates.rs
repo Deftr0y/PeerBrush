@@ -385,6 +385,20 @@ impl PeerBrush {
             return false;
         }
         let blocked = self.update_interaction_active();
+        if !blocked && self.updates.native_updater.may_prepare_final_control() {
+            self.message = match self.flush_update_tool_profile().and_then(|()| {
+                self.updates
+                    .native_updater
+                    .prepare_final_control(&self.workspace, blocked)
+            }) {
+                Ok(()) => {
+                    "App update preparation requested. Installation and restart remain unavailable."
+                        .into()
+                }
+                Err(error) => error,
+            };
+            return true;
+        }
         if !blocked && self.updates.native_updater.may_observe_final_profile() {
             // Match ordinary on_exit's UI delta before taking shared writer locks.
             self.message = match self.flush_update_tool_profile().and_then(|()| {

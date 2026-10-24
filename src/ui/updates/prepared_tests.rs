@@ -871,6 +871,12 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
             .contains("not available"));
         assert!(!app.updates.native_updater.download_requested());
         assert!(!app.updates.native_updater.startup_enabled());
+        assert!(!app.updates.native_updater.may_prepare_final_control());
+        assert!(app
+            .updates
+            .native_updater
+            .prepare_final_control(&app.workspace, false)
+            .is_err());
         assert!(!app.updates.native_updater.may_observe_final_profile());
         assert!(app
             .updates
@@ -918,6 +924,12 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
         let output = frame(&mut app, &ctx, vec![]);
         assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text=="Native update preparation is held. Installation and restart remain unavailable.")));
         assert!(app.updates.native_updater.view().cancelled);
+        assert!(!app.updates.native_updater.may_prepare_final_control());
+        assert!(app
+            .updates
+            .native_updater
+            .prepare_final_control(&app.workspace, false)
+            .is_err());
         assert!(!app.updates.native_updater.may_observe_final_profile());
         assert!(app
             .updates

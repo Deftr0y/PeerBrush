@@ -467,6 +467,9 @@ impl Probe {
             owner_status: None,
             final_profile: None,
             final_reply_processed: false,
+            final_profile_accepted: false,
+            final_control_request: None,
+            final_control_processed: false,
             checks,
         };
         for depth in [8, 16] {
@@ -562,6 +565,10 @@ impl Probe {
     pub fn assert_disabled(&self) {
         driver::assert_guarded(MainThreadMarker::new().expect("Main-thread component probe"));
         driver::assert_owned_ready(
+            MainThreadMarker::new().expect("Main-thread component probe"),
+            &self.controller,
+        );
+        driver::assert_owned_final_control(
             MainThreadMarker::new().expect("Main-thread component probe"),
             &self.controller,
         );
@@ -1053,6 +1060,9 @@ mod tests {
             owner_status: None,
             final_profile: None,
             final_reply_processed: false,
+            final_profile_accepted: false,
+            final_control_request: None,
+            final_control_processed: false,
             checks: checks.clone(),
         };
         assert!(app.configured());
@@ -1119,6 +1129,9 @@ pub struct Application {
     owner_status: Option<coordinator::NativeStatus>,
     final_profile: Option<checkpoint::FinalProfileBinding>,
     final_reply_processed: bool,
+    final_profile_accepted: bool,
+    final_control_request: Option<checkpoint::FinalProfileBinding>,
+    final_control_processed: bool,
 }
 
 impl Application {
@@ -1149,6 +1162,9 @@ impl Application {
             owner_status: None,
             final_profile: None,
             final_reply_processed: false,
+            final_profile_accepted: false,
+            final_control_request: None,
+            final_control_processed: false,
             checks: Rc::new(driver::State::default()),
         }
     }
@@ -1242,6 +1258,46 @@ impl Application {
         self.final_reply_processed = false;
         self.message =
             "Settings observation requested. Installation and restart remain unavailable.";
+        Ok(())
+    }
+    pub(crate) fn may_prepare_final_control(&self) -> bool {
+        self.startup_enabled()
+            && self.final_profile_accepted
+            && self.final_control_request.is_none()
+            && !self.final_control_processed
+            && !self.checks.view().cancelled
+    }
+    pub(crate) fn prepare_final_control(
+        &mut self,
+        workspace: &crate::workspace::Registry,
+        ui_blocked: bool,
+    ) -> Result<(), String> {
+        if !self.startup_enabled() {
+            return Err(
+                "App update preparation is not available in this development build.".into(),
+            );
+        }
+        checkpoint::require_captured_handoff()?;
+        let prepared = self.checkpoint.as_ref().ok_or("No retained app capture")?;
+        let remote = self
+            .remote
+            .as_ref()
+            .ok_or("No authenticated app update owner")?;
+        let result = request_final_control(
+            &self.checks,
+            self.owner_status.as_ref(),
+            self.final_profile
+                .as_ref()
+                .filter(|_| self.final_profile_accepted),
+            &mut self.final_control_request,
+            ui_blocked,
+            |binding| prepared.prepare_final_control(workspace, binding),
+            |binding| remote.prepare_final_control(binding),
+        );
+        self.final_control_processed = result.is_err();
+        result?;
+        self.message =
+            "App update preparation requested. Installation and restart remain unavailable.";
         Ok(())
     }
     pub fn message(&self) -> &'static str {
@@ -1340,6 +1396,9 @@ impl Application {
         self.owner_status = None;
         self.final_profile = None;
         self.final_reply_processed = false;
+        self.final_profile_accepted = false;
+        self.final_control_request = None;
+        self.final_control_processed = false;
         self.checks = checks;
         self.verification = Some(Verification { receiver, cancel });
         Ok(())
@@ -1422,6 +1481,7 @@ impl Application {
                         },
                     );
                     if let Some(result) = result {
+                        self.final_profile_accepted = result.is_ok();
                         self.message = if result.is_ok() {
                             "Settings were observed for this request. Installation and restart remain unavailable."
                         } else {
@@ -1436,6 +1496,39 @@ impl Application {
                     self.checks.quarantine();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.final_control_request.is_some() && !self.final_control_processed {
+            if let Some(remote) = &self.remote {
+                let result = match remote.final_control_reply.try_recv() {
+                    Ok(Ok(binding)) => Some(accept_final_control(
+                        &self.checks,
+                        self.owner_status.as_ref(),
+                        self.final_control_request.as_ref(),
+                        &binding,
+                        &mut self.final_control_processed,
+                        ui_blocked,
+                        |binding| {
+                            self.checkpoint
+                                .as_ref()
+                                .ok_or("No retained final settings capture")?
+                                .prepare_final_control(workspace, binding)
+                        },
+                    )),
+                    Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("Final native control remains unknown".into()))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                };
+                if let Some(result) = result {
+                    self.final_control_processed = true;
+                    self.message = if result.is_ok() {
+                        "The app update request was prepared. Installation and restart remain unavailable."
+                    } else {
+                        self.checks.quarantine();
+                        "The update request could not be confirmed. Projects remain open."
+                    };
+                }
             }
         }
         if self.verification.is_some() || self.checks.view().busy {
@@ -1514,6 +1607,63 @@ fn request_final_observation(
         return Err("The native observation changed".into());
     }
     send(binding)
+}
+fn request_final_control(
+    checks: &driver::State,
+    status: Option<&coordinator::NativeStatus>,
+    accepted: Option<&checkpoint::FinalProfileBinding>,
+    retained: &mut Option<checkpoint::FinalProfileBinding>,
+    ui_blocked: bool,
+    authenticate: impl FnOnce(&checkpoint::FinalProfileBinding) -> Result<(), String>,
+    send: impl FnOnce(checkpoint::FinalProfileBinding) -> Result<(), String>,
+) -> Result<(), String> {
+    let binding = accepted.ok_or("No accepted final settings observation")?;
+    if ui_blocked
+        || retained.is_some()
+        || checks.view().cancelled
+        || !checks.view().native_cycle
+        || !status.is_some_and(|status| {
+            !status.cancelled
+                && status.held_generation == Some(binding.ready_generation)
+                && status.final_profile.as_ref() == Some(binding)
+        })
+    {
+        return Err("Final update control changed; projects remain open".into());
+    }
+    authenticate(binding)?;
+    // The concrete request survives failed/ambiguous transport; no later replay.
+    *retained = Some(binding.clone());
+    if checks.view().cancelled {
+        return Err("Final update control was cancelled".into());
+    }
+    send(binding.clone())
+}
+fn accept_final_control(
+    checks: &driver::State,
+    status: Option<&coordinator::NativeStatus>,
+    requested: Option<&checkpoint::FinalProfileBinding>,
+    reply: &checkpoint::FinalProfileBinding,
+    processed: &mut bool,
+    ui_blocked: bool,
+    authenticate: impl FnOnce(&checkpoint::FinalProfileBinding) -> Result<(), String>,
+) -> Result<(), String> {
+    if *processed {
+        return Err("Final native control reply was already consumed".into());
+    }
+    *processed = true;
+    if ui_blocked
+        || requested != Some(reply)
+        || checks.view().cancelled
+        || !checks.view().native_cycle
+        || !status.is_some_and(|status| {
+            !status.cancelled
+                && status.held_generation == Some(reply.ready_generation)
+                && status.final_profile.as_ref() == Some(reply)
+        })
+    {
+        return Err("Final native control reply is no longer current".into());
+    }
+    authenticate(reply)
 }
 fn accept_final_observation(
     checks: &driver::State,

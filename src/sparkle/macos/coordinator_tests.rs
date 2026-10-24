@@ -316,6 +316,7 @@ fn native_observations_bind_exact_child_sequence_action_and_never_clear_unknown_
             binding: CheckCommand::new(&request, 3, CheckAction::Status),
             owner_pid: 17,
             status: observation(),
+            final_control: None,
         };
         match damage {
             "pid" => reply.owner_pid = 18,
@@ -676,6 +677,7 @@ fn download_command_and_reply_bind_exact_found_generation_on_the_actual_frame_pa
         binding: actual,
         owner_pid: 17,
         status: observation(),
+        final_control: None,
     };
     reply
         .validate(&request, 17, 2, CheckAction::Download, Some(11), None)
@@ -721,12 +723,15 @@ fn download_request_queue_is_one_shot_even_after_consumption_and_cancel_is_only_
     let (_result, receiver) = mpsc::channel();
     let (requests, pending) = mpsc::sync_channel(1);
     let cancel = Arc::new(AtomicBool::new(false));
+    let (_control_sender, final_control_reply) = mpsc::channel();
     let remote = RemoteCheck {
+        final_control_reply,
         receiver,
         cancel: cancel.clone(),
         requests,
         download_requested: AtomicBool::new(false),
         final_profile_requested: AtomicBool::new(false),
+        final_control_requested: AtomicBool::new(false),
     };
     assert!(remote.download(0).is_err());
     assert!(!remote.download_requested());
@@ -830,6 +835,7 @@ fn final_profile_command_and_reply_bind_actual_frames_to_ready_sources_record_an
             binding: actual,
             owner_pid: 17,
             status,
+            final_control: None,
         },
         deadline,
         &cancel,
@@ -930,12 +936,15 @@ fn final_profile_request_uses_the_sole_bounded_queue_once_and_retains_cancelled_
         let (_result, receiver) = mpsc::channel();
         let (requests, pending) = mpsc::sync_channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
+        let (_control_sender, final_control_reply) = mpsc::channel();
         let remote = RemoteCheck {
+            final_control_reply,
             receiver,
             cancel: cancel.clone(),
             requests,
             download_requested: AtomicBool::new(false),
             final_profile_requested: AtomicBool::new(false),
+            final_control_requested: AtomicBool::new(false),
         };
         if outcome == "full" {
             remote.download(3).unwrap();
@@ -969,5 +978,165 @@ fn final_profile_request_uses_the_sole_bounded_queue_once_and_retains_cancelled_
         remote.cancel();
         assert!(cancel.load(Ordering::Acquire));
         assert!(remote.observe_final_profile(final_binding()).is_err());
+    }
+}
+
+#[test]
+fn final_control_actual_frames_and_separate_delivery_bind_owner_attempt_sequence_ready_and_profile()
+{
+    let request = request();
+    let binding = final_binding();
+    let mut command = CheckCommand::new(&request, 5, CheckAction::PrepareFinalControl);
+    command.final_profile = Some(binding.clone());
+    let (mut parent, mut child) = UnixStream::pair().unwrap();
+    let cancel = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    send(&mut parent, &command, deadline, &cancel).unwrap();
+    let actual =
+        accept_check_command(&mut child, &request, 5, deadline, &cancel, |_| Ok(())).unwrap();
+    let mut status = observation();
+    status.final_profile = Some(binding.clone());
+    send(
+        &mut child,
+        &CheckReply {
+            binding: actual,
+            owner_pid: 17,
+            status,
+            final_control: Some(binding.clone()),
+        },
+        deadline,
+        &cancel,
+    )
+    .unwrap();
+    let raw = receive::<CheckReply>(&mut parent, deadline, &cancel).unwrap();
+    raw.validate(
+        &request,
+        17,
+        5,
+        CheckAction::PrepareFinalControl,
+        None,
+        Some(&binding),
+    )
+    .unwrap();
+    let encoded = serde_json::to_vec(&raw).unwrap();
+    assert!(encoded.len() <= FRAME_LIMIT);
+    let (observations, prior) = mpsc::sync_channel(1);
+    let (control, acknowledgement) = mpsc::sync_channel(1);
+    observations.send(Ok(observation())).unwrap();
+    assert!(deliver_check_reply(raw, &observations, &control).unwrap());
+    assert_eq!(acknowledgement.try_recv().unwrap().unwrap(), binding);
+    assert!(
+        prior.try_recv().unwrap().unwrap().final_profile.is_none(),
+        "Old status remains separate from the exact acknowledgement"
+    );
+    for damage in [
+        "owner",
+        "sequence",
+        "nonce",
+        "attempt",
+        "manifest",
+        "action",
+        "missing",
+        "wrong-ready",
+        "wrong-profile",
+        "wrong-sources",
+        "cancelled",
+        "native-cycle",
+    ] {
+        let mut reply: CheckReply = serde_json::from_slice(&encoded).unwrap();
+        match damage {
+            "owner" => reply.owner_pid = 18,
+            "sequence" => reply.binding.sequence = 6,
+            "nonce" => reply.binding.nonce = "c".repeat(64),
+            "attempt" => reply.binding.checkpoint = uuid::Uuid::new_v4().to_string(),
+            "manifest" => reply.binding.manifest_sha256 = "d".repeat(64),
+            "action" => reply.binding.action = CheckAction::ObserveFinalProfile,
+            "missing" => reply.final_control = None,
+            "wrong-ready" => reply.final_control.as_mut().unwrap().ready_generation += 1,
+            "wrong-profile" => reply.final_control.as_mut().unwrap().record_sha256 = "c".repeat(64),
+            "wrong-sources" => {
+                reply.final_control.as_mut().unwrap().sources_sha256 = "d".repeat(64)
+            }
+            "cancelled" => reply.status.cancelled = true,
+            "native-cycle" => reply.status.native_cycle = false,
+            _ => unreachable!(),
+        }
+        assert!(
+            reply
+                .validate(
+                    &request,
+                    17,
+                    5,
+                    CheckAction::PrepareFinalControl,
+                    None,
+                    Some(&binding)
+                )
+                .is_err(),
+            "{damage}"
+        );
+    }
+    for sequence in [0, 1] {
+        let mut early = CheckCommand::new(&request, sequence, CheckAction::PrepareFinalControl);
+        early.final_profile = Some(binding.clone());
+        assert!(early.validate(&request, sequence).is_err());
+    }
+    let first: CheckReply = serde_json::from_slice(&encoded).unwrap();
+    assert!(deliver_check_reply(first, &observations, &control).unwrap());
+    let duplicate: CheckReply = serde_json::from_slice(&encoded).unwrap();
+    assert!(
+        deliver_check_reply(duplicate, &observations, &control).is_err(),
+        "Unread control cannot be overwritten"
+    );
+    assert_eq!(acknowledgement.try_recv().unwrap().unwrap(), binding);
+    assert!(checkpoint::require_captured_handoff().is_err());
+}
+#[test]
+fn final_control_request_keeps_once_ownership_after_queue_errors_consumption_and_late_cancel() {
+    for outcome in ["success", "full", "disconnected", "cancelled"] {
+        let (_result, receiver) = mpsc::channel();
+        let (_ack, final_control_reply) = mpsc::channel();
+        let (requests, pending) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let remote = RemoteCheck {
+            receiver,
+            final_control_reply,
+            cancel: cancel.clone(),
+            requests,
+            download_requested: AtomicBool::new(false),
+            final_profile_requested: AtomicBool::new(false),
+            final_control_requested: AtomicBool::new(false),
+        };
+        if outcome == "full" {
+            remote.download(3).unwrap();
+        }
+        if outcome == "cancelled" {
+            remote.cancel();
+        }
+        let mut pending = Some(pending);
+        if outcome == "disconnected" {
+            drop(pending.take());
+        }
+        assert_eq!(
+            remote.prepare_final_control(final_binding()).is_ok(),
+            outcome == "success",
+            "{outcome}"
+        );
+        if let Some(pending) = pending {
+            match pending.try_recv() {
+                Ok(OwnerRequest::PrepareFinalControl(binding)) => {
+                    assert_eq!(binding, final_binding())
+                }
+                Ok(OwnerRequest::Download(3)) => assert_eq!(outcome, "full"),
+                Err(mpsc::TryRecvError::Empty) => assert_eq!(outcome, "cancelled"),
+                _ => panic!("Wrong final-control request"),
+            }
+        }
+        assert!(
+            remote.prepare_final_control(final_binding()).is_err(),
+            "{outcome}"
+        );
+        remote.cancel();
+        assert!(remote.prepare_final_control(final_binding()).is_err());
+        assert!(cancel.load(Ordering::Acquire));
     }
 }

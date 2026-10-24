@@ -826,6 +826,39 @@ impl Prepared {
         )?;
         self.check_identity()
     }
+    pub(super) fn prepare_final_control(
+        &self,
+        workspace: &crate::workspace::Registry,
+        binding: &FinalProfileBinding,
+    ) -> Result<(), String> {
+        let capture = self.final_profile.as_ref().ok_or(HOLD)?;
+        crate::workspace::lifecycle::publish_update_checkpoint(
+            workspace,
+            &capture.reviewed,
+            |tools| self.authenticate_final_profile_locked(tools, binding),
+        )
+    }
+    /// Actual caller holds sorted engines, registry and the Store writer mutex.
+    /// Never reacquire workspace locks here or invoke a native continuation.
+    pub(super) fn authenticate_final_profile_locked(
+        &self,
+        tools: &crate::tool_settings::Store,
+        binding: &FinalProfileBinding,
+    ) -> Result<(), String> {
+        self.check_identity()?;
+        self.final_profile
+            .as_ref()
+            .ok_or(HOLD)?
+            .authenticate_locked(
+                &self._profile,
+                &self.path,
+                &self.manifest,
+                self._owner.pid()?,
+                binding,
+                tools,
+            )?;
+        self.check_identity()
+    }
     pub fn retire_profile_capture(&self) -> Result<(), String> {
         self.check_identity()?;
         if Stamp::read(&self.path.join("native-start-intent.json"))?.is_some() {
@@ -1214,13 +1247,27 @@ impl FinalCapture {
             return Err(HOLD.into());
         }
         crate::workspace::lifecycle::publish_update_checkpoint(workspace, &self.reviewed, |tools| {
-            profile.validate()?;
-            read_final_profile(path, initial, owner_pid, binding)?;
-            let root = profile.locations.profile();
-            tools.authenticate_update_profile(&root)?;
-            self.current.authenticate_profile(&root)?;
-            self.current.recheck()
+            self.authenticate_locked(profile, path, initial, owner_pid, binding, tools)
         })
+    }
+    fn authenticate_locked(
+        &self,
+        profile: &UpdateProfile,
+        path: &Path,
+        initial: &[u8],
+        owner_pid: u32,
+        binding: &FinalProfileBinding,
+        tools: &crate::tool_settings::Store,
+    ) -> Result<(), String> {
+        if binding != &self.binding || reviewed_sources(&self.reviewed)? != binding.sources_sha256 {
+            return Err(HOLD.into());
+        }
+        profile.validate()?;
+        read_final_profile(path, initial, owner_pid, binding)?;
+        let root = profile.locations.profile();
+        tools.authenticate_update_profile(&root)?;
+        self.current.authenticate_profile(&root)?;
+        self.current.recheck()
     }
 }
 

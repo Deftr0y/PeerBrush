@@ -103,6 +103,7 @@ enum CheckAction {
     Cancel,
     Download,
     ObserveFinalProfile,
+    PrepareFinalControl,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,9 +142,14 @@ impl CheckCommand {
             || (sequence == 1
                 && matches!(
                     self.action,
-                    CheckAction::Download | CheckAction::ObserveFinalProfile
+                    CheckAction::Download
+                        | CheckAction::ObserveFinalProfile
+                        | CheckAction::PrepareFinalControl
                 ))
-            || (self.action == CheckAction::ObserveFinalProfile) != self.final_profile.is_some()
+            || matches!(
+                self.action,
+                CheckAction::ObserveFinalProfile | CheckAction::PrepareFinalControl
+            ) != self.final_profile.is_some()
             || (self.action == CheckAction::Download) != self.found_generation.is_some()
             || self.found_generation == Some(0)
         {
@@ -218,6 +224,7 @@ struct CheckReply {
     binding: CheckCommand,
     owner_pid: u32,
     status: NativeStatus,
+    final_control: Option<checkpoint::FinalProfileBinding>,
 }
 impl CheckReply {
     fn validate(
@@ -235,22 +242,49 @@ impl CheckReply {
             || self.binding.action != action
             || self.binding.found_generation != found_generation
             || self.binding.final_profile.as_ref() != final_profile
+            || (action == CheckAction::PrepareFinalControl) != self.final_control.is_some()
+            || self.final_control.as_ref().is_some_and(|binding| {
+                Some(binding) != final_profile
+                    || self.status.final_profile.as_ref() != Some(binding)
+                    || self.status.held_generation != Some(binding.ready_generation)
+                    || self.status.cancelled
+            })
         {
             return Err(FAILED.into());
         }
         self.status.validate()
     }
 }
+fn deliver_check_reply(
+    reply: CheckReply,
+    observations: &mpsc::SyncSender<Result<NativeStatus, String>>,
+    control: &mpsc::SyncSender<Result<checkpoint::FinalProfileBinding, String>>,
+) -> Result<bool, String> {
+    // This receives an already authenticated/validated frame from our sole reader.
+    // Control acknowledgement cannot be coalesced with an older status observation.
+    if reply.binding.action == CheckAction::PrepareFinalControl {
+        control
+            .try_send(Ok(reply.final_control.ok_or(FAILED)?))
+            .map_err(|_| FAILED)?;
+    }
+    match observations.try_send(Ok(reply.status)) {
+        Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(true),
+        Err(mpsc::TrySendError::Disconnected(_)) => Ok(false),
+    }
+}
 enum OwnerRequest {
     Download(u64),
     ObserveFinalProfile(checkpoint::FinalProfileBinding),
+    PrepareFinalControl(checkpoint::FinalProfileBinding),
 }
 pub(super) struct RemoteCheck {
     pub(super) receiver: mpsc::Receiver<Result<NativeStatus, String>>,
+    pub(super) final_control_reply: mpsc::Receiver<Result<checkpoint::FinalProfileBinding, String>>,
     cancel: Arc<AtomicBool>,
     requests: mpsc::SyncSender<OwnerRequest>,
     download_requested: AtomicBool,
     final_profile_requested: AtomicBool,
+    final_control_requested: AtomicBool,
 }
 impl RemoteCheck {
     pub(super) fn cancel(&self) {
@@ -288,6 +322,23 @@ impl RemoteCheck {
             .try_send(OwnerRequest::ObserveFinalProfile(binding))
             .map_err(|_| FAILED.into())
     }
+    pub(super) fn prepare_final_control(
+        &self,
+        binding: checkpoint::FinalProfileBinding,
+    ) -> Result<(), String> {
+        binding.validate()?;
+        if self.cancel.load(Ordering::Acquire)
+            || self
+                .final_control_requested
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err("Final update control is already held or cancelled".into());
+        }
+        self.requests
+            .try_send(OwnerRequest::PrepareFinalControl(binding))
+            .map_err(|_| FAILED.into())
+    }
     pub(super) fn download_requested(&self) -> bool {
         self.download_requested.load(Ordering::Acquire)
     }
@@ -315,7 +366,11 @@ struct NativeCommand {
     action: CheckAction,
     found_generation: Option<u64>,
     final_profile: Option<checkpoint::FinalProfileBinding>,
-    reply: mpsc::SyncSender<NativeStatus>,
+    reply: mpsc::SyncSender<NativeReply>,
+}
+struct NativeReply {
+    status: NativeStatus,
+    final_control: Option<checkpoint::FinalProfileBinding>,
 }
 fn check_reader(
     mut socket: UnixStream,
@@ -345,7 +400,7 @@ fn check_reader(
                     reply,
                 })
                 .map_err(|_| FAILED)?;
-            let status = loop {
+            let reply = loop {
                 remaining(deadline, &cancel)?;
                 match result.recv_timeout(Duration::from_millis(100)) {
                     Ok(status) => break status,
@@ -353,14 +408,15 @@ fn check_reader(
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Err(FAILED.into()),
                 }
             };
-            status.validate()?;
+            reply.status.validate()?;
             process_identity::authenticate(&socket, request.parent_pid, &team)?;
             send(
                 &mut socket,
                 &CheckReply {
                     binding: command,
                     owner_pid: std::process::id(),
-                    status,
+                    status: reply.status,
+                    final_control: reply.final_control,
                 },
                 deadline,
                 &cancel,
@@ -683,6 +739,7 @@ impl Owner {
         let cancel = Arc::new(AtomicBool::new(false));
         let requested_cancel = cancel.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
+        let (control_sender, final_control_reply) = mpsc::sync_channel(1);
         let (requests, pending) = mpsc::sync_channel(1);
         let repaint = ctx.clone();
         std::thread::Builder::new()
@@ -707,6 +764,9 @@ impl Owner {
                                 Ok(OwnerRequest::ObserveFinalProfile(binding)) => {
                                     (CheckAction::ObserveFinalProfile, None, Some(binding))
                                 }
+                                Ok(OwnerRequest::PrepareFinalControl(binding)) => {
+                                    (CheckAction::PrepareFinalControl, None, Some(binding))
+                                }
                                 Err(mpsc::TryRecvError::Empty) => (CheckAction::Status, None, None),
                                 Err(mpsc::TryRecvError::Disconnected) => return Err(FAILED.into()),
                             }
@@ -727,10 +787,8 @@ impl Owner {
                             final_profile.as_ref(),
                         )?;
                         process_identity::authenticate(&socket, child, &team)?;
-                        // Bounded observations may coalesce; none carries an install permit.
-                        match sender.try_send(Ok(reply.status)) {
-                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                            Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
+                        if !deliver_check_reply(reply, &sender, &control_sender)? {
+                            return Ok(());
                         }
                         repaint.request_repaint();
                         if action == CheckAction::Cancel {
@@ -741,6 +799,7 @@ impl Owner {
                     }
                 })();
                 if let Err(error) = result {
+                    let _ = control_sender.try_send(Err(error.clone()));
                     let _ = sender.try_send(Err(error));
                     repaint.request_repaint();
                 }
@@ -748,10 +807,12 @@ impl Owner {
             .map_err(|_| FAILED)?;
         Ok(RemoteCheck {
             receiver,
+            final_control_reply,
             cancel,
             requests,
             download_requested: AtomicBool::new(false),
             final_profile_requested: AtomicBool::new(false),
+            final_control_requested: AtomicBool::new(false),
         })
     }
 }
@@ -896,6 +957,7 @@ struct NativeOwner {
     check_attempted: bool,
     armed: Option<checkpoint::ArmedCheck>,
     final_profile: Option<checkpoint::FinalProfileBinding>,
+    final_control: Option<checkpoint::FinalProfileBinding>,
 }
 impl NativeOwner {
     fn load(
@@ -996,6 +1058,7 @@ impl NativeOwner {
             check_attempted: false,
             armed: None,
             final_profile: None,
+            final_control: None,
         })
     }
     fn check(&mut self) -> Result<(), String> {
@@ -1113,6 +1176,43 @@ impl NativeOwner {
         self.final_profile = Some(binding);
         Ok(())
     }
+    fn prepare_final_control(
+        &mut self,
+        binding: checkpoint::FinalProfileBinding,
+    ) -> Result<(), String> {
+        checkpoint::require_captured_handoff()?;
+        if self.final_control.is_some()
+            || self.final_profile.as_ref() != Some(&binding)
+            || self.cancel.load(Ordering::Acquire)
+            || !self.checks.held_is_current(binding.ready_generation)
+        {
+            return Err(FAILED.into());
+        }
+        process_identity::authenticate(
+            &self._channel,
+            self.parent,
+            &self.configuration.publisher_team_id,
+        )?;
+        self.armed
+            .as_ref()
+            .ok_or(FAILED)?
+            .observe_final_profile(&self._profile, &binding)?;
+        self.checks
+            .prepare_final_control(binding.ready_generation)?;
+        // Retain before any later authentication can fail; no ambiguous retry.
+        self.final_control = Some(binding.clone());
+        process_identity::authenticate(
+            &self._channel,
+            self.parent,
+            &self.configuration.publisher_team_id,
+        )?;
+        if self.cancel.load(Ordering::Acquire)
+            || !self.checks.final_control_current(binding.ready_generation)
+        {
+            return Err(FAILED.into());
+        }
+        Ok(())
+    }
     fn status(&self) -> NativeStatus {
         let mut status = self.checks.observed_status();
         status.final_profile = self
@@ -1133,6 +1233,7 @@ impl NativeOwner {
             // One command per turn leaves Foundation callbacks an opportunity to run.
             match commands.try_recv() {
                 Ok(command) => {
+                    let mut final_control = None;
                     match command.action {
                         CheckAction::Check => {
                             if self.check().is_err() {
@@ -1151,6 +1252,18 @@ impl NativeOwner {
                                 self.checks.quarantine();
                             }
                         }
+                        CheckAction::PrepareFinalControl => {
+                            match command
+                                .final_profile
+                                .ok_or_else(|| FAILED.to_string())
+                                .and_then(|binding| {
+                                    self.prepare_final_control(binding.clone())
+                                        .map(|()| binding)
+                                }) {
+                                Ok(binding) => final_control = Some(binding),
+                                Err(_) => self.checks.quarantine(),
+                            }
+                        }
                         CheckAction::Cancel => self.checks.cancel(),
                         CheckAction::Download => {
                             if command
@@ -1163,7 +1276,10 @@ impl NativeOwner {
                             }
                         }
                     }
-                    let _ = command.reply.try_send(self.status());
+                    let _ = command.reply.try_send(NativeReply {
+                        status: self.status(),
+                        final_control,
+                    });
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.checks.quarantine(),
                 Err(mpsc::TryRecvError::Empty) => {}
