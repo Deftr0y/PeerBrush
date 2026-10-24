@@ -254,9 +254,13 @@ class FixtureContract(unittest.TestCase):
         self.assertEqual(detail, 'Compatibility diagnostic: CalledProcessError exit=1 [child-reported: ' + child + ']')
         self.assertNotIn(private, detail)
         wrapped = subprocess.CalledProcessError(1, [private], stderr=error.stderr)
-        with mock.patch.object(upgrade.subprocess, 'run', side_effect=wrapped), self.assertRaises(ValueError) as caught:
-            upgrade.run([private])
-        detail = upgrade.failure_diagnostic(caught.exception)
+        with mock.patch.object(upgrade.subprocess, 'run', side_effect=wrapped):
+            try:
+                upgrade.run([private])
+            except ValueError as caught:
+                detail = upgrade.failure_diagnostic(caught)
+            else:
+                self.fail('The actual disposable run wrapper must reject the failed child')
         self.assertIn('ValueError at test_deb_installation.py:', detail)
         self.assertIn('[child-reported: ' + child + ']', detail)
         self.assertNotIn(private, detail)
