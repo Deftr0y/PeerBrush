@@ -1400,15 +1400,16 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
         return Err("Photoshop standard spool length changed".into());
     }
     let (compressed_length, compressed_hash, spool_length) = {
-        let mut source = StandardWriter::new(
-            std::io::BufWriter::with_capacity(64 * 1024, &mut *spool),
-            check,
-        );
+        let mut source = StandardWriter::new(&mut *spool, check);
         // Count the existing standard bytes against the same spool/file limit;
         // the fresh hash covers only the appended compressed source segment.
         source.bytes = total;
         let mut z = BoundedWriter {
-            inner: ZlibEncoder::new(source, Compression::fast()),
+            // Batch the compressor's small fragments before guarded writes too.
+            inner: ZlibEncoder::new(
+                std::io::BufWriter::with_capacity(64 * 1024, source),
+                Compression::fast(),
+            ),
             written: 0,
             limit: if high {
                 512 * 1024 * 1024
@@ -1419,8 +1420,9 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
             error: "Editable PSD source data exceeds its bounded serialization budget",
         };
         serde_json::to_writer(&mut z, &embedded).map_err(|e| e.to_string())?;
-        let mut source = z.inner.finish().map_err(|e| e.to_string())?;
-        source.flush().map_err(|e| e.to_string())?;
+        let mut buffered = z.inner.finish().map_err(|e| e.to_string())?;
+        buffered.flush().map_err(|e| e.to_string())?;
+        let source = buffered.into_inner().map_err(|e| e.to_string())?;
         check()?;
         (source.bytes - total, source.hash, source.bytes)
     };
@@ -4205,6 +4207,7 @@ mod storage_tests {
             let png = doc.export_png().unwrap();
             for layout in [Layout::Psd, Layout::Psb] {
                 let source = Rc::new(Cell::new(false));
+                let source_checks = Cell::new(0usize);
                 let mut spool = PhysicalSpool {
                     data: std::io::Cursor::new(Vec::new()),
                     source: source.clone(),
@@ -4216,7 +4219,12 @@ mod storage_tests {
                     layout,
                     &mut output,
                     &mut spool,
-                    &|| Ok(()),
+                    &|| {
+                        if source.get() {
+                            source_checks.set(source_checks.get() + 1);
+                        }
+                        Ok(())
+                    },
                     &|stage, _, _| {
                         source.set(stage == "Writing editable sources");
                         Ok(())
@@ -4249,9 +4257,30 @@ mod storage_tests {
                     standard_hash: hash(section) ^ hash(merged),
                     document: doc.clone(),
                 };
-                let mut previous = ZlibEncoder::new(Vec::new(), Compression::fast());
+                let input_checks = Cell::new(0usize);
+                let count_input = || {
+                    input_checks.set(input_checks.get() + 1);
+                    Ok(())
+                };
+                let mut previous = BoundedWriter {
+                    inner: ZlibEncoder::new(Vec::new(), Compression::fast()),
+                    written: 0,
+                    limit: if depth == 16 {
+                        512 * 1024 * 1024
+                    } else {
+                        128 * 1024 * 1024
+                    },
+                    check: &count_input,
+                    error: "Editable PSD source data exceeds its bounded serialization budget",
+                };
                 serde_json::to_writer(&mut previous, &original).unwrap();
-                assert_eq!(compressed, previous.finish().unwrap());
+                assert_eq!(compressed, previous.inner.finish().unwrap());
+                assert!(source_checks.get() >= input_checks.get());
+                assert!(
+                    source_checks.get() <= input_checks.get() + spool.writes.len() + 8,
+                    "Compressed-source guards must follow buffered writes, retaining every input check: {} source, {} input, {} physical writes",
+                    source_checks.get(), input_checks.get(), spool.writes.len()
+                );
                 let restored = decode(&output).unwrap();
                 assert!(!restored.read_only);
                 assert_eq!(serde_json::to_value(&restored).unwrap(), before);
