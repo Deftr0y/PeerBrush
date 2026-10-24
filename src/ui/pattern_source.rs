@@ -277,4 +277,181 @@ mod tests {
             assert_eq!(e.undo.len(), history);
         }
     }
+
+    #[test]
+    fn inspector_procedural_switch_and_real_import_receipts_preserve_native_sources_and_late_work()
+    {
+        use super::super::workspace_tests as workspace;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let size = Vec2::new(1100., 1800.);
+        let asset = |depth, reverse| {
+            let mut words = vec![
+                12347, 23459, 34571, 65535, 53127, 13729, 29131, 32769, 17333, 62337, 9353, 65535,
+                45139, 21341, 59347, 65535, 39349, 11351, 51353, 65535, 7357, 33359, 23363, 65535,
+                63367, 45371, 15373, 32769, 25377, 57379, 37381, 65535,
+            ];
+            if reverse {
+                words.reverse();
+            }
+            let png = if depth == 16 {
+                crate::raster::png16(4, 2, &words)
+            } else {
+                crate::raster::png(
+                    4,
+                    2,
+                    &words
+                        .into_iter()
+                        .map(crate::raster::project16)
+                        .collect::<Vec<_>>(),
+                )
+            }
+            .unwrap();
+            STANDARD.encode(png)
+        };
+        for depth in [8, 16] {
+            for outcome in ["ready", "newer", "escape"] {
+                for kind in ["pattern_overlay", "texture"] {
+                    let (mut app, ctx) = workspace::fixture(depth);
+                    let old_png = asset(depth, false);
+                    let new_png = asset(depth, true);
+                    let effect = {
+                        let mut engine = app.shared.lock().unwrap();
+                        let layer = app.selected.clone();
+                        engine
+                            .edit(
+                                "human",
+                                &[json!({"op":"effect.add","layer":layer,
+                        "kind":kind,"settings":{"pattern":"bitmap","bitmap_png":old_png,
+                            "sampling":"nearest","bitmap_scale":2.,"phase_x":1.}})],
+                                None,
+                                None,
+                                "Original embedded pattern",
+                            )
+                            .unwrap();
+                        engine.doc.layers[0].effects[0].id.clone()
+                    };
+                    app.select_effect(&app.selected.clone(), false, &effect);
+                    workspace::draw(&mut app, &ctx, size, vec![]);
+                    let output = workspace::draw(&mut app, &ctx, size, vec![]);
+                    let before = app.shared.lock().unwrap().doc.clone();
+                    let count = app.shared.lock().unwrap().undo.len();
+                    let choice = workspace::label(&output, "Bitmap PNG");
+                    workspace::click(&mut app, &ctx, size, choice);
+                    let output = workspace::draw(&mut app, &ctx, size, vec![]);
+                    let procedural = workspace::label(&output, "Checker");
+                    workspace::click(&mut app, &ctx, size, procedural);
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        let settings = &engine.doc.layers[0].effects[0].settings;
+                        assert_eq!(settings["pattern"], "checker");
+                        for key in crate::effects::styles::bitmap_defaults()
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                        {
+                            assert!(
+                                settings.get(key).is_none(),
+                                "Removed bitmap field {key} returned"
+                            );
+                        }
+                        assert_eq!(engine.undo.len(), count + 1);
+                        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+                        assert_ne!(
+                            engine.doc.export_png().unwrap(),
+                            before.export_png().unwrap()
+                        );
+                    }
+                    let (tx, rx) = mpsc::channel();
+                    let pending = {
+                        let engine = app.shared.lock().unwrap();
+                        let current = &engine.doc.layers[0].effects[0];
+                        Pending {
+                            project: engine.project_id.clone(),
+                            document: engine.doc.id.clone(),
+                            revision: engine.doc.revision,
+                            layer: app.selected.clone(),
+                            effect: effect.clone(),
+                            kind: current.kind.clone(),
+                            settings: current.settings.as_ref().clone(),
+                            receiver: Arc::new(Mutex::new(rx)),
+                        }
+                    };
+                    if outcome == "newer" {
+                        app.shared
+                            .lock()
+                            .unwrap()
+                            .edit(
+                                "human",
+                                &[json!({"op":"layer.update",
+                        "layer":app.selected,"name":"Newer human work"})],
+                                None,
+                                None,
+                                "Newer work",
+                            )
+                            .unwrap();
+                    }
+                    let retained = workspace::source(&app);
+                    let history = app.shared.lock().unwrap().undo.len();
+                    tx.send(Ok(Some(new_png.clone()))).unwrap();
+                    ctx.data_mut(|data| data.insert_temp(key(), pending));
+                    let events = if outcome == "escape" {
+                        vec![egui::Event::Key {
+                            key: egui::Key::Escape,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }]
+                    } else {
+                        vec![]
+                    };
+                    workspace::draw(&mut app, &ctx, size, events);
+                    assert!(ctx.data(|data| data.get_temp::<Pending>(key()).is_none()));
+                    if outcome == "ready" {
+                        {
+                            let engine = app.shared.lock().unwrap();
+                            assert_eq!(
+                                engine.doc.layers[0].effects[0].settings["pattern"],
+                                "bitmap"
+                            );
+                            assert_eq!(
+                                engine.doc.layers[0].effects[0].settings["bitmap_png"],
+                                json!(new_png)
+                            );
+                            assert_eq!(engine.undo.len(), history + 1);
+                            assert_eq!(engine.doc.bit_depth, depth);
+                            assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+                        }
+                        let imported = workspace::source(&app);
+                        for _ in 0..3 {
+                            workspace::draw(&mut app, &ctx, size, vec![]);
+                        }
+                        assert_eq!(workspace::source(&app), imported);
+                        let mut engine = app.shared.lock().unwrap();
+                        engine.undo("human").unwrap();
+                        assert_eq!(
+                            engine.doc.layers[0].effects[0].settings["pattern"],
+                            "checker"
+                        );
+                        assert!(engine.doc.layers[0].effects[0]
+                            .settings
+                            .get("bitmap_png")
+                            .is_none());
+                        engine.undo("human").unwrap();
+                        assert_eq!(
+                            engine.doc.layers[0].effects[0].settings["bitmap_png"],
+                            json!(old_png)
+                        );
+                        assert_eq!(
+                            engine.doc.export_png().unwrap(),
+                            before.export_png().unwrap()
+                        );
+                    } else {
+                        assert_eq!(workspace::source(&app), retained, "{depth}/{outcome}");
+                        assert_eq!(app.shared.lock().unwrap().undo.len(), history);
+                    }
+                }
+            }
+        }
+    }
 }
