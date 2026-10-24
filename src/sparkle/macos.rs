@@ -832,13 +832,22 @@ impl Probe {
         )
         .unwrap();
         let actual: Retained<NSBundle> = unsafe { msg_send![&*owner.controller, hostBundle] };
-        assert_eq!(PathBuf::from(actual.bundlePath().to_string()), target);
         assert_eq!(
-            PathBuf::from(owner._host_bundle.bundlePath().to_string()),
+            PathBuf::from(actual.bundlePath().to_string())
+                .canonicalize()
+                .unwrap(),
             target
         );
         assert_eq!(
-            PathBuf::from(owner._application_bundle.bundlePath().to_string()),
+            PathBuf::from(owner._host_bundle.bundlePath().to_string())
+                .canonicalize()
+                .unwrap(),
+            target
+        );
+        assert_eq!(
+            PathBuf::from(owner._application_bundle.bundlePath().to_string())
+                .canonicalize()
+                .unwrap(),
             target
         );
         assert_ne!(
