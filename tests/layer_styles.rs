@@ -628,8 +628,7 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
             assert_eq!(engine.doc.export_png().unwrap(), original);
             assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
             let mut legacy = engine.doc.clone();
-            legacy.layers[0].effects[0]
-                .settings
+            Arc::make_mut(&mut legacy.layers[0].effects[0].settings)
                 .as_object_mut()
                 .unwrap()
                 .remove("source_knockout");
@@ -1321,8 +1320,7 @@ fn legacy_bevel_settings_inherit_common_blend_and_opacity_without_changed_source
                     "highlight_blend",
                     "shadow_blend",
                 ] {
-                    e.doc.layers[0].effects[0]
-                        .settings
+                    Arc::make_mut(&mut e.doc.layers[0].effects[0].settings)
                         .as_object_mut()
                         .unwrap()
                         .remove(key);
