@@ -1,5 +1,7 @@
 # PeerBrush follow-ups
 
+Current v0.3 batch (unreleased, 2026-10-24): removed the redundant Save serialization clone; connected stable Windows discovery to explicit immutable descriptors and publication aliases; connected guarded macOS planned Quit to the final source/profile writer transaction. Focused regressions are written, with one combined test run deferred until the batch is complete. PB-108 remains first and open; performance is unmeasured for these changes. Installation, unexpected-death recovery, repeated-upgrade/cache handling and signed installed acceptance remain unfinished or unverified. Activation/publication/submission holds and the remote-control/add-on exclusion remain unchanged. Completed history below is preserved.
+
 ## Published 0.26 and next planning scope
 
 [Version 0.26.0](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0), source `a00cf47accde87400fad3f0fcfc5fe96fc4f5be1`, has verified public macOS arm64 and Linux x64 downloads and a matching live website. The Mac package is a Developer ID signed, notarized and stapled app in a ZIP; a drag-to-Applications DMG is planned, not shipped. Windows Store 0.26 remains pending; submission and certification have not been verified.

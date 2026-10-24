@@ -1,5 +1,7 @@
 # PeerBrush v0.3 — development
 
+Current implementation batch (unreleased, 2026-10-24): Save borrows its immutable document for supplementary serialization instead of cloning it again. Windows stable discovery now resolves and verifies exact immutable descriptor bytes, separately from CURRENT recovery media, and the producer/final publisher include the matching stable alias. The macOS planned-Quit caller now connects authenticated final-control/profile checks to the atomic writer-sealing close transaction; changed Ready/cancellation/owner failures refuse closure. Update activation remains disabled; unexpected-death outcomes, recovery and repeated Windows upgrade/cache transitions remain unfinished. The proposed Windows stable filename is now `PeerBrush-Windows-x64.appinstaller`; no feed is published or configured. These changes and the prior metadata-only Save identity change await one combined correctness and performance batch. Previous checkpoint results below qualify their own source only. PB-108 remains first and open. Remote control and add-ons remain excluded.
+
 This is the next milestone for all existing unfinished feature work and acceptance, as requested after the 0.26.0 Mac/Linux release. Development is unreleased. Full original acceptance criteria, earlier verified work and unresolved reports are preserved in [FOLLOWUPS.MD](../FOLLOWUPS.MD#planned-v03--remaining-development-and-acceptance); the [0.26 record](development-0.26.md) remains historical evidence.
 
 ## Scope and order
