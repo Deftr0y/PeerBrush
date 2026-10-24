@@ -17,7 +17,7 @@ def fixture():
     name = 'PeerBrush-1.26.0.0-Windows-x64.msix'
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, 'w') as archive:
-        archive.writestr('AppxManifest.xml', f'<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="{s.IDENTITY}" Publisher="{s.PUBLISHER}" Version="1.26.0.0" ProcessorArchitecture="x64"/></Package>')
+        archive.writestr(zipfile.ZipInfo('AppxManifest.xml'), f'<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="{s.IDENTITY}" Publisher="{s.PUBLISHER}" Version="1.26.0.0" ProcessorArchitecture="x64"/></Package>')
     package = stream.getvalue()
     report = dict(schema=1, package=name, sha256=hashlib.sha256(package).hexdigest(),
         commit='a' * 40, app_version='0.26.0', version='1.26.0.0', package_family_name=s.FAMILY,
@@ -48,6 +48,17 @@ class Tests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.journal = Journal(Path(directory.name).resolve() / 'receipt.json')
         self.journal.bind('v0.26.0', fixture()[0], fixture()[2])
+
+    def test_protocol_fixture_has_identical_bytes_across_wall_clock_changes(self):
+        results = []
+        for clock in [(2025, 1, 2, 3, 4, 6, 3, 2, -1),
+                      (2030, 6, 7, 8, 9, 10, 4, 158, -1)]:
+            with patch.object(zipfile.time, 'localtime', return_value=clock):
+                results.append(fixture())
+        self.assertEqual(results[0], results[1])
+        for name, package, report in results:
+            self.assertEqual(report['package'], name)
+            self.assertEqual(report['sha256'], hashlib.sha256(package).hexdigest())
 
     def test_unexpected_exception_redacted(self):
         output = io.StringIO()
