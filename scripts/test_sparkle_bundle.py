@@ -417,6 +417,22 @@ class Bundle(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'exact committed source contract'):
             verify_release.inspect_archive(archive, commit, '0.2.0', fixture.root)
 
+    def test_native_audit_bad_input_refuses_before_staging_or_native_commands(self):
+        import platform
+        import prepare_sparkle
+        work = self.base / 'invalid-native-audit'
+        original = self.archive.read_bytes()
+        native = mock.Mock()
+        with mock.patch.object(prepare_sparkle, 'load_pin', return_value=self.pin), \
+                mock.patch.object(bundle.sys, 'platform', 'darwin'), \
+                mock.patch.object(platform, 'mac_ver', return_value=('12.0', (), 'arm64')):
+            with self.assertRaisesRegex(ValueError, 'official checksum'):
+                bundle.audit_native(self.archive, work, native)
+        native.assert_not_called()
+        self.assertFalse(work.exists())
+        self.assertEqual(self.archive.read_bytes(), original)
+
+    @unittest.skipIf(os.name == 'nt', 'Native Unix framework link/mode staging; covered by macOS/Linux CI')
     def test_native_audit_is_bounded_review_only_and_never_modifies_upstream_code(self):
         import platform
         import prepare_sparkle
@@ -439,30 +455,89 @@ class Bundle(unittest.TestCase):
             archive.writestr('LICENSE', notice)
         selected.update(archive_bytes=archive_path.stat().st_size, archive_sha256=package.digest(archive_path))
         original = archive_path.read_bytes()
-        calls = []
-        def native(command):
-            calls.append(command)
-            self.assertEqual(command[0], '/usr/bin/codesign')
-            self.assertNotIn('--sign', command)
-            if '--remove-signature' in command:
-                self.assertTrue(pathlib.Path(command[-1]).is_relative_to(self.base / 'audit'))
-                pathlib.Path(command[-1]).write_bytes(b'SYNTHETIC_UNSIGNED')
-                return subprocess.CompletedProcess(command, 0, '', '')
-            if '--entitlements' in command:
-                return subprocess.CompletedProcess(command, 0, plistlib.dumps({}).decode(), '')
-            return subprocess.CompletedProcess(command, 0, '', 'Identifier=org.synthetic.helper\n')
-        with mock.patch.object(prepare_sparkle, 'load_pin', return_value=selected), \
-                mock.patch.object(bundle.sys, 'platform', 'darwin'), \
-                mock.patch.object(platform, 'mac_ver', return_value=('12.0', (), 'arm64')):
-            result = bundle.audit_native(archive_path, self.base / 'audit', native)
-            with self.assertRaises(ValueError):
-                bundle.audit_native(archive_path, self.base / 'audit', native)
-        self.assertEqual(result['authority'], 'review-candidate-only')
-        self.assertFalse(result['updater_started'] or result['signing_performed'] or result['production_ready'])
-        self.assertEqual(set(result['objects']), {name for name, _ in bundle.OBJECTS})
-        self.assertLess(len(json.dumps(result).encode()), 16 * 1024)
-        self.assertEqual(archive_path.read_bytes(), original)
-        self.assertEqual(sum('--remove-signature' in call for call in calls), 5)
+        for damage in ['none', 'code', 'resource', 'mode', 'link', 'archive', 'verify', 'facts', 'normalize']:
+            with self.subTest(damage=damage):
+                work = self.base / ('audit-' + damage)
+                framework = work / 'upstream/Sparkle.framework'
+                calls = []
+                damaged = False
+                def native(command):
+                    nonlocal damaged
+                    calls.append(command)
+                    self.assertEqual(command[0], '/usr/bin/codesign')
+                    self.assertNotIn('--sign', command)
+                    target = pathlib.Path(command[-1])
+                    if '--remove-signature' in command:
+                        self.assertTrue(target.is_relative_to(work))
+                        self.assertFalse(target.is_relative_to(framework))
+                        self.assertEqual(target.name, 'code')
+                        self.assertEqual(target.read_bytes(), b'SYNTHETIC:' + bundle.OBJECTS[int(target.parent.name)][1].encode())
+                        if damage == 'normalize':
+                            raise ValueError('Synthetic hidden native output')
+                        target.write_bytes(b'SYNTHETIC_UNSIGNED')
+                        if not damaged:
+                            damaged = True
+                            if damage == 'code':
+                                (framework / bundle.OBJECTS[0][1]).write_bytes(b'CHANGED_CODE')
+                            elif damage == 'resource':
+                                (framework / 'Versions/B/Resources/Info.plist').write_bytes(b'CHANGED_RESOURCE')
+                            elif damage == 'mode':
+                                (framework / bundle.OBJECTS[0][1]).chmod(0o644)
+                            elif damage == 'link':
+                                link = framework / 'Sparkle'
+                                link.unlink()
+                                link.symlink_to('Versions/B/Autoupdate')
+                            elif damage == 'archive':
+                                archive_path.write_bytes(original + b'CHANGED_ARCHIVE')
+                        return subprocess.CompletedProcess(command, 0, '', '')
+                    self.assertIn(target, [framework / name for name, _ in bundle.OBJECTS])
+                    # Actual complete staging is verified before the first native
+                    # boundary, including its public resource/signature envelope.
+                    if len(calls) == 1:
+                        prepare_sparkle.verify_stage(work / 'upstream', selected)
+                    if '--verify' in command:
+                        self.assertEqual(command[:3], ['/usr/bin/codesign', '--verify', '--strict'])
+                        if damage == 'verify':
+                            raise ValueError('Synthetic hidden native output')
+                    if '--entitlements' in command:
+                        if damage == 'facts':
+                            raise ValueError('Synthetic hidden native output')
+                        return subprocess.CompletedProcess(command, 0, plistlib.dumps({}).decode(), '')
+                    return subprocess.CompletedProcess(command, 0, '', 'Identifier=org.synthetic.helper\n')
+                with mock.patch.object(prepare_sparkle, 'load_pin', return_value=selected), \
+                        mock.patch.object(bundle.sys, 'platform', 'darwin'), \
+                        mock.patch.object(platform, 'mac_ver', return_value=('12.0', (), 'arm64')):
+                    if damage == 'none':
+                        result = bundle.audit_native(archive_path, work, native)
+                        with self.assertRaises(ValueError):
+                            bundle.audit_native(archive_path, work, native)
+                    else:
+                        with self.assertRaises(ValueError) as failure:
+                            bundle.audit_native(archive_path, work, native)
+                        if damage in ['verify', 'facts', 'normalize']:
+                            label = {'verify': 'strict signature verification', 'facts': 'identifier/entitlement inspection',
+                                     'normalize': 'owned-copy signature removal'}[damage]
+                            self.assertEqual(str(failure.exception), 'Sparkle native audit ' + label +
+                                             ' failed for pinned object ' + bundle.OBJECTS[0][0])
+                            self.assertNotIn('Synthetic hidden native output', str(failure.exception))
+                if damage == 'none':
+                    self.assertEqual(result['authority'], 'review-candidate-only')
+                    self.assertEqual((result['schema'], result['format'], result['archive_sha256']),
+                                     (1, 'PeerBrushSparkleNativePolicyCandidateV1', selected['archive_sha256']))
+                    self.assertFalse(result['updater_started'] or result['signing_performed'] or result['production_ready'])
+                    self.assertEqual(result['objects'], {name: dict(identifier='org.synthetic.helper', entitlements={},
+                                     unsigned_sha256=hashlib.sha256(b'SYNTHETIC_UNSIGNED').hexdigest())
+                                     for name, _ in bundle.OBJECTS})
+                    self.assertLess(len(json.dumps(result).encode()), 16 * 1024)
+                    self.assertEqual(sum('--remove-signature' in call for call in calls), 5)
+                    self.assertEqual([pathlib.Path(call[-1]) for call in calls if '--verify' in call],
+                                     [framework / name for name, _ in bundle.OBJECTS])
+                    prepare_sparkle.verify_stage(work / 'upstream', selected)
+                if damage == 'archive':
+                    self.assertEqual(archive_path.read_bytes(), original + b'CHANGED_ARCHIVE')
+                    archive_path.write_bytes(original)
+                self.assertEqual(archive_path.read_bytes(), original)
+                self.assertFalse((work / 'native-policy-candidate.json').exists())
 
     def test_source_layout_cannot_omit_native_policy_or_downgrade_marker(self):
         sources = [('src/sparkle.rs', b'pub const BUNDLED_LAYOUT: u32 = 1;', 0o644)]

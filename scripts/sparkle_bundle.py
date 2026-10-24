@@ -288,8 +288,7 @@ def sign_nested(app, identity, keychain, run):
 
 def audit_native(archive, work, run):
     """Credential-free facts for review, never accepted as signing authority."""
-    from prepare_sparkle import inspect, load_pin, external_output, ROOT
-    import zipfile
+    from prepare_sparkle import inspect, load_pin, external_output, prepare, verify_stage, ROOT
     if sys.platform != 'darwin':
         raise ValueError('Sparkle native audit requires macOS 12+')
     import platform
@@ -305,27 +304,35 @@ def audit_native(archive, work, run):
             raise ValueError('Native audit work must not use linked ancestors')
     work.mkdir(mode=0o700, parents=True)
     os.chmod(work, 0o700)
+    # Native verification needs the original bundle/resource context, not a
+    # renamed standalone Mach-O. Reuse the exact pinned framework stager.
+    prepared = prepare(archive, work / 'upstream')
+    framework = prepared / 'Sparkle.framework'
     facts = {}
-    # Copies are not loaded, executed, signed or given trust. Each original is
-    # independently bound to the full pinned archive and exact object checksum.
-    with zipfile.ZipFile(archive) as source:
-        for index, (name, code) in enumerate(OBJECTS):
-            directory = work / str(index)
-            directory.mkdir(mode=0o700)
-            original = directory / 'original'
-            data = source.read(selected['framework_prefix'] + code)
-            if hashlib.sha256(data).hexdigest() != selected['framework_entries'][code]['sha256']:
-                raise ValueError('Native audit original code differs from exact pin')
-            original.write_bytes(data)
-            original.chmod(0o500)
-            run(['/usr/bin/codesign', '--verify', '--strict', str(original)])
-            identifier, entitlements, _ = native_facts(original, run)
-            normalized = directory / 'normalize'
-            normalized.mkdir(mode=0o700)
+    # Neither the staged bundle nor its separate normalization copies are loaded,
+    # executed, signed or given trust. Signature removal touches owned copies only.
+    for index, (name, code) in enumerate(OBJECTS):
+        verify_stage(prepared, selected)
+        original = framework / code
+        data = original.read_bytes()
+        if hashlib.sha256(data).hexdigest() != selected['framework_entries'][code]['sha256']:
+            raise ValueError('Native audit original code differs from exact pin')
+        directory = work / str(index)
+        directory.mkdir(mode=0o700)
+        operation = 'strict signature verification'
+        try:
+            run(['/usr/bin/codesign', '--verify', '--strict', str(framework / name)])
+            operation = 'identifier/entitlement inspection'
+            identifier, entitlements, _ = native_facts(framework / name, run)
+            operation = 'owned-copy signature removal'
             facts[name] = dict(identifier=identifier, entitlements=entitlements,
-                               unsigned_sha256=normalized_hash(original, run, normalized))
-            if original.read_bytes() != data:
-                raise ValueError('Native audit modified its original snapshot')
+                               unsigned_sha256=normalized_hash(original, run, directory))
+        except ValueError as error:
+            # Fixed public labels only; no native stderr, private paths or accounts.
+            raise ValueError(f'Sparkle native audit {operation} failed for pinned object {name}') from error
+        if original.read_bytes() != data:
+            raise ValueError('Native audit modified its original snapshot')
+    verify_stage(prepared, selected)
     if hashlib.sha256(archive.read_bytes()).hexdigest() != selected['archive_sha256']:
         raise ValueError('Native audit upstream archive changed')
     result = dict(schema=1, format='PeerBrushSparkleNativePolicyCandidateV1',
