@@ -482,6 +482,7 @@ class UpstreamHandoff(unittest.TestCase):
         q = dict(commit=commit, version=version, portable=f.directory / next(row['file'] for row in f.inventory['assets'] if row['file'].endswith('-Linux-x64.zip')),
             portable_sha256=next(row['sha256'] for row in f.inventory['assets'] if row['file'].endswith('-Linux-x64.zip')),
             package=f.fixture.deb, package_sha256=sha(f.fixture.deb.read_bytes()), maintainer=f.options['maintainer'])
+        self.linux_q, self.linux_dir = q, linux_dir
         receipts = linux_dir / 'receipts'
         receipts.mkdir(mode=0o700)
         installation = receipts / 'installation.json'
@@ -562,6 +563,20 @@ class UpstreamHandoff(unittest.TestCase):
             self.value['artifacts'][role].update(artifact_sha256=sha(data), files={name: sha(content) for name, content in files.items()})
             self.artifacts[role].update(digest='sha256:' + sha(data), size_in_bytes=len(data))
 
+    def add_gui(self):
+        checked = qualify_linux_deb.inputs(self.f.root, self.linux_q)
+        expected = dict(self.linux_q, executable_sha256=checked['executable_sha256'], source_sha256=checked['record']['source_sha256'])
+        receipt = self.linux_dir / 'receipts/installed-gui.json'
+        receipt.write_bytes(qualify_linux_deb.encode(test_linux_qualification.gui_driver_receipt(expected)) + b'\n')
+        installation, upgrade = self.linux_dir / 'receipts/installation.json', self.linux_dir / 'receipts/portable-to-deb.json'
+        qualify_linux_deb.qualify(self.f.root, self.linux_q, installation, sha(installation.read_bytes()),
+            upgrade, sha(upgrade.read_bytes()), self.linux_dir / 'gui-report', gui=receipt, gui_sha256=sha(receipt.read_bytes()))
+        report = (self.linux_dir / 'gui-report/linux-deb-qualification.json').read_bytes()
+        self.files['linux_native'].update({'linux-deb-qualification.json': report, 'installed-gui.json': receipt.read_bytes()})
+        self.value['final']['linux_native'].update(qualification_sha256=sha(report),
+            gui='native/linux/installed-gui.json', gui_sha256=sha(receipt.read_bytes()))
+        self.refresh()
+
     def request(self, host, target, limit, **options):
         self.gets.append((host, target))
         if options.get('redirect'):
@@ -639,6 +654,56 @@ class UpstreamHandoff(unittest.TestCase):
         with self.assertRaises((ValueError, OSError)): self.produce()
         self.assertEqual(self.gets, [])
         self.assertFalse(self.work.exists())
+        self.assertFalse(self.artifact.exists())
+
+    def test_gui_receipt_survives_real_acquisition_bundle_and_relocation_without_public_or_ready_claims(self):
+        self.add_gui()
+        index = self.produce()
+        with self.seams():
+            candidate = inputs.consume(self.f.root, self.work / 'bundle/data', self.f.fixture.base / 'relocated-gui-final',
+                self.f.fixture.base / 'relocated-gui-native', index, index['selection_sha256'])
+        self.assertEqual(self.commands.count('linux'), 2)
+        self.assertNotIn('linux-installed-evidence-producer-not-authenticated', candidate.blockers)
+        self.assertIn('installed-upgrade-interruption-and-visible-native-acceptance-not-established', candidate.blockers)
+        self.assertIn('native-gui-not-verified', candidate.assessment['linux_bound_installation']['blockers'])
+        self.assertFalse(candidate.assessment['production_ready'])
+        self.assertTrue(all(channel['ready'] is False for channel in candidate.manifest['channels'].values()))
+        raw = self.files['linux_native']['installed-gui.json']
+        self.assertEqual((self.f.fixture.base / 'relocated-gui-native/linux/installed-gui.json').read_bytes(), raw)
+        with zipfile.ZipFile(self.artifact / inputs.ARCHIVE) as archive:
+            names = archive.namelist()
+            self.assertEqual(archive.read('native/linux/installed-gui.json'), raw)
+            self.assertFalse(any(name.endswith('.png') or 'captures' in name for name in names))
+            self.assertLessEqual(len(names), inputs.MAX_FILES)
+        for path in candidate.directory.iterdir():
+            self.assertNotEqual(path.name, 'installed-gui.json')
+            self.assertNotIn(b'current_profile_sha256', path.read_bytes())
+        candidate.verify()
+
+    def test_gui_role_is_explicit_and_never_accepts_unselected_capture_or_missing_receipt_data(self):
+        self.add_gui()
+        raw = self.files['linux_native'].pop('installed-gui.json')
+        self.refresh()
+        with self.assertRaises(ValueError): self.produce()
+        self.assertEqual(self.gets, [])
+        self.files['linux_native']['installed-gui.json'] = raw
+        self.files['linux_native']['canvas-0.png'] = b'PRIVATE_CAPTURE_MUST_NOT_ENTER_FINAL_INPUTS'
+        self.refresh()
+        with self.assertRaises(ValueError): self.produce()
+        self.assertEqual(self.gets, [])
+        self.assertFalse(self.work.exists())
+        self.assertFalse(self.artifact.exists())
+
+    def test_self_consistent_changed_gui_runtime_cannot_replace_attested_raw_receipt(self):
+        self.add_gui()
+        changed = json.loads(self.files['linux_native']['installed-gui.json'])
+        changed['executable_sha256'] = 'e' * 64
+        data = final.encode(changed)
+        self.files['linux_native']['installed-gui.json'] = data
+        self.value['final']['linux_native']['gui_sha256'] = sha(data)
+        self.refresh()
+        with self.assertRaises(ValueError): self.produce()
+        self.assertEqual(self.services['linux'].calls, [])
         self.assertFalse(self.artifact.exists())
 
     def test_native_report_and_bundle_without_original_descriptor_cannot_substitute_for_media(self):

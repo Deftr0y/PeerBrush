@@ -9,6 +9,7 @@ import qualify_linux_deb as qualifier
 import verify_macos_qualification as native
 
 FIELDS = {'qualification', 'qualification_sha256', 'upgrade', 'upgrade_sha256', 'trust'}
+GUI_FIELDS = FIELDS | {'gui', 'gui_sha256'}
 
 
 def authenticate(qualification, **inputs):
@@ -18,7 +19,7 @@ def authenticate(qualification, **inputs):
 
 
 def bind(root, selection, *, installation, assessment, commit, version, portable_sha256, maintainer):
-    if (not isinstance(selection, dict) or set(selection) != FIELDS
+    if (not isinstance(selection, dict) or set(selection) not in [FIELDS, GUI_FIELDS]
             or not qualifier.sha(selection['qualification_sha256']) or not qualifier.sha(selection['upgrade_sha256'])
             or not isinstance(selection['trust'], dict)
             or set(selection['trust']) != readiness.NATIVE_TRUST_FIELDS | {'readback_job'}
@@ -26,8 +27,9 @@ def bind(root, selection, *, installation, assessment, commit, version, portable
         raise ValueError('Linux native handoff requires complete independent public pins and actual job readback.')
     qualification = qualifier.read(selection['qualification'], selection['qualification_sha256'], qualifier.LIMIT)
     upgrade = qualifier.read(selection['upgrade'], selection['upgrade_sha256'], readiness.MAX_INSTALLATION_RECEIPT_BYTES)
+    gui = qualifier.read(selection['gui'], selection['gui_sha256'], readiness.MAX_INSTALLATION_RECEIPT_BYTES) if 'gui' in selection else None
     expected = qualifier.report(assessment, installation, upgrade, commit=commit, version=version,
-        portable_sha256=portable_sha256, maintainer=maintainer)
+        portable_sha256=portable_sha256, maintainer=maintainer, gui=gui)
     actual = json.loads(qualification, object_pairs_hook=readiness.unique_fields)
     if qualifier.encode(actual) != qualifier.encode(expected):
         raise ValueError('Linux native report differs from actual selected receipt/package/source bytes or safety gates.')
@@ -41,7 +43,11 @@ def bind(root, selection, *, installation, assessment, commit, version, portable
     records = [(Path(selection['qualification']), qualifier.LIMIT, selection['qualification_sha256']),
                (Path(trust['work']) / qualifier.REPORT, qualifier.LIMIT, selection['qualification_sha256']),
                (Path(selection['upgrade']), readiness.MAX_INSTALLATION_RECEIPT_BYTES, selection['upgrade_sha256'])]
-    for name, data in [('installation.json', installation), ('portable-to-deb.json', upgrade)]:
+    receipts = [('installation.json', installation), ('portable-to-deb.json', upgrade)]
+    if gui is not None:
+        records.append((Path(selection['gui']), readiness.MAX_INSTALLATION_RECEIPT_BYTES, selection['gui_sha256']))
+        receipts.append(('installed-gui.json', gui))
+    for name, data in receipts:
         private_inspection_directory(work, root, fresh=False)
         with (work / name).open('xb') as stream:
             stream.write(data)

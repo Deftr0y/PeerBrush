@@ -280,7 +280,10 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
     # selected version. The aggregate independently enforces its complete schema.
     try:
         report = json.loads(qualification, object_pairs_hook=unique_fields)
-        if (not isinstance(report, dict) or report.get('format') != report_format
+        if (not isinstance(report, dict)
+                or not (report.get('format') == report_format
+                    or (_linux and report.get('format') == 'PeerBrushLinuxDebQualificationV2'
+                        and type(report.get('schema')) is int and report['schema'] == 2))
                 or report.get('commit') != commit or report.get('version') != version):
             raise ValueError('report')
     except (ValueError, UnicodeError, RecursionError):

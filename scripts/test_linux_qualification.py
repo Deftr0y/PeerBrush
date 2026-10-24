@@ -45,6 +45,23 @@ def driver_receipt(expected):
         {'expected': expected, 'old': {'manifest': {'executable_sha256': 'c' * 64, 'source_sha256': 'd' * 64}}})
 
 
+def gui_driver_receipt(expected):
+    tree = ast.parse((ROOT / 'scripts/test_deb_installed_gui.py').read_text(encoding='utf-8'))
+    check = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'check')
+    value = next(node.value for node in check.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == 'receipt' for target in node.targets))
+    names = [name for index in range(4) for name in [f'canvas-{index}.png', f'activation-{index}.png']] + \
+        ['settings-settled.png'] + [f'restart-canvas-{index}.png' for index in range(4)]
+    # Metadata only: these are not actual captures or native acceptance evidence.
+    result = dict(captures=[dict(file=name, sha256=sha(name.encode()), width=1360, height=900,
+        canvas_regions=[[300, 180, 459, 299], [461, 180, 620, 299], [300, 301, 459, 420], [461, 301, 620, 420]])
+        for name in names], native_cells=4, graceful_restarts=1, current_profile_sha256='f' * 64,
+        native_gui='isolated-Xvfb-only', ready=False)
+    expression = ast.fix_missing_locations(ast.Expression(value))
+    return eval(compile(expression, '<actual-installed-gui-receipt>', 'eval'),
+        {'__builtins__': {}, 'dict': dict}, {'expected': expected, 'result': result})
+
+
 class LinuxFacts(unittest.TestCase):
     def setUp(self):
         self.f = test_final_release.Composition(methodName='runTest')
@@ -67,10 +84,17 @@ class LinuxFacts(unittest.TestCase):
         self.upgrade.write_bytes(qualifier.encode(driver_receipt(self.q)) + b'\n')
         self.report_dir = f.fixture.base / 'linux-report'
         self.report_path = self.report_dir / qualifier.REPORT
+        self.gui_path = receipts / 'private-installed-gui.json'
 
-    def qualify(self):
+    def add_gui(self):
+        checked = qualifier.inputs(self.f.root, self.q)
+        expected = dict(self.q, executable_sha256=checked['executable_sha256'], source_sha256=checked['record']['source_sha256'])
+        self.gui_path.write_bytes(qualifier.encode(gui_driver_receipt(expected)) + b'\n')
+
+    def qualify(self, *, gui=False):
         return qualifier.qualify(self.f.root, self.q, self.f.receipt, sha(self.f.receipt.read_bytes()),
-                                 self.upgrade, sha(self.upgrade.read_bytes()), self.report_dir)
+            self.upgrade, sha(self.upgrade.read_bytes()), self.report_dir,
+            **(dict(gui=self.gui_path, gui_sha256=sha(self.gui_path.read_bytes())) if gui else {}))
 
     def trust(self):
         service = service_fixtures.Readback(methodName='runTest')
@@ -103,6 +127,8 @@ class LinuxFacts(unittest.TestCase):
         trust = dict(service.trust.values, workflow_commit=self.f.fixture.commit, readback_job=True)
         selected = dict(qualification=self.report_path, qualification_sha256=sha(self.report_path.read_bytes()),
                         upgrade=self.upgrade, upgrade_sha256=sha(self.upgrade.read_bytes()), trust=trust)
+        if 'installed_gui' in json.loads(self.report_path.read_bytes()):
+            selected.update(gui=self.gui_path, gui_sha256=sha(self.gui_path.read_bytes()))
         return service, selected
 
     def compose(self, service, selected, *, via_selection=False):
@@ -147,6 +173,8 @@ class LinuxFacts(unittest.TestCase):
 
     def test_actual_two_receipt_qualification_and_authenticated_composition_keep_every_installed_gate(self):
         value = self.qualify()
+        self.assertEqual((value['schema'], value['format']), (1, qualifier.FORMAT))
+        self.assertNotIn('installed_gui', value)
         self.assertEqual(value['installation']['receipt']['limits'], final.readiness.DEB_INSTALLATION_LIMITS)
         self.assertEqual(value['portable_to_deb']['receipt'], driver_receipt(self.q))
         self.assertEqual(value['installation']['receipt']['limits']['real-application-version-migration'], 'not-performed')
@@ -178,6 +206,189 @@ class LinuxFacts(unittest.TestCase):
         import publish_release
         self.assertEqual(publish_release.publish(candidate, client, 'fixture', execute=True)['phase'], 'blocked')
         client.assert_not_called()
+
+    def test_actual_three_receipt_qualification_authenticates_only_origin_and_keeps_private_gui_metadata(self):
+        self.add_gui()
+        value = self.qualify(gui=True)
+        self.assertEqual((value['schema'], value['format']), (2, qualifier.GUI_FORMAT))
+        self.assertEqual(value['installed_gui'], dict(sha256=sha(self.gui_path.read_bytes()), native_cells=4,
+            graceful_restarts=1, capture_count=13, native_gui='isolated-Xvfb-only', limits=qualifier.GUI_LIMITS))
+        self.assertNotIn('current_profile_sha256', value['installed_gui'])
+        self.assertNotIn('captures', value['installed_gui'])
+        self.assertLessEqual(self.report_path.stat().st_size, qualifier.LIMIT)
+        service, selected = self.trust()
+        candidate = self.compose(service, selected, via_selection=True)
+        self.assertEqual(len(service.calls), 2)
+        self.assertNotIn('linux-installed-evidence-producer-not-authenticated', candidate.blockers)
+        self.assertIn('native-gui-not-verified', candidate.assessment['linux_bound_installation']['blockers'])
+        self.assertIn('installed-upgrade-interruption-and-visible-native-acceptance-not-established', candidate.blockers)
+        self.assertFalse(candidate.assessment['production_ready'])
+        self.assertTrue(all(channel['ready'] is False for channel in candidate.manifest['channels'].values()))
+        self.assertEqual(candidate.manifest['channels']['microsoft-store'], final.store_channel())
+        owned = self.f.fixture.base / ('linux-compose-origin-' + str(self.serial)) / 'installed-gui.json'
+        self.assertEqual(owned.read_bytes(), self.gui_path.read_bytes())
+        for path in candidate.directory.iterdir():
+            data = path.read_bytes()
+            self.assertNotIn(self.gui_path.name.encode(), data)
+            self.assertNotIn(b'current_profile_sha256', data)
+            self.assertNotIn(b'installed-gui-captures', data)
+        import publish_release
+        client = mock.Mock()
+        self.assertEqual(publish_release.publish(candidate, client, 'fixture', execute=True)['phase'], 'blocked')
+        client.assert_not_called()
+
+    def test_present_gui_requires_exact_source_runtime_shape_limits_and_false_gates_without_v1_fallback(self):
+        self.add_gui()
+        original = json.loads(self.gui_path.read_bytes())
+        mutations = [(['commit'], 'b' * 40), (['version'], '9.0.0'), (['package_sha256'], 'e' * 64),
+            (['executable_sha256'], 'e' * 64), (['source_sha256'], 'e' * 64), (['schema'], True),
+            (['format'], 'PeerBrushInstalledGuiV2'), (['candidate_verified'], True), (['ready'], True),
+            (['production_ready'], True), (['PRIVATE_CANARY'], 'DO_NOT_COPY'), (['limits'], {}),
+            (['limits', 'physical_desktop_consent'], 'passed'), (['checks', 'native_cells'], True),
+            (['checks', 'graceful_restarts'], 0), (['checks', 'current_profile_sha256'], 'not-a-hash'),
+            (['checks', 'native_gui'], 'physical-desktop'), (['checks', 'ready'], True),
+            (['checks', 'captures'], original['checks']['captures'][:-1]),
+            (['checks', 'captures', 0, 'file'], '../private.png'),
+            (['checks', 'captures', 1, 'file'], 'canvas-0.png'),
+            (['checks', 'captures', 0, 'sha256'], 'NOT_A_HASH'),
+            (['checks', 'captures', 0, 'width'], 1359),
+            (['checks', 'captures', 0, 'canvas_regions'], [[0, 0, 1360, 900]] * 4),
+            (['checks', 'captures', 0, 'PRIVATE_CANARY'], 'DO_NOT_COPY')]
+        for keys, replacement in mutations:
+            changed = copy.deepcopy(original)
+            target = changed
+            for key in keys[:-1]: target = target[key]
+            target[keys[-1]] = replacement
+            self.gui_path.write_bytes(qualifier.encode(changed))
+            with self.subTest(field=keys), self.assertRaises(ValueError): self.qualify(gui=True)
+            self.assertFalse(self.report_dir.exists())
+        raw = qualifier.encode(original)
+        for data in [b'{}', b'\xff', b'{', raw.replace(b'"schema":', b'"schema":1,"schema":'),
+                     b'x' * (final.readiness.MAX_INSTALLATION_RECEIPT_BYTES + 1)]:
+            self.gui_path.write_bytes(data)
+            with self.assertRaises((ValueError, UnicodeError)): self.qualify(gui=True)
+            self.assertFalse(self.report_dir.exists())
+        self.gui_path.write_bytes(raw)
+        for extra in [dict(gui=self.gui_path), dict(gui_sha256=sha(raw)), dict(gui=self.gui_path, gui_sha256='0' * 64)]:
+            with self.assertRaises(ValueError):
+                qualifier.qualify(self.f.root, self.q, self.f.receipt, sha(self.f.receipt.read_bytes()),
+                    self.upgrade, sha(self.upgrade.read_bytes()), self.report_dir, **extra)
+        self.assertFalse(self.report_dir.exists())
+
+    def test_gui_selection_cannot_drop_its_role_or_replace_v2_report_with_legacy_format_before_crypto(self):
+        self.add_gui()
+        self.qualify(gui=True)
+        service, selected = self.trust()
+        for key in ['gui', 'gui_sha256']:
+            changed = dict(selected)
+            del changed[key]
+            with self.subTest(field=key), self.assertRaises(ValueError): self.compose(service, changed)
+            self.assertFalse(self.output.exists())
+        changed = {key: value for key, value in selected.items() if key not in {'gui', 'gui_sha256'}}
+        with self.assertRaises(ValueError): self.compose(service, changed)
+        original = self.report_path.read_bytes()
+        self.report_path.chmod(0o600)
+        legacy = qualifier.report(final.readiness.assess_deb(self.f.root, Path(self.q['portable']), Path(self.q['package']),
+            commit=self.q['commit'], version=self.q['version'], portable_sha256=self.q['portable_sha256'],
+            package_sha256=self.q['package_sha256'], maintainer=self.q['maintainer'], installation_receipt=self.f.receipt.read_bytes()),
+            self.f.receipt.read_bytes(), self.upgrade.read_bytes(), commit=self.q['commit'], version=self.q['version'],
+            portable_sha256=self.q['portable_sha256'], maintainer=self.q['maintainer'])
+        self.report_path.write_bytes(qualifier.encode(legacy))
+        with self.assertRaises(ValueError): self.compose(service, dict(selected, qualification_sha256=sha(self.report_path.read_bytes())))
+        self.assertEqual(self.crypto_calls, [])
+        self.assertEqual(service.calls, [])
+        self.report_path.write_bytes(original)
+
+    def test_gui_original_and_owned_mutations_refuse_through_actual_native_and_final_copy_callers(self):
+        self.add_gui()
+        self.qualify(gui=True)
+        service, selected = self.trust()
+        raw, original = self.gui_path.read_bytes(), self.command
+        def changed(tool, arguments, work, label):
+            result = original(tool, arguments, work, label)
+            if label == 'verification': self.gui_path.write_bytes(b'PRIVATE_CANARY_CHANGED_GUI')
+            return result
+        self.command = changed
+        with self.assertRaisesRegex(ValueError, 'native evidence changed'): self.compose(service, selected)
+        self.assertFalse(self.output.exists())
+        self.gui_path.write_bytes(raw)
+        self.command = original
+        original_copy, fired = final.bounded_file, []
+        def changed_owned(path, limit, destination=None):
+            result = original_copy(path, limit, destination)
+            if destination is not None and Path(destination).parent == self.output and not fired:
+                owned = self.f.fixture.base / ('linux-compose-origin-' + str(self.serial)) / 'installed-gui.json'
+                owned.chmod(0o600)
+                owned.write_bytes(b'PRIVATE_CANARY_CHANGED_OWNED_GUI')
+                fired.append(True)
+            return result
+        with mock.patch.object(final, 'bounded_file', side_effect=changed_owned), self.assertRaisesRegex(ValueError, 'binding input changed'):
+            self.compose(service, selected)
+        self.assertEqual(fired, [True])
+        for path in self.output.iterdir(): self.assertNotIn(b'PRIVATE_CANARY', path.read_bytes())
+
+    def test_gui_cli_forwards_explicit_role_and_rejects_half_selected_receipt(self):
+        self.add_gui()
+        selection = self.f.fixture.base / 'linux-qualification-selection.json'
+        selection.write_text(json.dumps(self.q, default=str), encoding='utf-8')
+        arguments = ['qualify_linux_deb.py', '--source-root', str(self.f.root), '--selection', str(selection),
+            '--selection-sha256', sha(selection.read_bytes()), '--installation', str(self.f.receipt),
+            '--installation-sha256', sha(self.f.receipt.read_bytes()), '--upgrade', str(self.upgrade),
+            '--upgrade-sha256', sha(self.upgrade.read_bytes()), '--output', str(self.report_dir),
+            '--gui', str(self.gui_path), '--gui-sha256', sha(self.gui_path.read_bytes())]
+        with mock.patch.object(qualifier.sys, 'argv', arguments[:-2]), mock.patch('builtins.print'):
+            self.assertEqual(qualifier.main(), 1)
+        self.assertFalse(self.report_dir.exists())
+        with mock.patch.object(qualifier.sys, 'argv', arguments), mock.patch('builtins.print'):
+            self.assertEqual(qualifier.main(), 0)
+        self.assertEqual(json.loads(self.report_path.read_bytes())['format'], qualifier.GUI_FORMAT)
+
+    def test_actual_workflow_retains_exact_raw_gui_and_separate_private_captures_and_rechecks_late_mutation(self):
+        import package_macos_dmg
+        self.add_gui()
+        self.qualify(gui=True)
+        workflow = (ROOT / '.github/workflows/linux-qualification.yml').read_text(encoding='utf-8')
+        retained = workflow.split('      - name: Retain qualification and bundle\n', 1)[1].split('      - name: Upload qualification evidence\n', 1)[0]
+        script = textwrap.dedent(re.search(r"python3 -I - <<'PY'\n(.*?)\n          PY", retained, re.S).group(1))
+        actual_copy = package_macos_dmg.bounded_file
+        for mutate in [False, True]:
+            base = self.f.fixture.base / ('private-retention-' + str(mutate))
+            checks, report = base / 'peerbrush-linux-checks', base / 'peerbrush-linux-report'
+            checks.mkdir(parents=True)
+            report.mkdir()
+            (report / qualifier.REPORT).write_bytes(self.report_path.read_bytes())
+            for name, original in [('installation.json', self.f.receipt), ('portable-to-deb.json', self.upgrade), ('installed-gui.json', self.gui_path)]:
+                (checks / name).write_bytes(original.read_bytes())
+            captures = checks / 'installed-gui-captures'
+            captures.mkdir()
+            for item in json.loads(self.gui_path.read_bytes())['checks']['captures']:
+                (captures / item['file']).write_bytes(item['file'].encode())
+            bundle = base / 'selected.sigstore.json'
+            bundle.write_bytes(b'SYNTHETIC_ATTESTATION_BYTES_NO_AUTHORITY')
+            fired = []
+            def copied(path, limit, destination=None):
+                result = actual_copy(path, limit, destination)
+                if (mutate and destination is not None and Path(destination).parent.name == 'peerbrush-linux-gui-captures'
+                        and Path(destination).name == 'restart-canvas-3.png' and not fired):
+                    (checks / 'installed-gui.json').write_bytes(b'PRIVATE_CANARY_CHANGED_AFTER_COPY')
+                    fired.append(True)
+                return result
+            with mock.patch.dict(os.environ, dict(RUNNER_TEMP=str(base), GITHUB_WORKSPACE=str(self.f.root), SELECTED_BUNDLE=str(bundle))), \
+                    mock.patch.object(package_macos_dmg, 'bounded_file', side_effect=copied):
+                if mutate:
+                    with self.assertRaisesRegex(SystemExit, 'could not be retained'): exec(compile(script, '<actual-linux-retention>', 'exec'), {})
+                    self.assertEqual(fired, [True])
+                else:
+                    exec(compile(script, '<actual-linux-retention>', 'exec'), {})
+                    evidence = base / 'peerbrush-linux-evidence'
+                    self.assertEqual({path.name for path in evidence.iterdir()}, {qualifier.REPORT, 'installation.json',
+                        'portable-to-deb.json', 'installed-gui.json', 'linux-deb-qualification.sigstore.json'})
+                    self.assertEqual((evidence / 'installed-gui.json').read_bytes(), self.gui_path.read_bytes())
+                    actual = base / 'peerbrush-linux-gui-captures'
+                    self.assertEqual({path.name for path in actual.iterdir()}, set(qualifier.GUI_CAPTURES))
+                    for path in actual.iterdir(): self.assertEqual(sha(path.read_bytes()), sha(path.name.encode()))
+        self.assertIn('path: ${{ runner.temp }}/peerbrush-linux-gui-captures/*.png', workflow)
+        self.assertLess(workflow.index('/checks/test_deb_installed_gui.py'), workflow.index('--gui "$EVIDENCE/installed-gui.json"'))
 
     def test_distinct_receipt_limits_and_extra_private_fields_cannot_be_relabelled(self):
         raw = self.upgrade.read_bytes()

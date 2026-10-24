@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import select
+import stat
 import subprocess
 import sys
 import tempfile
@@ -433,11 +434,17 @@ def check(package, expected, output):
     require(result['native_cells'] == 4 and result['graceful_restarts'] == 1 and result['ready'] is False
             and len(result['captures']) == 13, 'Installed GUI result is incomplete.')
     captures = output.parent / 'installed-gui-captures'
-    captures.mkdir(mode=0o700)
+    # The existing private receipt parent contains these root-owned files; the
+    # host owner must also be able to retain them after the container exits.
+    captures.mkdir(mode=0o755)
+    captures.chmod(0o755)
+    require(stat.S_IMODE(captures.stat().st_mode) == 0o755, 'Private capture directory is not host-readable.')
     for item in result['captures']:
         require(item['file'] == Path(item['file']).name and item['file'].endswith('.png'), 'Invalid capture inventory.')
         require(bounded_file(work / item['file'], 8 * 1024 * 1024, captures / item['file'])[0] == item['sha256'],
                 'Actual installed capture changed before private retention.')
+        (captures / item['file']).chmod(0o644)
+        require(stat.S_IMODE((captures / item['file']).stat().st_mode) == 0o644, 'Private capture copy is not host-readable.')
     receipt = dict(schema=1, format='PeerBrushInstalledGuiV1', commit=expected['commit'], version=expected['version'],
         package_sha256=expected['package_sha256'], executable_sha256=expected['executable_sha256'],
         source_sha256=expected['source_sha256'], target='Ubuntu 24.04 amd64', checks=result,

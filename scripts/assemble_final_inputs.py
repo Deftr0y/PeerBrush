@@ -89,7 +89,8 @@ def selections(value):
     native('windows_native', 'windows-installer-qualification', windows['native'],
            {Path(windows['descriptor']).name: windows['descriptor_sha256']})
     native('linux_native', 'linux-deb-qualification', selected['linux_native'],
-           {'installation.json': selected['linux_receipt_sha256'], 'portable-to-deb.json': selected['linux_native']['upgrade_sha256']})
+           {'installation.json': selected['linux_receipt_sha256'], 'portable-to-deb.json': selected['linux_native']['upgrade_sha256'],
+            **({'installed-gui.json': selected['linux_native']['gui_sha256']} if 'gui' in selected['linux_native'] else {})})
     if windows['identity'] != 'windows/direct-identity.json':
         raise ValueError('Existing Windows producer requires its exact public identity filename.')
     exact('windows_signed', {portable: candidate[portable], 'runtime-license.txt': windows['native']['runtime_license_sha256'],
@@ -151,7 +152,7 @@ def unpack(archive, output, files, remaining, role):
             limit = transport.MAX_FILE
             if role.endswith('_native'):
                 limit = inputs.LIMITS['bundle'] if member.filename.endswith('.sigstore.json') else \
-                    inputs.MAX_INDEX if member.filename in {'installation.json', 'portable-to-deb.json'} else \
+                    inputs.MAX_INDEX if member.filename in {'installation.json', 'portable-to-deb.json', 'installed-gui.json'} else \
                     inputs.LIMITS['qualification'] if role == 'macos_native' else 16 * 1024
             elif member.filename in {'release-inventory.json', 'SHA256SUMS', 'production-readiness.json'}:
                 limit = inputs.MAX_INDEX
@@ -232,6 +233,8 @@ def produce(root, output, work, artifact_output, value, *, authority_directory, 
         sources[qualification_keys] = raw[platform + '_native'] / (report + '.json')
     sources[('linux_receipt',)] = raw['linux_native'] / 'installation.json'
     sources[('linux_native', 'upgrade')] = raw['linux_native'] / 'portable-to-deb.json'
+    if 'gui' in selected['linux_native']:
+        sources[('linux_native', 'gui')] = raw['linux_native'] / 'installed-gui.json'
     candidate = raw['candidate']
     inventory = inputs.json_input(candidate / 'release-inventory.json', inputs.MAX_INDEX, value['artifacts']['candidate']['files']['release-inventory.json'])
     from prepare_site_release import validate_inventory

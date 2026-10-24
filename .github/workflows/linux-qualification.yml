@@ -174,10 +174,12 @@ jobs:
                 --source-sha256 "$SOURCE_SHA" --output /evidence/installed-gui.json'
           INSTALL_SHA=$(sha256sum "$EVIDENCE/installation.json" | cut -d ' ' -f 1)
           UPGRADE_SHA=$(sha256sum "$EVIDENCE/portable-to-deb.json" | cut -d ' ' -f 1)
+          GUI_SHA=$(sha256sum "$EVIDENCE/installed-gui.json" | cut -d ' ' -f 1)
           python3 -B scripts/qualify_linux_deb.py --source-root "$GITHUB_WORKSPACE" \
             --selection "$RUNNER_TEMP/peerbrush-linux-inputs/qualification-selection.json" --selection-sha256 "$QUALIFICATION_SELECTION_SHA256" \
             --installation "$EVIDENCE/installation.json" --installation-sha256 "$INSTALL_SHA" \
-            --upgrade "$EVIDENCE/portable-to-deb.json" --upgrade-sha256 "$UPGRADE_SHA" --output "$RUNNER_TEMP/peerbrush-linux-report"
+            --upgrade "$EVIDENCE/portable-to-deb.json" --upgrade-sha256 "$UPGRADE_SHA" \
+            --gui "$EVIDENCE/installed-gui.json" --gui-sha256 "$GUI_SHA" --output "$RUNNER_TEMP/peerbrush-linux-report"
       - name: Attest generated native qualification
         id: attest
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
@@ -192,22 +194,42 @@ jobs:
           SELECTED_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
           python3 -I - <<'PY'
-          import os, pathlib, sys
+          import json, os, pathlib, sys
           sys.path.insert(0, 'scripts')
           from package_macos_dmg import bounded_file, private_inspection_directory
+          import qualify_linux_deb as q
           base, root = pathlib.Path(os.environ['RUNNER_TEMP']), pathlib.Path(os.environ['GITHUB_WORKSPACE'])
           output = private_inspection_directory(base / 'peerbrush-linux-evidence', root, fresh=True)
           output.mkdir(mode=0o700)
           try:
+              retained = []
               for path, name, limit in [
                   (base / 'peerbrush-linux-report/linux-deb-qualification.json', 'linux-deb-qualification.json', 16384),
                   (base / 'peerbrush-linux-checks/installation.json', 'installation.json', 65536),
                   (base / 'peerbrush-linux-checks/portable-to-deb.json', 'portable-to-deb.json', 65536),
+                  (base / 'peerbrush-linux-checks/installed-gui.json', 'installed-gui.json', 65536),
                   (pathlib.Path(os.environ['SELECTED_BUNDLE']), 'linux-deb-qualification.sigstore.json', 2097152),
               ]:
                   checksum, size = bounded_file(path, limit, output / name)
                   if bounded_file(path, limit) != (checksum, size) or bounded_file(output / name, limit) != (checksum, size):
                       raise ValueError('Native evidence copy changed.')
+                  retained.extend([(path, limit, checksum, size), (output / name, limit, checksum, size)])
+              report = json.loads((output / q.REPORT).read_bytes(), object_pairs_hook=q.readiness.unique_fields)
+              receipt = q.read(output / 'installed-gui.json', report['installed_gui']['sha256'], 65536)
+              if q.gui_summary(receipt, {'record': report['package']}, report['installation']['receipt'],
+                      commit=report['commit'], version=report['version']) != report['installed_gui']:
+                  raise ValueError('Retained GUI receipt differs from the generated bounded qualification.')
+              captures = private_inspection_directory(base / 'peerbrush-linux-gui-captures', root, fresh=True)
+              captures.mkdir(mode=0o700)
+              for item in json.loads(receipt, object_pairs_hook=q.readiness.unique_fields)['checks']['captures']:
+                  source = base / 'peerbrush-linux-checks/installed-gui-captures' / item['file']
+                  target = captures / item['file']
+                  checksum, size = bounded_file(source, 8388608, target)
+                  if checksum != item['sha256'] or bounded_file(source, 8388608) != (checksum, size) or bounded_file(target, 8388608) != (checksum, size):
+                      raise ValueError('Actual private installed capture changed.')
+                  retained.extend([(source, 8388608, checksum, size), (target, 8388608, checksum, size)])
+              if any(bounded_file(path, limit) != (checksum, size) for path, limit, checksum, size in retained):
+                  raise ValueError('Original or retained native evidence changed during private capture retention.')
           except Exception:
               raise SystemExit('Native Linux evidence could not be retained; no handoff is available.') from None
           PY
@@ -216,6 +238,14 @@ jobs:
         with:
           name: linux-native-qualification-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/peerbrush-linux-evidence/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Upload private installed GUI captures
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-installed-gui-captures-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-linux-gui-captures/*.png
           if-no-files-found: error
           retention-days: 14
           compression-level: 0

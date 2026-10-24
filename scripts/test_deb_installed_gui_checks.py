@@ -1,4 +1,5 @@
 """Offline installed-GUI fixture contracts; never launch apps, displays or containers."""
+import ast
 import hashlib
 import json
 import math
@@ -57,6 +58,48 @@ def screen(colors, *, thumbnails=False, only_thumbnails=False, swapped=False,
 
 
 class InstalledGuiContracts(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'Container ownership/mode contract requires POSIX filesystems')
+    def test_actual_owned_capture_persistence_overrides_restrictive_umask_inside_private_parent(self):
+        tree = ast.parse(Path(gui.__file__).read_text(encoding='utf-8'))
+        check = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'check')
+        start = next(index for index, node in enumerate(check.body) if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == 'captures' for target in node.targets))
+        end = next(index for index, node in enumerate(check.body) if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == 'receipt' for target in node.targets))
+        statements = ast.fix_missing_locations(ast.Module(body=check.body[start:end], type_ignores=[]))
+        with tempfile.TemporaryDirectory(prefix='peerbrush-owned-captures-') as temporary:
+            previous = os.umask(0o077)
+            try:
+                parent = Path(temporary).resolve(strict=True) / 'private-evidence'
+                parent.mkdir(mode=0o700)
+                work = parent / 'owned-gui-work'
+                work.mkdir(mode=0o700)
+                output = gui.receipt_path(parent / 'installed-gui.json')
+                names = [name for index in range(4) for name in [f'canvas-{index}.png', f'activation-{index}.png']] + \
+                    ['settings-settled.png'] + [f'restart-canvas-{index}.png' for index in range(4)]
+                images = {}
+                captures = []
+                for index, name in enumerate(names):
+                    data = png(1, 1, 8, bytes([index, 37, 73, 255]))
+                    (work / name).write_bytes(data)
+                    images[name] = data
+                    captures.append(dict(file=name, sha256=hashlib.sha256(data).hexdigest()))
+                namespace = dict(output=output, work=work, result=dict(captures=captures), Path=Path,
+                    stat=gui.stat, require=gui.require, bounded_file=gui.bounded_file)
+                # Execute the actual persistence block, not the GUI/installer path.
+                exec(compile(statements, '<actual-owned-capture-persistence>', 'exec'), namespace)
+                retained = parent / 'installed-gui-captures'
+                self.assertEqual(parent.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(retained.stat().st_mode & 0o777, 0o755)
+                self.assertEqual({path.name for path in retained.iterdir()}, set(images))
+                self.assertEqual(len(images), 13)
+                for name, data in images.items():
+                    self.assertEqual((retained / name).stat().st_mode & 0o777, 0o644)
+                    self.assertEqual((retained / name).read_bytes(), data)
+                    self.assertEqual((work / name).read_bytes(), data)
+            finally:
+                os.umask(previous)
+
     def test_actual_tiny_native_decoder_is_unchanged_by_explicit_fixed_capture_case(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-gui-png-') as temporary:
             root = Path(temporary)

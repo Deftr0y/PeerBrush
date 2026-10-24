@@ -78,14 +78,17 @@ def paths(selected):
                         16 * 1024, native['qualification_sha256']))
         trusts.append((('windows', 'native', 'trust'), 'windows'))
     if 'linux_native' in selected:
-        from verify_linux_qualification import FIELDS
+        from verify_linux_qualification import FIELDS, GUI_FIELDS
         native = selected['linux_native']
-        if not isinstance(native, dict) or set(native) != FIELDS:
+        if not isinstance(native, dict) or set(native) not in [FIELDS, GUI_FIELDS]:
             raise ValueError('Exact existing native Linux fields required.')
         records.extend([(('linux_native', 'qualification'), 'native/linux/linux-deb-qualification.json',
                          16 * 1024, native['qualification_sha256']),
                         (('linux_native', 'upgrade'), 'native/linux/portable-to-deb.json',
                          readiness.MAX_INSTALLATION_RECEIPT_BYTES, native['upgrade_sha256'])])
+        if 'gui' in native:
+            records.append((('linux_native', 'gui'), 'native/linux/installed-gui.json',
+                            readiness.MAX_INSTALLATION_RECEIPT_BYTES, native['gui_sha256']))
         trusts.append((('linux_native', 'trust'), 'linux'))
     for keys, platform in trusts:
         trust = get(selected, keys)
