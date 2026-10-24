@@ -472,10 +472,10 @@ pub fn metadata_for_duplicate(entries: &[LayerMetadata]) -> Vec<LayerMetadata> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Embedded {
+struct Embedded<D = Document> {
     format: u32,
     standard_hash: u64,
-    document: Document,
+    document: D,
 }
 // Bound decoded bytes and check cancellation before native decompression.
 struct EmbeddedReader<'a, R> {
@@ -1389,7 +1389,7 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
             1
         },
         standard_hash: layer_hash ^ composite_hash,
-        document: doc.clone(),
+        document: doc,
     };
     let total = layer_length
         .checked_add(composite_length)
