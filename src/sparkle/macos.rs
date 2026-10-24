@@ -568,15 +568,6 @@ impl Probe {
             absent_feed.is_none(),
             "An unbound updater has no feed override"
         );
-        let actual_delegate: Option<Retained<AnyObject>> =
-            unsafe { msg_send![&*updater, delegate] };
-        assert_eq!(
-            actual_delegate
-                .as_ref()
-                .map(|value| Retained::as_ptr(value)),
-            Some(Retained::as_ptr(&self.delegate).cast()),
-            "Native controller must retain the selected weak delegate identity through its owner"
-        );
         let ready: Bool = unsafe { msg_send![&*updater, canCheckForUpdates] };
         assert!(
             !ready.as_bool(),
@@ -698,6 +689,7 @@ impl Probe {
 
     fn assert_no_update_sequence(&self) {
         use crate::sparkle::check::Phase;
+        use objc2_foundation::NSURL;
         let framework = PathBuf::from(self._framework.bundlePath().to_string());
         for (shown_domain, abort_domain, abort_code, cancelled, expected) in [
             (
@@ -748,13 +740,15 @@ impl Probe {
             let abort = error(abort_domain, abort_code);
             checks.session.borrow_mut().begin().unwrap();
             checks.checking(&owner.controller);
-            let feed: Retained<NSString> = objc2::rc::autoreleasepool(|_| {
-                let value: Option<Retained<NSString>> = unsafe {
-                    msg_send![&*owner.delegate, feedURLStringForUpdater: &*owner.controller]
-                };
-                value.expect("The exact bound updater receives its source-defined feed override")
+            let feed: Retained<NSURL> = objc2::rc::autoreleasepool(|_| {
+                let value: Option<Retained<NSURL>> =
+                    unsafe { msg_send![&*owner.controller, feedURL] };
+                value.expect("The native updater receives its retained delegate's feed override")
             });
-            assert_eq!(feed.to_string(), crate::sparkle::PROPOSED_FEED_URL);
+            assert_eq!(
+                feed.absoluteString().unwrap().to_string(),
+                crate::sparkle::PROPOSED_FEED_URL
+            );
             let foreign_feed: Option<Retained<NSString>> =
                 unsafe { msg_send![&*owner.delegate, feedURLStringForUpdater: &*self.controller] };
             assert!(foreign_feed.is_none());
