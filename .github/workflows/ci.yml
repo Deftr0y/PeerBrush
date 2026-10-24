@@ -407,6 +407,7 @@ jobs:
           DEB="$1"
           DEB_SHA=$(sha256sum "$DEB" | cut -d ' ' -f 1)
           EVIDENCE=$(mktemp -d "$RUNNER_TEMP/peerbrush-deb-acceptance.XXXXXX")
+          echo "PEERBRUSH_INSTALLED_GUI_EVIDENCE=$EVIDENCE" >> "$GITHUB_ENV"
           docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
             --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
             bash -eu -c 'apt-get update; apt-get install -y python3 xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd; python3 -B /checks/test_deb_installation.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installation.json' \
@@ -427,6 +428,15 @@ jobs:
               python3 -B /checks/test_deb_version_upgrade.py --old-source-root /historical-source --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/portable-to-deb.json
               python3 -B /checks/test_deb_installed_gui.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installed-gui.json' \
             peerbrush-real-version-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
+      - name: Retain completed installed GUI captures for visual review
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installed-gui-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.PEERBRUSH_INSTALLED_GUI_EVIDENCE }}/installed-gui.json
+            ${{ env.PEERBRUSH_INSTALLED_GUI_EVIDENCE }}/installed-gui-captures/*.png
+          if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: runner.os == 'Linux'
         with:
