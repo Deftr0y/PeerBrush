@@ -792,3 +792,198 @@ fn real_relative_arrow_input_after_release_accumulates_while_the_old_worker_is_h
         );
     }
 }
+
+fn long_stroke(app: &mut PeerBrush, count: usize) {
+    app.points = (0..count)
+        .map(|index| [3. + (index % 24) as f32, 4. + ((index / 24) % 12) as f32])
+        .collect();
+    app.stroke_pressures = (0..count)
+        .map(|index| 0.2 + (index % 8) as f32 * 0.1)
+        .collect();
+    app.stroke_has_pressure = true;
+}
+
+fn begin_held_stroke(app: &mut PeerBrush, ctx: &egui::Context) -> (WorkerHold, Rect) {
+    app.tool = Tool::Brush;
+    app.radius = 1.5;
+    app.brush.smoothing = 0.;
+    app.brush.spacing = 1.;
+    app.brush.pressure_size = true;
+    settle(app, ctx);
+    let rect = app.view_rect.unwrap();
+    let at = rect.min + Vec2::new(3., 4.) * (rect.width() / 32.);
+    let hold = hold_worker(app);
+    app.current_pressure = Some(0.3);
+    frame(
+        app,
+        ctx,
+        vec![egui::Event::PointerMoved(at), pointer(at, true)],
+    );
+    assert!(app.pending && !app.points.is_empty());
+    assert!(app.live_gesture.is_some() && app.drag_revision.is_some());
+    (hold, rect)
+}
+
+#[test]
+fn pending_long_stroke_frames_skip_full_variant_and_render_latest_native_input_before_one_commit() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = app.shared.lock().unwrap().doc.clone();
+        let untouched = workspace::source(&app);
+        let history = app.shared.lock().unwrap().undo.len();
+        let (hold, rect) = begin_held_stroke(&mut app, &ctx);
+        let old_job = app.preview_job;
+        let accepted = app.canvas_pixels.clone();
+        let builds = app.preview_variant_builds.get();
+        long_stroke(&mut app, 1000);
+        let mut at = Pos2::ZERO;
+        for index in 0..8 {
+            app.current_pressure = Some(0.35 + index as f32 * 0.07);
+            app.radius = 1.5 + index as f32 * 0.1;
+            app.brush.flow = 0.6 + index as f32 * 0.03;
+            app.color = [43 + index * 7, 97, 211, 255];
+            at = rect.min + Vec2::new(20. + index as f32, 18.) * (rect.width() / 32.);
+            frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)]);
+            assert!(app.pending);
+            assert_eq!(app.preview_job, old_job);
+            assert_eq!(app.preview_variant_builds.get(), builds);
+            assert_eq!(app.canvas_pixels, accepted);
+            assert_eq!(workspace::source(&app), untouched);
+        }
+        assert_eq!(app.points.len(), 1008);
+        assert_eq!(app.stroke_pressures.len(), app.points.len());
+        assert_eq!(app.stroke_pressures.last(), app.current_pressure.as_ref());
+        let command = app.stroke_command(app.points.clone(), app.color);
+        assert_eq!(command["points"].as_array().unwrap().len(), 1008);
+        assert_eq!(command["pressures"].as_array().unwrap().len(), 1008);
+        let expected = Engine::preview_edits(before.clone(), &[command]).unwrap();
+        assert_ne!(expected.layers[0].pixels, before.layers[0].pixels);
+        app.parameter_worker_gate = None;
+        drop(hold);
+        let reply = app.preview_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(reply.job, old_job);
+        assert!(!reply.coarse && reply.error.is_none());
+        let completed_pixels = (reply.w, reply.h, reply.bytes.clone());
+        app.preview_tx.send(reply).unwrap();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.preview_variant_builds.get(), builds + 1);
+        assert_eq!(app.canvas_pixels.as_ref().unwrap(), &completed_pixels);
+        assert!(app.pending && app.preview_job != old_job);
+        assert_eq!(workspace::source(&app), untouched);
+        settle(&mut app, &ctx);
+        let (w, h, pixels) = app.canvas_pixels.as_ref().unwrap();
+        assert_eq!(
+            pixels,
+            &expected.preview(None, (*w).max(*h), None, false).unwrap().2
+        );
+        assert_eq!(workspace::source(&app), untouched);
+        frame(&mut app, &ctx, vec![pointer(at, false)]);
+        assert!(app.points.is_empty());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.doc.bit_depth, depth);
+        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+        assert_eq!(engine.doc.layers[0].source, before.layers[0].source);
+        assert_eq!(
+            engine.doc.layers[0].pixels.get16(1, 1),
+            before.layers[0].pixels.get16(1, 1)
+        );
+        assert_eq!(engine.undo.len(), history + 1);
+        assert!(engine.redo.is_empty());
+        engine.undo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+        engine.redo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+    }
+}
+
+#[test]
+fn pending_long_stroke_still_cancels_and_rejects_obsolete_results_after_escape_or_shared_edit() {
+    for depth in [8, 16] {
+        for interruption in ["escape", "shared"] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            let (hold, _) = begin_held_stroke(&mut app, &ctx);
+            long_stroke(&mut app, 1000);
+            let accepted = app.canvas_pixels.clone();
+            let before = workspace::source(&app);
+            let builds = app.preview_variant_builds.get();
+            if interruption == "escape" {
+                workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+                assert_eq!(workspace::source(&app), before);
+            } else {
+                app.shared.lock().unwrap().edit(
+                    "human", &[json!({"op":"layer.update","layer":app.selected,"name":"Newer human work"})],
+                    None, None, "Human rename",
+                ).unwrap();
+                frame(&mut app, &ctx, vec![]);
+                assert!(app.message.contains("Image changed during brush stroke"));
+            }
+            assert!(app.points.is_empty() && app.drag_start.is_none());
+            assert!(app.live_gesture.is_none());
+            assert!(app.pending);
+            assert_eq!(app.preview_variant_builds.get(), builds);
+            assert_eq!(app.canvas_pixels, accepted);
+            let retained = workspace::source(&app);
+            app.parameter_worker_gate = None;
+            drop(hold);
+            let reply = app.preview_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            app.preview_tx.send(reply).unwrap();
+            frame(&mut app, &ctx, vec![]);
+            assert_eq!(app.canvas_pixels, accepted);
+            assert_eq!(app.preview_variant_builds.get(), builds + 1);
+            assert_eq!(workspace::source(&app), retained);
+            frame(
+                &mut app,
+                &ctx,
+                vec![pointer(
+                    ctx.input(|i| i.pointer.interact_pos()).unwrap(),
+                    false,
+                )],
+            );
+            settle(&mut app, &ctx);
+            assert_eq!(workspace::source(&app), retained);
+            let engine = app.shared.lock().unwrap();
+            let (w, h, pixels) = app.canvas_pixels.as_ref().unwrap();
+            assert_eq!(
+                pixels,
+                &engine
+                    .doc
+                    .preview(None, (*w).max(*h), None, false)
+                    .unwrap()
+                    .2
+            );
+            assert_eq!(engine.doc.bit_depth, depth);
+        }
+    }
+}
+
+#[test]
+#[ignore = "Descriptive pending-frame construction diagnostic; run separately from regular QA"]
+fn pending_stroke_variant_construction_diagnostic() {
+    for depth in [8, 16] {
+        for samples in [100, 1000, 9000] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            let (hold, _) = begin_held_stroke(&mut app, &ctx);
+            long_stroke(&mut app, samples);
+            let before = workspace::source(&app);
+            let builds = app.preview_variant_builds.get();
+            let started = std::time::Instant::now();
+            for _ in 0..12 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let elapsed = started.elapsed();
+            assert!(app.pending);
+            assert_eq!(app.preview_variant_builds.get(), builds);
+            assert_eq!(workspace::source(&app), before);
+            println!(
+                "{}",
+                json!({"kind":"pending_stroke_variant", "depth":depth,
+                "seeded_samples":samples, "retained_samples":app.points.len(), "frames":12,
+                "full_variant_builds":app.preview_variant_builds.get() - builds,
+                "elapsed_ns":elapsed.as_nanos()})
+            );
+            app.parameter_worker_gate = None;
+            drop(hold);
+            let _ = app.preview_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    }
+}

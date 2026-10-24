@@ -482,6 +482,8 @@ pub struct PeerBrush {
     parameter_worker_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
     #[cfg(test)]
     parameter_worker_runs: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    preview_variant_builds: std::cell::Cell<usize>,
     preview_cache: Arc<std::sync::Mutex<crate::preview::Cache>>,
     last_preview: Option<(String, u64, String, bool)>,
     thumbs: HashMap<String, (u64, TextureHandle)>,
@@ -852,6 +854,8 @@ impl PeerBrush {
             parameter_worker_gate: None,
             #[cfg(test)]
             parameter_worker_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            preview_variant_builds: std::cell::Cell::new(0),
             preview_cache: Arc::new(std::sync::Mutex::new(crate::preview::Cache::default())),
             last_preview: None,
             thumbs: HashMap::new(),
@@ -2071,6 +2075,9 @@ impl PeerBrush {
             "Liquify: paint on the canvas · Choose Push, Expand, Pinch or Restore above".into();
     }
     fn preview_variant(&self) -> String {
+        #[cfg(test)]
+        self.preview_variant_builds
+            .set(self.preview_variant_builds.get() + 1);
         if let Some(id) = &self.proposal_review {
             return format!("proposal:{id}:{}", self.proposal_original);
         }
@@ -2264,11 +2271,8 @@ impl PeerBrush {
                 (r.width().max(r.height()) * ctx.pixels_per_point()).ceil() as u32
             })
             .clamp(512, 1536);
-        let variant = format!(
-            "{};{};{edge}",
-            self.preview_variant(),
-            self.animation.render_key(time)
-        );
+        let animation_key = self.animation.render_key(time);
+        let mut variant = None;
         let mut live = self.live_key();
         if live.is_empty() {
             let ai = self.animation.live_key();
@@ -2322,13 +2326,17 @@ impl PeerBrush {
                     }
                 }
             }
-            if parameter_matches
-                && p.doc_id == doc.id
-                && p.revision == doc.revision
-                && (p.target == variant || (!live.is_empty() && p.live == live))
-                && (p.parameter.is_none() || p.target == variant)
+            if !parameter_matches || p.doc_id != doc.id || p.revision != doc.revision {
+                self.last_preview = None;
+                continue;
+            }
+            let variant = variant.get_or_insert_with(|| {
+                format!("{};{animation_key};{edge}", self.preview_variant())
+            });
+            if (p.target == *variant || (!live.is_empty() && p.live == live))
+                && (p.parameter.is_none() || p.target == *variant)
                 && p.mask == preview_mask
-                && (self.free_transform.is_none() || (p.target == variant && p.live == live))
+                && (self.free_transform.is_none() || (p.target == *variant && p.live == live))
                 && ((self.source_editor.is_none() && self.filter_editor.is_none())
                     || p.live == live)
             {
@@ -2387,8 +2395,13 @@ impl PeerBrush {
         if self.animation.fading() || self.animation.progress(time) < 1.0 {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+        if self.pending {
+            return;
+        }
+        let variant =
+            variant.unwrap_or_else(|| format!("{};{animation_key};{edge}", self.preview_variant()));
         let key = (doc.id.clone(), doc.revision, variant.clone(), preview_mask);
-        if !self.pending && self.last_preview.as_ref() != Some(&key) {
+        if self.last_preview.as_ref() != Some(&key) {
             self.pending = true;
             self.last_preview = Some(key);
             let job = self
@@ -2469,7 +2482,7 @@ impl PeerBrush {
             let worker_gate = self
                 .parameter_worker_gate
                 .clone()
-                .filter(|_| parameter_replayed);
+                .filter(|_| parameter_replayed || !self.points.is_empty());
             #[cfg(test)]
             let worker_runs = self.parameter_worker_runs.clone();
             let dirty = if !live.is_empty()
