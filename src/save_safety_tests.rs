@@ -465,6 +465,7 @@ fn synthetic_save_phase_diagnostic() {
         Some(parent.as_path())
     );
     let mut records = Vec::new();
+    let mut stage_records = Vec::new();
     for depth in [8, 16] {
         let source = directory.join(format!("source-{depth}.psd"));
         let shared = Arc::new(Mutex::new(Engine::new()));
@@ -504,22 +505,93 @@ fn synthetic_save_phase_diagnostic() {
                 let output = directory.join(format!("saved-{depth}-{trial}.{extension}"));
                 let shared = Arc::new(Mutex::new(Engine::new()));
                 open(&shared, &source).unwrap();
+                {
+                    let mut engine = shared.lock().unwrap();
+                    let layer = engine.doc.layers[0].id.clone();
+                    engine
+                        .reserve(
+                            "human",
+                            "Keep diagnostic source ownership",
+                            vec![engine::Scope::layer(&layer)],
+                        )
+                        .unwrap();
+                }
                 let before = shared.lock().unwrap().doc.clone();
+                let full_history = |engine: &Engine| {
+                    let entries = |items: &[engine::History]| {
+                        items.iter().map(|entry| json!({
+                        "before":entry.before,"after":entry.after,"actor":entry.actor,"label":entry.label,
+                        "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted
+                    })).collect::<Vec<_>>()
+                    };
+                    json!({"undo":entries(&engine.undo),"redo":entries(&engine.redo),"leases":engine.leases})
+                };
+                let previous_history = full_history(&shared.lock().unwrap());
+                assert!(!shared.lock().unwrap().leases.is_empty());
                 assert_eq!(shared.lock().unwrap().saved_revision, before.revision);
                 let history = shared.lock().unwrap().undo.len();
+                #[derive(serde::Serialize)]
+                struct ObservedStage {
+                    stage: String,
+                    first_observed_ns: u64,
+                    last_observed_ns: u64,
+                    source_checks: u64,
+                    spool_write_callbacks: u64,
+                    output_write_callbacks: u64,
+                }
                 #[derive(Default)]
                 struct Phases {
                     source_checks: u64,
                     encoded: Option<std::time::Duration>,
                     precommit: Option<std::time::Duration>,
                     published: Option<std::time::Duration>,
+                    stages: Vec<ObservedStage>,
+                    observer_callbacks: u64,
+                    observer_body_ns: u64,
+                    maximum_observer_body_ns: u64,
+                    previous_callback_ns: Option<u64>,
+                    maximum_callback_gap_ns: u64,
                 }
+                let control = crate::saving::Control::default();
+                let observed_control = control.clone();
                 let started = Instant::now();
                 let phases = Rc::new(RefCell::new(Phases::default()));
                 let observed = phases.clone();
                 let observed_engine = shared.clone();
-                let watch = WatchSave::new(move |phase, _, _| {
+                let watch = WatchSave::new(move |phase, output, _| {
+                    let entered = Instant::now();
+                    let status = observed_control.status();
+                    let elapsed = started.elapsed().as_nanos() as u64;
                     let mut p = observed.borrow_mut();
+                    if p.stages.last().is_none_or(|row| row.stage != status.stage) {
+                        p.stages.push(ObservedStage {
+                            stage: status.stage,
+                            first_observed_ns: elapsed,
+                            last_observed_ns: elapsed,
+                            source_checks: 0,
+                            spool_write_callbacks: 0,
+                            output_write_callbacks: 0,
+                        });
+                    }
+                    let row = p.stages.last_mut().unwrap();
+                    row.last_observed_ns = elapsed;
+                    if phase == "encoding" {
+                        row.source_checks += 1;
+                    }
+                    if phase == "write" {
+                        match output.extension().and_then(|value| value.to_str()) {
+                            Some("psd-spool") => row.spool_write_callbacks += 1,
+                            Some("tmp") => row.output_write_callbacks += 1,
+                            _ => {
+                                panic!("The existing write observer must name its owned temporary")
+                            }
+                        }
+                    }
+                    if let Some(previous) = p.previous_callback_ns.replace(elapsed) {
+                        p.maximum_callback_gap_ns =
+                            p.maximum_callback_gap_ns.max(elapsed - previous);
+                    }
+                    p.observer_callbacks += 1;
                     match phase {
                         "encoding" => p.source_checks += 1,
                         "encoded" => {
@@ -538,11 +610,14 @@ fn synthetic_save_phase_diagnostic() {
                         }
                         _ => {}
                     }
+                    let overhead = entered.elapsed().as_nanos() as u64;
+                    p.observer_body_ns += overhead;
+                    p.maximum_observer_body_ns = p.maximum_observer_body_ns.max(overhead);
                     Ok(())
                 });
                 let precommit = phases.clone();
                 let precommit_engine = shared.clone();
-                save_prepared(&shared, &output, &json!({}), || {
+                save_controlled(&shared, &output, &json!({}), &control, || {
                     assert!(
                         precommit_engine.try_lock().is_ok(),
                         "Verification before final publication must leave the engine available"
@@ -556,7 +631,43 @@ fn synthetic_save_phase_diagnostic() {
                 .unwrap();
                 let total = started.elapsed();
                 drop(watch);
+                let terminal_observed_ns = started.elapsed().as_nanos() as u64;
+                let terminal = control.status();
+                assert!(
+                    terminal.finished
+                        && terminal.error.is_none()
+                        && !terminal.can_cancel
+                        && !terminal.cancel_requested
+                );
+                assert_eq!(terminal.stage, "Saved");
+                assert_eq!(
+                    (terminal.document_id.as_str(), terminal.revision),
+                    (before.id.as_str(), before.revision)
+                );
                 let p = phases.borrow();
+                for expected in [
+                    "Writing editable sources",
+                    "Assembling verified Photoshop output",
+                    "Verifying native spool",
+                    "Verifying save output",
+                    "Preserving previous version",
+                    "Finishing save",
+                ] {
+                    assert!(
+                        p.stages.iter().any(|row| row.stage == expected),
+                        "Missing existing guarded stage: {expected}"
+                    );
+                }
+                assert_eq!(
+                    p.stages.iter().map(|row| row.source_checks).sum::<u64>(),
+                    p.source_checks
+                );
+                let stage_record = json!({"depth":depth,"container":extension,"trial":trial,
+                    "source_check_callbacks":p.source_checks,"observer_callbacks":p.observer_callbacks,
+                    "observer_callback_body_ns":p.observer_body_ns,"maximum_observer_callback_body_ns":p.maximum_observer_body_ns,
+                    "maximum_callback_gap_ns":p.maximum_callback_gap_ns,"stages":p.stages,
+                    "terminal_observed_ns":terminal_observed_ns,"terminal_stage":terminal.stage,
+                    "save_return_ns":total.as_nanos(),"full_source_standard_composite_history_reservations_ownership_verified":true});
                 let (encoded, precommit, published) = (
                     p.encoded.unwrap(),
                     p.precommit.unwrap(),
@@ -584,13 +695,82 @@ fn synthetic_save_phase_diagnostic() {
                         (before.id.as_str(), before.revision, depth)
                     );
                     assert_eq!(e.undo.len(), history);
+                    assert_eq!(full_history(&e), previous_history);
+                    let mut expected = before.clone();
+                    expected.name = output.file_name().unwrap().to_string_lossy().into();
+                    assert_eq!(
+                        serde_json::to_value(&e.doc).unwrap(),
+                        serde_json::to_value(&expected).unwrap()
+                    );
+                    assert_eq!(e.path.as_deref(), Some(output.as_path()));
+                    assert!(e.file_ownership.is_some());
+                    assert!(crate::file_ownership::Ownership::open(
+                        &output,
+                        "unrelated-diagnostic-project"
+                    )
+                    .is_err());
+                    assert_eq!(
+                        e.file_version,
+                        Some(crate::file_safety::version(&output).unwrap())
+                    );
                     assert_eq!(
                         e.doc.layers[0].pixels.rgba16(),
                         before.layers[0].pixels.rgba16()
                     );
                     assert_eq!(e.saved_revision, before.revision);
                 }
-                let loaded = psd::decode(&fs::read(&output).unwrap()).unwrap();
+                let bytes = fs::read(&output).unwrap();
+                let loaded = psd::decode(&bytes).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&loaded).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                assert_eq!(loaded.export_png().unwrap(), before.export_png().unwrap());
+                let resources = u32::from_be_bytes(bytes[30..34].try_into().unwrap()) as usize;
+                let mut standard = bytes[..30].to_vec();
+                standard.extend([0; 4]);
+                standard.extend(&bytes[34 + resources..]);
+                let ordinary = psd::decode(&standard).unwrap();
+                assert_eq!(ordinary.bit_depth, depth);
+                assert_eq!(ordinary.layers.len(), 1);
+                assert_eq!(
+                    ordinary.layers[0].pixels.rgba16(),
+                    before.layers[0].pixels.rgba16()
+                );
+                assert_eq!(ordinary.export_png().unwrap(), before.export_png().unwrap());
+                // Independent wire offset and native-render expectation: removing
+                // PBR1 above must not substitute for the saved current composite.
+                let section = 34 + resources;
+                let length_bytes = if extension == "psb" { 8 } else { 4 };
+                let mut encoded_length = [0u8; 8];
+                encoded_length[8 - length_bytes..]
+                    .copy_from_slice(&bytes[section..section + length_bytes]);
+                let merged = section + length_bytes + u64::from_be_bytes(encoded_length) as usize;
+                assert_eq!(&bytes[merged..merged + 2], &[0, 0]);
+                let pixels = image::load_from_memory(&before.export_png().unwrap())
+                    .unwrap()
+                    .into_rgba16()
+                    .into_raw();
+                let plane = 2048 * 2048 * usize::from(depth / 8);
+                assert_eq!(bytes.len() - merged - 2, 4 * plane);
+                let maximum = if depth == 16 { 65535u64 } else { 255 };
+                for channel in 0..4 {
+                    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+                        let alpha = u64::from(pixel[3]) / if depth == 16 { 1 } else { 257 };
+                        let color = u64::from(pixel[channel]) / if depth == 16 { 1 } else { 257 };
+                        let expected = if channel == 3 {
+                            alpha
+                        } else {
+                            (color * alpha + maximum * (maximum - alpha) + maximum / 2) / maximum
+                        };
+                        let at = merged + 2 + channel * plane + index * usize::from(depth / 8);
+                        if depth == 16 {
+                            assert_eq!(&bytes[at..at + 2], &(expected as u16).to_be_bytes());
+                        } else {
+                            assert_eq!(bytes[at], expected as u8);
+                        }
+                    }
+                }
                 assert!(!loaded.read_only);
                 assert_eq!(loaded.bit_depth, depth);
                 assert_eq!(loaded.layers[0].pixels.depth, depth);
@@ -602,7 +782,18 @@ fn synthetic_save_phase_diagnostic() {
                     crate::file_safety::version(&source).unwrap(),
                     source_version
                 );
+                assert!(!fs::read_dir(&directory).unwrap().any(|entry| matches!(
+                    entry
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .and_then(|value| value.to_str()),
+                    Some("tmp" | "psd-spool")
+                )));
+                drop(precommit_engine);
                 drop(shared);
+                assert!(crate::file_ownership::local_project(&output).is_none());
+                stage_records.push(stage_record);
             }
         }
     }
@@ -630,6 +821,14 @@ fn synthetic_save_phase_diagnostic() {
             "note":"Opt-in test observer overhead is included. Cache and scheduling are uncontrolled. The final phase includes post-publication verification and return cleanup. The engine is observed locked at the publication checkpoint; exact unlock time is not instrumented. This is not input-to-display latency or total lock time.",
             "records":records
         })
+    );
+    println!(
+        "\n{}",
+        json!({"format":"PeerBrushSaveControlStageDiagnosticV1","build":build,
+        "native_window":false,"normal_application":false,"periodic_polling":false,
+        "observation":"Existing per-guard/write WatchSave callbacks read the actual Control; no added thread or production instrumentation",
+        "limits":"First-observed stage checkpoints are not exact progress calls or syscall/lock durations. No-callback I/O/fsync spans can be charged to an adjacent stage. Callback body wall overhead is measured and included; TLS dispatch/source checks and clocks have additional unmeasured overhead. Fixed order and caches/scheduling remain uncontrolled. The in-process test does not include CLI startup/JSON/IPC, normal native UI, GPU, physical latency or before/after attribution.",
+        "records":stage_records})
     );
 }
 
