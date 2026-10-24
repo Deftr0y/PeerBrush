@@ -1544,3 +1544,209 @@ fn buffered_source_flush_failure_and_cancel_keep_actual_native_save_and_history(
         }
     }
 }
+
+#[test]
+#[ignore = "Opt-in owned-file IO component timings; no normal Save or latency claim"]
+fn save_temporary_io_component_diagnostic() {
+    use std::time::Instant;
+    const CHUNK: usize = 64 * 1024;
+    const OPERATIONS: usize = 32;
+    fn elapsed(operation: impl FnOnce()) -> u64 {
+        let started = Instant::now();
+        operation();
+        started.elapsed().as_nanos().try_into().unwrap()
+    }
+    let state = |engine: &Engine| {
+        let entries = |items: &[engine::History]| {
+            items.iter().map(|entry| json!({
+            "before":entry.before,"after":entry.after,"actor":entry.actor,"label":entry.label,
+            "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted
+        })).collect::<Vec<_>>()
+        };
+        json!({"doc":engine.doc,"undo":entries(&engine.undo),"redo":entries(&engine.redo),
+            "leases":engine.leases,"path":engine.path,"saved_revision":engine.saved_revision})
+    };
+    let build: Value = serde_json::from_str(crate::build_info::json()).unwrap();
+    assert_eq!(build["tree"], "clean");
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    let directory = parent.join(format!("pb-save-io-components-{}", engine::id()));
+    fs::create_dir(&directory).unwrap();
+    assert_eq!(
+        directory.canonicalize().unwrap().parent(),
+        Some(parent.as_path())
+    );
+    let mut records = Vec::new();
+    for depth in [8, 16] {
+        let shared = native_save_fixture(depth, "Native IO component fixture");
+        let before = state(&shared.lock().unwrap());
+        let document = shared.lock().unwrap().doc.clone();
+        let encoded = psd::encode(&document).unwrap();
+        assert!(!encoded.is_empty() && encoded.len() <= CHUNK * OPERATIONS);
+        assert_eq!(
+            serde_json::to_value(psd::decode(&encoded).unwrap()).unwrap(),
+            serde_json::to_value(&document).unwrap()
+        );
+        // Repeated encoded fixture bytes are IO data, not a published Photoshop file.
+        let bytes: Vec<_> = encoded
+            .iter()
+            .copied()
+            .cycle()
+            .take(CHUNK * OPERATIONS)
+            .collect();
+        let expected: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &bytes)
+            .as_ref()
+            .try_into()
+            .unwrap();
+        for trial in 1..=3 {
+            for spool in [false, true] {
+                let mut temporary =
+                    SaveTemporary::new(&directory.join("unused-destination.psd"), spool).unwrap();
+                let path = temporary.path.clone();
+                let control = crate::saving::Control::default();
+                control
+                    .begin(document.id.clone(), document.revision)
+                    .unwrap();
+                let cancellation_check_ns = elapsed(|| {
+                    for _ in 0..OPERATIONS {
+                        control.check().unwrap();
+                    }
+                });
+                let mut writes = 0;
+                let guarded_write_ns = elapsed(|| {
+                    for chunk in bytes.chunks(CHUNK) {
+                        let mut pending = chunk;
+                        while !pending.is_empty() {
+                            let n = temporary.write(pending).unwrap();
+                            assert!(n > 0 && n <= pending.len());
+                            writes += 1;
+                            pending = &pending[n..];
+                        }
+                    }
+                });
+                assert_eq!(temporary.bytes, bytes.len() as u64);
+                assert_eq!(
+                    crate::file_safety::finish_fingerprint(temporary.fingerprint.clone()),
+                    expected
+                );
+                let check_path_ns = elapsed(|| {
+                    for _ in 0..OPERATIONS {
+                        temporary.check_path().unwrap();
+                    }
+                });
+                let symlink_metadata_ns = elapsed(|| {
+                    for _ in 0..OPERATIONS {
+                        assert!(fs::symlink_metadata(&path).unwrap().is_file());
+                    }
+                });
+                let named_open_close_ns = elapsed(|| {
+                    for _ in 0..OPERATIONS {
+                        drop(crate::file_safety::open_for_identity(&path).unwrap());
+                    }
+                });
+                let held_identity_ns = elapsed(|| {
+                    for _ in 0..OPERATIONS {
+                        assert_eq!(
+                            crate::file_safety::identity(&temporary.file).unwrap(),
+                            temporary.identity
+                        );
+                    }
+                });
+                let named = crate::file_safety::open_for_identity(&path).unwrap();
+                let named_identity_ns = elapsed(|| {
+                    for _ in 0..OPERATIONS {
+                        assert_eq!(
+                            crate::file_safety::identity(&named).unwrap(),
+                            temporary.identity
+                        );
+                    }
+                });
+                drop(named);
+                let mut fingerprint = ring::digest::Context::new(&ring::digest::SHA256);
+                let sha256_update_ns = elapsed(|| {
+                    for chunk in bytes.chunks(CHUNK) {
+                        fingerprint.update(chunk);
+                    }
+                });
+                assert_eq!(
+                    crate::file_safety::finish_fingerprint(fingerprint),
+                    expected
+                );
+                let mut verified = None;
+                let verify_flush_sync_full_hash_ns = elapsed(|| {
+                    verified = Some(temporary.verify(|| control.check()).unwrap());
+                });
+                assert_eq!(
+                    verified.unwrap(),
+                    crate::file_safety::published_version(&path, &bytes).unwrap()
+                );
+                temporary.rewind().unwrap();
+                let mut readback = vec![0; bytes.len()];
+                let mut reads = 0;
+                let guarded_read_ns = elapsed(|| {
+                    let mut offset = 0;
+                    while offset < readback.len() {
+                        let end = (offset + CHUNK).min(readback.len());
+                        let n = temporary.read(&mut readback[offset..end]).unwrap();
+                        assert!(n > 0 && n <= end - offset);
+                        reads += 1;
+                        offset += n;
+                    }
+                });
+                assert_eq!(readback, bytes);
+                assert!(writes >= OPERATIONS && reads >= OPERATIONS);
+                assert!(control.cancel());
+                assert!(temporary
+                    .verify(|| control.check())
+                    .unwrap_err()
+                    .contains("Save canceled"));
+                assert!(temporary
+                    .write(b"must not append after reading")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not sequential"));
+                assert_eq!(temporary.bytes, bytes.len() as u64);
+                assert_eq!(
+                    crate::file_safety::finish_fingerprint(temporary.fingerprint.clone()),
+                    expected
+                );
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                drop(temporary);
+                assert!(!path.exists());
+                records.push(json!({"depth":depth,"spool":spool,"trial":trial,"bytes":bytes.len(),
+                    "component_operations":OPERATIONS,"maximum_transfer_bytes":CHUNK,"write_calls":writes,"read_calls":reads,
+                    "check_path_ns":check_path_ns,"symlink_metadata_ns":symlink_metadata_ns,
+                    "named_open_close_ns":named_open_close_ns,"held_identity_ns":held_identity_ns,
+                    "named_identity_ns":named_identity_ns,"guarded_write_ns":guarded_write_ns,
+                    "guarded_read_ns":guarded_read_ns,"sha256_update_ns":sha256_update_ns,
+                    "cancellation_check_ns":cancellation_check_ns,"verify_flush_sync_full_hash_ns":verify_flush_sync_full_hash_ns,
+                    "bytes_fingerprint_cancel_read_only_transition_and_owned_cleanup_verified":true}));
+            }
+        }
+        assert_eq!(state(&shared.lock().unwrap()), before);
+    }
+    // Reuse the actual four role/read-write/Drop foreign-name cases outside timing.
+    save_temporary_rejects_replaced_names_before_reads_writes_and_cleanup();
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+    let metadata = fs::symlink_metadata(&directory).unwrap();
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        assert_eq!(metadata.file_attributes() & 0x400, 0);
+    }
+    assert_eq!(
+        directory.canonicalize().unwrap().parent(),
+        Some(parent.as_path())
+    );
+    fs::remove_dir(&directory).unwrap();
+    assert!(!directory.exists());
+    assert_eq!(records.len(), 12);
+    println!(
+        "\n{}",
+        json!({"format":"PeerBrushSaveIoComponentDiagnosticV1","build":build,
+        "normal_application":false,"native_window":false,"payload_is_published_psd":false,
+        "native_fixture_source_history_verified":true,"existing_real_foreign_name_read_write_drop_cases_verified":true,
+        "limits":"IO-only repeated native-fixture bytes; real guards unchanged. Aggregate component samples include timer/assert overhead and overlap; do not sum as Save attribution. Guarded IO includes identity, source-independent file checks and SHA; verification includes flush/fsync/full readback. Cancellation check excludes engine/source locking. Wire FNV is not isolated. Cache, filesystem and security scanning/scheduling uncontrolled; no normal Save, native input, device latency or performance change claim.",
+        "records":records})
+    );
+}
