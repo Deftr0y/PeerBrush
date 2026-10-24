@@ -1676,3 +1676,134 @@ fn installed_host_root_ownership_does_not_relax_private_capture_ownership() {
         assert_eq!(TreeOwner::PrivateCapture.permits(uid, 501), copied);
     }
 }
+
+#[test]
+fn retained_armed_owner_rechecks_its_exact_records_without_relaxing_new_owner_admission() {
+    for damage in [
+        "none",
+        "intent",
+        "receipt",
+        "unstarted",
+        "other",
+        "source",
+        "copy",
+        "profile",
+        "during",
+    ] {
+        let f = Fixture::new();
+        let profile = f.profile();
+        let lease = profile.update_profile();
+        let attempt = f.attempt(&lease);
+        let initial = fs::read(attempt.join("checkpoint.json")).unwrap();
+        fs::rename(
+            attempt.join("checkpoint.json"),
+            attempt.join("capture.json"),
+        )
+        .unwrap();
+        let (workspace, projects, paths) = current_profile_workspace(&f);
+        let tools = workspace.lock().unwrap().tool_settings.clone();
+        *tools.lock().unwrap() = crate::tool_settings::Store::load(
+            profile.locations.profile().join("tool-settings.json"),
+        );
+        let reviewed = crate::workspace::lifecycle::update_readiness(&workspace).unwrap();
+        let mut capture = None;
+        crate::workspace::lifecycle::publish_update_checkpoint(&workspace, &reviewed, |store| {
+            capture_current_profile(&lease, store, &attempt, &initial, &mut capture)
+        })
+        .unwrap();
+        let expected = current_workspace_bytes(&projects, &paths);
+        // Filesystem receipt injection only: no native owner/check is faked into
+        // authority. The actual factory and native recheck remain source-refused.
+        record_intent(&attempt, &initial).unwrap();
+        let mut armed = ArmedCheck {
+            app: attempt.join("PeerBrush.app"),
+            manifest: initial.clone(),
+            intent: read_marker(&attempt.join("native-start-intent.json")).unwrap(),
+            owner_pid: std::process::id(),
+        };
+        let configuration = ApprovedCheck {
+            feed_url: crate::sparkle::PROPOSED_FEED_URL.into(),
+            public_ed_key: "public fixture, no native authority".into(),
+            publisher_team_id: "ABCD123456".into(),
+            objects: BTreeMap::new(),
+        };
+        let stored: Manifest = serde_json::from_slice(&initial).unwrap();
+        let parent = stored.target.join("Contents/MacOS/peerbrush");
+        assert!(startup_guard(&profile.locations).is_err());
+        assert!(inspect_owner_copy_with(
+            &armed.app,
+            &lease,
+            &parent,
+            &digest(&initial),
+            &configuration,
+            &AtomicBool::new(false),
+            |_| panic!("Armed state reached new-owner native verification")
+        )
+        .is_err());
+        assert_eq!(
+            armed
+                .recheck(
+                    &lease,
+                    &parent,
+                    configuration.clone(),
+                    Arc::new(AtomicBool::new(false))
+                )
+                .err()
+                .unwrap(),
+            require_captured_handoff().unwrap_err()
+        );
+        match damage {
+            "intent" => {
+                fs::write(attempt.join("native-start-intent.json"), b"changed receipt").unwrap()
+            }
+            "receipt" => armed.manifest.push(b' '),
+            "unstarted" => record_unstarted(&attempt, &initial).unwrap(),
+            "other" => {
+                let other = checkpoints(&profile.locations).join(uuid::Uuid::new_v4().to_string());
+                fs::DirBuilder::new().mode(0o700).create(&other).unwrap();
+                record_intent(&other, &initial).unwrap();
+            }
+            "source" => fs::write(&parent, b"changed original").unwrap(),
+            "copy" => {
+                fs::write(armed.app.join("Contents/MacOS/peerbrush"), b"changed copy").unwrap()
+            }
+            "profile" => fs::write(
+                attempt.join("current-profile/tool-settings.json"),
+                b"changed profile",
+            )
+            .unwrap(),
+            _ => {}
+        }
+        let calls = std::cell::Cell::new(0);
+        let result = armed.recheck_with(
+            &lease,
+            &parent,
+            &configuration,
+            &AtomicBool::new(false),
+            |app| {
+                assert!(app == stored.target || app == armed.app);
+                calls.set(calls.get() + 1);
+                if damage == "during" && calls.get() == 1 {
+                    fs::write(
+                        attempt.join("native-start-intent.json"),
+                        b"changed during verification",
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(result.is_ok(), damage == "none", "{damage}");
+        if let Ok(bundles) = result {
+            assert_eq!(bundles.owner, armed.app);
+            assert_eq!(bundles.host, stored.target);
+            assert_eq!(bundles.application, stored.target);
+            assert_eq!(calls.get(), 2);
+        }
+        assert_eq!(current_workspace_bytes(&projects, &paths), expected);
+        assert!(!workspace.lock().unwrap().exiting);
+        assert!(attempt.join("native-start-intent.json").exists());
+        assert!(require_captured_handoff().is_err());
+        assert!(startup_guard(&profile.locations).is_err());
+    }
+}

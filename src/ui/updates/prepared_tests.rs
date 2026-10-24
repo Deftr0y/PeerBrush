@@ -692,3 +692,199 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
         fs::remove_dir_all(directory).unwrap();
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_projects_owned() {
+    for depth in [8, 16] {
+        let directory =
+            std::env::temp_dir().join(format!("pb-native-download-ui-{}", crate::engine::id()));
+        fs::create_dir(&directory).unwrap();
+        let (mut app, ctx) = crate::ui::tests::fixture();
+        app.recovery.open = false;
+        app.updates = Panel::load(&directory);
+        app.updates.owner = Owner::Direct;
+        app.updates
+            .store
+            .save(updates::Preferences {
+                last_attempt: Some(updates::now()),
+                ..Default::default()
+            })
+            .unwrap();
+        let (raster_id, source_id, source_before, sample) = {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new_depth(32, 24, depth).unwrap();
+            let raster_id = e.doc.layers[0].id.clone();
+            e.doc.layers[0]
+                .pixels
+                .set16(25, 20, [12347, 23459, 34567, 0]);
+            let sample = e.doc.layers[0].pixels.get16(25, 20);
+            let source = Source {
+                width: 16,
+                height: 16,
+                matrix: [1., 0., 0., 1., 0., 0.],
+                content: Content::Shape {
+                    shape: "rectangle".into(),
+                    bounds: [1., 1., 12., 12.],
+                    points: vec![],
+                    closed: true,
+                    fill: [12501, 23003, 34507, 45611],
+                    stroke: [0; 4],
+                    stroke_width: 0.,
+                },
+            };
+            e.edit(
+                "human",
+                &[json!({"op":"source.add","source":source,"x":8,"y":4})],
+                None,
+                None,
+                "Editable source",
+            )
+            .unwrap();
+            let layer = e
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.source.is_some())
+                .unwrap();
+            (
+                raster_id,
+                layer.id.clone(),
+                serde_json::to_value(layer).unwrap(),
+                sample,
+            )
+        };
+        let path = directory.join("owned.psd");
+        let (project, document, revision) = {
+            let e = app.shared.lock().unwrap();
+            (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+        };
+        let report = crate::server::dispatch(
+            &app.shared,
+            "document",
+            &json!({
+                "action":"save_report", "project_id":project,
+                "document_id":document, "expected_revision":revision
+            }),
+        )
+        .unwrap();
+        assert_eq!(report["document_id"], document);
+        assert_eq!(report["revision"], revision);
+        assert_eq!(report["save_allowed"], true);
+        assert_eq!(report["has_editability_losses"], true);
+        assert!(report["losses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|loss| loss["code"] == "editable_source_rasterized"));
+        crate::server::save_accepted_source(&app.shared, &path, &document, revision, false)
+            .unwrap();
+        {
+            let mut e = app.shared.lock().unwrap();
+            app.selected = raster_id.clone();
+            for x in [4, 6] {
+                e.edit("human", &[json!({"op":"paint","layer":raster_id,"points":[[x,4]],"radius":1,"color":[231,73,31,255]})], None, None, "Unsaved human stroke").unwrap();
+            }
+            e.undo("human").unwrap();
+            e.reserve(
+                "human",
+                "Keep original raster",
+                vec![crate::engine::Scope::layer(&raster_id)],
+            )
+            .unwrap();
+        }
+        let snapshot = |app: &PeerBrush| {
+            let e = app.shared.lock().unwrap();
+            assert!(!e.undo.is_empty() && !e.redo.is_empty() && !e.leases.is_empty());
+            assert!(!e.closed && e.doc.revision != e.saved_revision);
+            let raster = e
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.id == raster_id)
+                .unwrap();
+            assert_eq!(raster.pixels.depth, depth);
+            assert_eq!(raster.pixels.get16(25, 20), sample);
+            let source = e
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.id == source_id)
+                .unwrap();
+            assert_eq!(serde_json::to_value(source).unwrap(), source_before);
+            json!({"doc":e.doc,"history":history(&e),"leases":e.leases,"saved":e.saved_revision,
+                "path":e.path,"png":e.doc.export_png().unwrap(),"bytes":fs::read(&path).unwrap()})
+        };
+        let ownership = app.shared.lock().unwrap().file_ownership.clone().unwrap();
+        let file_version = app.shared.lock().unwrap().file_version;
+        let before = snapshot(&app);
+        // Synthetic observations exercise the actual dialog, never SDK reachability.
+        app.updates
+            .native_updater
+            .observe_download_for_test(false, None, false);
+        app.updates.open = true;
+        click_button(&mut app, &ctx, "Download app update", false);
+        assert!(app
+            .updates
+            .native_updater
+            .download(3)
+            .unwrap_err()
+            .contains("not available"));
+        assert!(!app.updates.native_updater.download_requested());
+        assert!(!app.updates.native_updater.startup_enabled());
+        assert_eq!(snapshot(&app), before);
+        app.updates
+            .native_updater
+            .observe_download_for_test(true, None, false);
+        let output = frame(&mut app, &ctx, vec![]);
+        assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text=="App update download: 2048 of 4096 bytes")));
+        click_button(&mut app, &ctx, "Later", true);
+        assert!(!app.updates.open);
+        assert!(app.updates.native_updater.view().cancelled);
+        assert!(app.updates.native_updater.pending_installation());
+        assert_eq!(snapshot(&app), before);
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.update","layer":raster_id,"name":"Newer human work"})],
+                None,
+                None,
+                "Newer human work",
+            )
+            .unwrap();
+            e.edit(
+                "human",
+                &[json!({"op":"layer.update","layer":raster_id,"name":"Undo this rename"})],
+                None,
+                None,
+                "Temporary rename",
+            )
+            .unwrap();
+            e.undo("human").unwrap();
+        }
+        let newer = snapshot(&app);
+        assert_ne!(newer, before);
+        app.updates
+            .native_updater
+            .observe_download_for_test(true, Some(0.5), true);
+        app.updates.open = true;
+        let output = frame(&mut app, &ctx, vec![]);
+        assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text=="Native update preparation is held. Installation and restart remain unavailable.")));
+        assert!(app.updates.native_updater.view().cancelled);
+        click_button(&mut app, &ctx, "Later", true);
+        assert!(!app.updates.open);
+        app.request_close(crate::ui::lifecycle::Intent::Exit);
+        assert!(!app.exit_approved && !app.workspace.lock().unwrap().exiting);
+        assert!(app.updates.native_updater.pending_installation());
+        assert_eq!(snapshot(&app), newer);
+        let e = app.shared.lock().unwrap();
+        assert_eq!(e.file_version, file_version);
+        assert!(Arc::ptr_eq(e.file_ownership.as_ref().unwrap(), &ownership));
+        assert!(crate::file_ownership::Ownership::open(&path, "unrelated-project").is_err());
+        drop(e);
+        drop(app);
+        drop(ownership);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}

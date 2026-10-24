@@ -233,7 +233,14 @@ impl Panel {
                             let state=self.native_updater.view();
                             if let Some(version)=&state.version { ui.label(format!("New app version {version}")); }
                             if !state.notes.is_empty() { egui::ScrollArea::vertical().id_salt("sparkle_notes").max_height(180.).show(ui,|ui| { ui.label(&state.notes); }); } else { ui.label("Plain-text release notes are not embedded in this update."); }
-                            ui.label("Package download is unavailable in this build.");
+                            drop(state);
+                            let generation=self.native_updater.owner_status().and_then(|status|status.found_generation);
+                            if ui.add_enabled(enabled && generation.is_some() && !self.native_updater.download_requested(),egui::Button::new("Download app update")).clicked() {
+                                if let Some(generation)=generation {
+                                    if let Err(error)=self.native_updater.download(generation) { self.message=error; }
+                                }
+                            }
+                            if !enabled { ui.label("Package download is unavailable in this build."); }
                         }
                         Phase::NoUpdate => { ui.label("No compatible signed app update was found."); }
                         Phase::Cancelled => { ui.label("App update check cancelled."); }
@@ -243,6 +250,23 @@ impl Panel {
                     }
                     let state=self.native_updater.view();
                     if !state.notice.is_empty() { ui.label(state.notice); }
+                    let held=state.cancelled || state.quarantine;
+                    drop(state);
+                    if let Some(status)=self.native_updater.owner_status() {
+                        if status.download_generation.is_some() {
+                            if status.held_generation.is_some() {
+                                ui.label("Native update preparation is held. Installation and restart remain unavailable.");
+                            } else if held || status.cancelled || status.quarantine {
+                                ui.label("App update progress is held; cancellation has not been confirmed.");
+                            } else if let Some(progress)=status.extraction {
+                                ui.add(egui::ProgressBar::new(progress as f32).text("Preparing downloaded app update"));
+                            } else {
+                                if let Some(expected)=status.expected_bytes {
+                                    ui.label(format!("App update download: {} of {} bytes",status.received_bytes,expected));
+                                } else { ui.label(format!("App update download: {} bytes",status.received_bytes)); }
+                            }
+                        }
+                    }
                 }
                 ui.label("Official GitHub release notes and portable package metadata");
                 let mut preferences = self.store.preferences.clone();

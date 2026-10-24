@@ -189,39 +189,44 @@ pub(crate) fn startup_guard(locations: &Locations) -> Result<(), String> {
         return Ok(());
     }
     for path in entries(&root)? {
-        let armed = path.join("native-start-intent.json");
-        if Stamp::read(&armed)?.is_none() {
-            continue;
-        }
-        let bytes = read_marker(&armed)?;
-        let intent: Intent = serde_json::from_slice(&bytes).map_err(|_| HOLD)?;
-        let manifest = read_private(&path.join("checkpoint.json"), 1024 * 1024)?;
-        let outcome: Unstarted =
-            serde_json::from_slice(&read_marker(&path.join("native-not-started.json"))?)
-                .map_err(|_| HOLD)?;
-        if intent.schema != 1
-            || intent.owner_pid == 0
-            || intent.checkpoint != path.file_name().unwrap().to_str().unwrap()
-            || intent.manifest_sha256 != digest(&manifest)
-            || outcome.schema != 1
-            || outcome.owner_pid != intent.owner_pid
-            || outcome.intent_sha256 != digest(&bytes)
-        {
-            return Err(HOLD.into());
-        }
-        let stored: Manifest = serde_json::from_slice(&manifest).map_err(|_| HOLD)?;
-        validate_manifest(&stored)?;
-        check_copy(
-            &path.join("PeerBrush.app"),
-            &stored.app,
-            &AtomicBool::new(false),
-        )?;
-        check_copy(
-            &path.join("profile"),
-            &stored.profile,
-            &AtomicBool::new(false),
-        )?;
+        inspect_unstarted_attempt(&path)?;
     }
+    Ok(())
+}
+
+fn inspect_unstarted_attempt(path: &Path) -> Result<(), String> {
+    let armed = path.join("native-start-intent.json");
+    if Stamp::read(&armed)?.is_none() {
+        return Ok(());
+    }
+    let bytes = read_marker(&armed)?;
+    let intent: Intent = serde_json::from_slice(&bytes).map_err(|_| HOLD)?;
+    let manifest = read_private(&path.join("checkpoint.json"), 1024 * 1024)?;
+    let outcome: Unstarted =
+        serde_json::from_slice(&read_marker(&path.join("native-not-started.json"))?)
+            .map_err(|_| HOLD)?;
+    if intent.schema != 1
+        || intent.owner_pid == 0
+        || intent.checkpoint != path.file_name().unwrap().to_str().unwrap()
+        || intent.manifest_sha256 != digest(&manifest)
+        || outcome.schema != 1
+        || outcome.owner_pid != intent.owner_pid
+        || outcome.intent_sha256 != digest(&bytes)
+    {
+        return Err(HOLD.into());
+    }
+    let stored: Manifest = serde_json::from_slice(&manifest).map_err(|_| HOLD)?;
+    validate_manifest(&stored)?;
+    check_copy(
+        &path.join("PeerBrush.app"),
+        &stored.app,
+        &AtomicBool::new(false),
+    )?;
+    check_copy(
+        &path.join("profile"),
+        &stored.profile,
+        &AtomicBool::new(false),
+    )?;
     Ok(())
 }
 
@@ -789,6 +794,16 @@ impl Prepared {
             None => Ok(()),
         }
     }
+    pub(super) fn check_in_owner(
+        &mut self,
+        ctx: &eframe::egui::Context,
+    ) -> Result<super::coordinator::RemoteCheck, String> {
+        require_captured_handoff()?;
+        self.check_identity()?;
+        let manifest: Manifest = serde_json::from_slice(&self.manifest).map_err(|_| HOLD)?;
+        validate_manifest(&manifest)?;
+        self._owner.check(manifest.publisher_team_id, ctx)
+    }
     /// Unreachable before the separate captured-handoff refusal is replaced by
     /// a complete native contract. Publishing a checkpoint cannot call this.
     pub fn arm_native_intent(&self) -> Result<(), String> {
@@ -980,6 +995,140 @@ fn publish_profile_checkpoint(
 /// Keep this source boundary independent of public pins and startup_enabled.
 pub(super) fn require_captured_handoff() -> Result<(), String> {
     Err("App updating is not available in this development build.".into())
+}
+
+/// Only the copied owner may arm its own native startup. This is still blocked
+/// before any filesystem access by the independent captured-handoff refusal.
+pub(super) fn arm_owner_check(
+    app: &Path,
+    expected_manifest: &str,
+    profile: &UpdateProfile,
+) -> Result<ArmedCheck, String> {
+    require_captured_handoff()?;
+    profile.validate()?;
+    let path = app.parent().ok_or(HOLD)?;
+    let manifest = read_private(&path.join("capture.json"), 1024 * 1024)?;
+    if digest(&manifest) != expected_manifest
+        || Stamp::read(&path.join("native-start-intent.json"))?.is_some()
+        || Stamp::read(&path.join("native-not-started.json"))?.is_some()
+    {
+        return Err(HOLD.into());
+    }
+    read_current_profile(path, &manifest)?;
+    record_intent(path, &manifest)?;
+    let armed = ArmedCheck {
+        app: app.into(),
+        intent: read_marker(&path.join("native-start-intent.json"))?,
+        manifest,
+        owner_pid: std::process::id(),
+    };
+    armed.check_records(profile)?;
+    Ok(armed)
+}
+pub(super) fn owner_check_not_started(app: &Path, manifest: &[u8]) -> Result<(), String> {
+    let path = app.parent().ok_or(HOLD)?;
+    if read_private(&path.join("capture.json"), 1024 * 1024)? != manifest {
+        return Err(HOLD.into());
+    }
+    record_unstarted(path, manifest)
+}
+
+// Constructed only by this process's actual arm/write/readback boundary.
+// This retained owner receipt is never deserialized from a status or marker.
+pub(super) struct ArmedCheck {
+    app: PathBuf,
+    manifest: Vec<u8>,
+    intent: Vec<u8>,
+    owner_pid: u32,
+}
+impl ArmedCheck {
+    fn check_records(&self, profile: &UpdateProfile) -> Result<PathBuf, String> {
+        profile.validate()?;
+        let path = self.app.parent().ok_or(HOLD)?;
+        if !self.app.is_absolute()
+            || self.app.file_name() != Some(std::ffi::OsStr::new("PeerBrush.app"))
+            || path.parent() != Some(checkpoints(&profile.locations).as_path())
+            || self.owner_pid != std::process::id()
+            || !private(path, false)?
+            || read_private(&path.join("capture.json"), 1024 * 1024)? != self.manifest
+            || read_marker(&path.join("native-start-intent.json"))? != self.intent
+            || Stamp::read(&path.join("native-not-started.json"))?.is_some()
+        {
+            return Err(HOLD.into());
+        }
+        let intent: Intent = serde_json::from_slice(&self.intent).map_err(|_| HOLD)?;
+        if intent.schema != 1
+            || intent.owner_pid != self.owner_pid
+            || intent.manifest_sha256 != digest(&self.manifest)
+            || intent.checkpoint
+                != path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(HOLD)?
+        {
+            return Err(HOLD.into());
+        }
+        read_current_profile(path, &self.manifest)?;
+        Ok(path.into())
+    }
+    pub(super) fn not_started(&self) -> Result<(), String> {
+        owner_check_not_started(&self.app, &self.manifest)
+    }
+    pub(super) fn recheck(
+        &self,
+        profile: &UpdateProfile,
+        parent_executable: &Path,
+        configuration: ApprovedCheck,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<OwnerBundles, String> {
+        require_captured_handoff()?;
+        self.recheck_with(profile, parent_executable, &configuration, &cancel, |app| {
+            installed::verify(app, configuration.clone(), cancel.clone())?.recheck()
+        })
+    }
+    fn recheck_with(
+        &self,
+        profile: &UpdateProfile,
+        parent_executable: &Path,
+        configuration: &ApprovedCheck,
+        cancel: &AtomicBool,
+        verify_native: impl FnMut(PathBuf) -> Result<(), String>,
+    ) -> Result<OwnerBundles, String> {
+        let path = self.check_records(profile)?;
+        let root = checkpoints(&profile.locations);
+        private(&root, false)?;
+        let mut before = entries(&root)?;
+        if !before.contains(&path) {
+            return Err(HOLD.into());
+        }
+        for other in &before {
+            if other != &path {
+                inspect_unstarted_attempt(other)?;
+            }
+        }
+        let result = inspect_owner_tree_with(
+            &self.app,
+            profile,
+            parent_executable,
+            &digest(&self.manifest),
+            configuration,
+            cancel,
+            verify_native,
+        )?;
+        self.check_records(profile)?;
+        let mut after = entries(&root)?;
+        before.sort();
+        after.sort();
+        if before != after {
+            return Err(HOLD.into());
+        }
+        for other in &after {
+            if other != &path {
+                inspect_unstarted_attempt(other)?;
+            }
+        }
+        Ok(result)
+    }
 }
 
 fn record_intent(path: &Path, manifest: &[u8]) -> Result<(), String> {
@@ -1254,13 +1403,33 @@ fn inspect_owner_copy_with(
     expected_manifest: &str,
     configuration: &ApprovedCheck,
     cancel: &AtomicBool,
-    mut verify_native: impl FnMut(PathBuf) -> Result<(), String>,
+    verify_native: impl FnMut(PathBuf) -> Result<(), String>,
 ) -> Result<OwnerBundles, String> {
     let attempt = app.parent().ok_or(HOLD)?;
     if Stamp::read(&attempt.join("native-start-intent.json"))?.is_some() {
         return Err(HOLD.into());
     }
     startup_guard(&profile.locations)?;
+    inspect_owner_tree_with(
+        app,
+        profile,
+        parent_executable,
+        expected_manifest,
+        configuration,
+        cancel,
+        verify_native,
+    )
+}
+fn inspect_owner_tree_with(
+    app: &Path,
+    profile: &UpdateProfile,
+    parent_executable: &Path,
+    expected_manifest: &str,
+    configuration: &ApprovedCheck,
+    cancel: &AtomicBool,
+    mut verify_native: impl FnMut(PathBuf) -> Result<(), String>,
+) -> Result<OwnerBundles, String> {
+    let attempt = app.parent().ok_or(HOLD)?;
     let bytes = read_private(&attempt.join("capture.json"), 1024 * 1024)?;
     if digest(&bytes) != expected_manifest {
         return Err(HOLD.into());

@@ -414,6 +414,16 @@ define_class!(
         #[unsafe(method(updater:shouldDownloadReleaseNotesForUpdate:))]
         fn download_notes(&self, _updater: &AnyObject, _item: &AnyObject) -> Bool { Bool::NO }
 
+        #[unsafe(method(updater:willDownloadUpdate:withRequest:))]
+        fn will_download(&self, updater: &AnyObject, item: &AnyObject, _request: &AnyObject) {
+            self.ivars().checks.will_download(updater, item);
+        }
+
+        #[unsafe(method(updater:didDownloadUpdate:))]
+        fn downloaded(&self, updater: &AnyObject, item: &AnyObject) {
+            self.ivars().checks.did_download(updater, item);
+        }
+
         #[unsafe(method_id(allowedSystemProfileKeysForUpdater:))]
         fn profile_keys(&self, _updater: &AnyObject) -> Retained<AnyObject> { unsafe { msg_send![class!(NSArray), array] } }
 
@@ -453,6 +463,8 @@ impl Probe {
             verification: None,
             profile: None,
             checkpoint: None,
+            remote: None,
+            owner_status: None,
             checks,
         };
         for depth in [8, 16] {
@@ -547,6 +559,14 @@ impl Probe {
     /// Exercise real selectors while asserting all operations stay vetoed.
     pub fn assert_disabled(&self) {
         driver::assert_guarded(MainThreadMarker::new().expect("Main-thread component probe"));
+        driver::assert_owned_ready(
+            MainThreadMarker::new().expect("Main-thread component probe"),
+            &self.controller,
+        );
+        driver::assert_owned_download(
+            MainThreadMarker::new().expect("Main-thread component probe"),
+            &PathBuf::from(self._framework.bundlePath().to_string()),
+        );
         self.assert_no_update_sequence();
         self.assert_native_start_guard();
         self.assert_external_bundle_constructor();
@@ -1027,6 +1047,8 @@ mod tests {
             verification: None,
             profile: None,
             checkpoint: None,
+            remote: None,
+            owner_status: None,
             checks: checks.clone(),
         };
         assert!(app.configured());
@@ -1089,6 +1111,8 @@ pub struct Application {
     checks: Rc<driver::State>,
     profile: Option<crate::settings::UpdateProfile>,
     checkpoint: Option<checkpoint::Prepared>,
+    remote: Option<coordinator::RemoteCheck>,
+    owner_status: Option<coordinator::NativeStatus>,
 }
 
 impl Application {
@@ -1115,6 +1139,8 @@ impl Application {
             verification: None,
             profile: None,
             checkpoint: None,
+            remote: None,
+            owner_status: None,
             checks: Rc::new(driver::State::default()),
         }
     }
@@ -1131,6 +1157,38 @@ impl Application {
     }
     pub(crate) fn view(&self) -> std::cell::Ref<'_, crate::sparkle::check::Session> {
         self.checks.view()
+    }
+    pub(crate) fn owner_status(&self) -> Option<&coordinator::NativeStatus> {
+        self.owner_status.as_ref()
+    }
+    pub(crate) fn download_requested(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(coordinator::RemoteCheck::download_requested)
+    }
+    pub(crate) fn download(&self, generation: u64) -> Result<(), String> {
+        if !self.startup_enabled() {
+            return Err(
+                "App package downloading is not available in this development build.".into(),
+            );
+        }
+        checkpoint::require_captured_handoff()?;
+        if self.checks.view().cancelled
+            || self.checks.view().quarantine
+            || self
+                .owner_status
+                .as_ref()
+                .and_then(|status| status.found_generation)
+                != Some(generation)
+        {
+            return Err(
+                "The offered native update changed; observe it again before downloading.".into(),
+            );
+        }
+        self.remote
+            .as_ref()
+            .ok_or("No authenticated app update owner is available")?
+            .download(generation)
     }
     pub fn message(&self) -> &'static str {
         self.controller
@@ -1167,6 +1225,9 @@ impl Application {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         self.checks.cancel();
+        if let Some(remote) = &self.remote {
+            remote.cancel();
+        }
         if let Some(owner) = &self.controller {
             owner.delegate.ivars().defer();
         }
@@ -1218,6 +1279,7 @@ impl Application {
             })
             .map_err(|_| "Could not start app update verification")?;
         self.controller = None;
+        self.owner_status = None;
         self.checks = checks;
         self.verification = Some(Verification { receiver, cancel });
         Ok(())
@@ -1261,32 +1323,11 @@ impl Application {
                             // mutable live app/framework after worker verification.
                             checkpoint::require_captured_handoff()?;
                             prepared.recheck_metadata()?;
-                            let marker = MainThreadMarker::new()
-                                .ok_or("App update checking requires the main thread")?;
-                            let owner = construct_with_state(
-                                &prepared.verified.framework,
-                                marker,
-                                self.checks.clone(),
-                            )?;
-                            prepared.recheck_metadata()?;
-                            self.checks.checking(&owner.controller);
-                            // Publish intent durably before Sparkle can resume any
-                            // previous installer. Every ambiguous outcome stays held.
-                            prepared.arm_native_intent()?;
+                            // Mark the parent's unknown-outcome hold before sending
+                            // any request. Only the copied process owns SDK callbacks.
+                            self.checks.session.borrow_mut().checking();
                             self.checks.native_starting()?;
-                            self.controller = Some(owner);
-                            let owner = self.controller.as_ref().unwrap();
-                            let mut error: *mut NSError = std::ptr::null_mut();
-                            let started: Bool =
-                                unsafe { msg_send![&*owner.controller, startUpdater: &mut error] };
-                            if !started.as_bool() {
-                                self.checkpoint.as_ref().unwrap().not_started()?;
-                                self.checks.native_start_failed();
-                                return Err("App update checking could not start".into());
-                            }
-                            unsafe {
-                                let _: () = msg_send![&*owner.controller, checkForUpdates];
-                            }
+                            self.remote = Some(prepared.check_in_owner(ctx)?);
                             Ok(())
                         });
                         if result.is_err() {
@@ -1300,6 +1341,16 @@ impl Application {
                     self.checks.failed();
                     self.checks.finished();
                 }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(remote) = &self.remote {
+            match remote.receiver.try_recv() {
+                Ok(Ok(status)) => {
+                    self.checks.observe_owner(status.clone());
+                    self.owner_status = Some(status);
+                }
+                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => self.checks.quarantine(),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -1356,6 +1407,43 @@ impl Application {
 
 #[cfg(test)]
 impl Application {
+    /// Component observation only. It creates no native owner or callback and
+    /// cannot bypass the unconditional check/download/captured-handoff gates.
+    pub(crate) fn observe_download_for_test(
+        &mut self,
+        selected: bool,
+        extraction: Option<f64>,
+        ready: bool,
+    ) {
+        self.configuration = Some(crate::sparkle::check::ApprovedCheck {
+            feed_url: crate::sparkle::PROPOSED_FEED_URL.into(),
+            public_ed_key: "Public fixture; not native authority".into(),
+            publisher_team_id: "ABCD123456".into(),
+            objects: std::collections::BTreeMap::new(),
+        });
+        if self.checks.view().phase == crate::sparkle::check::Phase::Idle {
+            self.checks.session.borrow_mut().begin().unwrap();
+            self.checks.session.borrow_mut().checking();
+            self.checks.native_starting().unwrap();
+        }
+        let status = coordinator::NativeStatus {
+            phase: crate::sparkle::check::Phase::Found,
+            version: Some("0.30.1".into()),
+            busy: true,
+            cancelled: false,
+            quarantine: ready,
+            native_cycle: true,
+            held_generation: ready.then_some(7),
+            found_generation: (!selected).then_some(3),
+            download_generation: selected.then_some(3),
+            expected_bytes: selected.then_some(4096),
+            received_bytes: if selected { 2048 } else { 0 },
+            extraction,
+            download_complete: extraction.is_some() || ready,
+        };
+        self.checks.observe_owner(status.clone());
+        self.owner_status = Some(status);
+    }
     pub(crate) fn native_starting_for_test(&self) {
         let mut state = self.checks.session.borrow_mut();
         state.begin().unwrap();

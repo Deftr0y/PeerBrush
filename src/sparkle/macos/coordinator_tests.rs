@@ -219,11 +219,214 @@ fn dropping_capture_channel_only_disconnects_our_owner_without_native_outcome() 
     let owner = Owner {
         socket: parent,
         child: None,
+        request: None,
     };
     drop(owner);
     let mut byte = [0_u8];
     assert_eq!(child.read(&mut byte).unwrap(), 0);
     assert!(checkpoint::require_captured_handoff().is_err());
+}
+
+#[test]
+fn owner_check_frames_reject_replay_foreign_binding_unknown_actions_and_fake_native_authority() {
+    for damage in [
+        "none",
+        "nonce",
+        "checkpoint",
+        "manifest",
+        "sequence",
+        "zero",
+        "schema",
+        "unknown",
+        "install",
+    ] {
+        let request = request();
+        let (mut parent, mut child) = UnixStream::pair().unwrap();
+        let cancel = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut command =
+            serde_json::to_value(CheckCommand::new(&request, 1, CheckAction::Check)).unwrap();
+        match damage {
+            "nonce" => command["nonce"] = serde_json::json!("a".repeat(64)),
+            "checkpoint" => {
+                command["checkpoint"] = serde_json::json!(uuid::Uuid::new_v4().to_string())
+            }
+            "manifest" => command["manifest_sha256"] = serde_json::json!("b".repeat(64)),
+            "sequence" => command["sequence"] = serde_json::json!(2),
+            "zero" => command["sequence"] = serde_json::json!(0),
+            "schema" => command["schema"] = serde_json::json!(2),
+            "unknown" => command["continuation"] = serde_json::json!(1),
+            "install" => command["action"] = serde_json::json!("install"),
+            _ => {}
+        }
+        send(&mut parent, &command, deadline, &cancel).unwrap();
+        let native = std::cell::Cell::new(false);
+        assert!(
+            accept_check_command(&mut child, &request, 1, deadline, &cancel, |_| {
+                native.set(true);
+                Err("native authentication fixture refuses".into())
+            })
+            .is_err()
+        );
+        assert_eq!(native.get(), damage == "none", "{damage}");
+    }
+    let request = request();
+    for action in [CheckAction::Check, CheckAction::Status, CheckAction::Cancel] {
+        let command = CheckCommand::new(&request, 9, action);
+        assert_eq!(
+            command.validate(&request, 9).is_ok(),
+            action != CheckAction::Check
+        );
+        assert!(command.validate(&request, 8).is_err());
+    }
+}
+
+fn observation() -> NativeStatus {
+    NativeStatus {
+        phase: crate::sparkle::check::Phase::Quarantined,
+        version: Some("0.30.1".into()),
+        busy: false,
+        cancelled: false,
+        quarantine: true,
+        native_cycle: true,
+        held_generation: Some(7),
+        found_generation: None,
+        download_generation: None,
+        expected_bytes: None,
+        received_bytes: 0,
+        extraction: None,
+        download_complete: false,
+    }
+}
+#[test]
+fn native_observations_bind_exact_child_sequence_action_and_never_clear_unknown_holds() {
+    let request = request();
+    for damage in [
+        "none",
+        "pid",
+        "sequence",
+        "action",
+        "version",
+        "zero",
+        "cycle",
+        "quarantine",
+    ] {
+        let mut reply = CheckReply {
+            binding: CheckCommand::new(&request, 3, CheckAction::Status),
+            owner_pid: 17,
+            status: observation(),
+        };
+        match damage {
+            "pid" => reply.owner_pid = 18,
+            "sequence" => reply.binding.sequence = 2,
+            "action" => reply.binding.action = CheckAction::Cancel,
+            "version" => reply.status.version = Some("bad\nversion".into()),
+            "zero" => reply.status.held_generation = Some(0),
+            "cycle" => reply.status.native_cycle = false,
+            "quarantine" => reply.status.quarantine = false,
+            _ => {}
+        }
+        assert_eq!(
+            reply
+                .validate(&request, 17, 3, CheckAction::Status, None)
+                .is_ok(),
+            damage == "none",
+            "{damage}"
+        );
+    }
+    let state = driver::State::default();
+    state.session.borrow_mut().begin().unwrap();
+    state.session.borrow_mut().checking();
+    state.native_starting().unwrap();
+    let mut absent_claim = observation();
+    absent_claim.native_cycle = false;
+    absent_claim.held_generation = None;
+    absent_claim.quarantine = false;
+    absent_claim.phase = crate::sparkle::check::Phase::NoUpdate;
+    state.observe_owner(absent_claim);
+    assert!(state.view().native_cycle && state.view().quarantine);
+    state.cancel();
+    state.finished();
+    assert!(state.view().native_cycle && state.view().quarantine);
+    assert!(state.session.borrow_mut().begin().is_err());
+}
+
+#[test]
+fn copied_check_parent_transport_refuses_before_reader_consumption_or_native_authority() {
+    let (parent, mut peer) = UnixStream::pair().unwrap();
+    let request = request();
+    let nonce = request.nonce.clone();
+    let mut owner = Owner {
+        socket: parent,
+        child: None,
+        request: Some(request),
+    };
+    let error = owner
+        .check("ABCD123456".into(), &eframe::egui::Context::default())
+        .err()
+        .unwrap();
+    assert_eq!(error, checkpoint::require_captured_handoff().unwrap_err());
+    assert_eq!(
+        owner.request.as_ref().unwrap().nonce,
+        nonce,
+        "Refusal precedes consuming the sole reader grant"
+    );
+    peer.set_nonblocking(true).unwrap();
+    assert_eq!(
+        peer.read(&mut [0_u8]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(checkpoint::require_captured_handoff().is_err());
+}
+
+#[test]
+fn copied_check_transport_decodes_one_authenticated_frame_and_rejects_partial_or_unbounded_frames()
+{
+    let request = request();
+    let (mut parent, mut child) = UnixStream::pair().unwrap();
+    let cancel = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    send(
+        &mut parent,
+        &CheckCommand::new(&request, 1, CheckAction::Cancel),
+        deadline,
+        &cancel,
+    )
+    .unwrap();
+    let received =
+        accept_check_command(&mut child, &request, 1, deadline, &cancel, |_| Ok(())).unwrap();
+    assert_eq!(
+        received.action,
+        CheckAction::Cancel,
+        "The injected authentication boundary supplies no native ownership"
+    );
+    for damage in ["oversize", "partial", "cancel", "deadline"] {
+        let (mut parent, mut child) = UnixStream::pair().unwrap();
+        match damage {
+            "oversize" => parent
+                .write_all(&((FRAME_LIMIT + 1) as u32).to_be_bytes())
+                .unwrap(),
+            "partial" => {
+                parent.write_all(&9_u32.to_be_bytes()).unwrap();
+                parent.write_all(b"{}").unwrap();
+                parent.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            _ => {}
+        }
+        let cancel = AtomicBool::new(damage == "cancel");
+        let deadline = if damage == "deadline" {
+            Instant::now() - Duration::from_secs(1)
+        } else {
+            deadline
+        };
+        assert!(
+            accept_check_command(&mut child, &request, 1, deadline, &cancel, |_| panic!(
+                "Invalid frame reached native authentication"
+            ))
+            .is_err(),
+            "{damage}"
+        );
+    }
 }
 
 #[test]
@@ -432,6 +635,12 @@ fn public_pins_and_capture_roles_cannot_activate_the_child_native_load_boundary(
     .err()
     .expect("Native ownership is source-disabled before bundle/API work");
     assert_eq!(error, checkpoint::require_captured_handoff().unwrap_err());
+    assert_eq!(
+        checkpoint::arm_owner_check(&owner, &"a".repeat(64), &profile.update_profile())
+            .err()
+            .unwrap(),
+        checkpoint::require_captured_handoff().unwrap_err()
+    );
     assert!(!owner.exists() && !target.exists());
     assert_eq!(
         std::fs::read(profile.locations.profile().join("profile.json")).unwrap(),
@@ -441,4 +650,147 @@ fn public_pins_and_capture_roles_cannot_activate_the_child_native_load_boundary(
     drop(peer);
     drop(profile);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn download_command_and_reply_bind_exact_found_generation_on_the_actual_frame_path() {
+    let request = request();
+    let mut command = CheckCommand::new(&request, 2, CheckAction::Download);
+    command.found_generation = Some(11);
+    command.validate(&request, 2).unwrap();
+    let (mut parent, mut child) = UnixStream::pair().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let cancel = AtomicBool::new(false);
+    send(&mut parent, &command, deadline, &cancel).unwrap();
+    let authenticated = std::cell::Cell::new(false);
+    let actual = accept_check_command(&mut child, &request, 2, deadline, &cancel, |_| {
+        authenticated.set(true);
+        Ok(())
+    })
+    .unwrap();
+    assert!(authenticated.get());
+    assert_eq!(actual.action, CheckAction::Download);
+    assert_eq!(actual.found_generation, Some(11));
+    let mut reply = CheckReply {
+        binding: actual,
+        owner_pid: 17,
+        status: observation(),
+    };
+    reply
+        .validate(&request, 17, 2, CheckAction::Download, Some(11))
+        .unwrap();
+    assert!(reply
+        .validate(&request, 17, 2, CheckAction::Download, Some(12))
+        .is_err());
+    reply.binding.found_generation = Some(12);
+    assert!(reply
+        .validate(&request, 17, 2, CheckAction::Download, Some(11))
+        .is_err());
+    for damage in [
+        "first",
+        "missing",
+        "zero",
+        "status",
+        "nonce",
+        "checkpoint",
+        "manifest",
+    ] {
+        let mut command = CheckCommand::new(&request, 2, CheckAction::Download);
+        command.found_generation = Some(11);
+        match damage {
+            "first" => command.sequence = 1,
+            "missing" => command.found_generation = None,
+            "zero" => command.found_generation = Some(0),
+            "status" => command.action = CheckAction::Status,
+            "nonce" => command.nonce = "b".repeat(64),
+            "checkpoint" => command.checkpoint = uuid::Uuid::new_v4().to_string(),
+            "manifest" => command.manifest_sha256 = "c".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(
+            command.validate(&request, command.sequence).is_err(),
+            "{damage}"
+        );
+    }
+    assert!(checkpoint::require_captured_handoff().is_err());
+}
+
+#[test]
+fn download_request_queue_is_one_shot_even_after_consumption_and_cancel_is_only_a_request() {
+    let (_result, receiver) = mpsc::channel();
+    let (downloads, requests) = mpsc::sync_channel(1);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let remote = RemoteCheck {
+        receiver,
+        cancel: cancel.clone(),
+        downloads,
+        download_requested: AtomicBool::new(false),
+    };
+    assert!(remote.download(0).is_err());
+    assert!(!remote.download_requested());
+    remote.download(11).unwrap();
+    assert!(remote.download_requested());
+    assert_eq!(requests.try_recv().unwrap(), 11);
+    assert!(remote.download(11).is_err() && remote.download(12).is_err());
+    assert!(matches!(
+        requests.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    remote.cancel();
+    assert!(cancel.load(Ordering::Acquire));
+    assert!(remote.download(11).is_err());
+    let state = driver::State::default();
+    state.session.borrow_mut().begin().unwrap();
+    state.session.borrow_mut().checking();
+    state.native_starting().unwrap();
+    state.cancel();
+    let mut late = observation();
+    late.quarantine = false;
+    late.phase = crate::sparkle::check::Phase::Found;
+    late.held_generation = None;
+    late.found_generation = Some(11);
+    state.observe_owner(late);
+    assert!(state.view().cancelled && state.view().native_cycle);
+    assert_ne!(state.view().phase, crate::sparkle::check::Phase::Found);
+    state.finished();
+    assert!(state.view().quarantine && state.view().native_cycle);
+    assert!(state.session.borrow_mut().begin().is_err());
+}
+
+#[test]
+fn native_download_observations_reject_unbound_counters_and_invalid_extraction() {
+    for damage in [
+        "none", "zero", "counter", "expected", "extract", "nan", "infinite", "range",
+    ] {
+        let mut status = observation();
+        status.download_generation = Some(11);
+        status.expected_bytes = Some(4096);
+        status.received_bytes = 2048;
+        status.extraction = Some(0.5);
+        status.download_complete = true;
+        match damage {
+            "zero" => status.download_generation = Some(0),
+            "counter" => status.download_generation = None,
+            "expected" => {
+                status.download_generation = None;
+                status.received_bytes = 0;
+                status.extraction = None;
+                status.download_complete = false;
+            }
+            "extract" => {
+                status.download_generation = None;
+                status.expected_bytes = None;
+                status.received_bytes = 0;
+                status.download_complete = false;
+            }
+            "nan" => status.extraction = Some(f64::NAN),
+            "infinite" => status.extraction = Some(f64::INFINITY),
+            "range" => status.extraction = Some(1.1),
+            _ => {}
+        }
+        assert_eq!(status.validate().is_ok(), damage == "none", "{damage}");
+    }
+    let status = observation();
+    assert!(serde_json::to_vec(&status).unwrap().len() <= FRAME_LIMIT);
+    assert!(checkpoint::require_captured_handoff().is_err());
 }

@@ -18,7 +18,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -27,7 +27,7 @@ const ENTRY: &str = "--peerbrush-update-capture-owner";
 const FAILED: &str = "App update capture owner is unavailable; all projects remain open";
 const FRAME_LIMIT: usize = 4096;
 const DEADLINE: Duration = Duration::from_secs(600);
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
     schema: u32,
@@ -94,6 +94,240 @@ impl Captured {
         }
         Ok(())
     }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckAction {
+    Check,
+    Status,
+    Cancel,
+    Download,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckCommand {
+    schema: u32,
+    nonce: String,
+    checkpoint: String,
+    manifest_sha256: String,
+    sequence: u64,
+    action: CheckAction,
+    found_generation: Option<u64>,
+}
+impl CheckCommand {
+    fn new(request: &Request, sequence: u64, action: CheckAction) -> Self {
+        Self {
+            schema: 1,
+            nonce: request.nonce.clone(),
+            checkpoint: request.checkpoint.clone(),
+            manifest_sha256: request.manifest_sha256.clone(),
+            sequence,
+            action,
+            found_generation: None,
+        }
+    }
+    fn validate(&self, request: &Request, sequence: u64) -> Result<(), String> {
+        if self.schema != 1
+            || self.nonce != request.nonce
+            || self.checkpoint != request.checkpoint
+            || self.manifest_sha256 != request.manifest_sha256
+            || self.sequence != sequence
+            || sequence == 0
+            || (sequence == 1 && self.action == CheckAction::Status)
+            || (sequence != 1 && self.action == CheckAction::Check)
+            || (sequence == 1 && self.action == CheckAction::Download)
+            || (self.action == CheckAction::Download) != self.found_generation.is_some()
+            || self.found_generation == Some(0)
+        {
+            return Err(FAILED.into());
+        }
+        Ok(())
+    }
+}
+/// Observation only. A held callback is neither an install permit nor readiness.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeStatus {
+    pub(super) phase: crate::sparkle::check::Phase,
+    pub(super) version: Option<String>,
+    pub(super) busy: bool,
+    pub(crate) cancelled: bool,
+    pub(crate) quarantine: bool,
+    pub(super) native_cycle: bool,
+    pub(crate) held_generation: Option<u64>,
+    pub(crate) found_generation: Option<u64>,
+    pub(crate) download_generation: Option<u64>,
+    pub(crate) expected_bytes: Option<u64>,
+    pub(crate) received_bytes: u64,
+    pub(crate) extraction: Option<f64>,
+    pub(super) download_complete: bool,
+}
+impl NativeStatus {
+    fn validate(&self) -> Result<(), String> {
+        if self.version.as_ref().is_some_and(|version| {
+            version.is_empty() || version.len() > 128 || version.chars().any(char::is_control)
+        }) || self
+            .held_generation
+            .is_some_and(|generation| generation == 0 || !self.native_cycle || !self.quarantine)
+            || self.found_generation.is_some_and(|generation| {
+                generation == 0
+                    || !self.native_cycle
+                    || self.quarantine
+                    || self.cancelled
+                    || self.phase != crate::sparkle::check::Phase::Found
+                    || self.download_generation.is_some()
+            })
+            || self
+                .download_generation
+                .is_some_and(|generation| generation == 0 || !self.native_cycle)
+            || (self.download_generation.is_none()
+                && (self.expected_bytes.is_some()
+                    || self.received_bytes != 0
+                    || self.extraction.is_some()
+                    || self.download_complete))
+            || self
+                .extraction
+                .is_some_and(|progress| !progress.is_finite() || !(0.0..=1.0).contains(&progress))
+        {
+            return Err(FAILED.into());
+        }
+        Ok(())
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckReply {
+    binding: CheckCommand,
+    owner_pid: u32,
+    status: NativeStatus,
+}
+impl CheckReply {
+    fn validate(
+        &self,
+        request: &Request,
+        child: u32,
+        sequence: u64,
+        action: CheckAction,
+        found_generation: Option<u64>,
+    ) -> Result<(), String> {
+        self.binding.validate(request, sequence)?;
+        if child <= 1
+            || self.owner_pid != child
+            || self.binding.action != action
+            || self.binding.found_generation != found_generation
+        {
+            return Err(FAILED.into());
+        }
+        self.status.validate()
+    }
+}
+pub(super) struct RemoteCheck {
+    pub(super) receiver: mpsc::Receiver<Result<NativeStatus, String>>,
+    cancel: Arc<AtomicBool>,
+    downloads: mpsc::SyncSender<u64>,
+    download_requested: AtomicBool,
+}
+impl RemoteCheck {
+    pub(super) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+    pub(super) fn download(&self, generation: u64) -> Result<(), String> {
+        if generation == 0 || self.cancel.load(Ordering::Acquire) {
+            return Err(FAILED.into());
+        }
+        if self
+            .download_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("A native download request is already held".into());
+        }
+        self.downloads
+            .try_send(generation)
+            .map_err(|_| FAILED.into())
+    }
+    pub(super) fn download_requested(&self) -> bool {
+        self.download_requested.load(Ordering::Acquire)
+    }
+}
+impl Drop for RemoteCheck {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn accept_check_command(
+    socket: &mut UnixStream,
+    request: &Request,
+    sequence: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    authenticate: impl FnOnce(&UnixStream) -> Result<(), String>,
+) -> Result<CheckCommand, String> {
+    let command: CheckCommand = receive(socket, deadline, cancel)?;
+    command.validate(request, sequence)?;
+    authenticate(socket)?;
+    Ok(command)
+}
+struct NativeCommand {
+    action: CheckAction,
+    found_generation: Option<u64>,
+    reply: mpsc::SyncSender<NativeStatus>,
+}
+fn check_reader(
+    mut socket: UnixStream,
+    request: Request,
+    team: String,
+    deadline: Instant,
+    cancel: Arc<AtomicBool>,
+    commands: mpsc::SyncSender<NativeCommand>,
+) {
+    let operation = (|| -> Result<(), String> {
+        let mut sequence = 1_u64;
+        loop {
+            let command = accept_check_command(
+                &mut socket,
+                &request,
+                sequence,
+                deadline,
+                &cancel,
+                |channel| process_identity::authenticate(channel, request.parent_pid, &team),
+            )?;
+            let (reply, result) = mpsc::sync_channel(1);
+            commands
+                .try_send(NativeCommand {
+                    action: command.action,
+                    found_generation: command.found_generation,
+                    reply,
+                })
+                .map_err(|_| FAILED)?;
+            let status = loop {
+                remaining(deadline, &cancel)?;
+                match result.recv_timeout(Duration::from_millis(100)) {
+                    Ok(status) => break status,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(FAILED.into()),
+                }
+            };
+            status.validate()?;
+            process_identity::authenticate(&socket, request.parent_pid, &team)?;
+            send(
+                &mut socket,
+                &CheckReply {
+                    binding: command,
+                    owner_pid: std::process::id(),
+                    status,
+                },
+                deadline,
+                &cancel,
+            )?;
+            sequence = sequence.checked_add(1).ok_or(FAILED)?;
+        }
+    })();
+    let _ = operation;
+    // This ends observation only. NativeOwner independently retains every SDK
+    // object/callback even when its only reader loses the parent or deadline.
+    cancel.store(true, Ordering::Release);
 }
 fn remaining(deadline: Instant, cancel: &AtomicBool) -> Result<Duration, String> {
     if cancel.load(Ordering::Acquire) {
@@ -380,6 +614,79 @@ impl Drop for Reaper {
 pub(super) struct Owner {
     socket: UnixStream,
     child: Option<(Child, Reaper)>,
+    request: Option<Request>,
+}
+impl Owner {
+    pub(super) fn check(
+        &mut self,
+        team: String,
+        ctx: &eframe::egui::Context,
+    ) -> Result<RemoteCheck, String> {
+        // Public configuration cannot activate the unfinished native contract.
+        checkpoint::require_captured_handoff()?;
+        // Consume the sole reader grant. A clone of the socket is not authority
+        // to start another worker competing for the same framed byte stream.
+        let request = self.request.take().ok_or(FAILED)?;
+        let child = self.child.as_ref().ok_or(FAILED)?.0.id();
+        let mut socket = self.socket.try_clone().map_err(|_| FAILED)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let requested_cancel = cancel.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (downloads, requests) = mpsc::sync_channel(1);
+        let repaint = ctx.clone();
+        std::thread::Builder::new()
+            .name("peerbrush-native-check-status".into())
+            .spawn(move || {
+                let result = (|| -> Result<(), String> {
+                    let deadline = Instant::now() + DEADLINE;
+                    let transport = AtomicBool::new(false);
+                    let mut sequence = 1_u64;
+                    loop {
+                        let (action, generation) = if requested_cancel.load(Ordering::Acquire) {
+                            (CheckAction::Cancel, None)
+                        } else if sequence == 1 {
+                            (CheckAction::Check, None)
+                        } else {
+                            match requests.try_recv() {
+                                Ok(generation) => (CheckAction::Download, Some(generation)),
+                                Err(mpsc::TryRecvError::Empty) => (CheckAction::Status, None),
+                                Err(mpsc::TryRecvError::Disconnected) => return Err(FAILED.into()),
+                            }
+                        };
+                        let mut command = CheckCommand::new(&request, sequence, action);
+                        command.found_generation = generation;
+                        command.validate(&request, sequence)?;
+                        process_identity::authenticate(&socket, child, &team)?;
+                        send(&mut socket, &command, deadline, &transport)?;
+                        let reply: CheckReply = receive(&mut socket, deadline, &transport)?;
+                        reply.validate(&request, child, sequence, action, generation)?;
+                        process_identity::authenticate(&socket, child, &team)?;
+                        // Bounded observations may coalesce; none carries an install permit.
+                        match sender.try_send(Ok(reply.status)) {
+                            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                            Err(mpsc::TrySendError::Disconnected(_)) => return Ok(()),
+                        }
+                        repaint.request_repaint();
+                        if action == CheckAction::Cancel {
+                            return Ok(());
+                        }
+                        sequence = sequence.checked_add(1).ok_or(FAILED)?;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                })();
+                if let Err(error) = result {
+                    let _ = sender.try_send(Err(error));
+                    repaint.request_repaint();
+                }
+            })
+            .map_err(|_| FAILED)?;
+        Ok(RemoteCheck {
+            receiver,
+            cancel,
+            downloads,
+            download_requested: AtomicBool::new(false),
+        })
+    }
 }
 impl Drop for Owner {
     fn drop(&mut self) {
@@ -399,6 +706,7 @@ fn spawn_owned(
     Ok(Owner {
         socket,
         child: Some((child, reaper)),
+        request: None,
     })
 }
 
@@ -470,6 +778,7 @@ pub(super) fn launch(
     if cancel.load(Ordering::Acquire) || child.try_wait().map_err(|_| FAILED)?.is_some() {
         return Err(FAILED.into());
     }
+    owner.request = Some(request);
     Ok(owner)
 }
 
@@ -502,8 +811,8 @@ pub(super) fn assert_native_termination_refusal(marker: MainThreadMarker) {
     );
 }
 
-/// Main-thread lifetime for the copied native owner. There is intentionally no
-/// start/check/installer method or successful retirement API in this increment.
+/// Main-thread lifetime for the copied native owner. Every check remains behind
+/// the independent source refusal; no install or successful retirement API exists.
 struct NativeOwner {
     _updater: Probe,
     _profile: UpdateProfile,
@@ -512,6 +821,13 @@ struct NativeOwner {
     _application: Retained<AnyObject>,
     _termination: Retained<NativeOwnerTermination>,
     run_loop: Retained<AnyObject>,
+    checks: std::rc::Rc<driver::State>,
+    parent: u32,
+    manifest: String,
+    configuration: ApprovedCheck,
+    cancel: Arc<AtomicBool>,
+    check_attempted: bool,
+    armed: Option<checkpoint::ArmedCheck>,
 }
 impl NativeOwner {
     fn load(
@@ -558,10 +874,11 @@ impl NativeOwner {
         }
         // Both public initializer arguments target the original installed app;
         // the SPUUpdater class must come from the verified copied framework.
+        let checks = std::rc::Rc::new(driver::State::default());
         let updater = super::construct_with_bundles(
             &bundles.framework(),
             marker,
-            std::rc::Rc::new(driver::State::default()),
+            checks.clone(),
             host.clone(),
             host,
         )?;
@@ -571,7 +888,7 @@ impl NativeOwner {
             &parent_executable,
             manifest,
             configuration.clone(),
-            cancel,
+            cancel.clone(),
         )?;
         if after != bundles || process_identity::executable(parent)? != parent_executable {
             return Err(FAILED.into());
@@ -603,12 +920,132 @@ impl NativeOwner {
             _application: application,
             _termination: termination,
             run_loop,
+            checks,
+            parent,
+            manifest: manifest.into(),
+            configuration,
+            cancel,
+            check_attempted: false,
+            armed: None,
         })
     }
-    fn retain_unknown_outcome(self) -> ! {
+    fn check(&mut self) -> Result<(), String> {
+        checkpoint::require_captured_handoff()?;
+        if self.check_attempted || self.cancel.load(Ordering::Acquire) {
+            return Err(FAILED.into());
+        }
+        self.check_attempted = true;
+        process_identity::authenticate(
+            &self._channel,
+            self.parent,
+            &self.configuration.publisher_team_id,
+        )?;
+        let parent_executable = process_identity::executable(self.parent)?;
+        let fresh = checkpoint::inspect_owner_copy(
+            &self._bundles.owner,
+            &self._profile,
+            &parent_executable,
+            &self.manifest,
+            self.configuration.clone(),
+            self.cancel.clone(),
+        )?;
+        if fresh != self._bundles {
+            return Err(FAILED.into());
+        }
+        self.checks.begin_in_owner(&self._updater.controller)?;
+        // This durable barrier belongs to this copied PID, never the parent.
+        self.armed = Some(checkpoint::arm_owner_check(
+            &self._bundles.owner,
+            &self.manifest,
+            &self._profile,
+        )?);
+        process_identity::authenticate(
+            &self._channel,
+            self.parent,
+            &self.configuration.publisher_team_id,
+        )?;
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(FAILED.into());
+        }
+        let mut error: *mut super::NSError = std::ptr::null_mut();
+        let started: objc2::runtime::Bool =
+            unsafe { msg_send![&*self._updater.controller, startUpdater: &mut error] };
+        if !started.as_bool() {
+            self.armed.as_ref().ok_or(FAILED)?.not_started()?;
+            self.checks.native_start_failed();
+            return Err(FAILED.into());
+        }
+        unsafe {
+            let _: () = msg_send![&*self._updater.controller, checkForUpdates];
+        }
+        Ok(())
+    }
+    fn download(&self, generation: u64) -> Result<(), String> {
+        checkpoint::require_captured_handoff()?;
+        if !self.check_attempted || self.cancel.load(Ordering::Acquire) {
+            return Err(FAILED.into());
+        }
+        process_identity::authenticate(
+            &self._channel,
+            self.parent,
+            &self.configuration.publisher_team_id,
+        )?;
+        let parent_executable = process_identity::executable(self.parent)?;
+        let fresh = self.armed.as_ref().ok_or(FAILED)?.recheck(
+            &self._profile,
+            &parent_executable,
+            self.configuration.clone(),
+            self.cancel.clone(),
+        )?;
+        if fresh != self._bundles || process_identity::executable(self.parent)? != parent_executable
+        {
+            return Err(FAILED.into());
+        }
+        process_identity::authenticate(
+            &self._channel,
+            self.parent,
+            &self.configuration.publisher_team_id,
+        )?;
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(FAILED.into());
+        }
+        self.checks.download(generation)
+    }
+    fn retain_unknown_outcome(mut self, commands: mpsc::Receiver<NativeCommand>) -> ! {
         // No verified native outcome/health retirement exists yet. In particular,
         // parent EOF, deadline, NoUpdate and cycle finish cannot release this owner.
         loop {
+            if self.cancel.load(Ordering::Acquire) {
+                self.checks.quarantine();
+            }
+            // No blocking socket read/write or channel wait on this native thread.
+            // One command per turn leaves Foundation callbacks an opportunity to run.
+            match commands.try_recv() {
+                Ok(command) => {
+                    match command.action {
+                        CheckAction::Check => {
+                            if self.check().is_err() {
+                                self.checks.quarantine();
+                            }
+                        }
+                        CheckAction::Status => {}
+                        CheckAction::Cancel => self.checks.cancel(),
+                        CheckAction::Download => {
+                            if command
+                                .found_generation
+                                .ok_or_else(|| FAILED.to_string())
+                                .and_then(|generation| self.download(generation))
+                                .is_err()
+                            {
+                                self.checks.quarantine();
+                            }
+                        }
+                    }
+                    let _ = command.reply.try_send(self.checks.observed_status());
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.checks.quarantine(),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
             objc2::rc::autoreleasepool(|_| {
                 let until = NSDate::dateWithTimeIntervalSinceNow(0.05);
                 unsafe {
@@ -695,22 +1132,20 @@ fn run() -> Result<(), String> {
     let copy = checkpoint::owner_copy(&executable, &profile.locations, &request.checkpoint)?;
     let monitor = socket.try_clone().map_err(|_| FAILED)?;
     let monitor_cancel = cancel.clone();
+    let monitor_request = request.clone();
+    let monitor_team = configuration.publisher_team_id.clone();
+    let (commands, native_commands) = mpsc::sync_channel(1);
     let watcher = std::thread::Builder::new()
         .name("peerbrush-capture-parent-watch".into())
         .spawn(move || {
-            let mut monitor = monitor;
-            let mut byte = [0_u8];
-            loop {
-                if remaining(deadline, &monitor_cancel).is_err() {
-                    break;
-                }
-                let _ = monitor.set_read_timeout(Some(Duration::from_millis(100)));
-                match monitor.read(&mut byte) {
-                    Err(e) if retry(&e) => continue,
-                    _ => break, // EOF or any unsupported request only cancels capture.
-                }
-            }
-            monitor_cancel.store(true, Ordering::Release);
+            check_reader(
+                monitor,
+                monitor_request,
+                monitor_team,
+                deadline,
+                monitor_cancel,
+                commands,
+            )
         })
         .map_err(|_| FAILED)?;
     let result = (|| {
@@ -751,11 +1186,15 @@ fn run() -> Result<(), String> {
             configuration.clone(),
             cancel.clone(),
         ) {
-            native.retain_unknown_outcome();
+            native.retain_unknown_outcome(native_commands);
         }
         // Known-unstarted capture still cancels on parent loss. It does not
         // establish absence/cancellation of any previous Sparkle installer.
         while remaining(deadline, &cancel).is_ok() && unsafe { libc::getppid() } as u32 == parent {
+            match native_commands.try_recv() {
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         Ok(())
