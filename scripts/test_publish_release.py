@@ -401,13 +401,16 @@ class Transactions(unittest.TestCase):
                 environment.write_bytes(b'PREVIOUS=value\n')
                 notes = work / 'peerbrush-site-notes.json'
                 if name == 'existing-notes': notes.write_bytes(b'Preserve previous public review input')
-                with mock.patch.dict(os.environ, dict(SITE_SELECTION=raw, RUNNER_TEMP=str(work), GITHUB_ENV=str(environment))), \
+                with mock.patch.object(os, 'environ', dict(os.environ, SITE_SELECTION=raw, RUNNER_TEMP=str(work), GITHUB_ENV=str(environment))), \
                         mock.patch.object(sys, 'path', list(sys.path)), contextlib.redirect_stdout(io.StringIO()):
                     if name == 'valid':
                         exec(compile(code, '<actual-production-site-selection>', 'exec'), {})
                     else:
-                        with self.assertRaises((ValueError, SystemExit, FileExistsError)):
+                        with self.assertRaises((ValueError, SystemExit, FileExistsError)) as refusal:
                             exec(compile(code, '<actual-production-site-selection>', 'exec'), {})
+                        if name == 'oversized':
+                            self.assertIsInstance(refusal.exception, SystemExit)
+                            self.assertEqual(str(refusal.exception), 'Reviewed public site selection is oversized.')
                 if name == 'valid':
                     self.assertEqual(json.loads(notes.read_bytes()), {key: selected[key] for key in ['notes', 'caution']})
                     self.assertEqual(environment.read_text(encoding='utf-8'), 'PREVIOUS=value\nSITE_COMMIT=' + selected['site_commit']
