@@ -385,6 +385,17 @@ impl PeerBrush {
             return false;
         }
         let blocked = self.update_interaction_active();
+        if !blocked && self.updates.native_updater.may_finish_exit() {
+            match self.flush_update_tool_profile().and_then(|()| {
+                self.updates
+                    .native_updater
+                    .finish_update_exit(&self.workspace, blocked)
+            }) {
+                Ok(()) => self.exit_approved = true,
+                Err(error) => self.message = error,
+            }
+            return true;
+        }
         if !blocked && self.updates.native_updater.may_prepare_final_control() {
             self.message = match self.flush_update_tool_profile().and_then(|()| {
                 self.updates

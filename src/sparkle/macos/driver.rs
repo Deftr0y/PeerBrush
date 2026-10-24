@@ -451,6 +451,11 @@ impl State {
             ctx.request_repaint();
         }
     }
+    pub(super) fn close_after_update_exit(&self) {
+        if let Some(ctx) = self.repaint.borrow().as_ref() {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+        }
+    }
     pub fn begin(&self, ctx: &eframe::egui::Context) -> Result<(), String> {
         self.session.borrow_mut().begin()?;
         *self.repaint.borrow_mut() = Some(ctx.clone());

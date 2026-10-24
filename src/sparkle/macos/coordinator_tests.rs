@@ -733,6 +733,7 @@ fn download_request_queue_is_one_shot_even_after_consumption_and_cancel_is_only_
         final_profile_requested: AtomicBool::new(false),
         final_control_requested: AtomicBool::new(false),
     };
+    assert!(remote.require_active().is_ok());
     assert!(remote.download(0).is_err());
     assert!(!remote.download_requested());
     remote.download(11).unwrap();
@@ -744,6 +745,7 @@ fn download_request_queue_is_one_shot_even_after_consumption_and_cancel_is_only_
     assert!(remote.download(11).is_err() && remote.download(12).is_err());
     assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
     remote.cancel();
+    assert!(remote.require_active().is_err());
     assert!(cancel.load(Ordering::Acquire));
     assert!(remote.download(11).is_err());
     let state = driver::State::default();

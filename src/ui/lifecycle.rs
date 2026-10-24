@@ -1029,7 +1029,11 @@ impl PeerBrush {
         if (ctx.input(|i| i.viewport().close_requested()) || native_quit) && !self.exit_approved {
             #[cfg(target_os = "macos")]
             if self.native_update_quit() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(if self.exit_approved {
+                    egui::ViewportCommand::Close
+                } else {
+                    egui::ViewportCommand::CancelClose
+                });
                 return;
             }
             self.request_close(Intent::Exit);
@@ -1094,6 +1098,10 @@ impl PeerBrush {
                 let blocked = review.intent == Intent::Exit && self.native_update_quit();
                 #[cfg(not(target_os = "macos"))]
                 let blocked = false;
+                if self.exit_approved {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
                 let result = if blocked {
                     Err(self.message.clone())
                 } else {

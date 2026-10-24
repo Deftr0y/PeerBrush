@@ -470,6 +470,7 @@ impl Probe {
             final_profile_accepted: false,
             final_control_request: None,
             final_control_processed: false,
+            final_control_accepted: false,
             checks,
         };
         for depth in [8, 16] {
@@ -1063,6 +1064,7 @@ mod tests {
             final_profile_accepted: false,
             final_control_request: None,
             final_control_processed: false,
+            final_control_accepted: false,
             checks: checks.clone(),
         };
         assert!(app.configured());
@@ -1132,6 +1134,7 @@ pub struct Application {
     final_profile_accepted: bool,
     final_control_request: Option<checkpoint::FinalProfileBinding>,
     final_control_processed: bool,
+    final_control_accepted: bool,
 }
 
 impl Application {
@@ -1165,6 +1168,7 @@ impl Application {
             final_profile_accepted: false,
             final_control_request: None,
             final_control_processed: false,
+            final_control_accepted: false,
             checks: Rc::new(driver::State::default()),
         }
     }
@@ -1295,9 +1299,55 @@ impl Application {
             |binding| remote.prepare_final_control(binding),
         );
         self.final_control_processed = result.is_err();
+        self.final_control_accepted = false;
         result?;
         self.message =
             "App update preparation requested. Installation and restart remain unavailable.";
+        Ok(())
+    }
+    pub(crate) fn may_finish_exit(&self) -> bool {
+        self.startup_enabled() && self.final_control_accepted && !self.checks.view().cancelled
+    }
+    /// Planned human Quit only. Native outcomes/recovery and unexpected target
+    /// death remain unfinished, so startup and captured handoff stay disabled.
+    pub(crate) fn finish_update_exit(
+        &mut self,
+        workspace: &crate::workspace::Registry,
+        ui_blocked: bool,
+    ) -> Result<(), String> {
+        if !self.startup_enabled() {
+            return Err("App update exit is not available in this development build.".into());
+        }
+        checkpoint::require_captured_handoff()?;
+        if !self.final_control_accepted || self.verification.is_some() {
+            return Err("No confirmed final native update request is available".into());
+        }
+        let binding = self
+            .final_control_request
+            .as_ref()
+            .ok_or("No final update request")?;
+        let remote = self
+            .remote
+            .as_ref()
+            .ok_or("No authenticated app update owner")?;
+        remote.require_active()?;
+        let mut processed = false;
+        accept_final_control(
+            &self.checks,
+            self.owner_status.as_ref(),
+            Some(binding),
+            binding,
+            &mut processed,
+            ui_blocked,
+            |binding| {
+                self.checkpoint
+                    .as_ref()
+                    .ok_or("No retained app capture")?
+                    .finish_exit(workspace, binding, remote)
+            },
+        )?;
+        self.final_control_accepted = false;
+        self.checks.close_after_update_exit();
         Ok(())
     }
     pub fn message(&self) -> &'static str {
@@ -1399,6 +1449,7 @@ impl Application {
         self.final_profile_accepted = false;
         self.final_control_request = None;
         self.final_control_processed = false;
+        self.final_control_accepted = false;
         self.checks = checks;
         self.verification = Some(Verification { receiver, cancel });
         Ok(())
@@ -1493,6 +1544,7 @@ impl Application {
                 }
                 Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
                     self.final_reply_processed = true;
+                    self.final_control_accepted = false;
                     self.checks.quarantine();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -1522,6 +1574,7 @@ impl Application {
                 };
                 if let Some(result) = result {
                     self.final_control_processed = true;
+                    self.final_control_accepted = result.is_ok();
                     self.message = if result.is_ok() {
                         "The app update request was prepared. Installation and restart remain unavailable."
                     } else {

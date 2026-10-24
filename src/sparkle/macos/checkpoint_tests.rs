@@ -2603,3 +2603,221 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
         );
     }
 }
+
+#[test]
+fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authentication() {
+    use super::super::{accept_final_control, coordinator, driver};
+    for outcome in [
+        "success",
+        "unsaved",
+        "dirty-tools",
+        "copy-changed",
+        "owner-gone",
+        "operation",
+        "newer-ready",
+        "quarantined",
+        "cancel",
+        "blocked",
+    ] {
+        let f = Fixture::new();
+        let profile = f.profile();
+        let lease = profile.update_profile();
+        let attempt = f.attempt(&lease);
+        let initial = fs::read(attempt.join("checkpoint.json")).unwrap();
+        fs::rename(
+            attempt.join("checkpoint.json"),
+            attempt.join("capture.json"),
+        )
+        .unwrap();
+        let (workspace, projects, paths) = current_profile_workspace(&f);
+        let tools = workspace.lock().unwrap().tool_settings.clone();
+        *tools.lock().unwrap() = crate::tool_settings::Store::load(
+            profile.locations.profile().join("tool-settings.json"),
+        );
+        for (project, path) in projects.iter().zip(&paths) {
+            let (project_id, document, revision) = {
+                let mut e = project.lock().unwrap();
+                let raster = e.doc.layers[0].id.clone();
+                let source = crate::source::Source {
+                    width: 4,
+                    height: 3,
+                    matrix: [1., 0., 0., 1., 0., 0.],
+                    content: crate::source::Content::Shape {
+                        shape: "rectangle".into(),
+                        bounds: [1., 1., 2., 2.],
+                        points: vec![],
+                        closed: true,
+                        fill: [12501, 23003, 34507, 45611],
+                        stroke: [0; 4],
+                        stroke_width: 0.,
+                    },
+                };
+                e.edit(
+                    "human",
+                    &[serde_json::json!({"op":"source.add","source":source,"x":0,"y":0})],
+                    None,
+                    None,
+                    "Keep editable source",
+                )
+                .unwrap();
+                e.edit("human", &[serde_json::json!({"op":"layer.update","layer":raster,"name":"Temporary exit name"})], None, None, "Keep redo").unwrap();
+                e.undo("human").unwrap();
+                (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+            };
+            let report = crate::server::dispatch(project, "document", &serde_json::json!({"action":"save_report","project_id":project_id,"document_id":document,"expected_revision":revision})).unwrap();
+            assert_eq!(report["save_allowed"], true);
+            assert!(report["losses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|loss| loss["code"] == "editable_source_rasterized"));
+            crate::server::save_accepted_source(project, path, &document, revision, false).unwrap();
+        }
+        let reviewed = crate::workspace::lifecycle::update_readiness(&workspace).unwrap();
+        let mut current = None;
+        crate::workspace::lifecycle::publish_update_checkpoint(&workspace, &reviewed, |store| {
+            capture_current_profile(&lease, store, &attempt, &initial, &mut current)
+        })
+        .unwrap();
+        record_intent(&attempt, &initial).unwrap();
+        let mut captured = None;
+        crate::workspace::lifecycle::publish_update_checkpoint(&workspace, &reviewed, |store| {
+            capture_final_profile(
+                &lease,
+                store,
+                &attempt,
+                &initial,
+                std::process::id(),
+                7,
+                &reviewed,
+                &mut captured,
+            )
+        })
+        .unwrap();
+        let capture = captured.as_ref().unwrap();
+        let binding = &capture.binding;
+        let ctx = eframe::egui::Context::default();
+        let checks = driver::State::default();
+        checks.begin(&ctx).unwrap();
+        checks.session.borrow_mut().checking();
+        checks.native_starting().unwrap();
+        let mut status = coordinator::NativeStatus {
+            phase: crate::sparkle::check::Phase::Quarantined,
+            version: Some("0.30.1".into()),
+            busy: false,
+            cancelled: false,
+            quarantine: true,
+            native_cycle: true,
+            held_generation: Some(if outcome == "newer-ready" { 8 } else { 7 }),
+            found_generation: None,
+            download_generation: None,
+            expected_bytes: None,
+            received_bytes: 0,
+            extraction: None,
+            download_complete: false,
+            final_profile: Some(binding.clone()),
+        };
+        if outcome == "quarantined" {
+            status.final_profile = None;
+        }
+        if outcome == "unsaved" {
+            let mut e = projects[1].lock().unwrap();
+            let layer = e
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.source.is_none())
+                .unwrap()
+                .id
+                .clone();
+            e.edit("human", &[serde_json::json!({"op":"fill","layer":layer,"rect":[1,0,1,1],"color":[75,125,175,255]})], None, None, "Newer exit artwork").unwrap();
+            e.edit("human", &[serde_json::json!({"op":"layer.update","layer":layer,"name":"Undo this exit name"})], None, None, "Keep newer redo").unwrap();
+            e.undo("human").unwrap();
+        }
+        if outcome == "dirty-tools" {
+            let mut store = tools.lock().unwrap();
+            let before = store.get("brush").unwrap().profile;
+            let mut after = before.clone();
+            after.settings.radius += 1.;
+            store.human_delta("brush", &before, &after).unwrap();
+        }
+        if outcome == "copy-changed" {
+            fs::write(attempt.join("final-profile/tool-settings.json"), b"changed").unwrap();
+        }
+        if outcome == "cancel" {
+            checks.cancel();
+        }
+        let operation = (outcome == "operation")
+            .then(|| crate::server::FileOperation::begin_workspace(&workspace).unwrap());
+        let before = current_workspace_bytes(&projects, &paths);
+        let profile_before =
+            fs::read(profile.locations.profile().join("tool-settings.json")).unwrap();
+        let mut consumed = false;
+        let owner_checks = std::cell::Cell::new(0);
+        let result = accept_final_control(
+            &checks,
+            Some(&status),
+            Some(binding),
+            binding,
+            &mut consumed,
+            outcome == "blocked",
+            |binding| {
+                capture.finish_exit(
+                    &workspace,
+                    &lease,
+                    &attempt,
+                    &initial,
+                    std::process::id(),
+                    binding,
+                    || {
+                        owner_checks.set(owner_checks.get() + 1);
+                        if outcome == "owner-gone" {
+                            Err("Signed owner authentication failed".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            },
+        );
+        assert_eq!(result.is_ok(), outcome == "success", "{outcome}");
+        assert!(consumed);
+        assert_eq!(
+            owner_checks.get(),
+            usize::from(matches!(outcome, "success" | "owner-gone"))
+        );
+        assert_eq!(workspace.lock().unwrap().exiting, outcome == "success");
+        assert_eq!(
+            tools.lock().unwrap().update_exit_committed(),
+            outcome == "success"
+        );
+        let mut expected = before;
+        if outcome == "success" {
+            for row in &mut expected {
+                row["closed"] = true.into();
+                row["owner_path"] = serde_json::Value::Null;
+                row["owner_project"] = serde_json::Value::Null;
+            }
+            assert!(tools.lock().unwrap().flush().is_err());
+            let output = ctx.run(Default::default(), |_| checks.close_after_update_exit());
+            assert!(output.viewport_output[&eframe::egui::ViewportId::ROOT]
+                .commands
+                .contains(&eframe::egui::ViewportCommand::Close));
+        }
+        assert_eq!(
+            current_workspace_bytes(&projects, &paths),
+            expected,
+            "{outcome}"
+        );
+        assert_eq!(
+            fs::read(profile.locations.profile().join("tool-settings.json")).unwrap(),
+            profile_before
+        );
+        assert!(
+            checks.view().native_cycle,
+            "Closing must not retire the copied native owner"
+        );
+        assert!(require_captured_handoff().is_err());
+        drop(operation);
+    }
+}

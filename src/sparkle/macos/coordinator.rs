@@ -287,6 +287,12 @@ pub(super) struct RemoteCheck {
     final_control_requested: AtomicBool,
 }
 impl RemoteCheck {
+    pub(super) fn require_active(&self) -> Result<(), String> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(FAILED.into());
+        }
+        Ok(())
+    }
     pub(super) fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
     }
@@ -717,6 +723,9 @@ pub(super) struct Owner {
     request: Option<Request>,
 }
 impl Owner {
+    pub(super) fn authenticate(&self, team: &str) -> Result<(), String> {
+        process_identity::authenticate(&self.socket, self.pid()?, team)
+    }
     pub(super) fn pid(&self) -> Result<u32, String> {
         self.child
             .as_ref()
@@ -799,6 +808,7 @@ impl Owner {
                     }
                 })();
                 if let Err(error) = result {
+                    requested_cancel.store(true, Ordering::Release);
                     let _ = control_sender.try_send(Err(error.clone()));
                     let _ = sender.try_send(Err(error));
                     repaint.request_repaint();
@@ -1218,7 +1228,13 @@ impl NativeOwner {
         status.final_profile = self
             .final_profile
             .as_ref()
-            .filter(|binding| self.checks.held_is_current(binding.ready_generation))
+            .filter(|binding| {
+                self.checks.held_is_current(binding.ready_generation)
+                    && self.final_control.as_ref().is_none_or(|control| {
+                        control == *binding
+                            && self.checks.final_control_current(binding.ready_generation)
+                    })
+            })
             .cloned();
         status
     }

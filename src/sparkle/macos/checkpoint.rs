@@ -838,6 +838,32 @@ impl Prepared {
             |tools| self.authenticate_final_profile_locked(tools, binding),
         )
     }
+    pub(super) fn finish_exit(
+        &self,
+        workspace: &crate::workspace::Registry,
+        binding: &FinalProfileBinding,
+        remote: &super::coordinator::RemoteCheck,
+    ) -> Result<(), String> {
+        let capture = self.final_profile.as_ref().ok_or(HOLD)?;
+        let manifest: Manifest = serde_json::from_slice(&self.manifest).map_err(|_| HOLD)?;
+        capture.finish_exit(
+            workspace,
+            &self._profile,
+            &self.path,
+            &self.manifest,
+            self._owner.pid()?,
+            binding,
+            || {
+                self.check_identity()?;
+                remote.require_active()?;
+                // A stored PID or acknowledgement alone cannot prove that our
+                // separately running, signed preservation owner still exists.
+                self._owner.authenticate(&manifest.publisher_team_id)?;
+                remote.require_active()?;
+                self.check_identity()
+            },
+        )
+    }
     /// Actual caller holds sorted engines, registry and the Store writer mutex.
     /// Never reacquire workspace locks here or invoke a native continuation.
     pub(super) fn authenticate_final_profile_locked(
@@ -1234,6 +1260,26 @@ fn capture_final_profile(
     saved.current.recheck()
 }
 impl FinalCapture {
+    fn finish_exit(
+        &self,
+        workspace: &crate::workspace::Registry,
+        profile: &UpdateProfile,
+        path: &Path,
+        initial: &[u8],
+        owner_pid: u32,
+        binding: &FinalProfileBinding,
+        authenticate_owner: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        crate::workspace::lifecycle::finish_update_exit_with_profile(
+            workspace,
+            &self.reviewed,
+            |tools| {
+                self.authenticate_locked(profile, path, initial, owner_pid, binding, tools)?;
+                authenticate_owner()?;
+                self.authenticate_locked(profile, path, initial, owner_pid, binding, tools)
+            },
+        )
+    }
     fn accept(
         &self,
         workspace: &crate::workspace::Registry,

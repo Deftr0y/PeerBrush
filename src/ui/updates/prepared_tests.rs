@@ -871,6 +871,13 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
             .contains("not available"));
         assert!(!app.updates.native_updater.download_requested());
         assert!(!app.updates.native_updater.startup_enabled());
+        assert!(!app.updates.native_updater.may_finish_exit());
+        assert!(app
+            .updates
+            .native_updater
+            .finish_update_exit(&app.workspace, false)
+            .unwrap_err()
+            .contains("not available"));
         assert!(!app.updates.native_updater.may_prepare_final_control());
         assert!(app
             .updates
