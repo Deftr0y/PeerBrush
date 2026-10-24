@@ -987,3 +987,540 @@ fn pending_stroke_variant_construction_diagnostic() {
         }
     }
 }
+
+fn alt_sample_frame(
+    app: &mut PeerBrush,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    alt: bool,
+    focused: bool,
+) {
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+            time: Some(ctx.input(|i| i.time) + 0.05),
+            modifiers: egui::Modifiers {
+                alt,
+                ..Default::default()
+            },
+            focused,
+            events,
+            ..Default::default()
+        },
+        |ctx| app.draw(ctx),
+    );
+}
+fn alt_sample_button(at: Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        },
+    }
+}
+fn alt_sample_point(app: &PeerBrush, point: [f32; 2]) -> Pos2 {
+    let rect = app.view_rect.expect("Actual canvas");
+    rect.min + Vec2::new(point[0], point[1]) * (rect.width() / 32.)
+}
+fn alt_sample_expected(app: &PeerBrush, point: [i32; 2]) -> Pixel {
+    let engine = app.shared.lock().unwrap();
+    if app.mask {
+        let layer = engine
+            .doc
+            .layers
+            .iter()
+            .find(|l| l.id == app.selected)
+            .unwrap();
+        let value =
+            (layer.mask_value_raw(point[0] - layer.x, point[1] - layer.y) * 255.).round() as u8;
+        [value; 4]
+    } else {
+        engine
+            .doc
+            .preview(
+                Some([point[0], point[1], point[0] + 1, point[1] + 1]),
+                1,
+                None,
+                false,
+            )
+            .unwrap()
+            .2
+            .try_into()
+            .unwrap()
+    }
+}
+fn alt_sample_assert(app: &PeerBrush, point: [i32; 2]) {
+    let expected = alt_sample_expected(app, point);
+    if app.mask {
+        assert_eq!(app.mask_value, expected[0]);
+    } else {
+        assert_eq!(app.color, expected);
+    }
+}
+fn alt_sample_fixture(depth: u16) -> (PeerBrush, egui::Context) {
+    let (mut app, ctx) = workspace::fixture(depth);
+    app.tool = Tool::Brush;
+    app.radius = 1.5;
+    app.brush.smoothing = 0.;
+    app.brush.spacing = 1.;
+    {
+        let mut engine = app.shared.lock().unwrap();
+        let layer = app.selected.clone();
+        engine.edit("human", &[
+            json!({"op":"mask.add","layer":layer}),
+            json!({"op":"paint","layer":layer,"mask":true,"points":[[6,8]],"radius":4,"color":[73,73,73,255]}),
+            json!({"op":"mask.step.add","layer":layer,"kind":"gaussian","settings":{"radius":1}}),
+            json!({"op":"mask.toggle","layer":layer,"enabled":false}),
+            json!({"op":"effect.add","layer":layer,"kind":"blur","settings":{"radius":1}}),
+            json!({"op":"filter.add","kind":"blur","settings":{"radius":1}}),
+            json!({"op":"layer.add","name":"Other native layer"}),
+        ], None, None, "Sampling native effects and raw spatial mask").unwrap();
+        for opacity in [0.9, 0.8] {
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"layer.update","layer":layer,"opacity":opacity})],
+                    None,
+                    None,
+                    "Human settings",
+                )
+                .unwrap();
+        }
+        engine.undo("human").unwrap();
+        assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+    }
+    settle(&mut app, &ctx);
+    (app, ctx)
+}
+
+#[test]
+fn alt_held_identical_native_pixels_reapply_exact_samples_without_resampling_and_paint_immediately()
+{
+    for depth in [8, 16] {
+        for mask in [false, true] {
+            let (mut app, ctx) = alt_sample_fixture(depth);
+            app.mask = mask;
+            let before = workspace::source(&app);
+            let reservations = json!(app.shared.lock().unwrap().leases);
+            let at = alt_sample_point(&app, [1.25, 1.25]);
+            let runs = app.color_pick_runs;
+            alt_sample_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(at), alt_sample_button(at, true)],
+                true,
+                true,
+            );
+            assert_eq!(app.color_pick_runs, runs + 1);
+            assert_eq!(app.alt_sample.as_ref().unwrap().point, [1, 1]);
+            alt_sample_assert(&app, [1, 1]);
+            let subpixel = alt_sample_point(&app, [1.45, 1.4]);
+            for _ in 0..8 {
+                app.color = [255, 0, 255, 23];
+                app.mask_value = 19;
+                alt_sample_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(subpixel)],
+                    true,
+                    true,
+                );
+                assert_eq!(app.color_pick_runs, runs + 1);
+                alt_sample_assert(&app, [1, 1]);
+                assert_eq!(workspace::source(&app), before);
+            }
+            let moved = alt_sample_point(&app, [8.25, 8.25]);
+            alt_sample_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(moved)],
+                true,
+                true,
+            );
+            assert_eq!(app.color_pick_runs, runs + 2);
+            alt_sample_assert(&app, [8, 8]);
+            assert!(
+                app.color[3] > 0,
+                "The immediate paint must have nonzero alpha"
+            );
+            if mask {
+                let engine = app.shared.lock().unwrap();
+                let layer = engine
+                    .doc
+                    .layers
+                    .iter()
+                    .find(|l| l.id == app.selected)
+                    .unwrap();
+                assert_ne!(
+                    app.mask_value,
+                    (layer.mask_value_raw(24, 16) * 255.).round() as u8
+                );
+            }
+            assert_eq!(workspace::source(&app), before);
+            alt_sample_frame(
+                &mut app,
+                &ctx,
+                vec![alt_sample_button(moved, false)],
+                true,
+                true,
+            );
+            assert!(app.alt_sample.is_none());
+            assert_eq!(json!(app.shared.lock().unwrap().leases), reservations);
+            let destination = alt_sample_point(&app, [24.25, 16.25]);
+            let baseline = app.shared.lock().unwrap().doc.clone();
+            let history = app.shared.lock().unwrap().undo.len();
+            let layer = app.selected.clone();
+            let target_pixel = |doc: &Document| {
+                let layer = doc.layers.iter().find(|l| l.id == layer).unwrap();
+                if mask {
+                    layer
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .steps
+                        .iter()
+                        .rev()
+                        .find(|step| step.kind == "paint")
+                        .unwrap()
+                        .pixels
+                        .get16(24, 16)
+                } else {
+                    layer.pixels.get16(24, 16)
+                }
+            };
+            let native_before = target_pixel(&baseline);
+            // The very next ordinary pointer press starts paint synchronously with the sampled value.
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(destination),
+                    pointer(destination, true),
+                ],
+            );
+            assert!(!app.points.is_empty());
+            let color = if mask {
+                [app.mask_value, app.mask_value, app.mask_value, app.color[3]]
+            } else {
+                app.color
+            };
+            let command = app.stroke_command(app.points.clone(), color);
+            let expected = Engine::preview_edits(baseline.clone(), &[command]).unwrap();
+            assert_ne!(
+                target_pixel(&expected),
+                native_before,
+                "The real shared preview must paint native data"
+            );
+            frame(&mut app, &ctx, vec![pointer(destination, false)]);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            assert_eq!(engine.doc.bit_depth, depth);
+            assert_ne!(
+                target_pixel(&engine.doc),
+                native_before,
+                "Immediate paint must change native data"
+            );
+            assert_eq!(target_pixel(&engine.doc), target_pixel(&expected));
+            assert_eq!(
+                engine
+                    .doc
+                    .layers
+                    .iter()
+                    .map(|l| json!([l.pixels, l.mask]))
+                    .collect::<Vec<_>>(),
+                expected
+                    .layers
+                    .iter()
+                    .map(|l| json!([l.pixels, l.mask]))
+                    .collect::<Vec<_>>()
+            );
+            engine.undo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                baseline.export_png().unwrap()
+            );
+            engine.redo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                expected.export_png().unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn alt_sample_source_revision_selected_mask_and_step_changes_cannot_reuse_old_pixel() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = alt_sample_fixture(depth);
+        let point = [6, 8];
+        let at = alt_sample_point(&app, [6.25, 8.25]);
+        alt_sample_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(at), alt_sample_button(at, true)],
+            true,
+            true,
+        );
+        let mut runs = app.color_pick_runs;
+        let layer = app.selected.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":layer,"opacity":0.4})],
+                None,
+                None,
+                "Newer human source",
+            )
+            .unwrap();
+        for operation in ["changed", "undo", "redo", "mask", "step", "selected"] {
+            match operation {
+                "undo" => app.shared.lock().unwrap().undo("human").unwrap(),
+                "redo" => app.shared.lock().unwrap().redo("human").unwrap(),
+                "mask" => app.mask = true,
+                "step" => {
+                    app.mask_step = Some(
+                        app.shared
+                            .lock()
+                            .unwrap()
+                            .doc
+                            .layers
+                            .iter()
+                            .find(|l| l.id == layer)
+                            .unwrap()
+                            .mask
+                            .as_ref()
+                            .unwrap()
+                            .steps[0]
+                            .id
+                            .clone(),
+                    );
+                }
+                "selected" => {
+                    app.selected = app
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .doc
+                        .layers
+                        .iter()
+                        .find(|l| l.id != layer)
+                        .unwrap()
+                        .id
+                        .clone();
+                }
+                _ => {}
+            }
+            let before = workspace::source(&app);
+            alt_sample_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(at)],
+                true,
+                true,
+            );
+            runs += 1;
+            assert_eq!(app.color_pick_runs, runs, "{depth}/{operation}");
+            alt_sample_assert(&app, point);
+            assert_eq!(workspace::source(&app), before);
+            alt_sample_frame(&mut app, &ctx, vec![], true, true);
+            assert_eq!(app.color_pick_runs, runs);
+        }
+        alt_sample_frame(
+            &mut app,
+            &ctx,
+            vec![alt_sample_button(at, false)],
+            true,
+            true,
+        );
+        assert!(app.alt_sample.is_none());
+    }
+}
+
+#[test]
+fn alt_sample_runtime_restore_engine_project_focus_and_plain_picker_boundaries_stay_owned() {
+    for depth in [8, 16] {
+        for boundary in ["restore", "engine", "project", "focus", "escape", "tool"] {
+            let (mut app, ctx) = alt_sample_fixture(depth);
+            let at = alt_sample_point(&app, [6.25, 8.25]);
+            alt_sample_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(at), alt_sample_button(at, true)],
+                true,
+                true,
+            );
+            let runs = app.color_pick_runs;
+            let previous = app.shared.clone();
+            let original = previous.lock().unwrap().doc.clone();
+            let original_id = original.id.clone();
+            let mut events = vec![];
+            let mut focused = true;
+            match boundary {
+                "restore" => {
+                    app.shared
+                        .lock()
+                        .unwrap()
+                        .replace(original.clone(), None)
+                        .unwrap();
+                    assert_ne!(app.shared.lock().unwrap().doc.id, original_id);
+                }
+                "engine" => {
+                    // Same serialized identity in a new Engine is still a different owner.
+                    let mut replacement = Engine::new();
+                    replacement.project_id = previous.lock().unwrap().project_id.clone();
+                    replacement.doc = original.clone();
+                    app.shared = Arc::new(std::sync::Mutex::new(replacement));
+                }
+                "project" => {
+                    let mut replacement = Engine::new();
+                    replacement.doc = original.clone();
+                    let added =
+                        crate::workspace::register_in(&app.workspace, replacement, None).unwrap();
+                    let id = added.lock().unwrap().project_id.clone();
+                    app.switch_project(&id);
+                    assert_ne!(app.shared.lock().unwrap().doc.id, original_id);
+                }
+                "focus" => {
+                    focused = false;
+                    events.push(egui::Event::WindowFocused(false));
+                }
+                "escape" => events.push(key(
+                    egui::Key::Escape,
+                    egui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                )),
+                "tool" => {
+                    app.select_tool(Tool::Picker);
+                    app.select_tool(Tool::Brush);
+                }
+                _ => unreachable!(),
+            }
+            let before = workspace::source(&app);
+            alt_sample_frame(&mut app, &ctx, events, true, focused);
+            assert_eq!(workspace::source(&app), before, "{depth}/{boundary}");
+            // At any fresh sampling opportunity the old entry cannot suppress exact work.
+            assert!(
+                app.color_pick_runs > runs || app.alt_sample.is_none(),
+                "{depth}/{boundary}"
+            );
+            if !focused {
+                alt_sample_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::WindowFocused(true)],
+                    true,
+                    true,
+                );
+            }
+            alt_sample_frame(
+                &mut app,
+                &ctx,
+                vec![alt_sample_button(at, false)],
+                false,
+                true,
+            );
+            assert!(app.alt_sample.is_none());
+            app.select_tool(Tool::Picker);
+            frame(&mut app, &ctx, vec![]);
+            let at = alt_sample_point(&app, [6.25, 8.25]);
+            let before = workspace::source(&app);
+            let plain_runs = app.color_pick_runs;
+            workspace::click(&mut app, &ctx, SIZE, at);
+            workspace::click(&mut app, &ctx, SIZE, at);
+            assert_eq!(app.color_pick_runs, plain_runs + 2);
+            assert!(app.alt_sample.is_none());
+            alt_sample_assert(&app, [6, 8]);
+            assert_eq!(workspace::source(&app), before);
+            if matches!(boundary, "engine" | "project") {
+                assert_eq!(
+                    serde_json::to_value(&previous.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(original).unwrap()
+                );
+            }
+        }
+    }
+}
+#[test]
+fn entering_alt_commits_existing_native_stroke_before_sampling_and_respects_later_reservation() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = alt_sample_fixture(depth);
+        app.color = [211, 43, 97, 255];
+        let before = app.shared.lock().unwrap().doc.clone();
+        let history = app.shared.lock().unwrap().undo.len();
+        let start = alt_sample_point(&app, [14.25, 12.25]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), pointer(start, true)],
+        );
+        let at = alt_sample_point(&app, [16.25, 12.25]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)]);
+        assert!(!app.points.is_empty());
+        let expected = Engine::preview_edits(
+            before.clone(),
+            &[app.stroke_command(app.points.clone(), app.color)],
+        )
+        .unwrap();
+        alt_sample_frame(&mut app, &ctx, vec![], true, true);
+        assert!(app.points.is_empty());
+        alt_sample_assert(&app, [16, 12]);
+        {
+            let engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            assert_eq!(engine.doc.bit_depth, depth);
+            assert_eq!(
+                engine
+                    .doc
+                    .layers
+                    .iter()
+                    .map(|l| json!(l.pixels))
+                    .collect::<Vec<_>>(),
+                expected
+                    .layers
+                    .iter()
+                    .map(|l| json!(l.pixels))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                app.alt_sample.as_ref().unwrap().revision,
+                engine.doc.revision
+            );
+        }
+        let layer = app.selected.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .reserve(
+                "other",
+                "Keep sampled native work",
+                vec![Scope::layer(&layer)],
+            )
+            .unwrap();
+        let retained = workspace::source(&app);
+        let reservations = json!(app.shared.lock().unwrap().leases);
+        let runs = app.color_pick_runs;
+        alt_sample_frame(&mut app, &ctx, vec![], true, true);
+        assert_eq!(app.color_pick_runs, runs);
+        assert_eq!(workspace::source(&app), retained);
+        assert_eq!(json!(app.shared.lock().unwrap().leases), reservations);
+        alt_sample_frame(
+            &mut app,
+            &ctx,
+            vec![alt_sample_button(at, false)],
+            true,
+            true,
+        );
+        let destination = alt_sample_point(&app, [24.25, 16.25]);
+        workspace::click(&mut app, &ctx, SIZE, destination);
+        assert_eq!(workspace::source(&app), retained);
+        assert_eq!(json!(app.shared.lock().unwrap().leases), reservations);
+        assert_eq!(app.shared.lock().unwrap().doc.bit_depth, depth);
+    }
+}

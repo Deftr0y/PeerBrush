@@ -316,6 +316,17 @@ struct EyeSweep {
     visible: bool,
     ids: HashSet<String>,
 }
+struct AltSample {
+    engine: std::sync::Weak<std::sync::Mutex<crate::engine::Engine>>,
+    project: String,
+    document: String,
+    revision: u64,
+    point: [i32; 2],
+    selected: String,
+    mask: bool,
+    step: Option<String>,
+    value: Pixel,
+}
 #[derive(Clone)]
 struct ParameterRequest {
     engine: std::sync::Weak<std::sync::Mutex<crate::engine::Engine>>,
@@ -469,6 +480,9 @@ pub struct PeerBrush {
     texture: Option<TextureHandle>,
     canvas_pixels: Option<(u32, u32, Vec<u8>)>,
     canvas_generation: u64,
+    alt_sample: Option<AltSample>,
+    #[cfg(test)]
+    color_pick_runs: usize,
     canvas_preview: Option<(String, u64, String, bool)>,
     capture_ready_at: f64,
     canvas_selection: Option<CanvasSelection>,
@@ -841,6 +855,9 @@ impl PeerBrush {
             texture: None,
             canvas_pixels: None,
             canvas_generation: 0,
+            alt_sample: None,
+            #[cfg(test)]
+            color_pick_runs: 0,
             canvas_preview: None,
             capture_ready_at: 0.,
             canvas_selection: None,
@@ -978,6 +995,7 @@ impl PeerBrush {
         }
     }
     fn select_tool(&mut self, tool: Tool) {
+        self.alt_sample = None;
         if let Some(editor) = &mut self.free_transform {
             if matches!(tool, Tool::Move | Tool::Rotate | Tool::Scale) {
                 editor.set_mode(tool);
@@ -3424,15 +3442,62 @@ impl PeerBrush {
             self.live_gesture = None;
         }
     }
-    fn pick_color(&mut self, doc: &Document, point: [f32; 2]) {
+    fn pick_color(&mut self, doc: &Document, point: [f32; 2]) -> bool {
+        #[cfg(test)]
+        {
+            self.color_pick_runs += 1;
+        }
         let (x, y) = (point[0].floor() as i32, point[1].floor() as i32);
         if self.mask {
             if let Some(l) = doc.layers.iter().find(|l| l.id == self.selected) {
                 self.mask_value = (l.mask_value_raw(x - l.x, y - l.y) * 255.0).round() as u8;
+                return true;
             }
         } else if let Ok((_, _, bytes, _)) = doc.preview(Some([x, y, x + 1, y + 1]), 1, None, false)
         {
             self.color.copy_from_slice(&bytes[..4]);
+            return true;
+        }
+        false
+    }
+    fn pick_alt_color(&mut self, doc: &Document, project: &str, point: [f32; 2]) {
+        // shortcut: only repeated identical-pixel samples; cold/new-pixel preparation still blocks,
+        // replace only after ordered async sampling acceptance.
+        let native = point.map(|value| value.floor() as i32);
+        if let Some(sample) = self.alt_sample.as_ref().filter(|sample| {
+            sample.engine.as_ptr() == Arc::as_ptr(&self.shared)
+                && sample.project == project
+                && sample.document == doc.id
+                && sample.revision == doc.revision
+                && sample.point == native
+                && sample.selected == self.selected
+                && sample.mask == self.mask
+                && sample.step == self.mask_step
+        }) {
+            if self.mask {
+                self.mask_value = sample.value[0];
+            } else {
+                self.color = sample.value;
+            }
+            return;
+        }
+        self.alt_sample = None;
+        if self.pick_color(doc, point) {
+            self.alt_sample = Some(AltSample {
+                engine: Arc::downgrade(&self.shared),
+                project: project.into(),
+                document: doc.id.clone(),
+                revision: doc.revision,
+                point: native,
+                selected: self.selected.clone(),
+                mask: self.mask,
+                step: self.mask_step.clone(),
+                value: if self.mask {
+                    [self.mask_value; 4]
+                } else {
+                    self.color
+                },
+            });
         }
     }
     fn canvas(&mut self, ui: &mut egui::Ui, doc: &Document) {
@@ -3921,8 +3986,19 @@ impl PeerBrush {
                     }
                     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                     if ui.input(|i| i.pointer.primary_down()) || response.clicked() {
-                        let current = self.shared.lock().unwrap().doc.clone();
-                        self.pick_color(&current, to_doc(pointer));
+                        let (current, project) = {
+                            let engine = self.shared.lock().unwrap();
+                            (engine.doc.clone(), engine.project_id.clone())
+                        };
+                        if ui.input(|i| {
+                            i.pointer.primary_down()
+                                && i.focused
+                                && !i.key_pressed(egui::Key::Escape)
+                        }) {
+                            self.pick_alt_color(&current, &project, to_doc(pointer));
+                        } else {
+                            self.pick_color(&current, to_doc(pointer));
+                        }
                     }
                 }
             }
@@ -4127,7 +4203,7 @@ impl PeerBrush {
                         Tool::Fill => {
                             self.layer_cmd("paint.fill", json!({"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}), "Fill layer")
                         }
-                        Tool::Picker => self.pick_color(doc, p),
+                        Tool::Picker => { self.pick_color(doc, p); }
                         _ => {}
                     }
                 }
@@ -4981,6 +5057,17 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        if self.tool != Tool::Brush
+            || ctx.input(|input| {
+                !input.focused
+                    || !input.modifiers.alt
+                    || !input.pointer.primary_down()
+                    || input.pointer.primary_pressed()
+                    || input.key_pressed(egui::Key::Escape)
+            })
+        {
+            self.alt_sample = None;
+        }
         self.free_transform_frame = self.free_transform.is_some();
         self.updates_tick(ctx);
         self.about.dismiss_escape(ctx);
