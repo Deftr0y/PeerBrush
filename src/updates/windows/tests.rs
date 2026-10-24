@@ -405,7 +405,7 @@ fn truncated_extra_oversized_and_canceled_streams_remain_unprepared_and_preserve
     .unwrap_err()
     .contains("canceled"));
     assert!(!temp.0.join("prepared.json").exists());
-    let retained = fs::read(temp.0.join("selected.appinstaller")).unwrap();
+    let retained = fs::read(temp.0.join("discovery.appinstaller")).unwrap();
     let transport = HttpFake::new();
     assert!(prepare(
         &temp.0,
@@ -418,7 +418,7 @@ fn truncated_extra_oversized_and_canceled_streams_remain_unprepared_and_preserve
     .contains("interrupted"));
     assert!(transport.calls.lock().unwrap().is_empty());
     assert_eq!(
-        fs::read(temp.0.join("selected.appinstaller")).unwrap(),
+        fs::read(temp.0.join("discovery.appinstaller")).unwrap(),
         retained
     );
 }

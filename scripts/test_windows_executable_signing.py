@@ -245,7 +245,9 @@ class WindowsProducer(unittest.TestCase):
                 require_executable_signature=True)
         self.assertTrue(descriptor.is_file())
         self.assertNotIn(b'UpdateSettings', descriptor.read_bytes())
-        self.assertEqual(len(list(descriptor.parent.iterdir())), 4)
+        self.assertEqual({path.name for path in descriptor.parent.iterdir()},
+                         {descriptor.name, installer.STABLE_DESCRIPTOR, package.name, runtime.name, 'SHA256SUMS'})
+        self.assertEqual((descriptor.parent / installer.STABLE_DESCRIPTOR).read_bytes(), descriptor.read_bytes())
         with self.assertRaises(ValueError):
             self.fixture.qualify(require_executable_signature=True,
                 portable_sha256=self.options['portable_sha256'])
