@@ -1,5 +1,10 @@
 """Credential-free transaction failures using opaque bytes, never native/release authority."""
 import copy
+import contextlib
+import io
+import os
+import sys
+import textwrap
 import hashlib
 import json
 from pathlib import Path
@@ -268,6 +273,150 @@ class Transactions(unittest.TestCase):
             caller = (root / '.github/workflows' / name).read_text(encoding='utf-8')
             self.assertIn('python -B scripts/test_final_release.py', caller)
             self.assertIn('python -B scripts/test_publish_release.py', caller)
+
+    def test_dormant_production_and_site_jobs_use_real_consumers_without_write_or_approval_authority(self):
+        root = Path(__file__).resolve().parents[1]
+        text = (root / '.github/workflows/production.yml').read_text(encoding='utf-8')
+        compose = text.split('\n  compose:\n', 1)[1].split('\n  publish:\n', 1)[0]
+        publish = text.split('\n  publish:\n', 1)[1].split('\n  site:\n', 1)[0]
+        site = text.split('\n  site:\n', 1)[1]
+        self.assertEqual(text.count('if: ${{ false }}'), 3)
+        self.assertNotIn('contents: write', text)
+        self.assertNotIn('pages: write', text)
+        self.assertNotIn('id-token: write', text)
+        for job in [compose, publish, site]:
+            self.assertIn('if: ${{ false }}', job)
+            self.assertIn('persist-credentials: false', job)
+            self.assertIn('scripts/release_gate.py --commit "$EXPECTED_COMMIT"', job)
+            self.assertIn("os.environ.get('GITHUB_WORKFLOW_SHA') != expected", job)
+            self.assertNotIn('continue-on-error:', job)
+        self.assertIn('needs: compose', publish)
+        self.assertIn("PEERBRUSH_PRODUCTION_APPROVED: 'false'", publish)
+        self.assertIn('GH_TOKEN: ${{ github.token }}', publish)
+        self.assertIn('scripts/acquire_final_inputs.py --source-root', publish)
+        self.assertLess(publish.index('scripts/acquire_final_inputs.py'), publish.index('scripts/publish_release.py'))
+        for argument in ['--final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256"',
+                         '--selection-sha256 "$SELECTION_SHA256"', '--notes-sha256 "$RELEASE_NOTES_SHA256"', '--execute']:
+            self.assertIn(argument, publish)
+        self.assertLess(publish.index('scripts/publish_release.py'), publish.index('Retain final manifest only after exact public release readback'))
+        self.assertIn('peerbrush-final-candidate/final-release-inventory.json', publish)
+        self.assertIn('needs: publish', site)
+        self.assertNotIn('always()', site)
+        self.assertIn('published-final-manifest-${{ github.run_id }}-${{ github.run_attempt }}', publish)
+        self.assertNotIn('actions/download-artifact@', site)
+        self.assertIn("public_get(DOWNLOAD + 'v' + version + '/' + MANIFEST, 128 * 1024)", site)
+        self.assertIn('sha(raw) != expected', site)
+        self.assertIn('raw != encode(manifest)', site)
+        self.assertIn("manifest['version'] != version or manifest['commit'] != commit", site)
+        self.assertIn('git fetch --no-tags --depth=1 origin "$SITE_COMMIT"', site)
+        self.assertIn('scripts/prepare_site_release.py --site-commit "$SITE_COMMIT"', site)
+        self.assertIn('--final-inventory-sha256 "$FINAL_INVENTORY_SHA256"', site)
+        self.assertIn('--tag "v$VERSION" --commit "$EXPECTED_COMMIT"', site)
+        self.assertIn('[ "$result" -ne 0 ] && [ "$result" -ne 2 ]', site)
+        self.assertNotIn('git push', text)
+        self.assertNotIn('deploy-pages@', text)
+        self.assertNotIn('gh workflow run', text)
+        self.assertNotIn('submit_store_release.py', text)
+        # The separately approved Pages and Store callers retain their own gates.
+        store = (root / '.github/workflows/store-submit.yml').read_text(encoding='utf-8')
+        self.assertIn("if: vars.MSSTORE_AUTOMATION_ENABLED == 'true'", store)
+        self.assertNotIn('store-submit.yml', text)
+
+    def test_actual_public_manifest_workflow_acquisition_bounds_and_authenticates_before_retaining_bytes(self):
+        import prepare_site_release as website
+        root = Path(__file__).resolve().parents[1]
+        text = (root / '.github/workflows/production.yml').read_text(encoding='utf-8')
+        step = text.split('      - name: Acquire independently selected bounded public final manifest\n', 1)[1].split('\n      - ', 1)[0]
+        code = textwrap.dedent(step.split("          python -B - <<'PY'\n", 1)[1].split('          PY', 1)[0])
+        original = final.encode(self.manifest)
+        for name in ['valid', 'wrong-sha', 'truncated', 'oversized', 'empty', 'noncanonical', 'duplicate',
+                     'unknown-field', 'wrong-source', 'wrong-version', 'unstable-version', 'unavailable', 'existing-output']:
+            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix='peerbrush-public-manifest-') as temporary:
+                work = Path(temporary).resolve(strict=True)
+                source = work / 'source'
+                source.mkdir()
+                version = '0.3.0' if name == 'wrong-version' else '0.2.0-dev.1' if name == 'unstable-version' else self.manifest['version']
+                (source / 'Cargo.toml').write_text('[package]\nversion=' + json.dumps(version) + '\n', encoding='utf-8')
+                raw = original
+                if name == 'truncated': raw = raw[:-1]
+                elif name == 'oversized': raw = b' ' * (128 * 1024 + 1)
+                elif name == 'empty': raw = b''
+                elif name == 'noncanonical': raw = json.dumps(self.manifest).encode()
+                elif name == 'duplicate': raw = b'{"schema":1,' + raw[1:]
+                elif name == 'unknown-field': raw = final.encode(dict(self.manifest, ready=True))
+                output = work / 'peerbrush-site-manifest'
+                target = output / final.MANIFEST
+                if name == 'existing-output':
+                    output.mkdir(mode=0o700)
+                    target.write_bytes(b'Preserve previous exact review evidence')
+                expected = '0' * 64 if name == 'wrong-sha' else hashlib.sha256(raw).hexdigest()
+                environment = dict(GITHUB_WORKSPACE=str(source), RUNNER_TEMP=str(work), FINAL_INVENTORY_SHA256=expected,
+                    EXPECTED_COMMIT='b' * 40 if name == 'wrong-source' else self.manifest['commit'])
+                previous_path = list(sys.path)
+                try:
+                    with mock.patch.dict(os.environ, environment), mock.patch.object(website, 'public_get',
+                            side_effect=website.Unavailable('Synthetic unavailable public bytes') if name == 'unavailable' else None,
+                            return_value=raw) as transport:
+                        if name == 'valid':
+                            exec(compile(code, '<actual-bounded-public-manifest-acquisition>', 'exec'), {})
+                        else:
+                            with self.assertRaises((ValueError, SystemExit)):
+                                exec(compile(code, '<actual-bounded-public-manifest-acquisition>', 'exec'), {})
+                    if name == 'unstable-version': transport.assert_not_called()
+                    else: transport.assert_called_once_with(website.DOWNLOAD + 'v' + version + '/' + final.MANIFEST, 128 * 1024)
+                finally:
+                    sys.path[:] = previous_path
+                if name == 'valid':
+                    self.assertEqual(target.read_bytes(), original)
+                    self.assertEqual(final.read(target, 128 * 1024, expected), original)
+                    self.assertEqual({path.name for path in output.iterdir()}, {final.MANIFEST})
+                elif name == 'existing-output':
+                    self.assertEqual(target.read_bytes(), b'Preserve previous exact review evidence')
+                    self.assertEqual({path.name for path in output.iterdir()}, {final.MANIFEST})
+                else:
+                    self.assertFalse(output.exists())
+                self.assertEqual((source / 'Cargo.toml').read_text(encoding='utf-8'), '[package]\nversion=' + json.dumps(version) + '\n')
+
+    def test_actual_site_workflow_selection_keeps_independent_digest_public_notes_and_exclusive_output(self):
+        root = Path(__file__).resolve().parents[1]
+        text = (root / '.github/workflows/production.yml').read_text(encoding='utf-8')
+        step = text.split('      - name: Validate explicit public site selection\n', 1)[1].split('\n      - ', 1)[0]
+        code = textwrap.dedent(step.split("          python -B - <<'PY'\n", 1)[1].split('          PY', 1)[0])
+        selected = dict(site_commit='a' * 40, final_inventory_sha256='b' * 64,
+                        notes=['Reviewed public note'], caution='Native acceptance remains unverified.')
+        cases = [('valid', json.dumps(selected)),
+                 ('unknown-readiness', json.dumps(dict(selected, ready=True))),
+                 ('wrong-site', json.dumps(dict(selected, site_commit='main'))),
+                 ('wrong-digest', json.dumps(dict(selected, final_inventory_sha256='a' * 63))),
+                 ('environment-injection', json.dumps(dict(selected, site_commit='a' * 40 + '\nREADY=true'))),
+                 ('bad-notes', json.dumps(dict(selected, notes=[]))),
+                 ('bad-caution', json.dumps(dict(selected, caution=False))),
+                 ('duplicate', '{"site_commit":"a",' + json.dumps(selected)[1:]),
+                 ('malformed', '{'), ('oversized', ' ' * (128 * 1024 + 1)),
+                 ('existing-notes', json.dumps(selected))]
+        for name, raw in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix='peerbrush-site-workflow-') as temporary:
+                work = Path(temporary).resolve(strict=True)
+                environment = work / 'workflow-environment'
+                environment.write_bytes(b'PREVIOUS=value\n')
+                notes = work / 'peerbrush-site-notes.json'
+                if name == 'existing-notes': notes.write_bytes(b'Preserve previous public review input')
+                with mock.patch.dict(os.environ, dict(SITE_SELECTION=raw, RUNNER_TEMP=str(work), GITHUB_ENV=str(environment))), \
+                        mock.patch.object(sys, 'path', list(sys.path)), contextlib.redirect_stdout(io.StringIO()):
+                    if name == 'valid':
+                        exec(compile(code, '<actual-production-site-selection>', 'exec'), {})
+                    else:
+                        with self.assertRaises((ValueError, SystemExit, FileExistsError)):
+                            exec(compile(code, '<actual-production-site-selection>', 'exec'), {})
+                if name == 'valid':
+                    self.assertEqual(json.loads(notes.read_bytes()), {key: selected[key] for key in ['notes', 'caution']})
+                    self.assertEqual(environment.read_text(encoding='utf-8'), 'PREVIOUS=value\nSITE_COMMIT=' + selected['site_commit']
+                        + '\nFINAL_INVENTORY_SHA256=' + selected['final_inventory_sha256'] + '\n')
+                else:
+                    self.assertEqual(environment.read_bytes(), b'PREVIOUS=value\n')
+                    if name == 'existing-notes': self.assertEqual(notes.read_bytes(), b'Preserve previous public review input')
+                    else: self.assertFalse(notes.exists())
+                self.assertNotIn('PEERBRUSH_PRODUCTION_APPROVED', environment.read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':
