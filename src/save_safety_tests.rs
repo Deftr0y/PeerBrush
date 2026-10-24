@@ -1255,13 +1255,13 @@ fn buffered_source_flush_failure_and_cancel_keep_actual_native_save_and_history(
                 {
                     let mut e = shared.lock().unwrap();
                     let layer = e.doc.layers[0].id.clone();
-                    for opacity in [0.5, 0.25] {
+                    for color in [[13, 29, 53, 97], [19, 31, 61, 113]] {
                         e.edit(
                             "human",
-                            &[json!({"op":"layer.update","layer":layer,"opacity":opacity})],
+                            &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":color})],
                             None,
                             None,
-                            "Human settings before Save",
+                            "Human artwork before Save",
                         )
                         .unwrap();
                     }
@@ -1313,7 +1313,7 @@ fn buffered_source_flush_failure_and_cancel_keep_actual_native_save_and_history(
                 drop(watch);
                 assert!(
                     hit.get(),
-                    "The real guarded compressed-source file writer must be reached"
+                    "The real guarded compressed-source file writer must be reached: depth={depth}, format={extension}, cancel={cancel}: {error}"
                 );
                 assert!(
                     error.contains(if cancel {
