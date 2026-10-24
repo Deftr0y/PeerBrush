@@ -37,7 +37,7 @@ PROJECT_SIZE = (32, 24)
 DIAGNOSTIC_SCRIPTS = frozenset({
     'test_deb_version_upgrade.py', 'test_deb_installation.py', 'package.py',
     'package_deb.py', 'package_macos_dmg.py', 'prepare_site_release.py',
-    'production_readiness.py', 'verify_release.py',
+    'production_readiness.py', 'verify_release.py', 'test_deb_installed_gui.py',
 })
 
 
@@ -141,11 +141,14 @@ def historical_inputs(root, work, get=public_get):
     return archive, checked
 
 
-def png_samples(path):
-    """Strict bounded RGBA PNG8/16 decoder for this tiny generated fixture only."""
-    checksum, size = bounded_file(path, 1024 * 1024)
+def png_samples(path, *, expected_size=PROJECT_SIZE):
+    """Strict decoder for the tiny native fixture or fixed installed-window capture."""
+    if expected_size not in [PROJECT_SIZE, (1360, 900)]:
+        raise ValueError('Unexpected fixture PNG dimensions.')
+    limit = 1024 * 1024 if expected_size == PROJECT_SIZE else 8 * 1024 * 1024
+    checksum, size = bounded_file(path, limit)
     with path.open('rb') as stream:
-        data = stream.read(1024 * 1024 + 1)
+        data = stream.read(limit + 1)
     if len(data) != size or hashlib.sha256(data).hexdigest() != checksum:
         raise ValueError('Fixture PNG changed during its bounded read.')
     if data[:8] != b'\x89PNG\r\n\x1a\n':
@@ -173,7 +176,7 @@ def png_samples(path):
             break
         elif not kind[0] & 32:
             raise ValueError('Unsupported critical fixture PNG chunk.')
-    if (not ended or header is None or header[:2] != PROJECT_SIZE or header[2] not in [8, 16]
+    if (not ended or header is None or header[:2] != expected_size or header[2] not in [8, 16]
             or header[3:] != (6, 0, 0, 0)):
         raise ValueError('Expected noninterlaced native RGBA fixture PNG.')
     width, height, depth = header[:3]

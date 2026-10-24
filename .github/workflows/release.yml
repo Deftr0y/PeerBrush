@@ -135,6 +135,7 @@ jobs:
       - run: python -B scripts/test_macos_signing_producer.py
       - run: python -B scripts/test_deb.py
       - run: python -B scripts/test_deb_version_upgrade_checks.py
+      - run: python -B scripts/test_deb_installed_gui_checks.py
       - run: python -B scripts/test_macos_dmg.py
       - run: python -B scripts/test_final_macos_dmg.py
       - run: python -B scripts/test_dmg_file_identity.py
@@ -213,12 +214,13 @@ jobs:
           # Actual published portable -> current installed application; no historical DEB is invented.
           docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env PEERBRUSH_DISPOSABLE_REAL_UPGRADE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
             --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
-            bash -eu -c 'apt-get update; apt-get install -y python3 git ca-certificates xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd;
+            bash -eu -c 'apt-get update; apt-get install -y python3 git ca-certificates xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd xvfb xauth dbus-x11 libglib2.0-bin openbox wmctrl mesa-vulkan-drivers libgl1-mesa-dri;
               git init --quiet /historical-source;
               git -C /historical-source remote add origin https://github.com/Deftr0y/PeerBrush.git;
               git -C /historical-source fetch --quiet --no-tags --depth=1 origin a00cf47accde87400fad3f0fcfc5fe96fc4f5be1;
               git -C /historical-source checkout --quiet --detach FETCH_HEAD;
-              python3 -B /checks/test_deb_version_upgrade.py --old-source-root /historical-source --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/portable-to-deb.json' \
+              python3 -B /checks/test_deb_version_upgrade.py --old-source-root /historical-source --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/portable-to-deb.json
+              python3 -B /checks/test_deb_installed_gui.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installed-gui.json' \
             peerbrush-real-version-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: runner.os == 'Linux'

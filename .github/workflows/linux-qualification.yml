@@ -64,6 +64,7 @@ jobs:
       - name: Test fixed native authentication contracts without authority
         run: |
           python3 -B scripts/test_linux_qualification.py
+          python3 -B scripts/test_deb_installed_gui_checks.py
           python3 -B scripts/test_macos_qualification_attestation.py
           python3 -B scripts/test_macos_qualification_job.py
           python3 -B scripts/test_windows_qualification.py
@@ -163,11 +164,14 @@ jobs:
             -e VERSION="$VERSION" -e SOURCE_COMMIT="$SELECTED_COMMIT" -e DEB_SHA="$DEB_SHA" \
             -e EXECUTABLE_SHA="$EXECUTABLE_SHA" -e SOURCE_SHA="$SOURCE_SHA" ubuntu:24.04 bash -euc '
               apt-get update -qq
-              apt-get install -y --no-install-recommends python3 git ca-certificates xdg-utils
+              apt-get install -y --no-install-recommends python3 git ca-certificates xdg-utils xvfb xauth dbus-x11 libglib2.0-bin openbox wmctrl mesa-vulkan-drivers libgl1-mesa-dri
               git config --global --add safe.directory /old-source
               python3 -B /checks/test_deb_version_upgrade.py --old-source-root /old-source \
                 --package /input/peerbrush_${VERSION}-1_amd64.deb --package-sha256 "$DEB_SHA" --commit "$SOURCE_COMMIT" --version "$VERSION" \
-                --executable-sha256 "$EXECUTABLE_SHA" --source-sha256 "$SOURCE_SHA" --output /evidence/portable-to-deb.json'
+                --executable-sha256 "$EXECUTABLE_SHA" --source-sha256 "$SOURCE_SHA" --output /evidence/portable-to-deb.json
+              python3 -B /checks/test_deb_installed_gui.py --package /input/peerbrush_${VERSION}-1_amd64.deb --package-sha256 "$DEB_SHA" \
+                --commit "$SOURCE_COMMIT" --version "$VERSION" --executable-sha256 "$EXECUTABLE_SHA" \
+                --source-sha256 "$SOURCE_SHA" --output /evidence/installed-gui.json'
           INSTALL_SHA=$(sha256sum "$EVIDENCE/installation.json" | cut -d ' ' -f 1)
           UPGRADE_SHA=$(sha256sum "$EVIDENCE/portable-to-deb.json" | cut -d ' ' -f 1)
           python3 -B scripts/qualify_linux_deb.py --source-root "$GITHUB_WORKSPACE" \

@@ -148,6 +148,8 @@
     "scripts/test_ci_diagnostics.py",
     "scripts/test_deb.py",
     "scripts/test_deb_installation.py",
+    "scripts/test_deb_installed_gui.py",
+    "scripts/test_deb_installed_gui_checks.py",
     "scripts/test_deb_version_upgrade.py",
     "scripts/test_deb_version_upgrade_checks.py",
     "scripts/test_dmg_file_identity.py",
