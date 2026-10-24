@@ -205,6 +205,11 @@ trait Verifier {
         runtime: bool,
         control: &Control,
     ) -> Result<Option<Target>>;
+    // A current archive is verified independently against the running package,
+    // never admitted as a newer download/staging target.
+    fn current_media(&self, _: &Held, _: &Policy, _: &Source, _: &Control) -> Result<Target> {
+        Err(STAGE_HOLD.into())
+    }
     fn running_target(&self, _: &Policy, _: &Target, _: &Control) -> Result<RunningTarget> {
         Err(STAGE_HOLD.into())
     }
@@ -743,6 +748,38 @@ impl RetainedSelection {
         Ok(())
     }
 }
+// This borrowed proof keeps the actual signed archive, retained media/parent
+// handles and actual running-file proof alive together. It is not serializable
+// and grants no application, registration, health or rollback authority.
+struct CurrentArchive<'a> {
+    retained: &'a RetainedSelection,
+    running: RunningTarget,
+}
+impl CurrentArchive<'_> {
+    fn check(&self, policy: &Policy, verifier: &dyn Verifier, control: &Control) -> Result<()> {
+        self.retained
+            .check_target(&self.running, policy, verifier, control)
+    }
+}
+fn current_archive<'a>(
+    retained: &'a RetainedSelection,
+    current: &Source,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<CurrentArchive<'a>> {
+    let target = retained.target.as_ref().ok_or(STAGE_HOLD)?;
+    if !target.matches(current, policy) || target.version != retained.prepared.selection.version {
+        return Err(STAGE_HOLD.into());
+    }
+    let running = verifier.running_target(policy, target, control)?;
+    if &running.current != current {
+        return Err(STAGE_HOLD.into());
+    }
+    let proof = CurrentArchive { retained, running };
+    proof.check(policy, verifier, control)?;
+    Ok(proof)
+}
 fn reconcile(
     root: &Path,
     policy: &Policy,
@@ -806,7 +843,7 @@ fn authenticate_original(
                 .into(),
         );
     }
-    let retained = authenticate_media(input, policy, verifier, control)?;
+    let retained = authenticate_media(input, policy, verifier, None, control)?;
     retained.check(verifier, control)?;
     control.check()?;
     Ok(retained)
@@ -815,6 +852,7 @@ fn authenticate_media(
     input: (Directory, Held, Prepared),
     policy: &Policy,
     verifier: &dyn Verifier,
+    current: Option<&Source>,
     control: &Control,
 ) -> Result<RetainedSelection> {
     let (owned, journal, prepared) = input;
@@ -832,7 +870,11 @@ fn authenticate_media(
         return Err("Pending Windows media changed.".into());
     }
     control.phase("Revalidating retained signed Windows media", 0)?;
-    let target = verifier.media(&package, policy, &prepared.selection, false, control)?;
+    let target = if let Some(current) = current {
+        Some(verifier.current_media(&package, policy, current, control)?)
+    } else {
+        verifier.media(&package, policy, &prepared.selection, false, control)?
+    };
     verifier.media(&runtime, policy, &prepared.selection, true, control)?;
     for file in [&journal, &descriptor_file, &package, &runtime] {
         file.check(control)?;
@@ -1343,23 +1385,14 @@ fn inspect_retained(
         let input = read_prepared(selected, policy, control)?;
         let selected_running = current != input.2.source;
         let retained = if selected_running {
-            authenticate_media(input, policy, verifier, control)?
+            authenticate_media(input, policy, verifier, Some(&current), control)?
         } else {
             authenticate_original(input, policy, verifier, control)?
         };
         let running = if selected_running {
-            let target = retained.target.as_ref().ok_or(STAGE_HOLD)?;
-            if !target.matches(&current, policy)
-                || target.version != retained.prepared.selection.version
-            {
-                return Err(STAGE_HOLD.into());
-            }
-            let running = verifier.running_target(policy, target, control)?;
-            if running.current != current {
-                return Err(STAGE_HOLD.into());
-            }
-            retained.check_target(&running, policy, verifier, control)?;
-            Some(running)
+            // Observation consumes the running member only; retained continues
+            // owning the verified current archive through every final recheck.
+            Some(current_archive(&retained, &current, policy, verifier, control)?.running)
         } else {
             None
         };

@@ -135,6 +135,33 @@ impl super::Verifier for Verifier {
         file.check(control)?;
         Ok(target)
     }
+    fn current_media(
+        &self,
+        file: &Held,
+        policy: &Policy,
+        current: &Source,
+        control: &Control,
+    ) -> Result<Target> {
+        if !ENABLED {
+            return Err(DISABLED.into());
+        }
+        control.check()?;
+        if &self.source(policy)? != current {
+            return Err(STAGE_HOLD.into());
+        }
+        file.check(control)?;
+        let target = unsafe { verify_version(file, policy, current.version, false, control)? }
+            .ok_or(STAGE_HOLD)?;
+        if !target.matches(current, policy) {
+            return Err(STAGE_HOLD.into());
+        }
+        file.check(control)?;
+        if &self.source(policy)? != current {
+            return Err(STAGE_HOLD.into());
+        }
+        control.check()?;
+        Ok(target)
+    }
     fn running_target(
         &self,
         policy: &Policy,
@@ -509,13 +536,13 @@ fn canonical(xml: &str) -> Result<Vec<String>> {
     }
     Ok(result)
 }
-fn manifest(bytes: &[u8], policy: &Policy, selected: &Selection) -> Result<()> {
+fn manifest(bytes: &[u8], policy: &Policy, expected_version: [u16; 4]) -> Result<()> {
     let actual = std::str::from_utf8(bytes).map_err(|_| "Invalid native package manifest text.")?;
     let expected = include_str!("../../../packaging/msix/AppxManifest.xml.in")
         .replace("{{IDENTITY_NAME}}", &policy.name)
         .replace("{{PUBLISHER}}", &policy.publisher)
         .replace("{{PUBLISHER_DISPLAY_NAME}}", &policy.publisher_display)
-        .replace("{{VERSION}}", &version_text(selected.version))
+        .replace("{{VERSION}}", &version_text(expected_version))
         .replace(
             "{{FILE_TYPES}}",
             "<uap:FileType>.psd</uap:FileType><uap:FileType>.psb</uap:FileType>",
@@ -530,6 +557,25 @@ unsafe fn verify(
     file: &Held,
     policy: &Policy,
     selected: &Selection,
+    runtime: bool,
+    control: &Control,
+) -> Result<Option<Target>> {
+    verify_version(
+        file,
+        policy,
+        if runtime {
+            selected.runtime_version
+        } else {
+            selected.version
+        },
+        runtime,
+        control,
+    )
+}
+unsafe fn verify_version(
+    file: &Held,
+    policy: &Policy,
+    expected_version: [u16; 4],
     runtime: bool,
     control: &Control,
 ) -> Result<Option<Target>> {
@@ -578,10 +624,10 @@ unsafe fn verify(
         (
             &policy.runtime_name,
             &policy.runtime_publisher,
-            selected.runtime_version,
+            expected_version,
         )
     } else {
-        (&policy.name, &policy.publisher, selected.version)
+        (&policy.name, &policy.publisher, expected_version)
     };
     let packed = version.into_iter().fold(0u64, |v, n| v << 16 | n as u64);
     if string(id.GetName())? != *name
@@ -607,7 +653,7 @@ unsafe fn verify(
             return Err("The selected framework adds unreviewed package dependencies.".into());
         }
     } else {
-        manifest(&manifest_bytes, policy, selected)?;
+        manifest(&manifest_bytes, policy, expected_version)?;
     }
     let blockmap = native(reader.GetBlockMap())?;
     if native(native(blockmap.GetHashMethod())?.GetAbsoluteUri())?.to_string()
@@ -680,8 +726,8 @@ unsafe fn verify(
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "Invalid signed release metadata.")?;
         let commit = value["commit"].as_str().unwrap_or_default();
-        let application = if selected.version[0] == 1 && selected.version[3] == 0 {
-            format!("0.{}.{}", selected.version[1], selected.version[2])
+        let application = if expected_version[0] == 1 && expected_version[3] == 0 {
+            format!("0.{}.{}", expected_version[1], expected_version[2])
         } else {
             return Err("Unsupported signed application/package version mapping.".into());
         };
@@ -725,7 +771,7 @@ unsafe fn verify(
         }
         Some(Target {
             full_name: string(id.GetPackageFullName())?,
-            version: selected.version,
+            version: expected_version,
             build: commit.into(),
             executable,
             source_name: archive.into(),
@@ -761,7 +807,17 @@ mod tests {
                 "{{FILE_TYPES}}",
                 "<uap:FileType>.psd</uap:FileType><uap:FileType>.psb</uap:FileType>",
             );
-        assert!(manifest(xml.as_bytes(), &policy, &selected).is_ok());
+        assert!(manifest(xml.as_bytes(), &policy, selected.version).is_ok());
+        let current = xml.replace("1.30.1.0", "1.30.0.0");
+        assert!(manifest(current.as_bytes(), &policy, [1, 30, 0, 0]).is_ok());
+        assert!(manifest(current.as_bytes(), &policy, selected.version).is_err());
+        for bad in [
+            current.replace("runFullTrust", "packageManagement"),
+            current.replace(".psb", ".png"),
+            current.replace(&policy.publisher, "CN=Foreign"),
+        ] {
+            assert!(manifest(bad.as_bytes(), &policy, [1, 30, 0, 0]).is_err());
+        }
         for bad in [
             xml.replace("runFullTrust", "packageManagement"),
             xml.replace("defer", "default"),
@@ -769,7 +825,7 @@ mod tests {
             xml.replace(".psb", ".png"),
             xml.replace("MinVersion=\"10.0.19041.0\"", "MinVersion=\"10.0.26100.0\""),
         ] {
-            assert!(manifest(bad.as_bytes(), &policy, &selected).is_err());
+            assert!(manifest(bad.as_bytes(), &policy, selected.version).is_err());
         }
         unsafe {
             assert!(sha256_oid(b"2.16.840.1.101.3.4.2.1\0".as_ptr()));

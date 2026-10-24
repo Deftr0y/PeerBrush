@@ -1410,6 +1410,9 @@ struct RunningNative {
     proof: bool,
     source_calls: AtomicUsize,
     change_after: usize,
+    current_media_calls: AtomicUsize,
+    new_main_calls: AtomicUsize,
+    archive_fault: &'static str,
 }
 impl RunningNative {
     fn new(root: &Path) -> Self {
@@ -1432,6 +1435,9 @@ impl RunningNative {
             proof: true,
             source_calls: AtomicUsize::new(0),
             change_after: usize::MAX,
+            current_media_calls: AtomicUsize::new(0),
+            new_main_calls: AtomicUsize::new(0),
+            archive_fault: "none",
         }
     }
 }
@@ -1451,8 +1457,44 @@ impl Verifier for RunningNative {
         runtime: bool,
         control: &Control,
     ) -> Result<Option<Target>> {
+        if !runtime {
+            self.new_main_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let verified = NativeFake::new().media(file, policy, selection, runtime, control)?;
         Ok(if self.proof { verified } else { None })
+    }
+    fn current_media(
+        &self,
+        file: &Held,
+        policy: &Policy,
+        current: &Source,
+        control: &Control,
+    ) -> Result<Target> {
+        self.current_media_calls.fetch_add(1, Ordering::Relaxed);
+        file.check(control)?;
+        if !self.proof
+            || self.archive_fault == "signature"
+            || file.media.sha256 != hash(b"main-native-bytes")
+        {
+            return Err("Synthetic current signature or signed payload rejected".into());
+        }
+        if &self.source(policy)? != current {
+            return Err(STAGE_HOLD.into());
+        }
+        let mut target = selected_target();
+        match self.archive_fault {
+            "manifest-version" => target.version[2] += 1,
+            "signed-build" => target.build = "9".repeat(40),
+            "full-name" => target.full_name.push_str("-foreign"),
+            "signed-executable" => target.executable.sha256 = "9".repeat(64),
+            "signed-source" => target.source.sha256 = "9".repeat(64),
+            _ => {}
+        }
+        if !target.matches(current, policy) {
+            return Err(STAGE_HOLD.into());
+        }
+        file.check(control)?;
+        Ok(target)
     }
     fn running_target(
         &self,
@@ -1814,4 +1856,192 @@ fn startup_reconciliation_retains_default_profile_and_cancel_cannot_promote_late
     assert!(disabled.start_reconciliation().is_err());
     assert!(disabled.deployment_blocker().is_none() && !disabled.view.busy);
     assert!(!temp.0.join("windows-prepared").exists());
+}
+
+#[test]
+fn current_signed_archive_uses_the_actual_selected_consumer_without_new_target_admission() {
+    for recorded in [false, true] {
+        let temp = Temp::new();
+        let root = temp.0.join("windows-prepared");
+        let attempt = if recorded {
+            completed_stage(&root)
+        } else {
+            fs::create_dir(&root).unwrap();
+            acquire(
+                &root,
+                &policy(),
+                &HttpFake::new(),
+                &NativeFake::new(),
+                &control(),
+            )
+            .unwrap();
+            stage_attempt(&root)
+        };
+        let native = RunningNative::new(&temp.0.join("current-installed"));
+        let archive = fs::read(attempt.join("main.msix")).unwrap();
+        assert!(matches!(
+            inspect_retained(&root, &policy(), &native, &control()).unwrap(),
+            Reconciled::SelectedTargetRunning([1, 30, 1, 0])
+        ));
+        assert_eq!(native.current_media_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            native.new_main_calls.load(Ordering::Relaxed),
+            0,
+            "The current archive must not be verified twice or admitted by the newer-target path"
+        );
+        assert_eq!(fs::read(attempt.join("main.msix")).unwrap(), archive);
+        assert!(descriptor(&xml(), &policy(), &native.current).is_err());
+        assert!(reconcile(&attempt, &policy(), &native, &control()).is_err());
+        let network = HttpFake {
+            files: BTreeMap::new(),
+            calls: Mutex::new(vec![]),
+        };
+        assert!(acquire(&root, &policy(), &network, &native, &control()).is_err());
+        assert!(network.calls.lock().unwrap().is_empty());
+        assert!(stage(
+            &root,
+            &policy(),
+            &native,
+            &FaultStage("submit-error"),
+            &control()
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn current_archive_signature_manifest_identity_and_signed_payload_mismatches_remain_unknown() {
+    for fault in [
+        "signature",
+        "manifest-version",
+        "signed-build",
+        "full-name",
+        "signed-executable",
+        "signed-source",
+    ] {
+        let temp = Temp::new();
+        let root = temp.0.join("windows-prepared");
+        let attempt = completed_stage(&root);
+        let before: Vec<_> = [
+            "prepared.json",
+            "main.msix",
+            "runtime.appx",
+            "selected.appinstaller",
+            "stage-intent.json",
+            "stage-outcome.json",
+        ]
+        .into_iter()
+        .map(|name| (name, fs::read(attempt.join(name)).unwrap()))
+        .collect();
+        let mut native = RunningNative::new(&temp.0.join("current-installed"));
+        native.archive_fault = fault;
+        assert!(
+            inspect_retained(&root, &policy(), &native, &control()).is_err(),
+            "{fault}"
+        );
+        assert_eq!(native.current_media_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 0);
+        for (name, bytes) in before {
+            assert_eq!(
+                fs::read(attempt.join(name)).unwrap(),
+                bytes,
+                "{fault}: {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn current_archive_proof_keeps_real_held_media_and_rejects_restamped_or_replaced_bytes() {
+    for replacement in [false, true] {
+        let temp = Temp::new();
+        let root = temp.0.join("windows-prepared");
+        let attempt = completed_stage(&root);
+        let native = RunningNative::new(&temp.0.join("current-installed"));
+        let c = control();
+        let current = native.source(&policy()).unwrap();
+        let retained = authenticate_media(
+            read_prepared(&attempt, &policy(), &c).unwrap(),
+            &policy(),
+            &native,
+            Some(&current),
+            &c,
+        )
+        .unwrap();
+        let proof = current_archive(&retained, &current, &policy(), &native, &c).unwrap();
+        let path = attempt.join("main.msix");
+        let original = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        #[cfg(unix)]
+        {
+            if replacement {
+                fs::rename(&path, attempt.join("held-current-original.msix")).unwrap();
+                fs::write(&path, &original).unwrap();
+            } else {
+                let mut altered = original.clone();
+                altered[0] ^= 1;
+                fs::write(&path, &altered).unwrap();
+            }
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().len(), original.len() as u64);
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            assert!(proof.check(&policy(), &native, &c).is_err());
+        }
+        #[cfg(windows)]
+        {
+            if replacement {
+                assert!(fs::rename(&path, attempt.join("held-current-original.msix")).is_err());
+            } else {
+                let mut altered = original.clone();
+                altered[0] ^= 1;
+                assert!(fs::write(&path, &altered).is_err());
+                assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
+            }
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            proof.check(&policy(), &native, &c).unwrap();
+        }
+        assert!(
+            attempt.join("stage-intent.json").exists()
+                && attempt.join("stage-outcome.json").exists()
+        );
+    }
+}
+
+#[test]
+fn current_archive_reopen_rejects_same_size_restamped_content_before_native_acceptance() {
+    let temp = Temp::new();
+    let root = temp.0.join("windows-prepared");
+    let attempt = completed_stage(&root);
+    let native = RunningNative::new(&temp.0.join("current-installed"));
+    let path = attempt.join("main.msix");
+    let original = fs::read(&path).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut altered = original.clone();
+    altered[0] ^= 1;
+    fs::write(&path, &altered).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), original.len() as u64);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    assert!(inspect_retained(&root, &policy(), &native, &control()).is_err());
+    assert_eq!(
+        native.current_media_calls.load(Ordering::Relaxed),
+        0,
+        "Retained bytes must match the actual Prepared digest before native trust"
+    );
+    assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(fs::read(&path).unwrap(), altered);
+    assert!(
+        attempt.join("stage-intent.json").exists() && attempt.join("stage-outcome.json").exists()
+    );
 }
