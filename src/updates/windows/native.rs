@@ -96,7 +96,6 @@ impl super::Verifier for Verifier {
             || !commit
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || association != policy.descriptor
             || native(id.Name())?.to_string() != policy.name
             || native(id.Publisher())?.to_string() != policy.publisher
             || native(id.FamilyName())?.to_string() != policy.family
@@ -105,7 +104,7 @@ impl super::Verifier for Verifier {
                 "Installed Windows source, identity or approved association differs.".into(),
             );
         }
-        Ok(Source {
+        let source = Source {
             full_name: native(id.FullName())?.to_string(),
             family: policy.family.clone(),
             version: [
@@ -116,7 +115,9 @@ impl super::Verifier for Verifier {
             ],
             association,
             build: commit.into(),
-        })
+        };
+        policy.source_descriptor(&source)?;
+        Ok(source)
     }
     fn media(
         &self,

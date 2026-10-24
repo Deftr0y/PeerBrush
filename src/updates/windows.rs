@@ -34,7 +34,6 @@ fn configured() -> Option<Policy> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Policy {
-    descriptor: String,
     discovery: String,
     archive_root: String,
     name: String,
@@ -102,7 +101,7 @@ impl Target {
             && current.version == self.version
             && current.build == self.build
             && current.family == policy.family
-            && current.association == policy.descriptor
+            && policy.source_descriptor(current).is_ok()
     }
 }
 struct RunningTarget {
@@ -323,15 +322,12 @@ impl Policy {
     fn validate(&self) -> Result<()> {
         let archive = https(&self.archive_root)?;
         let discovery = https(&self.discovery)?;
-        self.archive_uri(&self.descriptor)?;
         https(&self.runtime_uri)?;
         if !archive.path().ends_with('/')
             || discovery.origin() != archive.origin()
             || !discovery
                 .path()
                 .ends_with("/PeerBrush-Windows-x64.appinstaller")
-            || self.discovery == self.descriptor
-            || !self.descriptor.ends_with(".appinstaller")
             || !self.runtime_uri.ends_with(".appx")
             || !sha(&self.certificate)
             || !sha(&self.runtime_certificate)
@@ -351,6 +347,26 @@ impl Policy {
             return Err("Public Windows distribution policy is incomplete.".into());
         }
         Ok(())
+    }
+    fn source_descriptor(&self, source: &Source) -> Result<url::Url> {
+        let uri = self.archive_uri(&source.association)?;
+        if source.family != self.family
+            || source.version[0] != 1
+            || source.version[3] != 0
+            || source.build.len() != 40
+            || !source
+                .build
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || source.association == self.discovery
+            || !uri.path().ends_with(&format!(
+                "/PeerBrush-{}-Windows-x64.appinstaller",
+                version_text(source.version)
+            ))
+        {
+            return Err("This installed Windows source or immutable association changed.".into());
+        }
+        Ok(uri)
     }
     fn archive_uri(&self, value: &str) -> Result<url::Url> {
         let uri = https(value)?;
@@ -392,16 +408,7 @@ fn descriptor_for(
     role: MediaRole,
 ) -> Result<Selection> {
     policy.validate()?;
-    if source.family != policy.family
-        || source.association != policy.descriptor
-        || source.build.len() != 40
-        || !source
-            .build
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err("This installed Windows source or association changed.".into());
-    }
+    policy.source_descriptor(source)?;
     if bytes.is_empty() || bytes.len() as u64 > SMALL || !bytes.is_ascii() || bytes.contains(&b'&')
     {
         return Err("Unsupported App Installer descriptor.".into());
@@ -804,7 +811,9 @@ impl RetainedSelection {
         self.check_media(control)?;
         let target = self.target.as_ref().ok_or(STAGE_HOLD)?;
         running.check_files(target, control)?;
-        if !target.matches(&running.current, policy) || verifier.source(policy)? != running.current
+        if !target.matches(&running.current, policy)
+            || running.current.association != self.prepared.selection.descriptor
+            || verifier.source(policy)? != running.current
         {
             return Err(STAGE_HOLD.into());
         }
@@ -1063,6 +1072,7 @@ fn prepare_for(
         }
     }
     let source = verifier.source(policy)?;
+    policy.source_descriptor(&source)?;
     let discovery = if role == MediaRole::New {
         Some(download(
             transport,
@@ -1081,7 +1091,7 @@ fn prepare_for(
         .transpose()?;
     let descriptor_uri = selected
         .as_ref()
-        .map_or(policy.descriptor.as_str(), |s| s.descriptor.as_str());
+        .map_or(source.association.as_str(), |s| s.descriptor.as_str());
     let descriptor_file = download(
         transport,
         descriptor_uri,

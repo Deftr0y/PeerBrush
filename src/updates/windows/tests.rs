@@ -21,8 +21,6 @@ impl Drop for Temp {
 }
 pub(super) fn policy() -> Policy {
     Policy {
-        descriptor: "https://example.invalid/windows/PeerBrush-1.30.0.0-Windows-x64.appinstaller"
-            .into(),
         discovery: "https://example.invalid/stable/PeerBrush-Windows-x64.appinstaller".into(),
         archive_root: "https://example.invalid/windows/".into(),
         name: "PeerBrush.Synthetic".into(),
@@ -41,7 +39,8 @@ fn source() -> Source {
         full_name: "PeerBrush.Synthetic_1.30.0.0_x64__abc123".into(),
         family: policy().family,
         version: [1, 30, 0, 0],
-        association: policy().descriptor,
+        association: "https://example.invalid/windows/PeerBrush-1.30.0.0-Windows-x64.appinstaller"
+            .into(),
         build: "1".repeat(40),
     }
 }
@@ -82,7 +81,7 @@ struct HttpFake {
 impl HttpFake {
     fn new() -> Self {
         let files = [
-            (policy().descriptor, xml()),
+            (source().association, xml()),
             (policy().discovery, xml()),
             (new_descriptor(), xml()),
             (
@@ -215,6 +214,84 @@ fn strict_descriptor_rejects_downgrade_extra_settings_foreign_identity_and_uri_b
     let mut s = source();
     s.build = "unknown".into();
     assert!(descriptor(&xml(), &policy(), &s).is_err());
+}
+
+#[test]
+fn current_association_follows_the_actual_version_without_changing_distribution_policy() {
+    let temp = Temp::new();
+    let root = temp.0.join("windows-prepared");
+    let native = RunningNative::new(&temp.0.join("installed"));
+    let http = HttpFake::new();
+    capture_current_only(&root, &policy(), &http, &native, &control()).unwrap();
+    assert_eq!(
+        *http.calls.lock().unwrap(),
+        vec![
+            new_descriptor(),
+            "https://example.invalid/windows/PeerBrush-1.30.1.0.msix".into(),
+            policy().runtime_uri,
+        ]
+    );
+    assert_eq!(native.current_media_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 0);
+    let retained = read_prepared_for(
+        &captured_current(&root),
+        &policy(),
+        &control(),
+        MediaRole::Current,
+    )
+    .unwrap();
+    assert_eq!(retained.2.source, native.current);
+    assert_eq!(retained.2.selection.descriptor, new_descriptor());
+    assert!(!ENABLED && configured().is_none());
+}
+
+#[test]
+fn invalid_installed_associations_refuse_before_network_or_native_media() {
+    for association in [
+        source().association,
+        policy().discovery,
+        new_descriptor().replace("example.invalid", "foreign.invalid"),
+        new_descriptor().replace("/windows/", "/elsewhere/"),
+        new_descriptor().replace("1.30.1.0", "1.030.1.0"),
+        new_descriptor() + "?token=private",
+        new_descriptor().replace("https:", "http:"),
+    ] {
+        let temp = Temp::new();
+        let mut native = RunningNative::new(&temp.0.join("installed"));
+        native.current.association = association;
+        let http = HttpFake::new();
+        assert!(capture_current_only(
+            &temp.0.join("windows-prepared"),
+            &policy(),
+            &http,
+            &native,
+            &control(),
+        )
+        .is_err());
+        assert!(http.calls.lock().unwrap().is_empty());
+        assert_eq!(native.current_media_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn selected_running_association_must_equal_the_retained_immutable_descriptor() {
+    let temp = Temp::new();
+    let cache = temp.0.join("windows-prepared");
+    let attempt = completed_stage(&cache);
+    let original = fs::read(attempt.join("prepared.json")).unwrap();
+    let outcome = fs::read(attempt.join("stage-outcome.json")).unwrap();
+    let mut native = RunningNative::new(&temp.0.join("installed"));
+    native.current.association = new_descriptor().replace("/windows/", "/windows/other/");
+    assert!(policy().source_descriptor(&native.current).is_ok());
+    assert!(inspect_retained(&cache, &policy(), &native, &control()).is_err());
+    assert_eq!(fs::read(attempt.join("prepared.json")).unwrap(), original);
+    assert_eq!(fs::read(attempt.join("stage-outcome.json")).unwrap(), outcome);
+    native.current.association = new_descriptor();
+    assert!(matches!(
+        inspect_retained(&cache, &policy(), &native, &control()).unwrap(),
+        Reconciled::SelectedTargetRunning([1, 30, 1, 0])
+    ));
 }
 
 #[test]
@@ -1400,6 +1477,7 @@ impl Verifier for SelectedSource {
         current.version = [1, 30, 1, 0];
         current.full_name = "PeerBrush.Synthetic_1.30.1.0_x64__abc123".into();
         current.build = "2".repeat(40);
+        current.association = new_descriptor();
         Ok(current)
     }
     fn media(
@@ -1439,6 +1517,7 @@ impl RunningNative {
         current.full_name = target.full_name;
         current.version = target.version;
         current.build = target.build;
+        current.association = new_descriptor();
         Self {
             root: root.into(),
             executing: root.join("peerbrush.exe"),
@@ -2081,7 +2160,7 @@ fn current_http() -> HttpFake {
         .replace("1.30.1.0", "1.30.0.0")
         .into_bytes();
     http.files
-        .insert(policy().descriptor, (bytes.clone(), bytes.len() as u64));
+        .insert(source().association, (bytes.clone(), bytes.len() as u64));
     http.files.insert(
         "https://example.invalid/windows/PeerBrush-1.30.0.0.msix".into(),
         (b"main-native-bytes".to_vec(), 17),
@@ -2103,7 +2182,7 @@ fn stable_new_and_immutable_current_routes_work_without_an_opportunistic_prior_c
     assert_eq!(
         *http.calls.lock().unwrap(),
         vec![
-            policy().descriptor,
+            source().association,
             "https://example.invalid/windows/PeerBrush-1.30.0.0.msix".into(),
             policy().runtime_uri,
             policy().discovery,
@@ -2260,7 +2339,7 @@ fn changed_immutable_association_refuses_initial_capture_before_package_io_and_c
         capture_current_only(&root, &policy(), &http, &native, &control()).unwrap_err(),
         CURRENT_MISSING
     );
-    assert_eq!(*http.calls.lock().unwrap(), vec![policy().descriptor]);
+    assert_eq!(*http.calls.lock().unwrap(), vec![source().association]);
     assert_eq!(native.current_media_calls.load(Ordering::Relaxed), 0);
     assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 0);
     assert!(!root.exists());
