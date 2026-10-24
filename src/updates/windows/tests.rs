@@ -286,7 +286,10 @@ fn selected_running_association_must_equal_the_retained_immutable_descriptor() {
     assert!(policy().source_descriptor(&native.current).is_ok());
     assert!(inspect_retained(&cache, &policy(), &native, &control()).is_err());
     assert_eq!(fs::read(attempt.join("prepared.json")).unwrap(), original);
-    assert_eq!(fs::read(attempt.join("stage-outcome.json")).unwrap(), outcome);
+    assert_eq!(
+        fs::read(attempt.join("stage-outcome.json")).unwrap(),
+        outcome
+    );
     native.current.association = new_descriptor();
     assert!(matches!(
         inspect_retained(&cache, &policy(), &native, &control()).unwrap(),
