@@ -39,6 +39,41 @@ DIAGNOSTIC_SCRIPTS = frozenset({
     'package_deb.py', 'package_macos_dmg.py', 'prepare_site_release.py',
     'production_readiness.py', 'verify_release.py', 'test_deb_installed_gui.py',
 })
+GUI_PHASES = frozenset({'python-entry', 'imports-ready', 'environment', 'fixture-readback',
+    'installed-identity', 'window-manager-start', 'native-artwork-copy', 'desktop-launch',
+    'projects-and-native-oracles', 'profile-and-close', 'restart-and-native-oracles',
+    'restart-close', 'result-publication'})
+
+
+def _gui_child_progress(stderr, kinds):
+    """Bounded child-reported phase/bootstrap facts, never raw traceback text."""
+    if type(stderr) not in (str, bytes) or len(stderr) > 65536:
+        return None
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode('utf-8', errors='replace')
+    lines = stderr.splitlines()
+    prefix = 'PeerBrushInstalledGuiPhaseV1 '
+    phases = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    if len(phases) > 64 or any(phase not in GUI_PHASES for phase in phases):
+        return None
+    result = ['phase=' + phases[-1]] if phases else []
+    if lines.count('Traceback (most recent call last):') == 1:
+        scripts = Path(__file__).resolve().parent
+        allowed = {os.path.normcase(str(scripts / name)): name for name in DIAGNOSTIC_SCRIPTS}
+        frames = []
+        for line in lines:
+            match = re.fullmatch(r'  File "([^"\x00]+)", line ([1-9][0-9]{0,5})(?:, in .*)?', line)
+            if match is not None:
+                script = allowed.get(os.path.normcase(match[1]))
+                if script is not None:
+                    frames.append((script, match[2]))
+        if any(name == 'test_deb_installed_gui.py' for name, _ in frames):
+            last = next((line for line in reversed(lines) if line.strip()), '')
+            kind = last.partition(':')[0]
+            kind = kind if kind in kinds.values() else 'OtherError'
+            name, line = frames[-1]
+            result.append('bootstrap=' + kind + ' at ' + name + ':' + line)
+    return ', '.join(result) if result else None
 
 
 def _child_failure_diagnostic(stderr, kinds):
@@ -77,7 +112,8 @@ def failure_diagnostic(error):
         PermissionError: 'PermissionError', OSError: 'OSError', RuntimeError: 'RuntimeError',
         subprocess.TimeoutExpired: 'TimeoutExpired', subprocess.CalledProcessError: 'CalledProcessError',
         json.JSONDecodeError: 'JSONDecodeError', zipfile.BadZipFile: 'BadZipFile',
-        UnicodeDecodeError: 'UnicodeDecodeError'}
+        UnicodeDecodeError: 'UnicodeDecodeError', ImportError: 'ImportError',
+        ModuleNotFoundError: 'ModuleNotFoundError', SyntaxError: 'SyntaxError', AttributeError: 'AttributeError'}
     scripts = Path(__file__).resolve().parent
     allowed = {os.path.normcase(str((scripts / name).resolve())): name for name in DIAGNOSTIC_SCRIPTS}
     records, seen = [], set()
@@ -102,6 +138,9 @@ def failure_diagnostic(error):
             child = _child_failure_diagnostic(error.stderr, kinds)
             if child is not None:
                 record += ' [child-reported: ' + child + ']'
+            progress = _gui_child_progress(error.stderr, kinds)
+            if progress is not None:
+                record += ' [gui-child-reported: ' + progress + ']'
         records.append(record)
         cause = error.__cause__
         error = cause if cause is not None else None if error.__suppress_context__ else error.__context__

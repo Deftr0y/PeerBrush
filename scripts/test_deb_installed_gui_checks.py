@@ -58,6 +58,26 @@ def screen(colors, *, thumbnails=False, only_thumbnails=False, swapped=False,
 
 
 class InstalledGuiContracts(unittest.TestCase):
+    def test_gui_progress_is_fixed_stderr_only_and_entry_precedes_optional_imports(self):
+        with mock.patch.object(gui, 'print', create=True) as output:
+            gui.gui_phase('environment')
+            output.assert_called_once_with('PeerBrushInstalledGuiPhaseV1 environment', file=gui.sys.stderr, flush=True)
+            with self.assertRaises(ValueError): gui.gui_phase('PRIVATE_ARGUMENT_OR_TOKEN')
+            self.assertEqual(output.call_count, 1)
+        tree = ast.parse(Path(gui.__file__).read_text(encoding='utf-8'))
+        entry = next(index for index, node in enumerate(tree.body) if isinstance(node, ast.If)
+                     and any(isinstance(child, ast.Constant) and child.value == 'PeerBrushInstalledGuiPhaseV1 python-entry'
+                             for child in ast.walk(node)))
+        optional_import = next(index for index, node in enumerate(tree.body) if isinstance(node, ast.Import)
+                               and any(alias.name == 'ctypes' for alias in node.names))
+        self.assertLess(entry, optional_import)
+        display = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'display_check')
+        phases = [node.args[0].value for node in ast.walk(display) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name) and node.func.id == 'gui_phase']
+        self.assertEqual(set(phases), upgrade.GUI_PHASES - {'python-entry', 'imports-ready'})
+        self.assertTrue(all(isinstance(node.args[0], ast.Constant) for node in ast.walk(display)
+                            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'gui_phase'))
+
     @unittest.skipUnless(os.name == 'posix', 'Container ownership/mode contract requires POSIX filesystems')
     def test_actual_owned_capture_persistence_overrides_restrictive_umask_inside_private_parent(self):
         tree = ast.parse(Path(gui.__file__).read_text(encoding='utf-8'))

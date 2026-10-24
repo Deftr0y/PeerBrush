@@ -277,6 +277,52 @@ class FixtureContract(unittest.TestCase):
                 error.stderr = value
                 self.assertEqual(upgrade.failure_diagnostic(error), 'Compatibility diagnostic: CalledProcessError exit=1')
 
+    def test_actual_gui_child_bootstrap_traceback_and_phase_survive_wrapper_without_private_values(self):
+        private = 'PRIVATE_TRACEBACK_ARGUMENTS_PATH_TOKEN'
+        scripts = Path(upgrade.__file__).resolve().parent
+        stderr = ('PeerBrushInstalledGuiPhaseV1 python-entry\nTraceback (most recent call last):\n'
+            '  File "' + str(scripts / 'test_deb_installed_gui.py') + '", line 15, in <module>\n'
+            '    import ' + private + '\n  File "' + str(scripts / 'package.py') + '", line 22, in <module>\n'
+            '    raise ModuleNotFoundError("' + private + '")\nModuleNotFoundError: ' + private + '\n')
+        error = subprocess.CalledProcessError(1, [private], output=private, stderr=stderr.encode())
+        expected = 'phase=python-entry, bootstrap=ModuleNotFoundError at package.py:22'
+        self.assertEqual(upgrade.failure_diagnostic(error),
+                         'Compatibility diagnostic: CalledProcessError exit=1 [gui-child-reported: ' + expected + ']')
+        with mock.patch.object(upgrade.subprocess, 'run', side_effect=error):
+            try:
+                upgrade.run([private])
+            except ValueError as caught:
+                detail = upgrade.failure_diagnostic(caught)
+            else:
+                self.fail('Actual disposable wrapper must still refuse the failed child')
+        self.assertIn('[gui-child-reported: ' + expected + ']', detail)
+        self.assertNotIn(private, detail)
+        self.assertNotIn(str(scripts), detail)
+        prefix = 'Disposable installed GUI acceptance failed. Compatibility diagnostic: '
+        error.stderr = ('PeerBrushInstalledGuiPhaseV1 environment\nPeerBrushInstalledGuiPhaseV1 fixture-readback\n'
+                        + prefix + 'ValueError at test_deb_installed_gui.py:270\n')
+        detail = upgrade.failure_diagnostic(error)
+        self.assertIn('[child-reported: ValueError at test_deb_installed_gui.py:270]', detail)
+        self.assertIn('[gui-child-reported: phase=fixture-readback]', detail)
+
+    def test_gui_progress_parser_refuses_unbounded_or_unreviewed_labels_and_private_traceback_paths(self):
+        private = 'PRIVATE_UNKNOWN_PHASE_OR_PATH'
+        error = subprocess.CalledProcessError(1, [private])
+        for stderr in ['PeerBrushInstalledGuiPhaseV1 ' + private,
+                       'PeerBrushInstalledGuiPhaseV1 python-entry\n' * 65,
+                       'PeerBrushInstalledGuiPhaseV1 python-entry\n' + private * 65536,
+                       'Traceback (most recent call last):\n  File "/' + private + '/test_deb_installed_gui.py", line 7\n'
+                       'ValueError: ' + private, None]:
+            with self.subTest(input_kind=type(stderr).__name__):
+                error.stderr = stderr
+                self.assertEqual(upgrade.failure_diagnostic(error), 'Compatibility diagnostic: CalledProcessError exit=1')
+        scripts = Path(upgrade.__file__).resolve().parent
+        error.stderr = ('Traceback (most recent call last):\n  File "'
+                        + str(scripts / 'test_deb_installed_gui.py') + '", line 20, in ' + private + '\n'
+                        + private + ': ' + private)
+        self.assertEqual(upgrade.failure_diagnostic(error),
+                         'Compatibility diagnostic: CalledProcessError exit=1 [gui-child-reported: bootstrap=OtherError at test_deb_installed_gui.py:20]')
+
     def test_nonzero_rpc_and_readiness_timeout_keep_sanitizable_causes(self):
         session = upgrade.Session(Path('/bin/peerbrush'), {}, Path('/private'), None, Path('/usr/sbin/runuser'))
         reply = subprocess.CompletedProcess([], 23, b'PRIVATE_RPC_REPLY', b'PRIVATE_STDERR')

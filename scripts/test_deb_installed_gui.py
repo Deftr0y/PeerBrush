@@ -3,6 +3,12 @@
 Only synthetic container users/displays. No physical desktop consent, release,
 signature, updater, installation-interruption or hardware acceptance is implied.
 """
+import sys
+
+if __name__ == '__main__' and '--inside-display' in sys.argv:
+    # Import failures happen before the CLI handler below; never print arguments.
+    print('PeerBrushInstalledGuiPhaseV1 python-entry', file=sys.stderr, flush=True)
+
 import argparse
 import ctypes
 from itertools import product
@@ -13,7 +19,6 @@ from pathlib import Path
 import select
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -23,7 +28,7 @@ from package_macos_dmg import bounded_file
 from production_readiness import unique_fields
 from test_deb_installation import (APP_ID, MIME, installed_identity, receipt_path,
     require_disposable, run, selected_package, validate_expected, write_receipt)
-from test_deb_version_upgrade import (Session, editable_snapshot, failure_diagnostic,
+from test_deb_version_upgrade import (GUI_PHASES, Session, editable_snapshot, failure_diagnostic,
     installed_runuser, png_samples)
 
 USER = 'peerbrush-upgrade-qa'
@@ -32,6 +37,11 @@ DESKTOP = Path('/usr/share/applications') / (APP_ID + '.desktop')
 WINDOW_SIZE = (1360, 900)
 SOURCE_SIZE = (32, 24)
 CELLS = [(depth, extension) for depth in [8, 16] for extension in ['psd', 'psb']]
+
+
+def gui_phase(name):
+    require(name in GUI_PHASES, 'Invalid fixed GUI diagnostic phase.')
+    print('PeerBrushInstalledGuiPhaseV1 ' + name, file=sys.stderr, flush=True)
 
 
 def require(value, message):
@@ -252,15 +262,19 @@ class Window:
 
 
 def display_check(fixture):
+    gui_phase('environment')
     gui_environment()
+    gui_phase('fixture-readback')
     require(fixture == QA_HOME / 'installed-gui-qa/fixture.json', 'Use the fixed private GUI fixture.')
     checksum, _ = bounded_file(fixture, 256 * 1024)
     facts = json.loads(fixture.read_bytes(), object_pairs_hook=unique_fields)
     require(digest(fixture) == checksum, 'GUI fixture changed during inspection.')
     validate_expected(facts['expected'])
+    gui_phase('installed-identity')
     installed_identity(facts['expected'], run, deb_version(facts['expected']['version']))
     work = fixture.parent
     wm_log = (work / 'window-manager.log').open('xb')
+    gui_phase('window-manager-start')
     manager = subprocess.Popen(['openbox', '--sm-disable'], stdin=subprocess.DEVNULL,
         stdout=wm_log, stderr=wm_log)
     captures, saved = [], {}
@@ -274,6 +288,7 @@ def display_check(fixture):
             time.sleep(0.1)
         else:
             raise ValueError('Isolated window manager did not become available.')
+        gui_phase('native-artwork-copy')
         paths = []
         for index, (depth, extension) in enumerate(CELLS):
             original = QA_HOME / 'artwork' / ('Legacy ' + str(depth) + '.' + extension)
@@ -285,7 +300,9 @@ def display_check(fixture):
                     'Actual Unicode PSD/PSB fixture has no installed Photoshop MIME registration.')
             paths.append(project)
         window = Window(facts, work)
+        gui_phase('desktop-launch')
         window.launch(paths)
+        gui_phase('projects-and-native-oracles')
         opened = window.projects(paths)
         require(window.rpc('tool_settings', dict(action='get', tool='brush'))['profile'] == facts['profile'],
                 'GUI default launch changed the migrated real tool preferences.')
@@ -336,6 +353,7 @@ def display_check(fixture):
                 for color in [colors[(y >= 12) * 2 + (x >= 16)]])
             require(result == (32, 24, depth, expected_pixels), 'Saved GUI raster is not the exact native quadrant result.')
             saved[path] = (editable_snapshot(window.state(project)), result)
+        gui_phase('profile-and-close')
         profile = window.rpc('tool_settings', dict(action='set', tool='brush',
             settings=dict(radius=19.25, opacity=0.625)))['profile']
         captures.append(window.capture(opened[paths[-1]]['project_id'], work / 'settings-settled.png', palette(3)))
@@ -344,6 +362,7 @@ def display_check(fixture):
         bounded_file(stored, 128 * 1024)
         profile_bytes = stored.read_bytes()
         require(json.loads(profile_bytes)['tools']['brush'] == profile, 'Normal GUI on_exit did not preserve current preferences.')
+        gui_phase('restart-and-native-oracles')
         window = Window(facts, work)
         window.launch(paths)
         restarted = window.projects(paths)
@@ -355,9 +374,11 @@ def display_check(fixture):
                     and window.export(project, work / ('restart-' + str(index) + '.png')) == saved[path][1],
                     'Installed GUI restart changed saved native/source content.')
             captures.append(window.capture(project, work / ('restart-canvas-' + str(index) + '.png'), palette(index)))
+        gui_phase('restart-close')
         window.close()
         require(stored.read_bytes() == profile_bytes, 'Unchanged GUI restart rewrote persisted preferences.')
         require(digest(DESKTOP) == facts['desktop_sha256'], 'GUI check changed the installed desktop entry.')
+        gui_phase('result-publication')
         with (work / 'result.json').open('x', encoding='utf-8') as stream:
             json.dump(dict(captures=captures, native_cells=4, graceful_restarts=1,
                 current_profile_sha256=digest(stored), native_gui='isolated-Xvfb-only', ready=False), stream)
@@ -467,6 +488,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     try:
         if args.inside_display is not None:
+            gui_phase('imports-ready')
             display_check(args.inside_display)
         else:
             require(args.package is not None and args.output is not None, 'Select the exact installed GUI candidate and private output.')
