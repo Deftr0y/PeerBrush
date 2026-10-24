@@ -1258,6 +1258,10 @@ impl Application {
                 .as_ref()
                 .is_some_and(|owner| owner.delegate.ivars().termination_inhibited.get())
     }
+    /// Cancellation alone cannot release a verification worker's profile hold.
+    pub(crate) fn profile_writer_active(&self) -> bool {
+        self.verification.is_some()
+    }
     pub(crate) fn profile_capture_pending(&self) -> bool {
         self.verification.is_some() && !self.checks.view().cancelled
     }

@@ -224,6 +224,16 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
         let release = app.updates.windows_prepared.fake_prepare();
         click_button(&mut app, &ctx, "Prepare signed Windows update", true);
         assert!(app.updates.windows_prepared.view.busy);
+        let final_preservation = std::cell::Cell::new(false);
+        assert!(app
+            .finish_update_exit(&[], |_| {
+                final_preservation.set(true);
+                Ok(())
+            })
+            .unwrap_err()
+            .contains("Windows update work remains owned"));
+        assert!(!final_preservation.get() && !app.update_exit_committed() && !app.exit_approved);
+        assert!(!app.workspace.lock().unwrap().exiting);
         assert!(
             app.update_restart_blocker().is_some(),
             "Dirty native source remains protected"

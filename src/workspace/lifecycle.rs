@@ -39,7 +39,20 @@ pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), St
 /// Future verified native installers must use this path, never a discard-capable
 /// ordinary close. The native caller must also reject unfinished UI gestures.
 pub fn finish_update_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), String> {
-    finish(workspace, reviewed, true, true, |_| Ok(()))
+    finish_update_exit_with_profile(workspace, reviewed, |_| Ok(()))
+}
+
+/// Dormant final transaction for a future authenticated native exit caller.
+/// The callback must authenticate/preserve the final profile, never invoke a
+/// native continuation while shared locks are held. Observation is not consent.
+pub(crate) fn finish_update_exit_with_profile(
+    workspace: &Registry,
+    reviewed: &[Reviewed],
+    publish: impl FnOnce(&crate::tool_settings::Store) -> Result<(), String>,
+) -> Result<(), String> {
+    finish(workspace, reviewed, true, true, |tools| {
+        publish(tools.ok_or("Tool preference writer authority is unavailable")?)
+    })
 }
 
 /// Publish a pre-native-start checkpoint under the same complete workspace,
@@ -193,7 +206,7 @@ fn finish(
     {
         return Err("The workspace changed during exit review. All projects remain open.".into());
     }
-    let tools = if update {
+    let mut tools = if update {
         Some(
             registry
                 .tool_settings
@@ -207,6 +220,11 @@ fn finish(
         tools.update_checkpoint_ready()?;
     }
     publish(tools.as_deref())?;
+    if close {
+        if let Some(tools) = tools.as_deref_mut() {
+            tools.commit_update_exit();
+        }
+    }
     drop(tools);
     if !close {
         return Ok(());

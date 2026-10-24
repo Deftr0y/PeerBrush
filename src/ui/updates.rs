@@ -341,6 +341,39 @@ impl Panel {
 }
 
 impl PeerBrush {
+    /// Component foundation only; no native observation calls this. An actual
+    /// pending native owner must remain held until final-control/recovery exists.
+    #[cfg(any(windows, target_os = "macos", test))]
+    pub(super) fn finish_update_exit(
+        &mut self,
+        reviewed: &[crate::workspace::lifecycle::Reviewed],
+        publish: impl FnOnce(&crate::tool_settings::Store) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.update_interaction_active() {
+            return Err("Finish current work before the final update exit".into());
+        }
+        #[cfg(any(windows, test))]
+        if self.updates.windows_prepared.view.busy {
+            return Err("Windows update work remains owned; wait for its actual completion".into());
+        }
+        #[cfg(target_os = "macos")]
+        if self.updates.native_updater.profile_writer_active()
+            || self.updates.native_updater.pending_installation()
+        {
+            return Err(
+                "The native update owner remains held; authenticated final exit is unavailable"
+                    .into(),
+            );
+        }
+        self.flush_update_tool_profile()?;
+        crate::workspace::lifecycle::finish_update_exit_with_profile(
+            &self.workspace,
+            reviewed,
+            publish,
+        )?;
+        self.exit_approved = true;
+        Ok(())
+    }
     #[cfg(all(test, target_os = "macos"))]
     pub(super) fn native_check_starting_for_test(&self) {
         self.updates.native_updater.native_starting_for_test();
@@ -384,6 +417,9 @@ impl PeerBrush {
     }
 
     pub(super) fn updates_tick(&mut self, ctx: &egui::Context) {
+        if self.update_exit_committed() {
+            return;
+        }
         let idle = !self.update_interaction_active()
             && !ctx.wants_keyboard_input()
             && !ctx.input(|i| i.pointer.any_down() || !i.events.is_empty());
@@ -400,6 +436,9 @@ impl PeerBrush {
             self.updates
                 .native_updater
                 .tick(ctx, &self.workspace, !idle);
+        }
+        if self.update_exit_committed() {
+            return;
         }
         self.updates.tick(ctx, idle);
     }

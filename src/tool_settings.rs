@@ -61,6 +61,7 @@ pub struct Store {
     pub error: Option<String>,
     save_error: Option<String>,
     dirty: bool,
+    update_exit_committed: bool,
 }
 impl Default for Store {
     fn default() -> Self {
@@ -95,6 +96,7 @@ impl Default for Store {
             error: None,
             save_error: None,
             dirty: false,
+            update_exit_committed: false,
         }
     }
 }
@@ -155,6 +157,7 @@ impl Store {
         expected: Option<u64>,
         persist: bool,
     ) -> Result<Snapshot, String> {
+        self.require_writer()?;
         let before = self.get(tool)?;
         if actor.trim().is_empty()
             || actor.chars().count() > 80
@@ -259,7 +262,22 @@ impl Store {
         self.save_error = None;
         Ok(())
     }
+    fn require_writer(&self) -> Result<(), String> {
+        if self.update_exit_committed {
+            return Err("Update exit committed; tool preferences remain preserved".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn update_exit_committed(&self) -> bool {
+        self.update_exit_committed
+    }
+    /// The final workspace transaction calls this only after its profile callback
+    /// succeeds, while all engine/registry/Store writer locks are still held.
+    pub(crate) fn commit_update_exit(&mut self) {
+        self.update_exit_committed = true;
+    }
     pub(crate) fn update_checkpoint_ready(&self) -> Result<(), String> {
+        self.require_writer()?;
         if self.dirty || self.save_error.is_some() {
             return Err(
                 "Finish saving tool preferences before app update checking or restart".into(),
@@ -280,6 +298,7 @@ impl Store {
         Ok(())
     }
     pub fn flush(&mut self) -> Result<(), String> {
+        self.require_writer()?;
         if !self.dirty {
             return Ok(());
         }

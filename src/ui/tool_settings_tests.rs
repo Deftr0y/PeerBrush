@@ -486,3 +486,401 @@ fn ordinary_on_exit_still_flushes_its_last_ui_delta_and_preserves_document_sourc
     assert!(!app.shared.lock().unwrap().closed);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+fn update_exit_fixture() -> (
+    PeerBrush,
+    egui::Context,
+    Vec<Shared>,
+    crate::settings::Profile,
+    PathBuf,
+) {
+    use crate::source::{Content, Source};
+    let temporary =
+        std::env::temp_dir().join(format!("peerbrush-final-writers-{}", crate::engine::id()));
+    std::fs::create_dir(&temporary).unwrap();
+    let directory = temporary.canonicalize().unwrap();
+    let legacy = directory.join("legacy");
+    std::fs::create_dir(&legacy).unwrap();
+    let profile = crate::settings::Profile::open(
+        crate::settings::Locations {
+            config: directory.join("config"),
+            data: directory.join("data"),
+            cache: directory.join("cache"),
+        },
+        &legacy,
+    )
+    .unwrap();
+    let (mut app, ctx) = super::tests::fixture();
+    app.recovery.open = false;
+    app.connection.state_dir = directory.join("runtime");
+    std::fs::create_dir(&app.connection.state_dir).unwrap();
+    let preferences = profile.locations.profile();
+    *app.tool_settings_store.lock().unwrap() =
+        crate::tool_settings::Store::load(preferences.join("tool-settings.json"));
+    app.restore_tool_profile(Tool::Brush);
+    app.updates = updates::Panel::load(&preferences);
+    app.updates
+        .set_update_profile(Some(profile.update_profile()));
+    app.shared.lock().unwrap().doc = Document::new_depth(32, 24, 8).unwrap();
+    app.selected = app.shared.lock().unwrap().doc.layers[0].id.clone();
+    let second = crate::workspace::new_project(&app.shared, 32, 24, 16, None).unwrap();
+    let projects = vec![app.shared.clone(), second];
+    crate::workspace::select_in(&app.workspace, &app.project_id).unwrap();
+    for (index, shared) in projects.iter().enumerate() {
+        let mut engine = shared.lock().unwrap();
+        let raster = engine.doc.layers[0].id.clone();
+        engine.doc.layers[0]
+            .pixels
+            .set16(25, 20, [12347, 23459, 34567, 0]);
+        let hidden = engine.doc.layers[0].pixels.get16(25, 20);
+        assert_eq!(hidden[3], 0);
+        assert!(hidden[..3].iter().any(|value| *value != 0));
+        let source = Source {
+            width: 16,
+            height: 16,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: Content::Shape {
+                shape: "rectangle".into(),
+                bounds: [1., 1., 12., 12.],
+                points: vec![],
+                closed: true,
+                fill: [12501, 23003, 34507, 45611],
+                stroke: [0; 4],
+                stroke_width: 0.,
+            },
+        };
+        engine
+            .edit(
+                "human",
+                &[json!({"op":"source.add","source":source,"x":8,"y":4})],
+                None,
+                None,
+                "Keep editable source",
+            )
+            .unwrap();
+        for x in [4, 6] {
+            engine.edit("human", &[json!({"op":"paint","layer":raster,"points":[[x,4]],"radius":1,"color":[231,73,31,255]})],None,None,"Keep native history").unwrap();
+        }
+        engine.undo("human").unwrap();
+        engine
+            .reserve(
+                "human",
+                "Keep project ownership",
+                vec![crate::engine::Scope::layer(&raster)],
+            )
+            .unwrap();
+        assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+        assert_eq!(
+            engine
+                .doc
+                .layers
+                .iter()
+                .find(|layer| layer.id == raster)
+                .unwrap()
+                .pixels
+                .get16(25, 20),
+            hidden
+        );
+        drop(engine);
+        update_exit_save(shared, &directory.join(format!("art-{index}.psd")));
+    }
+    (app, ctx, projects, profile, directory)
+}
+
+fn update_exit_save(shared: &Shared, path: &Path) {
+    let (project, document, revision) = {
+        let engine = shared.lock().unwrap();
+        (
+            engine.project_id.clone(),
+            engine.doc.id.clone(),
+            engine.doc.revision,
+        )
+    };
+    let report = server::dispatch(
+        shared,
+        "document",
+        &json!({"action":"save_report","project_id":project,
+        "document_id":document,"expected_revision":revision}),
+    )
+    .unwrap();
+    assert_eq!(report["document_id"], document);
+    assert_eq!(report["revision"], revision);
+    assert_eq!(report["save_allowed"], true);
+    assert!(report["losses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|loss| loss["code"] == "editable_source_rasterized"));
+    server::save_accepted_source(shared, path, &document, revision, false).unwrap();
+}
+
+fn update_exit_documents(projects: &[Shared]) -> Vec<Value> {
+    projects.iter().map(|shared| {
+        let engine=shared.lock().unwrap();
+        let history = |entries: &[crate::engine::History]| entries.iter().map(|entry|json!({
+            "before":entry.before,"after":entry.after,"actor":entry.actor,"label":entry.label,"task":entry.task,
+            "scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted})).collect::<Vec<_>>();
+        assert!(!engine.undo.is_empty() && !engine.redo.is_empty() && !engine.leases.is_empty());
+        assert!(engine.doc.layers.iter().any(|layer|layer.source.is_some()));
+        let raster=engine.doc.layers.iter().find(|layer|layer.source.is_none()).unwrap();
+        assert_eq!(raster.pixels.depth,engine.doc.bit_depth);
+        json!({"document":engine.doc,"png":engine.doc.export_png().unwrap(),"hidden":raster.pixels.get16(25,20),
+            "undo":history(&engine.undo),"redo":history(&engine.redo),"leases":engine.leases,
+            "saved_revision":engine.saved_revision,"path":engine.path})
+    }).collect()
+}
+
+#[test]
+fn final_update_profile_transaction_blocks_same_future_frame_on_exit_and_late_mcp_writers() {
+    let (mut app, ctx, projects, profile, directory) = update_exit_fixture();
+    let preferences = profile.locations.profile();
+    let tool_file = preferences.join("tool-settings.json");
+    let reviewed = crate::workspace::lifecycle::update_readiness(&app.workspace).unwrap();
+    let expected = update_exit_documents(&projects);
+    let files: Vec<_> = projects
+        .iter()
+        .map(|shared| {
+            let engine = shared.lock().unwrap();
+            let path = engine.path.clone().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes, engine.file_version)
+        })
+        .collect();
+    // Deferred human UI settings and a newer independent MCP delta both belong
+    // to the final bytes, before the exact shared transaction takes its locks.
+    let brush = app
+        .tool_settings_store
+        .lock()
+        .unwrap()
+        .get("brush")
+        .unwrap();
+    server::dispatch(
+        &app.shared,
+        "tool_settings",
+        &json!({"action":"set","tool":"brush","actor":"artist",
+        "expected_tool_revision":brush.revision,"settings":{"radius":43,"flow":0.29}}),
+    )
+    .unwrap();
+    app.brush.opacity = 0.61;
+    let tools = app.tool_settings_store.clone();
+    let workspace = app.workspace.clone();
+    let published = std::cell::Cell::new(false);
+    app.finish_update_exit(&reviewed, |store| {
+        assert!(projects.iter().all(|shared| shared.try_lock().is_err()));
+        assert!(workspace.try_lock().is_err() && tools.try_lock().is_err());
+        profile.update_profile().validate()?;
+        store.authenticate_update_profile(&preferences)?;
+        let current = store.get("brush")?;
+        assert_eq!(current.profile.settings.radius, 43.);
+        assert_eq!(current.profile.settings.flow, 0.29);
+        assert_eq!(current.profile.settings.opacity, 0.61);
+        assert!(!store.update_exit_committed());
+        published.set(true);
+        Ok(())
+    })
+    .unwrap();
+    assert!(published.get() && app.update_exit_committed() && app.exit_approved);
+    assert!(app.workspace.lock().unwrap().exiting);
+    assert_eq!(update_exit_documents(&projects), expected);
+    let persisted = std::fs::read(&tool_file).unwrap();
+    let preference_manifest = std::fs::read(preferences.join("profile.json")).unwrap();
+    for (shared, (path, bytes, version)) in projects.iter().zip(&files) {
+        let engine = shared.lock().unwrap();
+        assert!(engine.closed && engine.file_ownership.is_none());
+        assert_eq!(engine.file_version, *version);
+        assert_eq!(std::fs::read(path).unwrap(), *bytes);
+        assert!(crate::file_ownership::local_project(path).is_none());
+    }
+    for (method, parameters) in [
+        ("tool_settings", json!({"action":"set"})),
+        ("brushes", json!({"action":"save"})),
+        ("brushes", json!({"action":"delete"})),
+        ("filters", json!({"action":"save"})),
+        ("filters", json!({"action":"rename"})),
+        ("filters", json!({"action":"delete"})),
+        ("filters", json!({"action":"import"})),
+        ("exports", json!({"action":"save_preset"})),
+        ("exports", json!({"action":"delete_preset"})),
+    ] {
+        assert!(server::dispatch(&app.shared, method, &parameters)
+            .unwrap_err()
+            .contains("Workspace is exiting"));
+    }
+    assert!(server::FileOperation::begin_workspace(&app.workspace).is_err());
+    assert!(server::FileOperation::begin(&app.shared).is_err());
+    let recovery = directory.join("late-recovery");
+    std::fs::create_dir(&recovery).unwrap();
+    crate::recovery::checkpoint(&app.workspace, &recovery, &mut Default::default());
+    assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 0);
+    {
+        let mut store = tools.lock().unwrap();
+        let before = store.get("brush").unwrap().profile;
+        let mut after = before.clone();
+        after.settings.radius = 97.;
+        assert!(store.human_delta("brush", &before, &after).is_err());
+        assert!(store.set("brush", after, "human", None).is_err());
+        assert!(store.flush().is_err() && store.update_checkpoint_ready().is_err());
+    }
+    app.radius = 97.;
+    app.brush.opacity = 0.17;
+    app.store_current_tool_profile();
+    app.sync_tool_profile(&ctx);
+    app.exit_tool_profile();
+    // These are actual full egui frames after the same committed close. No
+    // preference dialog, native update tick, shortcut or second sync may run.
+    for time in [0.1, 0.2] {
+        let output = frame(
+            &mut app,
+            &ctx,
+            time,
+            vec![egui::Event::Key {
+                key: egui::Key::Comma,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+        );
+        assert!(output.shapes.is_empty());
+    }
+    eframe::App::on_exit(&mut app);
+    assert_eq!(std::fs::read(&tool_file).unwrap(), persisted);
+    assert_eq!(
+        std::fs::read(preferences.join("profile.json")).unwrap(),
+        preference_manifest
+    );
+    assert_eq!(update_exit_documents(&projects), expected);
+    drop(app);
+    drop(projects);
+    drop(profile);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn failed_final_update_transaction_keeps_newer_work_cancel_and_ordinary_on_exit_writable() {
+    let (mut app, ctx, projects, profile, directory) = update_exit_fixture();
+    let reviewed = crate::workspace::lifecycle::update_readiness(&app.workspace).unwrap();
+    let layer = projects[1].lock().unwrap().doc.layers[0].id.clone();
+    projects[1]
+        .lock()
+        .unwrap()
+        .edit(
+            "human",
+            &[json!({"op":"layer.update","layer":layer,"name":"Newer human work"})],
+            None,
+            None,
+            "Keep newer work",
+        )
+        .unwrap();
+    let newer = serde_json::to_value(&projects[1].lock().unwrap().doc).unwrap();
+    let invoked = std::cell::Cell::new(false);
+    assert!(app
+        .finish_update_exit(&reviewed, |_| {
+            invoked.set(true);
+            Ok(())
+        })
+        .is_err());
+    assert!(!invoked.get() && !app.update_exit_committed() && !app.exit_approved);
+    assert!(!app.workspace.lock().unwrap().exiting);
+    assert!(projects.iter().all(|shared| !shared.lock().unwrap().closed));
+    assert_eq!(
+        serde_json::to_value(&projects[1].lock().unwrap().doc).unwrap(),
+        newer
+    );
+    // The real Don't Save review is still cancelable; no update-close receipt
+    // can be manufactured from an old read or from merely requesting the exit.
+    app.request_close(lifecycle::Intent::Exit);
+    for time in [0.1, 0.2, 0.3] {
+        frame(&mut app, &ctx, time, vec![]);
+    }
+    let at = app.lifecycle.as_ref().unwrap().buttons[2].unwrap().center();
+    for (time, pressed) in [(0.4, true), (0.5, false)] {
+        frame(
+            &mut app,
+            &ctx,
+            time,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+    }
+    assert!(app.lifecycle.is_none() && !app.exit_approved);
+    assert_eq!(
+        serde_json::to_value(&projects[1].lock().unwrap().doc).unwrap(),
+        newer
+    );
+    let path = projects[1].lock().unwrap().path.clone().unwrap();
+    update_exit_save(&projects[1], &path);
+    assert!(app
+        .finish_update_exit(&reviewed, |_| {
+            invoked.set(true);
+            Ok(())
+        })
+        .is_err());
+    assert!(!invoked.get());
+    let current = crate::workspace::lifecycle::update_readiness(&app.workspace).unwrap();
+    let operation = server::FileOperation::begin_workspace(&app.workspace).unwrap();
+    assert!(app
+        .finish_update_exit(&current, |_| {
+            invoked.set(true);
+            Ok(())
+        })
+        .is_err());
+    assert!(!invoked.get());
+    drop(operation);
+    app.radius = 51.;
+    assert_eq!(
+        app.finish_update_exit(&current, |_| Err("Final preservation failed".into()))
+            .unwrap_err(),
+        "Final preservation failed"
+    );
+    assert!(!app.update_exit_committed() && !app.workspace.lock().unwrap().exiting);
+    assert!(projects.iter().all(|shared| {
+        let engine = shared.lock().unwrap();
+        !engine.closed && engine.file_ownership.is_some()
+    }));
+    app.radius = 59.;
+    eframe::App::on_exit(&mut app);
+    let disk =
+        crate::tool_settings::Store::load(profile.locations.profile().join("tool-settings.json"));
+    assert_eq!(disk.get("brush").unwrap().profile.settings.radius, 59.);
+    assert_eq!(
+        serde_json::to_value(&projects[1].lock().unwrap().doc).unwrap(),
+        newer
+    );
+    drop(app);
+    drop(projects);
+    drop(profile);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unknown_native_owner_cannot_use_the_dormant_preference_close_foundation() {
+    let (mut app, _, projects, profile, directory) = update_exit_fixture();
+    let reviewed = crate::workspace::lifecycle::update_readiness(&app.workspace).unwrap();
+    let expected = update_exit_documents(&projects);
+    app.native_check_starting_for_test();
+    let invoked = std::cell::Cell::new(false);
+    assert!(app
+        .finish_update_exit(&reviewed, |_| {
+            invoked.set(true);
+            Ok(())
+        })
+        .unwrap_err()
+        .contains("native update owner remains held"));
+    assert!(!invoked.get() && !app.update_exit_committed() && !app.exit_approved);
+    assert!(!app.workspace.lock().unwrap().exiting);
+    assert!(projects.iter().all(|shared| !shared.lock().unwrap().closed));
+    assert_eq!(update_exit_documents(&projects), expected);
+    drop(app);
+    drop(projects);
+    drop(profile);
+    std::fs::remove_dir_all(directory).unwrap();
+}

@@ -5057,6 +5057,9 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        if self.update_exit_committed() {
+            return;
+        }
         if self.tool != Tool::Brush
             || ctx.input(|input| {
                 !input.focused
@@ -5070,6 +5073,9 @@ impl PeerBrush {
         }
         self.free_transform_frame = self.free_transform.is_some();
         self.updates_tick(ctx);
+        if self.update_exit_committed() {
+            return;
+        }
         self.about.dismiss_escape(ctx);
         self.fonts.refresh(ctx);
         self.selection_commit_failed = false;
@@ -6175,6 +6181,9 @@ impl eframe::App for PeerBrush {
     }
     fn on_exit(&mut self) {
         crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
+        if self.update_exit_committed() {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Err(error) = self.updates.retire_profile_capture() {
             eprintln!("PeerBrush: app update profile capture remains unusable: {error}");
