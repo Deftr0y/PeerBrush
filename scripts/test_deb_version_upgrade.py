@@ -41,6 +41,35 @@ DIAGNOSTIC_SCRIPTS = frozenset({
 })
 
 
+def _child_failure_diagnostic(stderr, kinds):
+    """Read only the fixed diagnostic emitted by the isolated GUI child."""
+    if type(stderr) not in (str, bytes) or len(stderr) > 65536:
+        return None
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode('utf-8', errors='replace')
+    prefix = 'Disposable installed GUI acceptance failed. Compatibility diagnostic: '
+    selected = [line[len(prefix):] for line in stderr.splitlines() if line.startswith(prefix)]
+    if len(selected) != 1 or len(selected[0]) > 512:
+        return None
+    rows = selected[0].split(' <- ')
+    if not 1 <= len(rows) <= 3:
+        return None
+    for row in rows:
+        match = re.fullmatch(r'([A-Za-z]+)(?: at ([a-z_]+\.py):([0-9]+))?(?: exit=(-?[0-9]+))?', row)
+        if match is None:
+            return None
+        kind, script, line, status = match.groups()
+        if kind not in {*kinds.values(), 'OtherError'}:
+            return None
+        if script is not None and (script not in DIAGNOSTIC_SCRIPTS
+                or not 1 <= int(line) <= 1000000 or str(int(line)) != line):
+            return None
+        if status is not None and (kind != 'CalledProcessError'
+                or not -32768 <= int(status) <= 32767 or str(int(status)) != status):
+            return None
+    return ' <- '.join(rows)
+
+
 def failure_diagnostic(error):
     """Fixed categories and reviewed source locations only, never exception text."""
     kinds = {ValueError: 'ValueError', KeyError: 'KeyError', TypeError: 'TypeError',
@@ -70,6 +99,9 @@ def failure_diagnostic(error):
             record += ' at ' + location
         if type(error) is subprocess.CalledProcessError and type(error.returncode) is int and -32768 <= error.returncode <= 32767:
             record += ' exit=' + str(error.returncode)
+            child = _child_failure_diagnostic(error.stderr, kinds)
+            if child is not None:
+                record += ' [child-reported: ' + child + ']'
         records.append(record)
         cause = error.__cause__
         error = cause if cause is not None else None if error.__suppress_context__ else error.__context__

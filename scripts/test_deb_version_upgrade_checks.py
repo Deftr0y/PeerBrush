@@ -244,6 +244,35 @@ class FixtureContract(unittest.TestCase):
         error.__cause__ = error
         self.assertLessEqual(len(upgrade.failure_diagnostic(error)), 256)
 
+    def test_nested_gui_child_diagnostic_retains_only_fixed_types_locations_and_status(self):
+        private = 'PRIVATE_CHILD_OUTPUT_AND_ARGUMENTS'
+        prefix = 'Disposable installed GUI acceptance failed. Compatibility diagnostic: '
+        child = 'ValueError at test_deb_installed_gui.py:284 <- CalledProcessError exit=1'
+        error = subprocess.CalledProcessError(1, [private], output=private,
+            stderr=(private + '\n' + prefix + child + '\n').encode())
+        detail = upgrade.failure_diagnostic(error)
+        self.assertEqual(detail, 'Compatibility diagnostic: CalledProcessError exit=1 [child-reported: ' + child + ']')
+        self.assertNotIn(private, detail)
+        wrapped = subprocess.CalledProcessError(1, [private], stderr=error.stderr)
+        with mock.patch.object(upgrade.subprocess, 'run', side_effect=wrapped), self.assertRaises(ValueError) as caught:
+            upgrade.run([private])
+        detail = upgrade.failure_diagnostic(caught.exception)
+        self.assertIn('ValueError at test_deb_installation.py:', detail)
+        self.assertIn('[child-reported: ' + child + ']', detail)
+        self.assertNotIn(private, detail)
+        for value in [private, prefix + child + '\n' + prefix + child,
+                      prefix + 'ValueError at ' + private + ':1',
+                      prefix + 'ValueError at test_deb_installed_gui.py:0001',
+                      prefix + 'ValueError at test_deb_installed_gui.py:1000001',
+                      prefix + private, prefix + 'ValueError exit=1',
+                      prefix + 'CalledProcessError exit=32768',
+                      prefix + 'CalledProcessError exit=-0',
+                      prefix + child + ' ' + private, prefix + ' <- '.join(['ValueError'] * 4),
+                      prefix + child + '\n' + private * 65536, None]:
+            with self.subTest(stderr_kind=type(value).__name__):
+                error.stderr = value
+                self.assertEqual(upgrade.failure_diagnostic(error), 'Compatibility diagnostic: CalledProcessError exit=1')
+
     def test_nonzero_rpc_and_readiness_timeout_keep_sanitizable_causes(self):
         session = upgrade.Session(Path('/bin/peerbrush'), {}, Path('/private'), None, Path('/usr/sbin/runuser'))
         reply = subprocess.CompletedProcess([], 23, b'PRIVATE_RPC_REPLY', b'PRIVATE_STDERR')
