@@ -42,6 +42,22 @@ fn source() -> Source {
         build: "1".repeat(40),
     }
 }
+fn selected_target() -> Target {
+    Target {
+        full_name: "PeerBrush.Synthetic_1.30.1.0_x64__abc123".into(),
+        version: [1, 30, 1, 0],
+        build: "2".repeat(40),
+        executable: Media {
+            bytes: 26,
+            sha256: hash(b"selected-native-executable"),
+        },
+        source_name: "PeerBrush-0.30.1-source.zip".into(),
+        source: Media {
+            bytes: 22,
+            sha256: hash(b"selected-native-source"),
+        },
+    }
+}
 fn xml() -> Vec<u8> {
     let p = policy();
     format!("<?xml version=\"1.0\" encoding=\"utf-8\"?><AppInstaller xmlns=\"http://schemas.microsoft.com/appx/appinstaller/2017\" Version=\"1.30.1.0\" Uri=\"{}\"><MainPackage Name=\"{}\" Publisher=\"{}\" Version=\"1.30.1.0\" ProcessorArchitecture=\"x64\" Uri=\"https://example.invalid/windows/PeerBrush-1.30.1.0.msix\"/><Dependencies><Package Name=\"{}\" Publisher=\"{}\" Version=\"14.0.30704.0\" ProcessorArchitecture=\"x64\" Uri=\"{}\"/></Dependencies></AppInstaller>", p.descriptor, p.name, p.publisher, p.runtime_name, p.runtime_publisher, p.runtime_uri).into_bytes()
@@ -123,7 +139,7 @@ impl Verifier for NativeFake {
         _: &Selection,
         runtime: bool,
         control: &Control,
-    ) -> Result<()> {
+    ) -> Result<Option<Target>> {
         self.media_calls.fetch_add(1, Ordering::Relaxed);
         control.check()?;
         file.check(control)?;
@@ -135,7 +151,7 @@ impl Verifier for NativeFake {
         if self.reject || file.media.sha256 != hash(expected) {
             return Err("Synthetic native signature or payload rejected actual bytes.".into());
         }
-        Ok(())
+        Ok((!runtime).then(selected_target))
     }
 }
 pub(super) fn receipt() -> Prepared {
@@ -606,12 +622,12 @@ fn real_lease_contention_and_cancel_after_native_success_cannot_publish_or_repla
             selection: &Selection,
             runtime: bool,
             c: &Control,
-        ) -> Result<()> {
-            NativeFake::new().media(file, policy, selection, runtime, c)?;
+        ) -> Result<Option<Target>> {
+            let target = NativeFake::new().media(file, policy, selection, runtime, c)?;
             if runtime {
                 c.cancelled.store(true, Ordering::Release);
             }
-            Ok(())
+            Ok(target)
         }
     }
     assert!(prepare(
@@ -1287,7 +1303,7 @@ pub(super) fn inspect_fixture(
             selection: &Selection,
             runtime: bool,
             control: &Control,
-        ) -> Result<()> {
+        ) -> Result<Option<Target>> {
             if let Some(resume) = self.resume.lock().unwrap().take() {
                 self.entered.send(()).unwrap();
                 resume
@@ -1383,8 +1399,292 @@ impl Verifier for SelectedSource {
         selected: &Selection,
         runtime: bool,
         control: &Control,
-    ) -> Result<()> {
+    ) -> Result<Option<Target>> {
         NativeFake::new().media(file, policy, selected, runtime, control)
+    }
+}
+struct RunningNative {
+    root: PathBuf,
+    executing: PathBuf,
+    current: Source,
+    proof: bool,
+    source_calls: AtomicUsize,
+    change_after: usize,
+}
+impl RunningNative {
+    fn new(root: &Path) -> Self {
+        fs::create_dir(root).unwrap();
+        fs::write(root.join("peerbrush.exe"), b"selected-native-executable").unwrap();
+        fs::write(
+            root.join("PeerBrush-0.30.1-source.zip"),
+            b"selected-native-source",
+        )
+        .unwrap();
+        let target = selected_target();
+        let mut current = source();
+        current.full_name = target.full_name;
+        current.version = target.version;
+        current.build = target.build;
+        Self {
+            root: root.into(),
+            executing: root.join("peerbrush.exe"),
+            current,
+            proof: true,
+            source_calls: AtomicUsize::new(0),
+            change_after: usize::MAX,
+        }
+    }
+}
+impl Verifier for RunningNative {
+    fn source(&self, _: &Policy) -> Result<Source> {
+        let mut current = self.current.clone();
+        if self.source_calls.fetch_add(1, Ordering::Relaxed) >= self.change_after {
+            current.full_name.push_str("-newer");
+        }
+        Ok(current)
+    }
+    fn media(
+        &self,
+        file: &Held,
+        policy: &Policy,
+        selection: &Selection,
+        runtime: bool,
+        control: &Control,
+    ) -> Result<Option<Target>> {
+        let verified = NativeFake::new().media(file, policy, selection, runtime, control)?;
+        Ok(if self.proof { verified } else { None })
+    }
+    fn running_target(
+        &self,
+        _: &Policy,
+        target: &Target,
+        control: &Control,
+    ) -> Result<RunningTarget> {
+        RunningTarget::open(
+            &self.root,
+            &self.executing,
+            self.source(&policy())?,
+            target,
+            control,
+        )
+    }
+}
+#[test]
+fn selected_running_target_requires_verified_payload_bytes_and_never_changes_old_source_admission()
+{
+    for recorded in [false, true] {
+        let temp = Temp::new();
+        let cache = temp.0.join("windows-prepared");
+        let attempt = if recorded {
+            completed_stage(&cache)
+        } else {
+            fs::create_dir(&cache).unwrap();
+            acquire(
+                &cache,
+                &policy(),
+                &HttpFake::new(),
+                &NativeFake::new(),
+                &control(),
+            )
+            .unwrap();
+            stage_attempt(&cache)
+        };
+        let native = RunningNative::new(&temp.0.join("installed-target"));
+        let names = [
+            "selected.appinstaller",
+            "main.msix",
+            "runtime.appx",
+            "prepared.json",
+            "stage-intent.json",
+            "stage-outcome.json",
+        ];
+        let original: Vec<_> = names
+            .into_iter()
+            .filter_map(|name| fs::read(attempt.join(name)).ok().map(|bytes| (name, bytes)))
+            .collect();
+        let observation = control();
+        assert!(matches!(
+            inspect_retained(&cache, &policy(), &native, &observation).unwrap(),
+            Reconciled::SelectedTargetRunning([1, 30, 1, 0])
+        ));
+        assert_eq!(
+            observation.view.lock().unwrap().installed_version,
+            Some([1, 30, 1, 0])
+        );
+        // Identical selected bytes do not turn NEW identity into the old download/stage source.
+        assert!(reconcile(&attempt, &policy(), &native, &control()).is_err());
+        let network = HttpFake {
+            files: BTreeMap::new(),
+            calls: Mutex::new(vec![]),
+        };
+        assert!(acquire(&cache, &policy(), &network, &native, &control()).is_err());
+        assert!(network.calls.lock().unwrap().is_empty());
+        assert!(stage(
+            &cache,
+            &policy(),
+            &native,
+            &FaultStage("submit-error"),
+            &control()
+        )
+        .is_err());
+        for (name, bytes) in original {
+            assert_eq!(fs::read(attempt.join(name)).unwrap(), bytes);
+        }
+        if !recorded {
+            assert!(!attempt.join("stage-intent.json").exists());
+        }
+    }
+}
+#[test]
+fn selected_target_json_native_identity_file_mutation_and_late_source_changes_cannot_claim_running()
+{
+    for fault in [
+        "no-proof",
+        "full-name",
+        "version",
+        "build",
+        "family",
+        "association",
+        "executable",
+        "source",
+        "wrong-process-path",
+        "late-source",
+        "json-claim",
+    ] {
+        let temp = Temp::new();
+        let cache = temp.0.join("windows-prepared");
+        let attempt = completed_stage(&cache);
+        let mut native = RunningNative::new(&temp.0.join("installed-target"));
+        match fault {
+            "no-proof" => native.proof = false,
+            "full-name" => native.current.full_name.push_str("-foreign"),
+            "version" => native.current.version[2] += 1,
+            "build" => native.current.build = "3".repeat(40),
+            "family" => native.current.family.push_str("-foreign"),
+            "association" => native.current.association.push_str("-foreign"),
+            "executable" => fs::write(
+                native.root.join("peerbrush.exe"),
+                b"changed executable bytes",
+            )
+            .unwrap(),
+            "source" => fs::write(
+                native.root.join("PeerBrush-0.30.1-source.zip"),
+                b"changed source bytes",
+            )
+            .unwrap(),
+            "wrong-process-path" => {
+                native.executing = native.root.join("foreign.exe");
+                fs::write(&native.executing, b"selected-native-executable").unwrap();
+            }
+            "late-source" => native.change_after = 3,
+            "json-claim" => {
+                let path = attempt.join("prepared.json");
+                let mut claim: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                claim["target"] =
+                    serde_json::json!({"version":[1,30,1,0],"verified":true,"healthy":true});
+                fs::write(path, serde_json::to_vec(&claim).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let original: Vec<_> = fs::read_dir(&attempt)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        assert!(
+            inspect_retained(&cache, &policy(), &native, &control()).is_err(),
+            "{fault}"
+        );
+        for (path, bytes) in original {
+            assert_eq!(fs::read(path).unwrap(), bytes, "{fault}");
+        }
+        assert!(attempt.join("stage-intent.json").exists());
+        assert!(attempt.join("stage-outcome.json").exists());
+    }
+}
+#[test]
+fn actual_selected_target_startup_worker_retains_profile_and_late_cancel_cannot_promote_observation(
+) {
+    struct Release(Option<mpsc::Sender<()>>, mpsc::Receiver<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+            let _ = self.1.recv_timeout(Duration::from_secs(5));
+        }
+    }
+    for cancel in [false, true] {
+        let temp = Temp::new();
+        let locations = crate::settings::Locations {
+            config: temp.0.join("config"),
+            data: temp.0.join("data"),
+            cache: temp.0.join("cache"),
+        };
+        let legacy = temp.0.join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        let profile = crate::settings::Profile::open(locations.clone(), &legacy).unwrap();
+        let cache = locations.profile().join("windows-prepared");
+        let attempt = completed_stage(&cache);
+        let outcome = fs::read(attempt.join("stage-outcome.json")).unwrap();
+        let native = RunningNative::new(&temp.0.join("installed-target"));
+        let lease = profile.update_profile();
+        let (ready, entered) = mpsc::channel();
+        let (sender, resume) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let mut release = Release(Some(sender), done);
+        let mut controller = Controller::load(&locations.profile());
+        controller.set_profile(Some(profile.update_profile()));
+        controller.next_reconcile = Some(Box::new(move |control| {
+            let _profile = lease;
+            _profile.validate()?;
+            let result = inspect_retained(&cache, &policy(), &native, control);
+            ready
+                .send(())
+                .map_err(|_| "Synthetic observer lost its owner")?;
+            resume
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "Synthetic observer was not released")?;
+            drop(_profile);
+            let _ = finished.send(());
+            result
+        }));
+        controller.startup();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        controller.set_profile(None);
+        drop(profile);
+        assert!(crate::settings::Profile::open(locations.clone(), &legacy).is_err());
+        if cancel {
+            controller.later();
+        }
+        release.0.take().unwrap().send(()).unwrap();
+        wait_controller(&mut controller, |value| !value.view.busy);
+        assert_eq!(
+            controller.view.observed_target,
+            (!cancel).then_some([1, 30, 1, 0])
+        );
+        assert!(controller.view.version.is_none() && controller.view.staged_version.is_none());
+        assert!(!controller.view.recorded_staging && controller.deployment_blocker().is_some());
+        assert!(controller.start().is_err() && controller.start_staging().is_err());
+        assert_eq!(
+            fs::read(attempt.join("stage-outcome.json")).unwrap(),
+            outcome
+        );
+        if !cancel {
+            let context = eframe::egui::Context::default();
+            let rendered = context.run(Default::default(), |context| {
+                eframe::egui::CentralPanel::default().show(context, |ui| controller.show(ui));
+            });
+            assert!(rendered.shapes.iter().any(|shape| matches!(&shape.shape,
+                eframe::egui::Shape::Text(text) if text.galley.job.text == "Observed selected target 1.30.1.0 · health unverified")));
+        }
+        drop(controller);
+        drop(crate::settings::Profile::open(locations, &legacy).unwrap());
     }
 }
 #[test]

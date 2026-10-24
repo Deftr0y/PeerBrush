@@ -125,16 +125,36 @@ impl super::Verifier for Verifier {
         selected: &Selection,
         runtime: bool,
         control: &Control,
-    ) -> Result<()> {
+    ) -> Result<Option<Target>> {
         if !ENABLED {
             return Err(DISABLED.into());
         }
         control.check()?;
         file.check(control)?;
-        unsafe {
-            verify(file, policy, selected, runtime, control)?;
+        let target = unsafe { verify(file, policy, selected, runtime, control)? };
+        file.check(control)?;
+        Ok(target)
+    }
+    fn running_target(
+        &self,
+        policy: &Policy,
+        target: &Target,
+        control: &Control,
+    ) -> Result<RunningTarget> {
+        if !ENABLED {
+            return Err(DISABLED.into());
         }
-        file.check(control)
+        let current = self.source(policy)?;
+        if !target.matches(&current, policy) {
+            return Err(STAGE_HOLD.into());
+        }
+        let executing = std::env::current_exe().map_err(|_| STAGE_HOLD)?;
+        let root = PathBuf::from(native(native(Package::Current())?.InstalledPath())?.to_string());
+        let running = RunningTarget::open(&root, &executing, current, target, control)?;
+        if self.source(policy)? != running.current {
+            return Err(STAGE_HOLD.into());
+        }
+        Ok(running)
     }
 }
 
@@ -512,7 +532,7 @@ unsafe fn verify(
     selected: &Selection,
     runtime: bool,
     control: &Control,
-) -> Result<()> {
+) -> Result<Option<Target>> {
     use std::io::{Seek, SeekFrom};
     policy.validate()?;
     let mut held = file
@@ -651,7 +671,7 @@ unsafe fn verify(
     if names.is_empty() || !runtime && !names.contains("peerbrush.exe") {
         return Err("The signed native package has no expected application payload.".into());
     }
-    if !runtime {
+    let target = if !runtime {
         let release = native(reader.GetPayloadFile(w!("release.json")))?;
         if native(release.GetSize())? > SMALL {
             return Err("Signed release metadata exceeds its bound.".into());
@@ -690,18 +710,35 @@ unsafe fn verify(
         }
         let source_hash = value["source_sha256"].as_str().unwrap_or_default();
         let source_file = native(reader.GetPayloadFile(&::windows::core::HSTRING::from(archive)))?;
-        if !sha(source_hash)
-            || stream_hash(&native(source_file.GetStream())?, control)?.sha256 != source_hash
-        {
+        let source = stream_hash(&native(source_file.GetStream())?, control)?;
+        if !sha(source_hash) || source.sha256 != source_hash {
             return Err(
                 "Signed corresponding-source archive differs from its declared digest.".into(),
             );
         }
-    }
+        let executable = native(reader.GetPayloadFile(w!("peerbrush.exe")))?;
+        let executable = stream_hash(&native(executable.GetStream())?, control)?;
+        if value["executable"] != "peerbrush.exe"
+            || value["executable_sha256"].as_str() != Some(executable.sha256.as_str())
+        {
+            return Err("Signed executable payload differs from its declared identity.".into());
+        }
+        Some(Target {
+            full_name: string(id.GetPackageFullName())?,
+            version: selected.version,
+            build: commit.into(),
+            executable,
+            source_name: archive.into(),
+            source,
+        })
+    } else {
+        None
+    };
     if stream_hash(&stream, control)? != file.media {
         return Err("Native reader bytes changed during verification.".into());
     }
-    control.check()
+    control.check()?;
+    Ok(target)
 }
 
 #[cfg(test)]

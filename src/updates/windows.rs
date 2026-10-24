@@ -83,6 +83,73 @@ struct Prepared {
     runtime: Media,
 }
 
+// Obtained from the native verifier's held signed payload, never from a journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Target {
+    full_name: String,
+    version: [u16; 4],
+    build: String,
+    executable: Media,
+    source_name: String,
+    source: Media,
+}
+impl Target {
+    fn matches(&self, current: &Source, policy: &Policy) -> bool {
+        current.full_name == self.full_name
+            && current.version == self.version
+            && current.build == self.build
+            && current.family == policy.family
+            && current.association == policy.descriptor
+    }
+}
+struct RunningTarget {
+    current: Source,
+    owned: Directory,
+    executable: Held,
+    source: Held,
+}
+impl RunningTarget {
+    fn open(
+        root: &Path,
+        executing: &Path,
+        current: Source,
+        target: &Target,
+        control: &Control,
+    ) -> Result<Self> {
+        let owned = Directory::open(root)?;
+        let executable_path = root.join("peerbrush.exe");
+        if fs::canonicalize(executing).map_err(|_| STAGE_HOLD)?
+            != fs::canonicalize(&executable_path).map_err(|_| STAGE_HOLD)?
+            || target.version[0] != 1
+            || target.version[3] != 0
+            || target.source_name
+                != format!(
+                    "PeerBrush-0.{}.{}-source.zip",
+                    target.version[1], target.version[2]
+                )
+        {
+            return Err(STAGE_HOLD.into());
+        }
+        let result = Self {
+            current,
+            executable: Held::open(&executable_path, PACKAGE, control)?,
+            source: Held::open(&root.join(&target.source_name), PACKAGE, control)?,
+            owned,
+        };
+        result.check_files(target, control)?;
+        Ok(result)
+    }
+    fn check_files(&self, target: &Target, control: &Control) -> Result<()> {
+        self.owned.check()?;
+        self.executable.check(control)?;
+        self.source.check(control)?;
+        if self.executable.media != target.executable || self.source.media != target.source {
+            return Err(STAGE_HOLD.into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct View {
     pub busy: bool,
@@ -94,6 +161,7 @@ pub(crate) struct View {
     pub percentage: Option<u32>,
     pub installed_version: Option<[u16; 4]>,
     pub recorded_staging: bool,
+    pub observed_target: Option<[u16; 4]>,
 }
 
 struct Control {
@@ -136,7 +204,10 @@ trait Verifier {
         selection: &Selection,
         runtime: bool,
         control: &Control,
-    ) -> Result<()>;
+    ) -> Result<Option<Target>>;
+    fn running_target(&self, _: &Policy, _: &Target, _: &Control) -> Result<RunningTarget> {
+        Err(STAGE_HOLD.into())
+    }
 }
 
 #[cfg(windows)]
@@ -633,9 +704,10 @@ struct RetainedSelection {
     package: Held,
     runtime: Held,
     prepared: Prepared,
+    target: Option<Target>,
 }
 impl RetainedSelection {
-    fn check(&self, verifier: &dyn Verifier, control: &Control) -> Result<()> {
+    fn check_media(&self, control: &Control) -> Result<()> {
         for file in [
             &self.journal,
             &self.descriptor,
@@ -645,8 +717,28 @@ impl RetainedSelection {
             file.check(control)?;
         }
         self.owned.check()?;
+        Ok(())
+    }
+    fn check(&self, verifier: &dyn Verifier, control: &Control) -> Result<()> {
+        self.check_media(control)?;
         if verifier.source(&self.prepared.policy)? != self.prepared.source {
             return Err("Installed Windows source changed; staging evidence is retained.".into());
+        }
+        Ok(())
+    }
+    fn check_target(
+        &self,
+        running: &RunningTarget,
+        policy: &Policy,
+        verifier: &dyn Verifier,
+        control: &Control,
+    ) -> Result<()> {
+        self.check_media(control)?;
+        let target = self.target.as_ref().ok_or(STAGE_HOLD)?;
+        running.check_files(target, control)?;
+        if !target.matches(&running.current, policy) || verifier.source(policy)? != running.current
+        {
+            return Err(STAGE_HOLD.into());
         }
         Ok(())
     }
@@ -677,20 +769,56 @@ fn authenticate_retained_media(
     verifier: &dyn Verifier,
     control: &Control,
 ) -> Result<RetainedSelection> {
+    authenticate_original(
+        read_prepared(root, policy, control)?,
+        policy,
+        verifier,
+        control,
+    )
+}
+fn read_prepared(
+    root: &Path,
+    policy: &Policy,
+    control: &Control,
+) -> Result<(Directory, Held, Prepared)> {
     let owned = Directory::open(root)?;
     let journal = Held::open(&root.join("prepared.json"), SMALL, control)?;
     let prepared: Prepared = serde_json::from_slice(&small(&journal, control)?)
         .map_err(|_| "Pending Windows download metadata is invalid; original retained.")?;
     policy.validate()?;
-    if prepared.schema != 1
-        || &prepared.policy != policy
-        || prepared.source != verifier.source(policy)?
-    {
+    if prepared.schema != 1 || &prepared.policy != policy {
         return Err(
             "Installed source or approved Windows policy changed; pending media was not reused."
                 .into(),
         );
     }
+    Ok((owned, journal, prepared))
+}
+fn authenticate_original(
+    input: (Directory, Held, Prepared),
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<RetainedSelection> {
+    if input.2.source != verifier.source(policy)? {
+        return Err(
+            "Installed source or approved Windows policy changed; pending media was not reused."
+                .into(),
+        );
+    }
+    let retained = authenticate_media(input, policy, verifier, control)?;
+    retained.check(verifier, control)?;
+    control.check()?;
+    Ok(retained)
+}
+fn authenticate_media(
+    input: (Directory, Held, Prepared),
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<RetainedSelection> {
+    let (owned, journal, prepared) = input;
+    let root = &owned.path;
     let descriptor_file = Held::open(&root.join("selected.appinstaller"), SMALL, control)?;
     if descriptor_file.media != prepared.descriptor
         || descriptor(&small(&descriptor_file, control)?, policy, &prepared.source)?
@@ -704,13 +832,10 @@ fn authenticate_retained_media(
         return Err("Pending Windows media changed.".into());
     }
     control.phase("Revalidating retained signed Windows media", 0)?;
-    verifier.media(&package, policy, &prepared.selection, false, control)?;
+    let target = verifier.media(&package, policy, &prepared.selection, false, control)?;
     verifier.media(&runtime, policy, &prepared.selection, true, control)?;
     for file in [&journal, &descriptor_file, &package, &runtime] {
         file.check(control)?;
-    }
-    if verifier.source(policy)? != prepared.source {
-        return Err("Installed Windows source changed during revalidation.".into());
     }
     owned.check()?;
     control.check()?;
@@ -721,6 +846,7 @@ fn authenticate_retained_media(
         package,
         runtime,
         prepared,
+        target,
     })
 }
 
@@ -1175,6 +1301,7 @@ enum Reconciled {
     Empty,
     Prepared(Prepared),
     RecordedStaging([u16; 4]),
+    SelectedTargetRunning([u16; 4]),
 }
 // Retained observations grant no installation, OS-stage, cancellation or cleanup
 // authority. A native current-user query is separate from this record's target.
@@ -1213,13 +1340,36 @@ fn inspect_retained(
         directory(&selected.join(".peerbrush-versions"))?;
         let transaction = crate::file_safety::Lease::acquire(&selected.join("prepared.json"))?;
         directory(&selected.join(".peerbrush-versions"))?;
-        let retained = authenticate_retained_media(selected, policy, verifier, control)?;
-        if current != retained.prepared.source {
-            return Err(STAGE_HOLD.into());
-        }
+        let input = read_prepared(selected, policy, control)?;
+        let selected_running = current != input.2.source;
+        let retained = if selected_running {
+            authenticate_media(input, policy, verifier, control)?
+        } else {
+            authenticate_original(input, policy, verifier, control)?
+        };
+        let running = if selected_running {
+            let target = retained.target.as_ref().ok_or(STAGE_HOLD)?;
+            if !target.matches(&current, policy)
+                || target.version != retained.prepared.selection.version
+            {
+                return Err(STAGE_HOLD.into());
+            }
+            let running = verifier.running_target(policy, target, control)?;
+            if running.current != current {
+                return Err(STAGE_HOLD.into());
+            }
+            retained.check_target(&running, policy, verifier, control)?;
+            Some(running)
+        } else {
+            None
+        };
         let result = if no_stage_evidence(selected).is_ok() {
             let prepared = retained.prepared.clone();
-            retained.check(verifier, control)?;
+            if let Some(running) = &running {
+                retained.check_target(running, policy, verifier, control)?;
+            } else {
+                retained.check(verifier, control)?;
+            }
             no_stage_evidence(selected)?;
             Reconciled::Prepared(prepared)
         } else {
@@ -1245,7 +1395,11 @@ fn inspect_retained(
             {
                 return Err(STAGE_HOLD.into());
             }
-            retained.check(verifier, control)?;
+            if let Some(running) = &running {
+                retained.check_target(running, policy, verifier, control)?;
+            } else {
+                retained.check(verifier, control)?;
+            }
             intent_file.check(control)?;
             outcome_file.check(control)?;
             evidence.push(intent_file);
@@ -1254,7 +1408,12 @@ fn inspect_retained(
         };
         transaction.validate()?;
         transaction_owner = Some(transaction);
-        authenticated = Some(retained);
+        let result = if let Some(running) = &running {
+            Reconciled::SelectedTargetRunning(running.current.version)
+        } else {
+            result
+        };
+        authenticated = Some((retained, running));
         result
     } else {
         Reconciled::Empty
@@ -1265,8 +1424,12 @@ fn inspect_retained(
     if attempts != after || selected != after_selected || verifier.source(policy)? != current {
         return Err(STAGE_HOLD.into());
     }
-    if let Some(retained) = &authenticated {
-        retained.check(verifier, control)?;
+    if let Some((retained, running)) = &authenticated {
+        if let Some(running) = running {
+            retained.check_target(running, policy, verifier, control)?;
+        } else {
+            retained.check(verifier, control)?;
+        }
     }
     for file in &evidence {
         file.check(control)?;
@@ -1606,6 +1769,7 @@ impl Controller {
             self.view.version = None;
             self.view.staged_version = None;
             self.view.recorded_staging = false;
+            self.view.observed_target = None;
             self.view.message = if canceled && kind != WorkKind::Download {
                 STAGE_HOLD.into()
             } else if canceled {
@@ -1627,6 +1791,11 @@ impl Controller {
                         self.view.staged_version = Some(version);
                         self.view.recorded_staging = true;
                         "Prior staging result verified. Installation is unverified; retries remain unavailable.".into()
+                    }
+                    Ok(Completed::Reconciled(Reconciled::SelectedTargetRunning(version))) => {
+                        self.deployment = DeploymentState::Unknown;
+                        self.view.observed_target = Some(version);
+                        "The selected signed target is running. Startup health, recovery and installation acceptance remain unverified; retained records were not retired.".into()
                     }
                     Ok(Completed::Stage(staged)) if staged.accepted => {
                         self.deployment = DeploymentState::Recorded;
@@ -1726,6 +1895,12 @@ impl Controller {
         if let Some(v) = self.view.installed_version {
             ui.label(format!(
                 "Current registered native package {}",
+                version_text(v)
+            ));
+        }
+        if let Some(v) = self.view.observed_target {
+            ui.label(format!(
+                "Observed selected target {} · health unverified",
                 version_text(v)
             ));
         }
