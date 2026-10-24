@@ -33,6 +33,10 @@ on:
         description: Independent strict final-inputs.json SHA-256
         type: string
         required: true
+      release_notes_sha256:
+        description: Independent SHA-256 of reviewed docs/release-0.30.md public notes
+        type: string
+        required: true
       selection_sha256:
         description: Independent portable selection.json SHA-256; selectors never grant readiness
         type: string
@@ -83,6 +87,7 @@ jobs:
       FINAL_INPUTS_BUNDLE_SHA256: ${{ inputs.final_inputs_bundle_sha256 }}
       FINAL_INPUTS_INDEX_SHA256: ${{ inputs.final_inputs_index_sha256 }}
       SELECTION_SHA256: ${{ inputs.selection_sha256 }}
+      RELEASE_NOTES_SHA256: ${{ inputs.release_notes_sha256 }}
     steps:
       - name: Require exact reviewed production invocation
         run: |
@@ -114,13 +119,14 @@ jobs:
             --artifact-sha256 "$FINAL_INPUTS_ARTIFACT_SHA256" --bundle-sha256 "$FINAL_INPUTS_BUNDLE_SHA256" \
             --index-sha256 "$FINAL_INPUTS_INDEX_SHA256" --selection-sha256 "$SELECTION_SHA256" \
             --output "$RUNNER_TEMP/peerbrush-final-inputs"
-      - name: Revalidate all selected native inputs through actual final composition
+      - name: Revalidate actual final inputs through the publication preflight
         run: |
           set +e
-          python -B scripts/prepare_final_inputs.py consume --source-root "$GITHUB_WORKSPACE" \
-            --directory "$RUNNER_TEMP/peerbrush-final-inputs/data" \
-            --selection "$RUNNER_TEMP/peerbrush-final-inputs/data/selection.json" --selection-sha256 "$SELECTION_SHA256" \
-            --index "$RUNNER_TEMP/peerbrush-final-inputs/final-inputs.json" --index-sha256 "$FINAL_INPUTS_INDEX_SHA256" \
+          python -B scripts/publish_release.py --source-root "$GITHUB_WORKSPACE" \
+            --directory "$RUNNER_TEMP/peerbrush-final-inputs/data" --selection-sha256 "$SELECTION_SHA256" \
+            --final-input-index "$RUNNER_TEMP/peerbrush-final-inputs/final-inputs.json" \
+            --final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256" \
+            --notes "$GITHUB_WORKSPACE/docs/release-0.30.md" --notes-sha256 "$RELEASE_NOTES_SHA256" \
             --work "$RUNNER_TEMP/peerbrush-final-verification" --output "$RUNNER_TEMP/peerbrush-final-candidate"
           result=$?
           set -e

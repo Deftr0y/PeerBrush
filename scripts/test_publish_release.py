@@ -258,6 +258,12 @@ class Transactions(unittest.TestCase):
         self.assertIn('--artifact-sha256 "$FINAL_INPUTS_ARTIFACT_SHA256" --bundle-sha256 "$FINAL_INPUTS_BUNDLE_SHA256"', acquire)
         self.assertIn('--index-sha256 "$FINAL_INPUTS_INDEX_SHA256" --selection-sha256 "$SELECTION_SHA256"', acquire)
         self.assertIn('--selection-sha256 "$SELECTION_SHA256"', text)
+        preflight = text.split('      - name: Revalidate actual final inputs through the publication preflight\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('scripts/publish_release.py --source-root', preflight)
+        self.assertIn('--final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256"', preflight)
+        self.assertIn('--notes "$GITHUB_WORKSPACE/docs/release-0.30.md" --notes-sha256 "$RELEASE_NOTES_SHA256"', preflight)
+        self.assertNotIn('--execute', preflight)
+        self.assertNotIn('GH_TOKEN:', preflight)
         for name in ['ci.yml', 'release.yml']:
             caller = (root / '.github/workflows' / name).read_text(encoding='utf-8')
             self.assertIn('python -B scripts/test_final_release.py', caller)

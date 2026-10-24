@@ -17,6 +17,7 @@ import assemble_final_inputs as upstream
 import acquire_macos_qualification_inputs as transport
 import final_release as final
 import prepare_final_inputs as inputs
+import publish_release as publisher
 import prepare_site_release as website
 import test_final_release
 import test_macos_qualification_attestation as crypto
@@ -244,6 +245,80 @@ class Handoff(unittest.TestCase):
                 '--output', str(self.fixture.fixture.base / 'cli-output')])
         self.assertEqual(result, 2)
         self.assertIn('readiness remain blocked', output.getvalue())
+
+    def test_publisher_revalidates_relocated_data_without_requesting_write_credentials(self):
+        index = self.prepare()
+        notes = self.fixture.fixture.base / 'public-notes.md'
+        notes.write_text('Reviewed synthetic public release notes.', encoding='utf-8')
+        for execute in [False, True]:
+            count = len(self.commands)
+            args = ['--source-root', str(self.fixture.root),
+                '--directory', str(self.work / 'data'),
+                '--output', str(self.fixture.fixture.base / ('publish-output-' + str(execute))),
+                '--final-input-index', str(self.output / inputs.INDEX),
+                '--final-input-index-sha256', sha((self.output / inputs.INDEX).read_bytes()),
+                '--selection-sha256', index['selection_sha256'],
+                '--work', str(self.fixture.fixture.base / ('publish-work-' + str(execute))),
+                '--notes', str(notes), '--notes-sha256', sha(notes.read_bytes())]
+            if execute:
+                args.append('--execute')
+            with self.seams(), mock.patch.object(publisher, 'GitHub') as credentials, \
+                    mock.patch.object(final, 'from_selection', wraps=final.from_selection) as compose, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(publisher.main(args), 2)
+                compose.assert_called_once()
+                credentials.assert_not_called()
+            self.assertGreater(len(self.commands), count)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result['phase'], 'blocked')
+            self.assertFalse(result['production_ready'] or result['publication_performed'])
+            self.assertEqual(result['store'], final.store_channel())
+
+    def test_publisher_refuses_mixed_selectors_or_bad_notes_and_index_before_native_work(self):
+        index = self.prepare()
+        notes = self.fixture.fixture.base / 'public-notes.md'
+        notes.write_text('Reviewed synthetic public notes.', encoding='utf-8')
+        args = ['--source-root', str(self.fixture.root), '--directory', str(self.work / 'data'),
+            '--output', str(self.fixture.fixture.base / 'rejected-publish-output'),
+            '--final-input-index', str(self.output / inputs.INDEX),
+            '--final-input-index-sha256', sha((self.output / inputs.INDEX).read_bytes()),
+            '--selection-sha256', index['selection_sha256'],
+            '--work', str(self.fixture.fixture.base / 'rejected-publish-work'),
+            '--notes', str(notes), '--notes-sha256', sha(notes.read_bytes()), '--execute']
+        def without(flag):
+            result = list(args)
+            offset = result.index(flag)
+            del result[offset:offset + 2]
+            return result
+        changed_index = list(args)
+        changed_index[changed_index.index('--final-input-index-sha256') + 1] = '0' * 64
+        changed_notes = list(args)
+        changed_notes[changed_notes.index('--notes-sha256') + 1] = '0' * 64
+        cases = [args + ['--selection', str(self.selection)], without('--work'),
+                 without('--final-input-index-sha256'), changed_index, changed_notes,
+                 without('--final-input-index') + ['--selection', str(self.selection)],
+                 args + ['--ready-report', 'untrusted.json']]
+        count = len(self.commands)
+        for number, selected in enumerate(cases):
+            with self.subTest(case=number), self.seams(), \
+                    mock.patch.object(publisher, 'GitHub') as credentials, \
+                    mock.patch.object(final, 'from_selection') as compose, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                publisher.main(selected)
+            credentials.assert_not_called()
+            compose.assert_not_called()
+            self.assertEqual(len(self.commands), count)
+            self.assertFalse((self.fixture.fixture.base / 'rejected-publish-work').exists())
+            self.assertFalse((self.fixture.fixture.base / 'rejected-publish-output').exists())
+        notes.write_bytes(b'x' * (128 * 1024 + 1))
+        args[args.index('--notes-sha256') + 1] = sha(notes.read_bytes())
+        with mock.patch.object(publisher, 'GitHub') as credentials, \
+                mock.patch.object(final, 'from_selection') as compose, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            publisher.main(args)
+        credentials.assert_not_called()
+        compose.assert_not_called()
+        self.assertFalse((self.fixture.fixture.base / 'rejected-publish-work').exists())
 
     def test_failed_wrong_source_or_wrong_producer_metadata_cannot_start_download(self):
         index = self.prepare()
@@ -624,7 +699,11 @@ class DormantSource(unittest.TestCase):
         self.assertIn('FINAL_INPUTS_RUN', compose)
         self.assertNotIn('actions/download-artifact@', compose)
         self.assertNotIn('input_artifact_name', production)
-        self.assertIn('scripts/prepare_final_inputs.py consume', compose)
+        self.assertIn('scripts/publish_release.py --source-root', compose)
+        self.assertIn('--final-input-index-sha256', compose)
+        self.assertIn('--notes-sha256', compose)
+        self.assertNotIn('--execute', compose)
+        self.assertNotIn('GH_TOKEN:', compose)
 
 
 if __name__ == '__main__':

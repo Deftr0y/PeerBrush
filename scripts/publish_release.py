@@ -362,15 +362,30 @@ def main(argv=None):
     import argparse
     from final_release import from_selection
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ['source-root', 'directory', 'output', 'selection', 'notes']:
+    for name in ['source-root', 'directory', 'output', 'notes']:
         parser.add_argument('--' + name, required=True, type=Path)
     for name in ['selection-sha256', 'notes-sha256']:
         parser.add_argument('--' + name, required=True)
+    selected = parser.add_mutually_exclusive_group(required=True)
+    selected.add_argument('--selection', type=Path)
+    selected.add_argument('--final-input-index', type=Path)
+    parser.add_argument('--final-input-index-sha256')
+    parser.add_argument('--work', type=Path)
     parser.add_argument('--execute', action='store_true', help='Still requires actual native authority and protected explicit approval; current source remains blocked.')
     args = parser.parse_args(argv)
+    if args.final_input_index is not None:
+        if args.final_input_index_sha256 is None or args.work is None:
+            parser.error('Final-input mode requires an independently selected index digest and private work directory.')
+    elif args.final_input_index_sha256 is not None or args.work is not None:
+        parser.error('Final-input digest and work options require --final-input-index.')
     try:
-        candidate = from_selection(args.source_root, args.directory, args.output, args.selection, args.selection_sha256)
         notes = read(args.notes, 128 * 1024, args.notes_sha256).decode('utf-8')
+        if args.final_input_index is not None:
+            from prepare_final_inputs import MAX_INDEX, consume, json_input
+            index = json_input(args.final_input_index, MAX_INDEX, args.final_input_index_sha256)
+            candidate = consume(args.source_root, args.directory, args.output, args.work, index, args.selection_sha256)
+        else:
+            candidate = from_selection(args.source_root, args.directory, args.output, args.selection, args.selection_sha256)
         # Missing native producers must stop before even requesting a write token.
         client = GitHub(os.environ.get('GH_TOKEN')) if (args.execute and not candidate.blockers
             and candidate.assessment.get('production_ready') is True) else None
