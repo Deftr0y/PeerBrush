@@ -1413,6 +1413,7 @@ struct RunningNative {
     current_media_calls: AtomicUsize,
     new_main_calls: AtomicUsize,
     archive_fault: &'static str,
+    target: Target,
 }
 impl RunningNative {
     fn new(root: &Path) -> Self {
@@ -1438,6 +1439,7 @@ impl RunningNative {
             current_media_calls: AtomicUsize::new(0),
             new_main_calls: AtomicUsize::new(0),
             archive_fault: "none",
+            target: selected_target(),
         }
     }
 }
@@ -1481,7 +1483,7 @@ impl Verifier for RunningNative {
         if &self.source(policy)? != current {
             return Err(STAGE_HOLD.into());
         }
-        let mut target = selected_target();
+        let mut target = self.target.clone();
         match self.archive_fault {
             "manifest-version" => target.version[2] += 1,
             "signed-build" => target.build = "9".repeat(40),
@@ -2044,4 +2046,402 @@ fn current_archive_reopen_rejects_same_size_restamped_content_before_native_acce
     assert!(
         attempt.join("stage-intent.json").exists() && attempt.join("stage-outcome.json").exists()
     );
+}
+
+fn initial_current_native(root: &Path) -> RunningNative {
+    let mut native = RunningNative::new(root);
+    native.current = source();
+    native.target.full_name = native.current.full_name.clone();
+    native.target.version = native.current.version;
+    native.target.build = native.current.build.clone();
+    native.target.source_name = "PeerBrush-0.30.0-source.zip".into();
+    fs::rename(
+        root.join("PeerBrush-0.30.1-source.zip"),
+        root.join(&native.target.source_name),
+    )
+    .unwrap();
+    native
+}
+fn current_http() -> HttpFake {
+    let mut http = HttpFake::new();
+    let bytes = String::from_utf8(xml())
+        .unwrap()
+        .replace("1.30.1.0", "1.30.0.0")
+        .into_bytes();
+    http.files
+        .insert(policy().descriptor, (bytes.clone(), bytes.len() as u64));
+    http.files.insert(
+        "https://example.invalid/windows/PeerBrush-1.30.0.0.msix".into(),
+        (b"main-native-bytes".to_vec(), 17),
+    );
+    http
+}
+fn captured_current(root: &Path) -> PathBuf {
+    attempts_for(&current_root(root).unwrap(), MediaRole::Current)
+        .unwrap()
+        .1
+        .unwrap()
+}
+
+#[test]
+fn explicit_capture_retains_exact_current_media_before_feed_advances_and_reuses_it_for_new_download(
+) {
+    let temp = Temp::new();
+    let root = temp.0.join("windows-prepared");
+    let native = initial_current_native(&temp.0.join("installed"));
+    let http = current_http();
+    capture_current_only(&root, &policy(), &http, &native, &control()).unwrap();
+    assert!(!root.exists());
+    let current = captured_current(&root);
+    assert!(current.join("current.json").is_file());
+    assert!(!current.join("prepared.json").exists());
+    assert_eq!(native.current_media_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(http.calls.lock().unwrap().len(), 3);
+    assert!(descriptor(
+        &small(
+            &Held::open(&current.join("selected.appinstaller"), SMALL, &control()).unwrap(),
+            &control()
+        )
+        .unwrap(),
+        &policy(),
+        &source()
+    )
+    .is_err());
+    // Only the private CURRENT consumer admits equality. A NEW cache cannot
+    // reinterpret a current marker or its JSON as a newer prepared package.
+    assert!(read_prepared(&current, &policy(), &control()).is_err());
+    fs::create_dir(&root).unwrap();
+    let newer = HttpFake::new();
+    let prepared = acquire_with_current(&root, &policy(), &newer, &native, &control()).unwrap();
+    assert_eq!(prepared, receipt());
+    assert_eq!(native.current_media_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        *newer.calls.lock().unwrap(),
+        vec![
+            policy().descriptor,
+            "https://example.invalid/windows/PeerBrush-1.30.1.0.msix".to_string(),
+            policy().runtime_uri
+        ]
+    );
+    assert_eq!(
+        fs::read(current.join("main.msix")).unwrap(),
+        b"main-native-bytes"
+    );
+    assert!(!current.join("stage-intent.json").exists());
+}
+
+#[test]
+fn advanced_feed_refuses_initial_capture_before_package_io_and_controller_reports_the_source_gap() {
+    let temp = Temp::new();
+    let root = temp.0.join("windows-prepared");
+    let native = initial_current_native(&temp.0.join("installed"));
+    let http = HttpFake::new();
+    assert_eq!(
+        capture_current_only(&root, &policy(), &http, &native, &control()).unwrap_err(),
+        CURRENT_MISSING
+    );
+    assert_eq!(*http.calls.lock().unwrap(), vec![policy().descriptor]);
+    assert_eq!(native.current_media_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 0);
+    assert!(!root.exists());
+    let mut controller = Controller::load(&temp.0);
+    assert!(controller.start_current_capture().is_err());
+    controller
+        .launch_task(WorkKind::Capture, |_| Err(CURRENT_MISSING.into()))
+        .unwrap();
+    wait_controller(&mut controller, |c| !c.view.busy);
+    assert_eq!(controller.view.message, CURRENT_MISSING);
+    assert!(controller.view.version.is_none());
+    assert!(controller.view.staged_version.is_none());
+    assert!(controller.view.observed_target.is_none());
+    assert!(!ENABLED);
+    assert!(configured().is_none());
+}
+
+struct CurrentDuringNew<'a> {
+    http: HttpFake,
+    current: &'a Path,
+    cancel: Option<Arc<AtomicBool>>,
+    tamper: bool,
+    late_source: Option<&'a AtomicUsize>,
+}
+impl Transport for CurrentDuringNew<'_> {
+    fn get(&self, uri: &str) -> Result<Response> {
+        if uri.ends_with("PeerBrush-1.30.1.0.msix") {
+            let cache = self.current.parent().unwrap();
+            assert!(crate::file_safety::Lease::acquire(&cache.join("acquisition.json")).is_err());
+            let media = self.current.join("main.msix");
+            if self.tamper {
+                #[cfg(windows)]
+                assert!(fs::write(&media, b"fake-native-bytes").is_err());
+                #[cfg(not(windows))]
+                fs::write(&media, b"fake-native-bytes").unwrap();
+            }
+            if let Some(cancel) = &self.cancel {
+                cancel.store(true, Ordering::Release);
+            }
+            if let Some(source_calls) = self.late_source {
+                source_calls.store(usize::MAX, Ordering::Relaxed);
+            }
+        }
+        self.http.get(uri)
+    }
+}
+
+#[test]
+fn current_archive_is_held_through_new_transfer_and_cancel_source_changes_and_tampering_refuse_reuse(
+) {
+    for fault in [
+        "cancel",
+        "source",
+        "late-source",
+        "signature",
+        "signed-build",
+        "signed-executable",
+        "signed-source",
+        "tamper",
+    ] {
+        let temp = Temp::new();
+        let root = temp.0.join("windows-prepared");
+        let mut native = initial_current_native(&temp.0.join("installed"));
+        capture_current_only(&root, &policy(), &current_http(), &native, &control()).unwrap();
+        let current = captured_current(&root);
+        let marker = fs::read(current.join("current.json")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let control = control();
+        if fault == "source" {
+            native.current.build = "9".repeat(40);
+        }
+        if fault.starts_with("signed-") || fault == "signature" {
+            native.archive_fault = fault;
+        }
+        let http = CurrentDuringNew {
+            http: HttpFake::new(),
+            current: &current,
+            cancel: (fault == "cancel").then(|| control.cancelled.clone()),
+            tamper: fault == "tamper",
+            late_source: (fault == "late-source").then_some(&native.source_calls),
+        };
+        let result = acquire_with_current(&root, &policy(), &http, &native, &control);
+        if fault == "tamper" && cfg!(windows) {
+            assert_eq!(result.unwrap(), receipt());
+        } else {
+            assert!(result.is_err(), "{fault}");
+        }
+        assert_eq!(fs::read(current.join("current.json")).unwrap(), marker);
+        assert!(!current.join("stage-intent.json").exists());
+        assert!(crate::file_safety::Lease::acquire(
+            &current_root(&root).unwrap().join("acquisition.json")
+        )
+        .is_ok());
+    }
+}
+
+#[test]
+fn initial_current_capture_preserves_strict_transport_and_native_failures_and_rejects_forged_cache_claims(
+) {
+    for fault in [
+        "length",
+        "truncated",
+        "signature",
+        "manifest-version",
+        "full-name",
+        "executing",
+        "journal",
+    ] {
+        let temp = Temp::new();
+        let root = temp.0.join("windows-prepared");
+        let mut native = initial_current_native(&temp.0.join("installed"));
+        let mut http = current_http();
+        let uri = "https://example.invalid/windows/PeerBrush-1.30.0.0.msix";
+        if fault == "length" {
+            http.files.get_mut(uri).unwrap().1 = PACKAGE + 1;
+        }
+        if fault == "truncated" {
+            http.files.get_mut(uri).unwrap().1 += 1;
+        }
+        if ["signature", "manifest-version", "full-name"].contains(&fault) {
+            native.archive_fault = fault;
+        }
+        if fault == "executing" {
+            fs::write(&native.executing, b"foreign-executable").unwrap();
+        }
+        if fault == "journal" {
+            capture_current_only(&root, &policy(), &http, &native, &control()).unwrap();
+            let current = captured_current(&root);
+            let mut record: Prepared =
+                serde_json::from_slice(&fs::read(current.join("current.json")).unwrap()).unwrap();
+            record.source.build = "9".repeat(40);
+            fs::write(
+                current.join("current.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(
+            capture_current_only(&root, &policy(), &http, &native, &control()).is_err(),
+            "{fault}"
+        );
+        assert!(!root.exists());
+        assert_eq!(native.new_main_calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+struct CurrentGuardedStage<'a> {
+    stage: StageFake,
+    current: &'a Path,
+    cancel: Option<Arc<AtomicBool>>,
+    tamper: bool,
+}
+impl Stager for CurrentGuardedStage<'_> {
+    fn submit(
+        &self,
+        selected: &RetainedSelection,
+        view: Arc<Mutex<View>>,
+    ) -> Result<Box<dyn StageOperation>> {
+        assert!(crate::file_safety::Lease::acquire(
+            &self.current.parent().unwrap().join("acquisition.json")
+        )
+        .is_err());
+        let file = self.current.join("main.msix");
+        if self.tamper {
+            #[cfg(windows)]
+            assert!(fs::write(&file, b"fake-native-bytes").is_err());
+            #[cfg(not(windows))]
+            fs::write(&file, b"fake-native-bytes").unwrap();
+        }
+        #[cfg(windows)]
+        assert!(OpenOptions::new()
+            .write(true)
+            .open(self.current.join("current.json"))
+            .is_err());
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Release);
+        }
+        self.stage.submit(selected, view)
+    }
+}
+#[test]
+fn staging_retains_current_archive_until_real_terminal_readback_including_cancel_and_changed_media()
+{
+    for fault in ["none", "cancel", "tamper"] {
+        let temp = Temp::new();
+        let root = temp.0.join("windows-prepared");
+        let native = initial_current_native(&temp.0.join("installed"));
+        capture_current_only(&root, &policy(), &current_http(), &native, &control()).unwrap();
+        let current = captured_current(&root);
+        let current_record = fs::read(current.join("current.json")).unwrap();
+        fs::create_dir(&root).unwrap();
+        acquire_with_current(&root, &policy(), &HttpFake::new(), &native, &control()).unwrap();
+        let control = control();
+        let (tx, rx) = mpsc::channel();
+        tx.send(()).unwrap();
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let stager = CurrentGuardedStage {
+            stage: StageFake {
+                release: Mutex::new(Some(rx)),
+                uncertain: false,
+                submissions: submissions.clone(),
+                cancellations: cancellations.clone(),
+            },
+            current: &current,
+            cancel: (fault == "cancel").then(|| control.cancelled.clone()),
+            tamper: fault == "tamper",
+        };
+        let result = stage_with_current(&root, &policy(), &native, &stager, &control);
+        if fault == "tamper" && !cfg!(windows) {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap().accepted, fault != "cancel");
+        }
+        assert_eq!(submissions.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cancellations.load(Ordering::Relaxed),
+            usize::from(fault == "cancel")
+        );
+        let selected = stage_attempt(&root);
+        assert!(selected.join("stage-intent.json").is_file());
+        assert!(selected.join("stage-outcome.json").is_file());
+        assert_eq!(
+            fs::read(current.join("current.json")).unwrap(),
+            current_record
+        );
+        assert!(!current.join("stage-intent.json").exists());
+        assert!(crate::file_safety::Lease::acquire(
+            &current_root(&root).unwrap().join("acquisition.json")
+        )
+        .is_ok());
+    }
+}
+
+#[test]
+fn current_cache_reopen_rejects_same_size_restamped_or_replaced_archive_before_new_download() {
+    for replacement in [false, true] {
+        let temp = Temp::new();
+        let root = temp.0.join("windows-prepared");
+        let native = initial_current_native(&temp.0.join("installed"));
+        capture_current_only(&root, &policy(), &current_http(), &native, &control()).unwrap();
+        let current = captured_current(&root);
+        let file = current.join("main.msix");
+        let original = fs::read(&file).unwrap();
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        if replacement {
+            fs::rename(&file, current.join("retained-original.msix")).unwrap();
+        }
+        let mut changed = original.clone();
+        changed[0] ^= 1;
+        fs::write(&file, changed).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().len(), original.len() as u64);
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+        fs::create_dir(&root).unwrap();
+        let http = HttpFake::new();
+        let native_calls = native.current_media_calls.load(Ordering::Relaxed);
+        assert!(acquire_with_current(&root, &policy(), &http, &native, &control()).is_err());
+        assert_eq!(
+            native.current_media_calls.load(Ordering::Relaxed),
+            native_calls
+        );
+        assert!(http.calls.lock().unwrap().is_empty());
+        assert!(attempts(&root).unwrap().0.is_empty());
+    }
+}
+
+#[test]
+fn explicit_copy_worker_reports_real_capture_without_prepared_update_or_health_authority() {
+    let temp = Temp::new();
+    let root = temp.0.join("windows-prepared");
+    let worker_root = root.clone();
+    let native = initial_current_native(&temp.0.join("installed"));
+    let mut controller = Controller::load(&temp.0);
+    controller
+        .launch_task(WorkKind::Capture, move |control| {
+            capture_current_only(&worker_root, &policy(), &current_http(), &native, control)?;
+            Ok(Completed::CurrentArchive)
+        })
+        .unwrap();
+    wait_controller(&mut controller, |c| !c.view.busy);
+    assert!(controller
+        .view
+        .message
+        .starts_with("Current-version copy retained."));
+    assert!(controller
+        .view
+        .message
+        .contains("Installation and recovery remain unavailable"));
+    assert!(controller.view.version.is_none());
+    assert!(controller.view.staged_version.is_none());
+    assert!(controller.view.observed_target.is_none());
+    assert!(matches!(controller.deployment, DeploymentState::Unchecked));
+    assert!(captured_current(&root).join("current.json").is_file());
+    assert!(!ENABLED);
+    assert!(configured().is_none());
 }

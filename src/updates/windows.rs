@@ -343,7 +343,31 @@ impl Policy {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaRole {
+    New,
+    Current,
+}
+impl MediaRole {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::New => "prepared.json",
+            Self::Current => "current.json",
+        }
+    }
+}
+const CURRENT_MISSING: &str = "The download feed does not offer this exact installed Windows version. A recovery copy is unavailable; retrieving a verified older package is not implemented. No update was prepared or installed.";
+
+#[cfg(test)]
 fn descriptor(bytes: &[u8], policy: &Policy, source: &Source) -> Result<Selection> {
+    descriptor_for(bytes, policy, source, MediaRole::New)
+}
+fn descriptor_for(
+    bytes: &[u8],
+    policy: &Policy,
+    source: &Source,
+    role: MediaRole,
+) -> Result<Selection> {
     policy.validate()?;
     if source.family != policy.family
         || source.association != policy.descriptor
@@ -429,7 +453,10 @@ fn descriptor(bytes: &[u8], policy: &Policy, source: &Source) -> Result<Selectio
     let package = main.attribute("Uri").ok_or("Missing native package URI.")?;
     let uri = https(package)?;
     let approved = https(&policy.descriptor)?;
-    if v <= source.version
+    if role == MediaRole::Current && v != source.version {
+        return Err(CURRENT_MISSING.into());
+    }
+    if (role == MediaRole::New && v <= source.version)
         || runtime_v < [14, 0, 30704, 0]
         || root.attribute("Version") != main.attribute("Version")
         || main.attribute("Name") != Some(&policy.name)
@@ -780,6 +807,7 @@ fn current_archive<'a>(
     proof.check(policy, verifier, control)?;
     Ok(proof)
 }
+#[cfg(test)]
 fn reconcile(
     root: &Path,
     policy: &Policy,
@@ -818,8 +846,16 @@ fn read_prepared(
     policy: &Policy,
     control: &Control,
 ) -> Result<(Directory, Held, Prepared)> {
+    read_prepared_for(root, policy, control, MediaRole::New)
+}
+fn read_prepared_for(
+    root: &Path,
+    policy: &Policy,
+    control: &Control,
+    role: MediaRole,
+) -> Result<(Directory, Held, Prepared)> {
     let owned = Directory::open(root)?;
-    let journal = Held::open(&root.join("prepared.json"), SMALL, control)?;
+    let journal = Held::open(&root.join(role.marker()), SMALL, control)?;
     let prepared: Prepared = serde_json::from_slice(&small(&journal, control)?)
         .map_err(|_| "Pending Windows download metadata is invalid; original retained.")?;
     policy.validate()?;
@@ -855,12 +891,26 @@ fn authenticate_media(
     current: Option<&Source>,
     control: &Control,
 ) -> Result<RetainedSelection> {
+    authenticate_media_for(input, policy, verifier, current, control, MediaRole::New)
+}
+fn authenticate_media_for(
+    input: (Directory, Held, Prepared),
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    current: Option<&Source>,
+    control: &Control,
+    role: MediaRole,
+) -> Result<RetainedSelection> {
     let (owned, journal, prepared) = input;
     let root = &owned.path;
     let descriptor_file = Held::open(&root.join("selected.appinstaller"), SMALL, control)?;
     if descriptor_file.media != prepared.descriptor
-        || descriptor(&small(&descriptor_file, control)?, policy, &prepared.source)?
-            != prepared.selection
+        || descriptor_for(
+            &small(&descriptor_file, control)?,
+            policy,
+            &prepared.source,
+            role,
+        )? != prepared.selection
     {
         return Err("Pending Windows descriptor changed.".into());
     }
@@ -892,6 +942,31 @@ fn authenticate_media(
     })
 }
 
+fn retain_for_role(
+    root: &Path,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+    role: MediaRole,
+) -> Result<RetainedSelection> {
+    if role == MediaRole::New {
+        return retain_selection(root, policy, verifier, control);
+    }
+    no_stage_evidence(root)?;
+    let input = read_prepared_for(root, policy, control, role)?;
+    let current = verifier.source(policy)?;
+    if input.2.source != current {
+        return Err(
+            "Retained current Windows archive belongs to a different running source.".into(),
+        );
+    }
+    let retained = authenticate_media_for(input, policy, verifier, Some(&current), control, role)?;
+    retained.check(verifier, control)?;
+    no_stage_evidence(root)?;
+    Ok(retained)
+}
+
+#[cfg(test)]
 fn prepare(
     root: &Path,
     policy: &Policy,
@@ -899,9 +974,19 @@ fn prepare(
     verifier: &dyn Verifier,
     control: &Control,
 ) -> Result<Prepared> {
+    Ok(prepare_for(root, policy, transport, verifier, control, MediaRole::New)?.prepared)
+}
+fn prepare_for(
+    root: &Path,
+    policy: &Policy,
+    transport: &dyn Transport,
+    verifier: &dyn Verifier,
+    control: &Control,
+    role: MediaRole,
+) -> Result<RetainedSelection> {
     policy.validate()?;
     let owned = Directory::open(root)?;
-    let marker = root.join("prepared.json");
+    let marker = root.join(role.marker());
     let versions = root.join(".peerbrush-versions");
     if fs::symlink_metadata(&versions).is_ok() {
         directory(&versions)?;
@@ -913,7 +998,7 @@ fn prepare(
         .try_exists()
         .map_err(|_| "Cannot inspect retained Windows download.")?
     {
-        return reconcile(root, policy, verifier, control);
+        return retain_for_role(root, policy, verifier, control, role);
     }
     // Never truncate/guess ownership of remnants. A new transaction requires a
     // fresh directory; only its validated Prepared record can be reused.
@@ -936,16 +1021,24 @@ fn prepare(
         &root.join("selected.appinstaller"),
         SMALL,
         control,
-        "Reading approved Windows descriptor",
+        if role == MediaRole::Current {
+            "Reading the current-version recovery descriptor"
+        } else {
+            "Reading approved Windows descriptor"
+        },
     )?;
-    let selection = descriptor(&small(&descriptor_file, control)?, policy, &source)?;
+    let selection = descriptor_for(&small(&descriptor_file, control)?, policy, &source, role)?;
     let package = download(
         transport,
         &selection.package,
         &root.join("main.msix"),
         PACKAGE,
         control,
-        "Downloading signed Windows package",
+        if role == MediaRole::Current {
+            "Downloading the current-version recovery copy"
+        } else {
+            "Downloading signed Windows package"
+        },
     )?;
     let runtime = download(
         transport,
@@ -953,10 +1046,18 @@ fn prepare(
         &root.join("runtime.appx"),
         PACKAGE,
         control,
-        "Downloading signed Windows runtime",
+        if role == MediaRole::Current {
+            "Downloading the recovery copy runtime"
+        } else {
+            "Downloading signed Windows runtime"
+        },
     )?;
     control.phase("Verifying Windows signatures and native payloads", 0)?;
-    verifier.media(&package, policy, &selection, false, control)?;
+    let target = if role == MediaRole::Current {
+        Some(verifier.current_media(&package, policy, &source, control)?)
+    } else {
+        verifier.media(&package, policy, &selection, false, control)?
+    };
     verifier.media(&runtime, policy, &selection, true, control)?;
     let prepared = Prepared {
         schema: 1,
@@ -998,7 +1099,15 @@ fn prepare(
     // the published marker's held identity/current bytes, not its old absence.
     saved.check(control)?;
     control.check()?;
-    Ok(prepared)
+    Ok(RetainedSelection {
+        owned,
+        journal: saved,
+        descriptor: descriptor_file,
+        package,
+        runtime,
+        prepared,
+        target,
+    })
 }
 
 fn no_stage_evidence(root: &Path) -> Result<()> {
@@ -1012,13 +1121,19 @@ fn no_stage_evidence(root: &Path) -> Result<()> {
 }
 
 fn attempts(root: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
-    let result = attempt_inventory(root)?;
+    attempts_for(root, MediaRole::New)
+}
+fn attempts_for(root: &Path, role: MediaRole) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    let result = attempt_inventory_for(root, role)?;
     for path in &result.0 {
         no_stage_evidence(path)?;
     }
     Ok(result)
 }
 fn attempt_inventory(root: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    attempt_inventory_for(root, MediaRole::New)
+}
+fn attempt_inventory_for(root: &Path, role: MediaRole) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
     let mut attempts = Vec::new();
     let mut prepared = None;
     for item in fs::read_dir(root).map_err(|_| "Cannot inspect Windows acquisition state.")? {
@@ -1039,7 +1154,7 @@ fn attempt_inventory(root: &Path) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
             return Err("Unrecognized Windows acquisition directory; files retained.".into());
         }
         directory(&item.path())?;
-        match fs::symlink_metadata(item.path().join("prepared.json")) {
+        match fs::symlink_metadata(item.path().join(role.marker())) {
             Ok(_) => {
                 if prepared.replace(item.path()).is_some() {
                     return Err(
@@ -1068,6 +1183,38 @@ fn acquire(
     verifier: &dyn Verifier,
     control: &Control,
 ) -> Result<Prepared> {
+    Ok(acquire_for(
+        root,
+        policy,
+        Some(transport),
+        verifier,
+        control,
+        MediaRole::New,
+    )?
+    .retained
+    .prepared)
+}
+struct OwnedSelection {
+    owned: Directory,
+    lease: crate::file_safety::Lease,
+    retained: RetainedSelection,
+}
+impl OwnedSelection {
+    fn check(&self) -> Result<()> {
+        self.owned.check()?;
+        self.lease
+            .validate()
+            .map_err(|_| "Windows acquisition destination changed.".into())
+    }
+}
+fn acquire_for(
+    root: &Path,
+    policy: &Policy,
+    transport: Option<&dyn Transport>,
+    verifier: &dyn Verifier,
+    control: &Control,
+    role: MediaRole,
+) -> Result<OwnedSelection> {
     policy.validate()?;
     let owned = Directory::open(root)?;
     let versions = root.join(".peerbrush-versions");
@@ -1079,15 +1226,20 @@ fn acquire(
     let lease = crate::file_safety::Lease::acquire(&root.join("acquisition.json"))
         .map_err(|_| "Another Windows acquisition owns this cache or its lease is unavailable.")?;
     directory(&versions)?;
-    let (attempts, prepared) = attempts(root)?;
+    let (attempts, prepared) = attempts_for(root, role)?;
     if let Some(path) = prepared {
-        let result = reconcile(&path, policy, verifier, control)?;
+        let retained = retain_for_role(&path, policy, verifier, control, role)?;
         owned.check()?;
         lease
             .validate()
             .map_err(|_| "Windows acquisition destination changed.")?;
-        return Ok(result);
+        return Ok(OwnedSelection {
+            owned,
+            lease,
+            retained,
+        });
     }
+    let transport = transport.ok_or("Capture the signed current Windows archive before staging; no historical locator is implemented.")?;
     // shortcut: three retained download-only attempts, add reviewed ownership-safe
     // cache retirement before admitting more retries. Never truncate partial bytes.
     if attempts.len() == 3 {
@@ -1104,12 +1256,108 @@ fn acquire(
     let attempt = root.join(format!("attempt-{}", crate::engine::id()));
     fs::create_dir(&attempt)
         .map_err(|_| "Cannot create a fresh owned Windows acquisition attempt.")?;
-    let result = prepare(&attempt, policy, transport, verifier, control)?;
+    let retained = prepare_for(&attempt, policy, transport, verifier, control, role)?;
     owned.check()?;
     lease
         .validate()
         .map_err(|_| "Windows acquisition destination changed.")?;
-    Ok(result)
+    Ok(OwnedSelection {
+        owned,
+        lease,
+        retained,
+    })
+}
+
+fn current_root(root: &Path) -> Result<PathBuf> {
+    if root.file_name().and_then(|v| v.to_str()) != Some("windows-prepared") {
+        return Err(
+            "Current Windows media requires the separate prepared/current cache roles.".into(),
+        );
+    }
+    Ok(root.with_file_name("windows-current"))
+}
+fn capture_current(
+    root: &Path,
+    policy: &Policy,
+    transport: &dyn Transport,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<OwnedSelection> {
+    let current_root = current_root(root)?;
+    directory(
+        current_root
+            .parent()
+            .ok_or("Missing current Windows cache parent.")?,
+    )?;
+    match fs::create_dir(&current_root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => directory(&current_root)?,
+        Err(_) => return Err("Cannot create the owned current Windows archive cache.".into()),
+    }
+    acquire_for(
+        &current_root,
+        policy,
+        Some(transport),
+        verifier,
+        control,
+        MediaRole::Current,
+    )
+}
+fn acquire_with_current(
+    root: &Path,
+    policy: &Policy,
+    transport: &dyn Transport,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<Prepared> {
+    let current = capture_current(root, policy, transport, verifier, control)?;
+    let proof = current_archive(
+        &current.retained,
+        &current.retained.prepared.source,
+        policy,
+        verifier,
+        control,
+    )?;
+    current.check()?;
+    proof.check(policy, verifier, control)?;
+    let prepared = acquire(root, policy, transport, verifier, control)?;
+    proof.check(policy, verifier, control)?;
+    current.check()?;
+    Ok(prepared)
+}
+fn stage_with_current(
+    root: &Path,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    stager: &dyn Stager,
+    control: &Control,
+) -> Result<Staged> {
+    let current = acquire_for(
+        &current_root(root)?,
+        policy,
+        None,
+        verifier,
+        control,
+        MediaRole::Current,
+    )?;
+    let proof = current_archive(
+        &current.retained,
+        &current.retained.prepared.source,
+        policy,
+        verifier,
+        control,
+    )?;
+    current.check()?;
+    let result = stage_inner(root, policy, verifier, stager, control, Some(&proof));
+    // A canceled UI request cannot skip the final held-byte/ownership readback.
+    let readback = Control {
+        cancelled: Arc::new(AtomicBool::new(false)),
+        deadline: Instant::now() + TIMEOUT,
+        view: control.view.clone(),
+    };
+    proof.check(policy, verifier, &readback)?;
+    current.check()?;
+    result
 }
 
 const STAGE_HOLD: &str =
@@ -1222,12 +1470,23 @@ fn stage_record(path: &Path, value: &impl Serialize, control: &Control) -> Resul
     }
     Ok(saved)
 }
+#[cfg(test)]
 fn stage(
     root: &Path,
     policy: &Policy,
     verifier: &dyn Verifier,
     stager: &dyn Stager,
     control: &Control,
+) -> Result<Staged> {
+    stage_inner(root, policy, verifier, stager, control, None)
+}
+fn stage_inner(
+    root: &Path,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    stager: &dyn Stager,
+    control: &Control,
+    current: Option<&CurrentArchive<'_>>,
 ) -> Result<Staged> {
     policy.validate()?;
     control.check()?;
@@ -1262,6 +1521,9 @@ fn stage(
     // cleanup or retry is safe after submission, including after process loss.
     control.check()?;
     retained.check(verifier, control)?;
+    if let Some(current) = current {
+        current.check(policy, verifier, control)?;
+    }
     let mut operation = stager.submit(&retained, control.view.clone())?;
     let mut rejected = false;
     let mut cancellation_sent = false;
@@ -1309,6 +1571,9 @@ fn stage(
         &readback,
     )?;
     retained.check(verifier, &readback)?;
+    if let Some(current) = current {
+        current.check(policy, verifier, &readback)?;
+    }
     intent.check(&readback)?;
     owned.check()?;
     acquisition.validate()?;
@@ -1482,14 +1747,35 @@ enum DeploymentState {
     Recorded,
     Unknown,
 }
+fn capture_current_only(
+    root: &Path,
+    policy: &Policy,
+    transport: &dyn Transport,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<()> {
+    let current = capture_current(root, policy, transport, verifier, control)?;
+    let proof = current_archive(
+        &current.retained,
+        &current.retained.prepared.source,
+        policy,
+        verifier,
+        control,
+    )?;
+    proof.check(policy, verifier, control)?;
+    current.check()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkKind {
     Download,
+    Capture,
     Stage,
     Reconcile,
 }
 enum Completed {
     Download(Prepared),
+    CurrentArchive,
     Stage(Staged),
     Reconciled(Reconciled),
 }
@@ -1617,6 +1903,12 @@ impl Controller {
         ENABLED && configured().is_some()
     }
     pub fn start(&mut self) -> Result<()> {
+        self.start_media(MediaRole::New)
+    }
+    fn start_current_capture(&mut self) -> Result<()> {
+        self.start_media(MediaRole::Current)
+    }
+    fn start_media(&mut self, role: MediaRole) -> Result<()> {
         if matches!(
             self.deployment,
             DeploymentState::Unknown | DeploymentState::Recorded
@@ -1624,8 +1916,10 @@ impl Controller {
             return Err(STAGE_HOLD.into());
         }
         #[cfg(test)]
-        if let Some(work) = self.next.take() {
-            return self.launch(work);
+        if role == MediaRole::New {
+            if let Some(work) = self.next.take() {
+                return self.launch(work);
+            }
         }
         if !self.allowed() {
             return Err(DISABLED.into());
@@ -1653,12 +1947,35 @@ impl Controller {
                 Err(_) => return Err("Cannot create Windows download directory.".into()),
             }
             let root = self.root.clone();
-            self.launch(move |control| {
+            let kind = if role == MediaRole::Current {
+                WorkKind::Capture
+            } else {
+                WorkKind::Download
+            };
+            self.launch_task(kind, move |control| {
                 if !ENABLED {
                     return Err(DISABLED.into());
                 }
                 native::session(|| {
-                    acquire(&root, &policy, &Http::new(), &native::Verifier, control)
+                    if role == MediaRole::Current {
+                        capture_current_only(
+                            &root,
+                            &policy,
+                            &Http::new(),
+                            &native::Verifier,
+                            control,
+                        )
+                        .map(|_| Completed::CurrentArchive)
+                    } else {
+                        acquire_with_current(
+                            &root,
+                            &policy,
+                            &Http::new(),
+                            &native::Verifier,
+                            control,
+                        )
+                        .map(Completed::Download)
+                    }
                 })
             })
         }
@@ -1707,7 +2024,7 @@ impl Controller {
                 let _profile = profile;
                 _profile.validate()?;
                 native::session(|| {
-                    stage(&root, &policy, &native::Verifier, &native::Stager, control)
+                    stage_with_current(&root, &policy, &native::Verifier, &native::Stager, control)
                 })
                 .map(Completed::Stage)
             })
@@ -1741,6 +2058,7 @@ impl Controller {
                 WorkKind::Stage => "Starting native Windows staging",
                 WorkKind::Reconcile => "Verifying retained Windows staging state",
                 WorkKind::Download => "Starting signed Windows download",
+                WorkKind::Capture => "Downloading the current version recovery copy",
             },
             ..View::default()
         }));
@@ -1750,13 +2068,13 @@ impl Controller {
             deadline,
             view: view.clone(),
         };
-        std::thread::Builder::new().name(if kind != WorkKind::Download { "peerbrush-windows-stage" } else { "peerbrush-windows-download" }.into()).spawn(move || {
+        std::thread::Builder::new().name(if matches!(kind, WorkKind::Stage | WorkKind::Reconcile) { "peerbrush-windows-stage" } else { "peerbrush-windows-download" }.into()).spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&control)))
                 .unwrap_or_else(|_| Err("Windows preparation stopped unexpectedly; retained media needs revalidation.".into()));
             let _ = tx.send(result);
         }).map_err(|_| "Could not start signed Windows download.")?;
         self.view = view.lock().unwrap().clone();
-        if kind != WorkKind::Download {
+        if matches!(kind, WorkKind::Stage | WorkKind::Reconcile) {
             self.deployment = DeploymentState::Unknown;
         }
         self.active = Some(Pending {
@@ -1778,7 +2096,7 @@ impl Controller {
             pending.cancel.store(true, Ordering::Release);
         }
         if pending.cancel.load(Ordering::Acquire) {
-            self.view.message = if pending.kind != WorkKind::Download {
+            self.view.message = if matches!(pending.kind, WorkKind::Stage | WorkKind::Reconcile) {
                 STAGE_HOLD
             } else if timeout {
                 "Windows preparation exceeded its deadline; waiting for its owned native operation."
@@ -1803,7 +2121,8 @@ impl Controller {
             self.view.staged_version = None;
             self.view.recorded_staging = false;
             self.view.observed_target = None;
-            self.view.message = if canceled && kind != WorkKind::Download {
+            self.view.message = if canceled && matches!(kind, WorkKind::Stage | WorkKind::Reconcile)
+            {
                 STAGE_HOLD.into()
             } else if canceled {
                 "Windows preparation was canceled. Retained bytes must be revalidated before reuse; nothing was installed.".into()
@@ -1813,6 +2132,9 @@ impl Controller {
                         self.deployment = DeploymentState::Clear;
                         "No retained staging record was found. Installation remains unavailable."
                             .into()
+                    }
+                    Ok(Completed::CurrentArchive) => {
+                        "Current-version copy retained. Installation and recovery remain unavailable; projects and preferences were not backed up.".into()
                     }
                     Ok(Completed::Reconciled(Reconciled::Prepared(prepared))) => {
                         self.deployment = DeploymentState::Clear;
@@ -1839,7 +2161,7 @@ impl Controller {
                         self.view.version = Some(prepared.selection.version);
                         "Signed Windows media prepared locally. Installation and restart remain unavailable.".into()
                     }
-                    _ if kind != WorkKind::Download => STAGE_HOLD.into(),
+                    _ if matches!(kind, WorkKind::Stage | WorkKind::Reconcile) => STAGE_HOLD.into(),
                     Err(error) => error,
                     _ => STAGE_HOLD.into(),
                 }
@@ -1857,6 +2179,23 @@ impl Controller {
         ui.label("Signed Windows package preparation");
         if !self.allowed() {
             ui.label(DISABLED);
+        }
+        ui.label("Prepare a copy of the current version before its download feed changes. This may download up to 512 MiB each for the app and runtime; recovery remains unavailable.");
+        if ui
+            .add_enabled(
+                self.allowed()
+                    && !self.view.busy
+                    && !matches!(
+                        self.deployment,
+                        DeploymentState::Unknown | DeploymentState::Recorded
+                    ),
+                eframe::egui::Button::new("Prepare recovery copy"),
+            )
+            .clicked()
+        {
+            if let Err(error) = self.start_current_capture() {
+                self.view.message = error;
+            }
         }
         if ui
             .add_enabled(
