@@ -394,6 +394,20 @@ class Published(unittest.TestCase):
             self.assertEqual(site.main(), 2)
         self.assertEqual(prepare.call_args.kwargs['maintainer'], test_deb.MAINTAINER)
 
+    def test_cli_requires_an_explicit_final_inventory_and_independent_digest_pair(self):
+        common = ['--site-commit', 'a' * 40, '--tag', 'v0.2.0', '--commit', self.commit,
+                  '--notes', 'unread-notes.json', '--output', 'not-created']
+        for selection in [[], ['--final-inventory', 'unread-final.json'],
+                          ['--final-inventory', 'unread-final.json', '--final-inventory-sha256', 'not-a-digest'],
+                          ['--inventory', 'unread-base.json', '--final-inventory-sha256', 'a' * 64],
+                          ['--inventory', 'unread-base.json', '--final-inventory', 'unread-final.json',
+                           '--final-inventory-sha256', 'a' * 64]]:
+            with self.subTest(selection=selection), mock.patch.object(site, 'prepare') as prepare, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as rejected:
+                site.main(common + selection)
+            self.assertEqual(rejected.exception.code, 2)
+            prepare.assert_not_called()
+
     def test_preparation_writes_only_new_review_overlay_and_bound_hashes(self):
         previous = json.loads((pathlib.Path(__file__).resolve().parents[1] / 'tests/fixtures/site-release-output.json').read_bytes())['files']
         data = json.loads(previous['downloads.json'])

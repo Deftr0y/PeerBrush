@@ -228,6 +228,12 @@ def installed_report(kind, record, data, commit, version):
 
 
 def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer=None):
+    selected_final = None
+    if isinstance(inventory, dict) and 'format' in inventory:
+        from final_release import validate_manifest
+        validate_manifest(inventory)
+        selected_final = inventory
+        inventory = selected_final['base_inventory']
     match = re.fullmatch('v(' + STABLE + ')', tag)
     if not match or not re.fullmatch('[0-9a-f]{40}', commit):
         raise ValueError('Choose a canonical stable vA.B.C tag and full source SHA.')
@@ -302,11 +308,17 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
         raw_final = download('final-release-inventory.json', 128 * 1024)
         final = json.loads(raw_final, object_pairs_hook=unique_fields)
         validate_manifest(final)
+        if selected_final is not None:
+            from final_release import encode as final_encode
+            if final != selected_final or raw_final != final_encode(selected_final):
+                raise ValueError('Public final manifest differs from the independently selected final inventory.')
         if final['base_inventory'] != inventory:
             raise ValueError('Public final manifest differs from the independently selected base inventory.')
         public_readback(final, get)
         expected_checksums = checksum_bytes(final).decode('ascii')
     else:
+        if selected_final is not None:
+            raise ValueError('Selected public final inventory is missing; legacy fallback is not permitted.')
         expected_checksums = ''.join(f"{r['sha256']}  {r['file']}\n" for r in inventory['assets'])
     if checksums.decode('ascii').replace('\r\n', '\n') != expected_checksums:
         raise ValueError('Published checksum list differs from the verified final inventory.')
@@ -543,7 +555,7 @@ def prepare(root, site_commit, inventory, tag, commit, notes, output, get=public
     report = dict(schema=1, version=tag, commit=commit, site_commit=site_commit,
                   site_update_prepared=bool(overlay), deployment_performed=False,
                   production_readiness='not-assessed', store_public_availability='unverified',
-                  release_inventory_sha256=inventory_sha(inventory),
+                  release_inventory_sha256=entry['releaseInventorySha256'],
                   excluded=excluded, files={name: sha(data) for name, data in overlay.items()})
     # Verification may involve several transfers. Recheck links/worktrees at
     # the point of use instead of relying on the earlier advisory path check.
@@ -563,16 +575,35 @@ def prepare(root, site_commit, inventory, tag, commit, notes, output, get=public
     return report
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ['site-commit', 'tag', 'commit']:
         parser.add_argument('--' + name, required=True)
-    for name in ['inventory', 'notes', 'output']:
+    for name in ['notes', 'output']:
         parser.add_argument('--' + name, required=True, type=pathlib.Path)
+    selected = parser.add_mutually_exclusive_group(required=True)
+    selected.add_argument('--inventory', type=pathlib.Path)
+    selected.add_argument('--final-inventory', type=pathlib.Path)
+    parser.add_argument('--final-inventory-sha256')
     parser.add_argument('--maintainer', help='Approved public DEB maintainer name <email>; content inspection does not establish download readiness')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.final_inventory is not None:
+        if not re.fullmatch('[0-9a-f]{64}', args.final_inventory_sha256 or ''):
+            parser.error('Select the final publisher inventory with an independent SHA-256.')
+        from final_release import read, encode as final_encode, validate_manifest
+        raw = read(args.final_inventory, 128 * 1024, args.final_inventory_sha256)
+        inventory = json.loads(raw, object_pairs_hook=unique_fields)
+        validate_manifest(inventory)
+        if raw != final_encode(inventory):
+            raise ValueError('Select the exact canonical final publisher inventory bytes.')
+    else:
+        if args.final_inventory_sha256 is not None:
+            parser.error('Final inventory digest requires --final-inventory.')
+        inventory = json.loads(args.inventory.read_bytes())
+        if isinstance(inventory, dict) and 'format' in inventory:
+            parser.error('Final publisher inventories require --final-inventory and its independent digest.')
     root = pathlib.Path(__file__).resolve().parents[1]
-    report = prepare(root, args.site_commit, json.loads(args.inventory.read_bytes()), args.tag,
+    report = prepare(root, args.site_commit, inventory, args.tag,
                      args.commit, json.loads(args.notes.read_bytes()), args.output, maintainer=args.maintainer)
     print('Reviewable website overlay prepared; deployment was not performed.' if report['site_update_prepared']
           else 'No eligible public platforms; only an exclusion report was prepared.')

@@ -297,6 +297,10 @@ class Composition(unittest.TestCase):
         entry, excluded = website.published(self.root, candidate.manifest['base_inventory'], tag,
             candidate.manifest['commit'], dict(notes=['Reviewed fixture notes'], caution='Native acceptance remains incomplete.'),
             service.public_get, maintainer=test_deb.MAINTAINER)
+        selected_entry, selected_excluded = website.published(self.root, candidate.manifest, tag,
+            candidate.manifest['commit'], dict(notes=['Reviewed fixture notes'], caution='Native acceptance remains incomplete.'),
+            service.public_get, maintainer=test_deb.MAINTAINER)
+        self.assertEqual((selected_entry, selected_excluded), (entry, excluded))
         self.assertEqual(entry['platforms'], [], 'Committed Store/DMG/DEB policy cannot be widened by final metadata')
         direct = next(r for r in excluded if r['file'] == self.descriptor.name)
         self.assertTrue(direct['asset_binding_verified'])
@@ -311,6 +315,142 @@ class Composition(unittest.TestCase):
         result = readback.downloads(self.root, report, entry, service.public_get)
         self.assertEqual(result, dict(status='verified', reason='public-bytes-source-checksums-match', verified_platforms=[]))
         self.assertFalse(any(channel['ready'] for channel in candidate.manifest['channels'].values()))
+
+    def test_final_inventory_cli_reaches_real_public_consumer_and_exact_site_source_without_publication(self):
+        import prepare_site_release as website
+        from test_publish_release import Service
+        candidate = self.compose()
+        service = Service(candidate.manifest)
+        tag, commit = 'v' + candidate.manifest['version'], candidate.manifest['commit']
+        service.create(tag, commit, 'PeerBrush ' + candidate.manifest['version'], 'Reviewed fixture notes')
+        for path in candidate.directory.iterdir(): service.upload(17, path)
+        service.publish(17)
+        previous = json.loads((ROOT / 'tests/fixtures/site-release-output.json').read_bytes())['files']
+        # Independent site-content objects do not alter the source checkout or its index.
+        objects = []
+        for name in website.SITE_FILES:
+            blob = website.git(self.root, 'hash-object', '-w', '--stdin', input=previous[name].encode()).decode().strip()
+            objects.append(f'100644 blob {blob}\t{name}\n')
+        tree = website.git(self.root, 'mktree', input=''.join(objects).encode()).decode().strip()
+        tree = website.git(self.root, 'mktree', input=f'040000 tree {tree}\tpublic-site\n'.encode()).decode().strip()
+        site_commit = website.git(self.root, '-c', 'user.name=Package Tests', '-c', 'user.email=package-tests@example.invalid',
+                                  'commit-tree', tree, input=b'Synthetic reviewed site fixture\n').decode().strip()
+        selected = self.fixture.base / 'selected-final-inventory.json'
+        selected.write_bytes(final.encode(candidate.manifest))
+        notes = self.fixture.base / 'selected-site-notes.json'
+        notes.write_bytes(final.encode(dict(notes=['Reviewed fixture notes'], caution='Native acceptance remains incomplete.')))
+        output = self.fixture.base / 'selected-site-output'
+        args = ['--site-commit', site_commit, '--tag', tag, '--commit', commit,
+                '--final-inventory', str(selected), '--final-inventory-sha256', digest(selected),
+                '--notes', str(notes), '--output', str(output), '--maintainer', test_deb.MAINTAINER]
+        original = website.prepare
+        def prepare(*arguments, **options):
+            return original(*arguments, **options, get=service.public_get)
+        status = website.git(self.root, 'status', '--porcelain')
+        mutations = list(service.mutations)
+        with mock.patch.object(website, '__file__', str(self.root / 'scripts/prepare_site_release.py')), \
+                mock.patch.object(website, 'prepare', side_effect=prepare) as consumer, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(website.main(args), 2)
+        self.assertEqual(consumer.call_count, 1)
+        self.assertEqual(consumer.call_args.args[1], site_commit)
+        self.assertEqual(consumer.call_args.args[2], candidate.manifest)
+        report = json.loads((output / 'website-output.json').read_bytes())
+        self.assertEqual(report['site_commit'], site_commit)
+        self.assertEqual(report['release_inventory_sha256'], website.inventory_sha(candidate.manifest['base_inventory']))
+        self.assertFalse(report['site_update_prepared'] or report['deployment_performed'])
+        self.assertEqual(report['files'], {})
+        self.assertEqual(report['production_readiness'], 'not-assessed')
+        self.assertEqual(report['store_public_availability'], 'unverified')
+        self.assertTrue(any(r.get('reason') == 'store-public-availability-unverified' for r in report['excluded']))
+        self.assertEqual({path.name for path in output.iterdir()}, {'website-output.json'})
+        self.assertEqual(website.site_sources(self.root, site_commit), previous)
+        self.assertEqual(website.git(self.root, 'rev-parse', 'HEAD').decode().strip(), commit)
+        self.assertEqual(website.git(self.root, 'status', '--porcelain'), status)
+        self.assertEqual(service.mutations, mutations)
+        self.assertEqual(selected.read_bytes(), final.encode(candidate.manifest))
+        self.assertFalse(any(channel['ready'] for channel in candidate.manifest['channels'].values()))
+        for change in ['wrong-hash', 'noncanonical', 'duplicate', 'unknown-field', 'legacy-selector']:
+            raw = final.encode(candidate.manifest)
+            if change == 'noncanonical': raw = json.dumps(candidate.manifest).encode()
+            elif change == 'duplicate': raw = b'{"schema":1,' + raw[1:]
+            elif change == 'unknown-field': raw = final.encode(dict(candidate.manifest, ready=True))
+            selected.write_bytes(raw)
+            refused = output.with_name('site-refused-' + change)
+            arguments = list(args)
+            arguments[arguments.index('--output') + 1] = str(refused)
+            arguments[arguments.index('--final-inventory-sha256') + 1] = '0' * 64 if change == 'wrong-hash' else digest(selected)
+            if change == 'legacy-selector':
+                position = arguments.index('--final-inventory-sha256')
+                del arguments[position:position + 2]
+                arguments[arguments.index('--final-inventory')] = '--inventory'
+            with self.subTest(change=change), mock.patch.object(website, 'prepare') as forbidden, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit if change == 'legacy-selector' else ValueError):
+                website.main(arguments)
+            forbidden.assert_not_called()
+            self.assertFalse(refused.exists())
+        self.assertEqual(website.git(self.root, 'status', '--porcelain'), status)
+        self.assertEqual(service.mutations, mutations)
+
+    def test_selected_final_inventory_refuses_different_full_manifest_missing_final_and_changed_media(self):
+        import prepare_site_release as website
+        from test_publish_release import Service
+        candidate = self.compose()
+        service = Service(candidate.manifest)
+        tag, commit = 'v' + candidate.manifest['version'], candidate.manifest['commit']
+        service.create(tag, commit, 'PeerBrush ' + candidate.manifest['version'], 'Reviewed fixture notes')
+        for path in candidate.directory.iterdir(): service.upload(17, path)
+        service.publish(17)
+        metadata, data = copy.deepcopy(service.current), service.data.copy()
+        selected = copy.deepcopy(candidate.manifest)
+        for change in ['different-full-manifest', 'noncanonical-remote', 'missing-final-with-legacy',
+                       'malformed-final-with-legacy', 'unavailable-final', 'changed-media', 'unavailable-media']:
+            service.current, service.data = copy.deepcopy(metadata), data.copy()
+            if change == 'different-full-manifest':
+                value = copy.deepcopy(candidate.manifest)
+                sidecar = next(r for r in value['files'] if r['file'].endswith('.qualification.json'))
+                sidecar['sha256'] = '0' * 64
+                final.validate_manifest(value)
+                self.assertEqual(value['base_inventory'], selected['base_inventory'])
+                raw = final.encode(value)
+                service.data[final.MANIFEST] = raw
+                next(a for a in service.current['assets'] if a['name'] == final.MANIFEST).update(
+                    size=len(raw), digest='sha256:' + hashlib.sha256(raw).hexdigest())
+            elif change == 'noncanonical-remote':
+                raw = json.dumps(selected).encode()
+                service.data[final.MANIFEST] = raw
+                next(a for a in service.current['assets'] if a['name'] == final.MANIFEST).update(
+                    size=len(raw), digest='sha256:' + hashlib.sha256(raw).hexdigest())
+            elif change in ['missing-final-with-legacy', 'malformed-final-with-legacy']:
+                if change == 'missing-final-with-legacy':
+                    service.current['assets'] = [a for a in service.current['assets'] if a['name'] != final.MANIFEST]
+                    service.data.pop(final.MANIFEST)
+                else:
+                    service.data[final.MANIFEST] = b'{}'
+                    next(a for a in service.current['assets'] if a['name'] == final.MANIFEST).update(
+                        size=2, digest='sha256:' + hashlib.sha256(b'{}').hexdigest())
+                legacy = final.encode(selected['base_inventory'])
+                service.data['release-inventory.json'] = legacy
+                service.current['assets'].append(dict(id=900, name='release-inventory.json', state='uploaded',
+                    size=len(legacy), digest='sha256:' + hashlib.sha256(legacy).hexdigest()))
+            elif change == 'unavailable-final': service.data.pop(final.MANIFEST)
+            else:
+                name = selected['channels']['windows-direct']['dependencies'][0]
+                if change == 'unavailable-media': service.data.pop(name)
+                else: service.data[name] = b'!' + service.data[name][1:]
+            requested = []
+            def get(url, limit, **options):
+                requested.append(url)
+                return service.public_get(url, limit, **options)
+            error = website.Unavailable if change in ['unavailable-final', 'unavailable-media'] else ValueError
+            message = ('independently selected final inventory' if change in ['different-full-manifest', 'noncanonical-remote']
+                       else 'legacy fallback is not permitted' if change == 'missing-final-with-legacy' else None)
+            with self.subTest(change=change), self.assertRaisesRegex(error, message or '.*'):
+                website.published(self.root, selected, tag, commit,
+                    dict(notes=['Reviewed fixture notes'], caution='Native acceptance remains incomplete.'),
+                    get, maintainer=test_deb.MAINTAINER)
+            self.assertNotIn(website.DOWNLOAD + tag + '/release-inventory.json', requested)
+            self.assertEqual(selected, candidate.manifest)
+            self.assertFalse(any(channel['ready'] for channel in selected['channels'].values()))
 
     def test_final_public_readback_rejects_changed_identity_metadata_and_unavailable_bytes_without_legacy_fallback(self):
         import prepare_site_release as website
