@@ -1382,6 +1382,7 @@ fn alt_sample_runtime_restore_engine_project_focus_and_plain_picker_boundaries_s
                     let added =
                         crate::workspace::register_in(&app.workspace, replacement, None).unwrap();
                     let id = added.lock().unwrap().project_id.clone();
+                    crate::workspace::select_in(&app.workspace, &id).unwrap();
                     app.switch_project(&id);
                     assert_ne!(app.shared.lock().unwrap().doc.id, original_id);
                 }
