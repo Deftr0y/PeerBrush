@@ -620,7 +620,8 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
                 raise ValueError('Installed macOS source requires bounded matching build provenance')
             shutil.copy2(source, resources / source.name)
             (resources / MACOS_INSTALLED_RELEASE).write_text(
-                json.dumps(macos_installed_release(manifest), indent=2) + '\n', encoding='utf-8')
+                json.dumps(macos_installed_release(manifest), indent=2) + '\n',
+                encoding='utf-8', newline='\n')
             manifest['macos_installed_release'] = 1
         (bundle / 'release.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
         files = [(f'{name}/{p.relative_to(bundle).as_posix()}', p.read_bytes(), 0o755 if p == staged_binary else 0o644) for p in bundle.rglob('*') if p.is_file()]
