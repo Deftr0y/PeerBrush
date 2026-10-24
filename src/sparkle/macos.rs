@@ -1051,6 +1051,8 @@ mod tests {
             checkpoint: None,
             remote: None,
             owner_status: None,
+            final_profile: None,
+            final_reply_processed: false,
             checks: checks.clone(),
         };
         assert!(app.configured());
