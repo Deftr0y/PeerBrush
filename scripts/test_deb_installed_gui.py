@@ -405,6 +405,7 @@ def check(package, expected, output):
         WINIT_X11_SCALE_FACTOR='1', LIBGL_ALWAYS_SOFTWARE='1')
     def user(command):
         return run([str(runuser), '-u', USER, '--', *command], env=environment)
+    print('Installed GUI acceptance: checking installed identity before launch.', flush=True)
     installed_identity(expected, user, deb_version(expected['version']))
     work = QA_HOME / 'installed-gui-qa'
     work.mkdir(mode=0o700)
@@ -421,6 +422,7 @@ def check(package, expected, output):
                 QA_HOME / 'data/applications/defaults.list']
     require(all(not path.is_symlink() for path in defaults), 'Synthetic default-editor configuration is a link.')
     default_bytes = {path: bounded_file(path, 128 * 1024)[0] if path.exists() else None for path in defaults}
+    print('Installed GUI acceptance: preparing native project fixtures.', flush=True)
     with tempfile.TemporaryDirectory(prefix='peerbrush-gui-observer-') as temporary:
         with Session(Path('/usr/bin/peerbrush'), environment, Path(temporary), None, runuser) as session:
             facts['profile'] = session.rpc('tool_settings', dict(action='get', tool='brush'))['profile']
@@ -439,6 +441,7 @@ def check(package, expected, output):
     fixture.write_text(json.dumps(facts), encoding='utf-8')
     fixture.chmod(0o600)
     os.chown(fixture, account.pw_uid, account.pw_gid)
+    print('Installed GUI acceptance: launching the isolated desktop.', flush=True)
     user(['xvfb-run', '-a', '-s', '-screen 0 1600x1000x24 -nolisten tcp', 'dbus-run-session', '--',
         sys.executable, '-B', str(Path(__file__).resolve()), '--inside-display', str(fixture)])
     require(all(digest(path) == checksum for path, checksum in originals.items()),
@@ -447,6 +450,7 @@ def check(package, expected, output):
                 (bounded_file(path, 128 * 1024)[0] if path.exists() else None) == checksum
                 for path, checksum in default_bytes.items()),
             'Desktop launch changed the synthetic user default-editor preference or its absence.')
+    print('Installed GUI acceptance: checking installed identity after desktop exit.', flush=True)
     selected_package(package, expected)
     installed_identity(expected, user, deb_version(expected['version']))
     result_hash, _ = bounded_file(work / 'result.json', 64 * 1024)
