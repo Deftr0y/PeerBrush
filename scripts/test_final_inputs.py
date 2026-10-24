@@ -447,6 +447,7 @@ class UpstreamHandoff(unittest.TestCase):
             target = final_selection['macos'] if platform == 'macos' else final_selection['windows']['native'] if platform == 'windows' else final_selection['linux_native']
             target['trust'] = trust
             bundles[platform] = Path(trust['bundle']).read_bytes()
+        final_selection = json.loads(json.dumps(final_selection, default=str))
         roles, trusts = inputs.paths(final_selection)
         for keys, name, _, _ in roles: inputs.put(final_selection, keys, name)
         for keys, platform in trusts: inputs.get(final_selection, keys)['work'] = '@consumer/' + platform

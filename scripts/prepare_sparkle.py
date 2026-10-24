@@ -155,7 +155,13 @@ def prepare(archive, output, root=ROOT):
             path.chmod(entry['mode'])
         for name, entry in pin['framework_entries'].items():
             if entry['kind'] == 'symlink':
-                (framework / relative_path(name)).symlink_to(entry['target'])
+                path = framework / relative_path(name)
+                path.symlink_to(entry['target'])
+                # Darwin applies umask to symlink modes; restore only the owned link.
+                if stat.S_IMODE(path.lstat().st_mode) != 0o777:
+                    path.chmod(0o777, follow_symlinks=False)
+                if stat.S_IMODE(path.lstat().st_mode) != 0o777:
+                    raise ValueError('Staged Sparkle link mode differs from exact pin')
         with (output / 'LICENSE').open('xb') as stream:
             stream.write(source.read('LICENSE'))
     with (output / 'preparation.json').open('x', encoding='utf-8') as stream:

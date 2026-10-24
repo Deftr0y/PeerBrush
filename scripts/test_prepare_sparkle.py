@@ -134,6 +134,23 @@ class Preparation(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Cannot identify every source checkout'):
                 sparkle.external_output(self.output, self.root)
 
+    @unittest.skipUnless(os.name == 'posix' and os.uname().sysname == 'Darwin',
+                         'Darwin link modes require native macOS')
+    def test_staging_restores_exact_link_modes_under_restrictive_umask(self):
+        # Change umask only inside this child, never in the shared test process.
+        program = (
+            'import os, sys, unittest\n'
+            'sys.path.insert(0, sys.argv[1])\n'
+            'import test_prepare_sparkle\n'
+            'os.umask(0o077)\n'
+            'suite = unittest.TestSuite([test_prepare_sparkle.Preparation("test_staging_is_exact_private_immutable_and_disabled")])\n'
+            'result = unittest.TextTestRunner().run(suite)\n'
+            'sys.exit(0 if result.wasSuccessful() else 1)\n'
+        )
+        result = subprocess.run([sparkle.sys.executable, '-I', '-B', '-c', program,
+                                 str(sparkle.ROOT / 'scripts')], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     @unittest.skipIf(os.name == 'nt', 'Native Unix framework symlink staging; covered by macOS/Linux CI')
     def test_staging_is_exact_private_immutable_and_disabled(self):
         before = self.archive.read_bytes()
@@ -141,6 +158,11 @@ class Preparation(unittest.TestCase):
         self.assertEqual(self.archive.read_bytes(), before)
         self.assertEqual(self.output.stat().st_mode & 0o777, 0o700)
         self.assertEqual(sparkle.tree(self.output / 'Sparkle.framework'), self.pin['framework_entries'])
+        for name, entry in self.pin['framework_entries'].items():
+            if entry['kind'] == 'symlink':
+                metadata = (self.output / 'Sparkle.framework' / name).lstat()
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o777)
+                self.assertEqual(metadata.st_nlink, 1)
         receipt = json.loads((self.output / 'preparation.json').read_text())
         self.assertFalse(receipt['updater_started'])
         self.assertFalse(receipt['update_installation_enabled'])
