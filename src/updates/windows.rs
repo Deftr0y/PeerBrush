@@ -13,6 +13,7 @@ use std::{
 
 #[cfg(windows)]
 mod native;
+mod profile;
 #[cfg(test)]
 mod tests;
 
@@ -745,8 +746,11 @@ fn download(
 }
 
 fn small(file: &Held, control: &Control) -> Result<Vec<u8>> {
+    bounded_bytes(file, SMALL, control)
+}
+fn bounded_bytes(file: &Held, limit: u64, control: &Control) -> Result<Vec<u8>> {
     use std::io::{Seek, SeekFrom};
-    if file.media.bytes > SMALL {
+    if file.media.bytes > limit {
         return Err("Windows update metadata exceeds its bound.".into());
     }
     let mut input = file
@@ -758,7 +762,7 @@ fn small(file: &Held, control: &Control) -> Result<Vec<u8>> {
         .map_err(|_| "Cannot read Windows update metadata.")?;
     let mut bytes = Vec::with_capacity(file.media.bytes as usize);
     input
-        .take(SMALL + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "Cannot read Windows update metadata.")?;
     file.check(control)?;
@@ -1421,6 +1425,7 @@ fn stage_with_current(
     verifier: &dyn Verifier,
     stager: &dyn Stager,
     control: &Control,
+    profile: &crate::settings::UpdateProfile,
 ) -> Result<Staged> {
     let current = acquire_for(
         &current_root(root)?,
@@ -1438,7 +1443,14 @@ fn stage_with_current(
         control,
     )?;
     current.check()?;
-    let result = stage_inner(root, policy, verifier, stager, control, Some(&proof));
+    let result = stage_inner(
+        root,
+        policy,
+        verifier,
+        stager,
+        control,
+        Some((&proof, profile)),
+    );
     // A canceled UI request cannot skip the final held-byte/ownership readback.
     let readback = Control {
         cancelled: Arc::new(AtomicBool::new(false)),
@@ -1532,6 +1544,8 @@ struct StageIntent<'a> {
     schema: u32,
     prepared_sha256: &'a str,
     prepared: &'a Prepared,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_profile_sha256: Option<&'a str>,
 }
 #[derive(Serialize)]
 struct StageOutcome<'a> {
@@ -1576,7 +1590,7 @@ fn stage_inner(
     verifier: &dyn Verifier,
     stager: &dyn Stager,
     control: &Control,
-    current: Option<&CurrentArchive<'_>>,
+    current: Option<(&CurrentArchive<'_>, &crate::settings::UpdateProfile)>,
 ) -> Result<Staged> {
     policy.validate()?;
     control.check()?;
@@ -1598,12 +1612,18 @@ fn stage_inner(
     owned.check()?;
     acquisition.validate()?;
     transaction.validate()?;
+    let profile = current
+        .map(|(current, profile)| {
+            profile::capture(&retained, current, profile, policy, verifier, control)
+        })
+        .transpose()?;
     let intent = stage_record(
         &selected.join("stage-intent.json"),
         &StageIntent {
             schema: 1,
             prepared_sha256: &retained.journal.media.sha256,
             prepared: &retained.prepared,
+            initial_profile_sha256: profile.as_ref().map(profile::Copy::digest),
         },
         control,
     )?;
@@ -1611,8 +1631,11 @@ fn stage_inner(
     // cleanup or retry is safe after submission, including after process loss.
     control.check()?;
     retained.check(verifier, control)?;
-    if let Some(current) = current {
+    if let Some((current, _)) = current {
         current.check(policy, verifier, control)?;
+    }
+    if let Some(profile) = &profile {
+        profile.check(control)?;
     }
     let mut operation = stager.submit(&retained, control.view.clone())?;
     let mut rejected = false;
@@ -1661,8 +1684,11 @@ fn stage_inner(
         &readback,
     )?;
     retained.check(verifier, &readback)?;
-    if let Some(current) = current {
+    if let Some((current, _)) = current {
         current.check(policy, verifier, &readback)?;
+    }
+    if let Some(profile) = &profile {
+        profile.check(&readback)?;
     }
     intent.check(&readback)?;
     owned.check()?;
@@ -1685,6 +1711,8 @@ struct RecordedIntent {
     schema: u32,
     prepared_sha256: String,
     prepared: Prepared,
+    #[serde(default)]
+    initial_profile_sha256: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1732,6 +1760,7 @@ fn inspect_retained(
     }
     let mut authenticated = None;
     let mut evidence = Vec::new();
+    let mut profile = None;
     let mut transaction_owner = None;
     let result = if let Some(selected) = &selected {
         directory(&selected.join(".peerbrush-versions"))?;
@@ -1769,6 +1798,9 @@ fn inspect_retained(
                 || intent.prepared != retained.prepared
             {
                 return Err(STAGE_HOLD.into());
+            }
+            if let Some(digest) = &intent.initial_profile_sha256 {
+                profile = Some(profile::reopen(&retained, digest, control)?);
             }
             let outcome_file = Held::open(&selected.join("stage-outcome.json"), SMALL, control)?;
             let outcome: RecordedOutcome =
@@ -1821,6 +1853,9 @@ fn inspect_retained(
     }
     for file in &evidence {
         file.check(control)?;
+    }
+    if let Some(profile) = &profile {
+        profile.check(control)?;
     }
     if let Some(transaction) = &transaction_owner {
         transaction.validate()?;
@@ -2114,7 +2149,14 @@ impl Controller {
                 let _profile = profile;
                 _profile.validate()?;
                 native::session(|| {
-                    stage_with_current(&root, &policy, &native::Verifier, &native::Stager, control)
+                    stage_with_current(
+                        &root,
+                        &policy,
+                        &native::Verifier,
+                        &native::Stager,
+                        control,
+                        &_profile,
+                    )
                 })
                 .map(Completed::Stage)
             })

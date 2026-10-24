@@ -2494,6 +2494,7 @@ struct CurrentGuardedStage<'a> {
     current: &'a Path,
     cancel: Option<Arc<AtomicBool>>,
     tamper: bool,
+    profile: &'a Path,
 }
 impl Stager for CurrentGuardedStage<'_> {
     fn submit(
@@ -2501,6 +2502,12 @@ impl Stager for CurrentGuardedStage<'_> {
         selected: &RetainedSelection,
         view: Arc<Mutex<View>>,
     ) -> Result<Box<dyn StageOperation>> {
+        // The initial copy must release original-file handles before native
+        // staging: later human preferences remain writable and are not lost.
+        let mut preferences = crate::updates::Store::load(self.profile);
+        let mut changed = preferences.preferences.clone();
+        changed.automatic_checks = true;
+        preferences.save(changed).unwrap();
         assert!(crate::file_safety::Lease::acquire(
             &self.current.parent().unwrap().join("acquisition.json")
         )
@@ -2528,7 +2535,20 @@ fn staging_retains_current_archive_until_real_terminal_readback_including_cancel
 {
     for fault in ["none", "cancel", "tamper"] {
         let temp = Temp::new();
-        let root = temp.0.join("windows-prepared");
+        let profile = staging_profile_fixture(&temp);
+        let preferences = profile.locations.profile();
+        let original_preferences = fs::read(preferences.join("updates.json")).unwrap();
+        fs::write(
+            preferences.join("connection.json"),
+            b"synthetic excluded state",
+        )
+        .unwrap();
+        fs::write(
+            preferences.join("artwork.psd"),
+            b"synthetic excluded artwork",
+        )
+        .unwrap();
+        let root = preferences.join("windows-prepared");
         let native = initial_current_native(&temp.0.join("installed"));
         capture_current_only(&root, &policy(), &current_http(), &native, &control()).unwrap();
         let current = captured_current(&root);
@@ -2550,8 +2570,16 @@ fn staging_retains_current_archive_until_real_terminal_readback_including_cancel
             current: &current,
             cancel: (fault == "cancel").then(|| control.cancelled.clone()),
             tamper: fault == "tamper",
+            profile: &preferences,
         };
-        let result = stage_with_current(&root, &policy(), &native, &stager, &control);
+        let result = stage_with_current(
+            &root,
+            &policy(),
+            &native,
+            &stager,
+            &control,
+            &profile.update_profile(),
+        );
         if fault == "tamper" && !cfg!(windows) {
             assert!(result.is_err());
         } else {
@@ -2563,6 +2591,17 @@ fn staging_retains_current_archive_until_real_terminal_readback_including_cancel
             usize::from(fault == "cancel")
         );
         let selected = stage_attempt(&root);
+        let backup = selected.join("profile-initial");
+        assert_eq!(
+            fs::read(backup.join("updates.json")).unwrap(),
+            original_preferences
+        );
+        assert!(!backup.join("connection.json").exists() && !backup.join("artwork.psd").exists());
+        assert!(
+            crate::updates::Store::load(&preferences)
+                .preferences
+                .automatic_checks
+        );
         assert!(selected.join("stage-intent.json").is_file());
         assert!(selected.join("stage-outcome.json").is_file());
         assert_eq!(
@@ -2574,6 +2613,127 @@ fn staging_retains_current_archive_until_real_terminal_readback_including_cancel
             &current_root(&root).unwrap().join("acquisition.json")
         )
         .is_ok());
+        if fault == "none" {
+            assert!(matches!(
+                inspect_retained(&root, &policy(), &native, &control).unwrap(),
+                Reconciled::RecordedStaging([1, 30, 1, 0])
+            ));
+            let path = backup.join("updates.json");
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            let mut changed = original_preferences.clone();
+            changed[0] ^= 1;
+            fs::write(&path, &changed).unwrap();
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert!(inspect_retained(&root, &policy(), &native, &control).is_err());
+            assert_eq!(fs::read(&path).unwrap(), changed);
+            assert!(
+                crate::updates::Store::load(&preferences)
+                    .preferences
+                    .automatic_checks
+            );
+            assert!(
+                selected.join("stage-intent.json").exists()
+                    && selected.join("stage-outcome.json").exists()
+            );
+        }
+    }
+}
+
+fn staging_profile_fixture(temp: &Temp) -> crate::settings::Profile {
+    let locations = crate::settings::Locations {
+        config: temp.0.join("config"),
+        data: temp.0.join("data"),
+        cache: temp.0.join("cache"),
+    };
+    let legacy = temp.0.join("legacy-profile");
+    fs::create_dir(&legacy).unwrap();
+    let profile = crate::settings::Profile::open(locations, &legacy).unwrap();
+    crate::updates::Store::load(&profile.locations.profile())
+        .save(crate::updates::Preferences::default())
+        .unwrap();
+    profile
+}
+
+#[test]
+fn initial_profile_backup_failures_preserve_settings_and_refuse_native_staging() {
+    for fault in [
+        "invalid-settings",
+        "existing-backup",
+        "foreign-profile",
+        "cancel",
+    ] {
+        let temp = Temp::new();
+        let profile = staging_profile_fixture(&temp);
+        let preferences = profile.locations.profile();
+        let root = preferences.join("windows-prepared");
+        let native = initial_current_native(&temp.0.join("installed"));
+        capture_current_only(&root, &policy(), &current_http(), &native, &control()).unwrap();
+        fs::create_dir(&root).unwrap();
+        acquire_with_current(&root, &policy(), &HttpFake::new(), &native, &control()).unwrap();
+        let selected = stage_attempt(&root);
+        let existing = selected.join("profile-initial");
+        if fault == "invalid-settings" {
+            fs::write(
+                preferences.join("updates.json"),
+                b"preserve invalid settings",
+            )
+            .unwrap();
+        }
+        if fault == "existing-backup" {
+            fs::create_dir(&existing).unwrap();
+            fs::write(existing.join("human-file"), b"preserve prior backup").unwrap();
+        }
+        let original = fs::read(preferences.join("updates.json")).unwrap();
+        let other_temp = Temp::new();
+        let foreign = staging_profile_fixture(&other_temp);
+        let input = if fault == "foreign-profile" {
+            &foreign
+        } else {
+            &profile
+        };
+        let control = control();
+        control
+            .cancelled
+            .store(fault == "cancel", Ordering::Release);
+        let (tx, rx) = mpsc::channel();
+        tx.send(()).unwrap();
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let stager = StageFake {
+            release: Mutex::new(Some(rx)),
+            uncertain: false,
+            submissions: submissions.clone(),
+            cancellations: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(
+            stage_with_current(
+                &root,
+                &policy(),
+                &native,
+                &stager,
+                &control,
+                &input.update_profile()
+            )
+            .is_err(),
+            "{fault}"
+        );
+        assert_eq!(submissions.load(Ordering::Relaxed), 0, "{fault}");
+        assert_eq!(
+            fs::read(preferences.join("updates.json")).unwrap(),
+            original
+        );
+        assert!(!selected.join("stage-intent.json").exists());
+        assert!(!selected.join("stage-outcome.json").exists());
+        if fault == "existing-backup" {
+            assert_eq!(
+                fs::read(existing.join("human-file")).unwrap(),
+                b"preserve prior backup"
+            );
+        }
     }
 }
 

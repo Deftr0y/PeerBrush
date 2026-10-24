@@ -154,7 +154,7 @@ impl UpdateProfile {
         Ok(())
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn update_files() -> Vec<std::path::PathBuf> {
     let mut paths = vec![std::path::PathBuf::from("profile.json")];
     for name in FILES {
