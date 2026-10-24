@@ -382,6 +382,35 @@ fn actual_default_disabled_control_cannot_create_a_cache_or_claim_the_github_tar
 
 #[test]
 fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_projects() {
+    fn save_accepted(shared: &crate::server::Shared, path: &std::path::Path) {
+        let (project, document, revision) = {
+            let engine = shared.lock().unwrap();
+            (
+                engine.project_id.clone(),
+                engine.doc.id.clone(),
+                engine.doc.revision,
+            )
+        };
+        let report = crate::server::dispatch(
+            shared,
+            "document",
+            &json!({
+                "action":"save_report", "project_id":project,
+                "document_id":document, "expected_revision":revision
+            }),
+        )
+        .unwrap();
+        assert_eq!(report["document_id"], document);
+        assert_eq!(report["revision"], revision);
+        assert_eq!(report["save_allowed"], true);
+        assert_eq!(report["has_editability_losses"], true);
+        assert!(report["losses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|loss| loss["code"] == "editable_source_rasterized"));
+        crate::server::save_accepted_source(shared, path, &document, revision, false).unwrap();
+    }
     fn close_cancel(app: &mut PeerBrush, ctx: &egui::Context) {
         app.request_close(crate::ui::lifecycle::Intent::Exit);
         for _ in 0..3 {
@@ -475,7 +504,7 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
                 )
                 .unwrap();
             drop(engine);
-            crate::server::save(shared, &directory.join(format!("human-{index}.psd"))).unwrap();
+            save_accepted(shared, &directory.join(format!("human-{index}.psd")));
             let mut engine = shared.lock().unwrap();
             for x in [4, 6] {
                 engine.edit("human", &[json!({"op":"paint","layer":raster,"points":[[x,4]],"radius":1,"color":[231,73,31,255]})],None,None,"Human stroke").unwrap();
@@ -657,7 +686,7 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
         // image export, then clean human Exit remain available under real guards.
         for (shared, (raster, hidden)) in projects.iter().zip(&hidden_samples) {
             let path = shared.lock().unwrap().path.clone().unwrap();
-            crate::server::save(shared, &path).unwrap();
+            save_accepted(shared, &path);
             let engine = shared.lock().unwrap();
             let reopened = crate::psd::decode(&fs::read(&path).unwrap()).unwrap();
             assert_eq!(reopened.bit_depth, engine.doc.bit_depth);
