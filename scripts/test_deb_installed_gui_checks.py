@@ -177,12 +177,13 @@ class InstalledGuiContracts(unittest.TestCase):
 
     def test_actual_process_consumer_rejects_changed_uid_media_route_or_parent(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-gui-owner-') as temporary:
-            work = Path(temporary)
+            work = Path(temporary).resolve(strict=True)
             process = work / 'proc/2468'
             process.mkdir(parents=True)
             executable = process / 'exe'
             original = b'SYNTHETIC_NONEXECUTED_EXECUTABLE'
             executable.write_bytes(original)
+            self.assertEqual(executable.resolve(strict=True), executable)
             (process / 'status').write_text('Uid: 1000 1000 1000 1000\nPPid: 600\n')
             (process / 'cmdline').write_bytes(b'/usr/bin/peerbrush\0--\0Unicode.psb\0')
             (process / 'stat').write_text('2468 (PeerBrush) S ' + '0 ' * 18 + '12345')
@@ -192,6 +193,14 @@ class InstalledGuiContracts(unittest.TestCase):
             with mock.patch.object(gui, 'Path', side_effect=selected), \
                     mock.patch.object(gui.os, 'geteuid', return_value=1000, create=True), \
                     mock.patch.object(gui.os, 'getpid', return_value=600):
+                self.assertEqual(window.process_identity(2468), '12345')
+                foreign = work / 'not-the-installed-executable'
+                foreign.write_bytes(original)
+                self.assertEqual(foreign.read_bytes(), executable.read_bytes())
+                with mock.patch.object(gui, 'Path', side_effect=lambda value:
+                        foreign if value == '/usr/bin/peerbrush' else selected(value)), \
+                        self.assertRaisesRegex(ValueError, 'exact adopted installed application'):
+                    window.process_identity(2468)
                 self.assertEqual(window.process_identity(2468), '12345')
                 for name, changed, restore in [
                     ('status', b'Uid: 9999 9999 9999 9999\nPPid: 600\n', (process / 'status').read_bytes()),
