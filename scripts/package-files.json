@@ -370,6 +370,7 @@
     "src/updates.rs",
     "src/updates/windows.rs",
     "src/updates/windows/native.rs",
+    "src/updates/windows/profile.rs",
     "src/updates/windows/tests.rs",
     "src/updates_tests.rs",
     "src/warp.rs",
