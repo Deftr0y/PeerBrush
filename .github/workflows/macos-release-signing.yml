@@ -1,0 +1,551 @@
+name: PeerBrush reviewed current-source Apple signing
+run-name: Prepare signed Mac ZIP and DMG for the reviewed main source
+
+# Dormant preparation. Activation, protected-environment settings and dispatch
+# require approval. The historical 0.26 signing workflow is intentionally separate.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full reviewed stable main source and workflow SHA
+        required: true
+        type: string
+      zip_revision:
+        description: New positive signed ZIP packaging revision
+        required: true
+        default: '1'
+        type: string
+      dmg_revision:
+        description: New positive final DMG packaging revision
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peerbrush-apple-signing
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SELECTED_COMMIT: ${{ inputs.expected_commit }}
+  ZIP_REVISION: ${{ inputs.zip_revision }}
+  DMG_REVISION: ${{ inputs.dmg_revision }}
+  PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED: ${{ vars.PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED }}
+  APPLE_TEAM: KU3Q7F9Q84
+  APPLE_IDENTITY_SHA1: 144ED1E67A4AF3F374E830FFF429B46109BB53EE
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+jobs:
+  build:
+    name: build
+    if: vars.PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.inspect.outputs.version }}
+      unsigned_sha256: ${{ steps.inspect.outputs.sha256 }}
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          commit = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_SHA': commit,
+              'GITHUB_WORKFLOW_SHA': commit,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/macos-release-signing.yml@refs/heads/main',
+              'GITHUB_RUN_ATTEMPT': '1', 'RUNNER_ENVIRONMENT': 'github-hosted',
+              'RUNNER_OS': 'macOS', 'RUNNER_ARCH': 'ARM64',
+              'PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED': 'true',
+          }
+          if (not re.fullmatch('[0-9a-f]{40}', commit)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or any(not re.fullmatch('[1-9][0-9]{0,5}', os.environ.get(key, ''))
+                         for key in ['ZIP_REVISION', 'DMG_REVISION'])):
+              raise SystemExit('Apple signing requires the explicitly approved exact first main invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Pin existing Python for native packaging
+        run: python -I scripts/select_native_python.py
+      - name: Require stable exact source before tests
+        run: |
+          python3 -B scripts/release_gate.py --commit "$SELECTED_COMMIT"
+          python3 -I - <<'PY'
+          import pathlib, re, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version']
+          if type(version) is not str or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+              raise SystemExit('Apple release signing accepts stable Cargo versions only.')
+          PY
+          python3 -B scripts/package.py --check-source
+      - name: Select existing native codec tools
+        run: python3 -B scripts/jxl_build.py --github-env
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy, rust-docs
+      - name: Test and build without Apple credentials
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
+          rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
+          python3 -B scripts/test_jxl_build.py
+          python3 -B scripts/test_macos_signing_producer.py
+          python3 -B scripts/test_release_source_guard.py
+          cargo build --locked --bin peerbrush
+          cargo test --locked
+          cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact
+          cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
+          cargo run --locked --example macos_activation
+          cargo run --locked --example macos_quit
+          cargo clippy --all-targets --locked
+          python3 -B scripts/test_package.py
+          python3 -B scripts/test_sign_macos.py
+          python3 -B scripts/test_sign_macos_dmg.py
+          python3 -B scripts/test_macos_dmg.py
+          python3 -B scripts/test_final_macos_dmg.py
+          python3 -B scripts/test_dmg_file_identity.py
+          python3 -B scripts/test_macos_qualification_producer.py
+          python3 -B scripts/test_macos_qualification_attestation.py
+          python3 -B scripts/test_macos_qualification_job.py
+          python3 -B scripts/test_prepare_sparkle.py
+          python3 -B scripts/test_sparkle_bundle.py
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/Sparkle-2.10.0.zip" 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip'
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --verify-only
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --native-audit-output "$RUNNER_TEMP/peerbrush-sparkle-native-audit"
+          cat "$RUNNER_TEMP/peerbrush-sparkle-native-audit/native-policy-candidate.json"
+          python3 -B scripts/build_release.py
+          python3 -B scripts/package.py --sparkle-archive "$RUNNER_TEMP/Sparkle-2.10.0.zip"
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          python3 -B scripts/check_bundled_sparkle.py --archive "dist/PeerBrush-$VERSION-macOS-arm64.zip" --work "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture" --commit "$SELECTED_COMMIT" --version "$VERSION"
+          cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture/payload/PeerBrush.app" --bundled
+      - name: Inspect the exact unsigned ZIP
+        id: inspect
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, sys, tomllib
+          sys.path.insert(0, 'scripts')
+          from package import digest
+          from verify_release import inspect_archive
+          version = tomllib.load(open('Cargo.toml', 'rb'))['package']['version']
+          archive = pathlib.Path('dist') / f'PeerBrush-{version}-macOS-arm64.zip'
+          record = inspect_archive(archive, os.environ['SELECTED_COMMIT'], version)['record']
+          if record['native_publisher_signing'] != 'not-configured':
+              raise SystemExit('Expected the same-job unsigned Mac candidate.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('version=' + version + '\nsha256=' + digest(archive) + '\n')
+          PY
+      - name: Retain exact unsigned input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-unsigned-${{ github.run_id }}-1
+          path: dist/*-macOS-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  sign:
+    name: sign
+    needs: build
+    if: vars.PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && needs.build.result == 'success'
+    environment: apple-signing
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      SELECTED_VERSION: ${{ needs.build.outputs.version }}
+      UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          commit = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_SHA': commit,
+              'GITHUB_WORKFLOW_SHA': commit,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/macos-release-signing.yml@refs/heads/main',
+              'GITHUB_RUN_ATTEMPT': '1', 'RUNNER_ENVIRONMENT': 'github-hosted',
+              'RUNNER_OS': 'macOS', 'RUNNER_ARCH': 'ARM64',
+              'PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED': 'true',
+          }
+          if (not re.fullmatch('[0-9a-f]{40}', commit)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or any(not re.fullmatch('[1-9][0-9]{0,5}', os.environ.get(key, ''))
+                         for key in ['ZIP_REVISION', 'DMG_REVISION'])):
+              raise SystemExit('Apple signing requires the explicitly approved exact first main invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Pin existing Python for native packaging
+        run: python -I scripts/select_native_python.py
+      - name: Acquire the same-workflow unsigned candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-unsigned-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/macos-unsigned
+      - name: Verify exact source and unsigned input before credentials
+        run: |
+          python3 -B scripts/release_gate.py --commit "$SELECTED_COMMIT"
+          python3 -B scripts/package.py --check-source
+          python3 - <<'PY'
+          import os, pathlib, re, sys, tomllib
+          sys.path.insert(0, 'scripts')
+          from package_macos_dmg import bounded_file
+          from verify_release import inspect_archive
+          version = tomllib.load(open('Cargo.toml', 'rb'))['package']['version']
+          expected = os.environ['UNSIGNED_SHA256']
+          if (version != os.environ['SELECTED_VERSION'] or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
+                  or not re.fullmatch('[0-9a-f]{64}', expected)):
+              raise SystemExit('Stable source or independently selected unsigned hash differs.')
+          parent = pathlib.Path(os.environ['RUNNER_TEMP']) / 'macos-unsigned'
+          archive = parent / f'PeerBrush-{version}-macOS-arm64.zip'
+          if set(path.name for path in parent.iterdir()) != {archive.name} or bounded_file(archive, 512 * 1024 * 1024)[0] != expected:
+              raise SystemExit('Same-workflow unsigned bytes differ.')
+          checked = inspect_archive(archive, os.environ['SELECTED_COMMIT'], version)
+          record = checked['record']
+          if record['native_publisher_signing'] != 'not-configured':
+              raise SystemExit('Expected unsigned Mac input before credential setup.')
+          if checked['manifest'].get('macos_sparkle_layout') == 1:
+              from sparkle_bundle import reviewed_policy
+              reviewed_policy()
+          PY
+          umask 077
+          mkdir "$RUNNER_TEMP/apple-credentials"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$RUNNER_TEMP/apple-credentials/DeveloperIDG2CA.cer"
+          printf '%s  %s\n' f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a \
+            "$RUNNER_TEMP/apple-credentials/DeveloperIDG2CA.cer" | shasum -a 256 -c -
+      # Reuse reviewed credential setup/cleanup; only the temporary keychain's
+      # lifetime differs for two formats. No remote settings are created here.
+      - name: Import credentials only after environment approval
+        env:
+          APPLE_SIGNING_P12_BASE64: ${{ secrets.APPLE_SIGNING_P12_BASE64 }}
+          APPLE_SIGNING_P12_PASSWORD: ${{ secrets.APPLE_SIGNING_P12_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          set +x
+          python3 - <<'PY'
+          import base64, binascii, json, os, pathlib, secrets, shlex, subprocess
+          names = ('APPLE_SIGNING_P12_BASE64', 'APPLE_SIGNING_P12_PASSWORD', 'APPLE_ID', 'APPLE_TEAM_ID', 'APPLE_NOTARY_PASSWORD')
+          values = {name: os.environ.pop(name, '') for name in names}
+          if not all(values.values()) or values['APPLE_TEAM_ID'] != os.environ['APPLE_TEAM']:
+              raise SystemExit('Missing Apple environment secrets or unexpected Team ID.')
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-credentials'
+          keychain = root / 'signing.keychain-db'
+          p12 = root / 'identity.p12'
+          password = secrets.token_urlsafe(48)
+          def quiet(stage, command):
+              try:
+                  return subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+              except subprocess.CalledProcessError as error:
+                  raise SystemExit(f'Apple credential setup failed at {stage} (exit {error.returncode}); tool output was suppressed to protect credentials.') from None
+              except subprocess.TimeoutExpired:
+                  raise SystemExit(f'Apple credential setup failed at {stage} (timed out); tool output was suppressed to protect credentials.') from None
+              except (OSError, subprocess.SubprocessError):
+                  raise SystemExit(f'Apple credential setup failed at {stage} (tool could not run); tool output was suppressed to protect credentials.') from None
+          try:
+              os.umask(0o077)
+              p12.write_bytes(base64.b64decode(values['APPLE_SIGNING_P12_BASE64'], validate=True))
+              quiet('create-keychain', ['/usr/bin/security', 'create-keychain', '-p', password, str(keychain)])
+              quiet('configure-keychain', ['/usr/bin/security', 'set-keychain-settings', '-lut', '10800', str(keychain)])
+              quiet('unlock-keychain', ['/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain)])
+              previous = shlex.split(quiet('read-keychain-search-list', ['/usr/bin/security', 'list-keychains', '-d', 'user']).stdout)
+              (root / 'search-list.json').write_text(json.dumps(previous))
+              quiet('update-keychain-search-list', ['/usr/bin/security', 'list-keychains', '-d', 'user', '-s', str(keychain), *previous])
+              quiet('import-apple-intermediate', ['/usr/bin/security', 'import', str(root / 'DeveloperIDG2CA.cer'), '-k', str(keychain)])
+              quiet('import-signing-p12', ['/usr/bin/security', 'import', str(p12), '-k', str(keychain), '-P', values['APPLE_SIGNING_P12_PASSWORD'], '-T', '/usr/bin/codesign'])
+              quiet('grant-codesign-key-access', ['/usr/bin/security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
+              quiet('validate-notary-credentials', ['/usr/bin/xcrun', 'notarytool', 'store-credentials', 'peerbrush-ci', '--keychain', str(keychain), '--apple-id', values['APPLE_ID'], '--team-id', values['APPLE_TEAM_ID'], '--password', values['APPLE_NOTARY_PASSWORD']])
+          except (OSError, ValueError, binascii.Error):
+              raise SystemExit('Apple credential setup failed; inspect secret names and local P12 export without printing their values.') from None
+          finally:
+              p12.unlink(missing_ok=True)
+              values.clear()
+          PY
+
+      - name: Sign ZIP then final DMG with separate submission journals
+        run: |
+          UNSIGNED="$RUNNER_TEMP/macos-unsigned/PeerBrush-$SELECTED_VERSION-macOS-arm64.zip"
+          python3 -B scripts/sign_macos.py --format zip --archive "$UNSIGNED" \
+            --output "$RUNNER_TEMP/macos-signed" --work "$RUNNER_TEMP/macos-zip-work" \
+            --commit "$SELECTED_COMMIT" --version "$SELECTED_VERSION" --expected-sha256 "$UNSIGNED_SHA256" \
+            --team-id "$APPLE_TEAM" --identity "$APPLE_IDENTITY_SHA1" --profile peerbrush-ci \
+            --keychain "$RUNNER_TEMP/apple-credentials/signing.keychain-db" --revision "$ZIP_REVISION"
+          SIGNED="$RUNNER_TEMP/macos-signed/PeerBrush-$SELECTED_VERSION-macOS-arm64-apple-signed-r$ZIP_REVISION.zip"
+          SIGNED_SHA=$(shasum -a 256 "$SIGNED" | cut -d ' ' -f 1)
+          python3 -B scripts/sign_macos.py --format dmg --archive "$SIGNED" \
+            --output "$RUNNER_TEMP/macos-signed" --work "$RUNNER_TEMP/macos-dmg-work" \
+            --commit "$SELECTED_COMMIT" --version "$SELECTED_VERSION" --expected-sha256 "$SIGNED_SHA" \
+            --team-id "$APPLE_TEAM" --identity "$APPLE_IDENTITY_SHA1" --profile peerbrush-ci \
+            --keychain "$RUNNER_TEMP/apple-credentials/signing.keychain-db" --revision "$DMG_REVISION"
+      - name: Delete temporary signing credentials before artifact upload
+        if: always()
+        run: |
+          set +x
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'apple-credentials'
+          previous = root / 'search-list.json'
+          try:
+              if previous.is_file():
+                  subprocess.run(['/usr/bin/security', 'list-keychains', '-d', 'user', '-s', *json.loads(previous.read_text())], check=False, capture_output=True, timeout=30)
+          finally:
+              try:
+                  subprocess.run(['/usr/bin/security', 'delete-keychain', str(root / 'signing.keychain-db')], check=False, capture_output=True, timeout=30)
+              finally:
+                  if root.exists():
+                      shutil.rmtree(root)
+          PY
+
+      - name: Prepare exact flat signed pair
+        id: pair
+        run: |
+          python3 - <<'PY'
+          try:
+              import os, pathlib, sys
+              sys.path.insert(0, 'scripts')
+              from package_macos_dmg import bounded_file, private_inspection_directory
+              source = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+              parent = pathlib.Path(os.environ['RUNNER_TEMP'])
+              output = private_inspection_directory(parent / 'macos-signed-pair', source, fresh=True)
+              output.mkdir(mode=0o700)
+              output.chmod(0o700)
+              private_inspection_directory(output, source, fresh=False)
+              archive = f"PeerBrush-{os.environ['SELECTED_VERSION']}-macOS-arm64-apple-signed-r{os.environ['ZIP_REVISION']}.zip"
+              image = archive[:-4] + f"-dmg-signed-r{os.environ['DMG_REVISION']}.dmg"
+              for name in [archive, image]:
+                  original = parent / 'macos-signed' / name
+                  expected = bounded_file(original, 512 * 1024 * 1024)
+                  if bounded_file(original, 512 * 1024 * 1024, output / name) != expected or bounded_file(output / name, 512 * 1024 * 1024) != expected:
+                      raise SystemExit('Final signed pair changed during immutable copy.')
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+                      stream.write(('archive' if name == archive else 'image') + '_sha256=' + expected[0] + '\n')
+              if set(path.name for path in output.iterdir()) != {archive, image}:
+                  raise SystemExit('Only two exact signed files may reach native qualification.')
+          except Exception:
+              raise SystemExit('Signed pair could not be retained; no qualification artifact is available.') from None
+          PY
+
+      - name: Retain only the two final signed files
+        id: signed_pair
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-signed-pair-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/macos-signed-pair/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Record public qualification selections
+        env:
+          ARTIFACT_ID: ${{ steps.signed_pair.outputs.artifact-id }}
+          ARTIFACT_SHA256: ${{ steps.signed_pair.outputs.artifact-digest }}
+          SIGNED_ARCHIVE_SHA256: ${{ steps.pair.outputs.archive_sha256 }}
+          SIGNED_IMAGE_SHA256: ${{ steps.pair.outputs.image_sha256 }}
+        run: |
+          python3 -I - <<'PY'
+          import os, re
+          if (not re.fullmatch('[1-9][0-9]{0,19}', os.environ['ARTIFACT_ID'])
+                  or any(not re.fullmatch('[0-9a-f]{64}', os.environ[key]) for key in ['ARTIFACT_SHA256', 'SIGNED_ARCHIVE_SHA256', 'SIGNED_IMAGE_SHA256'])):
+              raise SystemExit('Immutable signed-pair artifact metadata is unavailable; no qualification selections can be retained.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write('Signed pair only; installation, public availability and production readiness remain unverified.\n')
+              for key in ['GITHUB_RUN_ID', 'ARTIFACT_ID', 'ARTIFACT_SHA256', 'SIGNED_ARCHIVE_SHA256', 'SIGNED_IMAGE_SHA256']:
+                  stream.write(key + ': ' + os.environ[key] + '\n')
+          PY
+      - name: Preserve narrow credentials-free same-submission recovery
+        if: always()
+        run: |
+          python3 - <<'PY'
+          try:
+              import hashlib, json, os, pathlib, re, sys, tarfile
+              sys.path.insert(0, 'scripts')
+              from package import relative_path
+              from package_macos_dmg import bounded_file, private_inspection_directory
+              from production_readiness import unique_fields
+              source = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+              parent = pathlib.Path(os.environ['RUNNER_TEMP'])
+              version, commit = os.environ['SELECTED_VERSION'], os.environ['SELECTED_COMMIT']
+              unsigned = f'PeerBrush-{version}-macOS-arm64.zip'
+              signed = unsigned[:-4] + '-apple-signed-r' + os.environ['ZIP_REVISION'] + '.zip'
+              stage = private_inspection_directory(parent / 'macos-recovery-owned', source, fresh=True)
+              stage.mkdir(mode=0o700)
+              stage.chmod(0o700)
+              private_inspection_directory(stage, source, fresh=False)
+              selected = []
+              selected_links = {}
+              total = 0
+              def selected_bytes(path, name):
+                  from sparkle_bundle import link_target
+                  expected_link = link_target(name.removeprefix('zip/payload/')) if name.startswith('zip/payload/') else None
+                  if expected_link is not None and not path.is_symlink():
+                      raise ValueError('An exact Sparkle recovery link became a regular file.')
+                  if path.is_symlink():
+                      from sparkle_bundle import validate_link
+                      if not name.startswith('zip/payload/'):
+                          raise ValueError('Only exact ZIP payload Sparkle links belong in recovery.')
+                      if path.lstat().st_nlink != 1:
+                          raise ValueError('Sparkle recovery links must not have hard links.')
+                      target = os.readlink(path)
+                      if not path.resolve(strict=True).is_relative_to(parent / 'macos-zip-work' / 'payload'):
+                          raise ValueError('Sparkle recovery link escapes its exact payload.')
+                      validate_link(name.removeprefix('zip/payload/'), target.encode('utf-8'))
+                      if (path.lstat().st_mode & 0o777) != 0o777:
+                          raise ValueError('Sparkle recovery link mode changed.')
+                      selected_links[name] = target
+                      data = target.encode('utf-8')
+                      return hashlib.sha256(data).hexdigest(), len(data)
+                  if name in selected_links:
+                      raise ValueError('Sparkle recovery link became a regular file.')
+                  return bounded_file(path, 512 * 1024 * 1024)
+              def add(path, name, expected=None):
+                  global total
+                  if len(selected) >= 32768:
+                      raise ValueError('Recovery file count exceeds the reviewed scope.')
+                  digest, size = selected_bytes(path, name)
+                  if expected is not None and digest != expected:
+                      raise ValueError('Recovery bytes differ from their original submission journal.')
+                  total += size
+                  if total > 2 * 1024 * 1024 * 1024:
+                      raise ValueError('Recovery payload exceeds its byte budget.')
+                  selected.append((path, name, digest, size))
+              for kind in ['zip', 'dmg']:
+                  work = parent / ('macos-' + kind + '-work')
+                  if not work.exists():
+                      continue
+                  private_inspection_directory(work, source, fresh=False)
+                  state_path = work / 'state.json'
+                  if not state_path.exists():
+                      continue
+                  state_copy = stage / ('selected-' + kind + '-state')
+                  state_hash, state_size = bounded_file(state_path, 2 * 1024 * 1024, state_copy)
+                  state_copy.chmod(0o400)
+                  state = json.loads(state_copy.read_bytes(), object_pairs_hook=unique_fields)
+                  if not isinstance(state, dict):
+                      raise ValueError('Unexpected signing recovery state.')
+                  expected = dict(schema=1, commit=commit, version=version, team_id=os.environ['APPLE_TEAM'],
+                      certificate_sha1=os.environ['APPLE_IDENTITY_SHA1'],
+                      revision=('apple-signed-r' if kind == 'zip' else 'dmg-signed-r') + os.environ[kind.upper() + '_REVISION'])
+                  original = parent / ('macos-unsigned' if kind == 'zip' else 'macos-signed') / (unsigned if kind == 'zip' else signed)
+                  expected['input_sha256'] = bounded_file(original, 512 * 1024 * 1024)[0]
+                  if kind == 'zip' and expected['input_sha256'] != os.environ['UNSIGNED_SHA256']:
+                      raise ValueError('Original unsigned input changed before recovery retention.')
+                  if kind == 'dmg':
+                      expected['format'] = 'dmg'
+                  allowed = {'configuration', 'submission_sha256', 'submission_id'} | ({'bundle_hashes'} if kind == 'zip' else {'prepared_hashes', 'payload'})
+                  if (set(state) - allowed or state.get('configuration') != expected
+                          or not re.fullmatch('[0-9a-f]{64}', str(state.get('submission_sha256', '')))
+                          or ('submission_id' in state and not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', str(state['submission_id'])))):
+                      raise ValueError('Signing recovery state differs from the selected source and submission.')
+                  if kind == 'dmg':
+                      payload = state.get('payload')
+                      if not isinstance(payload, dict) or not 1 <= len(payload) <= 32768:
+                          raise ValueError('Missing bounded DMG recovery layout.')
+                      for name, entry in payload.items():
+                          if type(name) is not str or len(name) > 1024 or str(relative_path(name)) != name or not isinstance(entry, dict):
+                              raise ValueError('Unexpected DMG recovery layout.')
+                          if ((entry == {'directory': True} and type(entry.get('directory')) is bool)
+                                  or (name == 'Applications' and entry == {'link': '/Applications'})):
+                              continue
+                          if set(entry) == {'link'}:
+                              from sparkle_bundle import validate_link
+                              validate_link(name, str(entry['link']).encode('utf-8'))
+                              continue
+                          if (set(entry) != {'sha256', 'mode'} or not re.fullmatch('[0-9a-f]{64}', str(entry['sha256']))
+                                  or type(entry['mode']) is not int or entry['mode'] not in [0o644, 0o755]):
+                              raise ValueError('Unexpected DMG recovery layout metadata.')
+                  add(original, kind + '/input/' + original.name, expected['input_sha256'])
+                  add(state_path, kind + '/state.json', state_hash)
+                  add(work / ('submission.zip' if kind == 'zip' else 'submission.dmg'),
+                      kind + ('/submission.zip' if kind == 'zip' else '/submission.dmg'), state['submission_sha256'])
+                  hashes = state.get('bundle_hashes' if kind == 'zip' else 'prepared_hashes')
+                  if not isinstance(hashes, dict) or not hashes or len(hashes) > 32768:
+                      raise ValueError('Missing bounded preserved signing payload inventory.')
+                  folder = 'payload' if kind == 'zip' else 'prepared'
+                  if kind == 'dmg':
+                      candidate = signed[:-4] + '-dmg-candidate-r' + os.environ['DMG_REVISION'] + '.dmg'
+                      if set(hashes) != {candidate, candidate + '.sha256', candidate + '.verification.json'}:
+                          raise ValueError('Unexpected preserved DMG preparation inventory.')
+                  for name, checksum in sorted(hashes.items()):
+                      if (type(name) is not str or str(relative_path(name)) != name
+                              or not re.fullmatch('[0-9a-f]{64}', str(checksum))):
+                          raise ValueError('Unexpected recovery payload path or digest.')
+                      add(work / folder / name, kind + '/' + folder + '/' + name, checksum)
+              if selected:
+                  # Never walk work directories: failed DMG finalization can retain a
+                  # mounted volume. Copy only journal-listed regular payload files.
+                  owned = []
+                  for index, (path, name, digest, size) in enumerate(selected):
+                      copy = stage / str(index)
+                      if name in selected_links:
+                          if selected_bytes(path, name) != (digest, size):
+                              raise ValueError('Recovery link changed during owned copy.')
+                          with copy.open('xb') as stream:
+                              stream.write(selected_links[name].encode('utf-8'))
+                      elif bounded_file(path, 512 * 1024 * 1024, copy) != (digest, size):
+                          raise ValueError('Recovery input changed during owned copy.')
+                      owned.append((copy, name, digest, size, path.lstat().st_mode & 0o777))
+                  destination = parent / 'macos-signing-recovery.tar'
+                  temporary = parent / 'macos-signing-recovery.tar.partial'
+                  class CheckedRead:
+                      def __init__(self, stream):
+                          self.stream, self.total, self.checksum = stream, 0, hashlib.sha256()
+                      def read(self, count):
+                          data = self.stream.read(count)
+                          self.total += len(data)
+                          self.checksum.update(data)
+                          return data
+                  with temporary.open('xb') as sink, tarfile.open(fileobj=sink, mode='w', format=tarfile.PAX_FORMAT) as archive:
+                      for path, name, digest, size, mode in owned:
+                          if bounded_file(path, 512 * 1024 * 1024) != (digest, size):
+                              raise ValueError('Owned recovery bytes changed before retention.')
+                          info = tarfile.TarInfo(name)
+                          info.size, info.mode, info.mtime = size, mode, 0
+                          info.uid = info.gid = 0
+                          if name in selected_links:
+                              if path.read_bytes() != selected_links[name].encode('utf-8'):
+                                  raise ValueError('Owned recovery link changed before retention.')
+                              info.type, info.linkname, info.size = tarfile.SYMTYPE, selected_links[name], 0
+                              archive.addfile(info)
+                              continue
+                          with path.open('rb') as stream:
+                              reader = CheckedRead(stream)
+                              archive.addfile(info, reader)
+                              if reader.total != size or reader.checksum.hexdigest() != digest:
+                                  raise ValueError('Actual recovery member reads differ from the selected payload.')
+                  temporary.chmod(0o600)
+                  for path, name, digest, size in selected:
+                      if selected_bytes(path, name) != (digest, size):
+                          raise ValueError('Original recovery payload changed during retention.')
+                  # An incomplete recovery file must never become an upload input.
+                  os.link(temporary, destination)
+                  temporary.unlink()
+                  print('Credentials-free recovery retained separately. Reconcile Apple history before any retry; resume only the same immutable submission.')
+          except Exception:
+              raise SystemExit('Recovery retention failed; reconcile Apple history and preserve original work before any retry.') from None
+          PY
+
+      - name: Retain credentials-free recovery payload
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-signing-recovery-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/macos-signing-recovery.tar
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 0

@@ -16,6 +16,32 @@ import test_package
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+def synthetic_package(payload, mutate=None):
+    """Full byte/block-map fixture; not an SDK-validated, installable MSIX."""
+    files = dict(payload)
+    root = ET.Element('BlockMap', xmlns='http://schemas.microsoft.com/appx/2010/blockmap',
+                      HashMethod='http://www.w3.org/2001/04/xmlenc#sha256')
+    for name, data in files.items():
+        header_size = 30 + len(msix.opc_name(name).encode('utf-8'))
+        item = ET.SubElement(root, 'File', Name=name.replace('/', '\\'), Size=str(len(data)), LfhSize=str(header_size))
+        for i in range(0, len(data), 65536):
+            ET.SubElement(item, 'Block', Hash=base64.b64encode(hashlib.sha256(data[i:i+65536]).digest()).decode())
+    files['AppxBlockMap.xml'] = ET.tostring(root)
+    types = ET.Element('Types', xmlns='http://schemas.openxmlformats.org/package/2006/content-types')
+    for name in files:
+        mime = {'AppxManifest.xml': 'application/vnd.ms-appx.manifest+xml',
+                'AppxBlockMap.xml': 'application/vnd.ms-appx.blockmap+xml'}.get(name, 'application/octet-stream')
+        ET.SubElement(types, 'Override', PartName='/' + msix.opc_name(name), ContentType=mime)
+    files['[Content_Types].xml'] = ET.tostring(types)
+    if mutate:
+        mutate(files)
+    result = io.BytesIO()
+    with zipfile.ZipFile(result, 'w') as archive:
+        for name, data in files.items():
+            archive.writestr(msix.opc_name(name), data)
+    return result.getvalue()
+
+
 class Msix(unittest.TestCase):
     def setUp(self):
         self.fixture = test_package.Packages()
@@ -39,10 +65,11 @@ class Msix(unittest.TestCase):
 
     def rewrite_portable(self, change):
         with zipfile.ZipFile(self.archive) as archive:
-            files={n:archive.read(n) for n in archive.namelist()}
+            entries={entry.filename:entry for entry in archive.infolist()}
+            files={n:archive.read(n) for n in entries}
         change(files)
         with zipfile.ZipFile(self.archive,'w') as archive:
-            for n,data in files.items():archive.writestr(n,data)
+            for n,data in files.items():archive.writestr(entries.get(n,n),data)
 
     def test_manifest_retains_logo_alias_identity_and_scoped_permissions(self):
         report=self.stage()
@@ -62,6 +89,57 @@ class Msix(unittest.TestCase):
         self.assertNotIn('unvirtualizedResources',text)
         self.assertNotIn('FileSystemWriteVirtualization',text)
         self.assertNotIn('>disabled<',text)
+
+    def test_update_deferral_is_source_bound_and_never_enables_an_updater(self):
+        data = msix.manifest_bytes(self.template, self.identity, '0.2.0')
+        root = ET.fromstring(data)
+        policy = root.find('f:Properties/uap17:UpdateWhileInUse', msix.NS)
+        self.assertEqual((policy.text, policy.attrib, len(policy)), ('defer', {}, 0))
+        self.assertEqual(root.find('f:Dependencies/f:TargetDeviceFamily', msix.NS).get('MinVersion'), '10.0.19041.0')
+        self.assertEqual({node.get('Name') for node in root.findall('f:Capabilities/rescap:Capability', msix.NS)}, {'runFullTrust'})
+        self.assertNotIn(b'AutoUpdate', data)
+        self.assertNotIn(b'packageManagement', data)
+        policy_xml = b'<uap17:UpdateWhileInUse>defer</uap17:UpdateWhileInUse>'
+        for changed in [
+            data.replace(policy_xml, b''),
+            data.replace(policy_xml, policy_xml + policy_xml),
+            data.replace(b'>defer</uap17:', b'>allow</uap17:'),
+            data.replace(b'>defer</uap17:', b'> defer </uap17:'),
+            data.replace(b'<uap17:UpdateWhileInUse>', b'<uap17:UpdateWhileInUse Mode="defer">'),
+            data.replace(b'>defer</uap17:', b'><Child /></uap17:'),
+            data.replace(b' uap17 rescap"', b' rescap"'),
+            data.replace(b'manifest/uap/windows10/17', b'manifest/uap/windows10/16'),
+            data.replace(b'    ' + policy_xml, b'').replace(b'</Properties>', b'</Properties>' + policy_xml),
+        ]:
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, 'update deferral'):
+                    msix.validate_manifest(changed, self.identity, '0.2.0')
+        # Missing policy in a current selected source template is not legacy.
+        with self.assertRaisesRegex(ValueError, 'update deferral'):
+            msix.manifest_bytes(self.template.replace(policy_xml, b''), self.identity, '0.2.0')
+        legacy = self.template.replace(b'\r\n', b'\n').replace(policy_xml, b'').replace(
+            b'         xmlns:uap17="http://schemas.microsoft.com/appx/manifest/uap/windows10/17"\n', b'').replace(
+            b' uap17 rescap"', b' rescap"')
+        old = msix.manifest_bytes(legacy, self.identity, '0.2.0')
+        self.assertNotIn(b'UpdateWhileInUse', old)
+        msix.validate_manifest(old, self.identity, '0.2.0', _defer_updates=False)
+        with self.assertRaisesRegex(ValueError, 'current source policy'):
+            msix.validate_manifest(old, self.identity, '0.2.0')
+        with self.assertRaisesRegex(ValueError, 'Historical source'):
+            msix.validate_manifest(data, self.identity, '0.2.0', _defer_updates=False)
+
+    def test_current_msix_payload_rejects_missing_update_deferral_even_with_valid_block_hashes(self):
+        files, _release = msix.expected_payload(self.root, self.archive, self.identity)
+        with tempfile.TemporaryDirectory() as temporary:
+            package = pathlib.Path(temporary) / 'changed.msix'
+            package.write_bytes(synthetic_package(files))
+            msix.verify_payload(package, files)
+            changed = dict(files)
+            changed['AppxManifest.xml'] = changed['AppxManifest.xml'].replace(
+                b'<uap17:UpdateWhileInUse>defer</uap17:UpdateWhileInUse>', b'')
+            package.write_bytes(synthetic_package(changed))
+            with self.assertRaises(ValueError):
+                msix.verify_payload(package, files)
 
     def test_staging_has_no_casefolded_directory_collisions_on_windows(self):
         self.stage()
@@ -100,6 +178,8 @@ class Msix(unittest.TestCase):
         self.assertFalse(report['signed'])
         self.assertFalse(report['installed_tested'])
         self.assertTrue((self.root/'sdk-package'/report['package']).is_file())
+        with zipfile.ZipFile(self.root/'sdk-package'/report['package']) as package:
+            self.assertIn(b'<uap17:UpdateWhileInUse>defer</uap17:UpdateWhileInUse>', package.read('AppxManifest.xml'))
 
     def test_store_identity_is_required_and_local_identity_is_explicit(self):
         for identity in [{}, {'name':'x'}, {'name':'REPLACE_WITH_ID','publisher':'CN=Demo','publisher_display_name':'Demo'}]:
@@ -107,6 +187,8 @@ class Msix(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'development'):
             msix.identity_values(self.identity)
         self.assertEqual(msix.identity_values(self.identity,True),self.identity)
+        with self.assertRaisesRegex(ValueError, 'exact local test identity'):
+            msix.identity_values(dict(self.identity, name='PeerBrush.OtherTest'), True)
         for name in ['CON','com1.app','PeerBrush.','xn--peerbrush','Peer.xn--brush']:
             with self.assertRaises(ValueError):msix.identity_values(dict(self.identity,name=name),True)
         bad=dict(self.identity,publisher='CN=Test, OID.2.25.311729368913984317654407730594956997722=1')
@@ -152,6 +234,29 @@ class Msix(unittest.TestCase):
         for previous in ['1.2.0.0','1.3.0.0']:
             with self.assertRaises(ValueError):msix.package_version('0.2.0',previous=previous)
 
+    def test_development_version_requires_local_identity_and_keeps_source_version(self):
+        for name in ['Cargo.toml', 'Cargo.lock']:
+            path = self.root / name
+            path.write_text(path.read_text().replace('0.2.0', '0.30.0-dev.1'))
+        self.fixture.commit()
+        archive = self.fixture.build('Windows')
+        with self.assertRaisesRegex(ValueError, 'stable three-part'):
+            msix.stage_payload(self.root, archive, self.root/'store-stage', self.identity)
+        report = msix.stage_payload(self.root, archive, self.root/'dev-stage', self.identity, development=True)
+        self.assertEqual(report['version'], '0.30.0-dev.1')
+        root = ET.parse(self.root/'dev-stage/AppxManifest.xml').getroot()
+        self.assertEqual(root.find('f:Identity', msix.NS).attrib['Version'], '1.30.0.0')
+        self.assertEqual(root.find('f:Identity', msix.NS).attrib['Name'], 'PeerBrush.LocalTest')
+        self.assertEqual(msix.package_version('0.30.0-dev.1', development=True, previous='1.26.0.0'), '1.30.0.0')
+        with self.assertRaises(ValueError):
+            msix.package_version('0.30.0-dev.1', development=True, previous='1.30.0.0')
+        store = json.loads((ROOT/'packaging/msix/identity.store.json').read_text())
+        with self.assertRaisesRegex(ValueError, 'exact local test identity'):
+            msix.manifest_bytes(self.template, store, '0.30.0-dev.1', development=True)
+        for invalid in ['0.30.0-beta.1', '0.30.0-dev.01', '0.30.0-dev.1+build', '65535.0.0-dev.1']:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                msix.package_version(invalid, development=True)
+
     def test_optional_image_types_are_opt_in_and_only_supported_types(self):
         data=msix.manifest_bytes(self.template,self.identity,'0.2.0',['.png','.jpg','.png'])
         root=ET.fromstring(data)
@@ -166,12 +271,21 @@ class Msix(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'must be new'):self.stage()
 
     def test_staging_accepts_windows_crlf_notice_summary(self):
+        with zipfile.ZipFile(self.archive) as archive:
+            executable=next(entry for entry in archive.infolist() if entry.filename.endswith('/peerbrush.exe'))
+            executable_mode=executable.external_attr
         def use_crlf(files):
             name=next(n for n in files if n.endswith('/THIRD_PARTY_NOTICES.md'))
             text=files[name].decode('utf-8').replace('\r\n','\n')
             files[name]=text.replace('\n','\r\n').encode('utf-8')
         self.rewrite_portable(use_crlf)
+        with zipfile.ZipFile(self.archive) as archive:
+            self.assertEqual(archive.getinfo(executable.filename).external_attr,executable_mode)
+            self.assertTrue((executable_mode>>16)&0o111)
+            notice=archive.read(next(n for n in archive.namelist() if n.endswith('/THIRD_PARTY_NOTICES.md')))
+            self.assertIn(b'\r\n',notice)
         self.stage()
+        self.assertEqual((self.root/'stage/THIRD_PARTY_NOTICES.md').read_bytes(),notice)
 
     def test_staging_rejects_bare_carriage_return_notice_summary(self):
         def use_bare_cr(files):
@@ -231,18 +345,8 @@ class Msix(unittest.TestCase):
         self.stage()
         stage=self.root/'stage'
         files={p.relative_to(stage).as_posix():p.read_bytes() for p in stage.rglob('*') if p.is_file()}
-        block_ns='http://schemas.microsoft.com/appx/2010/blockmap'
-        root=ET.Element('BlockMap',xmlns=block_ns,HashMethod='http://www.w3.org/2001/04/xmlenc#sha256')
-        for name,data in files.items():
-            item=ET.SubElement(root,'File',Name=name.replace('/','\\'),Size=str(len(data)),LfhSize='0')
-            for i in range(0,len(data),65536):
-                ET.SubElement(item,'Block',Hash=base64.b64encode(hashlib.sha256(data[i:i+65536]).digest()).decode())
-        files['AppxBlockMap.xml']=ET.tostring(root)
-        files['[Content_Types].xml']=b'<Types />'
-        if mutate:mutate(files)
         result=self.root/'synthetic.msix'
-        with zipfile.ZipFile(result,'w') as archive:
-            for name,data in files.items():archive.writestr(msix.opc_name(name),data)
+        result.write_bytes(synthetic_package(files, mutate))
         return result,stage
 
     def test_opc_names_encode_spaces_percent_and_unicode_without_aliases(self):
@@ -250,6 +354,9 @@ class Msix(unittest.TestCase):
         self.assertEqual(msix.opc_name('Start%20PeerBrush.cmd'),'Start%2520PeerBrush.cmd')
         self.assertEqual(msix.opc_name('assets/作品.png'),'assets/%E4%BD%9C%E5%93%81.png')
         self.assertEqual(msix.opc_name('[Content_Types].xml'),'[Content_Types].xml')
+        expected = {'Start PeerBrush.cmd': b'one', 'Start%20PeerBrush.cmd': b'two',
+                    'assets/作品 #%.png': b'three'}
+        msix.verify_payload(io.BytesIO(synthetic_package(expected)), expected)
 
     def test_final_archive_checks_every_payload_byte_and_block(self):
         path,stage=self.synthetic_msix()
@@ -264,6 +371,152 @@ class Msix(unittest.TestCase):
             files['AppxBlockMap.xml']=ET.tostring(root)
         path,stage=self.synthetic_msix(change)
         with self.assertRaisesRegex(ValueError,'block hash'):msix.verify_packed(path,stage)
+
+    def test_native_sdk_whole_file_hash_is_verified_without_ignoring_other_children(self):
+        expected = {'large.bin': bytes(range(256)) * 256 + b'last',
+                    'one-block.bin': bytes(range(256)) * 256, 'empty.bin': b''}
+        def extension(files, case='valid'):
+            root = ET.fromstring(files['AppxBlockMap.xml'])
+            root.set('xmlns:b4', 'http://schemas.microsoft.com/appx/2021/blockmap')
+            root.set('IgnorableNamespaces', 'b4')
+            nodes = {node.get('Name'): node for node in root}
+            name = 'one-block.bin' if case == 'small' else 'empty.bin' if case == 'empty' else 'large.bin'
+            node = nodes[name]
+            digest = base64.b64encode(hashlib.sha256(expected[name]).digest()).decode()
+            file_hash = ET.SubElement(node, 'b4:FileHash', Hash=digest)
+            if case == 'wrong-hash':
+                file_hash.set('Hash', base64.b64encode(hashlib.sha256(b'different').digest()).decode())
+            elif case == 'duplicate':
+                ET.SubElement(node, 'b4:FileHash', Hash=digest)
+            elif case == 'unknown-namespace':
+                root.set('xmlns:b4', 'http://schemas.microsoft.com/appx/2099/blockmap')
+            elif case == 'unknown-attribute':
+                file_hash.set('Size', str(len(expected[name])))
+            elif case == 'text':
+                file_hash.text = 'unexpected'
+            elif case == 'nested':
+                ET.SubElement(file_hash, 'Ignored')
+            elif case == 'misordered':
+                node.remove(file_hash)
+                node.insert(0, file_hash)
+            elif case == 'wrong-block':
+                node[0].set('Hash', 'invalid')
+            files['AppxBlockMap.xml'] = ET.tostring(root)
+        msix.verify_payload(io.BytesIO(synthetic_package(expected)), expected)
+        msix.verify_payload(io.BytesIO(synthetic_package(expected, extension)), expected)
+        for case in ['wrong-hash', 'duplicate', 'unknown-namespace', 'unknown-attribute',
+                     'text', 'nested', 'misordered', 'small', 'empty', 'wrong-block']:
+            package = synthetic_package(expected, lambda files: extension(files, case))
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                msix.verify_payload(io.BytesIO(package), expected)
+
+    def test_source_derived_payload_rejects_repacked_changed_executable(self):
+        expected, _ = msix.expected_payload(self.root, self.archive, self.identity)
+        package = synthetic_package(expected)
+        msix.verify_payload(io.BytesIO(package), expected)
+        changed = dict(expected, **{'peerbrush.exe': expected['peerbrush.exe'] + b'changed'})
+        with self.assertRaisesRegex(ValueError, 'payload differs'):
+            msix.verify_payload(io.BytesIO(synthetic_package(changed)), expected)
+
+    def test_block_map_structure_sizes_and_footprints_are_not_self_authorizing(self):
+        expected, _ = msix.expected_payload(self.root, self.archive, self.identity)
+        def change(files, case):
+            root = ET.fromstring(files['AppxBlockMap.xml'])
+            node = root[0]
+            if case == 'root':
+                root.tag = 'Other'
+            elif case == 'duplicate':
+                root.append(ET.fromstring(ET.tostring(node)))
+            elif case == 'missing':
+                root.remove(node)
+            elif case == 'header':
+                node.set('LfhSize', '0')
+            elif case == 'block-size':
+                node[0].set('Size', '9999999999')
+            elif case == 'hidden-child':
+                ET.SubElement(node, 'Ignored')
+            elif case == 'types-root':
+                files['[Content_Types].xml'] = b'<Types />'
+            elif case == 'types-missing':
+                types = ET.fromstring(files['[Content_Types].xml'])
+                types.remove(types[0])
+                files['[Content_Types].xml'] = ET.tostring(types)
+            elif case == 'types-duplicate':
+                types = ET.fromstring(files['[Content_Types].xml'])
+                types.append(ET.fromstring(ET.tostring(types[0])))
+                files['[Content_Types].xml'] = ET.tostring(types)
+            elif case == 'footprint-budget':
+                files['[Content_Types].xml'] = b' ' * (msix.FOOTPRINT_LIMIT + 1)
+            files['AppxBlockMap.xml'] = ET.tostring(root)
+        for case in ['root', 'duplicate', 'missing', 'header', 'block-size', 'hidden-child', 'types-root',
+                     'types-missing', 'types-duplicate', 'footprint-budget']:
+            package = synthetic_package(expected, lambda files: change(files, case))
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                msix.verify_payload(io.BytesIO(package), expected)
+
+    def test_nonregular_aliasing_duplicate_crc_and_archive_budgets_are_rejected(self):
+        expected, _ = msix.expected_payload(self.root, self.archive, self.identity)
+        package = synthetic_package(expected)
+        def rewrite(change):
+            output = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(package)) as source, zipfile.ZipFile(output, 'w') as target:
+                for entry in source.infolist():
+                    data = source.read(entry)
+                    change(entry)
+                    target.writestr(entry, data)
+            return output.getvalue()
+        for case in ['symlink', 'alias', 'duplicate']:
+            def change(entry):
+                if entry.filename == 'peerbrush.exe':
+                    if case == 'symlink':
+                        entry.create_system = 3
+                        entry.external_attr = 0o120777 << 16
+                    elif case == 'alias':
+                        entry.filename = '%70eerbrush.exe'
+                    else:
+                        entry.filename = 'release.json'
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                msix.verify_payload(io.BytesIO(rewrite(change)), expected)
+        corrupted = bytearray(package)
+        with zipfile.ZipFile(io.BytesIO(package)) as source:
+            entry = source.getinfo('peerbrush.exe')
+            start = entry.header_offset + 30 + len(entry.filename.encode('utf-8'))
+        corrupted[start] ^= 1
+        with self.assertRaises((ValueError, zipfile.BadZipFile)):
+            msix.verify_payload(io.BytesIO(corrupted), expected)
+        from unittest.mock import patch
+        with patch.object(msix, 'PACKAGE_LIMIT', len(package) - 1), self.assertRaisesRegex(ValueError, 'budget'):
+            msix.verify_payload(io.BytesIO(package), expected)
+
+    def test_current_embedded_provenance_and_compiler_notices_reach_msix_boundary(self):
+        self.fixture.require_provenance()
+        self.archive = self.fixture.build('Windows')
+        msix.expected_payload(self.root, self.archive, self.identity, require_provenance=True)
+        original = self.archive.read_bytes()
+        for case in ['missing-label', 'duplicate-label', 'dirty-label', 'missing-compiler-notice']:
+            self.archive.write_bytes(original)
+            def change(files):
+                key = next(name for name in files if name.endswith('/release.json'))
+                release = json.loads(files[key])
+                if case == 'missing-compiler-notice':
+                    notice = next(name for name in release['notice_files'] if name.startswith('licenses/rust-runtime/'))
+                    release['notice_files'].pop(notice)
+                    files.pop(key.removesuffix('release.json') + notice)
+                else:
+                    binary_key = key.removesuffix('release.json') + 'peerbrush.exe'
+                    binary = files[binary_key]
+                    if case == 'missing-label':
+                        binary = binary[:128]
+                    elif case == 'duplicate-label':
+                        binary += binary[128:]
+                    else:
+                        binary = binary.replace(b'"tree":"clean"', b'"tree":"dirty"')
+                    files[binary_key] = binary
+                    release['executable_sha256'] = hashlib.sha256(binary).hexdigest()
+                files[key] = json.dumps(release).encode()
+            self.rewrite_portable(change)
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, 'provenance|Rust runtime'):
+                msix.expected_payload(self.root, self.archive, self.identity, require_provenance=True)
 
 
 if __name__=='__main__':unittest.main()

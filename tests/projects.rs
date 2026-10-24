@@ -235,7 +235,7 @@ fn transfer_preview_and_paste_preserve_native_tree_masks_effects_and_standard_ps
             id: peerbrush::engine::id(),
             kind: "invert".into(),
             enabled: true,
-            settings: json!({}),
+            settings: json!({}).into(),
         });
         e.doc.layers = vec![folder, child];
     }

@@ -63,7 +63,7 @@ pub struct Layer {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub psd_metadata: Vec<crate::psd::LayerMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<crate::source::Source>,
+    pub source: Option<Arc<crate::source::Source>>,
     #[serde(skip, default = "id")]
     pub effect_key: String,
 }
@@ -382,23 +382,12 @@ impl Document {
         Ok((w, h, bytes, rect))
     }
     pub fn export_png(&self) -> Result<Vec<u8>, String> {
-        let profile = self
-            .icc_profile
-            .as_deref()
-            .map(Vec::as_slice)
-            .or_else(|| self.srgb_tagged.then(crate::color_profile::srgb_profile));
-        if self.bit_depth == 16 {
-            let image = crate::depth16::render(self)?;
-            return crate::raster::png16_with_profile(
-                image.width,
-                image.height,
-                &image.words,
-                profile,
-            );
-        }
-        let (w, h, bytes, _) =
-            self.preview_native8(None, self.width.max(self.height), None, false)?;
-        crate::raster::png_with_profile(w, h, &bytes, profile)
+        crate::production_export::render_document(
+            self,
+            crate::production_export::Format::Png,
+            crate::jpeg_xl::Options::default(),
+            &crate::production_export::Control::default(),
+        )
     }
 }
 
@@ -468,6 +457,8 @@ pub struct Engine {
     pub(crate) truncated_tasks: BTreeSet<(String, String)>,
     pub changes: Vec<(u64, Vec<Scope>)>,
     pub saved_revision: u64,
+    /// Runtime I/O survives engine clones; never serialized into project sources.
+    pub(crate) file_operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub feedback: BTreeMap<String, String>,
     pub path: Option<std::path::PathBuf>,
     pub status: String,
@@ -483,6 +474,7 @@ pub struct Engine {
     ai_serial: u64,
     pub focus_requested: bool,
     pub loading: Option<crate::loading::Control>,
+    pub saving: Option<crate::saving::Control>,
     pub brush_library: std::sync::Arc<std::sync::Mutex<crate::brush_library::Library>>,
     pub tool_settings: std::sync::Arc<std::sync::Mutex<crate::tool_settings::Store>>,
     pub filter_library: std::sync::Arc<std::sync::Mutex<crate::filter_library::Library>>,
@@ -616,6 +608,7 @@ impl Engine {
             truncated_tasks: BTreeSet::new(),
             changes: vec![],
             saved_revision: 0,
+            file_operations: Default::default(),
             feedback: BTreeMap::new(),
             path: None,
             status: "Ready".into(),
@@ -630,6 +623,7 @@ impl Engine {
             ai_serial: 0,
             focus_requested: false,
             loading: None,
+            saving: None,
             brush_library: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::brush_library::Library::default(),
             )),
@@ -687,7 +681,7 @@ impl Engine {
     }
     fn state_core(&mut self) -> Value {
         self.expire();
-        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"source_structure":self.doc.source_structure,"source_patterns":self.doc.source_patterns,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"linked":m.linked,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"saving":self.saving.as_ref().map(|c| c.status()),"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"source_structure":self.doc.source_structure,"source_patterns":self.doc.source_patterns,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"linked":m.linked,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -1002,11 +996,63 @@ impl Engine {
                 .and_then(|_| rect(&c["rect"]))
                 .or(self.doc.selection);
         }
+        if op == "transform" && c.get("warp").is_some() {
+            match crate::warp::parse(c) {
+                Ok(Some(_)) => {
+                    let area = self
+                        .doc
+                        .selection
+                        .filter(|_| c["selection_only"] != false)
+                        .and_then(|b| {
+                            crate::warp::CommandMap::new(c, [0., 0.])
+                                .and_then(|m| m.bounds(b.map(|v| v as f64)))
+                                .ok()
+                                .map(|p| {
+                                    [
+                                        b[0].min(p[0].floor() as i32),
+                                        b[1].min(p[1].floor() as i32),
+                                        b[2].max(p[2].ceil() as i32),
+                                        b[3].max(p[3].ceil() as i32),
+                                    ]
+                                })
+                        });
+                    return vec![Scope { target, rect: area }];
+                }
+                Err(_) => return vec![Scope { target, rect: None }],
+                Ok(None) => {}
+            }
+        }
+        if op == "transform" && c.get("projective").is_some() {
+            match crate::projective::combined(c) {
+                Ok(Some(map)) => {
+                    let area = self
+                        .doc
+                        .selection
+                        .filter(|_| c["selection_only"] != false)
+                        .and_then(|b| {
+                            map.bounds(b.map(|v| v as f64)).ok().map(|p| {
+                                [
+                                    b[0].min(p[0].floor() as i32),
+                                    b[1].min(p[1].floor() as i32),
+                                    b[2].max(p[2].ceil() as i32),
+                                    b[3].max(p[3].ceil() as i32),
+                                ]
+                            })
+                        });
+                    return vec![Scope { target, rect: area }];
+                }
+                Err(_) => return vec![Scope { target, rect: None }],
+                Ok(None) => {}
+            }
+        }
         if ["move", "transform"].contains(&op) && c["selection_only"] != false {
             if let Some(b) = self.doc.selection {
                 let moving = op == "move";
-                let dx = if moving { num(c, "dx", 0.).round() } else { 0. };
-                let dy = if moving { num(c, "dy", 0.).round() } else { 0. };
+                let [dx, dy] = if moving {
+                    [num(c, "dx", 0.).round(), num(c, "dy", 0.).round()]
+                } else {
+                    crate::transform::translation(c).unwrap_or([0., 0.])
+                };
                 let angle = if moving {
                     0.
                 } else {
@@ -1024,16 +1070,66 @@ impl Engine {
                 let py = c["pivot"][1]
                     .as_f64()
                     .unwrap_or((b[1] as f64 + b[3] as f64) / 2.);
+                let shear = crate::transform::selected_shear(c).unwrap_or([0., 0.]);
+                let linear = [cos * sx, sin * sx, -sin * sy, cos * sy];
+                let skew = crate::transform::skewed(linear, c)
+                    .ok()
+                    .filter(|_| shear != [0., 0.]);
                 let mut out = b;
                 for p in crate::selection::rectangle(b) {
-                    let x = px + (p[0] as f64 - px) * sx * cos - (p[1] as f64 - py) * sy * sin + dx;
-                    let y = py + (p[0] as f64 - px) * sx * sin + (p[1] as f64 - py) * sy * cos + dy;
+                    let (x, y) = if let Some([a, bb, cc, d]) = skew {
+                        (
+                            px + a * (p[0] as f64 - px) + cc * (p[1] as f64 - py) + dx,
+                            py + bb * (p[0] as f64 - px) + d * (p[1] as f64 - py) + dy,
+                        )
+                    } else {
+                        (
+                            px + (p[0] as f64 - px) * sx * cos - (p[1] as f64 - py) * sy * sin + dx,
+                            py + (p[0] as f64 - px) * sx * sin + (p[1] as f64 - py) * sy * cos + dy,
+                        )
+                    };
                     out = [
                         out[0].min(x.floor() as i32),
                         out[1].min(y.floor() as i32),
                         out[2].max(x.ceil() as i32),
                         out[3].max(y.ceil() as i32),
                     ];
+                }
+                if shear != [0., 0.] || c["fractional_translation"] == true {
+                    let (mut sin, mut cos) = (num(c, "angle", 0.) as f32).to_radians().sin_cos();
+                    if sin.abs() < 0.000001 {
+                        sin = 0.;
+                    }
+                    if cos.abs() < 0.000001 {
+                        cos = 0.;
+                    }
+                    let rectangle = crate::selection::rectangle(b);
+                    let covered = self
+                        .doc
+                        .selection_coverage
+                        .as_ref()
+                        .is_some_and(|coverage| coverage.bounds == b);
+                    let points = if covered {
+                        rectangle.as_slice()
+                    } else {
+                        crate::selection::polygon(&self.doc).unwrap_or(&rectangle)
+                    };
+                    for &p in points {
+                        let [x, y] = crate::transform::selected_point(
+                            p,
+                            [px as f32, py as f32],
+                            [dx as f32, dy as f32],
+                            [sx as f32, sy as f32],
+                            [sin, cos],
+                            shear,
+                        );
+                        out = [
+                            out[0].min(x.floor() as i32),
+                            out[1].min(y.floor() as i32),
+                            out[2].max(x.ceil() as i32),
+                            out[3].max(y.ceil() as i32),
+                        ];
+                    }
                 }
                 area = Some(out);
             }
@@ -1793,6 +1889,11 @@ impl Engine {
             return Ok(());
         }
         if self.doc.layers[i].source.is_some() {
+            if op == "transform"
+                && (crate::projective::parse(c)?.is_some() || crate::warp::parse(c)?.is_some())
+            {
+                return Err("Rasterize the editable text/vector source at its native precision before Distort, Perspective or Warp".into());
+            }
             let mask = c["mask"] == true;
             if !mask
                 && matches!(
@@ -2057,7 +2158,7 @@ impl Engine {
                         id: id(),
                         kind: kind.into(),
                         enabled: true,
-                        settings,
+                        settings: settings.into(),
                     });
                 }
                 "effect.update" => {
@@ -2073,7 +2174,7 @@ impl Engine {
                         e.weight = crate::effects::command_weight(c)?;
                     }
                     if let Some(settings) = c.get("settings") {
-                        e.settings = crate::effects::normalized(&e.kind, settings)?;
+                        e.settings = crate::effects::normalized(&e.kind, settings)?.into();
                     }
                 }
                 "effect.delete" => {
@@ -2268,7 +2369,7 @@ impl Engine {
                     id: id(),
                     kind: "liquify".into(),
                     enabled: true,
-                    settings: crate::liquify::defaults(),
+                    settings: crate::liquify::defaults().into(),
                 });
                 l.effects.len() - 1
             };
@@ -2278,7 +2379,7 @@ impl Engine {
                 .ok_or("Invalid liquify stroke list")?
                 .push(stroke);
             crate::liquify::validate(&settings)?;
-            l.effects[at].settings = settings;
+            l.effects[at].settings = settings.into();
             return Ok(());
         }
         if op == "paint.fill" {

@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  EXPECTED_SITE_COMMIT: ${{ inputs.expected_site_commit }}
+
 concurrency:
   group: github-pages
   cancel-in-progress: false
@@ -19,22 +22,49 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - name: Require exact website invocation
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re
+          source = os.environ.get('GITHUB_SHA', '')
+          site = os.environ.get('EXPECTED_SITE_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_WORKFLOW_SHA': source,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/pages.yml@refs/heads/main',
+          }
+          if (not re.fullmatch('[0-9a-f]{40}', source)
+                  or not re.fullmatch('[0-9a-f]{40}', site)
+                  or any(os.environ.get(key) != value for key, value in required.items())):
+              raise SystemExit('Website deployment requires its exact official main workflow and reviewed site commit.')
+          PY
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: site-content
+          ref: ${{ inputs.expected_site_commit }}
           persist-credentials: false
       - name: Check reviewed public output
         shell: bash
-        env:
-          EXPECTED_SITE_COMMIT: ${{ inputs.expected_site_commit }}
         run: |
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SITE_COMMIT"
-          test -f public-site/index.html
-          test -f public-site/downloads.json
+          python -I - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          expected = os.environ['EXPECTED_SITE_COMMIT']
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if head != expected:
+              raise SystemExit('Website checkout differs from the reviewed commit.')
+          subprocess.run(['git', 'fetch', '--no-tags', '--depth=1', 'origin', 'refs/heads/site-content'], check=True)
+          tip = subprocess.check_output(['git', 'rev-parse', 'FETCH_HEAD'], text=True).strip()
+          if (tip != expected or not Path('public-site/index.html').is_file()
+                  or not Path('public-site/downloads.json').is_file()):
+              raise SystemExit('Reviewed website must match the current public output branch and required files.')
+          PY
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - name: Upload reviewed website output
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: public-site
 
@@ -48,6 +78,25 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Require exact website invocation
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re
+          source = os.environ.get('GITHUB_SHA', '')
+          site = os.environ.get('EXPECTED_SITE_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_WORKFLOW_SHA': source,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/pages.yml@refs/heads/main',
+          }
+          if (not re.fullmatch('[0-9a-f]{40}', source)
+                  or not re.fullmatch('[0-9a-f]{40}', site)
+                  or any(os.environ.get(key) != value for key, value in required.items())):
+              raise SystemExit('Website deployment requires its exact official main workflow and reviewed site commit.')
+          PY
       - name: Deploy website
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

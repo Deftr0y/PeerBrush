@@ -1,14 +1,18 @@
 """Packaging regressions using isolated, synthetic committed repositories."""
 import contextlib
+import gzip
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import re
+import shlex
 import plistlib
 import struct
 import subprocess
 import tempfile
+import tarfile
 import unittest
 from unittest import mock
 import zipfile
@@ -16,14 +20,138 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import verify_release
-from build_release import release_environment
+from build_release import release_environment, source_input_state
 
 spec = importlib.util.spec_from_file_location('packaging', pathlib.Path(__file__).with_name('package.py'))
 packaging = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packaging)
 
 
+def native_flags_failure_category(stdout, stderr):
+    message = b'\n'.join(stream[-65536:] for stream in [stdout, stderr] if isinstance(stream, bytes))
+    if b'--locked' in message and (b'cannot update the lock file' in message
+            or (b'needs to be updated' in message and (b'lock file' in message or b'lockfile' in message))):
+        return 'LOCKFILE_UPDATE_REQUIRED'
+    if b'--offline' in message and (b'no matching package named' in message
+            or b'attempting to make an HTTP request' in message):
+        return 'OFFLINE_DEPENDENCY_MISSING'
+    if re.search(rb'error\[E[0-9]{4}\]:', message):
+        return 'RUST_COMPILE_ERROR'
+    if b'native preprocessing could not start' in message:
+        return 'PREPROCESS_START_FAILED'
+    if b'native preprocessing failed' in message:
+        return 'PREPROCESS_FAILED'
+    if b'CMake Error' in message or b'ninja: build stopped:' in message:
+        return 'CMAKE_OR_NINJA_FAILED'
+    if b'failed to run custom build command' in message:
+        return 'CUSTOM_BUILD_COMMAND_FAILED'
+    return 'UNKNOWN'
+
+
 class Packages(unittest.TestCase):
+    def test_native_flags_failure_categories_are_bounded_and_never_forward_private_output(self):
+        sentinel = b'SYNTHETIC_PRIVATE_COMPILER_CANARY'
+        cases = [
+            ('lock', b'error: the lock file ' + sentinel + b' needs to be updated but --locked was passed', 'LOCKFILE_UPDATE_REQUIRED'),
+            ('lock-alternative', b'error: cannot update the lock file ' + sentinel + b' because --locked was passed', 'LOCKFILE_UPDATE_REQUIRED'),
+            ('offline', b'error: no matching package named ' + sentinel + b' found; --offline was specified', 'OFFLINE_DEPENDENCY_MISSING'),
+            ('offline-http', b'attempting to make an HTTP request, but --offline was specified', 'OFFLINE_DEPENDENCY_MISSING'),
+            ('rust', sentinel + b' error[E0433]: compile error', 'RUST_COMPILE_ERROR'),
+            ('preprocess-start', sentinel + b' native preprocessing could not start', 'PREPROCESS_START_FAILED'),
+            ('preprocess', sentinel + b' native preprocessing failed', 'PREPROCESS_FAILED'),
+            ('cmake', sentinel + b' CMake Error: failure', 'CMAKE_OR_NINJA_FAILED'),
+            ('ninja', sentinel + b' ninja: build stopped: subcommand failed.', 'CMAKE_OR_NINJA_FAILED'),
+            ('build', sentinel + b' failed to run custom build command', 'CUSTOM_BUILD_COMMAND_FAILED'),
+            ('unknown', sentinel, 'UNKNOWN'),
+            ('lock-without-locked', b'lock file needs to be updated', 'UNKNOWN'),
+            ('bad-code', b'error[E12345]: ' + sentinel, 'UNKNOWN'),
+            ('signal-no-inference', b'killed ' + sentinel, 'UNKNOWN'),
+        ]
+        for label, message, expected in cases:
+            with self.subTest(category=label):
+                result = native_flags_failure_category(message, None)
+                self.assertEqual(result, expected)
+                self.assertNotIn(sentinel.decode(), result)
+                self.assertEqual(native_flags_failure_category(None, message), expected)
+        self.assertEqual(native_flags_failure_category('not bytes', None), 'UNKNOWN')
+        self.assertEqual(native_flags_failure_category(b'CMake Error' + b'x' * 65536, b''), 'UNKNOWN')
+        self.assertEqual(native_flags_failure_category(b'x' * 65536 + b'CMake Error', b''), 'CMAKE_OR_NINJA_FAILED')
+
+    @unittest.skipUnless(all(os.environ.get(name) for name in ['CC', 'CXX', 'CMAKE', 'CMAKE_MAKE_PROGRAM']),
+                         'Requires qualified native compiler, CMake and Ninja')
+    def test_release_flags_reach_actual_cc_and_cmake_consumers_without_literal_quotes(self):
+        from build_release import release_environment
+        from jxl_build import configure
+        repository = pathlib.Path(__file__).resolve().parents[1]
+        fixture = repository / 'tests/fixtures/native-build-flags/Cargo.toml'
+        environment, _ = configure()
+        version = subprocess.run(['rustc', '-vV'], env=environment, check=True, capture_output=True, text=True, timeout=20)
+        self.assertTrue('release: 1.92.0' in version.stdout, 'native-flags-rust-version')
+        target = next(row.removeprefix('host: ') for row in version.stdout.splitlines() if row.startswith('host: '))
+        with tempfile.TemporaryDirectory(prefix='peerbrush-native-flags-') as temporary:
+            area = pathlib.Path(temporary).resolve()
+            for shell_mode in [False, True]:
+                with self.subTest(shell_mode=shell_mode):
+                    root = area / (('shell' if shell_mode else 'legacy') + ' source ' + chr(0xE9))
+                    root.mkdir()
+                    source = 'const char *pb_native_path(void) { return __FILE__; }\n'
+                    (root / 'native.c').write_text(source.replace('pb_native_path', 'pb_native_c_path'), encoding='utf-8')
+                    (root / 'native.cpp').write_text('extern "C" ' + source.replace('pb_native_path', 'pb_native_cpp_path'), encoding='utf-8')
+                    (root / 'CMakeLists.txt').write_text('cmake_minimum_required(VERSION 3.15)\nproject(flags_probe C CXX)\nadd_library(flags_probe STATIC native.c native.cpp)\n', encoding='utf-8')
+                    (root / 'launcher.py').write_text((repository / 'tests/fixtures/native-build-flags/launcher.py').read_text(encoding='utf-8'), encoding='utf-8')
+                    expected = ['-DPB_BACKSLASH="C:\\\\synthetic\\\\end\\\\"', '-DPB_UNICODE=' + chr(0xE9)]
+                    if shell_mode:
+                        include = root / 'include'
+                        include.mkdir()
+                        expected += ['-DPB_SPACES="two words"', '-DPB_QUOTES="one\\\\\\"two"', '-DPB_APOSTROPHE="one\'two"', '-I' + str(include) + '\\']
+                    raw = shlex.join(expected) if shell_mode else ' '.join(expected)
+                    if shell_mode:
+                        literal = '-DPB_ESCAPES="$cash`tick"'
+                        token = '"' + literal.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`') + '"'
+                        raw += ' -DPB_HASH=foo#bar ' + token + ' # ignored malformed quote \"'
+                        expected += ['-DPB_HASH=foo#bar', literal]
+                    inherited = dict(environment)
+                    inherited.update(CFLAGS=raw, CXXFLAGS=raw,
+                                     CC_SHELL_ESCAPED_FLAGS='true' if shell_mode else '0')
+                    child = release_environment(root, inherited)
+                    child.update(PB_FLAGS_ROOT=str(root), PB_FLAGS_TARGET=target, PB_FLAGS_PYTHON=sys.executable, NUM_JOBS='1')
+                    try:
+                        result = subprocess.run(['cargo', 'run', '--offline', '--locked', '--quiet',
+                                                 '--manifest-path', str(fixture), '--target-dir', str(area / 'cargo-output')],
+                                                cwd=repository, env=child, capture_output=True, timeout=180)
+                    except subprocess.TimeoutExpired:
+                        raise AssertionError('native-flags-consumer-timeout') from None
+                    category = native_flags_failure_category(result.stdout, result.stderr) if result.returncode else 'NONE'
+                    self.assertTrue(result.returncode == 0, 'native-flags-consumer-exit-' + str(result.returncode) + '-category-' + category)
+                    for language in ['c', 'cpp']:
+                        data = (root / ('cc-' + language + '.args')).read_bytes()
+                        actual = []
+                        while data:
+                            self.assertTrue(len(data) >= 4, 'native-flags-frame-header')
+                            size = int.from_bytes(data[:4], 'big')
+                            self.assertTrue(size <= len(data) - 4, 'native-flags-frame-body')
+                            actual.append(data[4:4 + size].decode('utf-8'))
+                            data = data[4 + size:]
+                        cmake_arguments = json.loads((root / ('cmake-' + language + '.args.json')).read_text(encoding='utf-8'))
+                        for index, argument in enumerate(expected):
+                            self.assertTrue(argument in actual, 'native-flags-cc-argv-' + language + '-' + str(index))
+                            self.assertTrue(argument in cmake_arguments, 'native-flags-cmake-argv-' + language + '-' + str(index))
+                        remaps = [argument for argument in actual if '-ffile-prefix-map=' in argument]
+                        self.assertTrue(bool(remaps), 'native-flags-missing-remap')
+                        self.assertTrue(all(argument in cmake_arguments for argument in remaps), 'native-flags-cmake-remap')
+                        preprocessed = (root / ('preprocessed-' + language + '.txt')).read_text(encoding='utf-8')
+                        returned = re.search(r'return\s+("(?:[^"\\]|\\.)*")\s*;', preprocessed)
+                        self.assertIsNotNone(returned, 'native-flags-missing-file-literal')
+                        self.assertTrue(json.loads(returned.group(1)).replace('\\', '/') == 'peerbrush/native.' + language, 'native-flags-file-prefix')
+                        objects = [path for path in (root / 'cmake-output').rglob('native.' + language + '.*')
+                                   if path.suffix in ['.o', '.obj']]
+                        self.assertTrue(len(objects) == 1, 'native-flags-cmake-object-count')
+                        object_bytes = objects[0].read_bytes()
+                        self.assertTrue(any(('peerbrush' + separator + 'native.' + language).encode() + b'\0' in object_bytes
+                                            for separator in ['/', '\\']), 'native-flags-cmake-file-prefix')
+                        self.assertTrue(not any(argument.startswith('"' + ('/clang:' if os.name == 'nt' else '') + '-ffile-prefix-map=') for argument in actual),
+                                        'native-flags-literal-quotes')
+
     def test_release_flags_remap_paths_and_preserve_encoded_options(self):
         environment = release_environment(pathlib.Path('synthetic checkout'), {'CARGO_ENCODED_RUSTFLAGS': '-C\x1ftarget-feature=+sse2'})
         flags = environment['CARGO_ENCODED_RUSTFLAGS'].split('\x1f')
@@ -37,13 +165,14 @@ class Packages(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='peerbrush-package-test-')
         self.addCleanup(self.temporary.cleanup)
-        self.root = pathlib.Path(self.temporary.name)
+        self.root = pathlib.Path(self.temporary.name).resolve()
         for name in ['vendor', 'docs', 'assets/fonts', 'src', 'scripts']:
             (self.root / name).mkdir(parents=True, exist_ok=True)
         for name, content in {'Cargo.toml': '[package]\nname="peerbrush"\nversion="0.2.0"\n', 'Cargo.lock': 'version=4\n[[package]]\nname="peerbrush"\nversion="0.2.0"\n', 'LICENSE': 'GNU GENERAL PUBLIC LICENSE\nGPL-3.0-only\n', 'README.md': 'Synthetic package fixture\n', 'FOLLOWUPS.MD': 'Synthetic backlog\n', 'assets/fonts/LICENCE.txt': 'Synthetic font license\n', 'assets/peerbrush-logo.png': 'Synthetic artwork\n', 'src/lib.rs': '// synthetic\n', 'scripts/start-windows.cmd': '@echo off\n', 'docs/usage.md': 'Synthetic instructions\n'}.items():
             (self.root / name).write_text(content, encoding='utf-8')
         (self.root / 'scripts/package-readme.md').write_text('Synthetic focused package README: {{SOURCE_ARCHIVE}}\n', encoding='utf-8')
-        (self.root / '.gitignore').write_text('/output/\n/verified/\n/rejected/\n/registry/\n/synthetic-binary\n', encoding='utf-8')
+        (self.root / 'assets/peerbrush.icns').write_bytes((pathlib.Path(__file__).resolve().parents[1] / 'assets/peerbrush.icns').read_bytes())
+        (self.root / '.gitignore').write_text('/output/\n/verified/\n/rejected/\n/registry/\n/cache/\n/synthetic-binary\n', encoding='utf-8')
         (self.root / 'integrations').mkdir()
         (self.root / 'integrations/segmentation_rembg.py').write_text('# Synthetic provider\n', encoding='utf-8')
         self.policy = {
@@ -81,10 +210,188 @@ class Packages(unittest.TestCase):
             header[18:20] = struct.pack('<H', 62)
         else:
             header[:8] = b'\xcf\xfa\xed\xfe' + struct.pack('<I', 0x100000c)
+        if self.policy['version'] == 2:
+            header.extend(json.dumps(self.build_info(), separators=(',', ':')).encode())
         binary = self.root / 'synthetic-binary'
         binary.write_bytes(header)
         with contextlib.redirect_stdout(io.StringIO()):
             return packaging.package(self.root, binary, self.output, self.root / 'registry', platform, verify_binary=False, rust_docs=self.rust_docs)
+
+    def build_info(self, commit=None):
+        return {'format': 'PeerBrushBuildInfoV1', 'schema': 1, 'product': 'PeerBrush',
+                'version': '0.2.0', 'commit': commit or packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip(),
+                'tree': 'clean', 'end': 'PeerBrushBuildInfoEnd'}
+
+    def require_provenance(self):
+        for name in ['build.rs', 'src/build_info.rs']:
+            (self.root / name).write_text('// synthetic build metadata source\n')
+            self.policy['source'].append(name)
+        self.policy['version'] = 2
+        self.save_policy()
+        self.commit()
+
+    def require_installed_macos_source(self):
+        self.require_provenance()
+        name = 'src/sparkle/macos/installed.rs'
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('const INSTALLED_RELEASE_LAYOUT: u32 = 1;\n', encoding='utf-8')
+        self.policy['source'].append(name)
+        self.save_policy()
+        self.commit()
+
+    def test_installed_macos_identity_and_source_survive_app_only_install_and_reject_mutations(self):
+        self.require_installed_macos_source()
+        archive = self.build('macOS')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        checked = verify_release.inspect_archive(archive, commit, '0.2.0', self.root)
+        with zipfile.ZipFile(archive) as bundle:
+            original = [(i.filename, bundle.read(i), i.external_attr >> 16 & 0o777) for i in bundle.infolist()]
+            root = archive.stem + '/'
+            resources = root + packaging.MACOS_RESOURCES
+            metadata_name = resources + packaging.MACOS_INSTALLED_RELEASE
+            source_name = resources + checked['manifest']['source']
+            identity = json.loads(bundle.read(metadata_name))
+            self.assertEqual(identity, packaging.macos_installed_release(checked['manifest']))
+            self.assertEqual(bundle.read(source_name), checked['source'])
+            self.assertEqual(identity['build_info'], self.build_info())
+            self.assertNotIn('executable_sha256', identity)
+            self.assertNotIn('macos_signing', identity)
+            # These two files are inside the .app copied to Applications, not
+            # dependent on the outer ZIP/DMG Support directory being retained.
+            self.assertTrue(all(name.startswith(root + 'PeerBrush.app/') for name in [metadata_name, source_name]))
+        for damage in ['source', 'version', 'commit', 'schema', 'extra', 'missing']:
+            with self.subTest(damage=damage):
+                changed = dict(identity)
+                if damage == 'version':
+                    changed['version'] = '0.2.1'
+                elif damage == 'commit':
+                    changed['commit'] = '0' * 40
+                elif damage == 'schema':
+                    changed['schema'] = True
+                elif damage == 'extra':
+                    changed['health'] = True
+                files = [(name, data + b'changed' if damage == 'source' and name == source_name
+                          else json.dumps(changed, indent=2).encode() + b'\n' if name == metadata_name
+                          else data, mode) for name, data, mode in original
+                         if not (damage == 'missing' and name == source_name)]
+                packaging.write_zip(archive, files, 1700000000)
+                with self.assertRaisesRegex(ValueError, 'Installed macOS|missing release entries'):
+                    verify_release.inspect_archive(archive, commit, '0.2.0', self.root)
+        # Historical archives without the source-derived marker retain their
+        # existing outer manifest/source layout (covered by the original suite).
+
+    def test_embedded_provenance_rejects_missing_duplicate_dirty_unknown_and_malformed_labels(self):
+        info = self.build_info()
+        encoded = json.dumps(info, separators=(',', ':')).encode()
+        self.assertEqual(packaging.binary_build_info(b'native-header' + encoded, '0.2.0', info['commit']), info)
+        invalid = [b'no build label', encoded + encoded, encoded.replace(b'"tree":"clean"', b'"tree":"dirty"'),
+                   encoded.replace(info['commit'].encode(), b'unknown'), encoded.replace(b'"schema":1', b'"schema":true'),
+                   encoded.replace(b'"version":"0.2.0"', b'"version":"0.1.0"'), encoded[:-1],
+                   encoded.replace(b'"tree":"clean"', b'"tree":"' + b'x' * 513 + b'"')]
+        for record in invalid:
+            with self.subTest(record=record[:64]), self.assertRaisesRegex(ValueError, 'build provenance'):
+                packaging.binary_build_info(record, '0.2.0', info['commit'])
+
+    def test_new_policy_cannot_be_downgraded_or_skip_embedded_binary_checks(self):
+        self.require_provenance()
+        self.build('Windows')
+        binary = self.root / 'synthetic-binary'
+        binary.write_bytes(binary.read_bytes()[:128])
+        with self.assertRaisesRegex(ValueError, 'embedded build provenance'):
+            packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs)
+        self.policy['version'] = 1
+        self.save_policy()
+        self.commit()
+        with self.assertRaisesRegex(ValueError, 'requires package policy version 2'):
+            packaging.source_files(self.root)
+
+    def test_new_policy_embedded_records_are_inspected_without_execution_on_each_platform(self):
+        self.require_provenance()
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        for platform in ['Windows', 'Linux', 'macOS']:
+            archive = self.build(platform)
+            checked = verify_release.inspect_archive(archive, commit, '0.2.0', self.root)
+            self.assertEqual(checked['manifest']['build_info'], self.build_info())
+
+    def test_new_policy_detects_relabelled_same_version_binary_and_allows_explicit_matching_correction(self):
+        self.require_provenance()
+        original = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        self.build('Windows')
+        binary = self.root / 'synthetic-binary'
+        (self.root / 'docs/usage.md').write_text('Updated guide, unchanged application')
+        self.commit()
+        with self.assertRaisesRegex(ValueError, 'clean expected version/commit'):
+            packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            archive = packaging.package(self.root, binary, self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs, binary_source_commit=original)
+        current = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        checked = verify_release.inspect_archive(archive, current, '0.2.0', self.root)
+        self.assertEqual(checked['manifest']['build_info']['commit'], original)
+        self.assertEqual(checked['record']['binary_source_commit'], original)
+
+    def test_inspector_rejects_forged_provenance_even_with_updated_executable_checksum(self):
+        self.require_provenance()
+        archive = self.build('Windows')
+        with zipfile.ZipFile(archive) as package:
+            files = [(i.filename, package.read(i.filename), i.external_attr >> 16 & 0o777) for i in package.infolist()]
+        binary_name = archive.stem + '/peerbrush.exe'
+        manifest_name = archive.stem + '/release.json'
+        forged = next(data for name, data, _ in files if name == binary_name).replace(b'"tree":"clean"', b'"tree":"dirty"')
+        manifest = json.loads(next(data for name, data, _ in files if name == manifest_name))
+        manifest['executable_sha256'] = verify_release.sha(forged)
+        packaging.write_zip(archive, [(name, forged if name == binary_name else json.dumps(manifest).encode() if name == manifest_name else data, mode) for name, data, mode in files], 1700000000)
+        with self.assertRaisesRegex(ValueError, 'build provenance'):
+            verify_release.inspect_archive(archive, manifest['commit'], '0.2.0', self.root)
+        manifest['executable_sha256'] = verify_release.sha(next(data for name, data, _ in files if name == binary_name))
+        manifest['build_info']['commit'] = '0' * 40
+        packaging.write_zip(archive, [(name, json.dumps(manifest).encode() if name == manifest_name else data, mode) for name, data, mode in files], 1700000000)
+        with self.assertRaisesRegex(ValueError, 'manifest differs from actual embedded'):
+            verify_release.inspect_archive(archive, manifest['commit'], '0.2.0', self.root)
+
+    def test_executed_build_info_must_match_the_actual_embedded_record(self):
+        self.require_provenance()
+        self.build('Windows')
+        real_check_output = packaging.subprocess.check_output
+        def executable_output(command, *args, **kwargs):
+            if command[-1] == '--version':
+                return 'PeerBrush 0.2.0\n'
+            if command[-1] == '--build-info':
+                return json.dumps(self.build_info('0' * 40), separators=(',', ':'))
+            return real_check_output(command, *args, **kwargs)
+        with mock.patch.object(packaging.subprocess, 'check_output', side_effect=executable_output), self.assertRaisesRegex(ValueError, '--build-info differs'):
+            packaging.package(self.root, self.root / 'synthetic-binary', self.output, self.root / 'registry', 'Windows', rust_docs=self.rust_docs)
+
+    def test_release_builder_invalidation_ignores_caller_fingerprint_and_detects_new_root_inputs(self):
+        original = source_input_state(self.root)
+        environment = release_environment(self.root, {'PEERBRUSH_BUILD_INPUT_STATE': 'caller-supplied-source-claim'})
+        self.assertEqual(environment['PEERBRUSH_BUILD_INPUT_STATE'], original)
+        self.assertRegex(original, r'^[0-9a-f]{64}$')
+        (self.root / 'new-root-input').write_text('new visible input')
+        self.assertNotEqual(source_input_state(self.root), original)
+        nested = self.root / 'extracted-source'
+        nested.mkdir()
+        self.assertEqual(source_input_state(nested), 'unknown')
+
+    def test_git_provenance_calls_ignore_inherited_repository_and_config_overrides(self):
+        actual = packaging.git(self.root, 'rev-parse', 'HEAD')
+        with mock.patch.dict(os.environ, {'GIT_DIR': str(self.root / 'nonexistent'), 'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'true'}):
+            self.assertEqual(packaging.git(self.root, 'rev-parse', 'HEAD'), actual)
+            self.assertRegex(source_input_state(self.root), r'^[0-9a-f]{64}$')
+
+    def test_policy_two_rejects_index_flags_hiding_changed_worktree_bytes(self):
+        self.require_provenance()
+        self.build('Windows')
+        path = self.root / 'src/lib.rs'
+        original = path.read_bytes()
+        for flag, clear in [('--assume-unchanged', '--no-assume-unchanged'), ('--skip-worktree', '--no-skip-worktree')]:
+            packaging.git(self.root, 'update-index', flag, 'src/lib.rs')
+            path.write_text('hidden different application bytes')
+            self.assertFalse(packaging.git(self.root, 'status', '--porcelain', '--untracked-files=no'))
+            with self.assertRaisesRegex(ValueError, 'Hidden index inputs'):
+                packaging.package(self.root, self.root / 'synthetic-binary', self.output, self.root / 'registry', 'Windows', verify_binary=False, rust_docs=self.rust_docs)
+            packaging.git(self.root, 'update-index', clear, 'src/lib.rs')
+            path.write_bytes(original)
 
     def test_platform_architecture_source_license_and_macos_bundle_match(self):
         sources = []
@@ -110,8 +417,121 @@ class Packages(unittest.TestCase):
                     info = plistlib.loads(package.read(root + 'PeerBrush.app/Contents/Info.plist'))
                     self.assertEqual(info['CFBundleShortVersionString'], '0.2.0')
                     self.assertEqual(info['CFBundleExecutable'], 'peerbrush')
+                    self.assertEqual(info['CFBundleIconFile'], 'PeerBrush.icns')
+                    self.assertEqual({kind['LSHandlerRank'] for kind in info['CFBundleDocumentTypes']}, {'Alternate'})
+                    self.assertEqual({kind['CFBundleTypeRole'] for kind in info['CFBundleDocumentTypes']}, {'Editor'})
+                    resource = root + packaging.MACOS_RESOURCES
+                    self.assertEqual(package.read(resource + 'PeerBrush.icns'), (self.root / 'assets/peerbrush.icns').read_bytes())
+                    for name in ['LICENSE', 'THIRD_PARTY_NOTICES.md', *manifest['notice_files']]:
+                        self.assertEqual(package.read(resource + name), package.read(root + name))
         self.assertEqual(sources[0], sources[1])
         self.assertEqual(sources[0], sources[2])
+
+    def test_macos_installed_resources_and_consent_cannot_be_changed_or_removed(self):
+        path = self.build('macOS')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+        for target, expected in [('PeerBrush.icns', 'committed artwork'),
+                                 ('LICENSE', 'installed license/notices'),
+                                 ('THIRD_PARTY_NOTICES.md', 'installed license/notices'),
+                                 ('licenses/ubuntu-sans/LICENCE.txt', 'installed license/notices')]:
+            name = prefix + packaging.MACOS_RESOURCES + target
+            changed = [(n, data + b'tampered' if n == name else data, mode) for n, data, mode in original]
+            packaging.write_zip(path, changed, 1700000000)
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, expected):
+                verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+        changed = []
+        for name, data, mode in original:
+            if name == prefix + 'PeerBrush.app/Contents/Info.plist':
+                info = plistlib.loads(data)
+                info['CFBundleDocumentTypes'][0]['LSHandlerRank'] = 'Default'
+                data = plistlib.dumps(info)
+            changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        with self.assertRaisesRegex(ValueError, 'document consent'):
+            verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+        changed = []
+        for name, data, mode in original:
+            if name == prefix + 'release.json':
+                manifest = json.loads(data)
+                del manifest['macos_bundle_resources']
+                data = json.dumps(manifest).encode()
+            if not name.startswith(prefix + packaging.MACOS_RESOURCES):
+                changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        with self.assertRaisesRegex(ValueError, 'Missing required installed macOS resources'):
+            verify_release.inspect_archive(path, commit, '0.2.0', self.root)
+
+    def test_macos_internal_development_mapping_retains_exact_cargo_version(self):
+        for name in ['Cargo.toml', 'Cargo.lock']:
+            path = self.root / name
+            path.write_text(path.read_text().replace('0.2.0', '0.30.0-dev.1'))
+        self.commit()
+        path = self.build('macOS')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+            info = plistlib.loads(archive.read(prefix + 'PeerBrush.app/Contents/Info.plist'))
+            self.assertEqual(info['CFBundleShortVersionString'], '0.30.0')
+            self.assertEqual(info['CFBundleVersion'], '0.30.0')
+            self.assertEqual(info['PeerBrushDevelopmentVersion'], '0.30.0-dev.1')
+            self.assertEqual(json.loads(archive.read(prefix + 'release.json'))['version'], '0.30.0-dev.1')
+        verify_release.inspect_archive(path, commit, '0.30.0-dev.1', self.root)
+        for key, changed in [('PeerBrushDevelopmentVersion', None), ('PeerBrushDevelopmentVersion', '0.30.0-dev.2'),
+                             ('CFBundleVersion', '0.30.0-dev.1'), ('CFBundleShortVersionString', '0.30.1')]:
+            altered = dict(info)
+            if changed is None:
+                del altered[key]
+            else:
+                altered[key] = changed
+            files = [(name, plistlib.dumps(altered) if name.endswith('/Info.plist') else data, mode)
+                     for name, data, mode in original]
+            packaging.write_zip(path, files, 1700000000)
+            with self.subTest(key=key, changed=changed), self.assertRaises(ValueError):
+                verify_release.inspect_archive(path, commit, '0.30.0-dev.1', self.root)
+        self.assertNotIn('PeerBrushDevelopmentVersion', packaging.macos_info('0.30.0'))
+        for version in ['0.30.0-beta.1', '0.30.0-dev.01', '0.30.0+build', '00.30.0-dev.1']:
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                packaging.macos_info(version)
+
+    def test_historical_macos_layout_remains_valid_for_its_matching_source(self):
+        path = self.build('macOS')
+        prefix = path.stem + '/'
+        with zipfile.ZipFile(path) as archive:
+            original = [(item.filename, archive.read(item.filename), item.external_attr >> 16 & 0o777)
+                        for item in archive.infolist()]
+        # An earlier source revision had neither ICNS nor installed Resources.
+        (self.root / 'assets/peerbrush.icns').unlink()
+        self.policy['source'].remove('assets/peerbrush.icns')
+        self.save_policy()
+        self.commit()
+        self.build('Windows')
+        source = (self.output / 'PeerBrush-0.2.0-source.zip').read_bytes()
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        changed = []
+        for name, data, mode in original:
+            if name.startswith(prefix + packaging.MACOS_RESOURCES):
+                continue
+            if name == prefix + 'release.json':
+                manifest = json.loads(data)
+                del manifest['macos_bundle_resources']
+                manifest.update(commit=commit, binary_source_commit=commit, source_sha256=verify_release.sha(source))
+                data = json.dumps(manifest).encode()
+            elif name == prefix + 'PeerBrush-0.2.0-source.zip':
+                data = source
+            elif name == prefix + 'PeerBrush.app/Contents/Info.plist':
+                info = plistlib.loads(data)
+                for key in ['CFBundleIconFile', 'CFBundleDocumentTypes', 'UTImportedTypeDeclarations']:
+                    del info[key]
+                data = plistlib.dumps(info)
+            changed.append((name, data, mode))
+        packaging.write_zip(path, changed, 1700000000)
+        verify_release.inspect_archive(path, commit, '0.2.0', self.root)
 
     def test_untracked_private_files_and_stale_output_never_enter_packages(self):
         (self.root / 'docs' / 'connection.json').write_text('private fixture, must be excluded')
@@ -415,6 +835,157 @@ class Packages(unittest.TestCase):
             self.assertTrue({'licenses/epaint_default_fonts-0.31.1/' + name for name in names} <= set(manifest['notice_files']))
             self.assertFalse(any(name.endswith('/private.txt') for name in archive.namelist()))
 
+    def test_tls_notices_include_ring_subcomponents_and_require_exact_checksums(self):
+        (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\nname="ring"\nversion="0.17.14"\nsource="registry+https://example.invalid"\n[[package]]\nname="rustls"\nversion="0.23.46"\nsource="registry+https://example.invalid"\n')
+        self.commit()
+        ring = self.root / 'registry/test/ring-0.17.14'
+        ring.mkdir(parents=True)
+        (ring / 'Cargo.toml').write_text('[package]\nname="ring"\nversion="0.17.14"\nlicense="Apache-2.0 AND ISC"\n')
+        (ring / 'LICENSE').write_text('Synthetic license index')
+        names = packaging.EXTRA_CRATE_NOTICES['ring']
+        for name in names:
+            path = ring / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('Synthetic component notice: ' + name)
+        (ring / 'LICENSE-private').write_text('SYNTHETIC_PRIVATE_CANARY')
+        checksums = {name: packaging.digest(ring / name) for name in names}
+        (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
+        rustls = self.root / 'registry/test/rustls-0.23.46'
+        rustls.mkdir(parents=True)
+        (rustls / 'Cargo.toml').write_text('[package]\nname="rustls"\nversion="0.23.46"\nlicense="Apache-2.0 OR ISC OR MIT"\n')
+        (rustls / 'LICENSE-ISC').write_text('Synthetic ISC alternative')
+        archive_path = self.build('Windows')
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = json.loads(archive.read(archive_path.stem + '/release.json'))
+            self.assertTrue({'licenses/ring-0.17.14/' + name for name in names} <= set(manifest['notice_files']))
+            self.assertIn('licenses/rustls-0.23.46/LICENSE-ISC', manifest['notice_files'])
+            self.assertFalse(any('LICENSE-private' in name for name in archive.namelist()))
+        notice = ring / 'LICENSE-other-bits'
+        original = notice.read_bytes()
+        notice.write_text('Tampered component notice')
+        with self.assertRaisesRegex(ValueError, 'notice checksum mismatch'):
+            self.build('Windows')
+        notice.write_bytes(original)
+        del checksums['LICENSE-other-bits']
+        (ring / '.cargo-checksum.json').write_text(json.dumps({'files': checksums}))
+        with self.assertRaisesRegex(ValueError, 'required dependency notice inventory'):
+            self.build('Windows')
+
+    def cached_notice_fixture(self, name='ring'):
+        version = '0.17.14' if name == 'ring' else '0.31.1'
+        key = name + '-' + version
+        self.cached_package = dict(name=name, version=version, source='registry+https://example.invalid')
+        self.cached_crate = self.root / 'registry/test' / key
+        self.cached_metadata = f'[package]\nname="{name}"\nversion="{version}"\nlicense="MIT"\nlicense-file="legal/custom.txt"\n'.encode()
+        self.cached_files = {'Cargo.toml': self.cached_metadata, 'LICENSE': b'Synthetic root license',
+                             'legal/custom.txt': b'Synthetic declared license', 'fonts/NOTICE.txt': b'Synthetic font notice',
+                             'LICENSE-private': b'SYNTHETIC_PRIVATE_CANARY', 'fonts/connection.txt': b'SYNTHETIC_PRIVATE_CANARY'}
+        for path in packaging.EXTRA_CRATE_NOTICES.get(name, set()) | packaging.EMBEDDED_FONT_NOTICES.get(name, set()):
+            self.cached_files[path] = b'Synthetic required notice: ' + path.encode()
+        for path, data in self.cached_files.items():
+            target = self.cached_crate / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        self.cached_archive = self.root / 'cache/test' / (key + '.crate')
+        self.cached_archive.parent.mkdir(parents=True, exist_ok=True)
+        self.write_cached_notice_archive()
+        (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\n' + ''.join(f'{key}="{value}"\n' for key, value in self.cached_package.items()))
+        self.commit()
+
+    def write_cached_notice_archive(self, mutation=None, extra=()):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode='w') as archive:
+            for name, data in [*self.cached_files.items(), *extra]:
+                entry = tarfile.TarInfo(self.cached_crate.name + '/' + name)
+                entry.size = len(data)
+                if mutation:
+                    mutation(entry)
+                if not entry.isfile():
+                    entry.size = 0
+                archive.addfile(entry, io.BytesIO(data) if entry.isfile() else None)
+        self.cached_archive.write_bytes(gzip.compress(raw.getvalue()))
+        self.cached_package['checksum'] = packaging.digest(self.cached_archive)
+
+    def cached_notices(self, metadata=None):
+        return packaging.cached_crate_notices(self.root / 'registry', self.cached_crate, self.cached_package,
+                                             self.cached_metadata if metadata is None else metadata)
+
+    def test_registry_cache_fallback_preserves_root_declared_component_and_embedded_font_notices(self):
+        for name in ['ring', 'epaint_default_fonts']:
+            self.cached_notice_fixture(name)
+            archive_path = self.build('Windows')
+            expected = {'LICENSE', 'legal/custom.txt', 'fonts/NOTICE.txt'} | packaging.EXTRA_CRATE_NOTICES.get(name, set()) | packaging.EMBEDDED_FONT_NOTICES.get(name, set())
+            with zipfile.ZipFile(archive_path) as archive:
+                prefix = archive_path.stem + '/licenses/' + self.cached_crate.name + '/'
+                self.assertEqual({path.removeprefix(prefix) for path in archive.namelist() if path.startswith(prefix)}, expected)
+                for path in expected:
+                    self.assertEqual(archive.read(prefix + path), self.cached_files[path])
+                self.assertFalse(any('LICENSE-private' in path or 'connection.txt' in path for path in archive.namelist()))
+
+    def test_registry_cache_requires_locked_bytes_and_matching_extracted_metadata_and_notices(self):
+        self.cached_notice_fixture()
+        original = self.cached_archive.read_bytes()
+        self.cached_archive.write_bytes(original + b'changed')
+        with self.assertRaisesRegex(ValueError, 'Cargo.lock checksum'):
+            self.cached_notices()
+        self.cached_archive.write_bytes(original)
+        checksum = self.cached_package.pop('checksum')
+        with self.assertRaisesRegex(ValueError, 'locked dependency archive checksum'):
+            self.cached_notices()
+        self.cached_package['checksum'] = checksum
+        with self.assertRaisesRegex(ValueError, 'metadata differs'):
+            self.cached_notices(self.cached_metadata + b'# changed extracted metadata\n')
+        notice = self.cached_crate / 'LICENSE-other-bits'
+        notice.write_bytes(b'Tampered notice')
+        with self.assertRaisesRegex(ValueError, 'notice checksum mismatch'):
+            self.cached_notices()
+        notice.write_bytes(self.cached_files['LICENSE-other-bits'])
+        (self.cached_crate / 'LICENSE').unlink()
+        with self.assertRaises(ValueError):
+            self.cached_notices()
+
+    def test_registry_cache_rejects_unsafe_members_and_missing_required_notices(self):
+        self.cached_notice_fixture()
+        for field, value in [('name', '../escape'), ('name', 'other-crate/LICENSE'),
+                             ('type', tarfile.SYMTYPE), ('type', tarfile.LNKTYPE), ('type', tarfile.FIFOTYPE)]:
+            def mutate(entry):
+                if entry.name.endswith('/LICENSE'):
+                    setattr(entry, field, value)
+            with self.subTest(field=field, value=value):
+                self.write_cached_notice_archive(mutate)
+                with self.assertRaises(ValueError):
+                    self.cached_notices()
+        for name in ['LICENSE', 'license']:
+            self.write_cached_notice_archive(extra=[(name, b'Duplicate')])
+            with self.assertRaisesRegex(ValueError, 'duplicates'):
+                self.cached_notices()
+        del self.cached_files['LICENSE-other-bits']
+        self.write_cached_notice_archive()
+        with self.assertRaisesRegex(ValueError, 'required dependency notice inventory'):
+            self.cached_notices()
+
+    def test_registry_cache_hard_budgets_fail_closed_before_unbounded_reads(self):
+        self.cached_notice_fixture()
+        for constant, limit in [('MAX_CRATE_COMPRESSED_BYTES', 8), ('MAX_CRATE_DECODED_BYTES', 512),
+                                ('MAX_CRATE_MEMBERS', 1), ('MAX_CRATE_NOTICE_BYTES', 8), ('MAX_CRATE_NOTICES_BYTES', 1)]:
+            with self.subTest(limit=constant), mock.patch.object(packaging, constant, limit):
+                with self.assertRaises(ValueError):
+                    self.cached_notices()
+        self.cached_archive.write_bytes(b'Not a gzip archive')
+        self.cached_package['checksum'] = packaging.digest(self.cached_archive)
+        with self.assertRaisesRegex(ValueError, 'lock-verified dependency notice archive'):
+            self.cached_notices()
+
+    def test_present_invalid_notice_inventory_never_uses_registry_cache_fallback(self):
+        for name in ['ring', 'epaint_default_fonts']:
+            self.cached_notice_fixture(name)
+            for data in ['{"files":{}}', 'not JSON']:
+                (self.cached_crate / '.cargo-checksum.json').write_text(data)
+                with mock.patch.object(packaging, 'cached_crate_notices') as cached:
+                    with self.assertRaises(ValueError):
+                        self.build('Windows')
+                    cached.assert_not_called()
+
     def test_dated_repack_names_preserve_internal_layout_and_require_matching_labels(self):
         commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
         for platform in ['Windows', 'Linux', 'macOS']:
@@ -437,6 +1008,26 @@ class Packages(unittest.TestCase):
         for name in ['docs/tab\t.txt', 'docs/newline\n.txt']:
             with self.assertRaises(ValueError):
                 packaging.relative_path(name)
+
+
+    def test_toolchain_is_a_required_listed_root_compiler_input_and_source_equivalence_input(self):
+        toolchain = self.root / 'rust-toolchain.toml'
+        toolchain.write_bytes(b'[toolchain]\nchannel="1.92.0"\n')
+        self.commit()
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        with self.assertRaisesRegex(ValueError, 'Unlisted build configuration'):
+            packaging.source_files(self.root, commit)
+        self.policy['source'].append('rust-toolchain.toml')
+        self.save_policy()
+        self.commit()
+        original = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        sources = packaging.source_files(self.root, original)
+        self.assertEqual(next(data for name, data, _ in sources if name == 'rust-toolchain.toml'), toolchain.read_bytes())
+        toolchain.write_bytes(b'[toolchain]\nchannel="1.93.0"\n')
+        self.commit()
+        current = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        with self.assertRaisesRegex(ValueError, 'Executable source inputs differ'):
+            packaging.equivalent_build_inputs(self.root, packaging.source_files(self.root, current), original)
 
 
 if __name__ == '__main__':

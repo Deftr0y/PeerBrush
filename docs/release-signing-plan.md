@@ -2,7 +2,19 @@
 
 Prepare public source and release packages for Windows signing, macOS signing and notarization, and verified Linux distribution. Preserve GPL v3, complete corresponding source, bundled artwork and fonts, and the Ember palette. Follow [release maintenance](release-maintenance.md) for publication and privacy checks.
 
-Status: corrected v0.2 archives retain original executable bytes. Dated historical rebuilds for development-d70f64e, v0.1.2 and v0.1.4 are published with unchanged application inputs, new executable hashes, matching GPL source and verified website history links. Website source and operational records are maintained separately. The scoped historical audit and targeted artifact correction are complete; original Git history/tags and their automatic source archives are unchanged. Native signing enrollment and notarization remain pending. See [v0.2 correction facts](release-0.2.md) and [historical correction facts](release-packaging-corrections.md).
+Status: corrected v0.2 archives retain original executable bytes. Dated historical rebuilds for development-d70f64e, v0.1.2 and v0.1.4 are published with unchanged application inputs, new executable hashes, matching GPL source and verified website history links. Website source and operational records are maintained separately. The scoped historical audit and targeted artifact correction are complete; original Git history/tags and their automatic source archives are unchanged. Those historical signing deferrals are not the current Mac status: 0.26.0 Mac arm64 is Developer ID signed, notarized and stapled, distributed as a ZIP. Verified Mac/Linux downloads and the website are live; Windows Store 0.26 remains pending, with submission/certification unverified. See [v0.2 correction facts](release-0.2.md) and [historical correction facts](release-packaging-corrections.md).
+
+## High-priority installation and production foundations
+
+Proposed for v0.3 implementation, following the first measurable PB-108 fix: settings/migration, installed distributions and associations, safe updates, then production publishing/Store reconciliation. This explicitly extends the earlier release-unassigned planning scope; it does not establish release readiness. PB-145, PB-146 and PB-147 are expanded existing requests, not new parallel implementations. PB-155 adds persistent settings/migration acceptance; PB-154 owns the end-to-end publishing work. [The backlog](../FOLLOWUPS.MD#high-priority-foundations--installation-updates-and-production-publishing) is authoritative for item status and acceptance. Responsiveness PB-108 remains priority #1.
+
+1. **Installed distribution (PB-145/PB-146/PB-155):** make installed software the default. Provide both Microsoft Store distribution and a direct signed Windows installer, and complete their runtime/install/upgrade/uninstall checks; provide a signed/notarized macOS DMG with PeerBrush.app dragged to Applications. Decide the supported Linux installation format and its update owner before implementation. Register PSD/PSB Open with handlers and icons; the user's OS-supported consent chooses defaults, and upgrades must not reset them. Persist per-user settings outside the installation/package, migrate portable settings with validation/backup, and protect artwork and stable MCP launch paths.
+2. **Update experience (PB-147):** record Store/package-managed versus direct-distribution ownership and prevent competing updaters. Specify automatic-check preferences, manual check, release/version/channel information, notifications, progress and restart-later behavior. Unsaved projects and active writes block disruptive replacement/restart. Validate authenticated metadata, trusted signatures and final integrity; define offline/interrupted/error recovery, bounded retries and last-working-installation rollback where supported, including settings compatibility. Acceptance requires native success/failure and unsaved-work tests for each selected channel.
+3. **Trusted main-to-production pipeline (PB-154):** after a main push, require tests, exact source/version validation and protected signing/notarization approval before publishing. Keep one immutable source SHA per version, final installers, matching GPLv3 source/third-party notices and checksums computed after signing/stapling. Append website history and update latest/download links only from verified public assets; show per-platform availability and pending channels accurately. Model Windows Store submission, certification delay/rejection, publication and verified public availability as separate states, with reconciliation, idempotent bounded retries and clear status reporting. Keep the artifact/channel contract extensible to future stores without claiming those integrations exist.
+
+Completion is demonstrated by an installed-platform acceptance matrix and one exact-source release progressing from main to verified public downloads/website and independently reported Store state. A delayed/rejected Store channel must not be labelled available or cause a duplicate submission; another ready platform may be published with its status stated explicitly. Preserve branch policies, protected signing approval, GPLv3/source availability and existing version history. Credential values, private operations and approval changes do not belong in public planning documents or this work's implicit authority.
+
+Current boundary: CI and manual release/signing/Pages workflows exist; end-to-end main-push publication and active Store submission automation are not established. Store integration is prepared with submission explicitly disabled; no durable private host or storage backend is configured. The historical checklist below retains earlier completed work and unresolved platform gates; it is not evidence that automation or native acceptance is complete.
 
 ## 1 Make packaging include only approved content
 
@@ -50,7 +62,7 @@ Completion: a public checkout containing contributor-facing material, separate p
 
 ## 4 Prepare trusted release automation
 
-The existing `.github/workflows/ci.yml` tests, builds and inspects Actions artifacts on pushes and pull requests. The separate release-candidate workflow enforces an exact commit and can sign archives with Sigstore; native publisher signing is not configured. Keep ordinary CI separate from jobs that can sign or publish a release.
+The existing `.github/workflows/ci.yml` tests, builds and inspects Actions artifacts on pushes and pull requests. The separate release-candidate workflow enforces an exact commit and can sign archives with Sigstore; protected manual Apple signing/notarization is configured for a reviewed source pin. Store-submission tooling remains inactive and untested against Partner Center; automatic main-to-production publication remains planned in PB-154. Keep ordinary CI separate from jobs that can sign or publish a release.
 
 - [ ] Add a release workflow with an explicit version, source commit and architecture matrix. All platforms must use the same revision.
 - [ ] Restrict signing and publishing to trusted release refs and protected environments. Pull requests must not receive signing authority or publication credentials.
@@ -84,13 +96,13 @@ Completion: Windows packages have valid trusted signatures and timestamps; macOS
 
 Windows SmartScreen reputation is separate from signature validity, and new signed files can still warn. EV certificates do not guarantee an immediate bypass. macOS can still show a normal first-open confirmation. Sources: [Microsoft SmartScreen guidance](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation), [Apple notarization](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution).
 
-## 7 Prepare Linux distribution and an optional Windows Store channel
+## 7 Prepare Linux distribution and the Windows Store channel
 
 - [ ] Create a Flatpak manifest with a stable application ID, desktop entry, icons and pinned sources. Preserve notices and source availability.
 - [ ] Test PSD/PNG loading and saving, file dialogs, clipboard, GPU rendering, runtime storage, and AI/MCP connectivity under the sandbox. Request only permissions demonstrated to be needed.
 - [ ] Prepare a Flathub submission and ownership verification. Flathub signs its published builds; listing verification separately establishes the maintainer's control of the application ID.
 - [ ] Keep portable Linux downloads with final checksums and a documented verification method. Detached checksum signatures provide integrity evidence but do not replace operating-system package trust.
-- [ ] If avoiding Windows SmartScreen prompts from the first Store installation is a priority, prepare an MSIX and test its filesystem and AI integration behavior before Microsoft Store submission. Keep this optional channel separate from signed direct downloads.
+- [ ] Complete the required Microsoft Store channel with MSIX filesystem, local MCP and installation acceptance before submission. Keep its package/update ownership separate from the required signed direct installer. Both Windows channels remain subject to native verification and explicit activation approval.
 
 Completion: Flatpak passes native smoke tests and its submission is ready. Store publication and Flathub publication require their respective account access and submission steps.
 
@@ -122,3 +134,14 @@ Completion: every in-scope public destination has been read back and matches the
 - [Removing sensitive data from Git history](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
 
 The checklist records public implementation requirements. Actual credentials, audit findings, account identities, private storage locations and release receipts belong outside this repository.
+
+## Pending final-artifact composition checkpoint (unreleased)
+
+The prepared [final composition and immutable transaction](production-publishing.md) binds the actual existing portable/source, DEB, final signed-DMG/native-origin and Windows MSIX/framework/App Installer consumers. It does not authenticate a Windows signing producer, executable signing, runtime redistribution approval or complete installed acceptance from JSON. All installed channels remain unverified and production readiness remains false. The protected preparation workflow requests read permissions only and its publication job is unconditionally disabled; Store submission remains disabled without an approved durable backend.
+
+Native signing/installed producer and final-input-bundle source work, installed upgrade/interruption/unsaved-work acceptance, final website/update adapters, approved identities/signing access/runtime media and explicit publication approvals are still required. Prepared offline fixtures and transaction recovery tests have not executed in combined QA. No checklist completion, operating-system trust, published availability or release authorization is inferred from this checkpoint.
+
+
+### Prepared direct Windows EXE/MSIX chain (unreleased)
+
+The [direct-MSIX signing producer](msix.md#executable-and-direct-msix-signing-producer-unreleased) now prepares an explicit existing CurrentUser/My certificate route with SHA256 leaf/Publisher preflight, native executable signing and timestamp verification, strict whole-PE signing-only equivalence, signed-executable MSIX construction, package signing and independent final verification. Offline source/payload/refusal fixtures and CI/release test callers are prepared; no tests or signing were run for this source slice. Store packaging remains unchanged. Public identity/provider configuration, Windows product/version resources, authenticated native producer evidence, actual installed/update acceptance and activation approval remain open. No checklist item above is closed by prepared source or an unready candidate report.

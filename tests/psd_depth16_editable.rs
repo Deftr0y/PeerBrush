@@ -58,6 +58,193 @@ fn remove_resources(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn editable_record(bytes: &[u8]) -> serde_json::Value {
+    use std::io::Read;
+    let at = 30 + u32::from_be_bytes(bytes[26..30].try_into().unwrap()) as usize;
+    let size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let resources = &bytes[at + 4..at + 4 + size];
+    assert_eq!(&resources[..6], b"8BIM\x0f\xa0");
+    let length = 6 + (usize::from(resources[6]) + 1).div_ceil(2) * 2;
+    let size = u32::from_be_bytes(resources[length..length + 4].try_into().unwrap()) as usize;
+    let payload = &resources[length + 4..length + 4 + size];
+    assert_eq!(&payload[..4], b"PBR1");
+    let mut json = Vec::new();
+    flate2::read::ZlibDecoder::new(&payload[4..])
+        .read_to_end(&mut json)
+        .unwrap();
+    serde_json::from_slice(&json).unwrap()
+}
+fn replace_editable_record(bytes: &[u8], value: &serde_json::Value) -> Vec<u8> {
+    use std::io::Write;
+    let at = 30 + u32::from_be_bytes(bytes[26..30].try_into().unwrap()) as usize;
+    let size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let resources = &bytes[at + 4..at + 4 + size];
+    let length = 6 + (usize::from(resources[6]) + 1).div_ceil(2) * 2;
+    let old_size = u32::from_be_bytes(resources[length..length + 4].try_into().unwrap()) as usize;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder
+        .write_all(&serde_json::to_vec(value).unwrap())
+        .unwrap();
+    let payload = [b"PBR1".to_vec(), encoder.finish().unwrap()].concat();
+    let mut replacement = resources[..length].to_vec();
+    replacement.extend((payload.len() as u32).to_be_bytes());
+    replacement.extend(&payload);
+    if payload.len() % 2 != 0 {
+        replacement.push(0);
+    }
+    replacement.extend(&resources[length + 4 + old_size.div_ceil(2) * 2..]);
+    [
+        bytes[..at].to_vec(),
+        (replacement.len() as u32).to_be_bytes().to_vec(),
+        replacement,
+        bytes[at + 4 + size..].to_vec(),
+    ]
+    .concat()
+}
+
+#[test]
+fn installed_text_format_31_retains_native_standard_channels_masks_composite_and_protection() {
+    use peerbrush::{
+        fonts::{InstalledFont, TextFont},
+        source::{Content, Source},
+    };
+    for depth in [8, 16] {
+        let mut doc = Document::new_depth(80, 52, depth).unwrap();
+        for y in 0..52 {
+            for x in 0..80 {
+                doc.layers[0]
+                    .pixels
+                    .set16(x, y, [17001, 29003, 41007, 65535]);
+            }
+        }
+        let mut source = Source {
+            width: 76,
+            height: 38,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: Content::Text {
+                text: "Native text".into(),
+                layout: peerbrush::source::TextLayout::Legacy,
+                font: "regular".into(),
+                size: 17.,
+                line_height: 1.2,
+                letter_spacing: 0.,
+                align: "left".into(),
+                color: [12501, 23003, 34507, 65535],
+            },
+        };
+        let mut layer = Layer::new("Absent installed font", "paint", 76, 38);
+        layer.pixels = source.render(76, 38, depth).unwrap();
+        layer.x = 2;
+        layer.y = 3;
+        if let Content::Text { font, .. } = &mut source.content {
+            *font = TextFont::Installed(InstalledFont {
+                family: "Synthetic absent font".into(),
+                postscript: "PeerBrushSynthetic-Absent".into(),
+                style: "normal".into(),
+                weight: 400,
+                stretch: 5,
+                index: 0,
+                sha256: "0".repeat(64),
+            });
+        }
+        source.validate_structure().unwrap();
+        layer.source = Some(source.clone().into());
+        let mut mask = Raster::new_depth(76, 38, depth);
+        mask.set16(4, 7, [45679, 45679, 45679, 65535]);
+        layer.mask = Some(Mask {
+            linked: false,
+            enabled: true,
+            cache_key: engine::id(),
+            steps: vec![
+                MaskStep {
+                    id: engine::id(),
+                    kind: "fill".into(),
+                    enabled: true,
+                    weight: 1.,
+                    value: 255.,
+                    pixels: Raster::new_depth(76, 38, depth),
+                    settings: json!(null),
+                },
+                MaskStep {
+                    id: engine::id(),
+                    kind: "paint".into(),
+                    enabled: true,
+                    weight: 1.,
+                    value: 0.,
+                    pixels: mask,
+                    settings: json!(null),
+                },
+            ],
+        });
+        let id = layer.id.clone();
+        let native = layer.pixels.rgba16();
+        let mask = layer.mask.clone();
+        doc.layers.insert(0, layer);
+        let before = json!(doc);
+        let current = doc.export_png().unwrap();
+        let composite = image::load_from_memory(&current)
+            .unwrap()
+            .into_rgba16()
+            .into_raw();
+        for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
+            let embedded = editable_record(&bytes);
+            assert_eq!(embedded["format"], 31);
+            assert_eq!(
+                serde_json::from_value::<peerbrush::source::Source>(
+                    embedded["document"]["layers"][0]["source"].clone()
+                )
+                .unwrap(),
+                source
+            );
+            assert!(
+                embedded["document"]["layers"][0]["source"]["content"]["font"]
+                    .get("path")
+                    .is_none()
+            );
+            let reopened = psd::decode(&bytes).unwrap();
+            assert!(!reopened.read_only);
+            assert_eq!(reopened.bit_depth, depth);
+            assert_eq!(reopened.layers[0].id, id);
+            assert_eq!(reopened.layers[0].source, Some(source.clone().into()));
+            assert_eq!(reopened.layers[0].pixels.rgba16(), native);
+            assert_eq!(json!(reopened.layers[0].mask), json!(mask));
+            assert_eq!(reopened.export_png().unwrap(), current);
+            let standard = psd::decode(&remove_resources(&bytes)).unwrap();
+            assert!(!standard.read_only);
+            assert!(standard.layers.iter().all(|layer| layer.source.is_none()));
+            assert_eq!(standard.layers[0].pixels.rgba16(), native);
+            assert_eq!(standard.export_png().unwrap(), current);
+            for case in [
+                "old_format",
+                "future_format",
+                "bad_reference",
+                "hash_mismatch",
+            ] {
+                let mut changed = embedded.clone();
+                match case {
+                    "old_format" => changed["format"] = json!(30),
+                    "future_format" => changed["format"] = json!(u32::MAX),
+                    "bad_reference" => {
+                        changed["document"]["layers"][0]["source"]["content"]["font"]["sha256"] =
+                            json!("invalid")
+                    }
+                    _ => {
+                        changed["standard_hash"] =
+                            json!(changed["standard_hash"].as_u64().unwrap() ^ 1)
+                    }
+                }
+                let protected = psd::decode(&replace_editable_record(&bytes, &changed)).unwrap();
+                assert!(protected.read_only, "{case}");
+                assert_eq!(protected.bit_depth, depth);
+                assert!(protected.layers.iter().all(|layer| layer.source.is_none()));
+                assert_eq!(protected.layers[0].pixels.rgba16(), composite, "{case}");
+                assert_eq!(protected.export_png().unwrap(), current, "{case}");
+            }
+        }
+        assert_eq!(json!(doc), before);
+    }
+}
+
 #[test]
 fn genuine_sixteen_bit_psd_sources_standard_channels_masks_and_composite_survive_saving() {
     let doc = fixture();
@@ -165,7 +352,7 @@ fn native_float_effect_sources_retain_exact_json_values_save_reopen_and_undo() {
         for (key, value) in settings.as_object().unwrap() {
             assert_eq!(&engine.doc.layers[0].effects[0].settings[key], value);
         }
-        let settings = engine.doc.layers[0].effects[0].settings.clone();
+        let settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
         assert_eq!(engine.doc.layers[0].pixels.rgba16(), original);
         let current = engine.doc.export_png().unwrap();
         assert_ne!(current, baseline);
@@ -176,7 +363,7 @@ fn native_float_effect_sources_retain_exact_json_values_save_reopen_and_undo() {
             let reopened = psd::decode(&bytes).unwrap();
             assert!(!reopened.read_only);
             assert_eq!(reopened.bit_depth, depth);
-            assert_eq!(reopened.layers[0].effects[0].settings, settings);
+            assert_eq!(*reopened.layers[0].effects[0].settings, settings);
             assert_eq!(reopened.layers[0].pixels.rgba16(), original);
             assert_eq!(reopened.export_png().unwrap(), current);
             let standard = psd::decode(&remove_resources(&bytes)).unwrap();

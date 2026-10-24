@@ -17,6 +17,12 @@ pub const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_FILE: u64 = 256 * 1024 * 1024;
 pub type Versions = HashMap<String, (String, u64, Value)>;
 
+#[cfg(test)]
+thread_local! {
+    static CLEANUP_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -138,7 +144,22 @@ pub fn discard(dir: &Path, snapshot: &str) -> Result<(), String> {
         .ok_or("Recovery version no longer exists; refresh the list")?;
     remove(dir, &entry)
 }
+pub fn discard_in(
+    workspace: &workspace::Registry,
+    dir: &Path,
+    snapshot: &str,
+) -> Result<(), String> {
+    let _operation = server::FileOperation::begin_workspace(workspace)?;
+    discard(dir, snapshot)
+}
 fn discard_project(dir: &Path, project: &str) -> Result<(), String> {
+    #[cfg(test)]
+    CLEANUP_OBSERVER.with(|slot| {
+        let observe = slot.borrow_mut().take();
+        if let Some(observe) = observe {
+            observe();
+        }
+    });
     for entry in catalog(dir).into_iter().filter(|e| e.project_id == project) {
         remove(dir, &entry)?;
     }
@@ -271,6 +292,13 @@ fn persist(
 /// Encoding runs outside the engine lock. Newer work stays dirty and is picked up
 /// by the next tick; a checkpoint never changes saved_revision or original files.
 pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Versions) {
+    let _operation = {
+        let state = workspace.lock().unwrap();
+        if state.exiting {
+            return;
+        }
+        server::FileOperation::track(state.file_operations.clone())
+    };
     let gate = gate(dir);
     let _guard = gate.lock().unwrap();
     let mut failures = workspace.lock().unwrap().recovery_failures.clone();
@@ -304,6 +332,7 @@ pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Ve
     for (project, _, shared) in entries {
         let (doc, path) = match shared.try_lock() {
             Ok(e) if e.closed || e.doc.read_only || e.doc.revision == e.saved_revision => {
+                drop(e);
                 previous.remove(&project);
                 if let Err(error) = discard_project(dir, &project) {
                     failures.insert(project, error);
@@ -374,7 +403,7 @@ pub fn restore(
     if bytes.len() as u64 != entry.bytes || checksum(&bytes) != entry.checksum {
         return Err("Recovery version is incomplete or damaged; choose an earlier version".into());
     }
-    let mut doc = psd::decode_reader(&mut std::io::Cursor::new(bytes), control)?;
+    let mut doc = psd::decode_slice(&bytes, control)?;
     control.check()?;
     if doc.read_only || doc.bit_depth != entry.bit_depth {
         return Err(
@@ -432,4 +461,186 @@ pub fn legacy(dir: &Path) -> Vec<(String, PathBuf)> {
         entries.push(("Last autosave (legacy)".into(), dir.join("recovery.psd")));
     }
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn source(engine: &engine::Engine) -> Value {
+        let history = |entries: &[engine::History]| {
+            entries.iter().map(|entry| json!({
+                "before":entry.before,"after":entry.after,"actor":entry.actor,"label":entry.label,
+                "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted,
+            })).collect::<Vec<_>>()
+        };
+        json!({"document":engine.doc,"png":engine.doc.export_png().unwrap(),
+            "undo":history(&engine.undo),"redo":history(&engine.redo),
+            "saved_revision":engine.saved_revision,"path":engine.path,"closed":engine.closed})
+    }
+
+    #[test]
+    fn clean_cleanup_releases_engine_but_retains_workspace_guard_and_later_native_work() {
+        for depth in [8, 16] {
+            let dir = std::env::temp_dir().join(format!("pb-recovery-lock-{}", engine::id()));
+            fs::create_dir(&dir).unwrap();
+            let mut engine = engine::Engine::new();
+            engine.doc = engine::Document::new_depth(12, 8, depth).unwrap();
+            engine.doc.layers[0]
+                .pixels
+                .set16(0, 0, [12347, 33559, 51237, 65535]);
+            let layer = engine.doc.layers[0].id.clone();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"fill","layer":layer,
+                "rect":[1,1,2,2],"color":[17,29,43,255]})],
+                    None,
+                    None,
+                    "Earlier human work",
+                )
+                .unwrap();
+            let shared = Arc::new(Mutex::new(engine));
+            let registry = workspace::attach(&shared);
+            let mut previous = Versions::new();
+            checkpoint(&registry, &dir, &mut previous);
+            let old = catalog(&dir).pop().expect("Real dirty recovery");
+            assert_eq!(catalog(&dir).len(), 1);
+            let original = dir.join("Original.psd");
+            server::save(&shared, &original).unwrap();
+            let original_bytes = fs::read(&original).unwrap();
+            let before = source(&shared.lock().unwrap());
+            let reviewed = workspace::lifecycle::update_readiness(&registry).unwrap();
+            let observed = Arc::new(AtomicBool::new(false));
+            let expected = Arc::new(Mutex::new(None));
+            let observed_shared = shared.clone();
+            let observed_registry = registry.clone();
+            let observed_dir = dir.clone();
+            let observed_old = old.clone();
+            let observed_flag = observed.clone();
+            let observed_expected = expected.clone();
+            CLEANUP_OBSERVER.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let engine = observed_shared.try_lock().unwrap_or_else(|_| {
+                        panic!("Recovery storage cleanup must not hold the document engine")
+                    });
+                    assert_eq!(engine.doc.revision, engine.saved_revision);
+                    assert!(!engine.closed);
+                    drop(engine);
+                    assert!(catalog(&observed_dir)
+                        .iter()
+                        .any(|entry| entry.snapshot == observed_old.snapshot));
+                    assert!(observed_dir.join(&observed_old.file).is_file());
+                    let storage_gate = gate(&observed_dir);
+                    assert!(
+                        storage_gate.try_lock().is_err(),
+                        "Cleanup keeps the existing storage gate"
+                    );
+                    assert!(
+                        observed_registry
+                            .lock()
+                            .unwrap()
+                            .file_operations
+                            .load(Ordering::Acquire)
+                            > 0
+                    );
+                    let error =
+                        workspace::lifecycle::finish_update_exit(&observed_registry, &reviewed)
+                            .unwrap_err();
+                    assert!(error.contains("workspace/recovery"), "{error}");
+                    assert!(!observed_registry.lock().unwrap().exiting);
+                    let mut engine = observed_shared.lock().unwrap();
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"fill","layer":layer,
+                        "rect":[2,1,4,3],"color":[53,97,173,255]})],
+                            None,
+                            None,
+                            "Human work during cleanup",
+                        )
+                        .unwrap();
+                    *observed_expected.lock().unwrap() = Some(source(&engine));
+                    observed_flag.store(true, Ordering::Release);
+                }));
+            });
+            checkpoint(&registry, &dir, &mut previous);
+            assert!(observed.load(Ordering::Acquire));
+            CLEANUP_OBSERVER.with(|slot| assert!(slot.borrow().is_none()));
+            assert!(catalog(&dir).is_empty());
+            assert!(!dir.join(&old.file).exists());
+            assert!(!old.manifest(&dir).exists());
+            assert_eq!(
+                registry
+                    .lock()
+                    .unwrap()
+                    .file_operations
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert!(!registry.lock().unwrap().exiting);
+            let expected = expected.lock().unwrap().take().unwrap();
+            {
+                let engine = shared.lock().unwrap();
+                assert_eq!(source(&engine), expected);
+                assert_eq!(engine.doc.revision, old.revision + 1);
+                assert_eq!(engine.doc.bit_depth, depth);
+                assert_eq!(
+                    engine.doc.layers[0].pixels.get16(2, 1),
+                    [53 * 257, 97 * 257, 173 * 257, 65535]
+                );
+                assert_eq!(
+                    engine.undo.len(),
+                    before["undo"].as_array().unwrap().len() + 1
+                );
+                assert_eq!(expected["undo"][0], before["undo"][0]);
+                assert!(engine.redo.is_empty());
+                assert!(!engine.closed);
+            }
+            checkpoint(&registry, &dir, &mut previous);
+            let entries = catalog(&dir);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].revision, old.revision + 1);
+            assert_eq!(entries[0].bit_depth, depth);
+            let recovered = psd::decode(&fs::read(dir.join(&entries[0].file)).unwrap()).unwrap();
+            let engine = shared.lock().unwrap();
+            assert_eq!(source(&engine), expected);
+            assert_eq!(recovered.bit_depth, depth);
+            assert!(!recovered.read_only);
+            assert_eq!(
+                recovered.layers[0].pixels.rgba16(),
+                engine.doc.layers[0].pixels.rgba16()
+            );
+            assert_eq!(
+                recovered.export_png().unwrap(),
+                engine.doc.export_png().unwrap()
+            );
+            assert_eq!(
+                recovered.layers[0].pixels.get16(0, 0),
+                engine.doc.layers[0].pixels.get16(0, 0)
+            );
+            if depth == 16 {
+                assert_eq!(
+                    recovered.layers[0].pixels.get16(0, 0),
+                    [12347, 33559, 51237, 65535]
+                );
+            }
+            drop(engine);
+            assert_eq!(fs::read(&original).unwrap(), original_bytes);
+            assert_eq!(
+                registry
+                    .lock()
+                    .unwrap()
+                    .file_operations
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert!(registry.lock().unwrap().recovery_error.is_none());
+            drop(shared);
+            drop(registry);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }

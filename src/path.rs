@@ -177,7 +177,11 @@ fn color(c: &Value, key: &str, default: [u16; 4]) -> Result<[u16; 4], String> {
         .unwrap_or(Ok(default))
 }
 pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
-    let mut source = layer.source.clone().ok_or("Choose an editable Pen path")?;
+    let mut source = layer
+        .source
+        .as_deref()
+        .cloned()
+        .ok_or("Choose an editable Pen path")?;
     let Content::Bezier {
         nodes,
         closed,
@@ -330,7 +334,7 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
         }
     }
     layer.pixels = source.render(layer.pixels.width, layer.pixels.height, layer.pixels.depth)?;
-    layer.source = Some(source);
+    layer.source = Some(source.into());
     layer.effect_key = id();
     Ok(())
 }
@@ -343,7 +347,7 @@ pub fn polygon(layer: &Layer) -> Result<Vec<[f32; 2]>, String> {
                 ..
             },
         ..
-    }) = &layer.source
+    }) = layer.source.as_deref()
     else {
         return Err("Close an editable Pen path before converting its area".into());
     };
@@ -358,7 +362,7 @@ pub fn observe(layer: &Layer) -> Value {
     let Some(Source {
         content: Content::Bezier { nodes, .. },
         ..
-    }) = &layer.source
+    }) = layer.source.as_deref()
     else {
         return Value::Null;
     };
@@ -369,7 +373,7 @@ pub fn nearest_segment(layer: &Layer, point: [f32; 2], tolerance: f32) -> Option
     let Some(Source {
         content: Content::Bezier { nodes, closed, .. },
         ..
-    }) = &layer.source
+    }) = layer.source.as_deref()
     else {
         return None;
     };

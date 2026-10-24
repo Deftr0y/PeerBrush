@@ -310,7 +310,7 @@ fn boxes(pixels: &mut [u32], width: usize, height: usize, sigma: f32) {
         if radius == 0 {
             continue;
         }
-        let mut ring = vec![0u32; radius + 1];
+        let mut ring = vec![[0u32; 4]; radius + 1];
         let count = (radius * 2 + 1) as u64;
         for vertical in [false, true] {
             let (lines, length, stride) = if vertical {
@@ -320,28 +320,36 @@ fn boxes(pixels: &mut [u32], width: usize, height: usize, sigma: f32) {
             };
             for line in 0..lines {
                 let base = if vertical { line * 4 } else { line * width * 4 };
-                for c in 0..4 {
-                    let first = pixels[base + c];
-                    let last = pixels[base + (length - 1) * stride + c];
-                    let mut sum = (radius as u64 + 1) * u64::from(first);
-                    for offset in 1..=radius {
-                        sum += u64::from(pixels[base + offset.min(length - 1) * stride + c]);
+                let first: [u32; 4] = pixels[base..base + 4].try_into().unwrap();
+                let last_at = base + (length - 1) * stride;
+                let last: [u32; 4] = pixels[last_at..last_at + 4].try_into().unwrap();
+                let mut sum = first.map(|value| (radius as u64 + 1) * u64::from(value));
+                for offset in 1..=radius {
+                    let at = base + offset.min(length - 1) * stride;
+                    for c in 0..4 {
+                        sum[c] += u64::from(pixels[at + c]);
                     }
-                    for offset in 0..length {
-                        ring[offset % (radius + 1)] = pixels[base + offset * stride + c];
-                        pixels[base + offset * stride + c] = ((sum + count / 2) / count) as u32;
+                }
+                // Keep adjacent premultiplied channels together, especially on
+                // strided columns; each channel retains the same integer sum.
+                for offset in 0..length {
+                    let at = base + offset * stride;
+                    ring[offset % (radius + 1)].copy_from_slice(&pixels[at..at + 4]);
+                    let add_at = base + (offset + radius + 1).min(length - 1) * stride;
+                    let remove = if offset < radius {
+                        first
+                    } else {
+                        ring[(offset - radius) % (radius + 1)]
+                    };
+                    for c in 0..4 {
+                        pixels[at + c] = ((sum[c] + count / 2) / count) as u32;
                         let add = if offset + radius + 1 >= length {
-                            last
+                            last[c]
                         } else {
-                            pixels[base + (offset + radius + 1) * stride + c]
+                            pixels[add_at + c]
                         };
-                        let remove = if offset < radius {
-                            first
-                        } else {
-                            ring[(offset - radius) % (radius + 1)]
-                        };
-                        sum += u64::from(add);
-                        sum -= u64::from(remove);
+                        sum[c] += u64::from(add);
+                        sum[c] -= u64::from(remove[c]);
                     }
                 }
             }
@@ -465,4 +473,122 @@ pub fn sample(image: &Image16, x: f64, y: f64) -> Pixel16 {
         word(color[2] / alpha),
         word(alpha),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    // Frozen channel-major CPU kernel for the opt-in same-process comparison.
+    fn legacy_boxes(pixels: &mut [u32], width: usize, height: usize, sigma: f32) {
+        for radius in effects::gaussian_radii(sigma) {
+            if radius == 0 {
+                continue;
+            }
+            let mut ring = vec![0u32; radius + 1];
+            let count = (radius * 2 + 1) as u64;
+            for vertical in [false, true] {
+                let (lines, length, stride) = if vertical {
+                    (width, height, width * 4)
+                } else {
+                    (height, width, 4)
+                };
+                for line in 0..lines {
+                    let base = if vertical { line * 4 } else { line * width * 4 };
+                    for c in 0..4 {
+                        let first = pixels[base + c];
+                        let last = pixels[base + (length - 1) * stride + c];
+                        let mut sum = (radius as u64 + 1) * u64::from(first);
+                        for offset in 1..=radius {
+                            sum += u64::from(pixels[base + offset.min(length - 1) * stride + c]);
+                        }
+                        for offset in 0..length {
+                            ring[offset % (radius + 1)] = pixels[base + offset * stride + c];
+                            pixels[base + offset * stride + c] = ((sum + count / 2) / count) as u32;
+                            let add = if offset + radius + 1 >= length {
+                                last
+                            } else {
+                                pixels[base + (offset + radius + 1) * stride + c]
+                            };
+                            let remove = if offset < radius {
+                                first
+                            } else {
+                                ring[(offset - radius) % (radius + 1)]
+                            };
+                            sum += u64::from(add);
+                            sum -= u64::from(remove);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Opt-in 2048-square CPU kernel benchmark; report balanced samples without a timing assertion"]
+    fn native16_spatial_kernel_performance() {
+        let edge = 2048usize;
+        let source: Vec<u32> = (0..edge * edge)
+            .flat_map(|n| {
+                let alpha = [0, 1, 33, 12345, 65535][n % 5];
+                [
+                    ((n * 317) % 65536) as u32 * alpha,
+                    45679 * alpha,
+                    32123 * alpha,
+                    65535 * alpha,
+                ]
+            })
+            .collect();
+        let mut baseline_ms = Vec::new();
+        let mut candidate_ms = Vec::new();
+        for round in 0..6 {
+            // Cloning and equality are outside both timed kernels.
+            let mut baseline = source.clone();
+            let mut candidate = source.clone();
+            let mut times = [0.0; 2];
+            for which in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let start = Instant::now();
+                if which == 0 {
+                    legacy_boxes(std::hint::black_box(&mut baseline), edge, edge, 4.0);
+                } else {
+                    boxes(std::hint::black_box(&mut candidate), edge, edge, 4.0);
+                }
+                // Keep the complete mutated output observable inside the timer.
+                std::hint::black_box(if which == 0 {
+                    baseline.as_slice()
+                } else {
+                    candidate.as_slice()
+                });
+                times[which] = start.elapsed().as_secs_f64() * 1000.0;
+            }
+            assert_eq!(
+                candidate, baseline,
+                "Native words changed in benchmark round {round}"
+            );
+            baseline_ms.push(times[0]);
+            candidate_ms.push(times[1]);
+        }
+        println!("2048-square CPU premultiplied radius4: channel-major ms {baseline_ms:?}; pixel-major ms {candidate_ms:?}");
+        let build: serde_json::Value = serde_json::from_str(crate::build_info::json()).unwrap();
+        println!(
+            "{}",
+            serde_json::json!({
+                "format":"PeerBrushNative16SpatialV1", "build":build,
+                "group":"native16-premultiplied-radius4", "width":edge, "height":edge,
+                "radius":4, "pairs":6,
+                "order":["channel-pixel", "pixel-channel", "channel-pixel", "pixel-channel", "channel-pixel", "pixel-channel"],
+                "channel_major_ms":baseline_ms, "pixel_major_ms":candidate_ms,
+                "native_window":false, "cpu_used":true, "gpu_used":false
+            })
+        );
+        baseline_ms.sort_by(f64::total_cmp);
+        candidate_ms.sort_by(f64::total_cmp);
+        let median = |times: &[f64]| (times[2] + times[3]) * 0.5;
+        println!(
+            "balanced medians: channel-major {:.3}ms; pixel-major {:.3}ms",
+            median(&baseline_ms),
+            median(&candidate_ms)
+        );
+    }
 }

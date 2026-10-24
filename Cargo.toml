@@ -1,7 +1,8 @@
 [package]
 name = "peerbrush"
-version = "0.26.0"
+version = "0.30.0-dev.1"
 edition = "2021"
+rust-version = "1.92"
 license = "GPL-3.0-only"
 description = "You and your AI. Same canvas."
 
@@ -15,7 +16,9 @@ svgtypes = "0.16"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp", "ico", "pnm", "tga", "qoi"] }
+png = "=0.18.1"
 moxcms = "0.8.1"
+jpegxl-sys = { version = "=0.13.0", features = ["vendored"] }
 serde = { version = "1", features = ["derive", "rc"] }
 # Native source settings must retain their exact f64 values through JSON saves.
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -25,12 +28,27 @@ flate2 = "1"
 base64 = "0.22"
 bytemuck = "1"
 tiny_http = "0.12"
-ureq = { version = "2.12", default-features = false, features = ["json"] }
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+semver = "1"
+url = "2.5"
 rfd = "0.15"
 ab_glyph = "0.2"
+ring = "0.17.14"
+unicode-script = "0.5.8"
+harfrust = "=0.12.0"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
+windows = { version = "0.58", features = ["ApplicationModel", "Foundation_Collections", "Management_Deployment", "Services_Store", "Win32_UI_Shell", "Win32_System_WinRT", "Win32_Foundation", "Win32_Graphics_DirectWrite", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_ErrorReporting", "Win32_System_Pipes", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_Storage_Packaging_Appx", "Win32_System_Com"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+block2 = "=0.6.2"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFURL", "CFData"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSAppleEventDescriptor", "NSAppleEventManager", "NSDate", "NSError", "NSBundle", "NSProcessInfo", "NSData", "NSArray", "objc2-core-foundation"] }
 
 [profile.dev]
 opt-level = 1
@@ -45,4 +63,6 @@ strip = true
 
 
 [patch.crates-io]
+cmake = { path = "vendor/cmake" }
 egui-winit = { path = "vendor/egui-winit" }
+jpegxl-src = { path = "vendor/jpegxl-src" }

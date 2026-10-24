@@ -359,7 +359,7 @@ fn derived_cache_tracks_cow_sources_uncommitted_settings_and_composite_alpha() {
         let changed = native(&draft);
         assert_ne!(changed, baseline);
         assert_eq!(native(&original), baseline);
-        draft.filters[0].settings["maximum"] = json!(0.5);
+        std::sync::Arc::make_mut(&mut draft.filters[0].settings)["maximum"] = json!(0.5);
         assert_ne!(native(&draft), changed);
         assert_eq!(native(&original), baseline);
     }

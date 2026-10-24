@@ -4,6 +4,13 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = peerbrush::sparkle::macos::coordinator_main_entry() {
+        std::process::exit(code);
+    }
+    if let Some(code) = peerbrush::jpeg_xl::main_entry() {
+        std::process::exit(code);
+    }
     if let Err(error) = run() {
         eprintln!("PeerBrush: {error}");
         // File-association launches have no console. Keep failures visible without
@@ -23,8 +30,13 @@ fn main() {
     }
 }
 fn run() -> Result<(), String> {
-    let (state_dir, args) = activation::arguments(
-        std::env::args_os().skip(1),
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.len() == 1 && arguments[0] == "--build-info" {
+        println!("{}", peerbrush::build_info::json());
+        return Ok(());
+    }
+    let (state_dir, args, local_preferences) = activation::storage_arguments(
+        arguments,
         peerbrush::packaged::default_state_dir(server::default_state_dir())?,
     )?;
     if !peerbrush::packaged::external_config_is_visible(&state_dir)? {
@@ -36,12 +48,56 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("mcp") => return server::stdio(&state_dir),
-        Some("discover") => {
-            let manifest = peerbrush::discovery::discover()?;
+        Some("updates") => {
+            let channel = match args.as_slice() {
+                [_, action] if action == "check" => peerbrush::updates::Channel::Stable,
+                [_, action, option] if action == "check" && option == "--preview" => {
+                    peerbrush::updates::Channel::Preview
+                }
+                _ => return Err("Use updates check [--preview]".into()),
+            };
+            let report =
+                peerbrush::updates::check(channel, peerbrush::updates::Target::current()?, |_| {})?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
             );
+            return Ok(());
+        }
+        Some("settings") => {
+            let locations = peerbrush::settings::Locations::user()?;
+            match args.get(1).and_then(|s| s.to_str()) {
+                Some("paths") if args.len() == 2 => {}
+                Some("migrate") if args.len() == 4 && args[2] == "--from" => {
+                    let source = std::path::absolute(std::path::PathBuf::from(&args[3]))
+                        .map_err(|e| e.to_string())?;
+                    let _profile =
+                        peerbrush::settings::Profile::migrate(locations.clone(), &source)?;
+                }
+                _ => {
+                    return Err(
+                        "Use settings paths or settings migrate --from LEGACY_STATE_DIR".into(),
+                    )
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&locations).map_err(|e| e.to_string())?
+            );
+            return Ok(());
+        }
+        Some("discover") => {
+            let report = match args.as_slice() {
+                [_] => serde_json::to_string_pretty(&peerbrush::discovery::discover()?),
+                [_, option] if option == "--status" => {
+                    serde_json::to_string_pretty(&peerbrush::discovery::status(
+                        local_preferences.then_some(state_dir.as_path()),
+                    )?)
+                }
+                _ => return Err("Use discover or discover --status [--state-dir PATH]".into()),
+            }
+            .map_err(|e| e.to_string())?;
+            println!("{report}");
             return Ok(());
         }
         Some("cli") => {
@@ -87,7 +143,7 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("--help") => {
-            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush discover\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\nFiles open in independent project tabs, preserving existing work.");
+            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush --build-info\npeerbrush discover\npeerbrush discover --status [--state-dir PATH]\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
             return Ok(());
         }
         _ => {}
@@ -97,6 +153,40 @@ fn run() -> Result<(), String> {
     if server::activate_existing(&state_dir, &files)? {
         return Ok(());
     }
+    let profile = if local_preferences {
+        None
+    } else {
+        match peerbrush::settings::Profile::open(
+            peerbrush::settings::Locations::user()?,
+            &state_dir,
+        ) {
+            Ok(profile) => Some(profile),
+            Err(error) => {
+                // A simultaneous default launch can own the profile before its
+                // listener is ready. File activation still reaches that window.
+                if error.starts_with("Settings are in use") {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while std::time::Instant::now() < deadline {
+                        if server::activate_existing(&state_dir, &files)? {
+                            return Ok(());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+                return Err(error);
+            }
+        }
+    };
+    let preferences = profile
+        .as_ref()
+        .map_or_else(|| state_dir.clone(), |p| p.locations.profile());
+    #[cfg(any(windows, target_os = "macos"))]
+    let update_profile = profile
+        .as_ref()
+        .map(peerbrush::settings::Profile::update_profile);
+    let cache = profile
+        .as_ref()
+        .map_or_else(|| state_dir.clone(), |p| p.locations.cache.clone());
     let shared = Arc::new(Mutex::new(Engine::new()));
     if !launch.headless {
         activation::enable(&shared);
@@ -104,7 +194,12 @@ fn run() -> Result<(), String> {
             activation::enqueue(&shared, files.clone())?;
         }
     }
-    let connection = match server::start(shared.clone(), state_dir.clone()) {
+    let connection = match server::start_with_preferences(
+        shared.clone(),
+        state_dir.clone(),
+        &preferences,
+        &cache,
+    ) {
         Ok(connection) => connection,
         Err(error) => {
             // Another Explorer launch can acquire the instance lock before its
@@ -126,6 +221,8 @@ fn run() -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
+    #[cfg(target_os = "macos")]
+    let _finder_activation = activation::macos::install(shared.clone())?;
     let options = eframe::NativeOptions {
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             present_mode: if cfg!(target_os = "windows") {
@@ -156,7 +253,15 @@ fn run() -> Result<(), String> {
     eframe::run_native(
         "PeerBrush",
         options,
-        Box::new(move |cc| Ok(Box::new(PeerBrush::new(cc, shared, connection)))),
+        Box::new(move |cc| {
+            #[cfg(target_os = "macos")]
+            activation::macos::install_termination(&shared, &cc.egui_ctx)?;
+            #[allow(unused_mut)]
+            let mut app = PeerBrush::new_with_preferences(cc, shared, connection, &preferences);
+            #[cfg(any(windows, target_os = "macos"))]
+            app.set_update_profile(update_profile);
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| e.to_string())
 }

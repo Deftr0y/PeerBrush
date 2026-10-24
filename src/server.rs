@@ -1,3 +1,4 @@
+mod fonts;
 use crate::{
     engine::{self, Engine, Scope},
     psd, raster,
@@ -6,7 +7,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{BufRead, Write},
+    io::{BufRead, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,6 +17,34 @@ use std::{
 };
 
 pub type Shared = Arc<Mutex<Engine>>;
+
+pub(crate) struct FileOperation(pub(crate) Arc<std::sync::atomic::AtomicUsize>);
+impl FileOperation {
+    pub(crate) fn begin_workspace(workspace: &crate::workspace::Registry) -> Result<Self, String> {
+        let state = workspace.lock().unwrap();
+        if state.exiting {
+            return Err("Workspace is exiting; settings and recovery remain protected".into());
+        }
+        Ok(Self::track(state.file_operations.clone()))
+    }
+    pub(crate) fn begin(shared: &Shared) -> Result<Self, String> {
+        let engine = shared.lock().unwrap();
+        engine.ensure_open()?;
+        Ok(Self::track(engine.file_operations.clone()))
+    }
+    pub(crate) fn track(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+impl Drop for FileOperation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+#[cfg(test)]
+#[path = "png_export_tests.rs"]
+mod png_export_tests;
 #[cfg(test)]
 #[path = "save_safety_tests.rs"]
 mod save_safety_tests;
@@ -250,7 +279,11 @@ fn open_progress_inner(
     if crate::file_safety::version_with_check(path, || control.check())? != version {
         return Err("File changed while opening; try again".into());
     }
+    #[cfg(test)]
+    psd::observe_open_phase("decoder_start", 0);
     let mut doc = psd::decode_reader(&mut file, control)?;
+    #[cfg(test)]
+    psd::observe_open_phase("decoder_returned", 0);
     doc.name = path
         .file_name()
         .unwrap_or_default()
@@ -265,11 +298,15 @@ fn open_progress_inner(
     if (e.doc.id.clone(), e.doc.revision) != before {
         return Err("Canvas changed while opening. Save the current work and try again.".into());
     }
+    #[cfg(test)]
+    psd::observe_open_phase("source_verified", 0);
     e.replace(doc, Some(path.into()))?;
     ownership.published(version.identity);
     e.release_file_ownership();
     e.file_ownership = Some(ownership);
     e.file_version = Some(version);
+    #[cfg(test)]
+    psd::observe_open_phase("replaced", 0);
     Ok(())
 }
 /// Explicitly flatten unsupported Photoshop structure without reducing channel precision or replacing its file.
@@ -417,12 +454,267 @@ pub fn save_accepted_source(
 fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     save_prepared(shared, path, request, || {})
 }
+// One registered control per project, retained for terminal observation. Its file
+// operation guard also covers asynchronous scheduling and failed worker creation.
+struct SaveOperation {
+    shared: Shared,
+    control: crate::saving::Control,
+    _operation: FileOperation,
+    completed: bool,
+}
+impl SaveOperation {
+    fn begin(
+        shared: &Shared,
+        request: &Value,
+        control: &crate::saving::Control,
+    ) -> Result<Self, String> {
+        let mut e = shared.lock().unwrap();
+        e.ensure_open()?;
+        crate::workspace::validate_target(&e, request)?;
+        if request["expected_revision"]
+            .as_u64()
+            .is_some_and(|revision| revision != e.doc.revision)
+        {
+            return Err("Project revision changed before saving".into());
+        }
+        if e.saving.as_ref().is_some_and(|c| !c.status().finished) {
+            return Err("A working save is already active for this project".into());
+        }
+        control.begin(e.doc.id.clone(), e.doc.revision)?;
+        e.saving = Some(control.clone());
+        if e.loading.is_none() {
+            e.status = "Saving Photoshop document".into();
+        }
+        Ok(Self {
+            shared: shared.clone(),
+            control: control.clone(),
+            _operation: FileOperation::track(e.file_operations.clone()),
+            completed: false,
+        })
+    }
+    fn complete(&mut self, result: &Result<(), String>) {
+        let mut e = self.shared.lock().unwrap();
+        if e.loading.is_none() && e.saving.as_ref().is_some_and(|c| c.same(&self.control)) {
+            e.status = result
+                .as_ref()
+                .map(|_| "Photoshop document saved".into())
+                .unwrap_or_else(|error| error.clone());
+        }
+        self.completed = true;
+        self.control.finish(result);
+    }
+}
+impl Drop for SaveOperation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.complete(&Err("Save interrupted; current work remains open".into()));
+        }
+    }
+}
+fn save_controlled(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    control: &crate::saving::Control,
+    before_commit: impl FnOnce(),
+) -> Result<(), String> {
+    let mut operation = SaveOperation::begin(shared, request, control)?;
+    let result = save_prepared_inner(shared, path, request, control, before_commit);
+    operation.complete(&result);
+    result
+}
+fn save_async(shared: &Shared, path: PathBuf, request: &Value) -> Result<(), String> {
+    if request["document_id"].as_str().is_none() || request["expected_revision"].as_u64().is_none()
+    {
+        return Err("Async Save requires observed document_id and expected_revision".into());
+    }
+    let control = crate::saving::Control::default();
+    let mut operation = SaveOperation::begin(shared, request, &control)?;
+    let shared = shared.clone();
+    let request = request.clone();
+    let worker = move || {
+        let result = save_prepared_inner(&shared, &path, &request, &control, || {});
+        operation.complete(&result);
+    };
+    // Dropping the unstarted closure exercises the same owned guard cleanup as
+    // an OS thread-creation error, without exhausting host threads in a test.
+    #[cfg(test)]
+    if let Err(error) = save_safety_tests::observe("spawn", Path::new(""), Path::new("")) {
+        drop(worker);
+        return Err(error);
+    }
+    thread::Builder::new()
+        .name("peerbrush-save".into())
+        .spawn(worker)
+        .map(|_| ())
+        .map_err(|error| format!("Could not start saving: {error}"))
+}
+// Working Save owns both files; neither becomes a loaded source until verified publication.
+struct SaveTemporary {
+    path: PathBuf,
+    file: fs::File,
+    identity: (u64, u64),
+    bytes: u64,
+    fingerprint: ring::digest::Context,
+    reading: bool,
+}
+impl SaveTemporary {
+    fn new(destination: &Path, spool: bool) -> Result<Self, String> {
+        let path = destination.with_extension(format!(
+            "{}.{}",
+            engine::id(),
+            if spool { "psd-spool" } else { "tmp" }
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        if spool {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|e| e.to_string())?;
+        let identity = crate::file_safety::identity(&file).map_err(|_| "Save temporary identity unavailable; an incomplete private file may remain beside the destination. Current work was not published.")?;
+        let temporary = Self {
+            path,
+            file,
+            identity,
+            bytes: 0,
+            fingerprint: ring::digest::Context::new(&ring::digest::SHA256),
+            reading: false,
+        };
+        temporary.check_path()?;
+        if !spool && destination.exists() {
+            crate::file_safety::preserve_permissions(destination, &temporary.path)?;
+        }
+        Ok(temporary)
+    }
+    fn check_path(&self) -> Result<(), String> {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err("Save temporary path is a link or reparse point".into());
+            }
+        }
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("Save temporary path is not a regular file".into());
+        }
+        let named = crate::file_safety::open_for_identity(&self.path).map_err(|e| e.to_string())?;
+        if crate::file_safety::identity(&self.file)? != self.identity
+            || crate::file_safety::identity(&named)? != self.identity
+        {
+            return Err("Save temporary file identity changed; destination retained".into());
+        }
+        Ok(())
+    }
+    fn stamp(&self) -> Result<(u64, std::time::SystemTime), String> {
+        let metadata = self.file.metadata().map_err(|e| e.to_string())?;
+        Ok((
+            metadata.len(),
+            metadata.modified().map_err(|e| e.to_string())?,
+        ))
+    }
+    fn verify(
+        &mut self,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<crate::file_safety::Version, String> {
+        self.file.flush().map_err(|e| e.to_string())?;
+        self.file.sync_all().map_err(|e| e.to_string())?;
+        self.check_path()?;
+        let before = self.stamp()?;
+        let version = crate::file_safety::verified_version(
+            &self.path,
+            self.bytes,
+            crate::file_safety::finish_fingerprint(self.fingerprint.clone()),
+            check,
+        )?;
+        self.check_path()?;
+        if version.identity != self.identity || self.stamp()? != before {
+            return Err("Save temporary file changed during verification".into());
+        }
+        Ok(version)
+    }
+    fn validate(&self, stamp: (u64, std::time::SystemTime)) -> Result<(), String> {
+        self.check_path()?;
+        if self.stamp()? != stamp {
+            return Err("Save temporary file changed before publication".into());
+        }
+        Ok(())
+    }
+    fn remove(&self) -> Result<(), String> {
+        self.check_path()?;
+        fs::remove_file(&self.path).map_err(|e| format!("Cannot remove completed save spool: {e}"))
+    }
+}
+impl Write for SaveTemporary {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.reading
+            || self.file.stream_position()? != self.bytes
+            || self
+                .bytes
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|n| n > 256 * 1024 * 1024)
+        {
+            return Err(std::io::Error::other(
+                "Save output is not sequential or exceeds the 256 MiB limit",
+            ));
+        }
+        self.check_path().map_err(std::io::Error::other)?;
+        #[cfg(test)]
+        save_safety_tests::observe("write", &self.path, Path::new(""))
+            .map_err(std::io::Error::other)?;
+        let n = self.file.write(bytes)?;
+        self.bytes += n as u64;
+        self.fingerprint.update(&bytes[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+impl Read for SaveTemporary {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.reading = true;
+        self.check_path().map_err(std::io::Error::other)?;
+        self.file.read(bytes)
+    }
+}
+impl Seek for SaveTemporary {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+impl Drop for SaveTemporary {
+    fn drop(&mut self) {
+        // A foreign replacement at our random name is never ours to remove.
+        if self.check_path().is_ok() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 fn save_prepared(
     shared: &Shared,
     path: &Path,
     request: &Value,
     before_commit: impl FnOnce(),
 ) -> Result<(), String> {
+    save_controlled(
+        shared,
+        path,
+        request,
+        &crate::saving::Control::default(),
+        before_commit,
+    )
+}
+fn save_prepared_inner(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    control: &crate::saving::Control,
+    before_commit: impl FnOnce(),
+) -> Result<(), String> {
+    control.progress("Checking destination", 0, 0)?;
     if path
         .extension()
         .and_then(|e| e.to_str())
@@ -443,6 +735,10 @@ fn save_prepared(
     let (doc, source_path, source_version, saved_revision, project) = {
         let e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, request)?;
+        let source = control.status();
+        if e.doc.id != source.document_id || e.doc.revision != source.revision {
+            return Err("Project source changed before saving; current work preserved".into());
+        }
         if request["expected_revision"]
             .as_u64()
             .is_some_and(|r| r != e.doc.revision)
@@ -476,16 +772,61 @@ fn save_prepared(
     }
     crate::compatibility::authorize_save(&doc, request)?;
     let ownership = crate::file_ownership::Ownership::save(path, &project)?;
-    let bytes = if path
+    let mut output = SaveTemporary::new(path, false)?;
+    let mut spool = SaveTemporary::new(path, true)?;
+    #[cfg(test)]
+    let output_path = output.path.clone();
+    #[cfg(test)]
+    let spool_path = spool.path.clone();
+    let check = || {
+        control.check()?;
+        let e = shared.lock().unwrap();
+        e.ensure_open()?;
+        if e.doc.id != doc.id
+            || e.doc.revision != doc.revision
+            || e.path != source_path
+            || e.file_version != source_version
+            || e.saved_revision != saved_revision
+        {
+            return Err("Project source changed while saving; current work preserved".into());
+        }
+        drop(e);
+        #[cfg(test)]
+        save_safety_tests::observe("encoding", &output_path, &spool_path)?;
+        Ok(())
+    };
+    if path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("psb"))
     {
-        psd::encode_psb(&doc)?
+        psd::encode_psb_to(
+            &doc,
+            &mut output,
+            &mut spool,
+            &check,
+            &|stage, completed, total| control.progress(stage, completed, total),
+        )?;
     } else {
-        psd::encode(&doc)?
-    };
+        psd::encode_to(
+            &doc,
+            &mut output,
+            &mut spool,
+            &check,
+            &|stage, completed, total| control.progress(stage, completed, total),
+        )?;
+    }
+    #[cfg(test)]
+    save_safety_tests::observe("encoded", &output_path, &spool_path)?;
+    control.progress("Verifying native spool", 0, 0)?;
+    spool.verify(&check)?;
+    control.progress("Verifying save output", 0, 0)?;
+    let staged = output.verify(&check)?;
+    let spool_stamp = spool.stamp()?;
+    let output_stamp = output.stamp()?;
     // Preserve the previous exact file before touching its replacement.
+    control.progress("Preserving previous version", 0, 0)?;
+    check()?;
     let backup = lease.preserve()?;
     before_commit();
     let mut e = shared.lock().unwrap();
@@ -499,11 +840,30 @@ fn save_prepared(
         return Err("Project source changed while saving; current work preserved".into());
     }
     lease.validate()?;
-    atomic_write_checked(path, &bytes, |temporary| {
-        ownership.prepare(temporary)?;
-        lease.validate()
-    })?;
-    let version = crate::file_safety::published_version(path, &bytes)?;
+    spool.validate(spool_stamp)?;
+    output.validate(output_stamp)?;
+    ownership.prepare(&output.path)?;
+    output.validate(output_stamp)?;
+    spool.validate(spool_stamp)?;
+    spool.remove()?;
+    lease.validate()?;
+    // Serialize the last cancellation decision with the first irreversible step.
+    // No cancellable callback may run after this transition or after rename.
+    control.commit()?;
+    replace_file(&output.path, path)?;
+    sync_parent(path)?;
+    #[cfg(test)]
+    save_safety_tests::observe("published", path, &spool_path)?;
+    // The engine is already locked; never invoke the source-locking callback here.
+    let version = crate::file_safety::verified_version(
+        path,
+        output.bytes,
+        crate::file_safety::finish_fingerprint(output.fingerprint.clone()),
+        || Ok(()),
+    )?;
+    if version != staged {
+        return Err("Published save changed before verification; current work remains open and the previous version is retained".into());
+    }
     ownership.published(version.identity);
     if e.doc.id == doc.id {
         e.path = Some(path.into());
@@ -546,15 +906,42 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
             "Use exports start with an explicit existing-file policy for batch skips".into(),
         );
     }
-    export_derived_guarded(
-        shared,
-        path,
-        request,
-        &crate::production_export::Control::default(),
-        |doc| doc.export_png(),
-    )
+    let format = crate::production_export::Format::from_path(path)?;
+    if format == crate::production_export::Format::Webp
+        && request
+            .get("bit_depth")
+            .is_some_and(|value| value.as_u64() != Some(8))
+    {
+        return Err("WebP output supports only 8-bit channels; the working document stays at its native depth".into());
+    }
+    if format != crate::production_export::Format::Jxl && request.get("jxl").is_some() {
+        return Err("JPEG XL options require a .jxl export destination".into());
+    }
+    let jxl: crate::jpeg_xl::Options = request
+        .get("jxl")
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|e| format!("Invalid JPEG XL options: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    jxl.validate()?;
+    let control = crate::production_export::Control::default();
+    export_derived_to_guarded(shared, path, request, &control, |doc, writer| {
+        if format == crate::production_export::Format::Jxl
+            && request
+                .get("bit_depth")
+                .is_some_and(|depth| depth.as_u64() != Some(u64::from(doc.bit_depth)))
+        {
+            return Err(
+                "JPEG XL export preserves the working document's native channel depth".into(),
+            );
+        }
+        crate::production_export::render_document_to(doc, format, jxl, &control, writer)
+    })
     .map(|_| ())
 }
+#[cfg(test)]
 pub(crate) fn export_derived_guarded(
     shared: &Shared,
     path: &Path,
@@ -562,23 +949,26 @@ pub(crate) fn export_derived_guarded(
     control: &crate::production_export::Control,
     encode: impl FnOnce(&crate::engine::Document) -> Result<Vec<u8>, String>,
 ) -> Result<bool, String> {
+    export_derived_to_guarded(shared, path, request, control, |doc, writer| {
+        writer.write_all(&encode(doc)?).map_err(|e| e.to_string())
+    })
+    .map(|bytes| bytes.is_some())
+}
+
+pub(crate) fn export_derived_to_guarded(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    control: &crate::production_export::Control,
+    encode: impl FnOnce(&crate::engine::Document, &mut dyn Write) -> Result<(), String>,
+) -> Result<Option<usize>, String> {
+    let _operation = FileOperation::begin(shared)?;
     control.check()?;
-    if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| !e.eq_ignore_ascii_case("png"))
-        .unwrap_or(true)
-    {
-        return Err("PNG is the only export format".into());
-    }
+    let format = crate::production_export::Format::from_path(path)?;
     let lease = crate::file_safety::Lease::acquire(path)?;
     let path = lease.path.as_path();
-    if !path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
-    {
-        return Err("Export alias must resolve to a .png destination".into());
+    if crate::production_export::Format::from_path(path)? != format {
+        return Err("Export alias must resolve to the same PNG, WebP or JPEG XL format".into());
     }
     if lease.expected.is_some() && request["overwrite"] != true && request["skip_existing"] != true
     {
@@ -596,7 +986,7 @@ pub(crate) fn export_derived_guarded(
             .transpose()?
             .unwrap_or(false)
         {
-            return Err("PNG export cannot replace this project's working source. Choose a different destination.".into());
+            return Err("Image export cannot replace this project's working source. Choose a different destination.".into());
         }
         if request["expected_revision"]
             .as_u64()
@@ -608,11 +998,85 @@ pub(crate) fn export_derived_guarded(
     };
     // Protect sources owned by another project or application instance too.
     if lease.expected.is_some() && request["skip_existing"] == true {
-        return Ok(false);
+        return Ok(None);
     }
     let project = shared.lock().unwrap().project_id.clone();
     let _ownership = crate::file_ownership::Ownership::save(path, &project)?;
-    let bytes = encode(&doc)?;
+    // Keep the existing 256 MiB file-safety envelope while encoding directly to
+    // a private same-directory file outside the document lock.
+    struct Output<'a> {
+        file: &'a mut fs::File,
+        bytes: usize,
+        fingerprint: ring::digest::Context,
+        control: &'a crate::production_export::Control,
+    }
+    impl Write for Output<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.control.check().map_err(std::io::Error::other)?;
+            if self
+                .bytes
+                .checked_add(bytes.len())
+                .is_none_or(|n| n > 256 * 1024 * 1024)
+            {
+                return Err(std::io::Error::other(
+                    "Export exceeds the 256 MiB file safety limit",
+                ));
+            }
+            let n = self.file.write(bytes)?;
+            self.fingerprint.update(&bytes[..n]);
+            self.bytes += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.control.check().map_err(std::io::Error::other)?;
+            self.file.flush()
+        }
+    }
+    struct Temporary(PathBuf);
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let temporary = Temporary(path.with_extension(format!("{}.tmp", engine::id())));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temporary.0)
+        .map_err(|e| e.to_string())?;
+    let identity = crate::file_safety::identity(&file)?;
+    if path.exists() {
+        crate::file_safety::preserve_permissions(path, &temporary.0)?;
+    }
+    let mut output = Output {
+        file: &mut file,
+        bytes: 0,
+        fingerprint: ring::digest::Context::new(&ring::digest::SHA256),
+        control,
+    };
+    encode(&doc, &mut output)?;
+    output.flush().map_err(|e| e.to_string())?;
+    let bytes = output.bytes;
+    let fingerprint = crate::file_safety::finish_fingerprint(output.fingerprint.clone());
+    drop(output);
+    file.sync_all().map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let stamp = (
+        metadata.len(),
+        metadata.modified().map_err(|e| e.to_string())?,
+    );
+    let named_metadata = fs::symlink_metadata(&temporary.0).map_err(|e| e.to_string())?;
+    if !named_metadata.is_file() || named_metadata.file_type().is_symlink() {
+        return Err("Export temporary path changed; destination retained".into());
+    }
+    let staged =
+        crate::file_safety::verified_version(&temporary.0, bytes as u64, fingerprint, || {
+            control.check()
+        })?;
+    if staged.identity != identity || staged.bytes != bytes as u64 {
+        return Err("Export temporary file changed; destination retained".into());
+    }
     control.check()?;
     let backup = lease.preserve()?;
     let e = shared.lock().unwrap();
@@ -621,15 +1085,34 @@ pub(crate) fn export_derived_guarded(
         return Err("Project source changed before exporting".into());
     }
     lease.validate()?;
-    atomic_write_checked(path, &bytes, |_| {
-        control.check()?;
-        lease.validate()
-    })?;
-    crate::file_safety::published_version(path, &bytes)?;
+    control.check()?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    let named_metadata = fs::symlink_metadata(&temporary.0).map_err(|e| e.to_string())?;
+    let named = fs::File::open(&temporary.0).map_err(|e| e.to_string())?;
+    if !named_metadata.is_file()
+        || named_metadata.file_type().is_symlink()
+        || (
+            metadata.len(),
+            metadata.modified().map_err(|e| e.to_string())?,
+        ) != stamp
+        || crate::file_safety::identity(&file)? != identity
+        || crate::file_safety::identity(&named)? != identity
+    {
+        return Err("Export temporary file changed; destination retained".into());
+    }
+    drop(named);
+    replace_file(&temporary.0, path)?;
+    sync_parent(path)?;
+    drop(e);
+    drop(file);
+    let published = crate::file_safety::version_with_check(path, || Ok(()))?;
+    if published != staged {
+        return Err("Published file changed before verification. Current work remains open; inspect the destination and use a new export path.".into());
+    }
     if let Some(backup) = backup {
         lease.prune(&backup);
     }
-    Ok(true)
+    Ok(Some(bytes))
 }
 
 pub fn tools() -> Value {
@@ -638,7 +1121,7 @@ pub fn tools() -> Value {
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_proposal","description":"Create and render frozen proposed edits for explicit human review. create needs observed document_id/expected_revision and ordinary engine commands; the shared project and history stay unchanged. preview returns actual PNG pixels with document coordinates. Only actor human can accept; agents can list, preview or reject their proposals. A changed project or ended/expired/taken-over task invalidates its draft. Never silently reacquire a task. Direct edits remain available when already authorized.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","preview","accept","reject"]},"actor":{"type":"string"},"proposal":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"task":{"type":"string"},"label":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"feedback":{"type":"string","enum":["batch","request"]}},"required":["action"],"additionalProperties":false}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status","recovery"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
-        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export PNG. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Destination extension selects the native 8/16-bit RGB save format under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. pattern_sources inspects protected raw RGB pattern assets; it requires observed document_id/expected_revision. Optional pattern_index returns native PNG content in pattern_asset coordinates, without interpreting Photoshop color handling or style placement. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_report","export","compatible_copy","pattern_sources"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"pattern_index":{"type":"integer","minimum":0,"maximum":15},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
+        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export flattened PNG/WebP/JPEG XL selected by destination extension. PNG and JPEG XL keep native 8/16-bit channels; lossless WebP is explicitly 8-bit output only, including from native16 sources. All retain alpha and supported color handling; JPEG XL assigns untagged RGB to sRGB and defaults to lossless, with optional jxl lossless/distance/effort settings; exporting never changes the editable document's precision. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Working saves remain PSD/PSB under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. save remains synchronous; save_async requires observed document_id/expected_revision and returns immediately. Observe state.saving and file_status; cancel_save requires its exact run. Cancellation is cooperative before final publication; late cancellation is refused while the verified save finishes. Existing effect/composite preparation, backup and OS calls may finish before cancellation is observed. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. pattern_sources inspects protected raw RGB pattern assets; it requires observed document_id/expected_revision. Optional pattern_index returns native PNG content in pattern_asset coordinates, without interpreting Photoshop color handling or style placement. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_async","cancel_save","save_report","export","compatible_copy","pattern_sources"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"run":{"type":"string","description":"Exact observed state.saving.run required by cancel_save."},"pattern_index":{"type":"integer","minimum":0,"maximum":15},"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply a supported absolute local image path or base64 PNG. SVG/SVGZ placement creates rendered pixels; image.import retains editable vector markup. Use image_info and explicit frame/page/variant for animations, multipage TIFF and icons. Supply an exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
@@ -648,12 +1131,13 @@ pub fn tools() -> Value {
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_recovery","description":"List complete instance-local autosave versions and failures. Restore an explicit snapshot into a new independent unsaved project, retaining original files and recovery versions. Returns actual image content with coordinates. Only human input may discard an explicit version; never discard to hide an autosave failure.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","restore","discard"]},"snapshot":{"type":"string"},"actor":{"type":"string"}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_filters","description":"Browse whole-image filter presets; thumbnail renders a standard reference image, preview renders the explicitly targeted current project without history and returns frozen commands. Apply with peerbrush_edit filter.add/update; edit settings, strength, bypass, delete and reorder non-destructively. Top filters run last after the composite. Save/rename/delete/import/export validated instance-local custom presets outside history. Curated presets are immutable. Preview requires current project_id/document_id/expected_revision; original 8/16-bit sources stay editable.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","thumbnail","preview","save","rename","delete","import","export"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"kind":{"type":"string"},"settings":{"type":"object"},"weight":{"type":"number","minimum":0,"maximum":1},"data":{"type":"object"},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_code","description":"Run bounded Rhai code against a frozen native 8/16-bit project, then commit shared commands atomically. start requires explicit project/document/revision, a named AI actor, active owned task, description and declared scopes. Code cannot bypass locks/reservations or read files/network. Returns run ID immediately; status returns completion and actual PNG with document coordinates. cancel or human takeover discards unfinished work. read_pixel, begin_pixels, write_pixel, commit_pixels and edit are documented in capabilities. One undo step; source changes reject the whole run.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","cancel"]},"actor":{"type":"string"},"task":{"type":"string"},"run":{"type":"string"},"description":{"type":"string","maxLength":240},"scopes":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}},"additionalProperties":false}},"script":{"type":"string","maxLength":65536},"max_edge":{"type":"integer","minimum":32,"maximum":1024}},"required":["action","project_id","document_id"],"additionalProperties":false}}));
-    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_exports","description":"Native-depth PNG production presets and selected layer/folder batches. list returns instance-local preset revision; save_preset/delete_preset require expected_library_revision and never enter document history. plan/preview/start require observed project_id/document_id/expected_revision. Targets are isolated selected roots with their masks/effects and internal clipping; ancestor folders and document filters are excluded. An empty target list exports the current composite with document filters. Standalone adjustments/clipped layers and protected-source layers require their containing folder/composite. Presets define portable filenames, explicit numbered duplicates, canvas/alpha bounds, transparent padding and named scale variants. PNGs preserve original 8/16-bit channels and ICC tags; no implicit depth/profile conversion. preview returns actual image pixels with document coordinates. start requires an existing output directory and explicit existing-file policy (error by default, skip, or replace); status reports each written/skipped/failed/not-written output. cancel preserves completed PNGs and editable sources. Loaded sources, file ownership, concurrent edits and destination conflicts remain guarded.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","save_preset","delete_preset","plan","preview","start","status","cancel"]},"preset":{"type":"string"},"name":{"type":"string"},"actor":{"type":"string"},"expected_library_revision":{"type":"integer","minimum":0},"targets":{"type":"array","maxItems":1024,"items":{"type":"string"}},"directory":{"type":"string"},"existing":{"type":"string","enum":["error","skip","replace"]},"run":{"type":"string"},"output_index":{"type":"integer","minimum":0,"maximum":63},"max_edge":{"type":"integer","minimum":32,"maximum":1024},"settings":{"type":"object","properties":{"template":{"type":"string","maxLength":160},"crop":{"type":"string","enum":["canvas","alpha"]},"padding":{"type":"integer","minimum":0,"maximum":4096},"resampling":{"type":"string","enum":["nearest","bilinear"]},"duplicate_names":{"type":"string","enum":["error","number"]},"variants":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":48},"scale":{"type":"number","minimum":0.01,"maximum":8}},"required":["name","scale"],"additionalProperties":false}}},"required":["template","crop","padding","resampling","duplicate_names","variants"],"additionalProperties":false}},"required":["action"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_exports","description":"Flattened PNG/WebP/JPEG XL production presets and selected layer/folder batches. list returns instance-local preset revision; save_preset/delete_preset require expected_library_revision and never enter document history. plan/preview/start require observed project_id/document_id/expected_revision. Targets are isolated selected roots with their masks/effects and internal clipping; ancestor folders and document filters are excluded. An empty target list exports the current composite with document filters. Standalone adjustments/clipped layers and protected-source layers require their containing folder/composite. Presets define format (png by default), portable filenames, explicit numbered duplicates, canvas/alpha bounds, transparent padding and named scale variants. PNG and JPEG XL preserve native 8/16-bit channels. JPEG XL defaults to lossless; jxl options select lossless/distance/effort, retaining alpha losslessly. JPEG XL previews and reopening use the validated actual decoded RGB profile; lossless retains the exact ICC, while a differing decoder profile selects explicit SDR sRGB. Lossless WebP has explicit 8-bit output; native16 working sources remain unchanged. All retain alpha and supported color handling without changing the working document. Plan/receipts report output format/bit_depth and native_source_depth. preview returns actual output pixels as PNG with document coordinates. start requires an existing output directory and explicit existing-file policy (error by default, skip, or replace); status reports each written/skipped/failed/not-written output. cancel preserves completed exports and editable sources. Loaded sources, file ownership, concurrent edits and destination conflicts remain guarded.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","save_preset","delete_preset","plan","preview","start","status","cancel"]},"preset":{"type":"string"},"name":{"type":"string"},"actor":{"type":"string"},"expected_library_revision":{"type":"integer","minimum":0},"targets":{"type":"array","maxItems":1024,"items":{"type":"string"}},"directory":{"type":"string"},"existing":{"type":"string","enum":["error","skip","replace"]},"run":{"type":"string"},"output_index":{"type":"integer","minimum":0,"maximum":63},"max_edge":{"type":"integer","minimum":32,"maximum":1024},"settings":{"type":"object","properties":{"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"format":{"type":"string","enum":["png","webp","jxl"],"default":"png"},"template":{"type":"string","maxLength":160},"crop":{"type":"string","enum":["canvas","alpha"]},"padding":{"type":"integer","minimum":0,"maximum":4096},"resampling":{"type":"string","enum":["nearest","bilinear"]},"duplicate_names":{"type":"string","enum":["error","number"]},"variants":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":48},"scale":{"type":"number","minimum":0.01,"maximum":8}},"required":["name","scale"],"additionalProperties":false}}},"required":["template","crop","padding","resampling","duplicate_names","variants"],"additionalProperties":false}},"required":["action"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(fonts::tool());
     for tool in tools.as_array_mut().unwrap() {
         // Project/source properties are added consistently below.
         if !matches!(
             tool["name"].as_str(),
-            Some("peerbrush_capabilities" | "peerbrush_brushes")
+            Some("peerbrush_capabilities" | "peerbrush_brushes" | "peerbrush_fonts")
         ) {
             let properties = &mut tool["inputSchema"]["properties"];
             properties["project_id"] = json!({"type":"string"});
@@ -695,7 +1179,8 @@ pub fn capabilities() -> Value {
     result["segmentation"]["configured"] = json!(crate::segmentation::configured());
     result["photoshop_files"] = json!({"formats":["PSD v1","PSB v2"],"native_depths":[8,16],"mode":"RGB","file_limit_bytes":256*1024*1024,"max_edge":8192,"max_pixels":32*1024*1024,"protection":"Unsupported structures remain read-only; explicit compatible copies retain original precision. Both formats write current standard raster/masks and merged composites."});
     result["projects"] = json!({"tool":"peerbrush_projects","max_open":crate::workspace::MAX_PROJECTS,"targeting":"Use project_id, document_id and expected_revision for every background AI mutation. Switching or reordering tabs never changes a project's engine. Human-only reorder requires the complete expected_order and new order.","transfer":"Editable trees, masks, effects and native16 sources; copy changes destination, move is atomic with one undo step per project."});
-    result["image_import"] = json!({"extensions":crate::image_import::EXTENSIONS,"inspect_tool":"peerbrush_image_info","choices":"Explicit zero-based frame/page/variant when image_info reports choice; never silently flatten animations or multipage files.","precision":"Raster imports retain native 8/16-bit RGB and gray. Supported embedded RGB ICC is converted to sRGB at original depth. Float, CMYK and PNG16 animation are rejected. Static supported SVG/SVGZ retains editable markup; its colors and coverage project through RGBA8 and promote in native16 projects without quantizing existing raster channels. image.place and external image-file paste rasterize SVG."});
+    result["image_import"] = json!({"extensions":crate::image_import::EXTENSIONS,"inspect_tool":"peerbrush_image_info","choices":"Explicit zero-based frame/page/variant when image_info reports choice; never silently flatten animations or multipage files.","precision":"Raster imports retain native 8/16-bit RGB and gray. Supported embedded RGB ICC is converted to sRGB at original depth. Float, CMYK and PNG16 animation are rejected. JPEG XL accepts static SDR RGB with optional straight alpha at native8/16; animation, gray, associated alpha and extra channels reject. Static supported SVG/SVGZ retains editable markup; its colors and coverage project through RGBA8 and promote in native16 projects without quantizing existing raster channels. image.place and external image-file paste rasterize SVG."});
+    result["production_exports"] = json!({"tool":"peerbrush_exports","formats":["png","webp","jxl"],"default_format":"png","precision":"PNG and JPEG XL retain native8/16. Lossless WebP produces8-bit RGBA from the rendered output only; native16 working channels are never replaced.","color":"Alpha is retained at the output depth. PNG/WebP retain supported ICC; lossless JPEG XL retains exact ICC. JPEG XL previews/reopening use the actual decoded RGB profile, selecting explicit SDR sRGB when the default differs. Untagged RGB is assigned sRGB for JPEG XL.","preview":"Actual encoded output returned as display PNG with document coordinates; output format/bit_depth and native_source_depth are distinct.","publication":"Existing guarded atomic writes, source revision/ownership checks, cancellation and exact previous-file preservation apply to every format."});
     result["effect_catalog"] = crate::effects::catalog::discovery();
     result["custom_contours"] = json!({"effects":["contour","bevel_emboss","inner_shadow","inner_glow","satin","outer_glow","drop_shadow"],"settings":{"contour":"custom","contour_points":"2–16 objects: position and value, each finite 0–1; positions strictly increase with fixed 0/1 endpoints"},"rendering":"Piecewise linear native contour mapping; original sources remain intact. Shared previews, history, reservations and document coordinates apply.","limits":"Unknown fields, missing points, duplicate positions and points on preset contours reject. Native contours do not establish Photoshop contour/style equivalence.","source_format":21});
     result["bevel_channels"] = json!({"effect":"bevel_emboss","settings":{"highlight_opacity":"0–1, default 1; multiplies common opacity","shadow_opacity":"0–1, default 1; multiplies common opacity","highlight_blend":"shared blend key or inherit (default)","shadow_blend":"shared blend key or inherit (default)"},"limits":"Native alpha-field relief; independent channels do not establish Photoshop bevel technique or backdrop equivalence. Shared previews, reservations, history and original native sources apply.","source_format":22});
@@ -723,7 +1208,7 @@ pub fn capabilities() -> Value {
         .as_array_mut()
         .unwrap()
         .push(json!({"op":"filter.add","preset":"posterize","settings":{"levels":5},"weight":0.6}));
-    result["filter_library"] = json!({"tool":"peerbrush_filters","actions":["list","thumbnail","preview","save","rename","delete","import","export"],"curated":15,"custom_limit":crate::filter_library::LIMIT,"file_limit":crate::filter_library::FILE_LIMIT,"scope":"Whole document; filter.add/update/delete/reorder run after the composite, independent of selected layer. Top runs last. Locks, reservations and revision guards apply.","precision":"Native 8/16-bit sources, effects and strength; previews project only for display.","preview":"Explicit current project/document/revision. Actual PNG/document_rect plus frozen commands; no shared edit or history. Thumbnails use filter_thumbnail reference coordinates.","storage":"Instance-local filters.json outside history; strict versioned import/export. Curated immutable, invalid or externally changed files preserved.","psd":"Format 15 editable sources plus current filtered standard raster/mask/composite; older readers remain protected.","cache_bytes":crate::filters::CACHE_BUDGET,"limits":"32 document filters; native derived output/scratch budgets apply. Liquify is a layer effect."});
+    result["filter_library"] = json!({"tool":"peerbrush_filters","actions":["list","thumbnail","preview","save","rename","delete","import","export"],"curated":15,"custom_limit":crate::filter_library::LIMIT,"file_limit":crate::filter_library::FILE_LIMIT,"scope":"Whole document; filter.add/update/delete/reorder run after the composite, independent of selected layer. Top runs last. Locks, reservations and revision guards apply.","precision":"Native 8/16-bit sources, effects and strength; previews project only for display.","preview":"Explicit current project/document/revision. Actual PNG/document_rect plus frozen commands; no shared edit or history. Thumbnails use filter_thumbnail reference coordinates.","storage":"Configured preferences directory filters.json outside history; strict versioned import/export. Curated immutable, invalid or externally changed files preserved.","psd":"Format 15 editable sources plus current filtered standard raster/mask/composite; older readers remain protected.","cache_bytes":crate::filters::CACHE_BUDGET,"limits":"32 document filters; native derived output/scratch budgets apply. Liquify is a layer effect."});
     result
 }
 
@@ -760,6 +1245,21 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
+    let persistent = match method {
+        "brushes" => matches!(p["action"].as_str(), Some("save" | "delete")),
+        "tool_settings" => p["action"] == "set",
+        "filters" => matches!(
+            p["action"].as_str(),
+            Some("save" | "rename" | "delete" | "import")
+        ),
+        _ => false,
+    };
+    let _operation = persistent
+        .then(|| FileOperation::begin_workspace(&crate::workspace::attach(shared)))
+        .transpose()?;
+    if method == "fonts" {
+        return fonts::request(p);
+    }
     if method == "exports" {
         return crate::production_export::request(shared, p);
     }
@@ -796,7 +1296,8 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                 Ok(result)
             }
             "discard" if p["actor"] == "human" => {
-                crate::recovery::discard(
+                crate::recovery::discard_in(
+                    &workspace,
                     &dir,
                     p["snapshot"]
                         .as_str()
@@ -1329,6 +1830,8 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     "calibration",
                     "view",
                     "shortcuts",
+                    "updates",
+                    "application_info",
                 ]
                 .contains(&name)
             }) {
@@ -1687,11 +2190,32 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     p["convert_to_srgb"].as_bool().unwrap_or(false),
                     p["document_id"].as_str(),
                 )?,
-                "save" => {
+                "save" | "save_async" => {
                     let path = path
                         .or_else(|| shared.lock().unwrap().path.clone())
                         .ok_or("Choose a PSD or PSB path")?;
-                    save_guarded(shared, &path, p)?;
+                    if action == "save_async" {
+                        save_async(shared, path, p)?;
+                    } else {
+                        save_guarded(shared, &path, p)?;
+                    }
+                }
+                "cancel_save" => {
+                    let control = {
+                        let e = shared.lock().unwrap();
+                        crate::workspace::validate_target(&e, p)?;
+                        e.saving.clone().ok_or("No working save to cancel")?
+                    };
+                    let run = p["run"]
+                        .as_str()
+                        .ok_or("Observe state.saving.run before canceling")?;
+                    if control.status().run != run {
+                        return Err("Save run changed; observe its current status".into());
+                    }
+                    let accepted = control.cancel();
+                    return Ok(
+                        json!({"run":run,"cancel_accepted":accepted,"saving":control.status()}),
+                    );
                 }
                 "export" => export_guarded(shared, path.as_deref().ok_or("Missing path")?, p)?,
                 _ => return Err("Unknown document action".into()),
@@ -1742,6 +2266,7 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             let method = name.strip_prefix("peerbrush_").unwrap_or(name);
             if ![
                 "capabilities",
+                "fonts",
                 "exports",
                 "brushes",
                 "tool_settings",
@@ -2495,6 +3020,16 @@ fn handle_http(
 }
 
 pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
+    start_with_preferences(shared, state_dir.clone(), &state_dir, &state_dir)
+}
+
+/// Preferences/cache may be per-user while external discovery and recovery stay stable.
+pub fn start_with_preferences(
+    shared: Shared,
+    state_dir: PathBuf,
+    preferences: &Path,
+    cache: &Path,
+) -> Result<Connection, String> {
     fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
     let instance_lock = fs::OpenOptions::new()
         .create(true)
@@ -2504,24 +3039,24 @@ pub fn start(shared: Shared, state_dir: PathBuf) -> Result<Connection, String> {
         .open(state_dir.join("instance.lock"))
         .map_err(|e| e.to_string())?;
     instance_lock.try_lock().map_err(|_|"PeerBrush is already running for this workspace. Use that window or a different --state-dir.".to_string())?;
-    crate::disk_cache::configure(&state_dir);
-    let library = crate::brush_library::Library::load(state_dir.join("brushes.json"));
+    crate::disk_cache::configure(cache);
+    let library = crate::brush_library::Library::load(preferences.join("brushes.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().brush_library.lock().unwrap() = library;
-    let preferences = crate::tool_settings::Store::load(state_dir.join("tool-settings.json"));
-    if let Some(error) = &preferences.error {
+    let tools = crate::tool_settings::Store::load(preferences.join("tool-settings.json"));
+    if let Some(error) = &tools.error {
         shared.lock().unwrap().status = error.clone();
     }
-    *shared.lock().unwrap().tool_settings.lock().unwrap() = preferences;
-    let library = crate::filter_library::Library::load(state_dir.join("filters.json"));
+    *shared.lock().unwrap().tool_settings.lock().unwrap() = tools;
+    let library = crate::filter_library::Library::load(preferences.join("filters.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }
     *shared.lock().unwrap().filter_library.lock().unwrap() = library;
     let library =
-        crate::production_export::library::Library::load(state_dir.join("export-presets.json"));
+        crate::production_export::library::Library::load(preferences.join("export-presets.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone();
     }
@@ -2590,7 +3125,6 @@ pub fn recovery_projects(state_dir: &Path) -> Vec<(String, PathBuf)> {
     results.extend(crate::recovery::legacy(state_dir));
     results
 }
-use std::io::Read;
 pub fn default_state_dir() -> PathBuf {
     std::env::temp_dir().join("PeerBrush")
 }
@@ -2646,53 +3180,18 @@ fn client_with_timeout(
     payload: &Value,
     timeout: std::time::Duration,
 ) -> Result<Value, String> {
-    let conn: Value = serde_json::from_slice(
-        &fs::read(state_dir.join("connection.json"))
-            .map_err(|_| "PeerBrush is not running. Open the application, then retry.")?,
-    )
-    .map_err(|_| "PeerBrush connection information is invalid. Reopen the application.")?;
-    let url = conn["url"]
-        .as_str()
-        .ok_or("Invalid PeerBrush connection information. Reopen the application.")?;
-    if !url.starts_with("http://127.0.0.1:") {
-        return Err("Connection must use the local PeerBrush endpoint".into());
-    }
-    let token = conn["token"]
-        .as_str()
-        .ok_or("Invalid PeerBrush connection token. Reopen the application.")?;
-    let bridge = endpoint == "mcp";
-    let endpoint = if bridge { "rpc" } else { endpoint };
-    let payload = if bridge {
-        json!({"method":"mcp","params":{"request":payload}})
-    } else {
-        payload.clone()
-    };
-    let response: Value = ureq::post(&format!("{url}/{endpoint}"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .timeout(timeout)
-        .send_json(payload)
-        .map_err(|error| match error {
-            ureq::Error::Transport(ref transport)
-                if transport.kind() == ureq::ErrorKind::ConnectionFailed =>
-            {
-                "PeerBrush is not running or cannot be reached. Open the application, then retry."
-                    .into()
-            }
-            ureq::Error::Transport(ref transport)
-                if transport.kind() == ureq::ErrorKind::Io =>
-            {
-                "The PeerBrush connection was interrupted or timed out. Check the application and observe the current document before retrying an edit."
-                    .into()
-            }
-            ureq::Error::Status(401, _) => {
-                "PeerBrush rejected stale connection information. Reopen the application, then retry."
-                    .into()
-            }
-            _ => error.to_string(),
-        })?
-        .into_json()
-        .map_err(|e| e.to_string())?;
-    if bridge {
+    let response = connection_request(state_dir, endpoint, payload, timeout)
+        .and_then(|response| {
+            serde_json::from_reader::<_, Value>(response.into_reader()).map_err(|error| {
+                ConnectionProbe::new(if error.is_io() {
+                    ConnectionCategory::ConnectionInterrupted
+                } else {
+                    ConnectionCategory::ResponseInvalid
+                })
+            })
+        })
+        .map_err(|failure| failure.message.to_owned())?;
+    if endpoint == "mcp" {
         if response["ok"] == true {
             Ok(response["result"].clone())
         } else {
@@ -2703,6 +3202,188 @@ fn client_with_timeout(
         }
     } else {
         Ok(response)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConnectionCategory {
+    Ready,
+    ConnectionMissing,
+    ConnectionUnreadable,
+    ConnectionInvalid,
+    ListenerUnreachable,
+    AuthenticationRejected,
+    ConnectionInterrupted,
+    ResponseRejected,
+    ResponseInvalid,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub(crate) struct ConnectionProbe {
+    pub category: ConnectionCategory,
+    pub message: &'static str,
+    pub recovery: &'static str,
+}
+impl ConnectionProbe {
+    fn new(category: ConnectionCategory) -> Self {
+        use ConnectionCategory::*;
+        let (message, recovery) = match category {
+            Ready => (
+                "PeerBrush's local MCP bridge is ready.",
+                "Use the exact stdio command and arguments from discovery.",
+            ),
+            ConnectionMissing => (
+                "PeerBrush connection information is missing. Open the application, then retry.",
+                "Open PeerBrush for the selected state directory; use Connect AI if setup is missing.",
+            ),
+            ConnectionUnreadable => (
+                "PeerBrush connection information cannot be read.",
+                "Check access to the selected state directory, then reopen the application.",
+            ),
+            ConnectionInvalid => (
+                "PeerBrush connection information is invalid. Reopen the application.",
+                "Reopen PeerBrush for the selected state directory to refresh its local connection information.",
+            ),
+            ListenerUnreachable => (
+                "PeerBrush's local listener cannot be reached. Open the application, allow it to finish starting, then retry.",
+                "Open PeerBrush for the selected state directory and allow startup to finish; if it is already open, reopen it.",
+            ),
+            AuthenticationRejected => (
+                "PeerBrush rejected stale connection information. Reopen the application, then retry.",
+                "Reopen PeerBrush to refresh the selected instance's local connection information.",
+            ),
+            ConnectionInterrupted => (
+                "The PeerBrush connection was interrupted or timed out. Check the application and observe the current document before retrying an edit.",
+                "Check PeerBrush and observe the current document before retrying any edit; a timed out edit may have completed.",
+            ),
+            ResponseRejected => (
+                "The local endpoint rejected or redirected the PeerBrush request.",
+                "Reopen PeerBrush to refresh the selected instance's local connection information, then retry.",
+            ),
+            ResponseInvalid => (
+                "The local endpoint returned an invalid PeerBrush response.",
+                "Reopen PeerBrush for the selected state directory, then retry.",
+            ),
+        };
+        Self {
+            category,
+            message,
+            recovery,
+        }
+    }
+}
+
+fn canonical_local_url(url: &str) -> bool {
+    url.strip_prefix("http://127.0.0.1:")
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some_and(|port| port != 0 && url == format!("http://127.0.0.1:{port}"))
+}
+
+fn connection_request(
+    state_dir: &Path,
+    endpoint: &str,
+    payload: &Value,
+    timeout: std::time::Duration,
+) -> Result<ureq::Response, ConnectionProbe> {
+    use ConnectionCategory::*;
+    if !matches!(endpoint, "rpc" | "mcp") {
+        return Err(ConnectionProbe::new(ConnectionInvalid));
+    }
+    let io_failure = |error: std::io::Error| {
+        ConnectionProbe::new(if error.kind() == std::io::ErrorKind::NotFound {
+            ConnectionMissing
+        } else {
+            ConnectionUnreadable
+        })
+    };
+    let path = state_dir.join("connection.json");
+    if !fs::metadata(&path).map_err(io_failure)?.is_file() {
+        return Err(ConnectionProbe::new(ConnectionUnreadable));
+    }
+    let file = fs::File::open(&path).map_err(io_failure)?;
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ConnectionProbe::new(ConnectionUnreadable))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(ConnectionProbe::new(ConnectionInvalid));
+    }
+    let conn: Value =
+        serde_json::from_slice(&bytes).map_err(|_| ConnectionProbe::new(ConnectionInvalid))?;
+    let url = conn["url"]
+        .as_str()
+        .filter(|url| canonical_local_url(url))
+        .ok_or_else(|| ConnectionProbe::new(ConnectionInvalid))?;
+    let token = conn["token"]
+        .as_str()
+        .filter(|token| {
+            !token.is_empty()
+                && token.len() <= 512
+                && token.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+        .ok_or_else(|| ConnectionProbe::new(ConnectionInvalid))?;
+    let bridge = endpoint == "mcp";
+    let endpoint = if bridge { "rpc" } else { endpoint };
+    let payload = if bridge {
+        json!({"method":"mcp","params":{"request":payload}})
+    } else {
+        payload.clone()
+    };
+    // Local authentication must never follow redirects or use an environment proxy.
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .build();
+    let response = agent
+        .post(&format!("{url}/{endpoint}"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(timeout)
+        .send_json(payload)
+        .map_err(|error| match error {
+            ureq::Error::Transport(ref transport)
+                if transport.kind() == ureq::ErrorKind::ConnectionFailed =>
+            {
+                ConnectionProbe::new(ListenerUnreachable)
+            }
+            ureq::Error::Transport(ref transport) if transport.kind() == ureq::ErrorKind::Io => {
+                ConnectionProbe::new(ConnectionInterrupted)
+            }
+            ureq::Error::Status(401, _) => ConnectionProbe::new(AuthenticationRejected),
+            _ => ConnectionProbe::new(ResponseRejected),
+        })?;
+    if response.status() != 200 {
+        return Err(ConnectionProbe::new(ResponseRejected));
+    }
+    Ok(response)
+}
+
+pub(crate) fn probe_connection(state_dir: &Path) -> ConnectionProbe {
+    let id = format!("discovery-probe-{}", engine::id());
+    let ping = json!({"jsonrpc":"2.0","id":id,"method":"ping","_client":id});
+    let response = connection_request(state_dir, "mcp", &ping, std::time::Duration::from_secs(1))
+        .and_then(|response| {
+            let mut bytes = Vec::new();
+            response
+                .into_reader()
+                .take(64 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| ConnectionProbe::new(ConnectionCategory::ConnectionInterrupted))?;
+            if bytes.len() > 64 * 1024 {
+                return Err(ConnectionProbe::new(ConnectionCategory::ResponseInvalid));
+            }
+            serde_json::from_slice::<Value>(&bytes)
+                .map_err(|_| ConnectionProbe::new(ConnectionCategory::ResponseInvalid))
+        });
+    match response {
+        Ok(response)
+            if response["ok"] == true
+                && response["result"] == json!({"jsonrpc":"2.0","id":id,"result":{}}) =>
+        {
+            ConnectionProbe::new(ConnectionCategory::Ready)
+        }
+        Ok(_) => ConnectionProbe::new(ConnectionCategory::ResponseInvalid),
+        Err(failure) => failure,
     }
 }
 
@@ -2812,6 +3493,106 @@ mod save_loss_tests {
     use crate::engine::Document;
 
     #[test]
+    fn derived_format_failure_cancellation_and_later_human_work_preserve_the_destination() {
+        use crate::production_export::{self, Control, Format};
+        for format in [Format::Webp, Format::Jxl] {
+            for depth in [8, 16] {
+                for failure in ["encode", "cancel", "source"] {
+                    let root =
+                        std::env::temp_dir().join(format!("peerbrush-webp-race-{}", engine::id()));
+                    std::fs::create_dir(&root).unwrap();
+                    let path = root.join(format!("Original.{}", format.extension()));
+                    let mut engine = Engine::new();
+                    engine.doc = Document::new_depth(8, 6, depth).unwrap();
+                    let shared = Arc::new(Mutex::new(engine));
+                    export(&shared, &path).unwrap();
+                    let original = std::fs::read(&path).unwrap();
+                    let source = shared.lock().unwrap().doc.clone();
+                    let before = serde_json::to_value(&source).unwrap();
+                    let control = Control::default();
+                    let error = export_derived_guarded(&shared, &path,
+                    &json!({"document_id":source.id,"expected_revision":source.revision,"overwrite":true}),
+                    &control, |doc| {
+                        let bytes = production_export::render_document(doc, format, crate::jpeg_xl::Options::default(), &control)?;
+                        match failure {
+                            "encode" => return Err("Injected encoder failure before publication".into()),
+                            "cancel" => control.cancel(),
+                            "source" => {
+                                shared.lock().unwrap().edit("human",
+                                    &[json!({"op":"fill","layer":source.layers[0].id,"rect":[1,2,3,4],"color":[53,97,173,255]})],
+                                    None, None, "Later human pixels")?;
+                            }
+                            _ => unreachable!(),
+                        }
+                        Ok(bytes)
+                    }).unwrap_err();
+                    assert!(
+                        error.contains(match failure {
+                            "encode" => "encoder failure",
+                            "cancel" => "canceled",
+                            _ => "source changed",
+                        }),
+                        "{error}"
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                    let engine = shared.lock().unwrap();
+                    assert_eq!(engine.doc.bit_depth, depth);
+                    assert_eq!(engine.saved_revision, 0);
+                    if failure == "source" {
+                        assert_eq!(
+                            engine.doc.layers[0].pixels.get16(1, 2),
+                            [53 * 257, 97 * 257, 173 * 257, 65535]
+                        );
+                        assert_eq!(engine.undo.len(), 1);
+                    } else {
+                        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                        assert!(engine.undo.is_empty());
+                    }
+                    assert_eq!(
+                        std::fs::read_dir(&root)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|entry| entry.file_type().unwrap().is_file())
+                            .count(),
+                        1
+                    );
+                    drop(engine);
+                    drop(shared);
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_format_alias_cannot_change_the_resolved_output_format() {
+        for format in [
+            crate::production_export::Format::Webp,
+            crate::production_export::Format::Jxl,
+        ] {
+            let root = std::env::temp_dir().join(format!("peerbrush-webp-alias-{}", engine::id()));
+            std::fs::create_dir(&root).unwrap();
+            let original = root.join("Original.png");
+            std::fs::write(&original, b"Exact original PNG").unwrap();
+            let alias = root.join(format!("Alias.{}", format.extension()));
+            std::os::unix::fs::symlink(&original, &alias).unwrap();
+            let shared = Arc::new(Mutex::new(Engine::new()));
+            let doc = shared.lock().unwrap().doc.clone();
+            let error =
+                export_confirmed_source(&shared, &alias, &doc.id, doc.revision).unwrap_err();
+            assert!(
+                error.contains("same PNG, WebP or JPEG XL format"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&original).unwrap(), b"Exact original PNG");
+            assert!(shared.lock().unwrap().undo.is_empty());
+            drop(shared);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn derived_exports_refuse_later_human_work_and_cancellation_at_publication() {
         for depth in [8, 16] {
             for cancel in [false, true] {
@@ -2896,5 +3677,405 @@ mod save_loss_tests {
             drop(shared);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use std::{net::TcpListener, time::Duration};
+
+    const CANARY: &str = "SYNTHETIC_PRIVATE_CONNECTION_CANARY";
+
+    struct State(PathBuf);
+    impl State {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("peerbrush-probe-{}", engine::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn write(&self, url: &str) {
+            fs::write(
+                self.0.join("connection.json"),
+                json!({"url":url,"token":CANARY}).to_string(),
+            )
+            .unwrap();
+        }
+    }
+    impl Drop for State {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0.join("connection.json"));
+            let _ = fs::remove_dir(self.0.join("connection.json"));
+            let _ = fs::remove_file(self.0.join("linked-connection.json"));
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+    fn mock(
+        state: &State,
+        reply: impl FnOnce(tiny_http::Request, Value) + Send + 'static,
+    ) -> thread::JoinHandle<()> {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        state.write(&format!(
+            "http://127.0.0.1:{}",
+            server.server_addr().to_ip().unwrap().port()
+        ));
+        thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .expect("local probe request");
+            assert_eq!(request.method(), &tiny_http::Method::Post);
+            assert_eq!(request.url(), "/rpc");
+            assert!(request
+                .headers()
+                .iter()
+                .any(|header| header.field.equiv("Authorization")
+                    && header.value.as_str() == format!("Bearer {CANARY}")));
+            let body = serde_json::from_reader(request.as_reader()).unwrap();
+            reply(request, body);
+        })
+    }
+    fn check(probe: ConnectionProbe, expected: ConnectionCategory) {
+        assert_eq!(probe.category, expected);
+        let text = serde_json::to_string(&probe).unwrap();
+        assert!(!text.contains(CANARY));
+        assert!(!text.contains("http://"));
+    }
+
+    #[test]
+    fn canonical_loopback_origin_rejects_userinfo_and_other_url_components() {
+        for port in [1, 80, 65535] {
+            assert!(canonical_local_url(&format!("http://127.0.0.1:{port}")));
+        }
+        for url in [
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:00080",
+            "http://127.0.0.1:+80",
+            "http://127.0.0.1:80/",
+            "http://127.0.0.1:80/rpc",
+            "http://127.0.0.1:80?query",
+            "http://127.0.0.1:80#fragment",
+            "http://127.0.0.1:80@example.invalid",
+            "http://127.0.0.1:80\\@example.invalid",
+            "http://127.0.0.1:80\n",
+            " http://127.0.0.1:80",
+            "HTTP://127.0.0.1:80",
+            "https://127.0.0.1:80",
+            "http://localhost:80",
+            "http://127.1:80",
+            "http://[::1]:80",
+        ] {
+            assert!(!canonical_local_url(url), "must reject {url:?}");
+        }
+    }
+
+    #[test]
+    fn connection_metadata_failures_are_bounded_and_secret_free() {
+        use ConnectionCategory::*;
+        let state = State::new();
+        check(probe_connection(&state.0), ConnectionMissing);
+        let path = state.0.join("connection.json");
+        fs::create_dir(&path).unwrap();
+        check(probe_connection(&state.0), ConnectionUnreadable);
+        fs::remove_dir(&path).unwrap();
+        for bytes in [
+            format!("{{{CANARY}"),
+            CANARY.repeat(3000),
+            json!({"url":"http://127.0.0.1:1"}).to_string(),
+            json!({"url":"http://127.0.0.1:1","token":""}).to_string(),
+            json!({"url":"http://127.0.0.1:1","token":format!("{CANARY}\r\nHeader: value")})
+                .to_string(),
+            json!({"url":format!("http://127.0.0.1:1@{CANARY}.invalid"),"token":CANARY})
+                .to_string(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            check(probe_connection(&state.0), ConnectionInvalid);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        state.write(&format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        ));
+        drop(listener);
+        check(probe_connection(&state.0), ListenerUnreachable);
+    }
+
+    #[test]
+    fn invalid_routes_never_send_authorization() {
+        let state = State::new();
+        let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+        trap.set_nonblocking(true).unwrap();
+        let origin = format!("http://127.0.0.1:{}", trap.local_addr().unwrap().port());
+        for url in [
+            format!(
+                "http://127.0.0.1:1@127.0.0.1:{}",
+                trap.local_addr().unwrap().port()
+            ),
+            format!("{origin}/{CANARY}"),
+            format!("{origin}?{CANARY}"),
+            format!("{origin}#{CANARY}"),
+        ] {
+            state.write(&url);
+            check(
+                connection_request(&state.0, "rpc", &json!({}), Duration::from_millis(100))
+                    .unwrap_err(),
+                ConnectionCategory::ConnectionInvalid,
+            );
+        }
+        state.write(&origin);
+        check(
+            connection_request(
+                &state.0,
+                "rpc/other",
+                &json!({}),
+                Duration::from_millis(100),
+            )
+            .unwrap_err(),
+            ConnectionCategory::ConnectionInvalid,
+        );
+        assert_eq!(
+            trap.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn probe_ping_leaves_presence_focus_history_and_sources_unchanged() {
+        let state = State::new();
+        let shared = Arc::new(Mutex::new(Engine::new()));
+        shared
+            .lock()
+            .unwrap()
+            .mcp_clients
+            .insert("direct-mcp".into(), 123);
+        let snapshot = |engine: &Engine| {
+            json!({"doc":engine.doc,"clients":engine.mcp_clients,
+            "undo":engine.undo.len(),"redo":engine.redo.len(),"saved":engine.saved_revision,
+            "focus":engine.focus_requested,"activity":engine.activity,"status":engine.status})
+        };
+        let before = snapshot(&shared.lock().unwrap());
+        let engine = shared.clone();
+        let worker = mock(&state, move |request, body| {
+            assert_eq!(body["method"], "mcp");
+            let ping = &body["params"]["request"];
+            assert_eq!(ping["method"], "ping");
+            assert_eq!(ping["_client"], ping["id"]);
+            assert!(ping["_client"]
+                .as_str()
+                .unwrap()
+                .starts_with("discovery-probe-"));
+            let result = mcp(&engine, ping);
+            request
+                .respond(tiny_http::Response::from_string(
+                    json!({"ok":true,"result":result}).to_string(),
+                ))
+                .unwrap();
+        });
+        #[cfg(unix)]
+        {
+            fs::rename(
+                state.0.join("connection.json"),
+                state.0.join("linked-connection.json"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("linked-connection.json", state.0.join("connection.json"))
+                .unwrap();
+        }
+        let metadata = fs::read(state.0.join("connection.json")).unwrap();
+        check(probe_connection(&state.0), ConnectionCategory::Ready);
+        worker.join().unwrap();
+        assert_eq!(snapshot(&shared.lock().unwrap()), before);
+        assert_eq!(fs::read(state.0.join("connection.json")).unwrap(), metadata);
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(state.0.join("connection.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn probe_authentication_and_bad_replies_have_fixed_categories() {
+        use ConnectionCategory::*;
+        for (status, body, category) in [
+            (401, CANARY, AuthenticationRejected),
+            (500, CANARY, ResponseRejected),
+            (200, CANARY, ResponseInvalid),
+            (200, "{}", ResponseInvalid),
+            (
+                200,
+                r#"{"ok":true,"result":{"jsonrpc":"2.0","id":"wrong","result":{}}}"#,
+                ResponseInvalid,
+            ),
+        ] {
+            let state = State::new();
+            let worker = mock(&state, move |request, _| {
+                request
+                    .respond(tiny_http::Response::from_string(body).with_status_code(status))
+                    .unwrap();
+            });
+            check(probe_connection(&state.0), category);
+            worker.join().unwrap();
+        }
+        for field in ["jsonrpc", "result", "error"] {
+            let state = State::new();
+            let worker = mock(&state, move |request, body| {
+                let mut result =
+                    json!({"jsonrpc":"2.0","id":body["params"]["request"]["id"],"result":{}});
+                result[field] = json!(CANARY);
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"ok":true,"result":result}).to_string(),
+                    ))
+                    .unwrap();
+            });
+            check(probe_connection(&state.0), ResponseInvalid);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn local_redirects_are_rejected_without_following_them() {
+        let state = State::new();
+        let trap = TcpListener::bind("127.0.0.1:0").unwrap();
+        trap.set_nonblocking(true).unwrap();
+        let target = format!(
+            "http://127.0.0.1:{}/{CANARY}",
+            trap.local_addr().unwrap().port()
+        );
+        let worker = mock(&state, move |request, _| {
+            let redirect = tiny_http::Response::empty(302)
+                .with_header(tiny_http::Header::from_bytes("Location", target).unwrap());
+            request.respond(redirect).unwrap();
+        });
+        check(
+            probe_connection(&state.0),
+            ConnectionCategory::ResponseRejected,
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            trap.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn public_client_preserves_actual_engine_and_mcp_errors() {
+        let message = "Project has unsaved changes; save or explicitly discard them";
+        for endpoint in ["rpc", "mcp"] {
+            let state = State::new();
+            let worker = mock(&state, move |request, _| {
+                request
+                    .respond(tiny_http::Response::from_string(
+                        json!({"ok":false,"error":message}).to_string(),
+                    ))
+                    .unwrap();
+            });
+            let result = client(&state.0, endpoint, &json!({"method":"document"}));
+            if endpoint == "mcp" {
+                assert_eq!(result.unwrap_err(), message);
+            } else {
+                assert_eq!(result.unwrap(), json!({"ok":false,"error":message}));
+            }
+            worker.join().unwrap();
+        }
+        let state = State::new();
+        let tool_error = json!({"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":message}]}});
+        let expected = tool_error.clone();
+        let worker = mock(&state, move |request, _| {
+            request
+                .respond(tiny_http::Response::from_string(
+                    json!({"ok":true,"result":tool_error}).to_string(),
+                ))
+                .unwrap();
+        });
+        assert_eq!(
+            client(&state.0, "mcp", &json!({"id":1,"method":"tools/call"})).unwrap(),
+            expected
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn probe_times_out_with_fixed_recovery_instead_of_hanging() {
+        let state = State::new();
+        let worker = mock(&state, |request, _| {
+            thread::sleep(Duration::from_millis(1250));
+            let _ = request.respond(tiny_http::Response::from_string(CANARY));
+        });
+        let started = std::time::Instant::now();
+        check(
+            probe_connection(&state.0),
+            ConnectionCategory::ConnectionInterrupted,
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn probe_response_budget_rejects_oversize_without_limiting_normal_client_replies() {
+        let state = State::new();
+        let worker = mock(&state, |request, body| {
+            let response = json!({"ok":true,"result":{"jsonrpc":"2.0",
+                "id":body["params"]["request"]["id"],"result":{}}})
+            .to_string()
+                + " ".repeat(64 * 1024).as_str();
+            let _ = request.respond(tiny_http::Response::from_string(response));
+        });
+        check(
+            probe_connection(&state.0),
+            ConnectionCategory::ResponseInvalid,
+        );
+        worker.join().unwrap();
+        let worker = mock(&state, |request, _| {
+            let result = json!({"ok":true,"result":{"large":CANARY.repeat(3000)}});
+            request
+                .respond(tiny_http::Response::from_string(result.to_string()))
+                .unwrap();
+        });
+        let result = client(&state.0, "mcp", &json!({"method":"tools/call"})).unwrap();
+        assert_eq!(result["large"], CANARY.repeat(3000));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn interrupted_response_body_does_not_expose_content_or_claim_invalid_json() {
+        let state = State::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        state.write(&format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        ));
+        let worker = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "local interruption request"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("local interruption listener failed: {error}"),
+                }
+            };
+            // BSD accepts inherit the listener's mode; reads use the timeout below.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{{\"{CANARY}").as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+        check(
+            probe_connection(&state.0),
+            ConnectionCategory::ConnectionInterrupted,
+        );
+        worker.join().unwrap();
     }
 }

@@ -19,7 +19,10 @@ const TOOLS: &[(&str, &str, Tool)] = &[
     ("Pan", "H", Tool::Pan),
     ("Selection", "M", Tool::Selection),
     ("Magic wand", "K", Tool::MagicWand),
+    ("Text", "T", Tool::Text),
 ];
+const TEXT_UNASSIGNED: &str =
+    "Text shortcut is unassigned. Choose a key in Keyboard and pen shortcuts.";
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Binding {
@@ -34,9 +37,14 @@ impl Binding {
         let Some(key) = self.key() else {
             return false;
         };
-        let mods = key_modifiers(input, key);
-        !mods.command && !mods.ctrl && !mods.alt && mods.shift == self.shift &&
-            (input.key_pressed(key) || input.events.iter().any(|e| matches!(e, egui::Event::Key {physical_key:Some(k),pressed:true,..} if *k==key)))
+        // egui-winit resolves logical keys, with one physical fallback for
+        // non-Latin layouts. Matching both here would dispatch two actions.
+        input.events.iter().any(|event| {
+            matches!(event,
+            egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                if *k == key && !modifiers.command && !modifiers.ctrl && !modifiers.alt
+                    && modifiers.shift == self.shift)
+        })
     }
     fn held(&self, input: &egui::InputState) -> bool {
         !input.modifiers.command
@@ -46,6 +54,9 @@ impl Binding {
             && self.key().is_some_and(|key| input.key_down(key))
     }
     fn label(&self) -> String {
+        if self.key.is_empty() {
+            return "Unassigned".into();
+        }
         format!("{}{}", if self.shift { "Shift+" } else { "" }, self.key)
     }
 }
@@ -89,7 +100,7 @@ impl Default for Preferences {
             );
         }
         Self {
-            version: 1,
+            version: 2,
             bindings,
             buttons: ["Eraser".into(), "Pan".into()],
         }
@@ -103,6 +114,12 @@ pub(super) struct Shortcuts {
     pub open: bool,
     pub message: String,
     temporary: Option<Tool>,
+}
+pub(crate) fn validate_file(path: &Path) -> Result<(), String> {
+    if let Some(bytes) = crate::tool_settings::read_owned(path)? {
+        Shortcuts::decode(&bytes)?;
+    }
+    Ok(())
 }
 impl Shortcuts {
     pub fn load(state: &Path) -> Self {
@@ -119,13 +136,14 @@ impl Shortcuts {
             let result = (|| {
                 this.original = crate::tool_settings::read_owned(path)?;
                 if let Some(bytes) = &this.original {
-                    let prefs: Preferences = serde_json::from_slice(bytes)
-                        .map_err(|e| format!("Unreadable shortcuts: {e}"))?;
-                    Self::validate(&prefs)?;
+                    let prefs = Self::decode(bytes)?;
                     if crate::tool_settings::read_owned(path)? != this.original {
                         return Err("Shortcuts changed while loading".into());
                     }
                     this.preferences = prefs;
+                    if this.preferences.bindings["Text"].key.is_empty() {
+                        this.message = TEXT_UNASSIGNED.into();
+                    }
                 }
                 Ok::<_, String>(())
             })();
@@ -179,13 +197,38 @@ impl Shortcuts {
                 | egui::Key::CloseBracket
         )
     }
+    fn decode(bytes: &[u8]) -> Result<Preferences, String> {
+        let mut prefs: Preferences =
+            serde_json::from_slice(bytes).map_err(|e| format!("Unreadable shortcuts: {e}"))?;
+        if prefs.version == 1 {
+            let defaults = Preferences::default();
+            if prefs.bindings.keys().ne(defaults
+                .bindings
+                .keys()
+                .filter(|action| action.as_str() != "Text"))
+            {
+                return Err("Unsupported shortcut preferences".into());
+            }
+            let mut text = defaults.bindings["Text"].clone();
+            if prefs.bindings.values().any(|binding| *binding == text) {
+                text.key.clear();
+            }
+            prefs.bindings.insert("Text".into(), text);
+            prefs.version = 2;
+        }
+        Self::validate(&prefs)?;
+        Ok(prefs)
+    }
     fn validate(prefs: &Preferences) -> Result<(), String> {
         let defaults = Preferences::default();
-        if prefs.version != 1 || prefs.bindings.keys().ne(defaults.bindings.keys()) {
+        if prefs.version != 2 || prefs.bindings.keys().ne(defaults.bindings.keys()) {
             return Err("Unsupported shortcut preferences".into());
         }
         let mut used = BTreeMap::new();
         for (action, binding) in &prefs.bindings {
+            if action == "Text" && binding.key.is_empty() && !binding.shift {
+                continue;
+            }
             if !binding
                 .key()
                 .is_some_and(|key| Self::allowed(key) && binding.key == key.symbol_or_name())
@@ -245,7 +288,7 @@ impl Shortcuts {
         self.preferences = prefs;
         Ok(())
     }
-    fn pressed(&self, action: &str, input: &egui::InputState) -> bool {
+    pub(super) fn pressed(&self, action: &str, input: &egui::InputState) -> bool {
         if self.preferences.bindings[action].pressed(input) {
             return true;
         }
@@ -254,17 +297,28 @@ impl Shortcuts {
             "Larger size" => (egui::Key::CloseBracket, "}"),
             _ => return false,
         };
-        let mods = key_modifiers(input, key);
+        let pressed_key = input.events.iter().any(|event| {
+            matches!(event,
+            egui::Event::Key { key: k, pressed: true, .. } if *k == key)
+        });
         self.preferences.bindings[action].key == key.symbol_or_name()
             && !self.preferences.bindings[action].shift
-            && !mods.command
-            && !mods.ctrl
-            && !mods.alt
-            && (input.key_pressed(key)
-                || input
-                    .events
-                    .iter()
-                    .any(|e| matches!(e,egui::Event::Text(t) if t==text)))
+            && input.events.iter().any(|event| match event {
+                egui::Event::Key {
+                    key: k,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => *k == key && !modifiers.command && !modifiers.ctrl && !modifiers.alt,
+                egui::Event::Text(t) => {
+                    !pressed_key
+                        && t == text
+                        && !input.modifiers.command
+                        && !input.modifiers.ctrl
+                        && !input.modifiers.alt
+                }
+                _ => false,
+            })
     }
     pub fn size_held(&self, input: &egui::InputState) -> bool {
         self.preferences.bindings["Size / hardness gesture"].held(input)
@@ -274,12 +328,11 @@ impl Shortcuts {
             egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => true,
             egui::Event::Key {
                 key,
-                physical_key,
                 pressed: true,
                 modifiers,
                 ..
             } => {
-                let is_key = |wanted| *key == wanted || *physical_key == Some(wanted);
+                let is_key = |wanted| *key == wanted;
                 if (modifiers.command || modifiers.ctrl)
                     && !modifiers.alt
                     && [egui::Key::C, egui::Key::X, egui::Key::V]
@@ -449,10 +502,11 @@ impl PeerBrush {
                 for (action,binding) in &mut candidate.bindings {
                     ui.horizontal(|ui| {
                         ui.add_sized(Vec2::new(200.,20.),egui::Label::new(action));
-                        egui::ComboBox::from_id_salt(action).width(50.).selected_text(&binding.key).show_ui(ui,|ui| {
+                        egui::ComboBox::from_id_salt(action).width(80.).selected_text(if binding.key.is_empty() {"Unassigned"} else {&binding.key}).show_ui(ui,|ui| {
+                            if action=="Text" && ui.selectable_label(binding.key.is_empty(),"Unassigned").clicked() {binding.key.clear();binding.shift=false;}
                             for key in egui::Key::ALL.iter().copied().filter(|key|Shortcuts::allowed(*key)) {ui.selectable_value(&mut binding.key,key.symbol_or_name().into(),key.symbol_or_name());}
                         });
-                        ui.checkbox(&mut binding.shift,"Shift");
+                        ui.add_enabled(!binding.key.is_empty(),egui::Checkbox::new(&mut binding.shift,"Shift"));
                     });
                 }
             });
@@ -469,7 +523,8 @@ impl PeerBrush {
             if candidate!=self.shortcuts.preferences {
                 self.shortcuts.message=match self.shortcuts.apply(candidate) {Ok(())=>"Preferences saved".into(),Err(error)=>error};
             }
-            if !self.shortcuts.message.is_empty() {ui.label(&self.shortcuts.message);}
+            if self.shortcuts.preferences.bindings["Text"].key.is_empty() {ui.label(TEXT_UNASSIGNED);}
+            if !self.shortcuts.message.is_empty() && self.shortcuts.message!=TEXT_UNASSIGNED {ui.label(&self.shortcuts.message);}
         });
         self.shortcuts.open = open;
     }
@@ -478,6 +533,197 @@ impl PeerBrush {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn legacy_preferences() -> Preferences {
+        let mut prefs = Preferences::default();
+        prefs.version = 1;
+        prefs.bindings.remove("Text");
+        prefs
+    }
+    #[test]
+    fn legacy_shortcuts_migrate_in_memory_with_custom_bindings_buttons_and_original_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-shortcuts-{}", crate::engine::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("shortcuts.json");
+        let mut legacy = legacy_preferences();
+        legacy.bindings.get_mut("Brush").unwrap().key = "O".into();
+        legacy.bindings.get_mut("Brush").unwrap().shift = true;
+        legacy.bindings.get_mut("Smudge").unwrap().key = "Y".into();
+        legacy.buttons = ["None".into(), "Eraser".into()];
+        let bytes = format!("{}\n  ", serde_json::to_string(&legacy).unwrap()).into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+        validate_file(&path).unwrap();
+        let mut shortcuts = Shortcuts::load(&root);
+        assert!(!shortcuts.protected);
+        assert_eq!(shortcuts.preferences.version, 2);
+        assert_eq!(shortcuts.preferences.bindings["Text"].label(), "T");
+        for (action, binding) in &legacy.bindings {
+            assert!(shortcuts.preferences.bindings[action] == *binding);
+        }
+        assert_eq!(shortcuts.preferences.buttons, legacy.buttons);
+        assert_eq!(shortcuts.original.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let locations = crate::settings::Locations {
+            config: root.join("per-user/config"),
+            data: root.join("per-user/data"),
+            cache: root.join("per-user/cache"),
+        };
+        let profile = crate::settings::Profile::migrate(locations, &root).unwrap();
+        let migrated = profile.locations.profile();
+        assert_eq!(
+            std::fs::read(migrated.join("shortcuts.json")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(migrated.join("migration-backup/shortcuts.json")).unwrap(),
+            bytes
+        );
+        assert!(Shortcuts::load(&migrated).preferences == shortcuts.preferences);
+        drop(profile);
+        let mut edited = shortcuts.preferences.clone();
+        edited.buttons[0] = "Pan".into();
+        shortcuts.apply(edited.clone()).unwrap();
+        let stored = std::fs::read(&path).unwrap();
+        assert_ne!(stored, bytes);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stored).unwrap()["version"],
+            2
+        );
+        assert!(Shortcuts::load(&root).preferences == edited);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn legacy_t_conflicts_leave_text_unassigned_without_changing_existing_chords() {
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-shortcuts-{}", crate::engine::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("shortcuts.json");
+        for shift in [false, true] {
+            let mut legacy = legacy_preferences();
+            legacy.bindings.get_mut("Brush").unwrap().key = "T".into();
+            legacy.bindings.get_mut("Brush").unwrap().shift = shift;
+            let bytes = serde_json::to_vec(&legacy).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            validate_file(&path).unwrap();
+            let mut shortcuts = Shortcuts::load(&root);
+            assert!(!shortcuts.protected);
+            assert!(shortcuts.preferences.bindings["Brush"] == legacy.bindings["Brush"]);
+            let text = &shortcuts.preferences.bindings["Text"];
+            assert_eq!(text.label(), if shift { "T" } else { "Unassigned" });
+            assert!(!text.shift);
+            assert_eq!(text.key(), shift.then_some(egui::Key::T));
+            if !shift {
+                assert_eq!(shortcuts.message, TEXT_UNASSIGNED);
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let mut edited = shortcuts.preferences.clone();
+            edited.bindings.get_mut("Text").unwrap().key = "O".into();
+            shortcuts.apply(edited).unwrap();
+            let reloaded = Shortcuts::load(&root);
+            assert_eq!(reloaded.preferences.bindings["Text"].label(), "O");
+            assert!(reloaded.preferences.bindings["Brush"] == legacy.bindings["Brush"]);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn invalid_legacy_or_current_shortcuts_remain_protected_and_byte_exact() {
+        let cases: &[(&str, fn(&mut Preferences))] = &[
+            ("unknown version", |p| p.version = 3),
+            ("zero version", |p| p.version = 0),
+            ("legacy with Text", |p| {
+                p.bindings.insert(
+                    "Text".into(),
+                    Preferences::default().bindings["Text"].clone(),
+                );
+            }),
+            ("current missing Text", |p| p.version = 2),
+            ("missing old action", |p| {
+                p.bindings.remove("Brush");
+            }),
+            ("unknown action", |p| {
+                p.bindings.insert(
+                    "Unknown".into(),
+                    Binding {
+                        key: "O".into(),
+                        shift: false,
+                    },
+                );
+            }),
+            ("duplicate chord", |p| {
+                p.bindings.get_mut("Eraser").unwrap().key = "B".into()
+            }),
+            ("noncanonical key", |p| {
+                p.bindings.get_mut("Brush").unwrap().key = "b".into()
+            }),
+            ("empty old action", |p| {
+                p.bindings.get_mut("Brush").unwrap().key.clear()
+            }),
+            ("reserved key", |p| {
+                p.bindings.get_mut("Brush").unwrap().key = "Space".into()
+            }),
+            ("invalid button", |p| p.buttons[0] = "Text".into()),
+            ("size alias conflict", |p| {
+                let binding = p.bindings.get_mut("Brush").unwrap();
+                binding.key = "[".into();
+                binding.shift = true;
+            }),
+            ("shifted unassigned Text", |p| {
+                *p = Preferences::default();
+                let binding = p.bindings.get_mut("Text").unwrap();
+                binding.key.clear();
+                binding.shift = true;
+            }),
+            ("empty current non-Text action", |p| {
+                *p = Preferences::default();
+                p.bindings.get_mut("Brush").unwrap().key.clear();
+            }),
+        ];
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-shortcuts-{}", crate::engine::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("shortcuts.json");
+        for (name, change) in cases {
+            let mut prefs = legacy_preferences();
+            change(&mut prefs);
+            let bytes = serde_json::to_vec(&prefs).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(validate_file(&path).is_err(), "{name}");
+            let mut shortcuts = Shortcuts::load(&root);
+            assert!(shortcuts.protected, "{name}");
+            assert!(shortcuts.apply(Preferences::default()).is_err(), "{name}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn migrated_shortcuts_preserve_external_bytes_and_existing_save_leases() {
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-shortcuts-{}", crate::engine::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("shortcuts.json");
+        let bytes = serde_json::to_vec(&legacy_preferences()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut shortcuts = Shortcuts::load(&root);
+        let before = shortcuts.preferences.clone();
+        let mut edited = before.clone();
+        edited.buttons[0] = "None".into();
+        let lease = crate::file_safety::Lease::acquire(&path).unwrap();
+        assert!(shortcuts.apply(edited.clone()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(shortcuts.preferences == before);
+        drop(lease);
+        let external = serde_json::to_vec_pretty(&before).unwrap();
+        std::fs::write(&path, &external).unwrap();
+        validate_file(&path).unwrap();
+        assert!(shortcuts
+            .apply(edited)
+            .unwrap_err()
+            .contains("changed on disk"));
+        assert_eq!(std::fs::read(&path).unwrap(), external);
+        assert!(shortcuts.preferences == before);
+        assert_eq!(shortcuts.original.as_deref(), Some(bytes.as_slice()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn conflicts_reset_protected_files_and_shortcut_persistence_are_atomic() {
         let root =
@@ -490,6 +736,25 @@ mod tests {
         shortcuts.apply(remapped.clone()).unwrap();
         let bytes = std::fs::read(root.join("shortcuts.json")).unwrap();
         assert!(Shortcuts::load(&root).preferences == remapped);
+        let user = root.join("per-user");
+        let locations = crate::settings::Locations {
+            config: user.join("config"),
+            data: user.join("data"),
+            cache: user.join("cache"),
+        };
+        let profile = crate::settings::Profile::migrate(locations, &root).unwrap();
+        assert!(Shortcuts::load(&profile.locations.profile()).preferences == remapped);
+        assert_eq!(
+            std::fs::read(
+                profile
+                    .locations
+                    .profile()
+                    .join("migration-backup/shortcuts.json")
+            )
+            .unwrap(),
+            bytes
+        );
+        drop(profile);
         let mut conflict = remapped.clone();
         conflict.bindings.get_mut("Brush").unwrap().key = "D".into();
         assert!(shortcuts.apply(conflict).is_err());
@@ -533,6 +798,387 @@ mod tests {
             pressed,
             repeat: false,
             modifiers: Default::default(),
+        }
+    }
+    #[test]
+    fn resolved_layout_keys_dispatch_one_binding_with_their_own_modifiers() {
+        let shortcuts = Shortcuts::load(Path::new(""));
+        for (logical, physical, shift, expected) in [
+            (egui::Key::W, egui::Key::Q, false, "Move"),
+            (egui::Key::X, egui::Key::B, false, "Swap colors"),
+            (egui::Key::R, egui::Key::E, true, "Rotate view right"),
+            (egui::Key::T, egui::Key::P, false, "Text"),
+            // Non-Latin native input has already selected its physical fallback.
+            (egui::Key::W, egui::Key::W, false, "Move"),
+        ] {
+            let ctx = egui::Context::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: logical,
+                        physical_key: Some(physical),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers {
+                            shift,
+                            ..Default::default()
+                        },
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input(|input| {
+                        let active = shortcuts
+                            .preferences
+                            .bindings
+                            .iter()
+                            .filter_map(|(name, binding)| {
+                                binding.pressed(input).then_some(name.as_str())
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(active, vec![expected]);
+                    })
+                },
+            );
+        }
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::W,
+                        physical_key: Some(egui::Key::Q),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::Key {
+                        key: egui::Key::Q,
+                        physical_key: Some(egui::Key::W),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.input(|input| {
+                    assert!(shortcuts.preferences.bindings["Move"].pressed(input));
+                    assert!(!shortcuts.preferences.bindings["Deselect"].pressed(input));
+                    assert!(command_key(input, egui::Key::Q));
+                    assert!(!command_key(input, egui::Key::W));
+                    assert!(!shortcuts.selection_dependent_event(&input.events[1]));
+                })
+            },
+        );
+        for reverse in [false, true] {
+            let ctx = egui::Context::default();
+            let modified = egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            };
+            let mut events = vec![
+                egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: Some(egui::Key::W),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+                egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: Some(egui::Key::W),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: modified,
+                },
+            ];
+            if reverse {
+                events.reverse();
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input(|input| {
+                        assert_eq!(command_modifiers(input, egui::Key::Z), Some(modified));
+                    })
+                },
+            );
+        }
+        let mut remapped = shortcuts.preferences.clone();
+        remapped.bindings.get_mut("Brush").unwrap().key = "O".into();
+        let mut shortcuts = shortcuts;
+        shortcuts.apply(remapped).unwrap();
+        for (logical, physical, expected) in [
+            (egui::Key::O, egui::Key::B, true),
+            (egui::Key::B, egui::Key::O, false),
+        ] {
+            let ctx = egui::Context::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: logical,
+                        physical_key: Some(physical),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input(|input| {
+                        assert_eq!(shortcuts.pressed("Brush", input), expected);
+                        assert!(!shortcuts.size_held(input));
+                    })
+                },
+            );
+        }
+    }
+    #[test]
+    fn alternate_latin_layouts_preserve_selection_colors_and_native_artwork() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = super::super::workspace_tests::fixture(depth);
+            app.shortcuts = Shortcuts::load(Path::new(""));
+            app.select_tool(Tool::Picker);
+            app.shared.lock().unwrap().doc.selection = Some([1, 1, 8, 8]);
+            frame(&mut app, &ctx, vec![], true);
+            let before = super::super::workspace_tests::source(&app);
+            let foreground = app.color;
+            let background = app.background;
+            for (logical, physical) in [(egui::Key::W, egui::Key::Q), (egui::Key::X, egui::Key::B)]
+            {
+                for pressed in [true, false] {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![egui::Event::Key {
+                            key: logical,
+                            physical_key: Some(physical),
+                            pressed,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        }],
+                        true,
+                    );
+                }
+                assert!(
+                    app.tool == Tool::Move,
+                    "Physical position must not dispatch another tool"
+                );
+                assert_eq!(super::super::workspace_tests::source(&app), before);
+            }
+            assert_eq!((app.color, app.background), (background, foreground));
+        }
+    }
+    #[test]
+    fn default_brace_aliases_pair_modifiers_and_keep_text_only_fallback_bounded() {
+        let mut shortcuts = Shortcuts::load(Path::new(""));
+        for (action, key, text) in [
+            ("Smaller size", egui::Key::OpenBracket, "{"),
+            ("Larger size", egui::Key::CloseBracket, "}"),
+        ] {
+            let pressed = |modifiers| egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            for reverse in [false, true] {
+                let mut events = vec![
+                    pressed(egui::Modifiers::COMMAND),
+                    pressed(egui::Modifiers::SHIFT),
+                ];
+                if reverse {
+                    events.reverse();
+                }
+                let ctx = egui::Context::default();
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.input(|input| {
+                            assert!(shortcuts.pressed(action, input));
+                        })
+                    },
+                );
+            }
+            for (events, modifiers, expected) in [
+                (
+                    vec![egui::Event::Text(text.into())],
+                    egui::Modifiers::SHIFT,
+                    true,
+                ),
+                (
+                    vec![egui::Event::Text(text.into())],
+                    egui::Modifiers::COMMAND,
+                    false,
+                ),
+                (
+                    vec![
+                        pressed(egui::Modifiers::COMMAND),
+                        egui::Event::Text(text.into()),
+                    ],
+                    egui::Modifiers::NONE,
+                    false,
+                ),
+            ] {
+                let ctx = egui::Context::default();
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        modifiers,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.input(|input| {
+                            assert_eq!(shortcuts.pressed(action, input), expected);
+                        })
+                    },
+                );
+            }
+            let mut remapped = shortcuts.preferences.clone();
+            remapped.bindings.get_mut(action).unwrap().key =
+                if action == "Smaller size" { "1" } else { "2" }.into();
+            shortcuts.apply(remapped).unwrap();
+            let ctx = egui::Context::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        pressed(egui::Modifiers::SHIFT),
+                        egui::Event::Text(text.into()),
+                    ],
+                    ..Default::default()
+                },
+                |ctx| ctx.input(|input| assert!(!shortcuts.pressed(action, input))),
+            );
+        }
+    }
+    #[test]
+    fn editing_shortcuts_use_event_modifiers_before_later_modifier_changes() {
+        for depth in [8, 16] {
+            for reverse in [false, true] {
+                let (mut app, ctx) = super::super::workspace_tests::fixture(depth);
+                app.shortcuts = Shortcuts::load(Path::new(""));
+                app.shared.lock().unwrap().doc.selection = Some([1, 1, 8, 8]);
+                frame(&mut app, &ctx, vec![], true);
+                let before = super::super::workspace_tests::source(&app);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                        time: Some(ctx.input(|i| i.time) + 0.1),
+                        modifiers: egui::Modifiers::ALT,
+                        events: vec![key(egui::Key::B, true)],
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                );
+                assert!(app.tool == Tool::Brush);
+                assert_eq!(
+                    super::super::workspace_tests::source(&app),
+                    before,
+                    "Alt pressed after B must not retroactively fill the artwork"
+                );
+                frame(&mut app, &ctx, vec![key(egui::Key::B, false)], true);
+                let doc = app.shared.lock().unwrap().doc.clone();
+                let prior_undo = app.shared.lock().unwrap().undo.len();
+                let expected = crate::engine::Engine::preview_edits(
+                    doc.clone(),
+                    &[json!({
+                        "op":"paint.clear_selection", "layer":app.selected, "mask":false
+                    })],
+                )
+                .unwrap();
+                let mut events = vec![
+                    egui::Event::Key {
+                        key: egui::Key::Delete,
+                        physical_key: Some(egui::Key::Delete),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                    key(egui::Key::Delete, true),
+                ];
+                if reverse {
+                    events.reverse();
+                }
+                frame(&mut app, &ctx, events, true);
+                let mut engine = app.shared.lock().unwrap();
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    expected.export_png().unwrap()
+                );
+                assert_eq!(engine.undo.len(), prior_undo + 1);
+                engine.undo("human").unwrap();
+                assert_eq!(engine.undo.len(), prior_undo);
+                assert_eq!(engine.doc.export_png().unwrap(), doc.export_png().unwrap());
+            }
+        }
+    }
+    #[test]
+    fn text_shortcut_respects_text_focus_and_unassigned_conflicts_at_native_depths() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = super::super::workspace_tests::fixture(depth);
+            app.shortcuts = Shortcuts::load(Path::new(""));
+            app.select_tool(Tool::Picker);
+            frame(&mut app, &ctx, vec![], true);
+            let before = super::super::workspace_tests::source(&app);
+            frame(&mut app, &ctx, vec![key(egui::Key::T, true)], true);
+            assert!(app.tool == Tool::Text);
+            frame(&mut app, &ctx, vec![key(egui::Key::T, false)], true);
+            assert_eq!(super::super::workspace_tests::source(&app), before);
+            app.select_tool(Tool::Picker);
+            let doc = app.shared.lock().unwrap().doc.clone();
+            let layer = doc
+                .layers
+                .iter()
+                .find(|layer| layer.id == app.selected)
+                .unwrap();
+            app.rename_edit = Some(RenameEdit {
+                document: doc.id.clone(),
+                layer: layer.id.clone(),
+                original: layer.name.clone(),
+                text: layer.name.clone(),
+                revision: doc.revision,
+                focus: true,
+            });
+            frame(&mut app, &ctx, vec![], true);
+            assert!(ctx
+                .memory(|memory| memory.focused())
+                .is_some_and(|id| egui::TextEdit::load_state(&ctx, id).is_some()));
+            let original_text = app.rename_edit.as_ref().unwrap().text.clone();
+            frame(
+                &mut app,
+                &ctx,
+                vec![key(egui::Key::T, true), egui::Event::Text("t".into())],
+                true,
+            );
+            assert!(app.tool == Tool::Picker);
+            assert_ne!(app.rename_edit.as_ref().unwrap().text, original_text);
+            assert!(app.rename_edit.as_ref().unwrap().text.contains('t'));
+            frame(
+                &mut app,
+                &ctx,
+                vec![key(egui::Key::T, false), key(egui::Key::Escape, true)],
+                true,
+            );
+            frame(&mut app, &ctx, vec![key(egui::Key::Escape, false)], true);
+            assert!(app.rename_edit.is_none());
+            let mut conflict = app.shortcuts.preferences.clone();
+            conflict.bindings.get_mut("Brush").unwrap().key = "T".into();
+            conflict.bindings.get_mut("Text").unwrap().key.clear();
+            app.shortcuts.apply(conflict).unwrap();
+            assert!(app.tool_caption(Tool::Text).ends_with(" · Unassigned"));
+            frame(&mut app, &ctx, vec![key(egui::Key::T, true)], true);
+            assert!(app.tool == Tool::Brush);
+            frame(&mut app, &ctx, vec![key(egui::Key::T, false)], true);
+            assert_eq!(super::super::workspace_tests::source(&app), before);
         }
     }
     #[test]

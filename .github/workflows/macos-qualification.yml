@@ -1,0 +1,252 @@
+name: PeerBrush native DMG qualification
+run-name: Read-only DMG qualification of selected stable main source
+
+# Dormant preparation: setting the enable variable and dispatching require approval.
+# No signing keys, notary credentials, installation or release publication.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full reviewed main source and workflow SHA
+        required: true
+        type: string
+      source_run_id:
+        description: Exact successful first-attempt macos-release-signing main run
+        required: true
+        type: string
+      artifact_id:
+        description: Immutable macos-signed-pair-RUN_ID-1 artifact ID
+        required: true
+        type: string
+      artifact_sha256:
+        description: Independently selected outer Actions artifact SHA256
+        required: true
+        type: string
+      archive_name:
+        description: Exact revisioned apple-signed ZIP filename
+        required: true
+        type: string
+      archive_sha256:
+        description: Independently selected signed ZIP SHA256
+        required: true
+        type: string
+      image_name:
+        description: Exact revisioned dmg-signed DMG filename
+        required: true
+        type: string
+      image_sha256:
+        description: Independently selected final DMG SHA256
+        required: true
+        type: string
+      team_id:
+        description: Reviewed public Developer ID Team identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: peerbrush-native-qualification-${{ github.sha }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PEERBRUSH_NATIVE_QUALIFICATION_ENABLED: ${{ vars.PEERBRUSH_NATIVE_QUALIFICATION_ENABLED }}
+  SELECTED_COMMIT: ${{ inputs.expected_commit }}
+  SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+  SELECTED_ARTIFACT_ID: ${{ inputs.artifact_id }}
+  ARTIFACT_SHA256: ${{ inputs.artifact_sha256 }}
+  ARCHIVE_NAME: ${{ inputs.archive_name }}
+  ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+  IMAGE_NAME: ${{ inputs.image_name }}
+  IMAGE_SHA256: ${{ inputs.image_sha256 }}
+  SELECTED_TEAM: ${{ inputs.team_id }}
+
+jobs:
+  gate:
+    name: gate
+    if: vars.PEERBRUSH_NATIVE_QUALIFICATION_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python3 -I - <<'PY'
+          import os, re
+          selected = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/macos-qualification.yml@refs/heads/main',
+              'GITHUB_SHA': selected, 'GITHUB_WORKFLOW_SHA': selected,
+              'GITHUB_RUN_ATTEMPT': '1', 'RUNNER_ENVIRONMENT': 'github-hosted',
+              'RUNNER_OS': 'macOS', 'RUNNER_ARCH': 'ARM64',
+              'PEERBRUSH_NATIVE_QUALIFICATION_ENABLED': 'true',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(key) != value for key, value in required.items()):
+              raise SystemExit('Native qualification requires the reviewed exact main invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Pin existing Python for native packaging
+        run: python -I scripts/select_native_python.py
+      - name: Require exact main source before tests
+        run: |
+          python3 -B scripts/acquire_macos_qualification_inputs.py --check-selection \
+            --source-root "$GITHUB_WORKSPACE" --commit "$SELECTED_COMMIT" \
+            --run-id "$SOURCE_RUN_ID" --artifact-id "$SELECTED_ARTIFACT_ID" --artifact-sha256 "$ARTIFACT_SHA256" \
+            --archive-name "$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" \
+            --image-name "$IMAGE_NAME" --image-sha256 "$IMAGE_SHA256" --team-id "$SELECTED_TEAM"
+          python3 -B scripts/package.py --check-source
+      - if: runner.os == 'Windows'
+        name: Initialize existing MSVC SDK for native codec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeTools = @{}
+          foreach ($name in @('clang-cl', 'cmake', 'ninja')) {
+            $nativeTools[$name] = (Get-Command $name -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Existing Visual Studio C++ tools unavailable' }
+          $launch = Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1'
+          & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          python -B scripts/jxl_build.py --github-env --selected-clang-cl ($nativeTools['clang-cl']) --selected-cmake ($nativeTools['cmake']) --selected-ninja ($nativeTools['ninja'])
+          if ($LASTEXITCODE -ne 0) { throw 'Native codec tool qualification failed' }
+      - if: runner.os != 'Windows'
+        name: Select existing native codec tools
+        run: python3 -B scripts/jxl_build.py --github-env
+      - name: Verify native codec tool selection regressions
+        run: python -B scripts/test_jxl_build.py
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy, rust-docs
+      - name: Test exact source without native attestation authority
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
+          rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
+          cargo build --locked --bin peerbrush
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets
+          python3 -B -m unittest discover -s scripts -p 'test_*.py'
+          python3 -B scripts/package.py --check-source
+
+  qualify:
+    name: qualify
+    needs: gate
+    if: vars.PEERBRUSH_NATIVE_QUALIFICATION_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && needs.gate.result == 'success'
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python3 -I - <<'PY'
+          import os, re
+          selected = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/macos-qualification.yml@refs/heads/main',
+              'GITHUB_SHA': selected, 'GITHUB_WORKFLOW_SHA': selected,
+              'GITHUB_RUN_ATTEMPT': '1', 'RUNNER_ENVIRONMENT': 'github-hosted',
+              'RUNNER_OS': 'macOS', 'RUNNER_ARCH': 'ARM64',
+              'PEERBRUSH_NATIVE_QUALIFICATION_ENABLED': 'true',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(key) != value for key, value in required.items()):
+              raise SystemExit('Native qualification requires the reviewed exact main invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Pin existing Python for native packaging
+        run: python -I scripts/select_native_python.py
+      - name: Require exact main source
+        run: |
+          python3 -B scripts/acquire_macos_qualification_inputs.py --check-selection \
+            --source-root "$GITHUB_WORKSPACE" --commit "$SELECTED_COMMIT" \
+            --run-id "$SOURCE_RUN_ID" --artifact-id "$SELECTED_ARTIFACT_ID" --artifact-sha256 "$ARTIFACT_SHA256" \
+            --archive-name "$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" \
+            --image-name "$IMAGE_NAME" --image-sha256 "$IMAGE_SHA256" --team-id "$SELECTED_TEAM"
+          python3 -B scripts/package.py --check-source
+      - name: Acquire selected signed assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          python3 -B scripts/acquire_macos_qualification_inputs.py \
+            --source-root "$GITHUB_WORKSPACE" --commit "$SELECTED_COMMIT" \
+            --run-id "$SOURCE_RUN_ID" --artifact-id "$SELECTED_ARTIFACT_ID" --artifact-sha256 "$ARTIFACT_SHA256" \
+            --archive-name "$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" \
+            --image-name "$IMAGE_NAME" --image-sha256 "$IMAGE_SHA256" --team-id "$SELECTED_TEAM" \
+            --output "$RUNNER_TEMP/peerbrush-native-inputs"
+      - name: Qualify selected final DMG
+        run: |
+          umask 077
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          python3 -B scripts/qualify_macos_dmg.py \
+            --source-root "$GITHUB_WORKSPACE" --commit "$SELECTED_COMMIT" --version "$VERSION" \
+            --archive "$RUNNER_TEMP/peerbrush-native-inputs/$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" \
+            --image "$RUNNER_TEMP/peerbrush-native-inputs/$IMAGE_NAME" --image-sha256 "$IMAGE_SHA256" --team-id "$SELECTED_TEAM" \
+            --work "$RUNNER_TEMP/peerbrush-native-inspection" --output "$RUNNER_TEMP/peerbrush-native-report"
+      - name: Attest generated native qualification
+        id: attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ runner.temp }}/peerbrush-native-report/dmg-qualification.json
+          subject-name: dmg-qualification.json
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+      - name: Retain qualification and bundle
+        env:
+          SELECTED_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import os, pathlib, sys
+          sys.path.insert(0, 'scripts')
+          from package_macos_dmg import bounded_file, private_inspection_directory
+          source = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          output = private_inspection_directory(pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-native-evidence', source, fresh=True)
+          output.mkdir(mode=0o700)
+          private_inspection_directory(output, source, fresh=False)
+          try:
+              for path, name, limit in [
+                  (pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-native-report/dmg-qualification.json', 'dmg-qualification.json', 8192),
+                  (pathlib.Path(os.environ['SELECTED_BUNDLE']), 'dmg-qualification.sigstore.json', 2 * 1024 * 1024),
+              ]:
+                  checksum, size = bounded_file(path, limit, output / name)
+                  if bounded_file(output / name, limit) != (checksum, size):
+                      raise ValueError('Native evidence copy changed.')
+          except Exception:
+              raise SystemExit('Native evidence could not be retained; no handoff is available.') from None
+          PY
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-native-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-native-evidence/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

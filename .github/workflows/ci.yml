@@ -6,18 +6,22 @@ jobs:
   branch-policy:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Verify branch-policy regressions
         run: python scripts/test_branch_policy.py
+      - name: Verify bounded CI failure diagnostics
+        run: python -B scripts/test_ci_diagnostics.py
+      - name: Verify exact release invocation guards
+        run: python -B scripts/test_release_source_guard.py
       - name: Enforce branch names and PR destinations
         shell: bash
         run: python scripts/check_branch_policy.py --event "$GITHUB_EVENT_PATH" --ref "$GITHUB_REF"
   attribution:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -54,11 +58,36 @@ jobs:
         os: [windows-2025, macos-26, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Pin existing Python for native packaging
+        if: runner.os == 'macOS'
+        run: python -I scripts/select_native_python.py
       - name: Check committed package source
         run: python scripts/package.py --check-source
-      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Windows'
+        name: Initialize existing MSVC SDK for native codec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeTools = @{}
+          foreach ($name in @('clang-cl', 'cmake', 'ninja')) {
+            $nativeTools[$name] = (Get-Command $name -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Existing Visual Studio C++ tools unavailable' }
+          $launch = Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1'
+          & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          python -B scripts/jxl_build.py --github-env --selected-clang-cl ($nativeTools['clang-cl']) --selected-cmake ($nativeTools['cmake']) --selected-ninja ($nativeTools['ninja'])
+          if ($LASTEXITCODE -ne 0) { throw 'Native codec tool qualification failed' }
+      - if: runner.os != 'Windows'
+        name: Select existing native codec tools
+        run: python3 -B scripts/jxl_build.py --github-env
+      - name: Verify native codec tool selection regressions
+        run: python -B scripts/test_jxl_build.py
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
         with:
+          toolchain: 1.92.0
           components: rustfmt, clippy, rust-docs
       - name: Identify compiler cache
         id: compiler
@@ -73,8 +102,9 @@ jobs:
           with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
               output.write(f'version={version}\n')
           PY
-      - name: Cache Rust dependencies and build outputs
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
+      - name: Restore Rust dependencies and build outputs
+        id: cargo_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
         with:
           path: |
             ~/.cargo/registry/index
@@ -85,20 +115,41 @@ jobs:
           restore-keys: |
             peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
       - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
+      - run: rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
+      - name: Build source-matched JPEG XL worker for integration tests
+        run: cargo build --locked --bin peerbrush
+      # Cached bytes are an optimization; source builds and every qualification gate still run.
+      - name: Save CI build cache after main compilation
+        if: success() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            target
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
       - name: Run regression tests and summarize failures
         shell: bash
         run: |
           set +e
-          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/peerbrush-tests.log"
-          test_status=${PIPESTATUS[0]}
+          CARGO_TERM_COLOR=never cargo test --locked > "$RUNNER_TEMP/peerbrush-tests.log" 2>&1
+          test_status=$?
+          if [[ "$RUNNER_OS" == "Windows" && "$test_status" -eq 0 ]]; then
+            CARGO_TERM_COLOR=never cargo test --locked --test clipboard -- --ignored >> "$RUNNER_TEMP/peerbrush-tests.log" 2>&1
+            test_status=$?
+          fi
           python - "$RUNNER_TEMP/peerbrush-tests.log" "$GITHUB_STEP_SUMMARY" "$test_status" <<'PY'
           import re, sys
           from pathlib import Path
           log = Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
+          log = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', log)
           failures = re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$', log, re.M)
           results = re.findall(r'^test result: (?:ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored;', log, re.M)
+          detail = ''
           if failures:
               print('::error title=Regression test failures::' + ', '.join(name[:128] for name in failures[:32]))
               locations = re.findall(r"^thread '([A-Za-z0-9_:]+)' (?:\([0-9]+\) )?panicked at (?:[^\r\n]*?[/\\])?((?:tests|src)[/\\][A-Za-z0-9_./\\-]+):([0-9]+):([0-9]+)", log, re.M)
@@ -120,34 +171,205 @@ jobs:
                   name, body = sections[index:index + 2]
                   if name in failures:
                       matched = [code for code, marker in kinds.items() if marker in body]
+                      matched += ['JXL_WORKER_' + code for code in sorted(set(re.findall(r'^JXL_TIMEOUT_ERROR_(FAILED|PROTOCOL|RESOURCE|OTHER)$', body, re.M)))]
                       if matched:
                           print('::error title=Regression failure category::' + name[:128] + ': ' + ', '.join(matched))
+                      if name in {'protocol_presets_preview_and_repeated_batches_keep_native_files_profiles_and_source', 'batch_existing_file_policies_report_written_skipped_failed_and_unattempted_outputs'}:
+                          records = re.findall(r'^PB_EXPORT_WAIT elapsed_ms=(0|[1-9][0-9]{0,5}) status=(running) phase=(planning|rendering|complete|stopped|unknown) outputs=(0|[1-9][0-9]{0,2}) written=(0|[1-9][0-9]{0,2}) skipped=(0|[1-9][0-9]{0,2}) failed=(0|[1-9][0-9]{0,2}) not_written=(0|[1-9][0-9]{0,2})$', body, re.M)
+                          if len(records) == 1:
+                              elapsed, status, phase, outputs, written, skipped, failed, pending = records[0]
+                              counts = [int(value) for value in [outputs, written, skipped, failed, pending]]
+                              if 15000 <= int(elapsed) <= 999999 and max(counts) <= 64 and sum(counts[1:]) == counts[0]:
+                                  print(f'::error title=Export completion diagnostic::elapsed_ms={elapsed} status={status} phase={phase} outputs={outputs} written={written} skipped={skipped} failed={failed} not_written={pending}')
+                      if name == 'ui::effect_color::tests::effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes':
+                          records = re.findall(r'^PB_EFFECT_COLOR_HISTORY depth=(8|16) action=(escape|invalid|source) before=(0|[1-9][0-9]{0,4}) after=(0|[1-9][0-9]{0,4})$', body, re.M)
+                          if len(records) == 1:
+                              depth, action, before, after = records[0]
+                              if max(int(before), int(after)) <= 65535 and before != after:
+                                  print(f'::error title=Effect color history diagnostic::depth={depth} action={action} before={before} after={after}')
           elif int(sys.argv[3]):
               codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
-              detail = ', '.join(codes) if codes else 'No failing test identifier was reported'
+              categories = []
+              if not codes:
+                  kinds = {
+                      'CARGO_TEST_FAILURE': r'^error: test failed(?:,|$)',
+                      'CARGO_BUILD_FAILURE': r'^error: could not compile\b',
+                      'BUILD_SCRIPT_FAILURE': r'^error: failed to run custom build command\b',
+                      'LINKER_FAILURE': r'^error: linking with [^\r\n]{0,4096} failed:',
+                      'COMPILER_PANIC': r"^(?:error: (?:the compiler unexpectedly panicked|internal compiler error)|thread 'rustc' panicked)",
+                      'OUT_OF_MEMORY_DIAGNOSTIC': r'^(?:error: |LLVM ERROR: |fatal runtime error: )?(?:out of memory|memory allocation of [0-9]+ bytes failed)\b',
+                      'DISK_FULL_DIAGNOSTIC': r'^(?:error:|fatal error:|LLVM ERROR:)[^\r\n]{0,4096}(?:No space left on device|os error 28\b|os error 112\b)',
+                  }
+                  categories = [name for name, pattern in kinds.items() if re.search(pattern, log, re.M)]
+                  # Report termination evidence, never infer a cause from SIGKILL.
+                  endings = re.findall(r"^  process didn't exit successfully: [^\r\n]{1,8192} \((signal|exit status|exit code): (0x[0-9a-fA-F]{1,8}|[0-9]{1,10})(?:, [^\r\n)]{0,512})?\)[ \t]*$", log, re.M)
+                  for kind, value in endings[:8]:
+                      number = int(value, 16 if value.startswith('0x') else 10)
+                      if kind == 'signal' and value.isdecimal() and 1 <= number <= 127:
+                          categories.append(f'CHILD_SIGNAL_{number}')
+                      elif kind != 'signal' and 1 <= number <= 0xffffffff:
+                          categories.append(f'CHILD_EXIT_{number}')
+              detail = ', '.join(codes[:32] or list(dict.fromkeys(categories)) or ['UNKNOWN'])
               print('::error title=Regression test run failed::' + detail)
+              if codes:
+                  locations = re.findall(r'^\s*(?:-->|:::)\s+((?:src|tests|examples|vendor)[/\\][A-Za-z0-9_./\\-]+|build\.rs):([0-9]+):([0-9]+)\s*$', log, re.M)
+                  for path, line, column in locations[:32]:
+                      path = path.replace('\\', '/')
+                      if '..' not in path.split('/'):
+                          print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Compiler diagnostic location::See the reported compiler error codes')
           # Publish only bounded test identifiers/counts, never arbitrary
           # panic output, environment values, paths or fixture contents.
           with Path(sys.argv[2]).open('a', encoding='utf-8') as summary:
               summary.write('### Regression tests\n\n')
               summary.write(f'Exit status: {int(sys.argv[3])}\n\n')
+              if detail:
+                  summary.write(f'Failure classification: `{detail}`\n\n')
               summary.writelines(f'- `{line}`\n' for line in results[:100])
               if failures:
                   summary.write('\nFailed tests:\n\n')
                   summary.writelines(f'- `{name[:256]}`\n' for name in failures[:100])
           PY
           exit "$test_status"
+      - name: Record headless workspace CPU component baseline
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --lib ui::input_performance_diagnostic::actual_workspace_control_and_navigation_components -- --exact --ignored --nocapture --test-threads=1 > "$RUNNER_TEMP/peerbrush-ui-cpu.log" 2>&1
+          diagnostic_status=$?
+          python - "$RUNNER_TEMP/peerbrush-ui-cpu.log" "$(git rev-parse HEAD)" "$diagnostic_status" <<'PY'
+          import json, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          if int(sys.argv[3]) or path.stat().st_size > 2 * 1024 * 1024:
+              raise SystemExit('Headless workspace CPU diagnostic failed; no timing comparison established')
+          rows = []
+          for line in path.read_text(encoding='utf-8', errors='strict').splitlines():
+              if line.startswith('{'):
+                  value = json.loads(line)
+                  if isinstance(value, dict) and value.get('format') == 'PeerBrushUiCpuDiagnosticV1':
+                      rows.append(value)
+          if len(rows) != 1 or rows[0].get('build', {}).get('commit') != sys.argv[2] or rows[0]['build'].get('tree') != 'clean' or rows[0].get('native_window') is not False:
+              raise SystemExit('CPU diagnostic does not match exact clean source/headless scope')
+          print('CPU component metrics only; caches/scheduling uncontrolled; compiler/platform changes are not controlled before/after comparisons.')
+          print(json.dumps(rows[0], sort_keys=True, separators=(',', ':')))
+          PY
+      - name: Record balanced native16 CPU kernel baseline
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --lib depth16::color::tests::native16_spatial_kernel_performance -- --exact --ignored --nocapture --test-threads=1 > "$RUNNER_TEMP/peerbrush-native16-cpu.log" 2>&1
+          diagnostic_status=$?
+          python - "$RUNNER_TEMP/peerbrush-native16-cpu.log" "$(git rev-parse HEAD)" "$diagnostic_status" <<'PY'
+          import json, math, re, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          failure = 'Native16 CPU kernel diagnostic failed; no timing comparison established'
+          if int(sys.argv[3]) or path.stat().st_size > 2 * 1024 * 1024:
+              raise SystemExit(failure)
+          rows = [line for line in path.read_text(encoding='utf-8', errors='strict').splitlines() if line.startswith('{')]
+          if len(rows) != 1 or len(rows[0]) > 4096:
+              raise SystemExit(failure)
+          def unique_fields(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError('Duplicate metric field')
+                  result[key] = value
+              return result
+          try:
+              value = json.loads(rows[0], object_pairs_hook=unique_fields)
+              fixed = dict(format='PeerBrushNative16SpatialV1', group='native16-premultiplied-radius4',
+                  width=2048, height=2048, radius=4, pairs=6,
+                  order=['channel-pixel', 'pixel-channel'] * 3)
+              if (not isinstance(value, dict) or set(value) != set(fixed) | {'build', 'channel_major_ms', 'pixel_major_ms', 'native_window', 'cpu_used', 'gpu_used'}
+                      or any(value[key] != expected for key, expected in fixed.items())
+                      or value['native_window'] is not False or value['cpu_used'] is not True or value['gpu_used'] is not False):
+                  raise ValueError('Wrong kernel metric scope')
+              build = value['build']
+              if (not isinstance(build, dict) or set(build) != {'format', 'schema', 'product', 'version', 'commit', 'tree', 'end'}
+                      or build['format'] != 'PeerBrushBuildInfoV1' or type(build['schema']) is not int or build['schema'] != 1
+                      or build['product'] != 'PeerBrush' or build['end'] != 'PeerBrushBuildInfoEnd'
+                      or build['commit'] != sys.argv[2] or not re.fullmatch('[0-9a-f]{40}', sys.argv[2]) or build['tree'] != 'clean'
+                      or not isinstance(build['version'], str) or len(build['version']) > 80
+                      or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', build['version'])):
+                  raise ValueError('Wrong kernel build binding')
+              for name in ['channel_major_ms', 'pixel_major_ms']:
+                  samples = value[name]
+                  if (not isinstance(samples, list) or len(samples) != 6
+                          or any(type(sample) not in [int, float] or not math.isfinite(sample) or sample <= 0 for sample in samples)):
+                      raise ValueError('Invalid kernel samples')
+          except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+              raise SystemExit(failure) from None
+          print('Native16 CPU kernel metrics only; full-word parity asserted; caches/scheduling uncontrolled; no application/GUI/GPU/peak-memory or isolated-causation claim.')
+          print(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False))
+          PY
+      - name: Verify native installed-font inventory without registration
+        run: cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact
+      - run: cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
       - run: cargo clippy --all-targets --locked
+      - name: Verify native macOS document delivery and icon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo run --locked --example macos_activation
+          cargo run --locked --example macos_quit
+          sips -s format png assets/peerbrush.icns --out "$RUNNER_TEMP/peerbrush-icon.png"
       - run: python scripts/test_package.py
       - run: python scripts/test_msix.py
+      - run: python -B scripts/test_signed_msix.py
+      - run: python -B scripts/test_windows_executable_signing.py
+      - run: python -B scripts/test_windows_qualification.py
+      - run: python -B scripts/test_linux_qualification.py
+      - run: python -B scripts/test_appinstaller.py
+      - run: python -B scripts/test_store_msix_preflight.py
+      - run: python -B scripts/test_store_msix_handoff.py
       - run: python scripts/test_sign_macos.py
+      - run: python -B scripts/test_macos_signing_producer.py
+      - run: python -B scripts/test_deb.py
+      - run: python -B scripts/test_deb_version_upgrade_checks.py
+      - run: python -B scripts/test_deb_installed_gui_checks.py
+      - run: python -B scripts/test_macos_dmg.py
+      - run: python -B scripts/test_final_macos_dmg.py
+      - run: python -B scripts/test_dmg_file_identity.py
+      - run: python -B scripts/test_dmg_handoff.py
+      - run: python -B scripts/test_macos_qualification_attestation.py
+      - run: python -B scripts/test_macos_qualification_producer.py
+      - run: python -B scripts/test_macos_qualification_job.py
+      - run: python -B scripts/test_sign_macos_dmg.py
+      - name: Native DMG round trip with synthetic unsigned data
+        if: runner.os == 'macOS'
+        run: python3 -B scripts/test_macos_dmg_native.py
+      - run: python -B scripts/test_prepare_sparkle.py
+      - run: python -B scripts/test_sparkle_bundle.py
+      - name: Verify disabled native Sparkle preparation
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/Sparkle-2.10.0.zip" 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip'
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --output "$RUNNER_TEMP/peerbrush-sparkle-preparation"
+          cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-preparation/Sparkle.framework"
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --native-audit-output "$RUNNER_TEMP/peerbrush-sparkle-native-audit"
+          cat "$RUNNER_TEMP/peerbrush-sparkle-native-audit/native-policy-candidate.json"
       - run: python scripts/test_submit_store_release.py
+      - run: python -B scripts/test_store_workflow.py
+      - run: python scripts/test_store_release_state.py
+      - run: python scripts/test_production_readiness.py
+      - run: python -B scripts/test_final_release.py
+      - run: python -B scripts/test_final_inputs.py
+      - run: python -B scripts/test_publish_release.py
+      - run: python -B scripts/test_prepare_site_release.py
+      - run: python -B scripts/test_readback_site_release.py
       - run: python scripts/build_release.py
+      - run: python -B scripts/test_windows_version.py
       - run: python scripts/test_msix_runtime_tests.py
       - name: Package and report archive sizes
         shell: bash
         run: |
-          python scripts/package.py
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            python scripts/package.py --sparkle-archive "$RUNNER_TEMP/Sparkle-2.10.0.zip"
+          else
+            python scripts/package.py
+          fi
           python - <<'PY'
           import os, re
           from pathlib import Path
@@ -161,6 +383,66 @@ jobs:
               summary.write('\n### Package archive sizes\n\n')
               summary.writelines(f'- `{name}`: {size:,} bytes\n' for name, size in rows)
           PY
+      - name: Round-trip exact dormant app framework and native continuations
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          COMMIT=$(git rev-parse HEAD)
+          python3 -B scripts/check_bundled_sparkle.py --archive "dist/PeerBrush-$VERSION-macOS-arm64.zip" --work "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture" --commit "$COMMIT" --version "$VERSION"
+          cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture/payload/PeerBrush.app" --bundled
+      - name: Build and test Ubuntu installation candidate in a disposable container
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          PORTABLE="dist/PeerBrush-$VERSION-Linux-x64.zip"
+          DIGEST=$(sha256sum "$PORTABLE" | cut -d ' ' -f 1)
+          python3 -B scripts/package_deb.py --portable "$PORTABLE" --portable-sha256 "$DIGEST" --output dist/deb --maintainer 'PeerBrush CI fixture <builds@example.invalid>'
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          HASHES=$(python3 -c 'import pathlib,sys; sys.path.insert(0,"scripts"); from verify_release import inspect_archive; record=inspect_archive(pathlib.Path(sys.argv[1]),sys.argv[2],sys.argv[3])["manifest"]; print(record["executable_sha256"],record["source_sha256"])' "$PORTABLE" "$SOURCE_COMMIT" "$VERSION")
+          read -r EXECUTABLE_SHA SOURCE_SHA <<< "$HASHES"
+          set -- dist/deb/*.deb
+          test "$#" -eq 1
+          DEB="$1"
+          DEB_SHA=$(sha256sum "$DEB" | cut -d ' ' -f 1)
+          EVIDENCE=$(mktemp -d "$RUNNER_TEMP/peerbrush-deb-acceptance.XXXXXX")
+          echo "PEERBRUSH_INSTALLED_GUI_EVIDENCE=$EVIDENCE" >> "$GITHUB_ENV"
+          docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
+            --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
+            bash -eu -c 'apt-get update; apt-get install -y python3 xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd; python3 -B /checks/test_deb_installation.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installation.json' \
+            peerbrush-deb-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
+          python3 -B scripts/production_readiness.py --deb "$DEB" --deb-sha256 "$DEB_SHA" \
+            --portable "$PORTABLE" --portable-sha256 "$DIGEST" \
+            --installation-receipt "$EVIDENCE/installation.json" --commit "$SOURCE_COMMIT" --version "$VERSION" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' --output "$DEB.qualification.json"
+
+          # Actual published portable -> current installed application; no historical DEB is invented.
+          docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env PEERBRUSH_DISPOSABLE_REAL_UPGRADE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
+            --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
+            bash -eu -c 'apt-get update; apt-get install -y python3 git ca-certificates xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd xvfb xauth dbus-x11 libglib2.0-bin openbox wmctrl mesa-vulkan-drivers libgl1-mesa-dri;
+              git init --quiet /historical-source;
+              git -C /historical-source remote add origin https://github.com/Deftr0y/PeerBrush.git;
+              git -C /historical-source fetch --quiet --no-tags --depth=1 origin a00cf47accde87400fad3f0fcfc5fe96fc4f5be1;
+              git -C /historical-source checkout --quiet --detach FETCH_HEAD;
+              python3 -B /checks/test_deb_version_upgrade.py --old-source-root /historical-source --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/portable-to-deb.json
+              python3 -B /checks/test_deb_installed_gui.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installed-gui.json' \
+            peerbrush-real-version-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
+      - name: Retain completed installed GUI captures for visual review
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installed-gui-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.PEERBRUSH_INSTALLED_GUI_EVIDENCE }}/installed-gui.json
+            ${{ env.PEERBRUSH_INSTALLED_GUI_EVIDENCE }}/installed-gui-captures/*.png
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: runner.os == 'Linux'
+        with:
+          name: DEB-installation-candidate
+          path: dist/deb/*
+          if-no-files-found: error
       - name: Build unsigned MSIX with explicit local-test identity
         if: runner.os == 'Windows'
         shell: pwsh
@@ -168,13 +450,13 @@ jobs:
           $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])'
           python scripts/package_msix.py --portable "dist/PeerBrush-$version-Windows-x64.zip" --development-identity
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: runner.os == 'Windows'
         with:
           name: MSIX-local-test
           path: dist/msix/*
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: PeerBrush-${{ runner.os }}
           path: dist/*.zip
@@ -183,21 +465,36 @@ jobs:
     needs: native
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: PeerBrush-*
           path: candidates
+      - name: Download the same-workflow Ubuntu candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: DEB-installation-candidate
+          path: deb-candidate
       - name: Inspect matching platform archives and source
         shell: bash
         env:
           EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
-          python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
-      - uses: actions/upload-artifact@v4
+          python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output verified-portable
+          set -- deb-candidate/*.deb
+          test "$#" -eq 1
+          DEB="$1"
+          DEB_SHA=$(sha256sum "$DEB" | cut -d ' ' -f 1)
+          PORTABLE_SHA=$(sha256sum "verified-portable/PeerBrush-$VERSION-Linux-x64.zip" | cut -d ' ' -f 1)
+          # Job success supplies producer provenance; report JSON grants no authority.
+          python3 -B scripts/production_readiness.py --directory verified-portable --include-deb "$DEB" \
+            --deb-sha256 "$DEB_SHA" --portable-sha256 "$PORTABLE_SHA" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' \
+            --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: verified-packages
           path: dist/*

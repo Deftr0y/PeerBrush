@@ -1,0 +1,31 @@
+// Public application metadata; numeric constants avoid SDK header dependencies.
+// https://learn.microsoft.com/en-us/windows/win32/menurc/versioninfo-resource
+LANGUAGE 9, 1
+1 VERSIONINFO
+FILEVERSION @FIXED_VERSION@
+PRODUCTVERSION @FIXED_VERSION@
+FILEFLAGSMASK 0x3fL
+FILEFLAGS @FLAGS@L
+FILEOS 0x40004L
+FILETYPE 1L
+FILESUBTYPE 0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "PeerBrush\0"
+            VALUE "FileDescription", "PeerBrush graphics editor\0"
+            VALUE "FileVersion", "@VERSION@\0"
+            VALUE "InternalName", "peerbrush\0"
+            VALUE "OriginalFilename", "peerbrush.exe\0"
+            VALUE "ProductName", "PeerBrush\0"
+            VALUE "ProductVersion", "@VERSION@\0"
+            VALUE "Comments", "GPL-3.0-only\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

@@ -123,13 +123,14 @@ pub(crate) fn prepare(doc: &mut Document, c: &Value) -> Result<(), String> {
         }
     }
     if let Some(source) = &mut layer.source {
+        let source = std::sync::Arc::make_mut(source);
         source.prepend([1., 0., 0., 1., dx as f32, dy as f32]);
     }
     for effect in &mut layer.effects {
         if effect.kind == "liquify" {
             crate::geometry::map_effect(
                 &effect.kind,
-                &mut effect.settings,
+                std::sync::Arc::make_mut(&mut effect.settings),
                 [1., 1.],
                 [dx, dy],
                 true,

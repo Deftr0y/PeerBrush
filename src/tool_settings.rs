@@ -61,6 +61,7 @@ pub struct Store {
     pub error: Option<String>,
     save_error: Option<String>,
     dirty: bool,
+    update_exit_committed: bool,
 }
 impl Default for Store {
     fn default() -> Self {
@@ -95,6 +96,7 @@ impl Default for Store {
             error: None,
             save_error: None,
             dirty: false,
+            update_exit_committed: false,
         }
     }
 }
@@ -136,7 +138,7 @@ impl Store {
             .ok_or_else(|| "Choose brush, eraser, smudge, clone, heal or liquify".into())
     }
     pub fn state(&self) -> Value {
-        json!({"tools":self.tools.iter().map(|(tool,snapshot)|(tool.clone(),snapshot.state(tool))).collect::<BTreeMap<_,_>>(),"persistence":if self.path.is_some(){"instance state directory"}else{"current instance"},"error":self.error,"save_error":self.save_error,"pending_save":self.dirty})
+        json!({"tools":self.tools.iter().map(|(tool,snapshot)|(tool.clone(),snapshot.state(tool))).collect::<BTreeMap<_,_>>(),"persistence":if self.path.is_some(){"configured preferences directory"}else{"current instance"},"error":self.error,"save_error":self.save_error,"pending_save":self.dirty})
     }
     pub fn set(
         &mut self,
@@ -155,6 +157,7 @@ impl Store {
         expected: Option<u64>,
         persist: bool,
     ) -> Result<Snapshot, String> {
+        self.require_writer()?;
         let before = self.get(tool)?;
         if actor.trim().is_empty()
             || actor.chars().count() > 80
@@ -259,7 +262,43 @@ impl Store {
         self.save_error = None;
         Ok(())
     }
+    fn require_writer(&self) -> Result<(), String> {
+        if self.update_exit_committed {
+            return Err("Update exit committed; tool preferences remain preserved".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn update_exit_committed(&self) -> bool {
+        self.update_exit_committed
+    }
+    /// The final workspace transaction calls this only after its profile callback
+    /// succeeds, while all engine/registry/Store writer locks are still held.
+    pub(crate) fn commit_update_exit(&mut self) {
+        self.update_exit_committed = true;
+    }
+    pub(crate) fn update_checkpoint_ready(&self) -> Result<(), String> {
+        self.require_writer()?;
+        if self.dirty || self.save_error.is_some() {
+            return Err(
+                "Finish saving tool preferences before app update checking or restart".into(),
+            );
+        }
+        Ok(())
+    }
+    /// Called with the actual Store writer mutex held at checkpoint publication.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn authenticate_update_profile(&self, root: &Path) -> Result<(), String> {
+        self.update_checkpoint_ready()?;
+        if self.error.is_some()
+            || self.path.as_deref() != Some(root.join("tool-settings.json").as_path())
+            || read_owned(&root.join("tool-settings.json"))? != self.original
+        {
+            return Err("Current tool preferences do not match the flushed profile".into());
+        }
+        Ok(())
+    }
     pub fn flush(&mut self) -> Result<(), String> {
+        self.require_writer()?;
         if !self.dirty {
             return Ok(());
         }
@@ -307,6 +346,44 @@ impl Snapshot {
         } else {
             serde_json::to_value(self.profile.settings).unwrap()
         };
-        json!({"tool":tool,"profile":{"settings":settings,"preset":self.profile.preset},"revision":self.revision,"actor":self.actor,"persistence":if self.persistent{"instance state directory"}else{"current instance"}})
+        json!({"tool":tool,"profile":{"settings":settings,"preset":self.profile.preset},"revision":self.revision,"actor":self.actor,"persistence":if self.persistent{"configured preferences directory"}else{"current instance"}})
+    }
+}
+
+#[cfg(test)]
+mod update_profile_tests {
+    use super::*;
+    #[test]
+    fn current_profile_binding_requires_the_configured_flushed_bytes_and_explicit_absence() {
+        let root = std::env::temp_dir().join(format!(
+            "peerbrush-tool-profile-binding-{}",
+            crate::engine::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("tool-settings.json");
+        let mut store = Store::load(file.clone());
+        store.authenticate_update_profile(&root).unwrap();
+        assert!(Store::default().authenticate_update_profile(&root).is_err());
+        assert!(store
+            .authenticate_update_profile(&root.join("other"))
+            .is_err());
+        fs::write(&file, br#"{"version":1,"tools":{}}"#).unwrap();
+        assert!(store.authenticate_update_profile(&root).is_err());
+        store = Store::load(file.clone());
+        store.authenticate_update_profile(&root).unwrap();
+        let before = store.get("brush").unwrap().profile;
+        let mut after = before.clone();
+        after.settings.radius = 53.;
+        store.human_delta("brush", &before, &after).unwrap();
+        assert!(store.authenticate_update_profile(&root).is_err());
+        store.flush().unwrap();
+        store.authenticate_update_profile(&root).unwrap();
+        let protected = fs::read(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        assert!(store.authenticate_update_profile(&root).is_err());
+        fs::write(&file, &protected).unwrap();
+        store.authenticate_update_profile(&root).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), protected);
+        fs::remove_dir_all(root).unwrap();
     }
 }

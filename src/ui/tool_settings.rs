@@ -23,6 +23,13 @@ pub(super) fn key(tool: Tool) -> Option<&'static str> {
     }
 }
 impl PeerBrush {
+    /// A completed shared transaction, never permission from native/JSON state.
+    pub(super) fn update_exit_committed(&self) -> bool {
+        self.tool_settings_store
+            .lock()
+            .unwrap()
+            .update_exit_committed()
+    }
     fn current_tool_profile(&self) -> Profile {
         let mut settings = self.brush;
         settings.radius = self.radius;
@@ -74,16 +81,16 @@ impl PeerBrush {
             snapshot,
         };
     }
-    pub(super) fn store_current_tool_profile(&mut self) {
+    fn merge_current_tool_profile(&mut self) -> Result<(), String> {
         let Some(tool) = key(self.tool) else {
-            return;
+            return Ok(());
         };
         if self.tool_profile.tool != tool {
-            return;
+            return Ok(());
         }
         let profile = self.current_tool_profile();
         if profile == self.tool_profile.snapshot.profile {
-            return;
+            return Ok(());
         }
         let result = self.tool_settings_store.lock().unwrap().human_delta(
             tool,
@@ -96,10 +103,34 @@ impl PeerBrush {
                 self.load_tool_profile(tool, snapshot, false);
             }
             Err(error) => {
-                self.message = error;
+                self.message = error.clone();
                 let snapshot = self.tool_settings_store.lock().unwrap().get(tool).unwrap();
                 self.load_tool_profile(tool, snapshot, false);
+                return Err(error);
             }
+        }
+        Ok(())
+    }
+    pub(super) fn store_current_tool_profile(&mut self) {
+        if self.update_exit_committed() {
+            return;
+        }
+        let _ = self.merge_current_tool_profile();
+    }
+    /// Flush precisely the UI delta ordinary on_exit would merge, before taking
+    /// engine/registry/Store locks. Never load UI/library state inside those locks.
+    #[cfg(any(windows, target_os = "macos", test))]
+    pub(super) fn flush_update_tool_profile(&mut self) -> Result<(), String> {
+        self.merge_current_tool_profile()?;
+        self.tool_settings_store.lock().unwrap().flush()
+    }
+    pub(super) fn exit_tool_profile(&mut self) {
+        if self.update_exit_committed() {
+            return;
+        }
+        self.store_current_tool_profile();
+        if let Err(error) = self.tool_settings_store.lock().unwrap().flush() {
+            eprintln!("PeerBrush: tool settings not saved: {error}");
         }
     }
     pub(super) fn restore_tool_profile(&mut self, tool: Tool) {
@@ -110,6 +141,9 @@ impl PeerBrush {
         }
     }
     pub(super) fn sync_tool_profile(&mut self, ctx: &egui::Context) {
+        if self.update_exit_committed() {
+            return;
+        }
         self.store_current_tool_profile();
         if !ctx.input(|i| i.pointer.any_down())
             && self.live_gesture.is_none()

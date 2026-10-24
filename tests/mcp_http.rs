@@ -8,6 +8,70 @@ use std::{
 };
 
 #[test]
+fn modern_fonts_are_bounded_path_free_and_independent_of_document_history() {
+    let canvas = Canvas::new();
+    let before = peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap();
+    let call = |args| {
+        let query = modern_request(
+            json!("fonts"),
+            "tools/call",
+            json!({"name":"peerbrush_fonts","arguments":args}),
+        );
+        response(canvas.modern(&query).send_json(query.clone()))
+            .into_json::<Value>()
+            .unwrap()
+    };
+    let reply = call(json!({"action":"list","limit":1}));
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let result: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(result["fonts"].as_array().unwrap().len() <= 1);
+    assert!(result.get("status").is_some());
+    for font in result["fonts"].as_array().unwrap() {
+        let object = font.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert!(!object.contains_key("path"));
+        if !font["font"].is_null() {
+            assert!(font["font"].get("sha256").is_some());
+        } else {
+            assert!(!font["error"].is_null());
+        }
+    }
+    let prepared = call(json!({"action":"prepare","font":"regular"}));
+    assert_eq!(prepared["result"]["isError"], false, "{prepared}");
+    let result: Value =
+        serde_json::from_str(prepared["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(result["ready"], true);
+    for args in [
+        json!({"action":"list","limit":129}),
+        json!({"action":"list","offset":8193}),
+        json!({"action":"refresh","path":"font.ttf"}),
+        json!({"action":"prepare","font":{"path":"font.ttf"}}),
+    ] {
+        assert_eq!(call(args)["result"]["isError"], true);
+    }
+    assert_eq!(
+        peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap(),
+        before
+    );
+    assert!(canvas.shared.lock().unwrap().undo.is_empty());
+    let schema = server::tools()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "peerbrush_fonts")
+        .unwrap()
+        .clone();
+    assert!(schema["inputSchema"]["properties"]
+        .get("project_id")
+        .is_none());
+    assert_eq!(
+        schema["inputSchema"]["properties"]["font"]["oneOf"][1]["additionalProperties"],
+        false
+    );
+}
+
+#[test]
 fn modern_tool_settings_are_guarded_independent_and_return_real_preview_pixels() {
     let canvas = Canvas::new();
     let call = |args| {
@@ -1103,4 +1167,122 @@ fn modern_transform_cycles_preserve_native_originals_and_return_current_pixels()
     e.undo("transform-agent").unwrap();
     assert!(e.doc.export_png().unwrap() == before);
     assert!(e.doc.layers[0].pixels.retained.is_none());
+}
+
+#[test]
+fn modern_async_save_exposes_exact_run_terminal_status_and_native_psb_sources() {
+    let canvas = Canvas::new();
+    let (document, revision) = {
+        let mut e = canvas.shared.lock().unwrap();
+        e.doc = peerbrush::engine::Document::new_depth(32, 16, 16).unwrap();
+        e.doc.layers[0]
+            .pixels
+            .set16(3, 7, [60001, 12347, 34569, 32769]);
+        e.doc.layers[0].pixels.set16(2, 5, [10001, 20003, 30007, 0]);
+        e.doc.revision = 1;
+        (e.doc.id.clone(), e.doc.revision)
+    };
+    let path = canvas.dir.join("async-native.psb");
+    let call = modern_request(
+        json!("save-native"),
+        "tools/call",
+        json!({"name":"peerbrush_document","arguments":{"action":"save_async","document_id":document,"expected_revision":revision,"path":path}}),
+    );
+    let reply: Value = response(canvas.modern(&call).send_json(call.clone()))
+        .into_json()
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    let result: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(result["saving"]["run"]
+        .as_str()
+        .is_some_and(|run| !run.is_empty()));
+    assert_eq!(result["saving"]["document_id"], document);
+    assert_eq!(result["saving"]["revision"], revision);
+    let control = canvas.shared.lock().unwrap().saving.clone().unwrap();
+    for _ in 0..100 {
+        if control.status().finished {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(control.status().finished);
+    assert!(control.status().error.is_none());
+    assert!(!control.cancel());
+    let mut e = canvas.shared.lock().unwrap();
+    assert_eq!(e.saved_revision, revision);
+    assert!(e.undo.is_empty() && e.redo.is_empty());
+    let observed = e.state();
+    assert_eq!(observed["saving"]["finished"], true);
+    assert_eq!(observed["saving"]["stage"], "Saved");
+    assert_eq!(observed["file_status"], "Photoshop document saved");
+    let decoded = peerbrush::psd::decode(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(decoded.bit_depth, 16);
+    assert!(!decoded.read_only);
+    assert_eq!(
+        decoded.layers[0].pixels.rgba16(),
+        e.doc.layers[0].pixels.rgba16()
+    );
+}
+
+#[test]
+fn modern_synchronous_save_keeps_terminal_reply_and_shared_consent_schema() {
+    for depth in [8, 16] {
+        let canvas = Canvas::new();
+        let (document, revision) = {
+            let mut e = canvas.shared.lock().unwrap();
+            e.doc = peerbrush::engine::Document::new_depth(8, 4, depth).unwrap();
+            e.doc.layers[0]
+                .pixels
+                .set16(2, 1, [60001, 12347, 34569, 32769]);
+            e.doc.layers[0].pixels.set16(3, 2, [10001, 20003, 30007, 0]);
+            e.doc.revision = 1;
+            (e.doc.id.clone(), e.doc.revision)
+        };
+        let path = canvas.dir.join("synchronous.psd");
+        let call = modern_request(
+            json!("save-sync"),
+            "tools/call",
+            json!({
+                "name":"peerbrush_document","arguments":{"action":"save","document_id":document,"expected_revision":revision,"path":path}
+            }),
+        );
+        let reply: Value = response(canvas.modern(&call).send_json(call.clone()))
+            .into_json()
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let result: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(result["saving"]["finished"], true);
+        assert_eq!(result["saving"]["stage"], "Saved");
+        assert!(result["saving"]["error"].is_null());
+        assert_eq!(result["saving"]["revision"], revision);
+        assert_eq!(result["dirty"], false);
+        let decoded = peerbrush::psd::decode(&std::fs::read(&path).unwrap()).unwrap();
+        let e = canvas.shared.lock().unwrap();
+        assert_eq!(decoded.bit_depth, depth);
+        assert!(!decoded.read_only);
+        assert_eq!(
+            decoded.layers[0].pixels.rgba16(),
+            e.doc.layers[0].pixels.rgba16()
+        );
+        assert_eq!(e.saved_revision, revision);
+        assert!(e.undo.is_empty() && e.redo.is_empty());
+    }
+    let tools = server::tools();
+    let schema = &tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "peerbrush_document")
+        .unwrap()["inputSchema"]["properties"];
+    for action in ["save", "save_async", "cancel_save"] {
+        assert!(schema["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(action)));
+    }
+    assert_eq!(schema["run"]["type"], "string");
+    assert_eq!(schema["overwrite"]["type"], "boolean");
+    assert_eq!(schema["accept_editability_loss"]["type"], "boolean");
 }

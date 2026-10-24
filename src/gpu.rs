@@ -42,10 +42,13 @@ const GROUP_SIZE: u32 = 256;
 const BOX_CORE: u32 = 128;
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 static STATUS: OnceLock<Mutex<Status>> = OnceLock::new();
+static INSTALL_GATE: Mutex<()> = Mutex::new(());
+static BACKGROUND_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Status {
     pub available: bool,
+    pub initializing: bool,
     pub adapter: Option<String>,
     pub effects: Vec<String>,
     pub automatic_effects: Vec<String>,
@@ -61,8 +64,81 @@ pub fn status() -> Status {
     status_store().lock().map(|s| s.clone()).unwrap_or_default()
 }
 
+fn finish_background(
+    status: &Mutex<Status>,
+    result: Result<(), String>,
+    ctx: &eframe::egui::Context,
+) {
+    if let Ok(mut status) = status.lock() {
+        status.initializing = false;
+        if let Err(error) = result {
+            if !status.available && status.fallback_reason.is_none() {
+                status.fallback_reason = Some(error);
+            }
+        }
+    }
+    ctx.request_repaint();
+}
+
+fn start_background(
+    started: &'static AtomicBool,
+    status: &'static Mutex<Status>,
+    ctx: &eframe::egui::Context,
+    install: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    if started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    if let Ok(mut status) = status.lock() {
+        status.initializing = true;
+        if !status.available {
+            status.fallback_reason = None;
+        }
+    }
+    let repaint = ctx.clone();
+    match std::thread::Builder::new()
+        .name("PeerBrush compute setup".into())
+        .spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(install))
+                .unwrap_or_else(|_| Err("GPU setup failed; using CPU".into()));
+            finish_background(status, result, &repaint);
+        }) {
+        Ok(worker) => Some(worker),
+        Err(_) => {
+            finish_background(
+                status,
+                Err("GPU setup worker could not start; using CPU".into()),
+                ctx,
+            );
+            None
+        }
+    }
+}
+
+/// One background attempt on the existing render device. Pending/failed setup uses CPU rendering.
+pub fn install_background(state: &eframe::egui_wgpu::RenderState, ctx: &eframe::egui::Context) {
+    if BACKEND.get().is_some() {
+        return;
+    }
+    let state = state.clone();
+    let _ = start_background(&BACKGROUND_STARTED, status_store(), ctx, move || {
+        install(&state)
+    });
+}
+
 /// Reuses the native renderer's existing device; does not create another GPU.
 pub fn install(state: &eframe::egui_wgpu::RenderState) -> Result<(), String> {
+    if BACKEND.get().is_some() {
+        return Ok(());
+    }
+    // Explicit synchronous callers may race the one background startup attempt.
+    // The UI scheduling entry never waits for this pipeline-construction gate.
+    let _install = INSTALL_GATE
+        .lock()
+        .map_err(|_| "GPU setup failed; using CPU")?;
     if BACKEND.get().is_some() {
         return Ok(());
     }
@@ -851,7 +927,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// Headless test/example device; normal application startup calls install().
+/// Headless test/example device; native startup schedules install_background().
 pub fn headless() -> Result<Backend, String> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -882,6 +958,136 @@ pub fn headless() -> Result<Backend, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn background_setup_keeps_control_and_native_previews_while_one_worker_is_blocked() {
+        use std::sync::atomic::AtomicUsize;
+        let started: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let status: &'static Mutex<Status> = Box::leak(Box::new(Mutex::new(Status::default())));
+        let ctx = eframe::egui::Context::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, hold) = mpsc::channel();
+        let worker_calls = calls.clone();
+        let worker = start_background(started, status, &ctx, move || {
+            worker_calls.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).unwrap();
+            hold.recv_timeout(Duration::from_secs(10))
+                .map_err(|_| "Controlled setup release missing")?;
+            status.lock().unwrap().available = true;
+            Ok(())
+        })
+        .expect("Controlled setup worker starts");
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(status.lock().unwrap().initializing);
+        assert!(!status.lock().unwrap().available);
+        assert!(status.lock().unwrap().fallback_reason.is_none());
+        assert!(start_background(started, status, &ctx, || panic!(
+            "A second worker must not start"
+        ))
+        .is_none());
+        // The scheduler cannot wait for the held worker: real derived previews
+        // and an egui frame complete before the release signal is sent.
+        for depth in [8, 16] {
+            let mut engine = crate::engine::Engine::new();
+            engine.doc = crate::engine::Document::new_depth(32, 24, depth).unwrap();
+            engine.doc.layers[0]
+                .pixels
+                .set16(7, 9, [60001, 12347, 35569, 45679]);
+            let before = serde_json::to_value(&engine.doc).unwrap();
+            let words = engine.doc.layers[0].pixels.rgba16();
+            let preview = engine.doc.preview(None, 32, None, false).unwrap();
+            let output = ctx.run(eframe::egui::RawInput::default(), |ctx| {
+                eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("PeerBrush");
+                });
+            });
+            assert!(!output.shapes.is_empty());
+            assert_eq!(
+                engine.doc.preview(None, 32, None, false).unwrap().2,
+                preview.2
+            );
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
+            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+            assert!(engine.undo.is_empty() && engine.redo.is_empty());
+        }
+        for _ in 0..4 {
+            let _ = ctx.run(Default::default(), |_| {});
+        }
+        let repaints = Arc::new(AtomicUsize::new(0));
+        let observed = repaints.clone();
+        ctx.set_request_repaint_callback(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!status.lock().unwrap().initializing);
+        assert!(status.lock().unwrap().available);
+        assert!(status.lock().unwrap().fallback_reason.is_none());
+        assert!(repaints.load(Ordering::SeqCst) > 0);
+        assert!(start_background(started, status, &ctx, || panic!(
+            "Ready setup must not retry"
+        ))
+        .is_none());
+    }
+    #[test]
+    fn background_setup_error_or_panic_is_terminal_and_wakes_without_retry() {
+        use std::sync::atomic::AtomicUsize;
+        for panic in [false, true] {
+            let started: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+            let status: &'static Mutex<Status> = Box::leak(Box::new(Mutex::new(Status::default())));
+            let ctx = eframe::egui::Context::default();
+            for _ in 0..4 {
+                let _ = ctx.run(Default::default(), |_| {});
+            }
+            let repaints = Arc::new(AtomicUsize::new(0));
+            let observed = repaints.clone();
+            ctx.set_request_repaint_callback(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            });
+            let worker = start_background(started, status, &ctx, move || {
+                if panic {
+                    panic!("Controlled setup panic");
+                }
+                Err("Controlled unavailable device".into())
+            })
+            .unwrap();
+            worker.join().unwrap();
+            let status_value = status.lock().unwrap().clone();
+            assert!(!status_value.initializing && !status_value.available);
+            assert_eq!(
+                status_value.fallback_reason.as_deref(),
+                Some(if panic {
+                    "GPU setup failed; using CPU"
+                } else {
+                    "Controlled unavailable device"
+                })
+            );
+            assert!(repaints.load(Ordering::SeqCst) > 0);
+            assert!(start_background(started, status, &ctx, || panic!(
+                "Failed setup must not retry"
+            ))
+            .is_none());
+        }
+    }
+    #[test]
+    fn background_completion_preserves_a_newer_explicit_install_result() {
+        let ctx = eframe::egui::Context::default();
+        for available in [false, true] {
+            let newer_error = (!available).then(|| "Newer explicit failure".to_string());
+            let state = Mutex::new(Status {
+                initializing: true,
+                available,
+                fallback_reason: newer_error.clone(),
+                ..Status::default()
+            });
+            finish_background(&state, Err("Older automatic failure".into()), &ctx);
+            let status = state.lock().unwrap();
+            assert!(!status.initializing);
+            assert_eq!(status.available, available);
+            assert_eq!(status.fallback_reason, newer_error);
+        }
+    }
     #[test]
     fn device_limits_reject_work_without_touching_source() {
         let image = Image {
@@ -985,21 +1191,21 @@ mod tests {
                     kind: "hsl".into(),
                     enabled: true,
                     weight: 0.7,
-                    settings: json!({"hue":23,"saturation":0.2}),
+                    settings: json!({"hue":23,"saturation":0.2}).into(),
                 },
                 Effect {
                     id: id(),
                     kind: "blur".into(),
                     enabled: true,
                     weight: 0.6,
-                    settings: json!({"radius":3}),
+                    settings: json!({"radius":3}).into(),
                 },
                 Effect {
                     id: id(),
                     kind: "bloom".into(),
                     enabled: true,
                     weight: 0.4,
-                    settings: json!({"spread":4,"threshold":0.3,"strength":0.8}),
+                    settings: json!({"spread":4,"threshold":0.3,"strength":0.8}).into(),
                 },
             ];
             let original = base.layers[0].pixels.clone();

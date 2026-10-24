@@ -1,7 +1,18 @@
 //! Native file activation is queued for the same new-project UI used by File > Open.
 //! The authenticated application RPC never replaces a document to service a launch.
 use crate::{server::Shared, workspace};
-use std::{collections::VecDeque, ffi::OsString, path::PathBuf};
+use std::{
+    collections::VecDeque,
+    ffi::OsString,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 pub const MAX_PENDING_FILES: usize = workspace::MAX_PROJECTS;
 
@@ -10,7 +21,16 @@ pub fn arguments(
     args: impl IntoIterator<Item = OsString>,
     default_state_dir: PathBuf,
 ) -> Result<(PathBuf, Vec<OsString>), String> {
+    storage_arguments(args, default_state_dir).map(|(state, args, _)| (state, args))
+}
+
+/// An explicit workspace keeps its existing instance-local preferences.
+pub fn storage_arguments(
+    args: impl IntoIterator<Item = OsString>,
+    default_state_dir: PathBuf,
+) -> Result<(PathBuf, Vec<OsString>, bool), String> {
     let mut state_dir = default_state_dir;
+    let mut local_preferences = false;
     let mut rest = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -28,11 +48,12 @@ pub fn arguments(
                 return Err("--state-dir needs a path".into());
             }
             state_dir = PathBuf::from(path);
+            local_preferences = true;
         } else {
             rest.push(arg);
         }
     }
-    Ok((state_dir, rest))
+    Ok((state_dir, rest, local_preferences))
 }
 
 /// Classify error presentation before parsing can fail. Broken MCP/headless
@@ -44,9 +65,10 @@ pub fn native_error_dialog(args: impl IntoIterator<Item = OsString>) -> bool {
             Some("--state-dir") => {
                 args.next();
             }
-            Some("mcp" | "cli" | "discover" | "--version" | "-V" | "--help" | "--headless") => {
-                return false
-            }
+            Some(
+                "mcp" | "cli" | "discover" | "settings" | "updates" | "--build-info" | "--version"
+                | "-V" | "--help" | "--headless",
+            ) => return false,
             _ => return true,
         }
     }
@@ -107,6 +129,20 @@ impl Launch {
 pub(crate) struct Queue {
     enabled: bool,
     files: VecDeque<PathBuf>,
+    quit: Arc<AtomicBool>,
+}
+
+/// Native callbacks retain only this presentation signal, never an engine lock.
+pub(crate) fn quit_signal(registry: &workspace::Registry) -> Arc<AtomicBool> {
+    registry.lock().unwrap().activation.quit.clone()
+}
+
+/// Consume one coalesced native Quit request through the ordinary guarded UI.
+pub fn take_quit(registry: &workspace::Registry) -> bool {
+    let workspace = registry.lock().unwrap();
+    workspace.activation.enabled
+        && !workspace.exiting
+        && workspace.activation.quit.swap(false, Ordering::AcqRel)
 }
 
 /// Enable before publishing the listener so simultaneous launches can queue safely.
@@ -165,6 +201,43 @@ mod tests {
     }
 
     #[test]
+    fn native_quit_coalesces_without_locks_or_file_queue_changes() {
+        for depth in [8, 16] {
+            let mut engine = Engine::new();
+            engine.doc = crate::engine::Document::new_depth(64, 64, depth).unwrap();
+            engine.doc.revision = 7;
+            let root = Arc::new(Mutex::new(engine));
+            let registry = workspace::attach(&root);
+            let signal = quit_signal(&registry);
+            signal.store(true, Ordering::Release);
+            assert!(
+                !take_quit(&registry),
+                "headless instances never process native Quit"
+            );
+            enable(&root);
+            let file = std::env::temp_dir().join("synthetic pending.psd");
+            enqueue(&root, vec![file.clone()]).unwrap();
+            let before = root.lock().unwrap().doc.clone();
+            {
+                let _engine = root.lock().unwrap();
+                let _workspace = registry.lock().unwrap();
+                signal.store(true, Ordering::Release);
+                signal.store(true, Ordering::Release);
+            }
+            assert!(take_quit(&registry));
+            assert!(!take_quit(&registry));
+            assert_eq!(next(&registry), Some(file));
+            assert_eq!(
+                serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            registry.lock().unwrap().exiting = true;
+            signal.store(true, Ordering::Release);
+            assert!(!take_quit(&registry));
+        }
+    }
+
+    #[test]
     fn malformed_noninteractive_arguments_never_request_error_dialogs() {
         for command in [
             vec!["mcp", "--state-dir"],
@@ -172,6 +245,7 @@ mod tests {
             vec!["--headless", "--state-dir", ""],
             vec!["--state-dir", "", "cli"],
             vec!["--state-dir", "workspace", "mcp"],
+            vec!["--build-info", "--state-dir"],
         ] {
             assert!(!native_error_dialog(args(&command)));
         }

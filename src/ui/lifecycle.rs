@@ -88,7 +88,8 @@ mod tests {
         }
     }
     fn waiting(app: &mut PeerBrush, ctx: &egui::Context) {
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             frame(app, ctx, vec![]);
             if app.lifecycle.as_ref().is_none_or(|r| r.saving.is_none()) {
                 return;
@@ -97,6 +98,193 @@ mod tests {
         }
         panic!("Save reply did not arrive");
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn late_native_start_preserves_an_already_reviewed_human_exit_and_all_projects() {
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            for shared in [&root, &second] {
+                let mut engine = shared.lock().unwrap();
+                if depth == 16 {
+                    engine.doc.layers[0]
+                        .pixels
+                        .set16(0, 0, [1001, 3003, 5007, 0]);
+                } else {
+                    engine.doc.layers[0].pixels.set(0, 0, [17, 93, 207, 0]);
+                }
+            }
+            dirty(&root, "Keep reviewed first artwork");
+            dirty(&second, "Keep reviewed second artwork");
+            let before: Vec<_> = [&root, &second]
+                .into_iter()
+                .map(|shared| {
+                    let engine = shared.lock().unwrap();
+                    (
+                        serde_json::to_value(&engine.doc).unwrap(),
+                        engine.undo.len(),
+                        engine.redo.len(),
+                    )
+                })
+                .collect();
+            app.request_close(Intent::Exit);
+            let review = app.lifecycle.as_mut().unwrap();
+            for row in &mut review.entries {
+                row.decided = true;
+                row.source.discard = true;
+            }
+            assert!(review.current().is_none());
+            // Model a native startup arriving after human decisions but before
+            // the final close. This hook changes only the unavailable Session.
+            app.native_check_starting_for_test();
+            let mut output = frame(&mut app, &ctx, vec![]);
+            for _ in 0..3 {
+                output = frame(&mut app, &ctx, vec![]);
+            }
+            assert!(!app.exit_approved);
+            let review = app
+                .lifecycle
+                .as_ref()
+                .expect("The human review must remain open");
+            assert!(review.current().is_none());
+            assert!(review
+                .entries
+                .iter()
+                .all(|row| row.decided && row.source.discard));
+            assert!(review
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Quitting is blocked"));
+            assert!(
+                review.buttons[2].is_some(),
+                "Blocked review must render its real Cancel control"
+            );
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Quitting is blocked"));
+            click(&mut app, &ctx, 2);
+            assert!(
+                app.lifecycle.is_none(),
+                "Real Cancel must return to the workspace"
+            );
+            assert!(!app.exit_approved);
+            assert!(app.message.contains("Close canceled"));
+            for (shared, (document, undo, redo)) in [&root, &second].into_iter().zip(before) {
+                let engine = shared.lock().unwrap();
+                assert!(!engine.closed);
+                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), document);
+                assert_eq!((engine.undo.len(), engine.redo.len()), (undo, redo));
+            }
+        }
+    }
+    #[test]
+    fn shared_save_cancel_status_and_reply_keep_the_native_close_review_open() {
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            dirty(&root, "Keep canceled save work");
+            frame(&mut app, &ctx, vec![]);
+            app.request_close(Intent::Close(app.project_id.clone()));
+            frame(&mut app, &ctx, vec![]);
+            let source = app
+                .lifecycle
+                .as_ref()
+                .unwrap()
+                .current()
+                .unwrap()
+                .source
+                .clone();
+            let before = serde_json::to_value(&root.lock().unwrap().doc).unwrap();
+            let other = serde_json::to_value(&second.lock().unwrap().doc).unwrap();
+            let control = crate::saving::Control::default();
+            control
+                .begin(source.document.clone(), source.revision)
+                .unwrap();
+            control
+                .progress("Writing current composite", 2, 16)
+                .unwrap();
+            root.lock().unwrap().saving = Some(control.clone());
+            let (tx, rx) = mpsc::channel();
+            app.lifecycle.as_mut().unwrap().saving = Some(rx);
+            let mut output = frame(&mut app, &ctx, vec![]);
+            for _ in 0..3 {
+                output = frame(&mut app, &ctx, vec![]);
+            }
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Writing current composite"));
+            assert!(text.contains("Cancel saving"));
+            let cancel = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Cancel saving" => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(cancel),
+                        egui::Event::PointerButton {
+                            pos: cancel,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+            assert!(control.status().cancel_requested);
+            let result = control.check();
+            control.finish(&result);
+            tx.send(SaveReply {
+                source,
+                result: result.map(|_| true),
+            })
+            .unwrap();
+            frame(&mut app, &ctx, vec![]);
+            assert!(app.lifecycle.as_ref().unwrap().current().is_some());
+            assert!(app
+                .lifecycle
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("canceled"));
+            let e = root.lock().unwrap();
+            assert!(!e.closed);
+            assert_ne!(e.doc.revision, e.saved_revision);
+            assert_eq!(e.undo.len(), 1);
+            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+            drop(e);
+            assert!(!second.lock().unwrap().closed);
+            assert_eq!(
+                serde_json::to_value(&second.lock().unwrap().doc).unwrap(),
+                other
+            );
+            click(&mut app, &ctx, 2);
+        }
+    }
+
     #[test]
     fn clean_conflicting_project_reviews_native_cancel_failed_save_and_discard() {
         for depth in [8, 16] {
@@ -379,6 +567,34 @@ mod tests {
         assert_eq!(app.project_id, other);
     }
     #[test]
+    fn clean_native_close_is_not_canceled_after_final_source_validation() {
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            for _ in 0..3 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let output = ctx.run(input, |ctx| app.draw(ctx));
+            assert!(app.exit_approved);
+            assert!(root.lock().unwrap().closed && second.lock().unwrap().closed);
+            // eframe cancels the original native close if this appears anywhere
+            // in the frame, even when a Close command is also present.
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose));
+        }
+    }
+
+    #[test]
     fn native_close_request_is_canceled_until_all_dirty_projects_are_reviewed() {
         let (mut app, ctx, root, second) = fixture(16);
         dirty(&root, "One");
@@ -405,6 +621,111 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         assert!(app.exit_approved);
         assert!(root.lock().unwrap().closed && second.lock().unwrap().closed);
+    }
+    #[test]
+    fn queued_native_quit_preserves_cancel_save_and_late_write_guards() {
+        use std::sync::atomic::Ordering;
+        for depth in [8, 16] {
+            let (mut app, ctx, root, second) = fixture(depth);
+            dirty(&root, "First native Quit edit");
+            dirty(&second, "Second native Quit edit");
+            let before = [
+                root.lock().unwrap().doc.clone(),
+                second.lock().unwrap().doc.clone(),
+            ];
+            let quit = crate::activation::quit_signal(&app.workspace);
+            quit.store(true, Ordering::Release);
+            frame(&mut app, &ctx, vec![]);
+            assert!(matches!(
+                app.lifecycle.as_ref().unwrap().intent,
+                Intent::Exit
+            ));
+            click(&mut app, &ctx, 2);
+            assert!(app.lifecycle.is_none() && !app.exit_approved);
+            for (shared, expected) in [&root, &second].into_iter().zip(&before) {
+                let engine = shared.lock().unwrap();
+                assert!(!engine.closed);
+                assert_eq!(
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                assert_eq!(engine.undo.len(), 1);
+            }
+            server::save(&root, &app.connection.state_dir.join("first.psd")).unwrap();
+            server::save(&second, &app.connection.state_dir.join("second.psb")).unwrap();
+            dirty(&root, "Save this exact source");
+            dirty(&second, "Keep review open");
+            quit.store(true, Ordering::Release);
+            frame(&mut app, &ctx, vec![]);
+            click(&mut app, &ctx, 0);
+            waiting(&mut app, &ctx);
+            let operations = second.lock().unwrap().file_operations.clone();
+            operations.fetch_add(1, Ordering::AcqRel);
+            click(&mut app, &ctx, 1);
+            frame(&mut app, &ctx, vec![]);
+            assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
+            assert!(app.lifecycle.as_ref().unwrap().error.is_some());
+            operations.fetch_sub(1, Ordering::AcqRel);
+            dirty(&root, "Late human edit must survive");
+            let late = root.lock().unwrap().doc.clone();
+            frame(&mut app, &ctx, vec![]);
+            click(&mut app, &ctx, 2);
+            assert_eq!(
+                serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&late).unwrap()
+            );
+            assert!(!app.exit_approved);
+            assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
+            server::save(&root, &app.connection.state_dir.join("first.psd")).unwrap();
+            server::save(&second, &app.connection.state_dir.join("second.psb")).unwrap();
+            quit.store(true, Ordering::Release);
+            let output = frame(&mut app, &ctx, vec![]);
+            assert!(app.exit_approved);
+            assert!(root.lock().unwrap().closed && second.lock().unwrap().closed);
+            assert!(output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close));
+        }
+    }
+
+    #[test]
+    fn queued_native_quit_keeps_existing_color_preferences_and_export_drafts() {
+        use std::sync::atomic::Ordering;
+        for depth in [8, 16] {
+            for draft in ["color", "preferences", "export", "proposal", "live gesture"] {
+                let (mut app, ctx, root, second) = fixture(depth);
+                let before = root.lock().unwrap().doc.clone();
+                match draft {
+                    "color" => {
+                        app.open_color(super::super::color::Target::Foreground, [17, 41, 73, 255])
+                    }
+                    "preferences" => app.project_settings = Some((96, 80, depth)),
+                    "export" => app.open_exports(&before),
+                    "proposal" => {
+                        let proposal = crate::collaboration::propose(&root, "synthetic-review", &json!({"document_id":before.id,"expected_revision":before.revision,"commands":[{"op":"layer.update","layer":before.layers[0].id,"name":"Proposed change"}]})).unwrap();
+                        app.proposal_review = Some(proposal["id"].as_str().unwrap().into());
+                    }
+                    "live gesture" => app.live_gesture = Some(crate::engine::id()),
+                    _ => unreachable!(),
+                }
+                crate::activation::quit_signal(&app.workspace).store(true, Ordering::Release);
+                frame(&mut app, &ctx, vec![]);
+                assert!(app.lifecycle.is_none() && !app.exit_approved, "{draft}");
+                assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
+                assert_eq!(
+                    serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                assert!(match draft {
+                    "color" => app.color_editor.is_some(),
+                    "preferences" => app.project_settings == Some((96, 80, depth)),
+                    "export" => app.export_editor.is_some(),
+                    "proposal" => app.proposal_review.is_some(),
+                    "live gesture" => app.live_gesture.is_some(),
+                    _ => false,
+                });
+            }
+        }
     }
 }
 #[derive(Clone)]
@@ -498,8 +819,16 @@ impl Review {
 
 impl PeerBrush {
     pub(super) fn request_close(&mut self, intent: Intent) {
+        #[cfg(target_os = "macos")]
+        if intent == Intent::Exit && self.native_update_quit() {
+            return;
+        }
         if self.lifecycle.is_some() || self.save_loss_review.is_some() || self.exit_approved {
             return;
+        }
+        #[cfg(any(windows, test))]
+        if intent == Intent::Exit {
+            self.updates.defer_windows_for_close();
         }
         let working = match &intent {
             Intent::Close(project) => self.jobs.contains(project),
@@ -512,12 +841,21 @@ impl PeerBrush {
         let affects_active =
             intent == Intent::Exit || matches!(&intent,Intent::Close(id) if id == &self.project_id);
         if affects_active
-            && (self.geometry.is_some()
+            && (self.free_transform.is_some()
+                || self.geometry.is_some()
                 || self.source_editor.is_some()
                 || self.filter_editor.is_some()
                 || self.refinement.is_some()
                 || self.pending_import.is_some()
+                || self.pending_image_open.is_some()
                 || self.rename_edit.is_some()
+                || self.color_editor.is_some()
+                || self.proposal_review.is_some()
+                || self.task_undo_review.is_some()
+                || self.live_gesture.is_some()
+                || self.pen.in_gesture()
+                || self.project_settings.is_some()
+                || self.export_editor.is_some()
                 || !self.points.is_empty()
                 || !self.selection_path.is_empty()
                 || self.layer_drag.is_some()
@@ -688,8 +1026,17 @@ impl PeerBrush {
                 }
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.exit_approved {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        let native_quit = crate::activation::take_quit(&self.workspace);
+        if (ctx.input(|i| i.viewport().close_requested()) || native_quit) && !self.exit_approved {
+            #[cfg(target_os = "macos")]
+            if self.native_update_quit() {
+                ctx.send_viewport_cmd(if self.exit_approved {
+                    egui::ViewportCommand::Close
+                } else {
+                    egui::ViewportCommand::CancelClose
+                });
+                return;
+            }
             self.request_close(Intent::Exit);
         }
         if self.exit_approved {
@@ -748,25 +1095,37 @@ impl PeerBrush {
                 }
             };
             if refreshed && review.current().is_none() {
-                let result = match &review.intent {
-                    Intent::Exit => crate::workspace::lifecycle::finish_exit(
-                        &self.workspace,
-                        &review
-                            .entries
-                            .iter()
-                            .map(|r| r.source.clone())
-                            .collect::<Vec<_>>(),
-                    ),
-                    Intent::Close(project) => {
-                        let row = &review.entries[0];
-                        crate::workspace::close_in(
+                #[cfg(target_os = "macos")]
+                let blocked = review.intent == Intent::Exit && self.native_update_quit();
+                #[cfg(not(target_os = "macos"))]
+                let blocked = false;
+                if self.exit_approved {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+                let result = if blocked {
+                    Err(self.message.clone())
+                } else {
+                    match &review.intent {
+                        Intent::Exit => crate::workspace::lifecycle::finish_exit(
                             &self.workspace,
-                            project,
-                            &row.source.document,
-                            row.source.revision,
-                            row.source.discard,
-                            "human",
-                        )
+                            &review
+                                .entries
+                                .iter()
+                                .map(|r| r.source.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                        Intent::Close(project) => {
+                            let row = &review.entries[0];
+                            crate::workspace::close_in(
+                                &self.workspace,
+                                project,
+                                &row.source.document,
+                                row.source.revision,
+                                row.source.discard,
+                                "human",
+                            )
+                        }
                     }
                 };
                 match result {
@@ -796,12 +1155,18 @@ impl PeerBrush {
             "Save project before closing?"
         };
         let saving = review.saving.is_some();
+        let save_control = current.as_ref().and_then(|row| {
+            crate::workspace::get_in(&self.workspace, &row.source.project)
+                .ok()
+                .and_then(|shared| shared.try_lock().ok().and_then(|e| e.saving.clone()))
+                .filter(|control| !control.status().finished)
+        });
         let mut action = 0;
         let mut save_as = false;
         review.buttons = [None; 3];
         let modal = egui::Modal::new(egui::Id::new("project lifecycle")).show(ctx, |ui| {
-            ui.set_width(380.);
-            ui.heading(title);
+            dialogs::body(ui, 400.);
+            dialogs::heading(ui, title, current.as_ref().is_some_and(|row| row.conflicted));
             if let Some(row) = &current {
                 ui.label(RichText::new(&row.name).strong());
                 if row.conflicted { ui.label(RichText::new("The saved file changed outside this project. Save As preserves both versions. Don't Save closes only this project's in-memory copy.").color(ACCENT)); }
@@ -822,16 +1187,20 @@ impl PeerBrush {
                 ui.label(RichText::new(error).color(ACCENT));
             }
             if saving {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Saving…");
-                });
+                if let Some(control) = &save_control {
+                    super::saving::progress(ui, control);
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Saving…");
+                    });
+                }
             }
             ui.horizontal(|ui| {
                 for (index, label) in ["Save", "Don't Save", "Cancel"].into_iter().enumerate() {
                     let response = ui.add_enabled(
                         !saving && (index == 2 || current.is_some()),
-                        egui::Button::new(label),
+                        if index == 0 { dialogs::primary(label) } else { egui::Button::new(label).min_size(Vec2::new(0., 28.)) },
                     );
                     review.buttons[index] = Some(response.rect);
                     if response.clicked() {
