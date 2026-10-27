@@ -22,8 +22,8 @@ from test_package import packaging
 class HistoricalAssets(unittest.TestCase):
     def setUp(self):
         self.fixture = test_package.Packages('test_platform_architecture_source_license_and_macos_bundle_match')
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.root = self.fixture.root.resolve()
         self.archive = self.fixture.build('Linux')
         self.commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
@@ -254,6 +254,7 @@ class FixtureContract(unittest.TestCase):
         detail = upgrade.failure_diagnostic(error)
         self.assertEqual(detail, 'Compatibility diagnostic: CalledProcessError exit=1 [child-reported: ' + child + ']')
         self.assertNotIn(private, detail)
+
         wrapped = subprocess.CalledProcessError(1, [private], stderr=error.stderr)
         with mock.patch.object(upgrade.subprocess, 'run', side_effect=wrapped):
             try:
@@ -277,6 +278,23 @@ class FixtureContract(unittest.TestCase):
             with self.subTest(stderr_kind=type(value).__name__):
                 error.stderr = value
                 self.assertEqual(upgrade.failure_diagnostic(error), 'Compatibility diagnostic: CalledProcessError exit=1')
+
+    def test_gui_assertion_reports_allowlisted_caller_not_shared_require_line(self):
+        import test_deb_installed_gui as gui
+        private = 'PRIVATE_ASSERTION_ARGUMENT'
+        scripts = Path(upgrade.__file__).resolve().parent
+        source = 'def check():\n    require(False, private)\ncheck()\n'
+        for filename, expected in [(scripts / 'test_deb_installed_gui.py', ' at test_deb_installed_gui.py:2'),
+                                   (Path('/private') / 'test_deb_installed_gui.py', '')]:
+            try:
+                exec(compile(source, str(filename), 'exec'), dict(require=gui.require, private=private))
+            except ValueError as error:
+                detail = upgrade.failure_diagnostic(error)
+            else:
+                self.fail('The real require helper must still reject the assertion')
+            self.assertEqual(detail, 'Compatibility diagnostic: ValueError' + expected)
+            self.assertNotIn(private, detail)
+            self.assertNotIn(str(scripts), detail)
 
     def test_actual_gui_child_bootstrap_traceback_and_phase_survive_wrapper_without_private_values(self):
         private = 'PRIVATE_TRACEBACK_ARGUMENTS_PATH_TOKEN'

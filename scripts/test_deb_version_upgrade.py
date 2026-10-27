@@ -128,7 +128,10 @@ def failure_diagnostic(error):
                 name = allowed.get(os.path.normcase(str(Path(current.tb_frame.f_code.co_filename).resolve())))
             except (OSError, ValueError, RuntimeError):
                 name = None
-            if name is not None and type(current.tb_lineno) is int and 1 <= current.tb_lineno <= 1000000:
+            # This assertion helper has one shared raise site. Its already
+            # allowlisted caller identifies the failed check without its text.
+            helper = name == 'test_deb_installed_gui.py' and current.tb_frame.f_code.co_name == 'require'
+            if name is not None and not helper and type(current.tb_lineno) is int and 1 <= current.tb_lineno <= 1000000:
                 location = name + ':' + str(current.tb_lineno)
             current = current.tb_next
         if location is not None:
