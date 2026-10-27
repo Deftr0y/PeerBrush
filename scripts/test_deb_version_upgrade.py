@@ -135,10 +135,17 @@ def failure_diagnostic(error):
             record += ' at ' + location
         if type(error) is subprocess.CalledProcessError and type(error.returncode) is int and -32768 <= error.returncode <= 32767:
             record += ' exit=' + str(error.returncode)
-            child = _child_failure_diagnostic(error.stderr, kinds)
+            # Ubuntu's xvfb-run redirects its child's stderr into stdout. Keep
+            # one shared budget/uniqueness check across both captured streams.
+            streams = [stream for stream in [error.stdout, error.stderr] if stream is not None]
+            output = None
+            if all(type(stream) in (str, bytes) for stream in streams) and sum(map(len, streams)) <= 65535:
+                output = '\n'.join(stream.decode('utf-8', errors='replace') if isinstance(stream, bytes)
+                                   else stream for stream in streams)
+            child = _child_failure_diagnostic(output, kinds)
             if child is not None:
                 record += ' [child-reported: ' + child + ']'
-            progress = _gui_child_progress(error.stderr, kinds)
+            progress = _gui_child_progress(output, kinds)
             if progress is not None:
                 record += ' [gui-child-reported: ' + progress + ']'
         records.append(record)

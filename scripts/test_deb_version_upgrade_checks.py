@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -304,6 +305,33 @@ class FixtureContract(unittest.TestCase):
         detail = upgrade.failure_diagnostic(error)
         self.assertIn('[child-reported: ValueError at test_deb_installed_gui.py:270]', detail)
         self.assertIn('[gui-child-reported: phase=fixture-readback]', detail)
+
+    def test_actual_subprocess_with_merged_xvfb_style_output_keeps_bounded_child_diagnostics(self):
+        private = 'PRIVATE_CHILD_OUTPUT_AND_ARGUMENTS'
+        child = 'ValueError at test_deb_installed_gui.py:270'
+        lines = ['PeerBrushInstalledGuiPhaseV1 fixture-readback',
+                 'Disposable installed GUI acceptance failed. Compatibility diagnostic: ' + child]
+        # Match xvfb-run's child stderr-to-stdout redirection in a real process;
+        # no display, package, account or application changes are involved.
+        source = ('import os,sys; os.dup2(sys.stdout.fileno(), sys.stderr.fileno()); '
+                  'print(' + repr(private) + '); print(' + repr('\n'.join(lines))
+                  + ', file=sys.stderr); sys.exit(1)')
+        try:
+            upgrade.run([sys.executable, '-c', source])
+        except ValueError as error:
+            self.assertEqual(error.__cause__.stderr, '')
+            self.assertIn(lines[0], error.__cause__.stdout)
+            detail = upgrade.failure_diagnostic(error)
+        else:
+            self.fail('The actual failed subprocess must remain rejected')
+        self.assertIn('[child-reported: ' + child + ']', detail)
+        self.assertIn('[gui-child-reported: phase=fixture-readback]', detail)
+        self.assertNotIn(private, detail)
+        marker = lines[-1] + '\n'
+        for stdout, stderr in [(marker, marker), (private * 65536, marker),
+                               (marker, private * 65536), (object(), marker)]:
+            error = subprocess.CalledProcessError(1, [private], output=stdout, stderr=stderr)
+            self.assertEqual(upgrade.failure_diagnostic(error), 'Compatibility diagnostic: CalledProcessError exit=1')
 
     def test_gui_progress_parser_refuses_unbounded_or_unreviewed_labels_and_private_traceback_paths(self):
         private = 'PRIVATE_UNKNOWN_PHASE_OR_PATH'
