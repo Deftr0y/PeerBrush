@@ -27,9 +27,26 @@ impl Copy {
         let directory = Directory::open(destination)?;
         let record: Record =
             serde_json::from_slice(&small(&self.marker, control)?).map_err(|_| STAGE_HOLD)?;
+        let mut root_names = BTreeSet::from(["migration-backup".to_owned()]);
+        let mut backup_names = BTreeSet::new();
         for (relative, media) in record.files {
-            let path = destination.join(relative);
+            let path = destination.join(&relative);
             if let Some(media) = media {
+                if relative
+                    .parent()
+                    .is_some_and(|p| p == Path::new("migration-backup"))
+                {
+                    backup_names.insert(
+                        relative
+                            .file_name()
+                            .ok_or(STAGE_HOLD)?
+                            .to_str()
+                            .ok_or(STAGE_HOLD)?
+                            .to_owned(),
+                    );
+                } else {
+                    root_names.insert(relative.to_str().ok_or(STAGE_HOLD)?.to_owned());
+                }
                 let actual = Held::open(&path, FILE_LIMIT, control)?;
                 if actual.media != media {
                     return Err("The health process changed the profile; compatible recovery is not established.".into());
@@ -38,6 +55,32 @@ impl Copy {
             } else if !fs::symlink_metadata(path)
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
             {
+                return Err(STAGE_HOLD.into());
+            }
+        }
+        for (path, mut expected) in [
+            (destination.to_owned(), root_names),
+            (destination.join("migration-backup"), backup_names),
+        ] {
+            let mut actual = BTreeSet::new();
+            for entry in fs::read_dir(&path).map_err(|_| STAGE_HOLD)? {
+                control.check()?;
+                if actual.len() >= 32 {
+                    return Err(STAGE_HOLD.into());
+                }
+                actual.insert(
+                    entry
+                        .map_err(|_| STAGE_HOLD)?
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| STAGE_HOLD)?,
+                );
+            }
+            if actual.contains(".peerbrush-versions") {
+                Directory::open(&path.join(".peerbrush-versions"))?.check()?;
+                expected.insert(".peerbrush-versions".into());
+            }
+            if actual != expected {
                 return Err(STAGE_HOLD.into());
             }
         }

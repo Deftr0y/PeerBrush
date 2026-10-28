@@ -2788,6 +2788,15 @@ fn final_profile_keeps_later_settings_separate_and_protects_exact_originals() {
             .matches_materialized(&destination, &control())
             .is_err());
         fs::remove_file(destination.join(absent)).unwrap();
+        let unknown = destination.join("new-schema-preference.json");
+        fs::write(&unknown, b"not in the compatible schema").unwrap();
+        assert!(reopened
+            .matches_materialized(&destination, &control())
+            .is_err());
+        fs::remove_file(unknown).unwrap();
+        reopened
+            .matches_materialized(&destination, &control())
+            .unwrap();
         assert!(reopened.materialize(&destination, &control()).is_err());
     }
     let originals = reopened.protect_originals(&profile, &control()).unwrap();

@@ -1571,7 +1571,13 @@ pub(super) fn health_main(name: &str) -> Result<()> {
         Ok((pipe, owner, probe, profile, target.clone(), source))
     })?;
     let preferences = profile.locations.profile();
-    let state = probe.locations.cache.join("health-state");
+    let state = probe
+        .locations
+        .config
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(STAGE_HOLD)?
+        .join("state");
     let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
     let connection = crate::server::start_with_preferences(
         shared.clone(),
