@@ -440,7 +440,10 @@ def display_check(fixture):
         stored = QA_HOME / 'config/peerbrush/settings-v1/tool-settings.json'
         bounded_file(stored, 128 * 1024)
         profile_bytes = stored.read_bytes()
-        require(json.loads(profile_bytes)['tools']['brush'] == profile, 'Normal GUI on_exit did not preserve current preferences.')
+        # Stored Profile includes the inapplicable Liquify mode; Snapshot::state
+        # projects only settings/preset for the ordinary brush RPC profile.
+        require(json.loads(profile_bytes)['tools']['brush'] == dict(profile, liquify_mode=None),
+                'Normal GUI on_exit did not preserve current preferences.')
         gui_phase('restart-and-native-oracles')
         window = Window(facts, work)
         window.launch(paths)
