@@ -1,11 +1,12 @@
 //! SDK-free package trust and dormant staging. No registration, shutdown or restart.
 use super::*;
 use ::windows::{
-    core::{w, PCWSTR, PWSTR},
-    ApplicationModel::{Package, PackageSignatureKind},
+    core::{w, Interface, PCWSTR, PWSTR},
+    ApplicationModel::{AppInstallerInfo, IPackage6, Package, PackageSignatureKind},
     Foundation::{AsyncOperationProgressHandler, AsyncStatus, IAsyncOperationWithProgress, Uri},
     Management::Deployment::{
-        DeploymentProgress, DeploymentResult, PackageManager, StagePackageOptions,
+        DeploymentOptions, DeploymentProgress, DeploymentResult, PackageManager,
+        StagePackageOptions,
     },
     Win32::{
         Foundation::HANDLE,
@@ -33,7 +34,8 @@ use std::{
 
 fn native<T>(result: ::windows::core::Result<T>) -> Result<T> {
     result.map_err(|_| {
-        "Native Windows package verification could not complete; no installation occurred.".into()
+        "Native Windows package verification could not complete; retained state needs review."
+            .into()
     })
 }
 pub(super) fn session<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -56,6 +58,23 @@ pub(super) fn session<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
 }
 
 pub(super) struct Verifier;
+// Distinguish native successful absence from a failed association query.
+fn association(package: &Package) -> Result<Option<AppInstallerInfo>> {
+    let interface: IPackage6 = native(package.cast())?;
+    let mut pointer = std::ptr::null_mut();
+    native(unsafe {
+        (Interface::vtable(&interface).GetAppInstallerInfo)(
+            Interface::as_raw(&interface),
+            &mut pointer,
+        )
+        .ok()
+    })?;
+    Ok(if pointer.is_null() {
+        None
+    } else {
+        Some(unsafe { AppInstallerInfo::from_raw(pointer) })
+    })
+}
 impl super::Verifier for Verifier {
     fn source(&self, policy: &Policy) -> Result<Source> {
         if !ENABLED {
@@ -80,12 +99,12 @@ impl super::Verifier for Verifier {
             || native(current.IsFramework())?
             || native(current.IsResourcePackage())?
             || native(current.IsOptional())?
+            || native(current.IsDevelopmentMode())?
         {
             return Err("Signed Windows preparation requires this exact non-Store App Installer main package.".into());
         }
         let id = native(current.Id())?;
-        let info = native(current.GetAppInstallerInfo())?;
-        let association = native(native(info.Uri())?.AbsoluteUri())?.to_string();
+        let info = association(&current)?;
         let version = native(id.Version())?;
         let build: serde_json::Value = serde_json::from_str(crate::build_info::json())
             .map_err(|_| "Cannot identify this Windows build.")?;
@@ -104,17 +123,34 @@ impl super::Verifier for Verifier {
                 "Installed Windows source, identity or approved association differs.".into(),
             );
         }
+        let version = [
+            version.Major,
+            version.Minor,
+            version.Build,
+            version.Revision,
+        ];
+        let (association, route) = if let Some(info) = info {
+            (
+                native(native(info.Uri())?.AbsoluteUri())?.to_string(),
+                Route::AppInstaller,
+            )
+        } else {
+            (
+                format!(
+                    "{}PeerBrush-{}-Windows-x64.appinstaller",
+                    policy.archive_root,
+                    version_text(version)
+                ),
+                Route::VerifiedLocal,
+            )
+        };
         let source = Source {
             full_name: native(id.FullName())?.to_string(),
             family: policy.family.clone(),
-            version: [
-                version.Major,
-                version.Minor,
-                version.Build,
-                version.Revision,
-            ],
+            version,
             association,
             build: commit.into(),
+            route,
         };
         policy.source_descriptor(&source)?;
         Ok(source)
@@ -297,6 +333,160 @@ impl StageOperation for Stage {
     fn cancel(&mut self) {
         let _ = self.operation.Cancel();
     }
+}
+
+/// Called only by the surviving owner after its final-seal/kernel-exit guards.
+/// The descriptor is evidence, never an installer input. No remote URI enters
+/// this API, and all submitted package bytes remain held until native terminal.
+pub(super) fn submit_local(
+    retained: &RetainedSelection,
+    role: transaction::Role,
+    control: &Control,
+) -> Result<Box<dyn StageOperation>> {
+    if !ENABLED {
+        return Err(DISABLED.into());
+    }
+    if retained.prepared.source.route != Route::VerifiedLocal {
+        return Err(
+            "Legacy App Installer association requires separate migration qualification.".into(),
+        );
+    }
+    retained.check_media(control)?;
+    let verified = super::Verifier::media(
+        &Verifier,
+        &retained.package,
+        &retained.prepared.policy,
+        &retained.prepared.selection,
+        false,
+        control,
+    )?;
+    if verified != retained.target || verified.is_none() {
+        return Err(STAGE_HOLD.into());
+    }
+    let main = local_uri(&retained.package.path)?;
+    let mut dependencies = vec![];
+    if role == transaction::Role::Selected {
+        super::Verifier::media(
+            &Verifier,
+            &retained.runtime,
+            &retained.prepared.policy,
+            &retained.prepared.selection,
+            true,
+            control,
+        )?;
+        dependencies.push(Some(local_uri(&retained.runtime.path)?));
+    }
+    let dependencies: ::windows::Foundation::Collections::IIterable<Uri> =
+        staging(dependencies.try_into())?;
+    let manager = staging(PackageManager::new())?;
+    let mut state = StageProgress::new(control.view.clone());
+    state.phase = if role == transaction::Role::Selected {
+        "Applying verified local Windows package"
+    } else {
+        "Restoring verified previous Windows package"
+    };
+    let state = Arc::new(state);
+    let callback = state.clone();
+    let progress = AsyncOperationProgressHandler::new(move |_, progress: &DeploymentProgress| {
+        callback.percentage(progress.percentage);
+        Ok(())
+    });
+    let options = if role == transaction::Role::Selected {
+        DeploymentOptions::None
+    } else {
+        DeploymentOptions::ForceUpdateFromAnyVersion
+    };
+    // Never force-shut down applications, defer registration, allow unsigned
+    // packages or downgrade a shared dependency. Rollback submits only the
+    // retained previous main package; its runtime was required by the old app.
+    retained.check_media(control)?;
+    let operation = staging(manager.AddPackageAsync(&main, &dependencies, options))?;
+    if operation.SetProgress(&progress).is_err() {
+        state.invalidate();
+    }
+    Ok(Box::new(Stage {
+        operation,
+        _progress: progress,
+        _manager: manager,
+        progress: state,
+    }))
+}
+
+pub(super) struct Registered {
+    pub(super) full_name: String,
+    pub(super) root: PathBuf,
+    version: [u16; 4],
+}
+impl Registered {
+    pub(super) fn prove(&self, target: &Target, control: &Control) -> Result<()> {
+        if self.full_name != target.full_name || self.version != target.version {
+            return Err(STAGE_HOLD.into());
+        }
+        let directory = Directory::open(&self.root)?;
+        let executable = Held::open(&self.root.join("peerbrush.exe"), PACKAGE, control)?;
+        let source = Held::open(&self.root.join(&target.source_name), PACKAGE, control)?;
+        if executable.media != target.executable || source.media != target.source {
+            return Err(STAGE_HOLD.into());
+        }
+        directory.check()?;
+        executable.check(control)?;
+        source.check(control)
+    }
+}
+pub(super) fn registered(policy: &Policy, control: &Control) -> Result<Option<Registered>> {
+    if !ENABLED {
+        return Err(DISABLED.into());
+    }
+    policy.validate()?;
+    control.check()?;
+    let manager = native(PackageManager::new())?;
+    let packages = native(manager.FindPackagesByUserSecurityIdPackageFamilyName(
+        &::windows::core::HSTRING::new(),
+        &::windows::core::HSTRING::from(&policy.family),
+    ))?;
+    let iterator = native(packages.First())?;
+    let mut result = None;
+    let mut count = 0;
+    while native(iterator.HasCurrent())? {
+        count += 1;
+        if count > 16 {
+            return Err(STAGE_HOLD.into());
+        }
+        let package = native(iterator.Current())?;
+        if !native(package.IsFramework())?
+            && !native(package.IsResourcePackage())?
+            && !native(package.IsOptional())?
+        {
+            let id = native(package.Id())?;
+            let kind = native(package.SignatureKind())?;
+            if result.is_some()
+                || native(package.IsDevelopmentMode())?
+                || (kind != PackageSignatureKind::Developer
+                    && kind != PackageSignatureKind::Enterprise)
+                || association(&package)?.is_some()
+                || !native(native(package.Status())?.VerifyIsOK())?
+                || native(id.Name())?.to_string() != policy.name
+                || native(id.Publisher())?.to_string() != policy.publisher
+                || native(id.FamilyName())?.to_string() != policy.family
+            {
+                return Err(STAGE_HOLD.into());
+            }
+            let version = native(id.Version())?;
+            result = Some(Registered {
+                full_name: native(id.FullName())?.to_string(),
+                root: PathBuf::from(native(package.InstalledPath())?.to_string()),
+                version: [
+                    version.Major,
+                    version.Minor,
+                    version.Build,
+                    version.Revision,
+                ],
+            });
+        }
+        native(iterator.MoveNext())?;
+    }
+    control.check()?;
+    Ok(result)
 }
 
 // Provider state owns all certificate/signer pointers until STATEACTION_CLOSE.

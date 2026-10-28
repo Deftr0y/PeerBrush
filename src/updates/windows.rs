@@ -15,9 +15,14 @@ use std::{
 pub(crate) mod gate;
 #[cfg(windows)]
 mod native;
+#[cfg(windows)]
+mod pipe;
+#[cfg(windows)]
+mod process;
 mod profile;
 #[cfg(test)]
 mod tests;
+mod transaction;
 
 pub(crate) const ENABLED: bool = false;
 const PACKAGE: u64 = 512 * 1024 * 1024;
@@ -58,6 +63,20 @@ struct Source {
     version: [u16; 4],
     association: String,
     build: String,
+    #[serde(default, skip_serializing_if = "Route::legacy")]
+    route: Route,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Route {
+    #[default]
+    AppInstaller,
+    VerifiedLocal,
+}
+impl Route {
+    fn legacy(&self) -> bool {
+        *self == Self::AppInstaller
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,10 +196,14 @@ struct Control {
 impl Control {
     fn check(&self) -> Result<()> {
         if self.cancelled.load(Ordering::Acquire) {
-            return Err("Windows download canceled; no package was installed.".into());
+            return Err(
+                "Windows update operation canceled; retain state for native readback.".into(),
+            );
         }
         if Instant::now() >= self.deadline {
-            return Err("Windows download timed out; no package was installed.".into());
+            return Err(
+                "Windows update operation timed out; retain state for native readback.".into(),
+            );
         }
         Ok(())
     }
@@ -662,7 +685,7 @@ impl Held {
                 != self.identity
             || fingerprint(&mut reopened, PACKAGE, control)? != self.media
         {
-            return Err("Downloaded Windows media changed; nothing was installed.".into());
+            return Err("Windows media changed; retain this transaction for review.".into());
         }
         Ok(())
     }
@@ -1499,6 +1522,7 @@ enum StageObservation {
 struct StageProgress {
     state: Mutex<StageProgressState>,
     view: Arc<Mutex<View>>,
+    phase: &'static str,
 }
 #[derive(Default)]
 struct StageProgressState {
@@ -1510,6 +1534,7 @@ impl StageProgress {
         Self {
             state: Mutex::new(StageProgressState::default()),
             view,
+            phase: "Staging signed Windows package with Windows",
         }
     }
     fn percentage(&self, percentage: u32) {
@@ -1522,7 +1547,7 @@ impl StageProgress {
             return;
         }
         let mut view = self.view.lock().unwrap_or_else(|p| p.into_inner());
-        view.phase = "Staging signed Windows package with Windows";
+        view.phase = self.phase;
         view.percentage = Some(percentage);
     }
     fn invalidate(&self) {

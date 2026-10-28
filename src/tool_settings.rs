@@ -286,7 +286,7 @@ impl Store {
         Ok(())
     }
     /// Called with the actual Store writer mutex held at checkpoint publication.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(windows, target_os = "macos", test))]
     pub(crate) fn authenticate_update_profile(&self, root: &Path) -> Result<(), String> {
         self.update_checkpoint_ready()?;
         if self.error.is_some()

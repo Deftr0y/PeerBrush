@@ -51,6 +51,29 @@ pub(super) fn capture(
     verifier: &dyn Verifier,
     control: &Control,
 ) -> Result<Copy> {
+    capture_at(retained, current, profile, policy, verifier, control, false)
+}
+
+pub(super) fn capture_final(
+    retained: &RetainedSelection,
+    current: &CurrentArchive<'_>,
+    profile: &crate::settings::UpdateProfile,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+) -> Result<Copy> {
+    capture_at(retained, current, profile, policy, verifier, control, true)
+}
+
+fn capture_at(
+    retained: &RetainedSelection,
+    current: &CurrentArchive<'_>,
+    profile: &crate::settings::UpdateProfile,
+    policy: &Policy,
+    verifier: &dyn Verifier,
+    control: &Control,
+    final_copy: bool,
+) -> Result<Copy> {
     profile.validate()?;
     current.check(policy, verifier, control)?;
     retained.check(verifier, control)?;
@@ -67,7 +90,11 @@ pub(super) fn capture(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(STAGE_HOLD.into()),
     };
-    let destination = retained.owned.path.join("profile-initial");
+    let destination = retained.owned.path.join(if final_copy {
+        "profile-final"
+    } else {
+        "profile-initial"
+    });
     // Exclusive creation preserves any interrupted or earlier backup.
     fs::create_dir(&destination).map_err(|_| STAGE_HOLD)?;
     let mut directories = vec![Directory::open(&destination)?];
@@ -131,7 +158,11 @@ pub(super) fn capture(
     retained.check(verifier, control)?;
     crate::server::sync_parent(&destination.join("migration-backup/entry"))?;
     let marker = stage_record(
-        &destination.join("initial.json"),
+        &destination.join(if final_copy {
+            "final.json"
+        } else {
+            "initial.json"
+        }),
         &Record {
             schema: 1,
             source: retained.prepared.source.clone(),
@@ -157,12 +188,43 @@ pub(super) fn reopen(
     current: &RetainedSelection,
     control: &Control,
 ) -> Result<Copy> {
-    let destination = retained.owned.path.join("profile-initial");
+    reopen_at(retained, expected, current, control, false)
+}
+
+pub(super) fn reopen_final(
+    retained: &RetainedSelection,
+    expected: &str,
+    current: &RetainedSelection,
+    control: &Control,
+) -> Result<Copy> {
+    reopen_at(retained, expected, current, control, true)
+}
+
+fn reopen_at(
+    retained: &RetainedSelection,
+    expected: &str,
+    current: &RetainedSelection,
+    control: &Control,
+    final_copy: bool,
+) -> Result<Copy> {
+    let destination = retained.owned.path.join(if final_copy {
+        "profile-final"
+    } else {
+        "profile-initial"
+    });
     let directories = vec![
         Directory::open(&destination)?,
         Directory::open(&destination.join("migration-backup"))?,
     ];
-    let marker = Held::open(&destination.join("initial.json"), SMALL, control)?;
+    let marker = Held::open(
+        &destination.join(if final_copy {
+            "final.json"
+        } else {
+            "initial.json"
+        }),
+        SMALL,
+        control,
+    )?;
     if marker.media.sha256 != expected {
         return Err(STAGE_HOLD.into());
     }
@@ -210,4 +272,81 @@ pub(super) fn reopen(
     };
     copy.check(control)?;
     Ok(copy)
+}
+
+/// Held only after the real parent's kernel exit and independent profile-lock
+/// acquisition. A health probe may mutate its private copy, never these files.
+pub(super) struct Originals {
+    directories: Vec<Directory>,
+    files: Vec<Held>,
+    absent: Vec<PathBuf>,
+}
+impl Originals {
+    pub(super) fn check(&self, control: &Control) -> Result<()> {
+        for directory in &self.directories {
+            directory.check()?;
+        }
+        for file in &self.files {
+            file.check(control)?;
+        }
+        for path in &self.absent {
+            control.check()?;
+            if !fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(STAGE_HOLD.into());
+            }
+        }
+        Ok(())
+    }
+}
+impl Copy {
+    pub(super) fn protect_originals(
+        &self,
+        profile: &crate::settings::UpdateProfile,
+        control: &Control,
+    ) -> Result<Originals> {
+        self.check(control)?;
+        profile.validate()?;
+        let root = profile.locations.profile();
+        let final_directory = self.marker.path.parent().ok_or(STAGE_HOLD)?;
+        if self.marker.path.file_name().and_then(|v| v.to_str()) != Some("final.json")
+            || final_directory.file_name().and_then(|v| v.to_str()) != Some("profile-final")
+            || final_directory.parent().and_then(Path::parent)
+                != Some(root.join("windows-prepared").as_path())
+        {
+            return Err(STAGE_HOLD.into());
+        }
+        let record: Record =
+            serde_json::from_slice(&small(&self.marker, control)?).map_err(|_| STAGE_HOLD)?;
+        let mut directories = vec![Directory::open(&root)?];
+        let mut absent = vec![];
+        match fs::symlink_metadata(root.join("migration-backup")) {
+            Ok(_) => directories.push(Directory::open(&root.join("migration-backup"))?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                absent.push(root.join("migration-backup"))
+            }
+            Err(_) => return Err(STAGE_HOLD.into()),
+        }
+        let mut files = vec![];
+        for (relative, media) in record.files {
+            let path = root.join(relative);
+            if let Some(media) = media {
+                let held = Held::open(&path, FILE_LIMIT, control)?;
+                if held.media != media {
+                    return Err(STAGE_HOLD.into());
+                }
+                files.push(held);
+            } else {
+                absent.push(path);
+            }
+        }
+        let result = Originals {
+            directories,
+            files,
+            absent,
+        };
+        result.check(control)?;
+        self.check(control)?;
+        Ok(result)
+    }
 }

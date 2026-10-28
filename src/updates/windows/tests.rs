@@ -43,6 +43,7 @@ fn source() -> Source {
         association: "https://example.invalid/windows/PeerBrush-1.30.0.0-Windows-x64.appinstaller"
             .into(),
         build: "1".repeat(40),
+        route: Route::AppInstaller,
     }
 }
 fn selected_target() -> Target {
@@ -2674,6 +2675,129 @@ fn staging_profile_fixture(temp: &Temp) -> crate::settings::Profile {
         .save(crate::updates::Preferences::default())
         .unwrap();
     profile
+}
+
+#[test]
+fn final_profile_keeps_later_settings_separate_and_protects_exact_originals() {
+    let temp = Temp::new();
+    let owner = staging_profile_fixture(&temp);
+    let profile = owner.update_profile();
+    let root = profile.locations.profile().join("windows-prepared");
+    let native = initial_current_native(&temp.0.join("installed"));
+    capture_current_only(&root, &policy(), &current_http(), &native, &control()).unwrap();
+    fs::create_dir(&root).unwrap();
+    acquire_with_current(&root, &policy(), &HttpFake::new(), &native, &control()).unwrap();
+    let old = acquire_for(
+        &current_root(&root).unwrap(),
+        &policy(),
+        None,
+        &native,
+        &control(),
+        MediaRole::Current,
+    )
+    .unwrap();
+    let current = current_archive(
+        &old.retained,
+        &old.retained.prepared.source,
+        &policy(),
+        &native,
+        &control(),
+    )
+    .unwrap();
+    let selected = retain_selection(&stage_attempt(&root), &policy(), &native, &control()).unwrap();
+    let initial = profile::capture(
+        &selected,
+        &current,
+        &profile,
+        &policy(),
+        &native,
+        &control(),
+    )
+    .unwrap();
+    let initial_bytes = fs::read(selected.owned.path.join("profile-initial/updates.json")).unwrap();
+    assert!(
+        initial.protect_originals(&profile, &control()).is_err(),
+        "initial backup is not the final seal"
+    );
+    let mut store = crate::updates::Store::load(&profile.locations.profile());
+    let mut settings = store.preferences.clone();
+    settings.automatic_checks = true;
+    store.save(settings).unwrap();
+    let final_copy = profile::capture_final(
+        &selected,
+        &current,
+        &profile,
+        &policy(),
+        &native,
+        &control(),
+    )
+    .unwrap();
+    let final_bytes = fs::read(selected.owned.path.join("profile-final/updates.json")).unwrap();
+    assert_ne!(initial_bytes, final_bytes);
+    assert_eq!(
+        fs::read(profile.locations.profile().join("updates.json")).unwrap(),
+        final_bytes
+    );
+    assert!(
+        profile::capture_final(
+            &selected,
+            &current,
+            &profile,
+            &policy(),
+            &native,
+            &control()
+        )
+        .is_err(),
+        "exclusive final copy is never replaced"
+    );
+    assert!(profile::reopen_final(&selected, &"0".repeat(64), &old.retained, &control()).is_err());
+    let reopened =
+        profile::reopen_final(&selected, final_copy.digest(), &old.retained, &control()).unwrap();
+    let originals = reopened.protect_originals(&profile, &control()).unwrap();
+    originals.check(&control()).unwrap();
+    let path = profile.locations.profile().join("updates.json");
+    #[cfg(windows)]
+    assert!(
+        fs::write(&path, b"foreign replacement").is_err(),
+        "real Windows read handles deny writes"
+    );
+    #[cfg(not(windows))]
+    {
+        fs::write(&path, b"foreign replacement").unwrap();
+        assert!(originals.check(&control()).is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"foreign replacement",
+            "refusal never overwrites foreign bytes"
+        );
+    }
+    assert_eq!(
+        fs::read(selected.owned.path.join("profile-initial/updates.json")).unwrap(),
+        initial_bytes
+    );
+    assert_eq!(
+        fs::read(selected.owned.path.join("profile-final/updates.json")).unwrap(),
+        final_bytes
+    );
+}
+
+#[test]
+fn legacy_journal_route_is_preserved_and_direct_install_route_is_explicit() {
+    let legacy = source();
+    let bytes = serde_json::to_vec(&legacy).unwrap();
+    assert!(!String::from_utf8(bytes.clone()).unwrap().contains("route"));
+    assert_eq!(serde_json::from_slice::<Source>(&bytes).unwrap(), legacy);
+    let mut direct = legacy.clone();
+    direct.route = Route::VerifiedLocal;
+    let bytes = serde_json::to_vec(&direct).unwrap();
+    assert!(String::from_utf8(bytes.clone())
+        .unwrap()
+        .contains("verified_local"));
+    assert_eq!(serde_json::from_slice::<Source>(&bytes).unwrap(), direct);
+    assert_ne!(direct, legacy);
+    let mut invalid = serde_json::to_value(&direct).unwrap();
+    invalid["route"] = json!("untrusted");
+    assert!(serde_json::from_value::<Source>(invalid).is_err());
 }
 
 #[test]

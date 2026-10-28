@@ -226,6 +226,23 @@ fn private_directory(path: &Path) -> Result<(), String> {
 }
 
 impl Profile {
+    /// The independent Windows gate already excludes new admissions. Reacquire
+    /// this process's own byte-range lock after the actual parent's kernel exit;
+    /// do not infer inherited ownership or run migration in the coordinator.
+    #[cfg(windows)]
+    pub(crate) fn lock_for_windows_owner(
+        locations: Locations,
+        gate: &crate::updates::windows::gate::Gate,
+    ) -> Result<Self, String> {
+        gate.validate_owner(&locations.config)?;
+        let lock = Lock::acquire(&locations.config.join("settings.lock"))?;
+        let profile = Self {
+            locations,
+            _lock: std::sync::Arc::new(lock),
+        };
+        profile.update_profile().validate()?;
+        Ok(profile)
+    }
     /// First default launch copies validated legacy preferences, never a blank reset.
     pub fn open(locations: Locations, legacy: &Path) -> Result<Self, String> {
         let profile = Self::lock(locations)?;

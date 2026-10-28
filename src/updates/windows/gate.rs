@@ -10,6 +10,7 @@ pub(crate) struct Gate {
     file: File,
     path: PathBuf,
     identity: (u64, u64),
+    owner: bool,
 }
 impl Gate {
     fn open(config: &Path, admission: bool) -> Result<Self> {
@@ -35,6 +36,7 @@ impl Gate {
             file,
             path,
             identity,
+            owner: !admission,
         };
         gate.check()?;
         Ok(gate)
@@ -44,6 +46,12 @@ impl Gate {
     }
     pub(super) fn own(config: &Path) -> Result<Self> {
         Self::open(config, false)
+    }
+    pub(crate) fn validate_owner(&self, config: &Path) -> Result<()> {
+        if !self.owner || self.directory.path != config {
+            return Err(HOLD.into());
+        }
+        self.check()
     }
     pub(super) fn check(&self) -> Result<()> {
         self.directory.check()?;
@@ -101,16 +109,30 @@ mod tests {
                 .unwrap(),
         );
         let mut stdout = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let kernel = super::super::process::Process::child(&child.0).unwrap();
+        assert_eq!(kernel.pid, child.0.id());
+        assert!(kernel.created > 0 && !kernel.exited().unwrap());
+        assert_eq!(
+            fs::canonicalize(kernel.image().unwrap()).unwrap(),
+            fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+        );
+        assert_eq!(
+            super::super::process::Process::open(child.0.id())
+                .unwrap()
+                .created,
+            kernel.created
+        );
         let (send, receive) = mpsc::channel();
         std::thread::spawn(move || {
-            for _ in 0..10 {
+            // Keep draining through child exit. Closing stdout at Ready makes
+            // libtest's subsequent result write fail with a broken pipe.
+            for _ in 0..32 {
                 let mut line = String::new();
                 if stdout.read_line(&mut line).unwrap_or(0) == 0 {
                     break;
                 }
-                if line.trim() == "PeerBrushNativeGateReadyV1" {
+                if line.trim_end().ends_with("PeerBrushNativeGateReadyV1") {
                     let _ = send.send(());
-                    break;
                 }
             }
         });
@@ -138,6 +160,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         drop(Gate::admit(&root).unwrap());
+        assert!(
+            kernel.exited().unwrap(),
+            "the held kernel object, not a journal PID, proves actual exit"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
