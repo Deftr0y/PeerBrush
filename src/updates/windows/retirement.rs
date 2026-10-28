@@ -58,7 +58,15 @@ fn move_owned(
         .map_err(|_| STAGE_HOLD)?;
     }
     parent.check()?;
-    let renamed = crate::file_safety::open_for_identity(destination).map_err(|_| STAGE_HOLD)?;
+    // The DELETE-capable rename handle remains alive. A readback must share
+    // that access and support directories; the ordinary metadata helper does
+    // not request FILE_FLAG_BACKUP_SEMANTICS.
+    let renamed = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(7)
+        .custom_flags(0x02000000 | 0x00200000)
+        .open(destination)
+        .map_err(|_| STAGE_HOLD)?;
     if crate::file_safety::identity(&renamed)? != identity {
         return Err(STAGE_HOLD.into());
     }
@@ -73,6 +81,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("peerbrush-retirement-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap(); // also exercise verbatim Windows paths
         for cycle in 0..3 {
             let source = root.join("current");
             fs::create_dir(&source).unwrap();
@@ -100,6 +109,15 @@ mod tests {
             );
             fs::remove_dir(&source).unwrap();
         }
+        let marker = root.join("active.json");
+        fs::write(&marker, b"completed-owner").unwrap();
+        let identity = crate::file_safety::identity(&File::open(&marker).unwrap()).unwrap();
+        let archived = root.join("completed.json");
+        rename_file(&marker, identity, &archived).unwrap();
+        assert_eq!(fs::read(&archived).unwrap(), b"completed-owner");
+        fs::write(&marker, b"foreign-owner").unwrap();
+        assert!(rename_file(&marker, identity, &root.join("wrong.json")).is_err());
+        assert_eq!(fs::read(&marker).unwrap(), b"foreign-owner");
         fs::remove_dir_all(root).unwrap();
     }
 }
