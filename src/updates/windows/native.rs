@@ -150,6 +150,24 @@ impl super::Verifier for Verifier {
         if &self.source(policy)? != current {
             return Err(STAGE_HOLD.into());
         }
+        let target = self.retained_current_media(file, policy, current, control)?;
+        if &self.source(policy)? != current {
+            return Err(STAGE_HOLD.into());
+        }
+        Ok(target)
+    }
+    fn retained_current_media(
+        &self,
+        file: &Held,
+        policy: &Policy,
+        current: &Source,
+        control: &Control,
+    ) -> Result<Target> {
+        if !ENABLED {
+            return Err(DISABLED.into());
+        }
+        control.check()?;
+        policy.source_descriptor(current)?;
         file.check(control)?;
         let target = unsafe { verify_version(file, policy, current.version, false, control)? }
             .ok_or(STAGE_HOLD)?;
@@ -157,9 +175,6 @@ impl super::Verifier for Verifier {
             return Err(STAGE_HOLD.into());
         }
         file.check(control)?;
-        if &self.source(policy)? != current {
-            return Err(STAGE_HOLD.into());
-        }
         control.check()?;
         Ok(target)
     }

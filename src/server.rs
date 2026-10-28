@@ -549,7 +549,7 @@ fn save_async(shared: &Shared, path: PathBuf, request: &Value) -> Result<(), Str
         .map(|_| ())
         .map_err(|error| format!("Could not start saving: {error}"))
 }
-// Working Save owns both files; neither becomes a loaded source until verified publication.
+// Working Save owns all staging files; none becomes a source before publication.
 struct SaveTemporary {
     path: PathBuf,
     file: fs::File,
@@ -774,6 +774,7 @@ fn save_prepared_inner(
     let ownership = crate::file_ownership::Ownership::save(path, &project)?;
     let mut output = SaveTemporary::new(path, false)?;
     let mut spool = SaveTemporary::new(path, true)?;
+    let mut composite = SaveTemporary::new(path, true)?;
     #[cfg(test)]
     let output_path = output.path.clone();
     #[cfg(test)]
@@ -804,6 +805,7 @@ fn save_prepared_inner(
             &doc,
             &mut output,
             &mut spool,
+            &mut composite,
             &check,
             &|stage, completed, total| control.progress(stage, completed, total),
         )?;
@@ -812,17 +814,22 @@ fn save_prepared_inner(
             &doc,
             &mut output,
             &mut spool,
+            &mut composite,
             &check,
             &|stage, completed, total| control.progress(stage, completed, total),
         )?;
     }
     #[cfg(test)]
+    save_safety_tests::observe("composite-encoded", &composite.path, &spool_path)?;
+    #[cfg(test)]
     save_safety_tests::observe("encoded", &output_path, &spool_path)?;
     control.progress("Verifying native spool", 0, 0)?;
+    composite.verify(&check)?;
     spool.verify(&check)?;
     control.progress("Verifying save output", 0, 0)?;
     let staged = output.verify(&check)?;
     let spool_stamp = spool.stamp()?;
+    let composite_stamp = composite.stamp()?;
     let output_stamp = output.stamp()?;
     // Preserve the previous exact file before touching its replacement.
     control.progress("Preserving previous version", 0, 0)?;
@@ -841,10 +848,13 @@ fn save_prepared_inner(
     }
     lease.validate()?;
     spool.validate(spool_stamp)?;
+    composite.validate(composite_stamp)?;
     output.validate(output_stamp)?;
     ownership.prepare(&output.path)?;
     output.validate(output_stamp)?;
     spool.validate(spool_stamp)?;
+    composite.validate(composite_stamp)?;
+    composite.remove()?;
     spool.remove()?;
     lease.validate()?;
     // Serialize the last cancellation decision with the first irreversible step.

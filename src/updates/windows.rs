@@ -213,6 +213,17 @@ trait Verifier {
     fn current_media(&self, _: &Held, _: &Policy, _: &Source, _: &Control) -> Result<Target> {
         Err(STAGE_HOLD.into())
     }
+    // Verify the retained previous signed package even when NEW is executing.
+    // This proves recovery bytes only, never a running package or apply permit.
+    fn retained_current_media(
+        &self,
+        _: &Held,
+        _: &Policy,
+        _: &Source,
+        _: &Control,
+    ) -> Result<Target> {
+        Err(STAGE_HOLD.into())
+    }
     fn running_target(&self, _: &Policy, _: &Target, _: &Control) -> Result<RunningTarget> {
         Err(STAGE_HOLD.into())
     }
@@ -981,7 +992,11 @@ fn authenticate_media_for(
     }
     control.phase("Revalidating retained signed Windows media", 0)?;
     let target = if let Some(current) = current {
-        Some(verifier.current_media(&package, policy, current, control)?)
+        Some(if role == MediaRole::Current {
+            verifier.retained_current_media(&package, policy, current, control)?
+        } else {
+            verifier.current_media(&package, policy, current, control)?
+        })
     } else {
         verifier.media(&package, policy, &prepared.selection, false, control)?
     };
@@ -1728,6 +1743,71 @@ enum Reconciled {
     RecordedStaging([u16; 4]),
     SelectedTargetRunning([u16; 4]),
 }
+
+struct RetainedRecovery {
+    selection: OwnedSelection,
+    transaction: crate::file_safety::Lease,
+    inventory: Vec<PathBuf>,
+}
+impl RetainedRecovery {
+    fn open(
+        root: &Path,
+        source: &Source,
+        policy: &Policy,
+        verifier: &dyn Verifier,
+        control: &Control,
+    ) -> Result<Self> {
+        let root = current_root(root)?;
+        let owned = Directory::open(&root)?;
+        let lease = crate::file_safety::Lease::acquire(&root.join("acquisition.json"))?;
+        let (mut inventory, selected) = attempts_for(&root, MediaRole::Current)?;
+        inventory.sort();
+        let selected = selected.ok_or(STAGE_HOLD)?;
+        let transaction = crate::file_safety::Lease::acquire(&selected.join("current.json"))?;
+        let input = read_prepared_for(&selected, policy, control, MediaRole::Current)?;
+        if &input.2.source != source {
+            return Err(STAGE_HOLD.into());
+        }
+        let retained = authenticate_media_for(
+            input,
+            policy,
+            verifier,
+            Some(source),
+            control,
+            MediaRole::Current,
+        )?;
+        if !retained.target.as_ref().is_some_and(|target| {
+            target.matches(source, policy) && target.version == retained.prepared.selection.version
+        }) {
+            return Err(STAGE_HOLD.into());
+        }
+        let recovery = Self {
+            selection: OwnedSelection {
+                owned,
+                lease,
+                retained,
+            },
+            transaction,
+            inventory,
+        };
+        recovery.check(control)?;
+        Ok(recovery)
+    }
+    fn check(&self, control: &Control) -> Result<()> {
+        self.selection.retained.check_media(control)?;
+        self.selection.check()?;
+        self.transaction.validate()?;
+        let (mut inventory, selected) =
+            attempts_for(&self.selection.owned.path, MediaRole::Current)?;
+        inventory.sort();
+        if inventory != self.inventory
+            || selected.as_ref() != Some(&self.selection.retained.owned.path)
+        {
+            return Err(STAGE_HOLD.into());
+        }
+        control.check()
+    }
+}
 // Retained observations grant no installation, OS-stage, cancellation or cleanup
 // authority. A native current-user query is separate from this record's target.
 fn inspect_retained(
@@ -1761,6 +1841,7 @@ fn inspect_retained(
     let mut authenticated = None;
     let mut evidence = Vec::new();
     let mut profile = None;
+    let mut recovery = None;
     let mut transaction_owner = None;
     let result = if let Some(selected) = &selected {
         directory(&selected.join(".peerbrush-versions"))?;
@@ -1800,7 +1881,20 @@ fn inspect_retained(
                 return Err(STAGE_HOLD.into());
             }
             if let Some(digest) = &intent.initial_profile_sha256 {
-                profile = Some(profile::reopen(&retained, digest, control)?);
+                let previous = RetainedRecovery::open(
+                    root,
+                    &retained.prepared.source,
+                    policy,
+                    verifier,
+                    control,
+                )?;
+                profile = Some(profile::reopen(
+                    &retained,
+                    digest,
+                    &previous.selection.retained,
+                    control,
+                )?);
+                recovery = Some(previous);
             }
             let outcome_file = Held::open(&selected.join("stage-outcome.json"), SMALL, control)?;
             let outcome: RecordedOutcome =
@@ -1856,6 +1950,9 @@ fn inspect_retained(
     }
     if let Some(profile) = &profile {
         profile.check(control)?;
+    }
+    if let Some(recovery) = &recovery {
+        recovery.check(control)?;
     }
     if let Some(transaction) = &transaction_owner {
         transaction.validate()?;

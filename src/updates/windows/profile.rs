@@ -154,6 +154,7 @@ pub(super) fn capture(
 pub(super) fn reopen(
     retained: &RetainedSelection,
     expected: &str,
+    current: &RetainedSelection,
     control: &Control,
 ) -> Result<Copy> {
     let destination = retained.owned.path.join("profile-initial");
@@ -170,7 +171,8 @@ pub(super) fn reopen(
     if record.schema != 1
         || record.source != retained.prepared.source
         || record.prepared_sha256 != retained.journal.media.sha256
-        || !sha(&record.current_sha256)
+        || record.current_sha256 != current.journal.media.sha256
+        || current.prepared.source != record.source
         || !record
             .files
             .get(Path::new("profile.json"))

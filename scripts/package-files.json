@@ -270,6 +270,7 @@
     "src/production_export/png.rs",
     "src/projective.rs",
     "src/psd.rs",
+    "src/psd/composite.rs",
     "src/psd/mask_rows_tests.rs",
     "src/psd/patterns.rs",
     "src/psd/source_stream_tests.rs",

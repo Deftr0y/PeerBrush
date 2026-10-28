@@ -332,25 +332,61 @@ pub(crate) fn startup_guard(locations: &Locations) -> Result<(), String> {
     if !private(&root, false)? {
         return Ok(());
     }
-    for path in entries(&root)? {
-        if inspect_unstarted_attempt(&path).is_err() {
-            return Err(native_recovery_message(&path).unwrap_or(HOLD).into());
+    let mut before = entries(&root)?;
+    before.sort();
+    for path in &before {
+        if inspect_unstarted_attempt(path).is_err() {
+            return Err(native_recovery_message(path).unwrap_or(HOLD).into());
         }
+    }
+    let mut after = entries(&root)?;
+    after.sort();
+    if before != after || !private(&root, false)? {
+        return Err(HOLD.into());
     }
     Ok(())
 }
 
 fn inspect_unstarted_attempt(path: &Path) -> Result<(), String> {
+    // Observation markers contradict a never-started outcome even if no intent
+    // remains. Absence is rechecked after reading the retained app/profile.
+    let forbidden = [
+        "native-owner-exited.json",
+        "native-parent-exited.json",
+        "native-aborted.json",
+        "native-installed-relaunched.json",
+        "native-installed-not-relaunched.json",
+        "native-cycle-ended.json",
+        "native-installing-terminated.json",
+        "native-installing-running.json",
+    ];
+    let absent = || -> Result<(), String> {
+        for marker in forbidden {
+            if Stamp::read(&path.join(marker))?.is_some() {
+                return Err(HOLD.into());
+            }
+        }
+        Ok(())
+    };
+    absent()?;
     let armed = path.join("native-start-intent.json");
     if Stamp::read(&armed)?.is_none() {
+        if Stamp::read(&path.join("native-not-started.json"))?.is_some() {
+            return Err(HOLD.into());
+        }
+        absent()?;
+        if Stamp::read(&armed)?.is_some()
+            || Stamp::read(&path.join("native-not-started.json"))?.is_some()
+        {
+            return Err(HOLD.into());
+        }
         return Ok(());
     }
     let bytes = read_marker(&armed)?;
     let intent: Intent = serde_json::from_slice(&bytes).map_err(|_| HOLD)?;
     let manifest = read_private(&path.join("checkpoint.json"), 1024 * 1024)?;
-    let outcome: Unstarted =
-        serde_json::from_slice(&read_marker(&path.join("native-not-started.json"))?)
-            .map_err(|_| HOLD)?;
+    let outcome_bytes = read_marker(&path.join("native-not-started.json"))?;
+    let outcome: Unstarted = serde_json::from_slice(&outcome_bytes).map_err(|_| HOLD)?;
     if intent.schema != 1
         || intent.owner_pid == 0
         || intent.checkpoint != path.file_name().unwrap().to_str().unwrap()
@@ -363,16 +399,26 @@ fn inspect_unstarted_attempt(path: &Path) -> Result<(), String> {
     }
     let stored: Manifest = serde_json::from_slice(&manifest).map_err(|_| HOLD)?;
     validate_manifest(&stored)?;
-    check_copy(
+    let app = check_copy(
         &path.join("PeerBrush.app"),
         &stored.app,
         &AtomicBool::new(false),
     )?;
-    check_copy(
+    let profile = check_copy(
         &path.join("profile"),
         &stored.profile,
         &AtomicBool::new(false),
     )?;
+    absent()?;
+    app.recheck()?;
+    profile.recheck()?;
+    if read_marker(&armed)? != bytes
+        || read_private(&path.join("checkpoint.json"), 1024 * 1024)? != manifest
+        || read_marker(&path.join("native-not-started.json"))? != outcome_bytes
+    {
+        return Err(HOLD.into());
+    }
+    absent()?;
     Ok(())
 }
 

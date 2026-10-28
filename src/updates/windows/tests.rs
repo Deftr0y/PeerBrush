@@ -1564,7 +1564,6 @@ impl Verifier for RunningNative {
         current: &Source,
         control: &Control,
     ) -> Result<Target> {
-        self.current_media_calls.fetch_add(1, Ordering::Relaxed);
         file.check(control)?;
         if !self.proof
             || self.archive_fault == "signature"
@@ -1575,7 +1574,30 @@ impl Verifier for RunningNative {
         if &self.source(policy)? != current {
             return Err(STAGE_HOLD.into());
         }
+        self.retained_current_media(file, policy, current, control)
+    }
+    fn retained_current_media(
+        &self,
+        file: &Held,
+        policy: &Policy,
+        current: &Source,
+        control: &Control,
+    ) -> Result<Target> {
+        self.current_media_calls.fetch_add(1, Ordering::Relaxed);
+        file.check(control)?;
+        if !self.proof
+            || self.archive_fault == "signature"
+            || file.media.sha256 != hash(b"main-native-bytes")
+        {
+            return Err(STAGE_HOLD.into());
+        }
         let mut target = self.target.clone();
+        if current == &source() {
+            target.full_name = current.full_name.clone();
+            target.version = current.version;
+            target.build = current.build.clone();
+            target.source_name = "PeerBrush-0.30.0-source.zip".into();
+        }
         match self.archive_fault {
             "manifest-version" => target.version[2] += 1,
             "signed-build" => target.build = "9".repeat(40),
@@ -2657,6 +2679,106 @@ fn staging_profile_fixture(temp: &Temp) -> crate::settings::Profile {
         .save(crate::updates::Preferences::default())
         .unwrap();
     profile
+}
+
+#[test]
+fn new_running_version_revalidates_previous_current_archive_and_initial_profile_binding() {
+    for fault in [
+        "none",
+        "changed-current",
+        "missing-current",
+        "current-lease",
+        "signature",
+    ] {
+        let temp = Temp::new();
+        let profile = staging_profile_fixture(&temp);
+        let root = profile.locations.profile().join("windows-prepared");
+        let old = initial_current_native(&temp.0.join("old-installed"));
+        capture_current_only(&root, &policy(), &current_http(), &old, &control()).unwrap();
+        fs::create_dir(&root).unwrap();
+        acquire_with_current(&root, &policy(), &HttpFake::new(), &old, &control()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(()).unwrap();
+        let stager = StageFake {
+            release: Mutex::new(Some(rx)),
+            uncertain: false,
+            submissions: Arc::new(AtomicUsize::new(0)),
+            cancellations: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(
+            stage_with_current(
+                &root,
+                &policy(),
+                &old,
+                &stager,
+                &control(),
+                &profile.update_profile()
+            )
+            .unwrap()
+            .accepted
+        );
+        let current = captured_current(&root);
+        let marker = fs::read(current.join("current.json")).unwrap();
+        let mut new = RunningNative::new(&temp.0.join("new-installed"));
+        let lease = if fault == "current-lease" {
+            Some(
+                crate::file_safety::Lease::acquire(
+                    &current_root(&root).unwrap().join("acquisition.json"),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        match fault {
+            "changed-current" => {
+                fs::write(current.join("main.msix"), b"fake-native-bytes").unwrap();
+            }
+            "missing-current" => {
+                fs::rename(
+                    current.join("current.json"),
+                    current.join("retained-current.json"),
+                )
+                .unwrap();
+            }
+            "signature" => {
+                new.archive_fault = "signature";
+            }
+            _ => {}
+        }
+        let result = inspect_retained(&root, &policy(), &new, &control());
+        if fault == "none" {
+            assert!(matches!(
+                result.unwrap(),
+                Reconciled::SelectedTargetRunning([1, 30, 1, 0])
+            ));
+            let recovery =
+                RetainedRecovery::open(&root, &source(), &policy(), &new, &control()).unwrap();
+            let late = current_root(&root)
+                .unwrap()
+                .join(format!("attempt-{}", crate::engine::id()));
+            fs::create_dir(&late).unwrap();
+            assert!(
+                recovery.check(&control()).is_err(),
+                "late inventory must be held"
+            );
+        } else {
+            assert!(result.is_err(), "{fault}");
+        }
+        drop(lease);
+        assert_eq!(
+            fs::read(current.join(if fault == "missing-current" {
+                "retained-current.json"
+            } else {
+                "current.json"
+            }))
+            .unwrap(),
+            marker
+        );
+        assert!(stage_attempt(&root)
+            .join("profile-initial/initial.json")
+            .is_file());
+    }
 }
 
 #[test]

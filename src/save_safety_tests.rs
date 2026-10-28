@@ -63,6 +63,104 @@ fn native_save_fixture(depth: u16, name: &str) -> Shared {
 }
 
 #[test]
+fn multistrip_working_save_preserves_destination_history_and_foreign_scratch() {
+    for depth in [8, 16] {
+        for extension in ["psd", "psb"] {
+            for fault in [
+                "none",
+                "cancel",
+                "stale",
+                "scratch-bytes",
+                "foreign-scratch",
+            ] {
+                let dir = std::env::temp_dir().join(format!("pb-multistrip-save-{}", engine::id()));
+                fs::create_dir(&dir).unwrap();
+                let path = dir.join(format!("art.{extension}"));
+                let mut engine = Engine::new();
+                engine.doc = engine::Document::new_depth(257, 515, depth).unwrap();
+                engine.doc.name = format!("art.{extension}");
+                let layer = engine.doc.layers[0].id.clone();
+                engine.edit("human", &[json!({"op":"fill","layer":layer,"rect":[0,0,257,515],"color":[37,73,151,193]})], None, None, "Dense native artwork").unwrap();
+                let shared = Arc::new(Mutex::new(engine));
+                save(&shared, &path).unwrap();
+                let original = fs::read(&path).unwrap();
+                {
+                    let mut engine = shared.lock().unwrap();
+                    engine.edit("human", &[json!({"op":"fill","layer":layer,"rect":[0,514,257,515],"color":[17,83,139,211]})], None, None, "Last strip artwork").unwrap();
+                }
+                let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+                let history = shared.lock().unwrap().undo.len();
+                let saved = shared.lock().unwrap().saved_revision;
+                let control = crate::saving::Control::default();
+                let observed_control = control.clone();
+                let observed_shared = shared.clone();
+                let foreign = dir.join("owned-scratch-relocated");
+                let foreign_name = Arc::new(Mutex::new(None));
+                let observed_foreign = foreign_name.clone();
+                let mut hit = false;
+                let watch = WatchSave::new(move |phase, output, _| {
+                    if !hit
+                        && phase == "encoding"
+                        && observed_control.status().stage == "Rendering composite strips"
+                        && observed_control.status().completed > 0
+                        && matches!(fault, "cancel" | "stale")
+                    {
+                        hit = true;
+                        if fault == "cancel" {
+                            assert!(observed_control.cancel());
+                        } else {
+                            let mut engine = observed_shared.lock().unwrap();
+                            let layer = engine.doc.layers[0].id.clone();
+                            engine.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,1,2,2],"color":[1,3,5,255]})], None, None, "Later human artwork").unwrap();
+                        }
+                    }
+                    if phase == "composite-encoded"
+                        && matches!(fault, "scratch-bytes" | "foreign-scratch")
+                    {
+                        if fault == "foreign-scratch" {
+                            fs::rename(output, &foreign).unwrap();
+                            *observed_foreign.lock().unwrap() = Some(output.to_path_buf());
+                        }
+                        fs::write(output, b"foreign scratch bytes").unwrap();
+                    }
+                    Ok(())
+                });
+                let result = save_controlled(&shared, &path, &json!({}), &control, || {});
+                drop(watch);
+                let engine = shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), history + usize::from(fault == "stale"));
+                if fault == "none" {
+                    result.unwrap();
+                    assert_eq!(
+                        serde_json::to_value(psd::decode(&fs::read(&path).unwrap()).unwrap())
+                            .unwrap(),
+                        before
+                    );
+                    assert_eq!(engine.saved_revision, engine.doc.revision);
+                    assert!(crate::file_safety::previous_versions(&path)
+                        .unwrap()
+                        .iter()
+                        .any(|old| fs::read(&old.path).unwrap() == original));
+                } else {
+                    assert!(result.is_err(), "{depth} {extension} {fault}");
+                    assert_eq!(fs::read(&path).unwrap(), original);
+                    assert_eq!(engine.saved_revision, saved);
+                }
+                if fault != "stale" {
+                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                }
+                if let Some(path) = &*foreign_name.lock().unwrap() {
+                    assert_eq!(fs::read(path).unwrap(), b"foreign scratch bytes");
+                }
+                drop(engine);
+                drop(shared);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn streamed_working_save_keeps_native_sources_history_ownership_and_previous_bytes() {
     for depth in [8, 16] {
         for extension in ["psd", "psb"] {

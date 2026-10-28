@@ -1,4 +1,5 @@
 //! Bounded PSD v1 / PSB v2 codecs. Unsupported Photoshop features are never silently rewritten.
+mod composite;
 pub mod patterns;
 mod styles;
 use crate::{
@@ -627,23 +628,41 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
 pub fn encode_psb(doc: &Document) -> Result<Vec<u8>, String> {
     encode_layout(doc, Layout::Psb)
 }
-pub(crate) fn encode_to<S: Read + Write + Seek>(
+pub(crate) fn encode_to<S: Read + Write + Seek, C: Read + Write + Seek>(
     doc: &Document,
     output: &mut dyn Write,
     spool: &mut S,
+    scratch: &mut C,
     check: &dyn Fn() -> Result<(), String>,
     progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    encode_layout_progress_to(doc, Layout::Psd, output, spool, check, progress)
+    encode_layout_scratch_to(
+        doc,
+        Layout::Psd,
+        output,
+        spool,
+        Some(scratch),
+        check,
+        progress,
+    )
 }
-pub(crate) fn encode_psb_to<S: Read + Write + Seek>(
+pub(crate) fn encode_psb_to<S: Read + Write + Seek, C: Read + Write + Seek>(
     doc: &Document,
     output: &mut dyn Write,
     spool: &mut S,
+    scratch: &mut C,
     check: &dyn Fn() -> Result<(), String>,
     progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    encode_layout_progress_to(doc, Layout::Psb, output, spool, check, progress)
+    encode_layout_scratch_to(
+        doc,
+        Layout::Psb,
+        output,
+        spool,
+        Some(scratch),
+        check,
+        progress,
+    )
 }
 fn check_output_size(doc: &Document, plan: &StandardPlan) -> Result<(), String> {
     // Validation bounds every frame and record count; u64 also covers their aggregate.
@@ -742,6 +761,17 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     check: &dyn Fn() -> Result<(), String>,
     progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
+    encode_layout_scratch_to(doc, layout, output, spool, None, check, progress)
+}
+fn encode_layout_scratch_to<S: Read + Write + Seek>(
+    doc: &Document,
+    layout: Layout,
+    output: &mut dyn Write,
+    spool: &mut S,
+    scratch: Option<&mut dyn composite::Scratch>,
+    check: &dyn Fn() -> Result<(), String>,
+    progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
+) -> Result<(), String> {
     progress("Preparing Photoshop sources", 0, 0)?;
     check()?;
     if spool.stream_position().map_err(|e| e.to_string())? != 0
@@ -758,6 +788,11 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     let plan = standard_plan(doc);
     check_output_size(doc, &plan)?;
     let high = doc.bit_depth == 16;
+    // Effect/bake/profile paths retain their separately materialized behavior.
+    let strip_composite = scratch.is_some()
+        && !plan.composite
+        && doc.icc_profile.is_none()
+        && doc.layers.iter().all(|layer| layer.effects.is_empty());
     progress("Preparing layer masks", 0, 0)?;
     check()?;
     let masks = if high {
@@ -796,7 +831,7 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     };
     progress("Preparing current composite", 0, 0)?;
     check()?;
-    let composite16 = if high {
+    let composite16 = if high && !strip_composite {
         Some(crate::depth16::render(doc)?)
     } else {
         None
@@ -1146,7 +1181,9 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     standard
         .write_all(&0u16.to_be_bytes())
         .map_err(|e| e.to_string())?;
-    if let Some(image) = &composite16 {
+    if strip_composite {
+        composite::write(doc, scratch.unwrap(), &mut standard, check, progress)?;
+    } else if let Some(image) = &composite16 {
         if image.width != w || image.height != h || image.words.len() != w as usize * h as usize * 4
         {
             return Err("Native PSD composite must match the full document dimensions".into());
