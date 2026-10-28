@@ -247,6 +247,10 @@ impl Profile {
     }
     fn lock(locations: Locations) -> Result<Self, String> {
         private_directory(&locations.config)?;
+        // Retain admission through byte-range lock acquisition. A surviving
+        // Windows owner denies new admission independently of the old process.
+        #[cfg(windows)]
+        let _admission = crate::updates::windows::gate::Gate::admit(&locations.config)?;
         let lock = Lock::acquire(&locations.config.join("settings.lock"))?;
         #[cfg(target_os = "macos")]
         crate::sparkle::macos::checkpoint::startup_guard(&locations)?;

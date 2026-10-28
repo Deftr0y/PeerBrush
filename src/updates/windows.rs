@@ -12,6 +12,8 @@ use std::{
 };
 
 #[cfg(windows)]
+pub(crate) mod gate;
+#[cfg(windows)]
 mod native;
 mod profile;
 #[cfg(test)]
