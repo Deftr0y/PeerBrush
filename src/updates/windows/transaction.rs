@@ -13,6 +13,7 @@ pub(super) enum Installed {
     Previous,
     Selected,
     Other,
+    Missing,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,7 +90,7 @@ fn run(host: &mut dyn Host) -> Result<Outcome> {
     }
     match installed {
         Installed::Other => return Err(STAGE_HOLD.into()),
-        Installed::Selected => {
+        Installed::Selected | Installed::Missing => {
             host.guard()?;
             host.record(Event::RollbackIntent)?;
             host.guard()?;
@@ -132,6 +133,7 @@ mod tests {
         new_health: bool,
         apply: bool,
         rollback: bool,
+        terminal_installed: Option<Installed>,
     }
     impl Fixture {
         fn new() -> Self {
@@ -143,6 +145,7 @@ mod tests {
                 new_health: true,
                 apply: true,
                 rollback: true,
+                terminal_installed: None,
             }
         }
         fn call(&mut self, name: &'static str) -> Result<()> {
@@ -189,6 +192,11 @@ mod tests {
                 } else {
                     Installed::Previous
                 };
+            }
+            if role == Role::Selected {
+                if let Some(installed) = self.terminal_installed {
+                    self.installed = installed;
+                }
             }
             Ok(success)
         }
@@ -241,6 +249,23 @@ mod tests {
         broken.rollback = false;
         assert!(execute(&mut broken).is_err());
         assert!(!broken.calls.contains(&"finish"));
+    }
+    #[test]
+    fn known_terminal_missing_registration_can_restore_only_the_previous_package() {
+        let mut missing = Fixture::new();
+        missing.apply = false;
+        missing.terminal_installed = Some(Installed::Missing);
+        assert_eq!(execute(&mut missing).unwrap(), Outcome::Recovered);
+        assert!(missing.events.contains(&Event::RollbackIntent));
+        assert!(missing.events.contains(&Event::RollbackSucceeded));
+        let mut foreign = Fixture::new();
+        foreign.terminal_installed = Some(Installed::Other);
+        assert!(execute(&mut foreign).is_err());
+        assert!(!foreign.calls.contains(&"rollback"));
+        let mut initially_missing = Fixture::new();
+        initially_missing.installed = Installed::Missing;
+        assert!(execute(&mut initially_missing).is_err());
+        assert!(!initially_missing.calls.contains(&"apply"));
     }
     #[test]
     fn every_failed_irreversible_boundary_holds_without_claiming_health_or_retirement() {

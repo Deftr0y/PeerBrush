@@ -345,6 +345,7 @@ fn control() -> Control {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Namespace {
+    user_profile: PathBuf,
     logical: Locations,
     physical: Locations,
     // Directory identity, including the actual settings profile and main lock.
@@ -362,7 +363,12 @@ impl Namespace {
             data: canonical(&logical.data)?,
             cache: canonical(&logical.cache)?,
         };
+        let user_profile = std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .ok_or(STAGE_HOLD)?;
         let result = Self {
+            user_profile,
             config: Directory::open(&logical.config)?.identity,
             profile: Directory::open(&logical.profile())?.identity,
             lock: crate::file_safety::identity(
@@ -382,9 +388,10 @@ impl Namespace {
         } else {
             &self.physical
         };
-        if ![&locations.config, &locations.data, &locations.cache]
-            .iter()
-            .all(|p| p.is_absolute())
+        if !self.user_profile.is_absolute()
+            || ![&locations.config, &locations.data, &locations.cache]
+                .iter()
+                .all(|p| p.is_absolute())
             || Directory::open(&locations.config)?.identity != self.config
             || Directory::open(&locations.profile())?.identity != self.profile
             || crate::file_safety::identity(
@@ -557,6 +564,7 @@ impl Parent {
                 &helper.temporary.path,
                 &helper.directory.path,
             )?;
+            command.env("USERPROFILE", &namespace.user_profile);
             let child = command
                 .args(["--windows-update-owner", &pipe.name])
                 .creation_flags(0x08000000 | 0x01000000)
@@ -943,7 +951,7 @@ impl transaction::Host for Live {
         self.guard()?;
         let registered = native::registered(&self.context.selected.prepared.policy, &self.c)?;
         let Some(registered) = registered else {
-            return Ok(transaction::Installed::Other);
+            return Ok(transaction::Installed::Missing);
         };
         for (role, result) in [
             (
@@ -1084,6 +1092,7 @@ impl Live {
             &root.join("tmp"),
             &registered.root,
         )?;
+        command.env("USERPROFILE", &root);
         let mut child = command
             .args(["--windows-update-health", &pipe.name])
             .creation_flags(0x08000000)
@@ -1261,6 +1270,7 @@ impl Live {
         registered.prove(&target, &owned.c)?;
         owned.guard()?;
         let locations = owned.namespace.logical.clone();
+        let user_profile = owned.namespace.user_profile.clone();
         let helper_path = owned.helper.directory.path.clone();
         // Keep admission, original-file protection and the independently owned
         // profile lock through retirement. Release only cache handles which
@@ -1313,13 +1323,19 @@ impl Live {
             &helper.temporary.path,
             &helper_path,
         )?;
-        command
+        command.env("USERPROFILE", user_profile);
+        let child = command
             .creation_flags(0x08000000 | 0x01000000)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| STAGE_HOLD)?;
+        Process::child(&child)?.authenticate(
+            &registered.root.join("peerbrush.exe"),
+            &target,
+            &control(),
+        )?;
         Ok(())
     }
 }
