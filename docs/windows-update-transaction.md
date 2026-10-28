@@ -102,8 +102,8 @@ human restart click and an untouched blank workspace. Users close projects throu
 the ordinary explicit close flow first; saved files do not authorize losing live
 undo/redo. The atomic transaction repeats that restriction under all engine,
 registry and Store writer locks. Arbitrary live-history restart persistence is
-outside this bounded path. Health probes suspend release checks and use isolated
-server/preferences/cache paths.
+outside this bounded path. Health probes suppress human edit/key/file-drop input, suspend release checks and
+use isolated server/preferences/cache paths.
 Signing/runtime facts, classic packaged-process launch identity, package file
 virtualization and surviving owner execution must be demonstrated with actual
 signed fixtures before activation.

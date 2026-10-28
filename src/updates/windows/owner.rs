@@ -1510,6 +1510,23 @@ impl Live {
     }
 }
 
+// The disposable health workspace renders the real app but must never accept
+// human document edits which would disappear when the probe exits.
+fn isolate_probe_input(ctx: &eframe::egui::Context) {
+    ctx.input_mut(|input| {
+        input.events.clear();
+        input.raw.events.clear();
+        input.keys_down.clear();
+        input.modifiers = Default::default();
+        input.raw.modifiers = Default::default();
+        input.pointer = Default::default();
+        input.raw.dropped_files.clear();
+        input.raw.hovered_files.clear();
+        input.raw_scroll_delta = eframe::egui::Vec2::ZERO;
+        input.smooth_scroll_delta = eframe::egui::Vec2::ZERO;
+    });
+}
+
 pub(super) fn health_main(name: &str) -> Result<()> {
     let policy = configured().ok_or(DISABLED)?;
     let (pipe, owner, probe, profile, target, source) = native::session(|| {
@@ -1597,6 +1614,7 @@ pub(super) fn health_main(name: &str) -> Result<()> {
     }
     impl eframe::App for App {
         fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+            isolate_probe_input(ctx);
             eframe::App::update(&mut self.app, ctx, frame);
             self.frames += 1;
             ctx.request_repaint();
@@ -1673,6 +1691,52 @@ pub(super) fn health_main(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disposable_health_workspace_suppresses_document_input_and_file_drops() {
+        use eframe::egui::{self, Event, Key, Modifiers, PointerButton, Pos2};
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    Event::PointerMoved(Pos2::new(100., 100.)),
+                    Event::PointerButton {
+                        pos: Pos2::new(100., 100.),
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::default(),
+                    },
+                    Event::Key {
+                        key: Key::N,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::COMMAND,
+                    },
+                    Event::Text("unwanted edit".into()),
+                ],
+                dropped_files: vec![egui::DroppedFile {
+                    path: Some(PathBuf::from("never-open-this.psd")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(ctx.input(|i| i.pointer.any_down() && !i.raw.dropped_files.is_empty()));
+                isolate_probe_input(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(!ui.button("Create document").clicked());
+                    let mut text = String::new();
+                    ui.text_edit_singleline(&mut text);
+                    assert!(text.is_empty());
+                });
+                assert!(ctx.input(|i| i.events.is_empty()
+                    && i.raw.events.is_empty()
+                    && i.keys_down.is_empty()
+                    && !i.pointer.any_down()
+                    && i.raw.dropped_files.is_empty()));
+            },
+        );
+    }
     #[test]
     fn native_pre_seal_cancellation_preserves_stage_and_refuses_every_late_boundary() {
         for marker in [
