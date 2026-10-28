@@ -985,11 +985,42 @@ fn cancel_before_seal(
     active.check(c)?;
     namespace.check(false)?;
     let intent = context.intent.take().ok_or(STAGE_HOLD)?;
+    retire_cancelled_records(intent, active, &namespace.physical.profile(), c, || {
+        context.check(c)?;
+        namespace.check(false)
+    })
+}
+fn pre_seal_absence(attempt: &Path) -> Result<()> {
+    for name in ["profile-final", "final-seal.json", "apply-records"] {
+        if !fs::symlink_metadata(attempt.join(name))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(STAGE_HOLD.into());
+        }
+    }
+    Ok(())
+}
+fn retire_cancelled_records(
+    intent: Held,
+    active: Held,
+    root: &Path,
+    c: &Control,
+    guard: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let attempt = intent.path.parent().ok_or(STAGE_HOLD)?;
+    if intent.path.file_name().and_then(|n| n.to_str()) != Some("owner-intent.json")
+        || active.path != root.join("windows-update-active.json")
+        || attempt.parent() != Some(root.join("windows-prepared").as_path())
+    {
+        return Err(STAGE_HOLD.into());
+    }
+    let attempt = Directory::open(attempt)?;
+    pre_seal_absence(&attempt.path)?;
     let path = intent.path.clone();
     let identity = intent.identity;
     let active_path = active.path.clone();
     let active_identity = active.identity;
-    let history = namespace.physical.profile().join("windows-update-history");
+    let history = root.join("windows-update-history");
     match fs::create_dir(&history) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1004,14 +1035,16 @@ fn cancel_before_seal(
     let archive_directory = Directory::open(&archive)?;
     intent.check(c)?;
     active.check(c)?;
-    namespace.check(false)?;
+    attempt.check()?;
+    pre_seal_absence(&attempt.path)?;
     drop(intent);
     drop(active);
     retirement::rename_file(&path, identity, &archive.join("owner-intent.json"))?;
-    context.check(c)?;
+    guard()?;
+    attempt.check()?;
+    pre_seal_absence(&attempt.path)?;
     history_directory.check()?;
     archive_directory.check()?;
-    namespace.check(false)?;
     retirement::rename_file(
         &active_path,
         active_identity,
@@ -1603,6 +1636,81 @@ pub(super) fn health_main(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_pre_seal_cancellation_preserves_stage_and_refuses_every_late_boundary() {
+        for marker in [
+            None,
+            Some("profile-final"),
+            Some("final-seal.json"),
+            Some("apply-records"),
+            Some("late-seal"),
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("peerbrush-cancel-native-{}", uuid::Uuid::new_v4()));
+            let attempt = root.join("windows-prepared/attempt-owned");
+            fs::create_dir_all(&attempt).unwrap();
+            fs::write(attempt.join("stage-outcome.json"), b"retained-stage").unwrap();
+            let c = control();
+            let intent = stage_record(
+                &attempt.join("owner-intent.json"),
+                &serde_json::json!({"synthetic":"intent"}),
+                &c,
+            )
+            .unwrap();
+            let active = stage_record(
+                &root.join("windows-update-active.json"),
+                &serde_json::json!({"synthetic":"active"}),
+                &c,
+            )
+            .unwrap();
+            if let Some(marker) = marker.filter(|n| *n != "late-seal") {
+                fs::write(attempt.join(marker), b"foreign-boundary").unwrap();
+            }
+            let result = retire_cancelled_records(intent, active, &root, &c, || {
+                if marker == Some("late-seal") {
+                    fs::write(attempt.join("final-seal.json"), b"late-boundary").unwrap();
+                }
+                Ok(())
+            });
+            assert_eq!(
+                fs::read(attempt.join("stage-outcome.json")).unwrap(),
+                b"retained-stage"
+            );
+            if marker.is_none() {
+                result.unwrap();
+                assert!(!attempt.join("owner-intent.json").exists());
+                assert!(!root.join("windows-update-active.json").exists());
+                let archive = fs::read_dir(root.join("windows-update-history"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                assert!(archive.join("owner-intent.json").is_file());
+                assert!(archive.join("cancelled-owner.json").is_file());
+            } else {
+                assert!(result.is_err());
+                assert!(root.join("windows-update-active.json").is_file());
+                if marker != Some("late-seal") {
+                    assert!(attempt.join("owner-intent.json").is_file());
+                }
+                let path = attempt.join(if marker == Some("late-seal") {
+                    "final-seal.json"
+                } else {
+                    marker.unwrap()
+                });
+                assert_eq!(
+                    fs::read(path).unwrap(),
+                    if marker == Some("late-seal") {
+                        b"late-boundary".as_slice()
+                    } else {
+                        b"foreign-boundary".as_slice()
+                    }
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
     #[test]
     fn logical_and_physical_profile_mapping_requires_actual_directory_and_lock_identity() {
         let root =
