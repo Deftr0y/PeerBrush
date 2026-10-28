@@ -52,6 +52,11 @@ impl Panel {
         // Stage-only work cannot replace the app. Ordinary human exit remains
         // available; its retained intent is not canceled/retired by this request.
         self.windows_prepared.later();
+        #[cfg(windows)]
+        {
+            self.install = None;
+            self.ready_owner = None;
+        }
     }
     #[cfg(target_os = "macos")]
     pub(super) fn retire_profile_capture(&mut self) -> Result<(), String> {
@@ -374,6 +379,11 @@ impl Panel {
             self.app_installer_check.cancel();
             #[cfg(any(windows, test))]
             self.windows_prepared.later();
+            #[cfg(windows)]
+            {
+                self.install = None;
+                self.ready_owner = None;
+            }
         }
     }
 }

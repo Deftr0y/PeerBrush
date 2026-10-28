@@ -960,3 +960,70 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
         fs::remove_dir_all(directory).unwrap();
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn human_later_drops_pending_windows_preflight_without_touching_native_pixels_or_history() {
+    for depth in [8, 16] {
+        let directory =
+            std::env::temp_dir().join(format!("pb-later-owner-ui-{}", crate::engine::id()));
+        fs::create_dir_all(directory.join("legacy")).unwrap();
+        let profile = crate::settings::Profile::open(
+            crate::settings::Locations {
+                config: directory.join("config"),
+                data: directory.join("data"),
+                cache: directory.join("cache"),
+            },
+            &directory.join("legacy"),
+        )
+        .unwrap();
+        let (mut app, ctx) = crate::ui::tests::fixture();
+        app.recovery.open = false;
+        {
+            let mut e = app.shared.lock().unwrap();
+            e.doc = Document::new_depth(16, 12, depth).unwrap();
+            let layer = e.doc.layers[0].id.clone();
+            e.edit(
+                "human",
+                &[json!({"op":"fill","layer":layer,"rect":[1,1,2,2],"color":[17,71,129,255]})],
+                None,
+                None,
+                "Retain history on Later",
+            )
+            .unwrap();
+            if depth == 16 {
+                e.doc.layers[0]
+                    .pixels
+                    .set16(3, 3, [12347, 23459, 34567, 45679]);
+            }
+        }
+        app.updates = Panel::load(&profile.locations.profile());
+        app.updates.owner = Owner::WindowsPackage;
+        app.updates.store.preferences.automatic_checks = false;
+        app.updates.open = true;
+        let (sender, receiver) = mpsc::channel();
+        app.updates.install = Some((profile.update_profile(), receiver));
+        let before = {
+            let e = app.shared.lock().unwrap();
+            (
+                serde_json::to_value(&e.doc).unwrap(),
+                history(&e),
+                e.doc.export_png().unwrap(),
+            )
+        };
+        click_button(&mut app, &ctx, "Later", true);
+        assert!(app.updates.install.is_none() && app.updates.ready_owner.is_none());
+        assert!(sender
+            .send(Err("Preflight result after human postponement".into()))
+            .is_err());
+        let e = app.shared.lock().unwrap();
+        assert!(!e.closed);
+        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before.0);
+        assert_eq!(history(&e), before.1);
+        assert_eq!(e.doc.export_png().unwrap(), before.2);
+        drop(e);
+        drop(app);
+        drop(profile);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
