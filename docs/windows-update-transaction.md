@@ -13,8 +13,15 @@ descriptor equality, complete signature/payload validation, exact hashes, named
 file identities and write/delete denial precede submission. The descriptor is
 evidence; it is never passed to an installation API for another network fetch.
 Forward deployment neither forces application shutdown nor downgrades versions.
-Only the separately verified previous main package can use the rollback flag;
-rollback does not force a shared framework downgrade.
+Only the separately verified previous main package can use the rollback flag.
+The documented `AddPackageAsync` overload accepts `None` or forced shutdown,
+so recovery uses the 19041
+[`AddPackageByUriAsync`](https://learn.microsoft.com/en-us/uwp/api/windows.management.deployment.packagemanager.addpackagebyuriasync)
+options API with
+[`ForceUpdateFromAnyVersion`](https://learn.microsoft.com/en-us/uwp/api/windows.management.deployment.addpackageoptions.forceupdatefromanyversion).
+Its URI is the same checked local MSIX file, and unsigned/development, forced
+shutdown and deferred registration options are explicitly refused. No network
+input or descriptor is passed. Rollback does not force a shared framework downgrade.
 
 This route requires a signed direct MSIX installation. Microsoft documents
 [different code-update paths for App Installer associations](https://learn.microsoft.com/en-us/windows/msix/non-store-developer-updates).

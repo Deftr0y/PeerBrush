@@ -5,7 +5,7 @@ use ::windows::{
     ApplicationModel::{AppInstallerInfo, IPackage6, Package, PackageSignatureKind},
     Foundation::{AsyncOperationProgressHandler, AsyncStatus, IAsyncOperationWithProgress, Uri},
     Management::Deployment::{
-        DeploymentOptions, DeploymentProgress, DeploymentResult, PackageManager,
+        AddPackageOptions, DeploymentOptions, DeploymentProgress, DeploymentResult, PackageManager,
         StagePackageOptions,
     },
     Win32::{
@@ -391,16 +391,27 @@ pub(super) fn submit_local(
         callback.percentage(progress.percentage);
         Ok(())
     });
-    let options = if role == transaction::Role::Selected {
-        DeploymentOptions::None
-    } else {
-        DeploymentOptions::ForceUpdateFromAnyVersion
-    };
+
     // Never force-shut down applications, defer registration, allow unsigned
     // packages or downgrade a shared dependency. Rollback submits only the
     // retained previous main package; its runtime was required by the old app.
     retained.check_media(control)?;
-    let operation = staging(manager.AddPackageAsync(&main, &dependencies, options))?;
+    let operation = if role == transaction::Role::Previous {
+        // The older AddPackageAsync overload does not document this flag.
+        // This 19041 API admits it explicitly; its URI is still only our held
+        // local MSIX, never HTTP or an App Installer descriptor.
+        let options = staging(AddPackageOptions::new())?;
+        staging(options.SetAllowUnsigned(false))?;
+        staging(options.SetDeveloperMode(false))?;
+        staging(options.SetForceAppShutdown(false))?;
+        staging(options.SetForceTargetAppShutdown(false))?;
+        staging(options.SetDeferRegistrationWhenPackagesAreInUse(false))?;
+        staging(options.SetForceUpdateFromAnyVersion(true))?;
+        retained.check_media(control)?;
+        staging(manager.AddPackageByUriAsync(&main, &options))?
+    } else {
+        staging(manager.AddPackageAsync(&main, &dependencies, DeploymentOptions::None))?
+    };
     if operation.SetProgress(&progress).is_err() {
         state.invalidate();
     }
