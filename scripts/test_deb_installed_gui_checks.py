@@ -136,8 +136,9 @@ class InstalledGuiContracts(unittest.TestCase):
 
     def test_screenshot_parks_pointer_outside_canvas_before_capture_without_clicking(self):
         with tempfile.TemporaryDirectory() as temporary:
-            window = gui.Window({}, Path(temporary))
-            path = Path(temporary) / 'settings-settled.png'
+            work = Path(temporary).resolve(strict=True)
+            window = gui.Window({}, work)
+            path = work / 'settings-settled.png'
             samples = screen(gui.palette(0))
             events = []
             def run(args):
