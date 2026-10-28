@@ -116,7 +116,8 @@ def duplicate_ok(samples, *, required=True):
     points = set()
     for y in range(height // 2 - 120, height // 2 + 160):
         for x in range(width // 2 - 250, width // 2 + 250):
-            if pixels[(y * width + x) * 4:(y * width + x + 1) * 4] == bytes([190, 70, 29, 255]):
+            rgba = pixels[(y * width + x) * 4:(y * width + x + 1) * 4]
+            if rgba[3] == 255 and all(abs(rgba[ch] - value) <= 1 for ch, value in enumerate([190, 70, 29])):
                 points.add((x, y))
     candidates = []
     while points:
@@ -304,9 +305,11 @@ class Window:
             samples = self.screenshot(self.work / ('duplicate-warning-' + str(index) + '.png'))
         x, y = duplicate_ok(samples)
         focused()
-        run(['xdotool', 'mousemove', '--window', window, str(x), str(y)])
+        run(['xdotool', 'mousemove', '--sync', '--window', window, str(x), str(y)])
         focused()
-        run(['xdotool', 'click', '--window', window, '1'])
+        # XTEST follows the native input route; --window would use SendEvent,
+        # which applications may ignore. Focus/owner are checked immediately above.
+        run(['xdotool', 'click', '1'])
 
     def close(self):
         self.authenticate()

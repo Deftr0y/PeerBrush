@@ -60,15 +60,18 @@ def screen(colors, *, thumbnails=False, only_thumbnails=False, swapped=False,
 class InstalledGuiContracts(unittest.TestCase):
     def test_duplicate_button_detector_is_bounded_unique_and_requires_visible_text(self):
         width, height = gui.WINDOW_SIZE
-        def sample(buttons):
+        def sample(buttons, delta=0):
             pixels = bytearray(bytes([41, 39, 43, 255]) * (width * height))
             for left, top, text in buttons:
                 for y in range(top, top + 28):
                     for x in range(left, left + 32):
-                        color = [255, 255, 255, 255] if text and left + 10 <= x < left + 20 and top + 10 <= y < top + 14 else [190, 70, 29, 255]
+                        color = [255, 255, 255, 255] if text and left + 10 <= x < left + 20 and top + 10 <= y < top + 14 else [190, 70, 29 + delta, 255]
                         pixels[(y * width + x) * 4:(y * width + x + 1) * 4] = bytes(color)
             return width, height, 8, bytes(pixels)
         self.assertEqual(gui.duplicate_ok(sample([(470, 500, True)])), (485, 513))
+        self.assertEqual(gui.duplicate_ok(sample([(470, 500, True)], delta=1)), (485, 513))
+        with self.assertRaises(ValueError):
+            gui.duplicate_ok(sample([(470, 500, True)], delta=2))
         self.assertIsNone(gui.duplicate_ok(sample([]), required=False))
         with self.assertRaises(ValueError):
             gui.duplicate_ok(sample([(470, 500, True), (550, 500, True)]), required=False)
@@ -109,6 +112,27 @@ class InstalledGuiContracts(unittest.TestCase):
                             window.capture('p', path, colors, select_project=False)
                     acknowledge.assert_called_once_with('canvas-0', samples=hidden)
                     self.assertEqual(captures.call_args_list, [mock.call(path), mock.call(path.with_name('canvas-0-after-duplicate.png'))])
+
+    def test_owned_focused_warning_uses_native_xtest_click_after_synchronized_move(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            window = gui.Window({}, Path(temporary))
+            window.pid = 2468
+            def run(args):
+                if args == ['wmctrl', '-lp']:
+                    return '0x00123456 0 2468 host PeerBrush'
+                if args == ['xdotool', 'getactivewindow']:
+                    return str(int('123456', 16))
+                if args == ['xdotool', 'getwindowpid', '0x00123456']:
+                    return '2468'
+                return ''
+            with mock.patch.object(window, 'authenticate'), mock.patch.object(gui, 'duplicate_ok', return_value=(477, 500)), \
+                    mock.patch.object(gui, 'run', side_effect=run) as commands:
+                window.acknowledge_duplicate(0, samples=screen(gui.palette(0)))
+            self.assertEqual(commands.call_args_list[-4:], [
+                mock.call(['xdotool', 'mousemove', '--sync', '--window', '0x00123456', '477', '500']),
+                mock.call(['xdotool', 'getactivewindow']),
+                mock.call(['xdotool', 'getwindowpid', '0x00123456']),
+                mock.call(['xdotool', 'click', '1'])])
 
     def test_gui_progress_is_fixed_stderr_only_and_entry_precedes_optional_imports(self):
         with mock.patch.object(gui, 'print', create=True) as output:
