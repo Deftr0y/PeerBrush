@@ -65,7 +65,26 @@ identity and profile checks. A subsequent upgrade must capture the then-current
 healthy package/profile; it cannot reuse the first transition's source proof.
 Historical signed archives are retained.
 
-The implemented state-machine, final-profile, gate, process and framing components
-must be connected to the live owner and health consumer and pass native replay
-before installation can be offered. Genuine signing/runtime facts and isolated
-signed-package qualification remain independent requirements.
+The live owner now consumes the final seal and real kernel exit, reacquires the
+profile lock, applies exact local bytes, launches the isolated installed GUI health
+consumer and uses the same guarded transaction for compatible previous-package
+recovery. The probe exercises the production workspace for three native frames;
+it does not establish calibrated rendering, tablet or arbitrary document fidelity.
+Its process must prove package identity and the logical-to-physical original and
+isolated profile mappings. A copied owner must prove that it is outside package
+identity and any parent lifetime job; inability to establish either fact refuses
+before parent exit.
+
+Successful live completion prepares fresh verified CURRENT media, preserves old
+CURRENT and completed transition archives, then retires the active marker by
+checked file-handle identity. Unknown interrupted state holds before migration.
+There is no automatic retry under an unobserved provider, no archive deletion and
+no claim that a terminal JSON record alone authorizes recovery. Eight retained
+owner directories/transitions are a bounded limit pending reviewed archive
+management.
+
+Native component replay and genuine isolated signed-package qualification are
+still required. Production remains disabled; the UI offer is not yet connected.
+Signing/runtime facts, classic packaged-process launch identity, package file
+virtualization and surviving owner execution must be demonstrated with actual
+signed fixtures before activation.

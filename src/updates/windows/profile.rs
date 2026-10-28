@@ -21,6 +21,38 @@ pub(super) struct Copy {
     absent: Vec<PathBuf>,
 }
 impl Copy {
+    #[cfg(windows)]
+    pub(super) fn materialize(&self, destination: &Path, control: &Control) -> Result<()> {
+        self.check(control)?;
+        let source = self.marker.path.parent().ok_or(STAGE_HOLD)?;
+        fs::create_dir(destination).map_err(|_| STAGE_HOLD)?;
+        let directory = Directory::open(destination)?;
+        fs::create_dir(destination.join("migration-backup")).map_err(|_| STAGE_HOLD)?;
+        for file in &self.files {
+            let relative = file.path.strip_prefix(source).map_err(|_| STAGE_HOLD)?;
+            if !crate::settings::update_files().contains(&relative.to_owned()) {
+                return Err(STAGE_HOLD.into());
+            }
+            let path = destination.join(relative);
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .map_err(|_| STAGE_HOLD)?;
+            let identity = crate::file_safety::identity(&output)?;
+            output
+                .write_all(&bounded_bytes(file, FILE_LIMIT, control)?)
+                .map_err(|_| STAGE_HOLD)?;
+            output.sync_all().map_err(|_| STAGE_HOLD)?;
+            drop(output);
+            let copied = Held::open(&path, FILE_LIMIT, control)?;
+            if copied.media != file.media || copied.identity != identity {
+                return Err(STAGE_HOLD.into());
+            }
+        }
+        directory.check()?;
+        self.check(control)
+    }
     pub(super) fn digest(&self) -> &str {
         &self.marker.media.sha256
     }

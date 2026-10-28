@@ -16,7 +16,8 @@ const FILES: &[&str] = &[
     "updates.json",
 ];
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Locations {
     pub config: PathBuf,
     pub data: PathBuf,
@@ -271,6 +272,8 @@ impl Profile {
         let lock = Lock::acquire(&locations.config.join("settings.lock"))?;
         #[cfg(target_os = "macos")]
         crate::sparkle::macos::checkpoint::startup_guard(&locations)?;
+        #[cfg(windows)]
+        crate::updates::windows::startup_guard(&locations)?;
         Ok(Self {
             locations,
             _lock: std::sync::Arc::new(lock),

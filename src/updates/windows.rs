@@ -16,10 +16,14 @@ pub(crate) mod gate;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+mod owner;
+#[cfg(windows)]
 mod pipe;
 #[cfg(windows)]
 mod process;
 mod profile;
+#[cfg(windows)]
+mod retirement;
 #[cfg(test)]
 mod tests;
 mod transaction;
@@ -2596,4 +2600,29 @@ impl Drop for Controller {
     fn drop(&mut self) {
         self.later();
     }
+}
+
+#[cfg(windows)]
+pub(crate) use owner::{startup_guard, Parent};
+/// Internal modes are rejected before normal startup when activation is disabled.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn main_entry() -> Option<i32> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mode = args.first().and_then(|a| a.to_str())?;
+    if !["--windows-update-owner", "--windows-update-health"].contains(&mode) {
+        return None;
+    }
+    let run = || -> Result<()> {
+        if !ENABLED || args.len() != 2 {
+            return Err(DISABLED.into());
+        }
+        let name = args[1].to_str().ok_or(STAGE_HOLD)?;
+        if mode == "--windows-update-owner" {
+            owner::owner_main(name)
+        } else {
+            owner::health_main(name)
+        }
+    };
+    Some(if run().is_ok() { 0 } else { 1 })
 }

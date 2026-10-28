@@ -29,7 +29,7 @@ use ::windows::{
 use std::{
     collections::BTreeSet,
     mem::size_of,
-    os::windows::{ffi::OsStrExt, io::AsRawHandle},
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
 };
 
 fn native<T>(result: ::windows::core::Result<T>) -> Result<T> {
@@ -487,6 +487,179 @@ pub(super) fn registered(policy: &Policy, control: &Control) -> Result<Option<Re
     }
     control.check()?;
     Ok(result)
+}
+
+pub(super) struct HelperFiles {
+    pub(super) inventory: std::collections::BTreeMap<String, Media>,
+    pub(super) held: Vec<Held>,
+}
+fn helper_name(name: &str, runtime: bool) -> Result<Option<String>> {
+    if name.contains(['/', '\\']) {
+        return Ok(None);
+    }
+    let name = name.to_ascii_lowercase();
+    if name != "peerbrush.exe" && !name.ends_with(".dll") || runtime && name == "peerbrush.exe" {
+        return Ok(None);
+    }
+    let stem = name.split('.').next().unwrap_or_default();
+    if name.len() > 128
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        || name.starts_with('.')
+        || ["con", "prn", "aux", "nul"].contains(&stem)
+        || (stem.len() == 4
+            && (stem.starts_with("com") || stem.starts_with("lpt"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    {
+        return Err(STAGE_HOLD.into());
+    }
+    Ok(Some(name))
+}
+/// The copied owner cannot depend on the old package graph surviving replacement.
+/// Its executable and local DLLs come only from the held signed CURRENT/runtime.
+/// No optional payload, arbitrary path or caller-provided DLL is accepted.
+pub(super) fn helper_files(
+    current: &RetainedSelection,
+    destination: Option<&Path>,
+    control: &Control,
+) -> Result<HelperFiles> {
+    if !ENABLED {
+        return Err(DISABLED.into());
+    }
+    current.check_media(control)?;
+    let target = super::Verifier::retained_current_media(
+        &Verifier,
+        &current.package,
+        &current.prepared.policy,
+        &current.prepared.source,
+        control,
+    )?;
+    if current.target.as_ref() != Some(&target)
+        || current.prepared.source.route != Route::VerifiedLocal
+    {
+        return Err(STAGE_HOLD.into());
+    }
+    super::Verifier::media(
+        &Verifier,
+        &current.runtime,
+        &current.prepared.policy,
+        &current.prepared.selection,
+        true,
+        control,
+    )?;
+    let mut inventory = std::collections::BTreeMap::new();
+    let mut held_files = vec![];
+    let mut total = 0u64;
+    for (file, runtime) in [(&current.package, false), (&current.runtime, true)] {
+        let path: Vec<u16> = file.path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let stream = unsafe {
+            native(SHCreateStreamOnFileEx(
+                PCWSTR(path.as_ptr()),
+                (STGM_READ | STGM_SHARE_DENY_WRITE).0,
+                0,
+                false,
+                None,
+            ))?
+        };
+        if unsafe { stream_hash(&stream, control)? } != file.media {
+            return Err(STAGE_HOLD.into());
+        }
+        unsafe {
+            native(stream.Seek(0, STREAM_SEEK_SET, None))?;
+        }
+        let factory: IAppxFactory =
+            unsafe { native(CoCreateInstance(&AppxFactory, None, CLSCTX_INPROC_SERVER))? };
+        let reader = unsafe { native(factory.CreatePackageReader(&stream))? };
+        let files = unsafe { native(reader.GetPayloadFiles())? };
+        while unsafe { native(files.GetHasCurrent())?.as_bool() } {
+            let payload = unsafe { native(files.GetCurrent())? };
+            let name = unsafe { string(payload.GetName())? };
+            if let Some(name) = helper_name(&name, runtime)? {
+                let data = unsafe { native(payload.GetStream())? };
+                let media = unsafe { stream_hash(&data, control)? };
+                if media.bytes == 0 || media.bytes > 64 * 1024 * 1024 {
+                    return Err(STAGE_HOLD.into());
+                }
+                if let Some(old) = inventory.get(&name) {
+                    if old != &media {
+                        return Err(STAGE_HOLD.into());
+                    }
+                } else {
+                    total = total.checked_add(media.bytes).ok_or(STAGE_HOLD)?;
+                    if total > 256 * 1024 * 1024 || inventory.len() >= 64 {
+                        return Err(STAGE_HOLD.into());
+                    }
+                    if let Some(root) = destination {
+                        let path = root.join(&name);
+                        let mut output = OpenOptions::new()
+                            .create_new(true)
+                            .write(true)
+                            .share_mode(1)
+                            .open(&path)
+                            .map_err(|_| STAGE_HOLD)?;
+                        let identity = crate::file_safety::identity(&output)?;
+                        unsafe {
+                            native(data.Seek(0, STREAM_SEEK_SET, None))?;
+                        }
+                        let mut bytes = 0u64;
+                        let mut block = [0; 64 * 1024];
+                        loop {
+                            control.check()?;
+                            let mut count = 0;
+                            unsafe {
+                                native(
+                                    data.Read(
+                                        block.as_mut_ptr() as _,
+                                        block.len() as u32,
+                                        Some(&mut count),
+                                    )
+                                    .ok(),
+                                )?;
+                            }
+                            if count as usize > block.len()
+                                || bytes + u64::from(count) > media.bytes
+                            {
+                                return Err(STAGE_HOLD.into());
+                            }
+                            if count == 0 {
+                                break;
+                            }
+                            output
+                                .write_all(&block[..count as usize])
+                                .map_err(|_| STAGE_HOLD)?;
+                            bytes += u64::from(count);
+                        }
+                        if bytes != media.bytes {
+                            return Err(STAGE_HOLD.into());
+                        }
+                        output.sync_all().map_err(|_| STAGE_HOLD)?;
+                        drop(output);
+                        let copied = Held::open(&path, 64 * 1024 * 1024, control)?;
+                        if copied.identity != identity || copied.media != media {
+                            return Err(STAGE_HOLD.into());
+                        }
+                        held_files.push(copied);
+                    }
+                    inventory.insert(name, media);
+                }
+            }
+            unsafe {
+                native(files.MoveNext())?;
+            }
+        }
+        if unsafe { stream_hash(&stream, control)? } != file.media {
+            return Err(STAGE_HOLD.into());
+        }
+    }
+    if inventory.get("peerbrush.exe") != Some(&target.executable) {
+        return Err(STAGE_HOLD.into());
+    }
+    current.check_media(control)?;
+    Ok(HelperFiles {
+        inventory,
+        held: held_files,
+    })
 }
 
 // Provider state owns all certificate/signer pointers until STATEACTION_CLOSE.

@@ -4,6 +4,10 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    #[cfg(windows)]
+    if let Some(code) = peerbrush::updates::windows::main_entry() {
+        std::process::exit(code);
+    }
     #[cfg(target_os = "macos")]
     if let Some(code) = peerbrush::sparkle::macos::coordinator_main_entry() {
         std::process::exit(code);
