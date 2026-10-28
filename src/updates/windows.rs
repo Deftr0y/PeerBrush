@@ -389,9 +389,18 @@ impl Policy {
         }
         Ok(())
     }
+    fn direct_descriptor(&self, version: [u16; 4]) -> String {
+        format!(
+            "{}PeerBrush-{}-Windows-x64.appinstaller",
+            self.archive_root,
+            version_text(version)
+        )
+    }
     fn source_descriptor(&self, source: &Source) -> Result<url::Url> {
         let uri = self.archive_uri(&source.association)?;
-        if source.family != self.family
+        if (source.route == Route::VerifiedLocal
+            && source.association != self.direct_descriptor(source.version))
+            || source.family != self.family
             || source.version[0] != 1
             || source.version[3] != 0
             || source.build.len() != 40
@@ -529,7 +538,8 @@ fn descriptor_for(
     if role == MediaRole::Current && v != source.version {
         return Err(CURRENT_MISSING.into());
     }
-    if (role == MediaRole::New && v <= source.version)
+    if (source.route == Route::VerifiedLocal && descriptor != policy.direct_descriptor(v))
+        || (role == MediaRole::New && v <= source.version)
         || (role == MediaRole::Current && descriptor != source.association)
         || descriptor == policy.discovery
         || !approved.path().ends_with(&format!(

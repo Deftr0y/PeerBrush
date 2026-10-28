@@ -135,14 +135,7 @@ impl super::Verifier for Verifier {
                 Route::AppInstaller,
             )
         } else {
-            (
-                format!(
-                    "{}PeerBrush-{}-Windows-x64.appinstaller",
-                    policy.archive_root,
-                    version_text(version)
-                ),
-                Route::VerifiedLocal,
-            )
+            (policy.direct_descriptor(version), Route::VerifiedLocal)
         };
         let source = Source {
             full_name: native(id.FullName())?.to_string(),

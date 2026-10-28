@@ -438,10 +438,15 @@ struct Seal {
     final_profile_sha256: String,
 }
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Commit {
-    nonce: String,
-    final_seal_sha256: String,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum Decision {
+    Commit {
+        nonce: String,
+        final_seal_sha256: String,
+    },
+    Cancel {
+        nonce: String,
+    },
 }
 
 struct Helper {
@@ -685,7 +690,7 @@ impl Parent {
     pub(crate) fn commit(&mut self) -> Result<()> {
         self.check()?;
         self.pipe.send(
-            &Commit {
+            &Decision::Commit {
                 nonce: self.hello.nonce.clone(),
                 final_seal_sha256: self
                     .context
@@ -703,8 +708,39 @@ impl Parent {
 }
 impl Drop for Parent {
     fn drop(&mut self) {
-        // Never terminate a surviving deployment owner. A lost parent/pipe is a
-        // hold, and durable admission prevents normal profile migration.
+        // Before any final copy/seal, an authenticated cancellation can retire
+        // only this owner's intent. Every later/uncertain boundary remains held.
+        let path = &self.context.selected.owned.path;
+        let absent = ["profile-final", "final-seal.json", "apply-records"]
+            .iter()
+            .all(|name| {
+                fs::symlink_metadata(path.join(name))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            });
+        if absent
+            && self.context.seal.is_none()
+            && self.context.final_profile.is_none()
+            && self.context.record_directory.is_none()
+        {
+            drop(self.context.intent.take());
+            let end = Instant::now() + Duration::from_secs(2);
+            if self
+                .pipe
+                .send(
+                    &Decision::Cancel {
+                        nonce: self.hello.nonce.clone(),
+                    },
+                    &self.owner,
+                    end,
+                )
+                .is_ok()
+                && self.pipe.receive::<bool>(&self.owner, end).is_ok_and(|v| v)
+            {
+                let _ = self.pipe.send(&true, &self.owner, end);
+            }
+        }
+        // Never terminate a surviving deployment owner. Lost/uncertain ownership
+        // retains the durable admission hold instead of guessing cancellation.
         let _ = self.child.try_wait();
     }
 }
@@ -850,17 +886,43 @@ pub(super) fn owner_main(name: &str) -> Result<()> {
             &parent,
             c.deadline,
         )?;
-        let commit: Commit = pipe.receive(&parent, c.deadline)?;
-        if commit.nonce != name {
-            return Err(STAGE_HOLD.into());
-        }
+        let decision: Decision = pipe.receive(&parent, c.deadline)?;
+        let final_seal_sha256 = match decision {
+            Decision::Commit {
+                nonce,
+                final_seal_sha256,
+            } if nonce == name => final_seal_sha256,
+            Decision::Cancel { nonce } if nonce == name => {
+                context.check(&c)?;
+                hello.namespace.check(false)?;
+                gate.check()?;
+                active.check(&c)?;
+                parent.authenticate(
+                    &parent.image()?,
+                    context.previous.target.as_ref().ok_or(STAGE_HOLD)?,
+                    &c,
+                )?;
+                if context.final_profile.is_some()
+                    || context.seal.is_some()
+                    || context.record_directory.is_some()
+                {
+                    return Err(STAGE_HOLD.into());
+                }
+                cancel_before_seal(context, active, &hello.namespace, &c)?;
+                let end = Instant::now() + Duration::from_secs(2);
+                pipe.send(&true, &parent, end)?;
+                let _ = pipe.receive::<bool>(&parent, end);
+                return Ok(());
+            }
+            _ => return Err(STAGE_HOLD.into()),
+        };
         let held = Held::open(
             &context.selected.owned.path.join("final-seal.json"),
             SMALL,
             &c,
         )?;
         let seal: Seal = serde_json::from_slice(&small(&held, &c)?).map_err(|_| STAGE_HOLD)?;
-        if held.media.sha256 != commit.final_seal_sha256
+        if held.media.sha256 != final_seal_sha256
             || seal.schema != 1
             || seal.nonce != name
             || seal.parent_created != parent.created
@@ -911,6 +973,50 @@ pub(super) fn owner_main(name: &str) -> Result<()> {
         let outcome = transaction::execute(&mut host)?;
         host.retire(outcome)
     })
+}
+
+fn cancel_before_seal(
+    mut context: Context,
+    active: Held,
+    namespace: &Namespace,
+    c: &Control,
+) -> Result<()> {
+    context.check(c)?;
+    active.check(c)?;
+    namespace.check(false)?;
+    let intent = context.intent.take().ok_or(STAGE_HOLD)?;
+    let path = intent.path.clone();
+    let identity = intent.identity;
+    let active_path = active.path.clone();
+    let active_identity = active.identity;
+    let history = namespace.physical.profile().join("windows-update-history");
+    match fs::create_dir(&history) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(STAGE_HOLD.into()),
+    }
+    let history_directory = Directory::open(&history)?;
+    if fs::read_dir(&history).map_err(|_| STAGE_HOLD)?.count() >= 8 {
+        return Err(STAGE_HOLD.into());
+    }
+    let archive = history.join(format!("cancelled-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&archive).map_err(|_| STAGE_HOLD)?;
+    let archive_directory = Directory::open(&archive)?;
+    intent.check(c)?;
+    active.check(c)?;
+    namespace.check(false)?;
+    drop(intent);
+    drop(active);
+    retirement::rename_file(&path, identity, &archive.join("owner-intent.json"))?;
+    context.check(c)?;
+    history_directory.check()?;
+    archive_directory.check()?;
+    namespace.check(false)?;
+    retirement::rename_file(
+        &active_path,
+        active_identity,
+        &archive.join("cancelled-owner.json"),
+    )
 }
 
 struct Live {

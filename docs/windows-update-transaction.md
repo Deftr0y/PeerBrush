@@ -70,7 +70,10 @@ uncertainty and cannot manufacture a new apply or recovery permit. Completion
 records, exact recovery-media promotion and cache retirement require fresh native
 identity and profile checks. A subsequent upgrade must capture the then-current
 healthy package/profile; it cannot reuse the first transition's source proof.
-Historical signed archives are retained.
+Historical signed archives are retained. Before a final copy/seal or apply record
+exists, an authenticated live-parent cancellation can archive only its owned
+intent/active marker and keep the staged media. A lost pipe or later cancellation
+cannot take that path. Unknown outcomes continue to hold.
 
 The live owner now consumes the final seal and real kernel exit, reacquires the
 profile lock, applies exact local bytes, launches the isolated installed GUI health

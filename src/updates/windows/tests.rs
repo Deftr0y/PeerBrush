@@ -3079,3 +3079,22 @@ fn explicit_copy_worker_reports_real_capture_without_prepared_update_or_health_a
     assert!(!ENABLED);
     assert!(configured().is_none());
 }
+
+#[test]
+fn direct_route_binds_the_future_installed_descriptor_for_repeated_upgrades() {
+    let mut current = source();
+    current.route = Route::VerifiedLocal;
+    policy().source_descriptor(&current).unwrap();
+    assert_eq!(
+        descriptor(&xml(), &policy(), &current).unwrap().descriptor,
+        new_descriptor()
+    );
+    let nested = String::from_utf8(xml())
+        .unwrap()
+        .replace("/windows/PeerBrush-", "/windows/nested/PeerBrush-");
+    assert!(descriptor(nested.as_bytes(), &policy(), &current).is_err());
+    // Legacy associations preserve their existing wire/layout interpretation.
+    assert!(descriptor(nested.as_bytes(), &policy(), &source()).is_ok());
+    current.association = current.association.replace("/windows/", "/windows/nested/");
+    assert!(policy().source_descriptor(&current).is_err());
+}

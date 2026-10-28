@@ -144,7 +144,9 @@ impl Panel {
         }
         #[cfg(any(windows, test))]
         {
-            if self.owner == Owner::WindowsAppInstaller {
+            if self.owner == Owner::WindowsAppInstaller
+                || (self.owner == Owner::WindowsPackage && updates::windows::ENABLED)
+            {
                 self.windows_prepared.startup();
             }
             self.windows_prepared.tick();
