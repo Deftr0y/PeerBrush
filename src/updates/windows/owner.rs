@@ -1214,6 +1214,25 @@ impl Live {
             .as_ref()
             .ok_or(STAGE_HOLD)?
             .materialize(&locations.profile(), &self.c)?;
+        // Keep the complete owned namespace pinned across the child's writes;
+        // checking an ID and dropping its directory handle is not isolation.
+        let isolation_paths = [
+            root.clone(),
+            root.join("roaming"),
+            locations.config.clone(),
+            locations.profile(),
+            locations.profile().join("migration-backup"),
+            root.join("local"),
+            root.join("local/PeerBrush"),
+            locations.data.clone(),
+            locations.cache.clone(),
+            root.join("state"),
+            root.join("tmp"),
+        ];
+        let isolation = isolation_paths
+            .iter()
+            .map(|p| Directory::open(p))
+            .collect::<Result<Vec<_>>>()?;
         let directories = [
             &locations.config,
             &locations.data,
@@ -1252,7 +1271,7 @@ impl Live {
                 nonce: pipe.name.clone(),
                 owner_created: Process::open(std::process::id())?.created,
                 namespace: self.namespace.clone(),
-                locations,
+                locations: locations.clone(),
                 directories,
                 helper: self.helper.directory.path.clone(),
                 current_sha256: self.context.previous.journal.media.sha256.clone(),
@@ -1286,8 +1305,20 @@ impl Live {
         })();
         match observed {
             Ok(true) => {
+                for directory in &isolation {
+                    directory.check()?;
+                }
+                // A successful process/frame echo alone cannot prove backward
+                // compatibility if it migrated or rewrote its isolated profile.
+                let compatible = self
+                    .context
+                    .final_profile
+                    .as_ref()
+                    .ok_or(STAGE_HOLD)?
+                    .matches_materialized(&locations.profile(), &self.c)
+                    .is_ok();
                 self.guard()?;
-                Ok(true)
+                Ok(compatible)
             }
             _ => {
                 // No rollback under a possibly live child. Kill through the

@@ -2766,6 +2766,28 @@ fn final_profile_keeps_later_settings_separate_and_protects_exact_originals() {
                 _ => panic!("Isolated final profile differs at {relative:?}"),
             }
         }
+        reopened
+            .matches_materialized(&destination, &control())
+            .unwrap();
+        let altered = destination.join("updates.json");
+        let original = fs::read(&altered).unwrap();
+        fs::write(&altered, b"foreign migrated profile").unwrap();
+        assert!(reopened
+            .matches_materialized(&destination, &control())
+            .is_err());
+        fs::write(&altered, &original).unwrap();
+        reopened
+            .matches_materialized(&destination, &control())
+            .unwrap();
+        let absent = crate::settings::update_files()
+            .into_iter()
+            .find(|relative| !destination.join(relative).exists())
+            .unwrap();
+        fs::write(destination.join(&absent), b"unexpected new preference").unwrap();
+        assert!(reopened
+            .matches_materialized(&destination, &control())
+            .is_err());
+        fs::remove_file(destination.join(absent)).unwrap();
         assert!(reopened.materialize(&destination, &control()).is_err());
     }
     let originals = reopened.protect_originals(&profile, &control()).unwrap();

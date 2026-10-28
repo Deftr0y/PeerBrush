@@ -58,7 +58,10 @@ boundary. Unknown or contradictory observations hold the original profile.
 Registration success is not launch health. The selected installed executable and
 corresponding source must match their verified signed payload, and an authenticated
 fresh package process must exercise an isolated copy of the final profile. The
-normal profile remains protected. An observed failed and exited health child can
+normal profile remains protected. The owner pins the isolated namespace throughout
+the probe and compares every copied/absent allowlisted preference byte after its
+actual process exit. A migrated or rewritten clone cannot establish compatible
+recovery; this bounded path requires no profile migration. An observed failed and exited health child can
 take the compatible previous-package path; an uncertain live child must hold.
 Recovery must prove the previous installed payload and its actual health before
 normal admission. Foreign profile changes are retained, never overwritten with

@@ -22,6 +22,29 @@ pub(super) struct Copy {
 }
 impl Copy {
     #[cfg(windows)]
+    pub(super) fn matches_materialized(&self, destination: &Path, control: &Control) -> Result<()> {
+        self.check(control)?;
+        let directory = Directory::open(destination)?;
+        let record: Record =
+            serde_json::from_slice(&small(&self.marker, control)?).map_err(|_| STAGE_HOLD)?;
+        for (relative, media) in record.files {
+            let path = destination.join(relative);
+            if let Some(media) = media {
+                let actual = Held::open(&path, FILE_LIMIT, control)?;
+                if actual.media != media {
+                    return Err("The health process changed the profile; compatible recovery is not established.".into());
+                }
+                actual.check(control)?;
+            } else if !fs::symlink_metadata(path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(STAGE_HOLD.into());
+            }
+        }
+        directory.check()?;
+        self.check(control)
+    }
+    #[cfg(windows)]
     pub(super) fn materialize(&self, destination: &Path, control: &Control) -> Result<()> {
         self.check(control)?;
         let source = self.marker.path.parent().ok_or(STAGE_HOLD)?;
