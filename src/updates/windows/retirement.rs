@@ -58,7 +58,7 @@ fn move_owned(
         .map_err(|_| STAGE_HOLD)?;
     }
     parent.check()?;
-    let renamed = crate::file_safety::open_for_identity(destination)?;
+    let renamed = crate::file_safety::open_for_identity(destination).map_err(|_| STAGE_HOLD)?;
     if crate::file_safety::identity(&renamed)? != identity {
         return Err(STAGE_HOLD.into());
     }

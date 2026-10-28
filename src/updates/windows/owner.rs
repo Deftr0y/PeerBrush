@@ -365,9 +365,10 @@ impl Namespace {
         let result = Self {
             config: Directory::open(&logical.config)?.identity,
             profile: Directory::open(&logical.profile())?.identity,
-            lock: crate::file_safety::identity(&crate::file_safety::open_for_identity(
-                &logical.config.join("settings.lock"),
-            )?)?,
+            lock: crate::file_safety::identity(
+                &crate::file_safety::open_for_identity(&logical.config.join("settings.lock"))
+                    .map_err(|_| STAGE_HOLD)?,
+            )?,
             logical,
             physical,
         };
@@ -386,9 +387,10 @@ impl Namespace {
             .all(|p| p.is_absolute())
             || Directory::open(&locations.config)?.identity != self.config
             || Directory::open(&locations.profile())?.identity != self.profile
-            || crate::file_safety::identity(&crate::file_safety::open_for_identity(
-                &locations.config.join("settings.lock"),
-            )?)? != self.lock
+            || crate::file_safety::identity(
+                &crate::file_safety::open_for_identity(&locations.config.join("settings.lock"))
+                    .map_err(|_| STAGE_HOLD)?,
+            )? != self.lock
         {
             return Err(
                 "Windows package profile mapping changed; preserve the original profile.".into(),
