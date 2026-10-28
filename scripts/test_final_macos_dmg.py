@@ -21,8 +21,8 @@ from package import digest
 class FinalImage(unittest.TestCase):
     def setUp(self):
         self.signer = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')
-        self.signer.setUp()
         self.addCleanup(self.signer.doCleanups)
+        self.signer.setUp()
         self.archive = self.signer.sign()
         self.base = self.signer.base
         self.image = self.base / 'images' / (self.archive.stem + '-dmg-signed-r2.dmg')

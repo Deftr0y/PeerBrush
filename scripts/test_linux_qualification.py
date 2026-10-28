@@ -65,8 +65,8 @@ def gui_driver_receipt(expected):
 class LinuxFacts(unittest.TestCase):
     def setUp(self):
         self.f = test_final_release.Composition(methodName='runTest')
-        self.f.setUp()
         self.addCleanup(self.f.doCleanups)
+        self.f.setUp()
         f = self.f
         self.serial = 0
         portable = next(row for row in f.inventory['assets'] if row.get('platform') == 'Linux' and row['file'].endswith('.zip'))
@@ -98,8 +98,8 @@ class LinuxFacts(unittest.TestCase):
 
     def trust(self):
         service = service_fixtures.Readback(methodName='runTest')
-        service.setUp()
         self.addCleanup(service.doCleanups)
+        service.setUp()
         workflow, identity, filename, _, _, runner, step, _ = shared._policy(False, True)
         service.run['head_sha'] = self.f.fixture.commit
         service.run['head_commit']['id'] = self.f.fixture.commit

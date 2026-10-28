@@ -16,8 +16,8 @@ import test_submit_store_release as submission_tests
 class StorePreflight(unittest.TestCase):
     def setUp(self):
         self.fixture = submission_tests.PackageTests(methodName='runTest')
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         fixture = self.fixture
         self.root = fixture.source
         self.package = self.root / fixture.name

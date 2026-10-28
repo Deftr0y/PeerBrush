@@ -43,8 +43,8 @@ def runtime_bytes(changes=None, framework='true', *, applications=False, depende
 class AppInstaller(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.SignedMsix()
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.parent = self.fixture.external
         self.inputs = self.parent / 'inputs'
         self.inputs.mkdir(mode=0o700)

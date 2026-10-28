@@ -27,8 +27,8 @@ class Signing(unittest.TestCase):
         # Reuse the isolated, committed synthetic GPL/source fixtures, not any
         # real checkout, native executable, credentials or external service.
         self.fixture = test_package.Packages(methodName='test_platform_architecture_source_license_and_macos_bundle_match')
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.archive = self.fixture.build('macOS')
         self.commit = packaging.git(self.fixture.root, 'rev-parse', 'HEAD').decode().strip()
         self.external = tempfile.TemporaryDirectory(prefix='peerbrush-sign-test-')

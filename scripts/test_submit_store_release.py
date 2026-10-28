@@ -175,8 +175,8 @@ class Tests(unittest.TestCase):
 class PackageTests(unittest.TestCase):
     def setUp(self):
         self.msix = test_msix.Msix()
-        self.msix.setUp()
         self.addCleanup(self.msix.doCleanups)
+        self.msix.setUp()
         self.source = self.msix.root
         fixture = self.msix.fixture
         for name in ['Cargo.toml', 'Cargo.lock']:

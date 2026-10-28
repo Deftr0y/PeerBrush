@@ -102,8 +102,8 @@ class PeEquivalence(unittest.TestCase):
 class WindowsProducer(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.SignedMsix()
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         fixture = self.fixture
         # Upgrade the existing source/provenance fixture to a structural PE32+.
         with zipfile.ZipFile(fixture.portable) as archive:

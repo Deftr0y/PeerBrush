@@ -160,8 +160,8 @@ class ResourceBytes(unittest.TestCase):
 class ResourcePackages(unittest.TestCase):
     def setUp(self):
         self.fixture = test_msix.Msix()
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.root = self.fixture.root
         f = self.fixture.fixture
         path = self.root / version.TEMPLATE

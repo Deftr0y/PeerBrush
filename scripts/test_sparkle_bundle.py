@@ -230,8 +230,8 @@ class Bundle(unittest.TestCase):
     def test_finalization_hashes_existing_payload_once_without_quadratic_walks(self):
         import test_sign_macos
         fixture = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         real_hashes = sign_macos.tree_hashes
         with mock.patch.object(sign_macos, 'tree_hashes', wraps=real_hashes) as hashes:
             fixture.sign()
@@ -289,8 +289,8 @@ class Bundle(unittest.TestCase):
         import test_package
         import verify_release
         fixture = test_package.Packages(methodName='test_platform_architecture_source_license_and_macos_bundle_match')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         notice = (pathlib.Path(__file__).resolve().parents[1] / 'packaging/sparkle/LICENSE').read_text(encoding='utf-8').encode('utf-8')
         selected = copy.deepcopy(self.pin)
         upstream = self.base / 'upstream-synthetic.zip'

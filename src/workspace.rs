@@ -54,6 +54,19 @@ pub struct Workspace {
 pub type Registry = Arc<Mutex<Workspace>>;
 pub const MAX_PROJECTS: usize = 16;
 
+impl Workspace {
+    /// Inspect selection while the caller holds the registry through capture dequeue.
+    pub(crate) fn is_active_engine(&self, shared: &Shared) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.id == self.active
+                && entry
+                    .handle
+                    .get()
+                    .is_some_and(|active| Arc::ptr_eq(&active, shared))
+        })
+    }
+}
+
 /// Queue native feedback without changing any document or presentation state.
 pub(crate) fn duplicate_warning(
     workspace: &Registry,

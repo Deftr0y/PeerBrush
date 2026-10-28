@@ -51,8 +51,8 @@ class PublicationPhases(unittest.TestCase):
 class Tests(unittest.TestCase):
     def setUp(self):
         self.fixture = test_package.Packages(methodName='runTest')
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.commit = git(self.fixture.root, 'rev-parse', 'HEAD').decode().strip()
         for platform in ['Windows', 'macOS', 'Linux']:
             self.fixture.build(platform)
@@ -145,8 +145,8 @@ class Tests(unittest.TestCase):
 class DebianQualification(unittest.TestCase):
     def setUp(self):
         self.fixture = test_deb.DebianPackage(methodName='runTest')
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.package = self.fixture.final_package()
         self.commit = git(self.fixture.root, 'rev-parse', 'HEAD').decode().strip()
         stage = self.fixture.root / 'final-deb-stage'
@@ -251,8 +251,8 @@ class DebianQualification(unittest.TestCase):
 class DebianHandoff(unittest.TestCase):
     def setUp(self):
         self.fixture = test_deb.DebianPackage(methodName='runTest')
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.root = self.fixture.root
         self.commit = git(self.root, 'rev-parse', 'HEAD').decode().strip()
         for platform in ['Windows', 'macOS']:

@@ -116,7 +116,8 @@ def relative_path(value):
     if not isinstance(value, str) or not value or any(ord(char) < 32 or ord(char) == 127 or char in '\\:<>"|?*' for char in value):
         raise ValueError("Manifest paths must be portable relative file names")
     path = pathlib.PurePosixPath(value)
-    reserved = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+    reserved = {"con", "prn", "aux", "nul", *(f"{prefix}{digit}" for prefix in ["com", "lpt"]
+        for digit in '123456789\u00b9\u00b2\u00b3')}
     if path.is_absolute() or str(path) != value or any(
         part in (".", "..") or part.rstrip(" .") != part or part.split(".")[0].casefold() in reserved for part in path.parts
     ):

@@ -210,7 +210,7 @@ fn tile_sequences_keep_encoded_decoded_tuple_and_duplicate16_rejections() {
                 json!([[0, 0, vec![0u8; bytes + 1]]]),
             ))
             .unwrap_err();
-            assert!(error.to_string().starts_with(length_error));
+            assert!(error.to_string().starts_with(oversized_error));
         }
         let data = STANDARD.encode(vec![0; bytes]);
         if depth == 16 {
@@ -226,6 +226,24 @@ fn tile_sequences_keep_encoded_decoded_tuple_and_duplicate16_rejections() {
         trailing.extend(b" null");
         assert!(serde_json::from_slice::<Raster>(&trailing).is_err());
     }
+}
+
+#[test]
+fn legacy_tile_rejects_first_excess_byte_before_reading_remaining_array() {
+    use std::io::Cursor;
+    let limit = (TILE * TILE * 4) as usize;
+    let mut input = br#"{"width":1,"height":1,"tiles":[[0,0,["#.to_vec();
+    input.extend_from_slice("0,".repeat(limit).as_bytes());
+    input.push(b'0');
+    let first_excess = input.len();
+    input.extend_from_slice(
+        b",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]]} ",
+    );
+    let mut reader = Cursor::new(input);
+    let error = serde_json::from_reader::<_, Raster>(&mut reader).unwrap_err();
+    assert!(error.to_string().starts_with("Oversized tile"), "{error}");
+    // serde_json may read the delimiter while parsing the first excess number.
+    assert!(reader.position() as usize <= first_excess + 2);
 }
 
 #[test]

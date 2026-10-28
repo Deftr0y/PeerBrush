@@ -109,6 +109,38 @@ def canvas_quadrants(samples, colors):
     return boxes
 
 
+def duplicate_ok(samples):
+    """Locate one bounded primary button in the expected centered warning."""
+    width, height, depth, pixels = samples
+    require((width, height, depth) == (*WINDOW_SIZE, 8), 'Unexpected warning capture size/depth.')
+    points = set()
+    for y in range(height // 2 - 120, height // 2 + 160):
+        for x in range(width // 2 - 250, width // 2 + 250):
+            if pixels[(y * width + x) * 4:(y * width + x + 1) * 4] == bytes([190, 70, 29, 255]):
+                points.add((x, y))
+    candidates = []
+    while points:
+        pending = [points.pop()]
+        component = []
+        while pending:
+            x, y = pending.pop()
+            component.append((x, y))
+            for point in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]:
+                if point in points:
+                    points.remove(point)
+                    pending.append(point)
+        left, right = min(x for x, _ in component), max(x for x, _ in component)
+        top, bottom = min(y for _, y in component), max(y for _, y in component)
+        w, h = right - left + 1, bottom - top + 1
+        if 24 <= w <= 64 and 24 <= h <= 36 and len(component) >= w * h * 0.55:
+            white = sum(all(pixels[(y * width + x) * 4 + ch] >= 220 for ch in range(3))
+                for y in range(top + 4, bottom - 3) for x in range(left + 4, right - 3))
+            if 8 <= white <= 200:
+                candidates.append(((left + right) // 2, (top + bottom) // 2))
+    require(len(candidates) == 1, 'Visible duplicate warning OK button is missing or ambiguous.')
+    return candidates[0]
+
+
 def gui_environment():
     import pwd
     account = pwd.getpwnam(USER)
@@ -243,6 +275,32 @@ class Window:
         return dict(file=path.name, sha256=digest(path), width=WINDOW_SIZE[0], height=WINDOW_SIZE[1],
                     canvas_regions=[list(box) for box in boxes])
 
+    def acknowledge_duplicate(self, index):
+        self.authenticate()
+        windows = [row.split(None, 4)[0] for row in run(['wmctrl', '-lp']).splitlines()
+            if len(row.split(None, 4)) == 5 and row.split(None, 4)[2] == str(self.pid)]
+        require(len(windows) == 1, 'Duplicate warning window is missing or ambiguous.')
+        window = windows[0]
+        run(['wmctrl', '-ia', window])
+        def focused():
+            self.authenticate()
+            require(int(run(['xdotool', 'getactivewindow'])) == int(window, 16)
+                    and run(['xdotool', 'getwindowpid', window]) == str(self.pid),
+                    'Duplicate warning is not in the focused owned installed window.')
+        focused()
+        path = self.work / ('duplicate-warning-' + str(index) + '.png')
+        require(not path.exists(), 'Preserve earlier warning evidence.')
+        self.rpc('capture_ui', dict(path=str(path), panel='workspace'))
+        deadline = time.monotonic() + 30
+        while not path.is_file() and time.monotonic() < deadline:
+            self.authenticate()
+            time.sleep(0.1)
+        x, y = duplicate_ok(png_samples(path, expected_size=WINDOW_SIZE))
+        focused()
+        run(['xdotool', 'mousemove', '--window', window, str(x), str(y)])
+        focused()
+        run(['xdotool', 'click', '--window', window, '1'])
+
     def close(self):
         self.authenticate()
         windows = []
@@ -337,6 +395,7 @@ def display_check(fixture):
             other = opened[paths[(index + 1) % len(paths)]]['project_id']
             window.rpc('projects', dict(action='select', project_id=other))
             window.launch([path])
+            window.acknowledge_duplicate(index)
             captures.append(window.capture(project, work / ('activation-' + str(index) + '.png'), colors, select_project=False))
             require(window.projects(paths)[path]['project_id'] == project and window.state(project) == snapshot
                     and window.rpc('history', dict(action='list', project_id=project, feedback='request')) == histories,

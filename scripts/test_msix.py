@@ -45,8 +45,8 @@ def synthetic_package(payload, mutate=None):
 class Msix(unittest.TestCase):
     def setUp(self):
         self.fixture = test_package.Packages()
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.root = self.fixture.root
         self.identity = msix.DEVELOPMENT_IDENTITY.copy()
         self.template = (ROOT/'packaging/msix/AppxManifest.xml.in').read_bytes()

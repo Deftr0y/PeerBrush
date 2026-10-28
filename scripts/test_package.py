@@ -1009,6 +1009,19 @@ class Packages(unittest.TestCase):
             with self.assertRaises(ValueError):
                 packaging.relative_path(name)
 
+    def test_windows_device_alias_refusal_preserves_existing_archive(self):
+        archive = self.root / 'retained.zip'
+        archive.write_bytes(b'previous good archive')
+        for prefix in ['COM', 'lPt']:
+            for digit in '123456789\u00b9\u00b2\u00b3':
+                for suffix in ['', '.txt']:
+                    name = 'docs/' + prefix + digit + suffix
+                    with self.subTest(name=name), self.assertRaises(ValueError):
+                        packaging.write_zip(archive, [(name, b'new', 0o644)], 1700000000)
+                    self.assertEqual(archive.read_bytes(), b'previous good archive')
+        for name in ['docs/COM0.txt', 'docs/LPT4\u00b2.txt', 'docs/\u200evalid\u200f.txt']:
+            self.assertEqual(str(packaging.relative_path(name)), name)
+
 
     def test_toolchain_is_a_required_listed_root_compiler_input_and_source_equivalence_input(self):
         toolchain = self.root / 'rust-toolchain.toml'

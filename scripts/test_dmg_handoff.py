@@ -24,16 +24,16 @@ from verify_release import inspect_archive, verify
 class Handoff(unittest.TestCase):
     def setUp(self):
         self.debian = test_deb.DebianPackage(methodName='runTest')
-        self.debian.setUp()
         self.addCleanup(self.debian.doCleanups)
+        self.debian.setUp()
         self.root = self.debian.root
         self.commit = git(self.root, 'rev-parse', 'HEAD').decode().strip()
         self.deb = self.debian.final_package()
         windows = self.debian.fixture.build('Windows')
         self.unsigned = self.debian.fixture.build('macOS')
         self.signer = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')
-        self.signer.setUp()
         self.addCleanup(self.signer.doCleanups)
+        self.signer.setUp()
         self.signer.archive = self.unsigned
         self.signer.kwargs.update(archive=self.unsigned, commit=self.commit,
                                   expected_sha256=digest(self.unsigned), source_root=self.root)
@@ -474,8 +474,8 @@ class Handoff(unittest.TestCase):
 class NativeProducerContract(unittest.TestCase):
     def test_real_consumer_schema_binds_without_authenticating_its_job(self):
         native = test_final_macos_dmg.FinalImage(methodName='runTest')
-        native.setUp()
         self.addCleanup(native.doCleanups)
+        native.setUp()
         claims = native.inspect()  # Every Apple command remains mocked.
         data = json.dumps(claims).encode()
         result = readiness.bind_dmg(native.signer.fixture.root, native.archive, native.image,

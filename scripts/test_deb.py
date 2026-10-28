@@ -56,8 +56,8 @@ def write_deb(path, data, control):
 class DebianPackage(unittest.TestCase):
     def setUp(self):
         self.fixture = test_package.Packages()
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         # macOS exposes its temporary directory through the /var symlink.
         # Select the real fixture root; production output still rejects links.
         self.root = self.fixture.root.resolve()

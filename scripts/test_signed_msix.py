@@ -45,8 +45,8 @@ def signed_package(unsigned, mutate=None):
 class SignedMsix(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.PackageTests()
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.root, self.portable = self.fixture.source, self.fixture.portable
         self.identity = dict(name='PeerBrush.DirectFixture', publisher='CN=PeerBrush Direct Fixture',
                              publisher_display_name='PeerBrush fixture')

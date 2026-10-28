@@ -15,8 +15,8 @@ from test_sign_macos import TEAM, IDENTITY, SUBMISSION
 class DmgSigning(unittest.TestCase):
     def setUp(self):
         self.preparation = test_macos_dmg.Preparation()
-        self.preparation.setUp()
         self.addCleanup(self.preparation.doCleanups)
+        self.preparation.setUp()
         self.signing = self.preparation.signing
         self.archive = self.preparation.archive
         self.base = self.signing.base

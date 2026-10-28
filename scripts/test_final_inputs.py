@@ -37,11 +37,11 @@ def sha(data):
 class Handoff(unittest.TestCase):
     def setUp(self):
         self.fixture = test_final_release.Composition(methodName='runTest')
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.service = jobs.Readback(methodName='runTest')
-        self.service.setUp()
         self.addCleanup(self.service.doCleanups)
+        self.service.setUp()
         f, service = self.fixture, self.service
         service.run['head_sha'] = service.run['head_commit']['id'] = f.fixture.commit
         for job in service.jobs['jobs']:
@@ -391,8 +391,8 @@ class Handoff(unittest.TestCase):
 class OptionalWindowsHandoff(unittest.TestCase):
     def test_both_actual_native_adapters_rerun_from_owned_portable_selection(self):
         fixture = test_windows_qualification.WindowsFacts(methodName='runTest')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         fixture.qualify()
         windows, selection = fixture.trust()
         windows.run['id'] = 54321
@@ -401,8 +401,8 @@ class OptionalWindowsHandoff(unittest.TestCase):
             job['run_id'] = 54321
         selection['trust']['run_id'] = '54321'
         mac = jobs.Readback(methodName='runTest')
-        mac.setUp()
         self.addCleanup(mac.doCleanups)
+        mac.setUp()
         f = fixture.f
         mac.run['head_sha'] = mac.run['head_commit']['id'] = f.fixture.commit
         for job in mac.jobs['jobs']:
@@ -455,8 +455,8 @@ class OptionalWindowsHandoff(unittest.TestCase):
 class UpstreamHandoff(unittest.TestCase):
     def setUp(self):
         self.windows = test_windows_qualification.WindowsFacts(methodName='runTest')
-        self.windows.setUp()
         self.addCleanup(self.windows.doCleanups)
+        self.windows.setUp()
         self.windows.qualify()
         f = self.f = self.windows.f
         base, commit, version = f.fixture.base, f.fixture.commit, '0.2.0'
@@ -503,8 +503,8 @@ class UpstreamHandoff(unittest.TestCase):
         bundles = {}
         for platform, identifier in [('macos', '103'), ('windows', '105'), ('linux', '106')]:
             service = jobs.Readback(methodName='runTest')
-            service.setUp()
             self.addCleanup(service.doCleanups)
+            service.setUp()
             policy = native._policy(platform == 'windows', platform == 'linux')
             service.base = 'https://api.github.com/repos/' + native.REPOSITORY + '/actions/runs/' + identifier + '/attempts/1'
             service.run.update(id=int(identifier), path=policy[0], head_sha=commit)

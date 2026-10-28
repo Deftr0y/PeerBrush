@@ -16,8 +16,8 @@ from package import digest
 class Preparation(unittest.TestCase):
     def setUp(self):
         self.signing = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')
-        self.signing.setUp()
         self.addCleanup(self.signing.doCleanups)
+        self.signing.setUp()
         self.signing.fixture.require_installed_macos_source()
         self.signing.archive = self.signing.fixture.build('macOS')
         self.signing.commit = dmg.git(self.signing.fixture.root, 'rev-parse', 'HEAD').decode().strip()

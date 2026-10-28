@@ -24,8 +24,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class Readback(unittest.TestCase):
     def setUp(self):
         self.fixture = test_prepare_site_release.Published(methodName='runTest')
-        self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
         self.root = self.fixture.root
         self.entry, excluded = self.fixture.published()
         self.assertEqual(excluded, [])

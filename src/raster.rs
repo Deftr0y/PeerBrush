@@ -57,11 +57,37 @@ mod tiles_serde {
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         d: D,
     ) -> Result<BTreeMap<(u32, u32), Arc<Vec<u8>>>, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum TileData {
-            Compact(String),
-            Legacy(Vec<u8>),
+        struct TileData(Vec<u8>);
+        impl<'de> Deserialize<'de> for TileData {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct Data;
+                impl<'de> serde::de::Visitor<'de> for Data {
+                    type Value = TileData;
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("base64 tile data or a bounded byte sequence")
+                    }
+                    fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<TileData, E> {
+                        if text.len() > ((TILE * TILE * 4 + 2) / 3 * 4) as usize {
+                            return Err(E::custom("Oversized tile"));
+                        }
+                        STANDARD.decode(text).map(TileData).map_err(E::custom)
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<TileData, A::Error> {
+                        let mut bytes = Vec::with_capacity((TILE * TILE * 4) as usize);
+                        while let Some(byte) = seq.next_element::<u8>()? {
+                            if bytes.len() == (TILE * TILE * 4) as usize {
+                                return Err(serde::de::Error::custom("Oversized tile"));
+                            }
+                            bytes.push(byte);
+                        }
+                        Ok(TileData(bytes))
+                    }
+                }
+                d.deserialize_any(Data)
+            }
         }
         struct Tiles;
         impl<'de> serde::de::Visitor<'de> for Tiles {
@@ -75,15 +101,7 @@ mod tiles_serde {
             ) -> Result<Self::Value, A::Error> {
                 let mut out = BTreeMap::new();
                 while let Some((x, y, data)) = sequence.next_element::<(u32, u32, TileData)>()? {
-                    let data = match data {
-                        TileData::Compact(s) => {
-                            if s.len() > ((TILE * TILE * 4 + 2) / 3 * 4) as usize {
-                                return Err(serde::de::Error::custom("Oversized tile"));
-                            }
-                            STANDARD.decode(s).map_err(serde::de::Error::custom)?
-                        }
-                        TileData::Legacy(bytes) => bytes,
-                    };
+                    let data = data.0;
                     if data.len() != (TILE * TILE * 4) as usize {
                         return Err(serde::de::Error::custom("Invalid tile length"));
                     }

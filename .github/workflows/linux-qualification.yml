@@ -164,7 +164,7 @@ jobs:
             -e VERSION="$VERSION" -e SOURCE_COMMIT="$SELECTED_COMMIT" -e DEB_SHA="$DEB_SHA" \
             -e EXECUTABLE_SHA="$EXECUTABLE_SHA" -e SOURCE_SHA="$SOURCE_SHA" ubuntu:24.04 bash -euc '
               apt-get update -qq
-              apt-get install -y --no-install-recommends python3 git ca-certificates xdg-utils xvfb xauth dbus-x11 libglib2.0-bin openbox wmctrl mesa-vulkan-drivers libgl1-mesa-dri
+              apt-get install -y --no-install-recommends python3 git ca-certificates xdg-utils xvfb xauth dbus-x11 libglib2.0-bin openbox wmctrl xdotool mesa-vulkan-drivers libgl1-mesa-dri
               git config --global --add safe.directory /old-source
               python3 -B /checks/test_deb_version_upgrade.py --old-source-root /old-source \
                 --package /input/peerbrush_${VERSION}-1_amd64.deb --package-sha256 "$DEB_SHA" --commit "$SOURCE_COMMIT" --version "$VERSION" \

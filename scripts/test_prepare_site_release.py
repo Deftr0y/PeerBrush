@@ -21,8 +21,8 @@ from verify_release import verify
 class Published(unittest.TestCase):
     def setUp(self):
         fixture = self.fixture = test_package.Packages(methodName='runTest')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         self.root = fixture.root.resolve()
         self.formats = {'Windows': 'zip', 'macOS': 'zip', 'Linux': 'zip'}
         path = self.root / 'packaging/release-policy.json'
@@ -440,8 +440,8 @@ class Published(unittest.TestCase):
         self.final_deb()
         original = next(a for a in self.inventory['assets'] if a.get('platform') == 'macOS')
         signer = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')
-        signer.setUp()
         self.addCleanup(signer.doCleanups)
+        signer.setUp()
         signer.archive = self.directory / original['file']
         signer.kwargs.update(archive=signer.archive, commit=self.commit,
                              expected_sha256=site.sha(self.assets[original['file']]), source_root=self.root)

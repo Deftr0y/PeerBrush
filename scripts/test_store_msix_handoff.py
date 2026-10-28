@@ -34,8 +34,8 @@ class StoreHandoff(unittest.TestCase):
 
     def setUp(self):
         self.seed = preflight_tests.StorePreflight(methodName='runTest')
-        self.seed.setUp()
         self.addCleanup(self.seed.doCleanups)
+        self.seed.setUp()
         self.root = self.seed.root
         self.fixture = self.seed.fixture.msix.fixture
         self.package = self.seed.package.rename(self.fixture.output / self.seed.package.name)
@@ -157,8 +157,8 @@ class StoreHandoff(unittest.TestCase):
 
     def test_five_and_six_record_inputs_use_actual_shared_inspection_and_explicit_context(self):
         fixture = dmg_tests.Handoff(methodName='runTest')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         for count in [5, 6]:
             if count == 6:
                 fixture.handoff()

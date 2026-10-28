@@ -31,8 +31,8 @@ def sha(data):
 class WindowsFacts(unittest.TestCase):
     def setUp(self):
         self.f = test_final_release.Composition(methodName='runTest')
-        self.f.setUp()
         self.addCleanup(self.f.doCleanups)
+        self.f.setUp()
         f = self.f
         portable = next(row for row in f.inventory['assets'] if row.get('platform') == 'Windows')
         self.options = {key: value for key, value in f.windows.items()
@@ -103,8 +103,8 @@ class WindowsFacts(unittest.TestCase):
 
     def trust(self):
         fixture = service_fixtures.Readback(methodName='runTest')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         fixture.run['head_sha'] = self.f.fixture.commit
         fixture.run['head_commit']['id'] = self.f.fixture.commit
         fixture.run['path'] = '.github/workflows/windows-qualification.yml'
@@ -270,8 +270,8 @@ class WindowsFacts(unittest.TestCase):
 class WindowsProducer(unittest.TestCase):
     def test_actual_existing_signer_calls_and_six_file_handoff_are_preserved(self):
         fixture = signing_fixtures.WindowsProducer(methodName='runTest')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         f = fixture.fixture
         selected = {key: value for key, value in fixture.options.items() if key not in ['identity', 'approve_existing_certificate_signing']}
         media = f.external / 'handoff-public-media'
@@ -343,8 +343,8 @@ class WindowsWorkflow(unittest.TestCase):
 class WindowsDescriptorRetention(unittest.TestCase):
     def test_actual_retention_keeps_original_descriptor_and_rejects_missing_or_changed_media(self):
         fixture = WindowsFacts(methodName='runTest')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         fixture.qualify()
         f = fixture.f
         workflow = (ROOT / '.github/workflows/windows-qualification.yml').read_text()

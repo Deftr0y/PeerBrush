@@ -6148,18 +6148,37 @@ impl PeerBrush {
     }
     fn finish_capture(&mut self, ctx: &egui::Context, drawn_generation: u64) {
         let time = ctx.input(|i| i.time);
-        let ready = !self.pending
+        let presentation_ready = !self.pending
             && self.exports_capture_ready()
             && drawn_generation == self.canvas_generation
             && time >= self.capture_ready_at
             && !self.animation.fading()
-            && self.animation.progress(time) >= 1.
-            && self.canvas_preview.as_ref().is_some_and(|key| {
-                let doc = &self.shared.lock().unwrap().doc;
-                key.0 == doc.id && key.1 == doc.revision && self.last_preview.as_ref() == Some(key)
-            });
+            && self.animation.progress(time) >= 1.;
+        // Keep selection and both documents stable through dequeue. Every lock
+        // here is nonblocking; root may itself be the selected engine.
         if let Ok(mut engine) = self.workspace_root.try_lock() {
             if engine.capture_ui.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                let selected = if std::sync::Arc::ptr_eq(&self.workspace_root, &self.shared) {
+                    None
+                } else {
+                    let Ok(selected) = self.shared.try_lock() else {
+                        return;
+                    };
+                    Some(selected)
+                };
+                let Ok(workspace) = self.workspace.try_lock() else {
+                    return;
+                };
+                let doc = &selected.as_deref().unwrap_or(&engine).doc;
+                let ready = presentation_ready
+                    && engine.capture_panel.is_none()
+                    && workspace.is_active_engine(&self.shared)
+                    && self.canvas_preview.as_ref().is_some_and(|key| {
+                        key.0 == doc.id
+                            && key.1 == doc.revision
+                            && self.last_preview.as_ref() == Some(key)
+                    });
                 if ready {
                     let path = engine.capture_ui.take().unwrap();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
@@ -6169,6 +6188,8 @@ impl PeerBrush {
                     ctx.request_repaint_after(Duration::from_millis(16));
                 }
             }
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 }
@@ -6255,6 +6276,34 @@ mod tests {
                 "new isolation/target needs its own pixels"
             );
             app.canvas_preview = Some(next);
+            let root = app.workspace_root.clone();
+            let registry = app.workspace.clone();
+            {
+                let _held = root.lock().unwrap();
+                assert!(!run(&mut app, 0.71, painted), "root contention must defer");
+            }
+            {
+                let _held = registry.lock().unwrap();
+                assert!(
+                    !run(&mut app, 0.72, painted),
+                    "registry contention must defer"
+                );
+            }
+            root.lock().unwrap().capture_panel = Some("workspace".into());
+            assert!(
+                !run(&mut app, 0.73, painted),
+                "pending panel must be presented first"
+            );
+            root.lock().unwrap().capture_panel = None;
+            let other = crate::workspace::register_in(&registry, Engine::new(), None).unwrap();
+            let other_id = other.lock().unwrap().project_id.clone();
+            crate::workspace::select_in(&registry, &other_id).unwrap();
+            assert!(
+                !run(&mut app, 0.74, painted),
+                "mid-frame project selection must defer"
+            );
+            let original_id = root.lock().unwrap().project_id.clone();
+            crate::workspace::select_in(&registry, &original_id).unwrap();
             assert!(run(&mut app, 0.8, painted));
             assert!(app.workspace_root.lock().unwrap().capture_ui.is_none());
             assert!(
@@ -6266,6 +6315,22 @@ mod tests {
                 !path.exists(),
                 "synthetic screenshot request must not write a fake capture"
             );
+            app.shared = other.clone();
+            crate::workspace::select_in(&registry, &other_id).unwrap();
+            let doc = other.lock().unwrap().doc.clone();
+            let key = (doc.id, doc.revision, "owned engine".into(), false);
+            app.canvas_preview = Some(key.clone());
+            app.last_preview = Some(key);
+            root.lock().unwrap().capture_ui = Some(path);
+            {
+                let _held = other.lock().unwrap();
+                assert!(
+                    !run(&mut app, 1.0, painted),
+                    "selected engine contention must defer"
+                );
+            }
+            assert!(run(&mut app, 1.1, painted));
+            assert!(!run(&mut app, 1.2, painted));
         }
     }
     #[test]

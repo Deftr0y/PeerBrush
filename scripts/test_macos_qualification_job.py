@@ -18,8 +18,8 @@ from test_production_readiness import assert_publication_phases
 class Readback(unittest.TestCase):
     def setUp(self):
         self.trust = fixtures.Authentication(methodName='runTest')
-        self.trust.setUp()
         self.addCleanup(self.trust.doCleanups)
+        self.trust.setUp()
         self.serial = 0
         self.calls, self.raw, self.transport_error = [], {}, None
         self.base = 'https://api.github.com/repos/' + native.REPOSITORY + '/actions/runs/12345/attempts/1'
@@ -266,8 +266,8 @@ class Readback(unittest.TestCase):
 
     def test_authenticated_handoff_can_reconcile_only_its_job_and_stays_unready(self):
         fixture = test_dmg_handoff.Handoff(methodName='runTest')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         self.run['head_sha'] = fixture.commit
         self.run['head_commit']['id'] = fixture.commit
         for job in self.jobs['jobs']:

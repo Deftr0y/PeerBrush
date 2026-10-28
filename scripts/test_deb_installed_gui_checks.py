@@ -58,6 +58,32 @@ def screen(colors, *, thumbnails=False, only_thumbnails=False, swapped=False,
 
 
 class InstalledGuiContracts(unittest.TestCase):
+    def test_duplicate_button_detector_is_bounded_unique_and_requires_visible_text(self):
+        width, height = gui.WINDOW_SIZE
+        def sample(buttons):
+            pixels = bytearray(bytes([41, 39, 43, 255]) * (width * height))
+            for left, top, text in buttons:
+                for y in range(top, top + 28):
+                    for x in range(left, left + 32):
+                        color = [255, 255, 255, 255] if text and left + 10 <= x < left + 20 and top + 10 <= y < top + 14 else [190, 70, 29, 255]
+                        pixels[(y * width + x) * 4:(y * width + x + 1) * 4] = bytes(color)
+            return width, height, 8, bytes(pixels)
+        self.assertEqual(gui.duplicate_ok(sample([(470, 500, True)])), (485, 513))
+        for buttons in [[], [(470, 500, False)], [(470, 500, True), (550, 500, True)], [(50, 50, True)]]:
+            with self.subTest(buttons=buttons), self.assertRaises(ValueError):
+                gui.duplicate_ok(sample(buttons))
+
+    def test_duplicate_acknowledgement_refuses_foreign_focus_before_any_click(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            window = gui.Window({}, Path(temporary))
+            window.pid = 2468
+            def run(args):
+                return '0x00123456 0 2468 host PeerBrush' if args == ['wmctrl', '-lp'] else '999'
+            with mock.patch.object(window, 'authenticate'), mock.patch.object(gui, 'run', side_effect=run) as commands:
+                with self.assertRaisesRegex(ValueError, 'focused owned'):
+                    window.acknowledge_duplicate(0)
+            self.assertFalse(any('click' in call.args[0] for call in commands.call_args_list))
+
     def test_gui_progress_is_fixed_stderr_only_and_entry_precedes_optional_imports(self):
         with mock.patch.object(gui, 'print', create=True) as output:
             gui.gui_phase('environment')

@@ -246,11 +246,11 @@ class Authentication(unittest.TestCase):
 class Aggregate(unittest.TestCase):
     def test_only_actual_verifier_call_can_add_origin_and_never_production_authority(self):
         fixture = test_dmg_handoff.Handoff(methodName='runTest')
-        fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
         trust = Authentication(methodName='runTest')
-        trust.setUp()
         self.addCleanup(trust.doCleanups)
+        trust.setUp()
         values = dict(trust.values, workflow_commit=fixture.commit)
         def command(executable, arguments, work, label):
             if label == 'version':
