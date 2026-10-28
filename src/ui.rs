@@ -6295,7 +6295,9 @@ mod tests {
                 "pending panel must be presented first"
             );
             root.lock().unwrap().capture_panel = None;
-            let other = crate::workspace::register_in(&registry, Engine::new(), None).unwrap();
+            let mut other_engine = Engine::new();
+            other_engine.doc = Document::new_depth(32, 32, depth).unwrap();
+            let other = crate::workspace::register_in(&registry, other_engine, None).unwrap();
             let other_id = other.lock().unwrap().project_id.clone();
             crate::workspace::select_in(&registry, &other_id).unwrap();
             assert!(

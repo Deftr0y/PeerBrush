@@ -1565,12 +1565,6 @@ impl Verifier for RunningNative {
         control: &Control,
     ) -> Result<Target> {
         file.check(control)?;
-        if !self.proof
-            || self.archive_fault == "signature"
-            || file.media.sha256 != hash(b"main-native-bytes")
-        {
-            return Err("Synthetic current signature or signed payload rejected".into());
-        }
         if &self.source(policy)? != current {
             return Err(STAGE_HOLD.into());
         }
@@ -2689,6 +2683,7 @@ fn new_running_version_revalidates_previous_current_archive_and_initial_profile_
         "missing-current",
         "current-lease",
         "signature",
+        "initial-binding",
     ] {
         let temp = Temp::new();
         let profile = staging_profile_fixture(&temp);
@@ -2743,6 +2738,23 @@ fn new_running_version_revalidates_previous_current_archive_and_initial_profile_
             }
             "signature" => {
                 new.archive_fault = "signature";
+            }
+            "initial-binding" => {
+                let attempt = stage_attempt(&root);
+                let file = attempt.join("profile-initial/initial.json");
+                let mut record: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+                record["current_sha256"] = json!("9".repeat(64));
+                let bytes = serde_json::to_vec(&record).unwrap();
+                fs::write(&file, &bytes).unwrap();
+                let file = attempt.join("stage-intent.json");
+                let mut intent: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+                intent["initial_profile_sha256"] = json!(hash(&bytes));
+                let bytes = serde_json::to_vec(&intent).unwrap();
+                fs::write(&file, &bytes).unwrap();
+                let file = attempt.join("stage-outcome.json");
+                let mut outcome: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+                outcome["intent_sha256"] = json!(hash(&bytes));
+                fs::write(file, serde_json::to_vec(&outcome).unwrap()).unwrap();
             }
             _ => {}
         }
