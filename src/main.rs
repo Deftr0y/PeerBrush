@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 fn main() {
     #[cfg(windows)]
-    if let Some(code) = peerbrush::updates::windows::main_entry() {
+    if let Some(code) = peerbrush::updates::windows_main_entry() {
         std::process::exit(code);
     }
     #[cfg(target_os = "macos")]

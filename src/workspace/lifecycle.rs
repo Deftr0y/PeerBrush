@@ -33,7 +33,7 @@ pub fn request_close(
 /// engines in the same order as transfers, then checks the registry at commit.
 /// No engine is closed when any source, save, reservation or project set changed.
 pub fn finish_exit(workspace: &Registry, reviewed: &[Reviewed]) -> Result<(), String> {
-    finish(workspace, reviewed, false, true, |_| Ok(()))
+    finish(workspace, reviewed, false, true, false, |_| Ok(()))
 }
 
 /// Future verified native installers must use this path, never a discard-capable
@@ -50,7 +50,7 @@ pub(crate) fn finish_update_exit_with_profile(
     reviewed: &[Reviewed],
     publish: impl FnOnce(&crate::tool_settings::Store) -> Result<(), String>,
 ) -> Result<(), String> {
-    finish(workspace, reviewed, true, true, |tools| {
+    finish(workspace, reviewed, true, true, false, |tools| {
         publish(tools.ok_or("Tool preference writer authority is unavailable")?)
     })
 }
@@ -65,7 +65,7 @@ pub(crate) fn publish_update_checkpoint(
     reviewed: &[Reviewed],
     publish: impl FnOnce(&crate::tool_settings::Store) -> Result<(), String>,
 ) -> Result<(), String> {
-    finish(workspace, reviewed, true, false, |tools| {
+    finish(workspace, reviewed, true, false, false, |tools| {
         publish(tools.ok_or("Tool preference writer authority is unavailable")?)
     })
 }
@@ -129,13 +129,78 @@ pub fn update_readiness(workspace: &Registry) -> Result<Vec<Reviewed>, String> {
     Ok(reviewed)
 }
 
+// shortcut: update restart admits only the untouched blank workspace. Persisting
+// arbitrary live undo/redo across process replacement needs a separate compatible
+// snapshot format; never silently erase that history just because files are saved.
+#[cfg(any(windows, test))]
+fn windows_blank_workspace<'a>(engines: impl Iterator<Item = &'a Engine>) -> Result<(), String> {
+    let engines: Vec<_> = engines.collect();
+    let refused = || {
+        "Close your projects before installing a Windows update; open documents and undo history are retained.".to_string()
+    };
+    if engines.len() != 1 {
+        return Err(refused());
+    }
+    let e = engines[0];
+    if e.path.is_some()
+        || !e.undo.is_empty()
+        || !e.redo.is_empty()
+        || !e.changes.is_empty()
+        || !e.leases.is_empty()
+        || e.saved_revision != 0
+    {
+        return Err(refused());
+    }
+    let mut blank = Document::new(1024, 768)?;
+    blank.id = e.doc.id.clone();
+    if e.doc.layers.len() != 1 {
+        return Err(refused());
+    }
+    blank.layers[0].id = e.doc.layers[0].id.clone();
+    blank.layers[0].effect_key = e.doc.layers[0].effect_key.clone();
+    if serde_json::to_value(&blank).map_err(|e| e.to_string())?
+        != serde_json::to_value(&e.doc).map_err(|e| e.to_string())?
+    {
+        return Err(refused());
+    }
+    Ok(())
+}
+#[cfg(any(windows, test))]
+pub(crate) fn windows_update_readiness(workspace: &Registry) -> Result<Vec<Reviewed>, String> {
+    let reviewed = update_readiness(workspace)?;
+    let entries = entries_in(workspace);
+    let engines = entries
+        .iter()
+        .map(|(_, _, engine)| {
+            engine
+                .try_lock()
+                .map_err(|_| "A project is still working".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    windows_blank_workspace(engines.iter().map(|e| &**e))?;
+    Ok(reviewed)
+}
+#[cfg(any(windows, test))]
+pub(crate) fn finish_windows_update_exit(
+    workspace: &Registry,
+    reviewed: &[Reviewed],
+    publish: impl FnOnce(&crate::tool_settings::Store) -> Result<(), String>,
+) -> Result<(), String> {
+    finish(workspace, reviewed, true, true, true, |tools| {
+        publish(tools.ok_or("Tool preference writer authority is unavailable")?)
+    })
+}
+
 fn finish(
     workspace: &Registry,
     reviewed: &[Reviewed],
     update: bool,
     close: bool,
+    blank_windows_workspace: bool,
     publish: impl FnOnce(Option<&crate::tool_settings::Store>) -> Result<(), String>,
 ) -> Result<(), String> {
+    #[cfg(not(any(windows, test)))]
+    let _ = blank_windows_workspace;
     let mut entries = entries_in(workspace);
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut reviewed: Vec<_> = reviewed.iter().collect();
@@ -157,6 +222,10 @@ fn finish(
                 .map_err(|_| "A project is still working. All projects remain open.".to_string())
         })
         .collect::<Result<_, _>>()?;
+    #[cfg(any(windows, test))]
+    if blank_windows_workspace {
+        windows_blank_workspace(engines.iter().map(|engine| &**engine))?;
+    }
     for (e, r) in engines.iter_mut().zip(&reviewed) {
         guard(e, &r.document, r.revision)?;
         if update {
@@ -245,6 +314,40 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn windows_restart_refuses_saved_projects_and_preserves_actual_history() {
+        let shared = Arc::new(Mutex::new(Engine::new()));
+        let workspace = attach(&shared);
+        windows_update_readiness(&workspace).unwrap();
+        {
+            let mut e = shared.lock().unwrap();
+            let layer = e.doc.layers[0].id.clone();
+            e.edit(
+                "human",
+                &[json!({"op":"fill","layer":layer,"rect":[1,1,2,2],"color":[1,2,3,255]})],
+                None,
+                None,
+                "Keep actual history",
+            )
+            .unwrap();
+            e.saved_revision = e.doc.revision;
+        }
+        let before = shared.lock().unwrap().doc.revision;
+        assert!(windows_update_readiness(&workspace).is_err());
+        let reviewed = update_readiness(&workspace).unwrap();
+        assert!(
+            finish_windows_update_exit(&workspace, &reviewed, |_| panic!(
+                "No final seal for an open project"
+            ))
+            .is_err()
+        );
+        let mut e = shared.lock().unwrap();
+        assert!(!e.closed);
+        assert_eq!(e.doc.revision, before);
+        assert_eq!(e.undo.len(), 1);
+        e.undo("human").unwrap();
+        assert_eq!(e.redo.len(), 1);
+    }
     #[test]
     fn checkpoint_publication_reuses_atomic_source_and_write_guards_without_closing() {
         let directory = std::env::temp_dir().join(format!(

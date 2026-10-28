@@ -1,4 +1,4 @@
-//! SDK-free package trust and dormant staging. No registration, shutdown or restart.
+//! Native package trust and dormant exact local deployment. Activation stays gated.
 use super::*;
 use ::windows::{
     core::{w, Interface, PCWSTR, PWSTR},
@@ -1168,6 +1168,38 @@ unsafe fn verify_version(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copied_helper_inventory_rejects_aliases_and_unreviewed_paths() {
+        use super::*;
+        assert_eq!(
+            helper_name("peerbrush.exe", false).unwrap(),
+            Some("peerbrush.exe".into())
+        );
+        assert_eq!(
+            helper_name("VCRUNTIME140.dll", true).unwrap(),
+            Some("vcruntime140.dll".into())
+        );
+        for name in [
+            "com1.dll",
+            "LPT9.dll",
+            "CON.dll",
+            ".foreign.dll",
+            "bad name.dll",
+            "bad:.dll",
+            "com\u{b9}.dll",
+        ] {
+            assert!(helper_name(name, false).is_err(), "{name}");
+        }
+        for name in [
+            "nested/runtime.dll",
+            "nested\\runtime.dll",
+            "other.exe",
+            "unrelated.txt",
+        ] {
+            assert!(helper_name(name, false).unwrap().is_none());
+        }
+        assert!(helper_name("peerbrush.exe", true).unwrap().is_none());
+    }
     use super::*;
     #[test]
     fn exact_native_manifest_gate_preserves_capabilities_and_file_association_contract() {

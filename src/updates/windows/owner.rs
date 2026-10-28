@@ -354,7 +354,7 @@ struct Namespace {
 }
 impl Namespace {
     fn capture(profile: &UpdateProfile) -> Result<Self> {
-        profile.validate()?;
+        profile.ensure_update_locations()?;
         let logical = profile.locations.clone();
         let canonical = |p: &Path| fs::canonicalize(p).map_err(|_| STAGE_HOLD.to_string());
         let physical = Locations {
@@ -1094,7 +1094,7 @@ impl Live {
         // The only terminable process is this exact newly created isolated child.
         // Its held kernel object prevents PID reuse even if initial launch fails.
         let deadline = Instant::now() + Duration::from_secs(90);
-        let observed = (|| {
+        let observed: Result<bool> = (|| {
             pipe.accept(&peer, deadline)?;
             peer.authenticate(&registered.root.join("peerbrush.exe"), &target, &self.c)?;
             let probe = Probe {
@@ -1293,14 +1293,14 @@ impl Live {
             prepared_id,
             &archive.join("completed-prepared"),
         )?;
+        history_directory.check()?;
+        archive_directory.check()?;
+        originals.check(&control())?;
         retirement::rename_file(
             &root.join("windows-update-active.json"),
             active_id,
             &archive.join("completed-owner.json"),
         )?;
-        history_directory.check()?;
-        archive_directory.check()?;
-        originals.check(&control())?;
         drop(originals);
         drop(profile);
         drop(gate);
@@ -1324,7 +1324,7 @@ impl Live {
 
 pub(super) fn health_main(name: &str) -> Result<()> {
     let policy = configured().ok_or(DISABLED)?;
-    let (mut pipe, owner, probe, profile) = native::session(|| {
+    let (pipe, owner, probe, profile, target, source) = native::session(|| {
         let c = control();
         let (mut pipe, owner) = Pipe::connect(name, c.deadline)?;
         let probe: Probe = pipe.receive(&owner, c.deadline)?;
@@ -1380,7 +1380,7 @@ pub(super) fn health_main(name: &str) -> Result<()> {
             &helper.temporary.path.join("no-legacy"),
         )?;
         profile.update_profile().validate()?;
-        Ok((pipe, owner, probe, profile))
+        Ok((pipe, owner, probe, profile, target.clone(), source))
     })?;
     let preferences = profile.locations.profile();
     let state = probe.locations.cache.join("health-state");
@@ -1398,25 +1398,30 @@ pub(super) fn health_main(name: &str) -> Result<()> {
         owner: Process,
         probe: Probe,
         failed: Arc<AtomicBool>,
+        target: Target,
+        source: Source,
     }
     impl eframe::App for App {
         fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
-            self.app.update(ctx, frame);
+            eframe::App::update(&mut self.app, ctx, frame);
             self.frames += 1;
             ctx.request_repaint();
             if self.frames >= 3 {
                 if let Some(mut pipe) = self.pipe.take() {
-                    let result = (|| {
+                    let result: Result<()> = (|| {
                         let c = control();
-                        let source = native::session(|| {
-                            native::Verifier.source(&configured().ok_or(DISABLED)?)
-                        })?;
+                        Process::open(std::process::id())?.authenticate(
+                            &std::env::current_exe().map_err(|_| STAGE_HOLD)?,
+                            &self.target,
+                            &c,
+                        )?;
+                        let source = &self.source;
                         self.probe.namespace.check(true)?;
                         pipe.send(
                             &Health {
                                 nonce: self.probe.nonce.clone(),
-                                full_name: source.full_name,
-                                build: source.build,
+                                full_name: source.full_name.clone(),
+                                build: source.build.clone(),
                                 final_profile_sha256: self.probe.final_profile_sha256.clone(),
                                 frames: self.frames,
                             },
@@ -1436,7 +1441,7 @@ pub(super) fn health_main(name: &str) -> Result<()> {
             }
         }
         fn on_exit(&mut self) {
-            self.app.on_exit();
+            eframe::App::on_exit(&mut self.app);
         }
     }
     let failed = Arc::new(AtomicBool::new(false));
@@ -1448,18 +1453,18 @@ pub(super) fn health_main(name: &str) -> Result<()> {
             ..Default::default()
         },
         Box::new(move |cc| {
+            let mut app =
+                crate::ui::PeerBrush::new_with_preferences(cc, shared, connection, &preferences);
+            app.suspend_updates_for_health();
             Ok(Box::new(App {
-                app: crate::ui::PeerBrush::new_with_preferences(
-                    cc,
-                    shared,
-                    connection,
-                    &preferences,
-                ),
+                app,
                 frames: 0,
                 pipe: Some(pipe),
                 owner,
                 probe,
                 failed: observed,
+                target,
+                source,
             }))
         }),
     )
@@ -1474,6 +1479,34 @@ pub(super) fn health_main(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn logical_and_physical_profile_mapping_requires_actual_directory_and_lock_identity() {
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-namespace-{}", uuid::Uuid::new_v4()));
+        let locations = Locations {
+            config: root.join("config"),
+            data: root.join("data"),
+            cache: root.join("cache"),
+        };
+        fs::create_dir_all(root.join("legacy")).unwrap();
+        let profile =
+            crate::settings::Profile::open(locations.clone(), &root.join("legacy")).unwrap();
+        let namespace = Namespace::capture(&profile.update_profile()).unwrap();
+        namespace.check(true).unwrap();
+        namespace.check(false).unwrap();
+        let foreign = root.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep"), b"foreign").unwrap();
+        let mut changed = namespace.clone();
+        changed.logical.config = foreign.clone();
+        assert!(changed.check(true).is_err());
+        assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"foreign");
+        let mut changed = namespace.clone();
+        changed.lock.1 ^= 1;
+        assert!(changed.check(false).is_err());
+        drop(profile);
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn interrupted_owner_markers_hold_before_any_profile_migration() {
         let root =

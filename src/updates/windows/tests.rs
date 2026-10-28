@@ -2753,6 +2753,21 @@ fn final_profile_keeps_later_settings_separate_and_protects_exact_originals() {
     assert!(profile::reopen_final(&selected, &"0".repeat(64), &old.retained, &control()).is_err());
     let reopened =
         profile::reopen_final(&selected, final_copy.digest(), &old.retained, &control()).unwrap();
+    #[cfg(windows)]
+    {
+        let destination = temp.0.join("isolated-profile");
+        reopened.materialize(&destination, &control()).unwrap();
+        for relative in crate::settings::update_files() {
+            let expected = fs::read(profile.locations.profile().join(&relative));
+            let actual = fs::read(destination.join(&relative));
+            match (expected, actual) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind()),
+                _ => panic!("Isolated final profile differs at {relative:?}"),
+            }
+        }
+        assert!(reopened.materialize(&destination, &control()).is_err());
+    }
     let originals = reopened.protect_originals(&profile, &control()).unwrap();
     originals.check(&control()).unwrap();
     let path = profile.locations.profile().join("updates.json");

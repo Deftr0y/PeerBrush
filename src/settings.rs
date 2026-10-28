@@ -101,6 +101,13 @@ impl Profile {
 }
 #[cfg(any(windows, target_os = "macos", test))]
 impl UpdateProfile {
+    #[cfg(windows)]
+    pub(crate) fn ensure_update_locations(&self) -> Result<(), String> {
+        self.validate()?;
+        private_directory(&self.locations.data)?;
+        private_directory(&self.locations.cache)
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn inherited_lock(&self) -> Result<fs::File, String> {
         self._lock

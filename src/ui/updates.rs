@@ -22,6 +22,14 @@ pub(super) struct Panel {
     next_auto: Instant,
     last_notification: Option<String>,
     defer_current: bool,
+    #[cfg(windows)]
+    install: Option<(
+        crate::settings::UpdateProfile,
+        mpsc::Receiver<Result<updates::windows::Parent, String>>,
+    )>,
+    #[cfg(windows)]
+    ready_owner: Option<(crate::settings::UpdateProfile, updates::windows::Parent)>,
+    health_probe: bool,
     #[cfg(target_os = "macos")]
     native_updater: crate::sparkle::macos::Application,
     #[cfg(any(windows, test))]
@@ -61,6 +69,11 @@ impl Panel {
             next_auto: Instant::now() + Duration::from_secs(2),
             last_notification: None,
             defer_current: false,
+            #[cfg(windows)]
+            install: None,
+            #[cfg(windows)]
+            ready_owner: None,
+            health_probe: false,
             #[cfg(target_os = "macos")]
             native_updater: crate::sparkle::macos::Application::load(),
             #[cfg(any(windows, test))]
@@ -126,6 +139,9 @@ impl Panel {
         }
     }
     fn tick(&mut self, ctx: &egui::Context, allow_notification: bool) {
+        if self.health_probe {
+            return;
+        }
         #[cfg(any(windows, test))]
         {
             if self.owner == Owner::WindowsAppInstaller {
@@ -213,6 +229,26 @@ impl Panel {
                     self.app_installer_check.show(ui);
                     self.windows_prepared.show(ui);
                 }
+                #[cfg(windows)]
+                if self.owner==Owner::WindowsPackage && updates::windows::ENABLED && self.windows_prepared.allowed() {
+                    self.windows_prepared.show(ui);
+                    let pending=self.install.is_some() || self.ready_owner.is_some();
+                    let reason=crate::workspace::lifecycle::windows_update_readiness(_workspace).err();
+                    if let Some(reason)=&reason {ui.label(reason);}
+                    if ui.add_enabled(!pending && reason.is_none() && self.windows_prepared.apply_profile().is_ok(),egui::Button::new("Install verified update and restart")).clicked() {
+                        match self.windows_prepared.apply_profile() {
+                            Ok(profile)=>{
+                                let (sender,receiver)=mpsc::channel();let capture=profile.clone();let repaint=ctx.clone();
+                                match std::thread::Builder::new().name("peerbrush-windows-owner".into()).spawn(move || {
+                                    let result=updates::windows::Parent::prepare(&capture);let _=sender.send(result);repaint.request_repaint();
+                                }) {Ok(_)=>self.install=Some((profile,receiver)),Err(_)=>self.message="The Windows update owner could not start.".into()}
+                            }
+                            Err(error)=>self.message=error,
+                        }
+                    }
+                    if pending {ui.spinner();ui.label("Verifying the Windows update owner before restart");ctx.request_repaint_after(Duration::from_millis(50));}
+                }
+
                 #[cfg(target_os = "macos")]
                 if self.native_updater.configured() {
                     use crate::sparkle::check::Phase;
@@ -341,6 +377,11 @@ impl Panel {
 }
 
 impl PeerBrush {
+    #[cfg(windows)]
+    pub(crate) fn suspend_updates_for_health(&mut self) {
+        self.updates.health_probe = true;
+    }
+
     /// Component foundation only; no native observation calls this. An actual
     /// pending native owner must remain held until final-control/recovery exists.
     #[cfg(any(windows, target_os = "macos", test))]
@@ -445,9 +486,57 @@ impl PeerBrush {
         if self.update_exit_committed() {
             return;
         }
+        if self.updates.health_probe {
+            return;
+        }
         let idle = !self.update_interaction_active()
             && !ctx.wants_keyboard_input()
             && !ctx.input(|i| i.pointer.any_down() || !i.events.is_empty());
+        #[cfg(windows)]
+        {
+            let result = self
+                .updates
+                .install
+                .as_ref()
+                .map(|(_, receiver)| receiver.try_recv());
+            match result {
+                Some(Ok(result)) => {
+                    let (profile, _) = self.updates.install.take().unwrap();
+                    match result {
+                        Ok(owner) => self.updates.ready_owner = Some((profile, owner)),
+                        Err(error) => self.message = error,
+                    }
+                }
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    self.updates.install = None;
+                    self.message="Windows owner verification ended without authority; retained state needs review.".into();
+                }
+                _ => {}
+            }
+            if idle && !self.exit_approved && self.updates.ready_owner.is_some() {
+                let (profile, mut owner) = self.updates.ready_owner.take().unwrap();
+                let result = self.flush_update_tool_profile().and_then(|()| {
+                    let reviewed =
+                        crate::workspace::lifecycle::windows_update_readiness(&self.workspace)?;
+                    crate::workspace::lifecycle::finish_windows_update_exit(
+                        &self.workspace,
+                        &reviewed,
+                        |tools| owner.seal(&profile, tools),
+                    )
+                });
+                match result {
+                    Ok(()) => {
+                        if let Err(error) = owner.commit() {
+                            eprintln!("PeerBrush: final Windows acknowledgement failed; recovery remains held: {error}");
+                        }
+                        self.exit_approved = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    Err(error) => self.message = error,
+                }
+            }
+        }
         #[cfg(target_os = "macos")]
         if self.exit_approved || self.lifecycle.is_some() {
             self.updates.native_updater.defer();

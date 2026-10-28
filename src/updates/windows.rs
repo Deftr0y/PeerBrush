@@ -1,4 +1,4 @@
-//! Signed Windows media and dormant native staging. No registration or restart.
+//! Signed Windows media and the dormant verified local update lifecycle.
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -2091,6 +2091,18 @@ impl Controller {
             );
         }
         Ok(profile)
+    }
+    #[cfg(windows)]
+    pub(crate) fn apply_profile(&self) -> Result<crate::settings::UpdateProfile> {
+        if !ENABLED
+            || configured().is_none()
+            || self.active.is_some()
+            || self.view.busy
+            || self.view.staged_version.is_none()
+        {
+            return Err(STAGE_HOLD.into());
+        }
+        self.staging_profile()
     }
     pub(crate) fn deployment_blocker(&self) -> Option<&'static str> {
         match self.deployment {

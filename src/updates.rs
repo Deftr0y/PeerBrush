@@ -1,4 +1,4 @@
-//! Release discovery and dormant signed media preparation. No installer is executed.
+//! Release discovery and disabled signed update integrations.
 #[cfg(any(windows, test))]
 pub(crate) mod windows;
 use semver::Version;
@@ -479,3 +479,9 @@ pub fn parse_releases(
 #[cfg(test)]
 #[path = "updates_tests.rs"]
 mod tests;
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn windows_main_entry() -> Option<i32> {
+    windows::main_entry()
+}

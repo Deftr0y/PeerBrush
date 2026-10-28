@@ -84,7 +84,13 @@ owner directories/transitions are a bounded limit pending reviewed archive
 management.
 
 Native component replay and genuine isolated signed-package qualification are
-still required. Production remains disabled; the UI offer is not yet connected.
+still required. The UI caller is connected behind the unchanged production gate. It requires a
+human restart click and an untouched blank workspace. Users close projects through
+the ordinary explicit close flow first; saved files do not authorize losing live
+undo/redo. The atomic transaction repeats that restriction under all engine,
+registry and Store writer locks. Arbitrary live-history restart persistence is
+outside this bounded path. Health probes suspend release checks and use isolated
+server/preferences/cache paths.
 Signing/runtime facts, classic packaged-process launch identity, package file
 virtualization and surviving owner execution must be demonstrated with actual
 signed fixtures before activation.
