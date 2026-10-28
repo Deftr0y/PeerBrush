@@ -256,6 +256,11 @@ class Window:
         return png_samples(path)
 
     def screenshot(self, path):
+        # Hovered brush previews are real overlays, especially at a magnified
+        # 32x24 canvas. Park in the header; never weaken the painted-region oracle.
+        window = self.focused_window()
+        run(['xdotool', 'mousemove', '--sync', '--window', window, '2', '2'])
+        self.check_focus(window)
         require(not path.exists(), 'Preserve earlier capture evidence.')
         self.rpc('capture_ui', dict(path=str(path), panel='workspace'))
         deadline = time.monotonic() + 30
@@ -288,25 +293,30 @@ class Window:
         return dict(file=path.name, sha256=digest(path), width=WINDOW_SIZE[0], height=WINDOW_SIZE[1],
                     canvas_regions=[list(box) for box in boxes])
 
-    def acknowledge_duplicate(self, index, *, samples=None):
+    def focused_window(self):
         self.authenticate()
         windows = [row.split(None, 4)[0] for row in run(['wmctrl', '-lp']).splitlines()
             if len(row.split(None, 4)) == 5 and row.split(None, 4)[2] == str(self.pid)]
-        require(len(windows) == 1, 'Duplicate warning window is missing or ambiguous.')
+        require(len(windows) == 1, 'The owned installed window is missing or ambiguous.')
         window = windows[0]
         run(['wmctrl', '-ia', window])
-        def focused():
-            self.authenticate()
-            require(int(run(['xdotool', 'getactivewindow'])) == int(window, 16)
-                    and run(['xdotool', 'getwindowpid', window]) == str(self.pid),
-                    'Duplicate warning is not in the focused owned installed window.')
-        focused()
+        self.check_focus(window)
+        return window
+
+    def check_focus(self, window):
+        self.authenticate()
+        require(int(run(['xdotool', 'getactivewindow'])) == int(window, 16)
+                and run(['xdotool', 'getwindowpid', window]) == str(self.pid),
+                'Capture interaction is not in the focused owned installed window.')
+
+    def acknowledge_duplicate(self, index, *, samples=None):
+        window = self.focused_window()
         if samples is None:
             samples = self.screenshot(self.work / ('duplicate-warning-' + str(index) + '.png'))
         x, y = duplicate_ok(samples)
-        focused()
+        self.check_focus(window)
         run(['xdotool', 'mousemove', '--sync', '--window', window, str(x), str(y)])
-        focused()
+        self.check_focus(window)
         # XTEST follows the native input route; --window would use SendEvent,
         # which applications may ignore. Focus/owner are checked immediately above.
         run(['xdotool', 'click', '1'])

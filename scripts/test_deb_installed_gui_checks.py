@@ -134,6 +134,26 @@ class InstalledGuiContracts(unittest.TestCase):
                 mock.call(['xdotool', 'getwindowpid', '0x00123456']),
                 mock.call(['xdotool', 'click', '1'])])
 
+    def test_screenshot_parks_pointer_outside_canvas_before_capture_without_clicking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            window = gui.Window({}, Path(temporary))
+            path = Path(temporary) / 'settings-settled.png'
+            samples = screen(gui.palette(0))
+            events = []
+            def run(args):
+                events.append(args)
+                self.assertNotIn('click', args)
+                return ''
+            def rpc(method, parameters):
+                events.append(method)
+                path.write_bytes(png(*samples))
+            with mock.patch.object(window, 'focused_window', return_value='0x00123456'), \
+                    mock.patch.object(window, 'check_focus') as focused, \
+                    mock.patch.object(window, 'rpc', side_effect=rpc), mock.patch.object(gui, 'run', side_effect=run):
+                self.assertEqual(window.screenshot(path), samples)
+            self.assertEqual(events, [['xdotool', 'mousemove', '--sync', '--window', '0x00123456', '2', '2'], 'capture_ui'])
+            focused.assert_called_once_with('0x00123456')
+
     def test_gui_progress_is_fixed_stderr_only_and_entry_precedes_optional_imports(self):
         with mock.patch.object(gui, 'print', create=True) as output:
             gui.gui_phase('environment')

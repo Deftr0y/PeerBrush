@@ -330,7 +330,8 @@ pub(crate) fn startup_guard(locations: &Locations) -> Result<(), String> {
         return Ok(());
     }
     if !private(&root, false)? {
-        return Ok(());
+        // A journal root observed above must not disappear during admission.
+        return Err(HOLD.into());
     }
     let mut before = entries(&root)?;
     before.sort();
