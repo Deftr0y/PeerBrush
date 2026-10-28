@@ -109,7 +109,7 @@ def canvas_quadrants(samples, colors):
     return boxes
 
 
-def duplicate_ok(samples):
+def duplicate_ok(samples, *, required=True):
     """Locate one bounded primary button in the expected centered warning."""
     width, height, depth, pixels = samples
     require((width, height, depth) == (*WINDOW_SIZE, 8), 'Unexpected warning capture size/depth.')
@@ -132,11 +132,13 @@ def duplicate_ok(samples):
         left, right = min(x for x, _ in component), max(x for x, _ in component)
         top, bottom = min(y for _, y in component), max(y for _, y in component)
         w, h = right - left + 1, bottom - top + 1
-        if 24 <= w <= 64 and 24 <= h <= 36 and len(component) >= w * h * 0.55:
+        if 20 <= w <= 64 and 24 <= h <= 36 and len(component) >= w * h * 0.55:
             white = sum(all(pixels[(y * width + x) * 4 + ch] >= 220 for ch in range(3))
                 for y in range(top + 4, bottom - 3) for x in range(left + 4, right - 3))
             if 8 <= white <= 200:
                 candidates.append(((left + right) // 2, (top + bottom) // 2))
+    if not candidates and not required:
+        return None
     require(len(candidates) == 1, 'Visible duplicate warning OK button is missing or ambiguous.')
     return candidates[0]
 
@@ -252,6 +254,15 @@ class Window:
         self.guarded('document', project, action='export', path=str(path))
         return png_samples(path)
 
+    def screenshot(self, path):
+        require(not path.exists(), 'Preserve earlier capture evidence.')
+        self.rpc('capture_ui', dict(path=str(path), panel='workspace'))
+        deadline = time.monotonic() + 30
+        while not path.is_file() and time.monotonic() < deadline:
+            self.authenticate()
+            time.sleep(0.1)
+        return png_samples(path, expected_size=WINDOW_SIZE)
+
     def capture(self, project, path, colors, *, select_project=True):
         if select_project:
             self.rpc('projects', dict(action='select', project_id=project))
@@ -262,20 +273,21 @@ class Window:
             time.sleep(0.1)
         before = self.state(project)
         history = self.rpc('history', dict(action='list', project_id=project, feedback='request'))
-        require(not path.exists(), 'Preserve earlier capture evidence.')
-        self.rpc('capture_ui', dict(path=str(path), panel='workspace'))
-        deadline = time.monotonic() + 30
-        while not path.is_file() and time.monotonic() < deadline:
-            self.authenticate()
-            time.sleep(0.1)
-        boxes = canvas_quadrants(png_samples(path, expected_size=WINDOW_SIZE), colors)
+        samples = self.screenshot(path)
+        if duplicate_ok(samples, required=False) is not None:
+            # Initial desktop delivery can also repeat an already-open file.
+            # Keep the first real capture and qualify a fresh frame after OK.
+            self.acknowledge_duplicate(path.stem, samples=samples)
+            path = path.with_name(path.stem + '-after-duplicate.png')
+            samples = self.screenshot(path)
+        boxes = canvas_quadrants(samples, colors)
         require(self.state(project) == before
                 and self.rpc('history', dict(action='list', project_id=project, feedback='request')) == history,
                 'Window capture changed native project state, history or reservations.')
         return dict(file=path.name, sha256=digest(path), width=WINDOW_SIZE[0], height=WINDOW_SIZE[1],
                     canvas_regions=[list(box) for box in boxes])
 
-    def acknowledge_duplicate(self, index):
+    def acknowledge_duplicate(self, index, *, samples=None):
         self.authenticate()
         windows = [row.split(None, 4)[0] for row in run(['wmctrl', '-lp']).splitlines()
             if len(row.split(None, 4)) == 5 and row.split(None, 4)[2] == str(self.pid)]
@@ -288,14 +300,9 @@ class Window:
                     and run(['xdotool', 'getwindowpid', window]) == str(self.pid),
                     'Duplicate warning is not in the focused owned installed window.')
         focused()
-        path = self.work / ('duplicate-warning-' + str(index) + '.png')
-        require(not path.exists(), 'Preserve earlier warning evidence.')
-        self.rpc('capture_ui', dict(path=str(path), panel='workspace'))
-        deadline = time.monotonic() + 30
-        while not path.is_file() and time.monotonic() < deadline:
-            self.authenticate()
-            time.sleep(0.1)
-        x, y = duplicate_ok(png_samples(path, expected_size=WINDOW_SIZE))
+        if samples is None:
+            samples = self.screenshot(self.work / ('duplicate-warning-' + str(index) + '.png'))
+        x, y = duplicate_ok(samples)
         focused()
         run(['xdotool', 'mousemove', '--window', window, str(x), str(y)])
         focused()

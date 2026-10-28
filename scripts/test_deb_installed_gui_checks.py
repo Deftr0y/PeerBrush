@@ -69,6 +69,9 @@ class InstalledGuiContracts(unittest.TestCase):
                         pixels[(y * width + x) * 4:(y * width + x + 1) * 4] = bytes(color)
             return width, height, 8, bytes(pixels)
         self.assertEqual(gui.duplicate_ok(sample([(470, 500, True)])), (485, 513))
+        self.assertIsNone(gui.duplicate_ok(sample([]), required=False))
+        with self.assertRaises(ValueError):
+            gui.duplicate_ok(sample([(470, 500, True), (550, 500, True)]), required=False)
         for buttons in [[], [(470, 500, False)], [(470, 500, True), (550, 500, True)], [(50, 50, True)]]:
             with self.subTest(buttons=buttons), self.assertRaises(ValueError):
                 gui.duplicate_ok(sample(buttons))
@@ -83,6 +86,29 @@ class InstalledGuiContracts(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'focused owned'):
                     window.acknowledge_duplicate(0)
             self.assertFalse(any('click' in call.args[0] for call in commands.call_args_list))
+
+    def test_initial_capture_acknowledges_visible_warning_and_still_requires_strict_canvas(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            window = gui.Window({}, Path(temporary))
+            colors = gui.palette(0)
+            valid = screen(colors)
+            hidden = screen(colors, only_thumbnails=True)
+            path = Path(temporary) / 'canvas-0.png'
+            for after, succeeds in [(valid, True), (hidden, False)]:
+                with mock.patch.object(window, 'rpc', side_effect=[{'active_project_id': 'p'}, {'undo': [], 'redo_count': 0}, {'undo': [], 'redo_count': 0}]), \
+                        mock.patch.object(window, 'state', return_value={'unchanged': True}), \
+                        mock.patch.object(window, 'screenshot', side_effect=[hidden, after]) as captures, \
+                        mock.patch.object(window, 'acknowledge_duplicate') as acknowledge, \
+                        mock.patch.object(gui, 'duplicate_ok', return_value=(485, 513)), \
+                        mock.patch.object(gui, 'digest', return_value='synthetic-digest'):
+                    if succeeds:
+                        result = window.capture('p', path, colors, select_project=False)
+                        self.assertEqual(result['file'], 'canvas-0-after-duplicate.png')
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'missing, fragmented or obscured'):
+                            window.capture('p', path, colors, select_project=False)
+                    acknowledge.assert_called_once_with('canvas-0', samples=hidden)
+                    self.assertEqual(captures.call_args_list, [mock.call(path), mock.call(path.with_name('canvas-0-after-duplicate.png'))])
 
     def test_gui_progress_is_fixed_stderr_only_and_entry_precedes_optional_imports(self):
         with mock.patch.object(gui, 'print', create=True) as output:
