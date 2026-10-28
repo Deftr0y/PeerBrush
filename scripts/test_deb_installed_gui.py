@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import select
 import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -52,6 +53,23 @@ def require(value, message):
 def palette(cell):
     return [[r - cell * 3, g + cell * 3, b + cell * 3, 255]
             for r, g, b in [(211, 17, 79), (31, 199, 101), (53, 71, 227), (239, 181, 23)]]
+
+
+def require_stored_brush_profile(profile_bytes, profile):
+    stored = json.loads(profile_bytes)['tools']['brush']
+    require(type(stored) is dict and set(stored) == {'settings', 'preset', 'liquify_mode'}
+            and stored['preset'] == profile['preset'] and stored['liquify_mode'] is None,
+            'Normal GUI on_exit changed the stored brush profile schema or preset.')
+    require(type(stored['settings']) is dict and set(stored['settings']) == set(profile['settings']),
+            'Normal GUI on_exit changed the stored brush setting fields.')
+    for name, value in profile['settings'].items():
+        saved = stored['settings'][name]
+        require(type(saved) is type(value), 'Normal GUI on_exit changed a brush setting type.')
+        # Stored f32 uses shortest decimal text; RPC Value widens f32 to f64.
+        # Compare exact native bits, with no numeric tolerance or dropped fields.
+        equal = (math.isfinite(saved) and math.isfinite(value)
+                 and struct.pack('>f', saved) == struct.pack('>f', value)) if type(value) is float else saved == value
+        require(equal, 'Normal GUI on_exit did not preserve a native brush setting.')
 
 
 def canvas_quadrants(samples, colors):
@@ -440,10 +458,7 @@ def display_check(fixture):
         stored = QA_HOME / 'config/peerbrush/settings-v1/tool-settings.json'
         bounded_file(stored, 128 * 1024)
         profile_bytes = stored.read_bytes()
-        # Stored Profile includes the inapplicable Liquify mode; Snapshot::state
-        # projects only settings/preset for the ordinary brush RPC profile.
-        require(json.loads(profile_bytes)['tools']['brush'] == dict(profile, liquify_mode=None),
-                'Normal GUI on_exit did not preserve current preferences.')
+        require_stored_brush_profile(profile_bytes, profile)
         gui_phase('restart-and-native-oracles')
         window = Window(facts, work)
         window.launch(paths)

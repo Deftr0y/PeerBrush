@@ -176,25 +176,23 @@ class InstalledGuiContracts(unittest.TestCase):
                             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'gui_phase'))
 
     def test_actual_exit_profile_check_requires_exact_stored_brush_schema_and_values(self):
-        tree = ast.parse(Path(gui.__file__).read_text(encoding='utf-8'))
-        statement = next(node for node in ast.walk(tree) if isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == 'require' and len(node.value.args) == 2
-            and isinstance(node.value.args[1], ast.Constant)
-            and node.value.args[1].value == 'Normal GUI on_exit did not preserve current preferences.')
-        code = compile(ast.fix_missing_locations(ast.Module(body=[statement], type_ignores=[])),
-                       '<actual-installed-exit-profile-check>', 'exec')
-        profile = dict(settings=dict(radius=19.25, opacity=0.625), preset=None)
-        stored = dict(profile, liquify_mode=None)
+        widened = lambda value: struct.unpack('>f', struct.pack('>f', value))[0]
+        profile = dict(settings=dict(radius=19.25, opacity=0.625, spacing=widened(0.15),
+            wetness=widened(0.8), tip='round', seed=7, pressure_size=True), preset=None)
+        stored = dict(profile, settings=dict(profile['settings'], spacing=0.15, wetness=0.8), liquify_mode=None)
+        self.assertNotEqual(stored['settings'], profile['settings'])
+        changed_spacing = struct.unpack('>f', (int.from_bytes(struct.pack('>f', 0.15), 'big') + 1).to_bytes(4, 'big'))[0]
         for candidate in [stored, profile, dict(stored, liquify_mode='push'), dict(stored, extra=True),
-                          dict(stored, settings=dict(radius=18, opacity=0.625)), dict(stored, preset='changed')]:
-            namespace = dict(json=json, profile=profile, require=gui.require,
-                             profile_bytes=json.dumps(dict(version=1, tools=dict(brush=candidate))).encode())
-            if candidate == stored:
-                exec(code, namespace)
+                          dict(stored, preset='changed'),
+                          *[dict(stored, settings=dict(stored['settings'], **change)) for change in
+                            [dict(radius=18.), dict(spacing=changed_spacing), dict(wetness=float('nan')),
+                             dict(pressure_size=1), dict(seed=7.), dict(extra=True)]]]:
+            profile_bytes = json.dumps(dict(version=1, tools=dict(brush=candidate))).encode()
+            if candidate is stored:
+                gui.require_stored_brush_profile(profile_bytes, profile)
             else:
-                with self.subTest(candidate=candidate), self.assertRaisesRegex(ValueError, 'preserve current preferences'):
-                    exec(code, namespace)
+                with self.subTest(candidate=candidate), self.assertRaisesRegex(ValueError, 'Normal GUI on_exit'):
+                    gui.require_stored_brush_profile(profile_bytes, profile)
 
     @unittest.skipUnless(os.name == 'posix', 'Container ownership/mode contract requires POSIX filesystems')
     def test_actual_owned_capture_persistence_overrides_restrictive_umask_inside_private_parent(self):
