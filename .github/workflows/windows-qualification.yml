@@ -104,6 +104,7 @@ jobs:
           cargo build --locked --bin peerbrush
           cargo test --locked --all-targets
           cargo clippy --locked --all-targets
+          python3 -B scripts/build_release.py
           python3 -B -m unittest discover -s scripts -p 'test_*.py'
           python3 -B scripts/package.py --check-source
 

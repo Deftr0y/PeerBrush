@@ -11,6 +11,13 @@ Both layouts retain false readiness and unverified installed acceptance. This
 alignment does not supply a verified fresh-install bootstrapper, trusted signing,
 native installed evidence or a selectable website download.
 
+The held Windows signing/qualification and Mac qualification source gates build
+the exact-source release executable before full Python unittest discovery. The
+native version/API and installation-observation/MCP runtime tests require that
+binary; a debug worker alone cannot satisfy them. This prerequisite build does
+not enable the jobs, give the gate signing/attestation authority or establish
+installed acceptance.
+
 PB-154 now has a prepared final-byte composition and immutable GitHub transaction. It remains disabled. Current native signing and installed-acceptance producer work is incomplete; configuration or a supplied readiness report cannot make this source production-ready. No release, Store submission, website deployment, environment or credential change is performed by developing these scripts.
 
 ## Final inputs and trust boundaries
