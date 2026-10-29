@@ -121,6 +121,8 @@ jobs:
       - run: rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
       - name: Build source-matched JPEG XL worker for integration tests
         run: cargo build --locked --bin peerbrush
+      - name: Check the separate setup entry in the ordinary non-test configuration
+        run: cargo check --locked --features windows-setup --bin peerbrush-setup
       # Cached bytes are an optimization; source builds and every qualification gate still run.
       - name: Save CI build cache after main compilation
         if: success() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''

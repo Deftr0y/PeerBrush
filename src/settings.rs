@@ -84,13 +84,13 @@ pub struct Profile {
 }
 /// A default-profile lease can only come from the session holding settings.lock.
 /// Explicit --state-dir sessions cannot request installed-app native staging or checkpoints.
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test, feature = "windows-setup"))]
 #[derive(Clone)]
 pub struct UpdateProfile {
     pub(crate) locations: Locations,
     _lock: std::sync::Arc<Lock>,
 }
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test, feature = "windows-setup"))]
 impl Profile {
     pub fn update_profile(&self) -> UpdateProfile {
         UpdateProfile {
@@ -99,7 +99,7 @@ impl Profile {
         }
     }
 }
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test, feature = "windows-setup"))]
 impl UpdateProfile {
     #[cfg(windows)]
     pub(crate) fn ensure_update_locations(&self) -> Result<(), String> {
@@ -162,7 +162,7 @@ impl UpdateProfile {
         Ok(())
     }
 }
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test, feature = "windows-setup"))]
 pub(crate) fn update_files() -> Vec<std::path::PathBuf> {
     let mut paths = vec![std::path::PathBuf::from("profile.json")];
     for name in FILES {
