@@ -66,8 +66,17 @@ pub fn native_error_dialog(args: impl IntoIterator<Item = OsString>) -> bool {
                 args.next();
             }
             Some(
-                "mcp" | "cli" | "discover" | "settings" | "updates" | "--build-info" | "--version"
-                | "-V" | "--help" | "--headless",
+                "mcp"
+                | "cli"
+                | "discover"
+                | "settings"
+                | "updates"
+                | "--build-info"
+                | "--installation-info"
+                | "--version"
+                | "-V"
+                | "--help"
+                | "--headless",
             ) => return false,
             _ => return true,
         }
@@ -246,6 +255,7 @@ mod tests {
             vec!["--state-dir", "", "cli"],
             vec!["--state-dir", "workspace", "mcp"],
             vec!["--build-info", "--state-dir"],
+            vec!["--installation-info", "--state-dir"],
         ] {
             assert!(!native_error_dialog(args(&command)));
         }

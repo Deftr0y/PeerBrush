@@ -2,7 +2,7 @@
 use super::*;
 use ::windows::{
     core::{w, Interface, PCWSTR, PWSTR},
-    ApplicationModel::{AppInstallerInfo, IPackage6, Package, PackageSignatureKind},
+    ApplicationModel::{AppInstallerInfo, Package, PackageSignatureKind},
     Foundation::{AsyncOperationProgressHandler, AsyncStatus, IAsyncOperationWithProgress, Uri},
     Management::Deployment::{
         AddPackageOptions, DeploymentOptions, DeploymentProgress, DeploymentResult, PackageManager,
@@ -60,20 +60,7 @@ pub(super) fn session<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
 pub(super) struct Verifier;
 // Distinguish native successful absence from a failed association query.
 fn association(package: &Package) -> Result<Option<AppInstallerInfo>> {
-    let interface: IPackage6 = native(package.cast())?;
-    let mut pointer = std::ptr::null_mut();
-    native(unsafe {
-        (Interface::vtable(&interface).GetAppInstallerInfo)(
-            Interface::as_raw(&interface),
-            &mut pointer,
-        )
-        .ok()
-    })?;
-    Ok(if pointer.is_null() {
-        None
-    } else {
-        Some(unsafe { AppInstallerInfo::from_raw(pointer) })
-    })
+    native(crate::packaged::appinstaller_association(package))
 }
 impl super::Verifier for Verifier {
     fn source(&self, policy: &Policy) -> Result<Source> {
@@ -101,7 +88,9 @@ impl super::Verifier for Verifier {
             || native(current.IsOptional())?
             || native(current.IsDevelopmentMode())?
         {
-            return Err("Signed Windows preparation requires this exact non-Store App Installer main package.".into());
+            return Err(
+                "Signed Windows preparation requires this exact non-Store main package.".into(),
+            );
         }
         let id = native(current.Id())?;
         let info = association(&current)?;

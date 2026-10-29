@@ -6,6 +6,17 @@ qualify a genuine signed installation, launch, interruption or recovery.
 
 ## Installation boundary
 
+Final composition separates the signed MSIX installation entry point from its
+descriptor discovery metadata in the V2 manifest. A descriptor is not handed to
+an installer by this route. Historical V1 manifests stay readable and unready;
+App Installer association migration still requires separate qualification.
+`peerbrush --installation-info` reports bounded public process/package facts
+before opening settings or state. It distinguishes a verified-local candidate
+from Store, legacy association, development and unknown cases, without exposing
+the association URI. The observation is not signature verification, installed
+acceptance, launch health or an update permit. An approved fresh-install driver
+and genuine signed installation still have to establish those facts.
+
 The direct route submits a verified local MSIX and explicit local runtime through
 [`PackageManager.AddPackageAsync`](https://learn.microsoft.com/en-us/uwp/api/windows.management.deployment.packagemanager.addpackageasync).
 Its inputs are file URIs made from the already held files. Stable and immutable

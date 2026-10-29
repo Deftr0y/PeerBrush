@@ -79,6 +79,23 @@ For Claude Desktop and any custom client paths inside AppData, on all supported 
 
 ## Required installed Windows QA
 
+Before opening the GUI, `peerbrush --installation-info` is a read-only diagnostic
+for the actual launched process. It returns bounded JSON with the public build
+record, kernel/WinRT-matched package family, package name/version, signature kind,
+main/development flags and whether an App Installer association exists. It never
+returns the association URI, private profile paths or tokens, opens a profile,
+downloads media or grants update eligibility. Unpackaged processes return no
+Windows package observation; a self-reported record alone is not authenticated
+native acceptance. Installed qualification must bind this fresh observation to
+the independently verified selected package/executable and native job evidence.
+The existing installed MCP smoke driver checks the actual native APPEXECLINK tag
+and this process observation before reporting an installed alias. Its optional
+`--expected-route verified-local-candidate` refuses a legacy App Installer
+association; Store and legacy checks use their own explicit route selections.
+Copied executables in a folder named WindowsApps do not establish an alias.
+These read-only checks retain `installed_acceptance: not-established`; they do
+not install, sign, enable an alias or qualify GUI/update health.
+
 Perform these in an authorized disposable Windows test profile/VM, after the package has an approved installation/signing route. This checklist is not permission to create or trust certificates, enable Developer Mode or install unsigned executable packages.
 
 1. Validate with the Windows SDK and Windows App Certification Kit. Inspect identity, version, restricted capabilities, embedded source/notices and signature status. Record exact commit/package SHA256, Windows build and SDK version.

@@ -39,6 +39,16 @@ fn run() -> Result<(), String> {
         println!("{}", peerbrush::build_info::json());
         return Ok(());
     }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--installation-info")
+    {
+        if arguments.len() != 1 {
+            return Err("Use --installation-info without state or file arguments".into());
+        }
+        println!("{}", peerbrush::packaged::installation_info()?);
+        return Ok(());
+    }
     let (state_dir, args, local_preferences) = activation::storage_arguments(
         arguments,
         peerbrush::packaged::default_state_dir(server::default_state_dir())?,
@@ -147,7 +157,7 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("--help") => {
-            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush --build-info\npeerbrush discover\npeerbrush discover --status [--state-dir PATH]\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
+            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush --build-info\npeerbrush --installation-info\npeerbrush discover\npeerbrush discover --status [--state-dir PATH]\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
             return Ok(());
         }
         _ => {}
