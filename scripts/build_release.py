@@ -74,6 +74,8 @@ def native_shell_flags(value):
 
 def release_environment(root, inherited=None):
     environment = dict(os.environ if inherited is None else inherited)
+    if 'PEERBRUSH_SETUP_OFFER' in environment:
+        raise ValueError('Setup offers are selected only by the separate reviewed setup producer')
     reject_overrides(environment)
     environment['PEERBRUSH_BUILD_INPUT_STATE'] = source_input_state(root)
     if environment.get('RUSTFLAGS') and not environment.get('CARGO_ENCODED_RUSTFLAGS'):
@@ -114,9 +116,11 @@ if __name__ == '__main__':
     parser.add_argument('--target-dir', type=pathlib.Path)
     parser.add_argument('--offline', action='store_true')
     parser.add_argument('--jobs', type=int)
+    parser.add_argument('--setup-entry', action='store_true', help='Build only the separate dormant setup entry')
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
     command = ['cargo', 'build', '--release', '--locked']
+    command += ['--bin', 'peerbrush-setup', '--features', 'windows-setup'] if args.setup_entry else ['--bin', 'peerbrush']
     if args.target_dir:
         command += ['--target-dir', str(args.target_dir)]
     if args.offline:

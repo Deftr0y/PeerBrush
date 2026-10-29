@@ -8,9 +8,9 @@ TEMPLATE = 'packaging/windows/version.rc.in'
 RESOURCE_LIMIT = 65536
 
 
-def strings(version):
-    return dict(CompanyName='PeerBrush', FileDescription='PeerBrush graphics editor', FileVersion=version,
-        InternalName='peerbrush', OriginalFilename='peerbrush.exe', ProductName='PeerBrush',
+def strings(version, *, setup=False):
+    return dict(CompanyName='PeerBrush', FileDescription='PeerBrush installer' if setup else 'PeerBrush graphics editor', FileVersion=version,
+        InternalName='peerbrush-setup' if setup else 'peerbrush', OriginalFilename='peerbrush-setup.exe' if setup else 'peerbrush.exe', ProductName='PeerBrush',
         ProductVersion=version, Comments='GPL-3.0-only')
 
 
@@ -134,7 +134,7 @@ def version_bytes(data):
     return result
 
 
-def inspect(data, version):
+def inspect(data, version, *, setup=False):
     expected = numeric(version)
     resource = version_bytes(data)
     nodes = 0
@@ -211,7 +211,7 @@ def inspect(data, version):
             or variable_info[2]['Translation'] != (0, struct.pack('<HH', 0x409, 1200), {})):
         raise ValueError('Version translation/container contract differs.')
     table = string_info[2]['040904B0']
-    expected_strings = strings(version)
+    expected_strings = strings(version, setup=setup)
     if table[:2] != (1, b'') or set(table[2]) != set(expected_strings):
         raise ValueError('Version application metadata fields differ.')
     for name, expected_value in expected_strings.items():

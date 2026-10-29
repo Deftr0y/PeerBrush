@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod bootstrap;
 #[cfg(windows)]
 pub(crate) mod gate;
 #[cfg(windows)]
@@ -112,7 +113,8 @@ struct Prepared {
 }
 
 // Obtained from the native verifier's held signed payload, never from a journal.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Target {
     full_name: String,
     version: [u16; 4],
@@ -459,6 +461,17 @@ fn descriptor_for(
 ) -> Result<Selection> {
     policy.validate()?;
     policy.source_descriptor(source)?;
+    descriptor_content(bytes, policy, Some((source, role)))
+}
+
+// Shared structure only: update callers still impose their current/newer-source
+// checks above; fresh setup binds the entire descriptor to its fixed offer.
+fn descriptor_content(
+    bytes: &[u8],
+    policy: &Policy,
+    installed: Option<(&Source, MediaRole)>,
+) -> Result<Selection> {
+    policy.validate()?;
     if bytes.is_empty() || bytes.len() as u64 > SMALL || !bytes.is_ascii() || bytes.contains(&b'&')
     {
         return Err("Unsupported App Installer descriptor.".into());
@@ -535,13 +548,20 @@ fn descriptor_for(
         .attribute("Uri")
         .ok_or("Missing immutable descriptor URI.")?;
     let approved = policy.archive_uri(descriptor)?;
-    if role == MediaRole::Current && v != source.version {
-        return Err(CURRENT_MISSING.into());
+    if let Some((source, role)) = installed {
+        if role == MediaRole::Current && v != source.version {
+            return Err(CURRENT_MISSING.into());
+        }
+        if (source.route == Route::VerifiedLocal && descriptor != policy.direct_descriptor(v))
+            || (role == MediaRole::New && v <= source.version)
+            || (role == MediaRole::Current && descriptor != source.association)
+        {
+            return Err(
+                "App Installer target is not an approved newer package and runtime.".into(),
+            );
+        }
     }
-    if (source.route == Route::VerifiedLocal && descriptor != policy.direct_descriptor(v))
-        || (role == MediaRole::New && v <= source.version)
-        || (role == MediaRole::Current && descriptor != source.association)
-        || descriptor == policy.discovery
+    if descriptor == policy.discovery
         || !approved.path().ends_with(&format!(
             "/PeerBrush-{}-Windows-x64.appinstaller",
             version_text(v)
@@ -2647,4 +2667,9 @@ pub fn main_entry() -> Option<i32> {
         }
     };
     Some(if run().is_ok() { 0 } else { 1 })
+}
+
+#[cfg(feature = "windows-setup")]
+pub(super) fn setup_entry(embedded: Option<&str>) -> i32 {
+    bootstrap::entry(embedded)
 }

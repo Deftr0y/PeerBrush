@@ -42,6 +42,11 @@ pub(super) fn session<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
     if !ENABLED {
         return Err(DISABLED.into());
     }
+    inspection_session(work)
+}
+// Read-only setup inspection also needs an apartment while update activation is
+// disabled. Deployment still requires the private live setup permit below.
+pub(super) fn inspection_session<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
     unsafe {
         native(CoInitializeEx(None, COINIT_MULTITHREADED).ok())?;
     }
@@ -148,11 +153,7 @@ impl super::Verifier for Verifier {
         if !ENABLED {
             return Err(DISABLED.into());
         }
-        control.check()?;
-        file.check(control)?;
-        let target = unsafe { verify(file, policy, selected, runtime, control)? };
-        file.check(control)?;
-        Ok(target)
+        inspect_media(file, policy, selected, runtime, control)
     }
     fn current_media(
         &self,
@@ -217,6 +218,20 @@ impl super::Verifier for Verifier {
         }
         Ok(running)
     }
+}
+
+pub(super) fn inspect_media(
+    file: &Held,
+    policy: &Policy,
+    selected: &Selection,
+    runtime: bool,
+    control: &Control,
+) -> Result<Option<Target>> {
+    control.check()?;
+    file.check(control)?;
+    let target = unsafe { verify(file, policy, selected, runtime, control)? };
+    file.check(control)?;
+    Ok(target)
 }
 
 fn staging<T>(value: ::windows::core::Result<T>) -> Result<T> {
@@ -430,6 +445,9 @@ pub(super) fn registered(policy: &Policy, control: &Control) -> Result<Option<Re
     if !ENABLED {
         return Err(DISABLED.into());
     }
+    observe_registered(policy, control)
+}
+pub(super) fn observe_registered(policy: &Policy, control: &Control) -> Result<Option<Registered>> {
     policy.validate()?;
     control.check()?;
     let manager = native(PackageManager::new())?;
@@ -480,6 +498,76 @@ pub(super) fn registered(policy: &Policy, control: &Control) -> Result<Option<Re
     }
     control.check()?;
     Ok(result)
+}
+
+// Fresh setup refuses every registered member of the family, including a
+// framework/resource-only or otherwise contradictory registration.
+pub(super) fn setup_absent(policy: &Policy, control: &Control) -> Result<bool> {
+    policy.validate()?;
+    control.check()?;
+    let packages = native(
+        native(PackageManager::new())?.FindPackagesByUserSecurityIdPackageFamilyName(
+            &::windows::core::HSTRING::new(),
+            &::windows::core::HSTRING::from(&policy.family),
+        ),
+    )?;
+    let empty = !native(native(packages.First())?.HasCurrent())?;
+    control.check()?;
+    Ok(empty)
+}
+
+pub(super) fn submit_setup(
+    _: &bootstrap::Permit,
+    package: &Held,
+    runtime: &Held,
+    policy: &Policy,
+    selection: &Selection,
+    target: &Target,
+    control: &Control,
+    guard: &dyn Fn() -> Result<()>,
+) -> Result<Box<dyn StageOperation>> {
+    let verify = || -> Result<()> {
+        if inspect_media(package, policy, selection, false, control)? != Some(target.clone())
+            || inspect_media(runtime, policy, selection, true, control)?.is_some()
+        {
+            return Err(STAGE_HOLD.into());
+        }
+        Ok(())
+    };
+    verify()?;
+    let main = local_uri(&package.path)?;
+    let dependencies: ::windows::Foundation::Collections::IIterable<Uri> =
+        staging(vec![Some(local_uri(&runtime.path)?)].try_into())?;
+    let manager = staging(PackageManager::new())?;
+    let mut state = StageProgress::new(control.view.clone());
+    state.phase = "Installing verified local Windows package";
+    let state = Arc::new(state);
+    let callback = state.clone();
+    let progress = AsyncOperationProgressHandler::new(move |_, value: &DeploymentProgress| {
+        callback.percentage(value.percentage);
+        Ok(())
+    });
+    // No App Installer/network input, force shutdown, unsigned/developer mode,
+    // deferred registration or downgrade. Keep exact media held through drain.
+    guard()?;
+    verify()?;
+    if !setup_absent(policy, control)? {
+        return Err(STAGE_HOLD.into());
+    }
+    package.check(control)?;
+    runtime.check(control)?;
+    guard()?;
+    let operation =
+        staging(manager.AddPackageAsync(&main, &dependencies, DeploymentOptions::None))?;
+    if operation.SetProgress(&progress).is_err() {
+        state.invalidate();
+    }
+    Ok(Box::new(Stage {
+        operation,
+        _progress: progress,
+        _manager: manager,
+        progress: state,
+    }))
 }
 
 pub(super) struct HelperFiles {

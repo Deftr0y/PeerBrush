@@ -198,7 +198,7 @@ class Candidate:
             raise ValueError('Final release inventory, checksums or exclusive output changed.')
 
 
-def windows_binding(root, base, directory, selection):
+def windows_binding(root, base, directory, selection, *, for_setup=False):
     required = {'unsigned', 'unsigned_sha256', 'package', 'package_sha256', 'runtime', 'runtime_sha256',
                 'identity', 'identity_sha256', 'package_family', 'descriptor', 'descriptor_sha256',
                 'descriptor_uri', 'package_uri', 'runtime_uri'}
@@ -261,8 +261,8 @@ def windows_binding(root, base, directory, selection):
             original_executable=original_executable, executable=executable, identity_sha256=selection['identity_sha256'],
             runtime=runtime, runtime_sha256=selection['runtime_sha256'], dependency=dependency,
             descriptor=descriptor, descriptor_sha256=selection['descriptor_sha256'],
-            descriptor_uri=selection['descriptor_uri'], package_uri=selection['package_uri'], runtime_uri=selection['runtime_uri'])
-        originals += native.retained_inputs(selection['native'])
+            descriptor_uri=selection['descriptor_uri'], package_uri=selection['package_uri'], runtime_uri=selection['runtime_uri'], _setup=for_setup)
+        originals += native.retained_inputs(selection['native'], setup_host=for_setup)
     return [package, runtime, descriptor], channel, originals, origin
 
 

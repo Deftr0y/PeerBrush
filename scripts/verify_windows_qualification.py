@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 from package_macos_dmg import bounded_file
 from production_readiness import unique_fields, NATIVE_TRUST_FIELDS
@@ -15,15 +16,21 @@ FIELDS = {'qualification', 'qualification_sha256', 'certificate_sha256', 'timest
 
 
 def authenticate(qualification, **inputs):
-    if '_windows' in inputs or '_linux' in inputs:
+    if any(key in inputs for key in ['_windows', '_linux', '_setup_host']):
         raise ValueError('Windows native origin uses its fixed reviewed workflow policy.')
     return native.authenticate(qualification, **inputs, _windows=True)
+
+
+def authenticate_setup(qualification, **inputs):
+    if any(key in inputs for key in ['_windows', '_linux', '_setup_host']):
+        raise ValueError('Setup native origin uses its fixed reviewed workflow and host policy.')
+    return native.authenticate(qualification, **inputs, _windows=True, _setup_host=True)
 
 
 def bind(root, selection, qualification, *, commit, version, identity, family, portable_sha256,
          unsigned_sha256, package, package_sha256, original_executable, executable,
          identity_sha256, runtime, runtime_sha256, dependency, descriptor, descriptor_sha256,
-         descriptor_uri, package_uri, runtime_uri):
+         descriptor_uri, package_uri, runtime_uri, _setup=False):
     if (not isinstance(selection, dict) or set(selection) != FIELDS
             or any(not signed._sha(selection[name]) for name in FIELDS - {'qualification', 'trust'})
             or not isinstance(selection['trust'], dict)
@@ -58,21 +65,24 @@ def bind(root, selection, qualification, *, commit, version, identity, family, p
     encode = lambda value: json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
     if encode(report) != encode(expected):
         raise ValueError('Windows native report differs from actual selected bytes, source, leaves, tools or safety gates.')
-    origin = authenticate(qualification, qualification_sha256=selection['qualification_sha256'],
+    if type(_setup) is not bool: raise ValueError('Fixed setup adapter selection required.')
+    consumer = authenticate_setup if _setup else authenticate
+    origin = consumer(qualification, qualification_sha256=selection['qualification_sha256'],
         commit=commit, version=version, source_root=root, **selection['trust'])
     if origin['native_job_conclusion'] != 'service-reconciled-success':
         raise ValueError('Windows native qualification job has not completed successfully.')
     return origin
 
 
-def retained_inputs(selection):
+def retained_inputs(selection, *, setup_host=False):
     trust = selection['trust']
     records = [(Path(selection['qualification']), LIMITS['qualification'], selection['qualification_sha256']),
                (Path(trust['work']) / 'windows-installer-qualification.json', LIMITS['qualification'], selection['qualification_sha256'])]
+    windows_host = setup_host and sys.platform == 'win32'
     for key, owned, limit in [('bundle', 'bundle.jsonl', LIMITS['bundle']),
-                              ('trusted_root', 'trusted_root.jsonl', LIMITS['trusted-root']), ('cli', 'gh', LIMITS['gh'])]:
+                              ('trusted_root', 'trusted_root.jsonl', LIMITS['trusted-root']), ('cli', 'gh.exe' if windows_host else 'gh', LIMITS['gh'])]:
         records += [(Path(path), limit, trust[key + '_sha256']) for path in [trust[key], Path(trust['work']) / owned]]
     for path, limit, checksum in records:
-        if bounded_file(path, limit)[0] != checksum:
+        if bounded_file(path, limit, executable=windows_host and path.name.casefold() == 'gh.exe')[0] != checksum:
             raise ValueError('Windows original or owned native evidence changed.')
     return records

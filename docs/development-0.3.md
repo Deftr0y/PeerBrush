@@ -1,5 +1,18 @@
 # PeerBrush v0.3 — development
 
+October 29 setup follow-through (unreleased): a separate disabled fixed-offer
+setup target now connects exact signed local media to fresh registration and
+source-bound installed-identity observation. Its producer requires actual
+source/media/native-origin binding, builds static CRT, verifies native metadata
+and refuses runtime offer injection. A setup-only Windows x64 origin adapter
+preserves the aggregate verifier's Linux-only policy and its exact pinned
+OIDC/workflow/job checks. Identity proof is deliberately not installed acceptance
+or update/website eligibility. No signing, installation, production activation or
+publication follows from source/component checks. Genuine signed qualification,
+the documented prior-attempt/reinstall hold and provider-dependent signing and
+installed/public adapters remain open. Current test evidence belongs on draft PR
+#49; earlier checkpoint totals below do not qualify this batch.
+
 October 28 reconstruction (unreleased): capture dequeue now holds nonblocking root/selected-engine and registry guards through the painted document/revision/target and pending-panel checks. The installed Ubuntu GUI fixture acknowledges its deliberate duplicate-open warning through a bounded visible primary-button detector in the authenticated focused window, retaining its original canvas density, source and history oracles. Numeric legacy tile input rejects the first excess byte before collecting the remainder; compact base64 compatibility remains.
 
 Ordinary native8/16 working Save now renders approximately 128 KiPixel composite strips into a third exclusive owned append-only scratch file, then verifies SHA-256 strip bindings while replaying standard planar channels into the existing spool. ICC, bake and effect paths retain their materialized behavior. The 8192-edge/32MP caps and 256 MiB per-staging-file limit remain: three files can require up to 768 MiB temporary disk, plus destination and retained previous versions. Bounded strip buffers are not a total application RAM guarantee or a speed claim. PB-108 and unrestricted 16000-square PB-068 acceptance remain open.

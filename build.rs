@@ -210,37 +210,47 @@ fn link_windows_version(root: &Path, version: &str) {
         watch(path);
     }
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let script = output.join("peerbrush-version.rc");
-    let resource = output.join("peerbrush-version.res");
-    fs::write(
-        &script,
-        windows_version_resource(version, env::var("DEBUG").as_deref() == Ok("true")).unwrap(),
-    )
-    .unwrap();
-    if resource.exists() {
-        assert!(
-            resource.is_file() && !resource.is_symlink(),
-            "Unexpected prior resource output"
-        );
-        fs::remove_file(&resource).unwrap();
+    let mut binaries = vec!["peerbrush"];
+    if env::var_os("CARGO_FEATURE_WINDOWS_SETUP").is_some() {
+        binaries.push("peerbrush-setup");
     }
-    let status = Command::new(compiler)
-        .args(["/nologo", "/c65001", "/l0x0409", "/fo"])
-        .arg(&resource)
-        .arg(&script)
-        .status()
-        .expect("Windows SDK resource compiler could not start");
-    assert!(
-        status.success(),
-        "Windows version resource compilation failed"
-    );
-    let metadata =
-        fs::symlink_metadata(&resource).expect("Windows resource compiler produced no resource");
-    assert!(
-        metadata.is_file() && metadata.len() > 0 && metadata.len() <= 65536,
-        "Windows resource output is invalid or exceeds its bound"
-    );
-    println!("cargo:rustc-link-arg-bin=peerbrush={}", resource.display());
+    for binary in binaries {
+        let script = output.join(format!("{binary}-version.rc"));
+        let resource = output.join(format!("{binary}-version.res"));
+        let mut source =
+            windows_version_resource(version, env::var("DEBUG").as_deref() == Ok("true")).unwrap();
+        if binary == "peerbrush-setup" {
+            source = source
+                .replace("PeerBrush graphics editor", "PeerBrush installer")
+                .replace("\"peerbrush\\0\"", "\"peerbrush-setup\\0\"")
+                .replace("peerbrush.exe", "peerbrush-setup.exe");
+        }
+        fs::write(&script, source).unwrap();
+        if resource.exists() {
+            assert!(
+                resource.is_file() && !resource.is_symlink(),
+                "Unexpected prior resource output"
+            );
+            fs::remove_file(&resource).unwrap();
+        }
+        let status = Command::new(&compiler)
+            .args(["/nologo", "/c65001", "/l0x0409", "/fo"])
+            .arg(&resource)
+            .arg(&script)
+            .status()
+            .expect("Windows SDK resource compiler could not start");
+        assert!(
+            status.success(),
+            "Windows version resource compilation failed"
+        );
+        let metadata = fs::symlink_metadata(&resource)
+            .expect("Windows resource compiler produced no resource");
+        assert!(
+            metadata.is_file() && metadata.len() > 0 && metadata.len() <= 65536,
+            "Windows resource output is invalid or exceeds its bound"
+        );
+        println!("cargo:rustc-link-arg-bin={binary}={}", resource.display());
+    }
 }
 
 fn main() {

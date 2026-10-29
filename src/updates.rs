@@ -1,5 +1,5 @@
 //! Release discovery and disabled signed update integrations.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, feature = "windows-setup"))]
 pub(crate) mod windows;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -485,4 +485,10 @@ mod tests;
 #[doc(hidden)]
 pub fn windows_main_entry() -> Option<i32> {
     windows::main_entry()
+}
+
+#[cfg(feature = "windows-setup")]
+#[doc(hidden)]
+pub fn windows_setup_entry(embedded: Option<&str>) -> i32 {
+    windows::setup_entry(embedded)
 }

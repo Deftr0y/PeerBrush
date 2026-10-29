@@ -168,6 +168,12 @@ jobs:
       - run: python -B scripts/test_prepare_site_release.py
       - run: python -B scripts/test_readback_site_release.py
       - run: python scripts/build_release.py
+      - name: Verify fixed-offer setup feature component tests
+        run: cargo test --locked --features windows-setup --lib updates::windows::bootstrap
+      - name: Build dormant setup entry without an offer
+        run: python -B scripts/build_release.py --setup-entry
+      - name: Verify fixed-offer setup contracts and read-only runtime
+        run: python -B scripts/test_windows_setup.py
       - run: python -B scripts/test_windows_version.py
       - run: python scripts/test_msix_runtime_tests.py
       - name: Package exact platform with dormant macOS dependency

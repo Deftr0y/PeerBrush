@@ -59,17 +59,24 @@ def _policy(windows, linux=False):
             'PeerBrushMacosNativeOriginV1', 'macos-26', 'Qualify selected final DMG', LIMITS['qualification'])
 
 
-def _command(executable, arguments, work, label):
+def _command(executable, arguments, work, label, *, _windows_host=False):
     """Only fixed built-in CLI commands; capture private output with a size/deadline guard."""
     output, errors = work / (label + '.stdout'), work / (label + '.stderr')
     environment = dict(PATH=os.defpath, HOME=str(work / 'home'), XDG_CACHE_HOME=str(work / 'cache'),
                        GH_CONFIG_DIR=str(work / 'config'), GH_HOST='github.com',
                        GH_PROMPT_DISABLED='1', GH_NO_UPDATE_NOTIFIER='1',
                        GH_NO_EXTENSION_UPDATE_NOTIFIER='1', NO_COLOR='1', LANG='C.UTF-8', TZ='UTC')
+    if _windows_host:
+        environment.update(USERPROFILE=str(work / 'home'), APPDATA=str(work / 'config'),
+                           LOCALAPPDATA=str(work / 'cache'), TEMP=str(work / 'cache'), TMP=str(work / 'cache'))
+        for name in ['SYSTEMROOT', 'WINDIR']:
+            value = next((value for key, value in os.environ.items() if key.upper() == name), None)
+            if value: environment[name] = value
     with output.open('xb') as stdout, errors.open('xb') as stderr:
         try:
             child = subprocess.Popen([str(executable), *arguments], cwd=work, env=environment,
-                                     stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True)
+                                     stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, close_fds=True,
+                                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if _windows_host else 0)
             try:
                 deadline = time.monotonic() + 60
                 while True:
@@ -259,7 +266,7 @@ def _reconcile_job(claims, *, _windows=False, _linux=False):
 
 def authenticate(qualification, *, qualification_sha256, commit, version, bundle, bundle_sha256,
                  trusted_root, trusted_root_sha256, cli, cli_sha256, cli_version,
-                 workflow_commit, run_id, run_attempt, work, source_root, readback_job=False, _windows=False, _linux=False):
+                 workflow_commit, run_id, run_attempt, work, source_root, readback_job=False, _windows=False, _linux=False, _setup_host=False):
     """Explicit reviewed public trust inputs only; never fetch roots/bundles or use auth."""
     _, identity, filename, report_format, origin_format, _, _, qualification_limit = _policy(_windows, _linux)
     selected = [qualification_sha256, bundle_sha256, trusted_root_sha256, cli_sha256]
@@ -274,7 +281,10 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
             or type(run_attempt) is not str or not re.fullmatch('[1-9][0-9]{0,2}', run_attempt)
             or type(readback_job) is not bool):
         raise ValueError('Native attestation requires independently reviewed exact source, verifier, trust and run selections.')
-    if sys.platform != 'linux' or platform.machine().lower() not in {'x86_64', 'amd64'}:
+    if type(_setup_host) is not bool or (_setup_host and (not _windows or _linux)):
+        raise ValueError('Setup host is available only through the fixed Windows adapter.')
+    windows_host = _setup_host and sys.platform == 'win32' and platform.machine().lower() in {'x86_64', 'amd64'}
+    if not windows_host and (sys.platform != 'linux' or platform.machine().lower() not in {'x86_64', 'amd64'}):
         raise ValueError('The prepared native attestation consumer requires Linux x64 aggregate execution.')
     # Confirm the exact artifact being authenticated belongs to the already
     # selected version. The aggregate independently enforces its complete schema.
@@ -289,6 +299,8 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
     except (ValueError, UnicodeError, RecursionError):
         raise ValueError('Native attestation artifact differs from the selected qualification.') from None
     bundle, trusted_root, cli = map(handoff_path, [bundle, trusted_root, cli])
+    if windows_host and cli.name.casefold() != 'gh.exe':
+        raise ValueError('Windows setup origin needs the independently pinned native gh.exe.')
     work = private_inspection_directory(work, source_root, fresh=True)
     if any(work.is_relative_to(path.parent) for path in [bundle, trusted_root, cli]):
         raise ValueError('Native attestation work must be separate from input directories.')
@@ -297,12 +309,15 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
     private_inspection_directory(work, source_root, fresh=False)
     copies = [(bundle, work / 'bundle.jsonl', bundle_sha256, LIMITS['bundle']),
               (trusted_root, work / 'trusted_root.jsonl', trusted_root_sha256, LIMITS['trusted-root']),
-              (cli, work / 'gh', cli_sha256, LIMITS['gh'])]
+              (cli, work / ('gh.exe' if windows_host else 'gh'), cli_sha256, LIMITS['gh'])]
     for source, destination, expected, limit in copies:
-        actual, size = bounded_file(source, limit, destination)
+        actual, size = bounded_file(source, limit, destination, executable=windows_host and source == cli)
         if actual != expected or size == 0:
             raise ValueError('Native attestation input differs from its independently reviewed SHA256.')
-        destination.chmod(0o500 if destination.name == 'gh' else 0o400)
+        destination.chmod(0o500 if destination.name in ['gh', 'gh.exe'] else 0o400)
+    if windows_host:
+        from pe_signing import layout
+        layout((work / 'gh.exe').read_bytes())  # exact pinned x64 PE, never a shell script
     # The pinned CLI consumes a newline-delimited trusted root file. No network
     # fallback or implicit TUF trust is allowed by this consumer.
     if not (work / 'trusted_root.jsonl').read_bytes().endswith(b'\n'):
@@ -313,8 +328,9 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
     artifact.chmod(0o400)
     for name in ['home', 'cache', 'config']:
         (work / name).mkdir(mode=0o700)
-    executable = work / 'gh'
-    version_output = _command(executable, ['--version'], work, 'version')
+    executable = work / ('gh.exe' if windows_host else 'gh')
+    command_options = {'_windows_host': True} if windows_host else {}
+    version_output = _command(executable, ['--version'], work, 'version', **command_options)
     if not re.fullmatch(rb'gh version 2\.102\.0 \([0-9]{4}-[0-9]{2}-[0-9]{2}\)\r?\nhttps://github.com/cli/cli/releases/tag/v2\.102\.0\r?\n?', version_output):
         raise ValueError('Native attestation requires the reviewed GitHub CLI 2.102.0 binary.')
     arguments = ['attestation', 'verify', str(artifact), '--bundle', str(work / 'bundle.jsonl'),
@@ -323,13 +339,14 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
                  '--source-ref', 'refs/heads/main', '--source-digest', commit, '--signer-digest', workflow_commit,
                  '--deny-self-hosted-runners', '--predicate-type', PREDICATE, '--digest-alg', 'sha256',
                  '--format', 'json']
-    verified = _command(executable, arguments, work, 'verification')
+    verified = _command(executable, arguments, work, 'verification', **command_options)
     claims = _verified_claims(verified, commit=commit, qualification_sha256=qualification_sha256,
                               run_id=run_id, run_attempt=run_attempt, _windows=_windows, _linux=_linux)
     service = _reconcile_job(claims, _windows=_windows, _linux=_linux) if readback_job else None
     private_inspection_directory(work, source_root, fresh=False)
     for source, destination, expected, limit in copies:
-        if bounded_file(source, limit)[0] != expected or bounded_file(destination, limit)[0] != expected:
+        is_cli = windows_host and source == cli
+        if bounded_file(source, limit, executable=is_cli)[0] != expected or bounded_file(destination, limit, executable=is_cli)[0] != expected:
             raise ValueError('Native attestation input changed during verification; preserve private work.')
     if bounded_file(artifact, qualification_limit)[0] != qualification_sha256:
         raise ValueError('Native qualification changed during verification.')

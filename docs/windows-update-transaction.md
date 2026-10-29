@@ -14,8 +14,9 @@ App Installer association migration still requires separate qualification.
 before opening settings or state. It distinguishes a verified-local candidate
 from Store, legacy association, development and unknown cases, without exposing
 the association URI. The observation is not signature verification, installed
-acceptance, launch health or an update permit. An approved fresh-install driver
-and genuine signed installation still have to establish those facts.
+acceptance, launch health or an update permit. The separate fixed-offer setup
+driver is implemented but disabled; genuine signed installation still has to
+establish those facts. See [the setup contract](msix.md#fixed-offer-setup-executable-unreleased).
 The ordinary installation-owner classifier uses the same native association
 query: a failed query is Unknown, never successful absence or a direct-package
 claim. Store ownership retains priority without querying the association.

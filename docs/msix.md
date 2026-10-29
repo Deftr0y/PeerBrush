@@ -6,6 +6,78 @@ This is packaging support for the native x64 Windows application. It is separate
 
 The 0.26 candidate uses application version 0.26.0 and maps to MSIX 1.26.0.0. Build all three platforms from one reviewed final source commit with matching embedded source. Preserve earlier tags, artifacts and signing receipts. Before Store submission, verify the actual current Partner Center package version and require a strictly newer candidate; the proposed mapping alone does not establish upgrade eligibility.
 
+## Fixed-offer setup executable (unreleased)
+
+The v0.3 milestone targets application **0.30.0**, not 0.3.0. The separate
+`peerbrush-setup` feature target prepares a normal per-user MSIX installation;
+it is not included in the ordinary portable app ZIP. `INSTALL_ENABLED=false`
+remains a source hold, and current CI builds have no offer. No command-line URL,
+configuration path, runtime environment override or JSON ready flag enables it.
+
+`build_windows_setup.py` constructs its compiled public offer through the actual
+portable/source, signed-executable/MSIX/runtime/descriptor and authenticated
+native-origin consumers. The fixed offer binds complete byte lengths/SHA256,
+publisher and runtime leaves, immutable locations, source commit/version and the
+expected installed executable/source. It rejects a raw offer or self-described
+qualification in place of those consumers. The ordinary build helper refuses an
+inherited `PEERBRUSH_SETUP_OFFER`; only this separate producer supplies its own
+constructed value to its Cargo child. The source remains clean and the setup and
+target package use the same selected source/version, avoiding a package-hash
+dependency on a later source commit.
+
+The native producer selects x64/MSVC and static CRT, checks the PE import table
+for a dynamic CRT prerequisite or unsupported delay imports, verifies installer
+VERSIONINFO and embedded source, and executes only `--setup-info` with isolated
+preferences and bounded output. It retains corresponding source, GPL and
+existing dependency/compiler notices in a fresh private output. This is an
+unsigned dormant build, not a release artifact or a signing/redistribution grant.
+`build_release.py --setup-entry` is only the entry compile/smoke prerequisite; it
+does not perform the standalone CRT qualification.
+
+The dormant native install path asks for consent before creating setup state.
+It pins local directory identities, refuses an existing package-family member,
+downloads the exact selected descriptor/MSIX/runtime, and verifies both signed
+payloads before an exclusive durable intent. Descriptor data is checked but
+never submitted for installation. Only held local MSIX/runtime file URIs reach
+`AddPackageAsync` with `DeploymentOptions::None`. There is no force shutdown,
+developer-mode allowance, unsigned-package allowance, downgrade, automatic
+launch, profile migration, rollback, uninstall or default-editor takeover.
+Cancellation/uncertainty drains the owned operation to observed native terminal
+while retaining the media handles. Late byte/inventory/registration changes hold.
+Windows registration is observed again and the installed executable/source must
+match the independently verified selected payload.
+
+Bounded limit: **any prior setup directory holds**, including an interrupted
+download or a completed install later uninstalled. Automatic retry/reinstall and
+retirement need separate authenticated native qualification; no disk receipt
+authorizes them. Independent before/after package queries are observations,
+not an atomic compare-and-install API. Concurrent external package-manager
+changes remain a native acceptance case. No production installation is enabled.
+The two 512 MiB media caps allow up to 1 GiB retained temporary media, plus the
+setup executable, corresponding source/notices and Windows installation storage.
+
+The setup's `--verify-installed` mode is read-only and binds native registration,
+signature kind, absence of an App Installer association and installed bytes to
+its compiled offer. `verify_installed` accepts only an in-process source-built
+setup object and a fresh bounded subprocess result. The strict typed identity
+proof always retains `installed_acceptance: not-established`, `update_eligible:
+false` and `ready: false`. It is not GUI health or authenticated installed
+acceptance; a website cannot use its true identity flag as availability authority.
+The aggregate origin verifier remains Linux-only. A fixed setup-only adapter can
+also verify on Windows x64 using an independently pinned `gh.exe`/CLI version,
+offline bundle/root and the same exact workflow/OIDC/source/first-attempt/job
+checks. It inherits no authentication tokens and changes no trust settings.
+
+An ignored feature test exposes the same native install path only in a test
+executable. It requires explicit fixture approval, an independently pinned
+canonical offer, clean matching stable source, a fresh private temporary output,
+hosted-runner markers and the native disposable `runneradmin` account. Those
+markers are guards, not provenance. Run it only with separately approved genuine
+signed packages in an authorized disposable hosted Windows profile. Normal CI
+does not run it or change the production hold. Actual installation, launch,
+virtualization, interruption/reinstall, compatible recovery, repeated updates and
+authenticated installed/website eligibility remain unqualified.
+
 ## Installed behavior
 
 - Start menu entry uses the existing PeerBrush logo and application name.

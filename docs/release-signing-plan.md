@@ -75,7 +75,7 @@ Completion: the workflow can prepare and validate a release without publishing i
 ## 5 Select and enroll signing providers
 
 - [ ] Confirm the publisher's registration country and whether the publisher is an individual or a legal organization. Agree on the publisher identity users will see.
-- [ ] Apply to SignPath Foundation for Windows signing. Its free program requires acceptance, verified builds, a public code signing policy, defined roles and manual approval of each release. Its certificate identifies SignPath Foundation as publisher.
+- [ ] Confirm an accepted Windows signing provider and access before relying on it. SignPath Foundation is conditional on acceptance; its free program requires verified builds, a public code signing policy, defined roles and manual approval of each release. Its certificate identifies SignPath Foundation as publisher. Do not assume a subscription includes a certificate or submit/reapply without owner review.
 - [ ] If SignPath is unsuitable or declined, check Azure Artifact Signing eligibility or obtain a quote from a trusted certificate provider with a CI-compatible hardware-backed signing service. Do not assume Azure supports every country or individual publisher.
 - [ ] Enroll in the Apple Developer Program and create a Developer ID Application certificate. Store its private key and notarization credentials securely.
 - [ ] Prepare provider applications and account configuration before submitting them or incurring charges. Record account details privately; publish only required contributor-facing policies.
