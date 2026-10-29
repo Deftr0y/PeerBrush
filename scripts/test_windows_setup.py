@@ -45,6 +45,18 @@ def executable(libraries=('KERNEL32.dll',), *, text='0.2.0', overlay=b''):
 
 
 class SourceAndBytes(unittest.TestCase):
+    def test_native_setup_check_preserves_the_main_cache_and_unfiltered_regression_boundary(self):
+        workflow = (ROOT/'.github/workflows/ci.yml').read_text()
+        save = workflow.index('      - name: Save CI build cache after main compilation')
+        setup_check = workflow.index('      - name: Verify dormant native setup without a VC runtime prerequisite')
+        regression = workflow.index('      - name: Run regression tests and summarize failures')
+        self.assertLess(save, setup_check); self.assertLess(setup_check, regression)
+        block = workflow[setup_check:regression]
+        self.assertIn("        if: runner.os == 'Windows'\n", block)
+        self.assertNotIn('cache-hit', block)
+        self.assertNotIn('continue-on-error', block)
+        self.assertNotIn('always()', block)
+
     def test_failed_cli_reports_only_fixed_public_refusal_codes(self):
         for error, code in [(ValueError('PRIVATE_CANARY/path'), 'UNAVAILABLE'),
                             (ValueError('Setup has invalid imports or requires the runtime it must install'), 'CRT_OR_DLL_IMPORTS')]:
