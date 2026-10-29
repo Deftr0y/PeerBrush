@@ -57,8 +57,13 @@ def failure_code(error):
         'Executable build provenance differs from the clean expected version/commit': 'BUILD_IDENTITY',
         'Executable contains a credential marker or personal build path; rebuild with path remapping and review before packaging': 'BINARY_PRIVACY',
         'Setup info differs from its source/offer/disabled gate or wrote state': 'INFO_BINDING',
+        'Setup info differs from its exact source/offer/disabled gate': 'INFO_SOURCE_IDENTITY',
+        'Setup info wrote unexpected state': 'INFO_STATE_WRITE',
         'Native attestation cryptographic verification failed.': 'INFO_PROCESS',
         'Native attestation verifier could not complete.': 'INFO_UNAVAILABLE',
+        'Native MSIX verification did not complete without warnings.': 'INFO_PROCESS',
+        'Native MSIX verification could not complete.': 'INFO_UNAVAILABLE',
+        'Native MSIX verification exceeded its output or time budget.': 'INFO_BUDGET',
     }.get(str(error), 'UNAVAILABLE')
 
 
@@ -380,8 +385,10 @@ def build(root, work, output, *, commit, prepared=None, offline=False, jobs=None
     expected = dict(schema=1, format='PeerBrushWindowsSetupInfoV1', build=build_info,
         offer_sha256=hashlib.sha256(prepared.data).hexdigest() if prepared else None,
         installation_enabled=False, installed_acceptance='not-established', update_eligible=False, ready=False)
-    if encode(info) != encode(expected) or {p.name for p in work.iterdir()} != before | {'setup-info.stdout', 'setup-info.stderr'}:
-        raise ValueError('Setup info differs from its source/offer/disabled gate or wrote state')
+    if encode(info) != encode(expected):
+        raise ValueError('Setup info differs from its exact source/offer/disabled gate')
+    if {p.name for p in work.iterdir()} != before | {'setup-info.stdout'}:
+        raise ValueError('Setup info wrote unexpected state')
     final.signed._source(root, commit)
     if bounded_file(binary, LIMIT, executable=True) != (checksum, size): raise ValueError('Built setup changed after observation')
     if prepared is not None: prepared.verify()

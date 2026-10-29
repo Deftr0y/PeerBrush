@@ -45,6 +45,24 @@ def executable(libraries=('KERNEL32.dll',), *, text='0.2.0', overlay=b''):
 
 
 class SourceAndBytes(unittest.TestCase):
+    def test_actual_setup_command_adapter_retains_only_stdout_and_discards_private_stderr(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-setup-command-') as temporary:
+            work = Path(temporary).resolve()
+            observed = {}
+            class Child:
+                def __init__(self, command, **options):
+                    observed.update(options)
+                    options['stdout'].write(b'exact setup response')
+                def poll(self): return 0
+            with mock.patch.dict(os.environ, {'GH_TOKEN':'PRIVATE_CANARY','GITHUB_TOKEN':'PRIVATE_CANARY'}), \
+                    mock.patch.object(setup.final.signed.subprocess, 'Popen', Child):
+                response = setup.final.signed._command(Path('never-launched.exe'), ['--setup-info'], work, 'setup-info')
+            self.assertEqual(response, b'exact setup response')
+            self.assertEqual({p.name for p in work.iterdir()}, {'setup-info.stdout'})
+            self.assertEqual(observed['stderr'], subprocess.DEVNULL)
+            self.assertNotIn('GH_TOKEN', observed['env']); self.assertNotIn('GITHUB_TOKEN', observed['env'])
+            self.assertEqual(observed['env']['USERPROFILE'], str(work))
+
     def test_cargo_snapshot_refuses_late_source_changes_and_retains_both_files(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-setup-cargo-fault-') as temporary:
             work = Path(temporary).resolve()
@@ -245,7 +263,6 @@ class BoundOffer(unittest.TestCase):
                 installed_acceptance='not-established', update_eligible=False, ready=False)
             raw = setup.encode(value)
             (directory/(label+'.stdout')).write_bytes(raw)
-            (directory/(label+'.stderr')).write_bytes(b'')
             return raw
         with mock.patch.object(setup.sys, 'platform', 'win32'), \
                 mock.patch.object(setup.jxl_build, 'configure', side_effect=lambda env:(env, {})), \
