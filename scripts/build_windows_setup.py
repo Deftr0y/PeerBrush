@@ -23,7 +23,7 @@ import jxl_build
 import package as packaging
 import pe_signing
 import windows_version
-from package_macos_dmg import bounded_file, private_inspection_directory
+from package_macos_dmg import bounded_file, inspection_path, private_inspection_directory
 from qualify_windows_installer import read_selection
 from verify_release import inspect_archive
 
@@ -43,6 +43,13 @@ def failure_code(error):
         'DMG inspection input changed during its bounded read': 'OUTPUT_CHANGED',
         'Setup delay imports require a separately reviewed loader contract': 'DELAY_IMPORTS',
         'Setup has invalid imports or requires the runtime it must install': 'CRT_OR_DLL_IMPORTS',
+        'Setup has invalid import names or descriptor count': 'INVALID_DLL_IMPORTS',
+        'Setup requires an external CRT runtime': 'CRT_RUNTIME',
+        'Setup requires the VCRUNTIME DLL family': 'CRT_VCRUNTIME',
+        'Setup requires the MSVC C++ DLL family': 'CRT_MSVC_CXX',
+        'Setup requires the MSVC C DLL family': 'CRT_MSVC_C',
+        'Setup requires the concurrency CRT DLL family': 'CRT_CONCURRENCY',
+        'Setup requires the Universal CRT DLL family': 'CRT_UCRT',
         'Missing bounded setup import table': 'IMPORT_TABLE',
         'Setup import range is unmapped or ambiguous': 'IMPORT_RANGE',
         'Setup import descriptors are not terminated within their bound': 'IMPORT_TERMINATION',
@@ -71,7 +78,7 @@ def cargo_snapshot(work):
     Admit at most those two exact owned aliases, copy exclusively, and use only
     the checked single-link snapshot for all later byte/native verification.
     """
-    directory = work/'target/x86_64-pc-windows-msvc/release'
+    directory = inspection_path(work/'target/x86_64-pc-windows-msvc/release')
     source = packaging.regular_file(directory, 'peerbrush-setup.exe')
     before = source.lstat()
     if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= LIMIT or before.st_nlink not in [1, 2]:
@@ -93,7 +100,7 @@ def cargo_snapshot(work):
                 aliases.append((alias, state(metadata)))
         if len(aliases) != 1 or identity(aliases[0][0].lstat()) != identity(before):
             raise ValueError('Cargo setup output has unsupported identity or link inventory')
-    snapshot = work/'peerbrush-setup.exe'
+    snapshot = inspection_path(work/'peerbrush-setup.exe')
     checksum, total = hashlib.sha256(), 0
     flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
     with os.fdopen(os.open(source, flags), 'rb') as stream:
@@ -110,6 +117,7 @@ def cargo_snapshot(work):
                 or state(source.lstat()) != state(before)
                 or any(state(path.lstat()) != original for path, original in aliases)):
             raise ValueError('Cargo setup output changed during snapshot')
+    inspection_path(directory)
     if bounded_file(snapshot, LIMIT, executable=True) != (checksum.hexdigest(), total):
         raise ValueError('Owned Cargo setup snapshot changed')
     return snapshot
@@ -238,7 +246,7 @@ def imported_libraries(data):
         if not any(entry):
             if not names:
                 raise ValueError('Setup must have an ordinary import table')
-            return sorted(names)
+            return sorted(set(names))
         name, end = mapped(entry[3], 1)
         raw = data[name:min(end, name + 256)]
         if b'\0' not in raw:
@@ -247,9 +255,18 @@ def imported_libraries(data):
             value = raw.split(b'\0', 1)[0].decode('ascii').lower()
         except UnicodeError:
             raise ValueError('Setup library name is not ASCII') from None
-        if (not re.fullmatch(r'[a-z0-9_.-]+\.dll', value) or value in names or len(names) >= 128
-                or re.match(r'(?:vcruntime|msvcp|msvcr|concrt|ucrtbase|api-ms-win-crt|ext-ms-win-crt)', value)):
-            raise ValueError('Setup has invalid imports or requires the runtime it must install')
+        if not re.fullmatch(r'[a-z0-9_.-]+\.dll', value) or len(names) >= 128:
+            raise ValueError('Setup has invalid import names or descriptor count')
+        # The native linker can emit separate case variants of one DLL. Check
+        # every descriptor and retain the descriptor cap; only the report is a
+        # case-independent module set. A repeated name must never hide a CRT.
+        for pattern, message in [
+                (r'vcruntime', 'Setup requires the VCRUNTIME DLL family'),
+                (r'msvcp', 'Setup requires the MSVC C++ DLL family'),
+                (r'msvcr', 'Setup requires the MSVC C DLL family'),
+                (r'concrt', 'Setup requires the concurrency CRT DLL family'),
+                (r'(?:ucrtbase|api-ms-win-crt|ext-ms-win-crt)', 'Setup requires the Universal CRT DLL family')]:
+            if re.match(pattern, value): raise ValueError(message)
         names.append(value)
     raise ValueError('Setup import descriptors are not terminated within their bound')
 

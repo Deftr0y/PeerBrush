@@ -91,6 +91,7 @@ class SourceAndBytes(unittest.TestCase):
 
     def test_failed_cli_reports_only_fixed_public_refusal_codes(self):
         for error, code in [(ValueError('PRIVATE_CANARY/path'), 'UNAVAILABLE'),
+                            (ValueError('Setup requires an external CRT runtime'), 'CRT_RUNTIME'),
                             (ValueError('Setup has invalid imports or requires the runtime it must install'), 'CRT_OR_DLL_IMPORTS')]:
             output = io.StringIO()
             with mock.patch.object(sys, 'argv', ['setup', '--source-root', '.', '--commit', 'a'*40,
@@ -132,8 +133,13 @@ class SourceAndBytes(unittest.TestCase):
         for name in ['VCRUNTIME140.dll', 'ucrtbase.dll', 'MSVCP140.dll', 'api-ms-win-crt-heap-l1-1-0.dll',
                      'ext-ms-win-crt-runtime-l1-1-0.dll', 'foreign/path.dll']:
             with self.subTest(library=name), self.assertRaises(ValueError): setup.imported_libraries(executable((name,)))
-        for libraries in [(), ('kernel32.dll', 'KERNEL32.dll')]:
-            with self.assertRaises(ValueError): setup.imported_libraries(executable(libraries))
+        with self.assertRaises(ValueError): setup.imported_libraries(executable(()))
+        self.assertEqual(setup.imported_libraries(executable(('kernel32.dll', 'KERNEL32.dll'))), ['kernel32.dll'])
+        self.assertEqual(setup.imported_libraries(executable(('kernel32.dll',)*128)), ['kernel32.dll'])
+        with self.assertRaises(ValueError): setup.imported_libraries(executable(('kernel32.dll',)*129))
+        for name in ['VCRUNTIME140.dll','ucrtbase.dll','MSVCP140.dll','MSVCR120.dll']:
+            with self.subTest(hidden_runtime=name), self.assertRaises(ValueError):
+                setup.imported_libraries(executable(('kernel32.dll','KERNEL32.dll',name)))
         for offset, values in [(272, (0xfffffff0, 40)), (272, (0x3000, 20)), (368, (0x3000, 32))]:
             changed = bytearray(data); struct.pack_into('<II', changed, offset, *values)
             with self.assertRaises(ValueError): setup.imported_libraries(bytes(changed))

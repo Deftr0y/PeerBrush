@@ -34,6 +34,13 @@ VERSIONINFO and embedded source, and executes only `--setup-info` with isolated
 preferences and bounded output. It retains corresponding source, GPL and
 existing dependency/compiler notices in a fresh private output. This is an
 unsigned dormant build, not a release artifact or a signing/redistribution grant.
+
+Every import descriptor remains bounded and checked, including repeated DLL
+names; the report collapses case variants into one module name. Native linking
+can emit those variants, and Windows compares module names without case. This
+does not exempt any descriptor from CRT refusal or the 128-descriptor bound.
+See the [PE import layout](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-idata-section)
+and [module-name comparison](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlew).
 `build_release.py --setup-entry` is only the entry compile/smoke prerequisite; it
 does not perform the standalone CRT qualification.
 
