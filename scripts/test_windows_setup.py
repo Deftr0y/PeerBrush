@@ -57,6 +57,8 @@ class SourceAndBytes(unittest.TestCase):
                     mock.patch.object(shared.subprocess,'Popen',Child), \
                     mock.patch.object(shared.subprocess,'CREATE_NO_WINDOW',0x08000000,create=True):
                 self.assertEqual(shared._command(Path('gh.exe'),['--version'],root,'windows',_windows_host=True),b'bounded verifier response')
+            self.assertEqual({p.name for p in root.iterdir()}, {'home','cache','config','windows.stdout','windows.stderr'})
+            self.assertEqual((root/'windows.stderr').read_bytes(), b'')
             environment = observed['env']
             self.assertNotIn('GH_TOKEN',environment); self.assertNotIn('GITHUB_TOKEN',environment)
             self.assertNotIn('PRIVATE_CANARY',json.dumps(environment))
@@ -179,6 +181,7 @@ class BoundOffer(unittest.TestCase):
                 installed_acceptance='not-established', update_eligible=False, ready=False)
             raw = setup.encode(value)
             (directory/(label+'.stdout')).write_bytes(raw)
+            (directory/(label+'.stderr')).write_bytes(b'')
             return raw
         with mock.patch.object(setup.sys, 'platform', 'win32'), \
                 mock.patch.object(setup.jxl_build, 'configure', side_effect=lambda env:(env, {})), \

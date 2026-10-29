@@ -281,7 +281,7 @@ def build(root, work, output, *, commit, prepared=None, offline=False, jobs=None
     expected = dict(schema=1, format='PeerBrushWindowsSetupInfoV1', build=build_info,
         offer_sha256=hashlib.sha256(prepared.data).hexdigest() if prepared else None,
         installation_enabled=False, installed_acceptance='not-established', update_eligible=False, ready=False)
-    if encode(info) != encode(expected) or {p.name for p in work.iterdir()} != before | {'setup-info.stdout'}:
+    if encode(info) != encode(expected) or {p.name for p in work.iterdir()} != before | {'setup-info.stdout', 'setup-info.stderr'}:
         raise ValueError('Setup info differs from its source/offer/disabled gate or wrote state')
     final.signed._source(root, commit)
     if bounded_file(binary, LIMIT, executable=True) != (checksum, size): raise ValueError('Built setup changed after observation')
