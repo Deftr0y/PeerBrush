@@ -17,7 +17,8 @@ import prepare_appinstaller as installer
 import production_readiness as readiness
 import qualify_signed_msix as signed
 
-FORMAT = 'PeerBrushFinalReleaseV1'
+FORMAT = 'PeerBrushFinalReleaseV2'
+LEGACY_FORMAT = 'PeerBrushFinalReleaseV1'
 MANIFEST = 'final-release-inventory.json'
 LIMIT = 512 * 1024 * 1024
 _CONSTRUCTED = object()
@@ -67,10 +68,25 @@ def observe_store(store, journal):
     return store_channel(reconcile(store, journal))
 
 
+def _windows_files(value):
+    entry = value['channels']['windows-direct']
+    if value['format'] == LEGACY_FORMAT:
+        return dict(package=entry['dependencies'][0], runtime=entry['dependencies'][1],
+                    descriptor=entry['file'], stable_descriptor=installer.STABLE_DESCRIPTOR)
+    return dict(package=entry['file'], runtime=entry['dependencies'][0],
+                descriptor=entry['discovery']['versioned'], stable_descriptor=entry['discovery']['stable'])
+
+
+def windows_files(value):
+    """Validated file roles only; these grant no installation or native authority."""
+    validate_manifest(value)
+    return _windows_files(value)
+
+
 def validate_manifest(value):
     fields = {'schema', 'format', 'version', 'commit', 'base_inventory', 'channels', 'files'}
     if (not isinstance(value, dict) or set(value) != fields or type(value['schema']) is not int
-            or value['schema'] != 1 or value['format'] != FORMAT
+            or (value['schema'], value['format']) not in [(1, LEGACY_FORMAT), (2, FORMAT)]
             or type(value['commit']) is not str or not re.fullmatch('[0-9a-f]{40}', value['commit'])
             or type(value['version']) is not str
             or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', value['version'])):
@@ -95,34 +111,49 @@ def validate_manifest(value):
     channels = value['channels']
     if not isinstance(channels, dict) or set(channels) != {'windows-direct', 'macos-direct', 'linux-direct', 'microsoft-store'}:
         raise ValueError('Each distribution needs its explicit reviewed channel adapter.')
-    expected_platform = {'windows-direct': ('Windows', '.appinstaller'), 'macos-direct': ('macOS', '.dmg'),
+    legacy = value['format'] == LEGACY_FORMAT
+    expected_platform = {'windows-direct': ('Windows', '.appinstaller' if legacy else '.msix'), 'macos-direct': ('macOS', '.dmg'),
                          'linux-direct': ('Linux', '.deb')}
     for channel, (platform, suffix) in expected_platform.items():
         entry = channels[channel]
-        if (not isinstance(entry, dict) or set(entry) != {'platform', 'file', 'dependencies', 'installed_acceptance', 'ready'}
-                or entry['platform'] != platform or entry['file'] not in records or not entry['file'].endswith(suffix)
+        fields = {'platform', 'file', 'dependencies', 'installed_acceptance', 'ready'}
+        if channel == 'windows-direct' and not legacy:
+            fields |= {'discovery', 'update_route'}
+        if (not isinstance(entry, dict) or set(entry) != fields
+                or entry['platform'] != platform or type(entry['file']) is not str
+                or entry['file'] not in records or not entry['file'].endswith(suffix)
                 or entry['installed_acceptance'] != 'unverified' or entry['ready'] is not False
                 or not isinstance(entry['dependencies'], list)
-                or len(entry['dependencies']) != (2 if channel == 'windows-direct' else 0)
+                or len(entry['dependencies']) != ((2 if legacy else 1) if channel == 'windows-direct' else 0)
                 or any(type(name) is not str or name not in records for name in entry['dependencies'])
                 or len(set(entry['dependencies'])) != len(entry['dependencies'])):
             raise ValueError('Final channel binding or explicit unverified installed state differs.')
     if channels['microsoft-store'] != store_channel():
         raise ValueError('Store submission remains disabled; a manifest cannot assert public availability.')
     windows = channels['windows-direct']
+    if not legacy:
+        discovery = windows['discovery']
+        if (windows['update_route'] != 'verified-local' or not isinstance(discovery, dict)
+                or set(discovery) != {'versioned', 'stable'}
+                or any(type(name) is not str for name in discovery.values())
+                or discovery['stable'] != installer.STABLE_DESCRIPTOR):
+            raise ValueError('Windows discovery is metadata only for the verified-local route.')
+    selected = _windows_files(value)
     target = msix.package_version(value['version'])
-    if (windows['file'] != f'PeerBrush-{target}-Windows-x64.appinstaller'
-            or not re.fullmatch(f'PeerBrush-{re.escape(target)}-Windows-x64-signed-r[1-9][0-9]*\\.msix', windows['dependencies'][0])
-            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,126}\.(?:appx|msix)', windows['dependencies'][1])):
+    if (selected['descriptor'] != f'PeerBrush-{target}-Windows-x64.appinstaller'
+            or not re.fullmatch(f'PeerBrush-{re.escape(target)}-Windows-x64-signed-r[1-9][0-9]*\\.msix', selected['package'])
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,126}\.(?:appx|msix)', selected['runtime'])
+            or len(set(selected.values())) != 4):
         raise ValueError('Final Windows channel must bind its exact signed package and framework.')
     stable = records.get(installer.STABLE_DESCRIPTOR)
-    if stable is None or any(stable[key] != records[windows['file']][key] for key in ['bytes', 'sha256']):
+    descriptor = records.get(selected['descriptor'])
+    if stable is None or descriptor is None or any(stable[key] != descriptor[key] for key in ['bytes', 'sha256']):
         raise ValueError('Stable discovery must contain the exact immutable Windows descriptor bytes.')
     dmg = channels['macos-direct']['file']
     deb = channels['linux-direct']['file']
     if dmg not in base or deb not in base:
         raise ValueError('Selected Mac/Linux channels differ from the inspected base assets.')
-    expected = set(base) | {windows['file'], installer.STABLE_DESCRIPTOR, *windows['dependencies'], dmg + '.qualification.json',
+    expected = set(base) | {*selected.values(), dmg + '.qualification.json',
                             dmg + '.sha256', deb + '.json', deb + '.sha256'}
     if set(records) != expected:
         raise ValueError('Final release permits only exact selected assets and reviewed public sidecars.')
@@ -211,8 +242,9 @@ def windows_binding(root, base, directory, selection):
         selection['descriptor_uri'], selection['package_uri'], selection['runtime_uri'])
     if read(descriptor, 16 * 1024) != expected_descriptor:
         raise ValueError('Final App Installer differs from the exact shared descriptor serializer.')
-    channel = dict(platform='Windows', file=descriptor.name,
-        dependencies=[package.name, runtime.name], installed_acceptance='unverified', ready=False)
+    channel = dict(platform='Windows', file=package.name, dependencies=[runtime.name],
+        discovery=dict(versioned=descriptor.name, stable=installer.STABLE_DESCRIPTOR),
+        update_route='verified-local', installed_acceptance='unverified', ready=False)
     originals = [
         (path, limit, selection[key + '_sha256']) for key, path, limit in [
             ('unsigned', unsigned, LIMIT), ('package', package, LIMIT), ('runtime', runtime, LIMIT),
@@ -292,7 +324,7 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
     if any(record['sha256'] != expected_hashes[record['file']] for record in records):
         raise ValueError('Final input changed between validation and composition.')
     records += [dict(file=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest()) for name, data in sidecars.items()]
-    manifest = dict(schema=1, format=FORMAT, version=version, commit=commit, base_inventory=inventory,
+    manifest = dict(schema=2, format=FORMAT, version=version, commit=commit, base_inventory=inventory,
         files=sorted(records, key=lambda r: r['file']), channels={
             'windows-direct': windows_channel,
             'macos-direct': dict(platform='macOS', file=dmg['file'], dependencies=[], installed_acceptance='unverified', ready=False),

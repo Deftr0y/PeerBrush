@@ -88,6 +88,7 @@ class Service:
 
 
 class Transactions(unittest.TestCase):
+    legacy = False
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='peerbrush-publish-mechanics-')
         self.addCleanup(temporary.cleanup)
@@ -119,10 +120,14 @@ class Transactions(unittest.TestCase):
         (self.directory / alias).write_bytes(data)
         files.append(dict(file=alias, bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
         channel = lambda platform, name, dependencies: dict(platform=platform, file=name, dependencies=dependencies, installed_acceptance='unverified', ready=False)
-        self.manifest = dict(schema=1, format=final.FORMAT, version=version, commit=commit,
+        windows = channel('Windows', package, [runtime])
+        windows.update(discovery=dict(versioned=descriptor, stable=alias), update_route='verified-local')
+        if self.legacy:
+            windows = channel('Windows', descriptor, [package, runtime])
+        self.manifest = dict(schema=1 if self.legacy else 2, format=final.LEGACY_FORMAT if self.legacy else final.FORMAT, version=version, commit=commit,
             base_inventory=dict(schema=1, version=version, commit=commit, binary_source_commit=commit, packaging_correction=None, assets=base),
             files=sorted(files, key=lambda r:r['file']), channels={
-                'windows-direct':channel('Windows', descriptor, [package, runtime]),
+                'windows-direct':windows,
                 'macos-direct':channel('macOS', names[5], []), 'linux-direct':channel('Linux', names[4], []),
                 'microsoft-store':final.store_channel()})
         (self.directory / final.MANIFEST).write_bytes(final.encode(self.manifest))
@@ -424,6 +429,11 @@ class Transactions(unittest.TestCase):
                     if name == 'existing-notes': self.assertEqual(notes.read_bytes(), b'Preserve previous public review input')
                     else: self.assertFalse(notes.exists())
                 self.assertNotIn('PEERBRUSH_PRODUCTION_APPROVED', environment.read_text(encoding='utf-8'))
+
+
+class LegacyTransactions(Transactions):
+    """Retained V1 bytes have the same immutable readback/retry protections."""
+    legacy = True
 
 
 if __name__ == '__main__':

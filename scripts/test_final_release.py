@@ -314,11 +314,48 @@ class Composition(unittest.TestCase):
             if change == 'source': selected['commit'] = '0' * 40
             elif change == 'bytes': selected['files'][0]['sha256'] = '0' * 64
             elif change == 'missing': selected['files'].pop()
-            elif change == 'channel': selected['channels']['windows-direct']['dependencies'].reverse()
+            elif change == 'channel':
+                selected['channels']['windows-direct']['file'], selected['channels']['windows-direct']['dependencies'][0] = (
+                    selected['channels']['windows-direct']['dependencies'][0], selected['channels']['windows-direct']['file'])
             elif change == 'ready': selected['channels']['windows-direct']['ready'] = True
             else: selected['channels']['microsoft-store']['ready'] = True
             with self.subTest(change=change), self.assertRaises(ValueError):
                 final.immutable(manifest, selected)
+
+    def test_verified_local_msix_entrypoint_keeps_discovery_separate_and_legacy_readback_strict(self):
+        manifest = self.compose().manifest
+        entry = manifest['channels']['windows-direct']
+        self.assertEqual((manifest['schema'], manifest['format']), (2, final.FORMAT))
+        self.assertEqual(entry['file'], self.package.name)
+        self.assertEqual(entry['dependencies'], [self.runtime.name])
+        self.assertEqual(entry['discovery'], dict(versioned=self.descriptor.name, stable=final.installer.STABLE_DESCRIPTOR))
+        self.assertEqual(entry['update_route'], 'verified-local')
+        self.assertFalse(entry['ready'])
+        legacy = copy.deepcopy(manifest)
+        legacy.update(schema=1, format=final.LEGACY_FORMAT)
+        legacy['channels']['windows-direct'] = dict(platform='Windows', file=self.descriptor.name,
+            dependencies=[self.package.name, self.runtime.name], installed_acceptance='unverified', ready=False)
+        self.assertEqual(final.validate_manifest(legacy), final.validate_manifest(manifest))
+        self.assertEqual(final.windows_files(legacy), final.windows_files(manifest))
+        with self.assertRaisesRegex(ValueError, 'immutable'):
+            final.immutable(legacy, manifest)
+        for change in ['old-schema', 'route', 'discovery-install', 'unknown-discovery', 'wrong-stable',
+                       'runtime-entrypoint', 'duplicate-role', 'ready']:
+            selected = copy.deepcopy(manifest)
+            current = selected['channels']['windows-direct']
+            if change == 'old-schema': selected['schema'] = 1
+            elif change == 'route': current['update_route'] = 'appinstaller'
+            elif change == 'discovery-install': current['file'] = self.descriptor.name
+            elif change == 'unknown-discovery': current['discovery']['install'] = self.package.name
+            elif change == 'wrong-stable': current['discovery']['stable'] = self.descriptor.name
+            elif change == 'runtime-entrypoint': current['file'] = self.runtime.name
+            elif change == 'duplicate-role': current['dependencies'] = [self.package.name]
+            else: current['ready'] = True
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                final.validate_manifest(selected)
+        legacy['channels']['windows-direct']['update_route'] = 'verified-local'
+        with self.assertRaises(ValueError):
+            final.validate_manifest(legacy)
 
     def test_real_public_site_adapter_reads_all_final_bytes_but_never_selects_unverified_installer_or_store(self):
         import prepare_site_release as website
@@ -337,7 +374,7 @@ class Composition(unittest.TestCase):
             service.public_get, maintainer=test_deb.MAINTAINER)
         self.assertEqual((selected_entry, selected_excluded), (entry, excluded))
         self.assertEqual(entry['platforms'], [], 'Committed Store/DMG/DEB policy cannot be widened by final metadata')
-        direct = next(r for r in excluded if r['file'] == self.descriptor.name)
+        direct = next(r for r in excluded if r.get('file') == self.package.name)
         self.assertTrue(direct['asset_binding_verified'])
         self.assertFalse(direct['ready'] or direct['production_ready'] or direct['content_verified'])
         self.assertEqual(direct['installed_acceptance'], 'unverified')

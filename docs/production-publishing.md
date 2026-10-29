@@ -1,5 +1,16 @@
 # Production composition and immutable publication (unreleased)
 
+The current composer emits `PeerBrushFinalReleaseV2`. Its Windows install file is
+the exact signed MSIX, with the explicit runtime as its dependency and
+`update_route: verified-local`. The versioned and stable `.appinstaller` files
+are separate discovery metadata, never the installation entry point. Their
+canonical bytes, hashes, identities and public readback remain required. The
+strict V1 reader retains its original descriptor entry point for historical
+readback only; it cannot be silently rewritten into V2 for an existing version.
+Both layouts retain false readiness and unverified installed acceptance. This
+alignment does not supply a verified fresh-install bootstrapper, trusted signing,
+native installed evidence or a selectable website download.
+
 PB-154 now has a prepared final-byte composition and immutable GitHub transaction. It remains disabled. Current native signing and installed-acceptance producer work is incomplete; configuration or a supplied readiness report cannot make this source production-ready. No release, Store submission, website deployment, environment or credential change is performed by developing these scripts.
 
 ## Final inputs and trust boundaries
