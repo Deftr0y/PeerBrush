@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import struct
 import subprocess
 import sys
@@ -35,6 +36,9 @@ def failure_code(error):
     # Fixed public diagnostics only: exceptions may otherwise contain private
     # paths, native provider output or credentials. Never echo arbitrary text.
     return {
+        'Cargo setup output has unsupported identity or link inventory': 'CARGO_OUTPUT_LAYOUT',
+        'Cargo setup output changed during snapshot': 'CARGO_OUTPUT_CHANGED',
+        'Owned Cargo setup snapshot changed': 'CARGO_SNAPSHOT_CHANGED',
         'DMG inspection input is not an unchanged bounded regular file': 'OUTPUT_IDENTITY',
         'DMG inspection input changed during its bounded read': 'OUTPUT_CHANGED',
         'Setup delay imports require a separately reviewed loader contract': 'DELAY_IMPORTS',
@@ -57,6 +61,58 @@ def encode(value):
 
 def measure(data):
     return dict(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+
+
+def cargo_snapshot(work):
+    """Re-own this fresh Cargo producer's known output aliases, not selected media.
+
+    Cargo can hardlink the public executable to its deps executable. The
+    unchanged native-input guard intentionally accepts only single-link files.
+    Admit at most those two exact owned aliases, copy exclusively, and use only
+    the checked single-link snapshot for all later byte/native verification.
+    """
+    directory = work/'target/x86_64-pc-windows-msvc/release'
+    source = packaging.regular_file(directory, 'peerbrush-setup.exe')
+    before = source.lstat()
+    if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= LIMIT or before.st_nlink not in [1, 2]:
+        raise ValueError('Cargo setup output has unsupported identity or link inventory')
+    def identity(info):
+        mode = stat.S_IFMT(info.st_mode) | (stat.S_IMODE(info.st_mode) & 0o666) if os.name == 'nt' else info.st_mode
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, mode,
+                info.st_nlink, getattr(info, 'st_birthtime_ns', None))
+    def state(info):
+        return identity(info), info.st_mode, info.st_ctime_ns
+    aliases = []
+    if before.st_nlink == 2:
+        for index, path in enumerate((directory/'deps').glob('peerbrush_setup*.exe')):
+            if index >= 8 or not re.fullmatch(r'peerbrush_setup(?:-[0-9a-f]{16})?\.exe', path.name):
+                raise ValueError('Cargo setup output has unsupported identity or link inventory')
+            alias = packaging.regular_file(directory, 'deps/'+path.name)
+            metadata = alias.lstat()
+            if (metadata.st_dev, metadata.st_ino) == (before.st_dev, before.st_ino):
+                aliases.append((alias, state(metadata)))
+        if len(aliases) != 1 or identity(aliases[0][0].lstat()) != identity(before):
+            raise ValueError('Cargo setup output has unsupported identity or link inventory')
+    snapshot = work/'peerbrush-setup.exe'
+    checksum, total = hashlib.sha256(), 0
+    flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    with os.fdopen(os.open(source, flags), 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if identity(opened) != identity(before) or (os.name == 'nt' and not opened.st_ino):
+            raise ValueError('Cargo setup output changed during snapshot')
+        with snapshot.open('xb') as output:
+            while chunk := stream.read(min(64*1024, LIMIT + 1 - total)):
+                total += len(chunk)
+                if total > LIMIT: raise ValueError('Cargo setup output changed during snapshot')
+                checksum.update(chunk); output.write(chunk)
+            output.flush(); os.fsync(output.fileno())
+        if (total != before.st_size or state(os.fstat(stream.fileno())) != state(opened)
+                or state(source.lstat()) != state(before)
+                or any(state(path.lstat()) != original for path, original in aliases)):
+            raise ValueError('Cargo setup output changed during snapshot')
+    if bounded_file(snapshot, LIMIT, executable=True) != (checksum.hexdigest(), total):
+        raise ValueError('Owned Cargo setup snapshot changed')
+    return snapshot
 
 
 class PreparedOffer:
@@ -286,7 +342,7 @@ def build(root, work, output, *, commit, prepared=None, offline=False, jobs=None
         command += ['--jobs', str(jobs)]
     subprocess.run(command, cwd=root, env=environment, check=True)
     print('Setup verification: owned native output', flush=True)
-    binary = packaging.regular_file(work / 'target/x86_64-pc-windows-msvc/release', 'peerbrush-setup.exe')
+    binary = cargo_snapshot(work)
     checksum, size = bounded_file(binary, LIMIT, executable=True)
     data = binary.read_bytes()
     if len(data) != size or hashlib.sha256(data).hexdigest() != checksum: raise ValueError('Built setup changed')

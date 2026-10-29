@@ -45,6 +45,38 @@ def executable(libraries=('KERNEL32.dll',), *, text='0.2.0', overlay=b''):
 
 
 class SourceAndBytes(unittest.TestCase):
+    def test_cargo_snapshot_refuses_late_source_changes_and_retains_both_files(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-setup-cargo-fault-') as temporary:
+            work = Path(temporary).resolve()
+            source = work/'target/x86_64-pc-windows-msvc/release/peerbrush-setup.exe'
+            source.parent.mkdir(parents=True); original = executable(); source.write_bytes(original)
+            with mock.patch.object(setup.os, 'fsync', side_effect=lambda _:source.write_bytes(b'foreign late output')):
+                with self.assertRaisesRegex(ValueError, 'changed during snapshot'): setup.cargo_snapshot(work)
+            self.assertEqual(source.read_bytes(), b'foreign late output')
+            self.assertEqual((work/'peerbrush-setup.exe').read_bytes(), original)
+
+    def test_actual_cargo_aliases_get_an_exclusive_snapshot_without_relaxing_native_input_guards(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-setup-cargo-') as temporary:
+            work = Path(temporary).resolve()
+            directory = work/'target/x86_64-pc-windows-msvc/release'
+            (directory/'deps').mkdir(parents=True)
+            source = directory/'peerbrush-setup.exe'; source.write_bytes(executable())
+            alias = directory/'deps/peerbrush_setup.exe'
+            os.link(source, alias)
+            self.assertEqual(source.stat().st_nlink, 2)
+            with self.assertRaises(ValueError): setup.bounded_file(source, setup.LIMIT, executable=True)
+            snapshot = setup.cargo_snapshot(work)
+            self.assertEqual(snapshot.read_bytes(), source.read_bytes())
+            self.assertEqual(snapshot.stat().st_nlink, 1)
+            self.assertEqual(source.stat().st_nlink, 2)
+            setup.bounded_file(snapshot, setup.LIMIT, executable=True)
+            snapshot.write_bytes(b'foreign replacement')
+            with self.assertRaises(FileExistsError): setup.cargo_snapshot(work)
+            self.assertEqual(snapshot.read_bytes(), b'foreign replacement')
+            alias.rename(directory/'unexpected.exe')
+            with self.assertRaises(ValueError): setup.cargo_snapshot(work)
+            self.assertEqual(source.read_bytes(), (directory/'unexpected.exe').read_bytes())
+
     def test_native_setup_check_preserves_the_main_cache_and_unfiltered_regression_boundary(self):
         workflow = (ROOT/'.github/workflows/ci.yml').read_text()
         save = workflow.index('      - name: Save CI build cache after main compilation')

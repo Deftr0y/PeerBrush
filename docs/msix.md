@@ -25,7 +25,10 @@ constructed value to its Cargo child. The source remains clean and the setup and
 target package use the same selected source/version, avoiding a package-hash
 dependency on a later source commit.
 
-The native producer selects x64/MSVC and static CRT, checks the PE import table
+The native producer first copies Cargo's recognized final/deps executable aliases
+exclusively into a single-link owned snapshot. Unknown aliases, replacements or
+late changes fail without overwriting or deleting either input; the shared native
+input guards remain unchanged. It selects x64/MSVC and static CRT, checks the PE import table
 for a dynamic CRT prerequisite or unsupported delay imports, verifies installer
 VERSIONINFO and embedded source, and executes only `--setup-info` with isolated
 preferences and bounded output. It retains corresponding source, GPL and
