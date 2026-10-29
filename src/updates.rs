@@ -32,7 +32,8 @@ impl Owner {
                 Ok(Some(_)) => match Package::Current() {
                     Ok(package) => windows_package_owner(package.SignatureKind(), || {
                         // Association only; never read/expose its potentially private URI.
-                        package.GetAppInstallerInfo().is_ok()
+                        crate::packaged::appinstaller_association(&package)
+                            .map(|info| info.is_some())
                     }),
                     Err(_) => Self::Unknown,
                 },
@@ -79,16 +80,16 @@ impl Owner {
 #[cfg(windows)]
 fn windows_package_owner(
     signature: ::windows::core::Result<::windows::ApplicationModel::PackageSignatureKind>,
-    app_installer_associated: impl FnOnce() -> bool,
+    app_installer_associated: impl FnOnce() -> ::windows::core::Result<bool>,
 ) -> Owner {
     use ::windows::ApplicationModel::PackageSignatureKind;
     match signature {
         Ok(PackageSignatureKind::Store) => Owner::MicrosoftStore,
         Ok(PackageSignatureKind::Developer | PackageSignatureKind::Enterprise) => {
-            if app_installer_associated() {
-                Owner::WindowsAppInstaller
-            } else {
-                Owner::WindowsPackage
+            match app_installer_associated() {
+                Ok(true) => Owner::WindowsAppInstaller,
+                Ok(false) => Owner::WindowsPackage,
+                Err(_) => Owner::Unknown,
             }
         }
         Ok(_) => Owner::WindowsPackage,

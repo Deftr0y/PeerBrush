@@ -16,6 +16,9 @@ from Store, legacy association, development and unknown cases, without exposing
 the association URI. The observation is not signature verification, installed
 acceptance, launch health or an update permit. An approved fresh-install driver
 and genuine signed installation still have to establish those facts.
+The ordinary installation-owner classifier uses the same native association
+query: a failed query is Unknown, never successful absence or a direct-package
+claim. Store ownership retains priority without querying the association.
 
 The direct route submits a verified local MSIX and explicit local runtime through
 [`PackageManager.AddPackageAsync`](https://learn.microsoft.com/en-us/uwp/api/windows.management.deployment.packagemanager.addpackageasync).

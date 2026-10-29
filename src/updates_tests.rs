@@ -31,7 +31,7 @@ fn windows_ownership_keeps_store_priority_and_queries_association_only_for_suppo
             let mut queries = 0;
             let owner = windows_package_owner(Ok(signature), || {
                 queries += 1;
-                associated
+                Ok(associated)
             });
             assert_eq!(queries, 1);
             assert_eq!(
@@ -43,6 +43,12 @@ fn windows_ownership_keeps_store_priority_and_queries_association_only_for_suppo
                 }
             );
         }
+        assert_eq!(
+            windows_package_owner(Ok(signature), || Err(::windows::core::Error::from_hresult(
+                ::windows::core::HRESULT(0x80004005_u32 as i32)
+            ))),
+            Owner::Unknown
+        );
     }
 }
 
