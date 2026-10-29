@@ -31,6 +31,26 @@ SMALL = 16 * 1024
 _PREPARED, _BUILT = object(), object()
 
 
+def failure_code(error):
+    # Fixed public diagnostics only: exceptions may otherwise contain private
+    # paths, native provider output or credentials. Never echo arbitrary text.
+    return {
+        'DMG inspection input is not an unchanged bounded regular file': 'OUTPUT_IDENTITY',
+        'DMG inspection input changed during its bounded read': 'OUTPUT_CHANGED',
+        'Setup delay imports require a separately reviewed loader contract': 'DELAY_IMPORTS',
+        'Setup has invalid imports or requires the runtime it must install': 'CRT_OR_DLL_IMPORTS',
+        'Missing bounded setup import table': 'IMPORT_TABLE',
+        'Setup import range is unmapped or ambiguous': 'IMPORT_RANGE',
+        'Setup import descriptors are not terminated within their bound': 'IMPORT_TERMINATION',
+        'Missing or ambiguous embedded build provenance': 'BUILD_LABEL',
+        'Executable build provenance differs from the clean expected version/commit': 'BUILD_IDENTITY',
+        'Executable contains a credential marker or personal build path; rebuild with path remapping and review before packaging': 'BINARY_PRIVACY',
+        'Setup info differs from its source/offer/disabled gate or wrote state': 'INFO_BINDING',
+        'Native attestation cryptographic verification failed.': 'INFO_PROCESS',
+        'Native attestation verifier could not complete.': 'INFO_UNAVAILABLE',
+    }.get(str(error), 'UNAVAILABLE')
+
+
 def encode(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
 
@@ -265,15 +285,21 @@ def build(root, work, output, *, commit, prepared=None, offline=False, jobs=None
         if type(jobs) is not int or not 1 <= jobs <= 128: raise ValueError('Bounded positive Cargo jobs required')
         command += ['--jobs', str(jobs)]
     subprocess.run(command, cwd=root, env=environment, check=True)
+    print('Setup verification: owned native output', flush=True)
     binary = packaging.regular_file(work / 'target/x86_64-pc-windows-msvc/release', 'peerbrush-setup.exe')
     checksum, size = bounded_file(binary, LIMIT, executable=True)
     data = binary.read_bytes()
     if len(data) != size or hashlib.sha256(data).hexdigest() != checksum: raise ValueError('Built setup changed')
     pe_signing.unsigned(data)
+    print('Setup verification: static CRT and native imports', flush=True)
     imports = imported_libraries(data)
+    print('Setup verification: binary privacy', flush=True)
     packaging.validate_binary(data)
+    print('Setup verification: exact build label', flush=True)
     build_info = packaging.binary_build_info(data, version, commit)
+    print('Setup verification: installer version resource', flush=True)
     windows_version.inspect(data, version, setup=True)
+    print('Setup verification: read-only disabled entry', flush=True)
     before = {p.name for p in work.iterdir()}
     raw = final.signed._command(binary, ['--setup-info'], work, 'setup-info')
     if len(raw) > SMALL: raise ValueError('Setup info exceeds its public bound')
@@ -287,6 +313,7 @@ def build(root, work, output, *, commit, prepared=None, offline=False, jobs=None
     if bounded_file(binary, LIMIT, executable=True) != (checksum, size): raise ValueError('Built setup changed after observation')
     if prepared is not None: prepared.verify()
     output.mkdir(mode=0o700)
+    print('Setup verification: corresponding source and notices', flush=True)
     if bounded_file(binary, LIMIT, output / binary.name, executable=True) != (checksum, size): raise ValueError('Setup copy changed')
     epoch = int(packaging.git(root, 'show', '-s', '--format=%ct', commit).strip())
     source = output / f'PeerBrush-{version}-source.zip'
@@ -334,8 +361,8 @@ def main():
         prepared = prepare_offer(args.source_root, read_selection(args.selection, args.selection_sha256)) if args.selection else None
         build(args.source_root, args.work, args.output, commit=args.commit, prepared=prepared, offline=args.offline, jobs=args.jobs)
         if args.selection: read_selection(args.selection, args.selection_sha256)
-    except Exception:
-        print('Setup build failed or is unavailable; preserve private work. No signing, installation or publication occurred.', file=sys.stderr)
+    except Exception as error:
+        print(f'Setup build failed ({failure_code(error)}); preserve private work. No signing, installation or publication occurred.', file=sys.stderr)
         return 1
     print('Dormant unsigned setup source/CRT/info checks passed. Installed acceptance and production readiness remain held.')
     return 0

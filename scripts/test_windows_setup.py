@@ -1,6 +1,8 @@
 """Source/byte fixtures plus explicit read-only real-binary smoke; never install."""
 import copy
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -43,6 +45,18 @@ def executable(libraries=('KERNEL32.dll',), *, text='0.2.0', overlay=b''):
 
 
 class SourceAndBytes(unittest.TestCase):
+    def test_failed_cli_reports_only_fixed_public_refusal_codes(self):
+        for error, code in [(ValueError('PRIVATE_CANARY/path'), 'UNAVAILABLE'),
+                            (ValueError('Setup has invalid imports or requires the runtime it must install'), 'CRT_OR_DLL_IMPORTS')]:
+            output = io.StringIO()
+            with mock.patch.object(sys, 'argv', ['setup', '--source-root', '.', '--commit', 'a'*40,
+                    '--work', 'unopened-work', '--output', 'unopened-output']), \
+                    mock.patch.object(setup, 'build', side_effect=error), contextlib.redirect_stderr(output):
+                self.assertEqual(setup.main(), 1)
+            self.assertIn('('+code+')', output.getvalue())
+            self.assertNotIn('PRIVATE_CANARY', output.getvalue())
+            self.assertNotIn('unopened-work', output.getvalue())
+
     def test_windows_verifier_child_has_private_state_no_inherited_auth_and_no_visible_window(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-setup-verifier-') as directory:
             root = Path(directory)

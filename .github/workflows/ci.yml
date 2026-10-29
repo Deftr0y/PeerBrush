@@ -123,6 +123,12 @@ jobs:
         run: cargo build --locked --bin peerbrush
       - name: Check the separate setup entry in the ordinary non-test configuration
         run: cargo check --locked --features windows-setup --bin peerbrush-setup
+      - name: Verify dormant native setup without a VC runtime prerequisite
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -B scripts/build_windows_setup.py --source-root . --commit $env:GITHUB_SHA `
+            --work "$env:RUNNER_TEMP/peerbrush-setup-work" --output "$env:RUNNER_TEMP/peerbrush-setup-output"
       # Cached bytes are an optimization; source builds and every qualification gate still run.
       - name: Save CI build cache after main compilation
         if: success() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''
@@ -368,12 +374,6 @@ jobs:
         run: python -B scripts/build_release.py --setup-entry
       - name: Verify fixed-offer setup contracts and read-only runtime
         run: python -B scripts/test_windows_setup.py
-      - name: Verify dormant native setup without a VC runtime prerequisite
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          python -B scripts/build_windows_setup.py --source-root . --commit $env:GITHUB_SHA `
-            --work "$env:RUNNER_TEMP/peerbrush-setup-work" --output "$env:RUNNER_TEMP/peerbrush-setup-output"
       - run: python -B scripts/test_windows_version.py
       - run: python scripts/test_msix_runtime_tests.py
       - name: Package and report archive sizes
