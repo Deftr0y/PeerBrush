@@ -744,6 +744,95 @@ class UpstreamHandoff(unittest.TestCase):
         self.assertFalse(self.artifact.exists())
 
 
+class StoreUpstreamHandoff(unittest.TestCase):
+    def setUp(self):
+        self.legacy = UpstreamHandoff(methodName='runTest')
+        self.addCleanup(self.legacy.doCleanups)
+        self.legacy.setUp()
+        f = self.legacy
+        self.value = f.value
+        self.value['schema'] = 2
+        selected = self.value['final']
+        del selected['windows']
+        name = 'PeerBrush-1.2.0.0-Windows-x64.msix'
+        package = b'SYNTHETIC_STORE_TRANSPORT_NOT_SDK_QUALIFICATION'
+        report = b'{"synthetic":"transport-only"}\n'
+        selected['store'] = dict(package='windows/' + name, package_sha256=sha(package),
+            report='windows/' + name + '.json', report_sha256=sha(report), previous_version='1.1.0.0')
+        for role in ['windows_signed', 'windows_native']:
+            for collection in [f.files, f.runs, f.artifacts, self.value['artifacts']]:
+                del collection[role]
+        f.files['store_package'] = {name: package, name + '.json': report,
+                                   name + '.sha256': (sha(package) + '  ' + name + '\n').encode()}
+        f.runs['store_package'] = copy.deepcopy(f.runs['candidate'])
+        f.artifacts['store_package'] = copy.deepcopy(f.artifacts['candidate'])
+        identifier = '999'
+        f.artifacts['store_package'].update(id=int(identifier), name='unsigned-store-msix-candidate',
+            url='https://api.github.com' + transport.API + 'artifacts/' + identifier,
+            archive_download_url='https://api.github.com' + transport.API + 'artifacts/' + identifier + '/zip')
+        self.value['artifacts']['store_package'] = dict(run_id=self.value['artifacts']['candidate']['run_id'],
+            artifact_id=identifier, artifact_sha256='', files={})
+        f.refresh()
+
+    def test_same_release_store_artifact_survives_acquisition_composition_and_relocation(self):
+        f = self.legacy
+        def binding(root, inventory, directory, selected):
+            # The shared historical fixture is 0.2, intentionally below Store's
+            # submission floor. This seam tests transport/composition only; the
+            # separate StoreBinding suite runs real package/source validation.
+            package, report = Path(selected['package']), Path(selected['report'])
+            self.assertEqual(sha(package.read_bytes()), selected['package_sha256'])
+            self.assertEqual(sha(report.read_bytes()), selected['report_sha256'])
+            return ([package], final.store_package_channel(package.name),
+                [(package, final.LIMIT, selected['package_sha256'])], {'content_verified': True},
+                {report.name: report.read_bytes(), package.name + '.sha256':
+                 (selected['package_sha256'] + '  ' + package.name + '\n').encode()})
+        with mock.patch.object(final, 'store_binding', side_effect=binding) as bound:
+            index = f.produce()
+            with f.seams():
+                candidate = inputs.consume(f.f.root, f.work / 'bundle/data', f.f.fixture.base / 'store-final',
+                    f.f.fixture.base / 'store-native', index, index['selection_sha256'])
+        self.assertGreaterEqual(bound.call_count, 2)
+        self.assertEqual(candidate.manifest['format'], final.STORE_FORMAT)
+        self.assertNotIn('windows', f.commands)
+        self.assertIn('store-native-sdk-producer-not-authenticated', candidate.blockers)
+        self.assertFalse(candidate.assessment['production_ready'])
+        with zipfile.ZipFile(f.artifact / inputs.ARCHIVE) as archive:
+            names = set(archive.namelist())
+            self.assertTrue({'windows/' + name for name in f.files['store_package'] if not name.endswith('.sha256')} <= names)
+            self.assertFalse(any(name.startswith('native/windows/') or 'runtime' in name for name in names))
+        candidate.verify()
+
+    def test_distinct_store_run_wrong_workflow_extra_or_missing_member_refuse_before_download(self):
+        f = self.legacy
+        checksum = next(name for name in f.files['store_package'] if name.endswith('.sha256'))
+        original = f.files['store_package'][checksum]
+        for ending in [b'\r\n', b'\n']:
+            f.files['store_package'][checksum] = original.replace(b'\n', ending)
+            f.refresh()
+            upstream.selections(self.value)
+        for change in ['run', 'artifact', 'workflow', 'extra', 'missing', 'checksum']:
+            value, files, runs = copy.deepcopy(self.value), copy.deepcopy(f.files), copy.deepcopy(f.runs)
+            if change == 'run': self.value['artifacts']['store_package']['run_id'] = '998'
+            elif change == 'artifact': self.value['artifacts']['store_package']['artifact_id'] = self.value['artifacts']['candidate']['artifact_id']
+            elif change == 'workflow':
+                # Both artifacts resolve the same run endpoint, hence the same
+                # authoritative metadata rather than two independent responses.
+                f.runs['candidate']['path'] = '.github/workflows/windows-release-signing.yml'
+            elif change == 'extra': f.files['store_package']['runtime.msix'] = b'foreign'
+            elif change == 'checksum': f.files['store_package'][checksum] = b'foreign\n'
+            else: f.files['store_package'].pop(next(name for name in f.files['store_package'] if name.endswith('.json')))
+            f.refresh()
+            with self.subTest(change=change), self.assertRaises(ValueError): f.produce()
+            self.assertFalse(any(host != 'api.github.com' for host, _ in f.gets))
+            self.assertFalse(f.work.exists())
+            self.value.clear()
+            self.value.update(value)
+            f.files, f.runs = files, runs
+            f.refresh()
+            f.gets.clear()
+
+
 class DormantSource(unittest.TestCase):
     def test_two_new_jobs_and_production_composition_stay_literal_disabled(self):
         root = Path(__file__).resolve().parents[1]

@@ -1,5 +1,16 @@
 # PeerBrush v0.3 — development
 
+October 31 distribution scope (unreleased): Windows uses Microsoft Store
+installation and Store-managed updates. Standalone Windows signing, App Installer
+and the dormant direct-update lifecycle are separate historical work, not release
+prerequisites for this channel. Store-only final composition and bounded upstream
+acquisition retain exact source/package/report bindings alongside Mac/Linux
+qualification. The publisher's same-invocation Store handoff remains disabled;
+genuine Store producer, installed/upgrade and authenticated public-availability
+qualification are still required. No production workflow, credential or service
+configuration has been activated. The existing 8192-edge/32MP limits remain;
+unrestricted 16000-square support and PB-108 native acceptance remain open.
+
 October 29 setup follow-through (unreleased): a separate disabled fixed-offer
 setup target now connects exact signed local media to fresh registration and
 source-bound installed-identity observation. Its producer requires actual

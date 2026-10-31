@@ -29,17 +29,22 @@ POLICIES = {
     'windows_native': ('windows-qualification.yml', 'windows-native-qualification-'),
     'linux_native': ('linux-qualification.yml', 'linux-native-qualification-'),
 }
+STORE_POLICIES = {key: value for key, value in POLICIES.items() if not key.startswith('windows_')}
+STORE_POLICIES['store_package'] = ('release.yml', 'unsigned-store-msix-candidate')
 
 
 def selections(value):
+    store = isinstance(value, dict) and type(value.get('schema')) is int and value['schema'] == 2
+    policies = STORE_POLICIES if store else POLICIES
     if (not isinstance(value, dict) or set(value) != {'schema', 'final', 'artifacts'}
-            or type(value['schema']) is not int or value['schema'] != 1
-            or not isinstance(value['artifacts'], dict) or set(value['artifacts']) != set(POLICIES)):
+            or type(value['schema']) is not int or value['schema'] not in (1, 2)
+            or not isinstance(value['artifacts'], dict) or set(value['artifacts']) != set(policies)):
         raise ValueError('Exact fixed upstream artifact selections required.')
     selected, artifacts = value['final'], value['artifacts']
     roles, trusts = inputs.paths(selected)
-    if 'linux_native' not in selected or 'native' not in selected['windows']:
-        raise ValueError('The upstream producer requires both current Windows and Linux native contracts.')
+    if ('linux_native' not in selected or ('store' in selected) != store
+            or (not store and 'native' not in selected['windows'])):
+        raise ValueError('The upstream producer requires the selected Windows channel and current Linux native contract.')
     for keys, name, _, _ in roles:
         if inputs.get(selected, keys) != name:
             raise ValueError('Upstream file fields must use their fixed portable role locations.')
@@ -56,9 +61,13 @@ def selections(value):
                 or any(not inputs.safe_name(name) or not transport.hexadecimal(checksum, 64)
                        for name, checksum in record['files'].items())):
             raise ValueError('Upstream artifacts require exact bounded ID/outer/inner selections.')
-    if len({record['run_id'] for record in artifacts.values()}) != len(POLICIES):
+    independent = [record['run_id'] for role, record in artifacts.items() if role != 'store_package']
+    if len(set(independent)) != len(independent):
         raise ValueError('Each fixed upstream workflow requires its distinct selected run.')
-    version, windows = selected['version'], selected['windows']
+    if store and (artifacts['store_package']['run_id'] != artifacts['candidate']['run_id']
+                  or artifacts['store_package']['artifact_id'] == artifacts['candidate']['artifact_id']):
+        raise ValueError('Store package and candidate require distinct artifacts from the same exact release run.')
+    version = selected['version']
     if type(version) is not str or not re.fullmatch(transport.STABLE, version):
         raise ValueError('Upstream producer requires the exact stable version.')
     portable = f'PeerBrush-{version}-Windows-x64.zip'
@@ -86,11 +95,26 @@ def selections(value):
         exact(role, {report + '.json': selection['qualification_sha256'],
                      report + '.sigstore.json': selection['trust']['bundle_sha256'], **(extra or {})})
     native('macos_native', 'dmg-qualification', selected['macos'])
-    native('windows_native', 'windows-installer-qualification', windows['native'],
-           {Path(windows['descriptor']).name: windows['descriptor_sha256']})
+    if not store:
+        windows = selected['windows']
+        native('windows_native', 'windows-installer-qualification', windows['native'],
+               {Path(windows['descriptor']).name: windows['descriptor_sha256']})
     native('linux_native', 'linux-deb-qualification', selected['linux_native'],
            {'installation.json': selected['linux_receipt_sha256'], 'portable-to-deb.json': selected['linux_native']['upgrade_sha256'],
             **({'installed-gui.json': selected['linux_native']['gui_sha256']} if 'gui' in selected['linux_native'] else {})})
+    if store:
+        package = selected['store']
+        name = Path(package['package']).name
+        if (name != f'PeerBrush-{final.msix.package_version(version)}-Windows-x64.msix'
+                or Path(package['report']).name != name + '.json'):
+            raise ValueError('Store acquisition requires the canonical package and producer report filenames.')
+        sums = (package['package_sha256'] + '  ' + name + '\n').encode()
+        checksum = artifacts['store_package']['files'].get(name + '.sha256')
+        if checksum not in {hashlib.sha256(data).hexdigest() for data in [sums, sums.replace(b'\n', b'\r\n')]}:
+            raise ValueError('Store checksum member differs from the exact selected package digest/name.')
+        exact('store_package', {name: package['package_sha256'], name + '.json': package['report_sha256'],
+                               name + '.sha256': checksum})
+        return selected, roles, trusts, archive, images[0]
     if windows['identity'] != 'windows/direct-identity.json':
         raise ValueError('Existing Windows producer requires its exact public identity filename.')
     exact('windows_signed', {portable: candidate[portable], 'runtime-license.txt': windows['native']['runtime_license_sha256'],
@@ -99,7 +123,7 @@ def selections(value):
 
 
 def metadata(run, artifact, role, record, commit):
-    workflow, name = POLICIES[role]
+    workflow, name = (STORE_POLICIES if role == 'store_package' else POLICIES)[role]
     workflow = '.github/workflows/' + workflow
     for field in ['repository', 'head_repository']:
         repository = run.get(field) if isinstance(run, dict) else None
@@ -116,7 +140,7 @@ def metadata(run, artifact, role, record, commit):
             or run.get('head_branch') != 'main' or run.get('head_sha') != commit or run.get('pull_requests') != []
             or run.get('path') not in {workflow, workflow + '@main'}):
         raise ValueError('Upstream data is not its fixed successful exact first main workflow.')
-    if role != 'candidate':
+    if role not in {'candidate', 'store_package'}:
         name += record['run_id'] + '-1'
     expected = dict(id=int(record['artifact_id']), name=name, expired=False,
         digest='sha256:' + record['artifact_sha256'], url='https://api.github.com' + transport.API + 'artifacts/' + record['artifact_id'],
@@ -160,6 +184,10 @@ def unpack(archive, output, files, remaining, role):
                 limit = 16 * 1024
             elif member.filename == 'runtime-license.txt':
                 limit = 256 * 1024
+            elif role == 'store_package' and member.filename.endswith('.json'):
+                limit = 64 * 1024
+            elif role == 'store_package' and member.filename.endswith('.sha256'):
+                limit = 4096
             if member.filename not in files or not 0 < member.file_size <= limit:
                 raise ValueError('Upstream member exceeds its existing selected role budget.')
     if total > remaining:
@@ -223,9 +251,14 @@ def produce(root, output, work, artifact_output, value, *, authority_directory, 
             raise ValueError('Upstream outer bytes differ from their independent digest/size.')
         remaining -= unpack(wrapper, area, record['files'], remaining, role)
         raw[role] = area
-    for key in ['unsigned', 'package', 'runtime', 'identity']:
-        sources[('windows', key)] = raw['windows_signed'] / Path(selected['windows'][key]).name
-    sources[('windows', 'descriptor')] = raw['windows_native'] / Path(selected['windows']['descriptor']).name
+    store = 'store' in selected
+    if store:
+        for key in ['package', 'report']:
+            sources[('store', key)] = raw['store_package'] / Path(selected['store'][key]).name
+    else:
+        for key in ['unsigned', 'package', 'runtime', 'identity']:
+            sources[('windows', key)] = raw['windows_signed'] / Path(selected['windows'][key]).name
+        sources[('windows', 'descriptor')] = raw['windows_native'] / Path(selected['windows']['descriptor']).name
     for keys, platform in trusts:
         report = {'macos': 'dmg-qualification', 'windows': 'windows-installer-qualification', 'linux': 'linux-deb-qualification'}[platform]
         sources[(*keys, 'bundle')] = raw[platform + '_native'] / (report + '.sigstore.json')
@@ -242,14 +275,15 @@ def produce(root, output, work, artifact_output, value, *, authority_directory, 
     if len(records) != 5 or set(records) | {'release-inventory.json', 'SHA256SUMS', 'production-readiness.json'} != set(value['artifacts']['candidate']['files']):
         raise ValueError('Upstream candidate must be the exact selected five-record base.')
     windows_portable = f"PeerBrush-{selected['version']}-Windows-x64.zip"
-    if bounded_file(candidate / windows_portable, final.LIMIT) != bounded_file(raw['windows_signed'] / windows_portable, final.LIMIT):
+    if not store and bounded_file(candidate / windows_portable, final.LIMIT) != bounded_file(raw['windows_signed'] / windows_portable, final.LIMIT):
         raise ValueError('Windows signed producer substituted the selected candidate portable.')
-    identity = inputs.json_input(sources[('windows', 'identity')], 16 * 1024, selected['windows']['identity_sha256'])
-    dependency = final.installer.framework_identity(sources[('windows', 'package')], sources[('windows', 'runtime')])
-    descriptor = final.installer.descriptor_bytes_for_selection(identity, dependency, final.msix.package_version(selected['version']),
-        *[selected['windows'][key] for key in ['descriptor_uri', 'package_uri', 'runtime_uri']])
-    if final.read(sources[('windows', 'descriptor')], 16 * 1024, selected['windows']['descriptor_sha256']) != descriptor:
-        raise ValueError('Selected actual native descriptor differs from the exact shared serializer.')
+    if not store:
+        identity = inputs.json_input(sources[('windows', 'identity')], 16 * 1024, selected['windows']['identity_sha256'])
+        dependency = final.installer.framework_identity(sources[('windows', 'package')], sources[('windows', 'runtime')])
+        descriptor = final.installer.descriptor_bytes_for_selection(identity, dependency, final.msix.package_version(selected['version']),
+            *[selected['windows'][key] for key in ['descriptor_uri', 'package_uri', 'runtime_uri']])
+        if final.read(sources[('windows', 'descriptor')], 16 * 1024, selected['windows']['descriptor_sha256']) != descriptor:
+            raise ValueError('Selected actual native descriptor differs from the exact shared serializer.')
     owned = copy.deepcopy(selected)
     for keys, _, _, _ in roles:
         inputs.put(owned, keys, str(sources[keys]))

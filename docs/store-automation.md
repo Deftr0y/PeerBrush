@@ -11,6 +11,18 @@ Store-only final composition binds the unsigned SDK submission package and its
 reports without an App Installer or direct signing dependency. Store-managed
 installation and upgrades still require genuine native acceptance.
 
+The final-input acquisition selector supports schema 2 for this channel. Its
+five roles are candidate, macos_signed, macos_native, linux_native and
+store_package. The Store package is the existing unsigned-store-msix-candidate
+artifact from the same exact successful first main release.yml run as the
+ordinary candidate, with a distinct artifact ID. Select independently pinned
+outer ZIP and exact MSIX/report/checksum member digests. Direct Windows signing,
+runtime, descriptor and native-direct artifacts are excluded from this variant.
+Existing bounded extraction, source/content reinspection, Mac/Linux native
+authentication and late original/metadata checks still run. Schema 1 remains
+the historical direct-Windows input contract. Downloading a successful SDK
+artifact does not itself grant installed acceptance or Store public readiness.
+
 The protected publisher has an explicit same-invocation Store handoff. It can
 run only after that invocation freshly publishes the exact final release and
 reads back its public bytes. An already-public release, rerun, lost publish
@@ -21,8 +33,10 @@ First-attempt, exact-main, native readiness and protected approval checks remain
 Before create, draft update, package upload and commit, the adapter rechecks
 the actual Partner Center product, unchanged published baseline and exact pending
 submission owner. A sanitized write-ahead receipt is retained when possible;
-the complete draft metadata is also compared, preserving concurrent owner edits
-to listings or pricing. Each in-process create/update/upload/commit permission
+the complete draft metadata is also compared, stopping when concurrent owner
+edits to listings or pricing are observed. This is a read-before-write check,
+not a service-side atomic lock; a qualified run requires exclusive operator
+ownership of the product's submission throughout the handoff. Each in-process create/update/upload/commit permission
 is consumed before its request, including when a response is lost. Unknown
 completion cannot be turned into a second upload or commit.
 The receipt contains no credential or SAS URL. Artifacts are diagnostic evidence, never
