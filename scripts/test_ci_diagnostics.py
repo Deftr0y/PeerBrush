@@ -52,6 +52,24 @@ class Diagnostics(unittest.TestCase):
             output = self.summarize('test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n' + marker)
             self.assertNotIn('Regression failure category', output)
 
+    def test_failure_section_binds_safe_location_when_thread_name_is_shortened_or_different(self):
+        name = 'ui::free_transform::tests::canvas_context_typing_guard_spans_held_and_same_frame_secondary_gestures'
+        for thread in [name[:63], 'worker']:
+            with self.subTest(thread=thread):
+                log = f"test {name} ... FAILED\n---- {name} stdout ----\nthread '{thread}' (1234) panicked at C:\\private\\checkout\\src\\ui\\free_transform\\tests.rs:3451:13:\n{PRIVATE}"
+                output = self.summarize(log)
+                self.assertIn('file=src/ui/free_transform/tests.rs,line=3451,col=13', output)
+                self.assertEqual(output.count('title=Regression failure location::'), 1)
+                self.assertNotIn('private', output)
+
+    def test_section_location_never_exports_non_source_traversal_or_unselected_test(self):
+        name = 'ui::bounded'
+        for path in ['private/input.rs', 'src/../private.rs', 'src/private.rs:0:1', 'src/' + PRIVATE]:
+            output = self.summarize(f"test {name} ... FAILED\n---- {name} stdout ----\nthread 'worker' panicked at {path}:12:3:\n{PRIVATE}")
+            self.assertNotIn('title=Regression failure location::', output)
+        output = self.summarize(f"test {name} ... FAILED\n---- other::test stdout ----\nthread 'worker' panicked at src/other.rs:12:3:\n{PRIVATE}")
+        self.assertNotIn('title=Regression failure location::', output)
+
     def test_effect_color_history_record_reports_only_exact_fixed_fields(self):
         name = 'ui::effect_color::tests::effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes'
         header = 'test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n'
