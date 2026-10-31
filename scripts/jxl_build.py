@@ -10,7 +10,7 @@ import subprocess
 # Official hosted-image inventories plus the privately tested Windows tools.
 # A changed image needs an explicit reviewed adjustment, never a latest fetch.
 VERSIONS = {
-    'Windows': {'clang': {'20.1.8', '21.1.8'}, 'cmake': {'3.31.6', '3.31.12', '4.4.4'}},
+    'Windows': {'clang': {'20.1.8', '21.1.8'}, 'cmake': {'3.31.6', '3.31.12', '4.4.4', '4.4.5'}},
     'Linux': {'clang': {'18.1.3'}, 'cmake': {'3.31.6'}},
     'Darwin': {'clang': {'21.0.0'}, 'cmake': {'4.4.2', '4.4.4'}},
 }

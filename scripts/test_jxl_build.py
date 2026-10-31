@@ -222,6 +222,8 @@ class NativeJxlBuild(unittest.TestCase):
                                          (str(executable.resolve()), '4.4.4'))
                 allowed = jxl_build.VERSIONS['Windows']['cmake']
                 cases = [
+                    ('cmake', 'cmake', allowed, b'cmake version 4.4.6\n', '4.4.6'),
+                    ('cmake', 'cmake', allowed, b'cmake version 4.4.5-msvc\n', '4.4.5'),
                     ('cmake', 'cmake', allowed, b'cmake version 4.4.3\n', '4.4.3'),
                     ('cmake', 'cmake', allowed, b'cmake version 4.4.4-msvc\n', '4.4.4'),
                     ('cmake', 'cmake', allowed, b'cmake version 3.31.6-msvc\n', '3.31.6'),
@@ -240,6 +242,18 @@ class NativeJxlBuild(unittest.TestCase):
                     self.assertNotIn(secret, str(caught.exception))
                     self.assertNotIn(str(executable), str(caught.exception))
                     self.assertLess(len(str(caught.exception)), 100)
+
+    def test_windows_october_30_image_cmake_patch_is_explicit_and_platform_scoped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / 'cmake.exe'
+            executable.write_text('synthetic version boundary; never executed', encoding='utf-8')
+            response = subprocess.CompletedProcess([], 0, b'cmake version 4.4.5\n', b'')
+            with mock.patch.object(jxl_build.shutil, 'which', return_value=str(executable)), \
+                    mock.patch.object(jxl_build.subprocess, 'run', return_value=response):
+                self.assertEqual(jxl_build.tool('cmake', 'cmake', jxl_build.VERSIONS['Windows']['cmake'], {}),
+                                 (str(executable.resolve()), '4.4.5'))
+                with self.assertRaisesRegex(ValueError, 'Unqualified'):
+                    jxl_build.tool('cmake', 'cmake', jxl_build.VERSIONS['Darwin']['cmake'], {})
 
     @unittest.skipUnless(os.name == 'nt', 'Actual PowerShell application discovery requires Windows')
     def test_actual_powershell_capture_keeps_one_precedence_path_and_all_cli_flags(self):

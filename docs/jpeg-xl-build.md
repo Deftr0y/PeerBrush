@@ -92,3 +92,14 @@ numeric version. Rejected versions now report only a bounded numeric candidate,
 with no tool path or raw output. A subsequent native run must confirm the selected
 versions and successful compilation and acceptance tests; the inventories alone
 do not establish build compatibility.
+
+CI647's Windows job selected the official VS2026 image `20261030.294.1` and
+stopped before compilation because it contains CMake `4.4.5`. The
+[fixed image inventory](https://github.com/actions/runner-images/blob/win25-vs2026/20261030.294/images/windows/Windows2025-VS2026-Readme.md)
+confirms that version, LLVM `20.1.8` and Ninja `1.13.2`.
+[Kitware's patch notes](https://cmake.org/cmake/help/v4.4/release/4.4.html)
+report no documented feature/interface changes for 4.4.4/4.4.5. Windows now
+accepts exactly `4.4.5` alongside its previous reviewed versions; other platform
+allowlists, suffix refusal and all build/acceptance checks remain unchanged.
+This source review is not native build qualification; new exact-head CI must
+establish compilation and codec/application acceptance. No tool is downloaded.
