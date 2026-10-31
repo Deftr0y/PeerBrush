@@ -34,6 +34,12 @@ PB-154 now has a prepared final-byte composition and immutable GitHub transactio
 
 ## Final inputs and trust boundaries
 
+The direct-Windows details in this section describe historical V1/V2 selections.
+The current Store-only V3 selection uses the Store MSIX/report roles above and
+the same Mac/Linux/source/immutability boundaries. Its schema-2 upstream input
+selects the existing SDK package artifact from the same release run as the base
+candidate; see [Store acquisition and remaining gates](store-automation.md).
+
 `scripts/final_release.py` consumes the existing six-record candidate: Windows/macOS/Linux portable archives, matching GPL source, final DEB and final signed DMG. It reruns the existing archive/source, DEB and DMG consumers, including the selected Mac qualification's actual cryptographic verification and exact successful-job service readback. Its bounded Linux installation receipt is checked through `production_readiness.assess_deb`; matching receipt bytes remain distinct from authenticating the native job. Originals, copied bytes, source/version and native trust snapshots are checked again after composition.
 
 Windows direct input selects the exact source-derived unsigned MSIX containing a signed executable, signed package revision, independently selected framework media, public identity/family and versioned App Installer descriptor. The aggregate reads the bounded actual packaged PE, reconstructs its signing-only payload from the exact portable original and compares both package variants, framework identity and the exact shared descriptor serializer. Legacy unsigned-PE packages do not meet this direct final-composition contract. It does not run Windows signature verification from Linux, accept a qualification JSON as native authority, or establish native executable-signature trust. The existing Windows-native `prepare_appinstaller.py` remains the native verifier/preparer; authenticating its producer and approved runtime redistribution remain required source work; real native executable-signature and installed acceptance remain independent gates. The serializer extraction preserves its literal ASCII/XML and no-update-configuration rules.
@@ -44,7 +50,7 @@ The CLI takes a SHA-256-selected JSON containing only the explicit commit/versio
 
 ## Publication and interruption recovery
 
-`scripts/publish_release.py` consumes an in-process result of actual composition, never a deserialized ready report. Its public entry verifies the candidate again and stops before obtaining credentials while any native gate remains. The prepared `production.yml` runs source/version and offline contract checks on main; optional protected preparation also requires a successful exact-source release-candidate predecessor. Its publication job is unconditionally disabled and requests no contents-write permission. The selected final-input bundle producer and authenticated installed producers still need implementation before enabling that path; ordinary candidate artifacts do not already contain those inputs.
+`scripts/publish_release.py` consumes an in-process result of actual composition, never a deserialized ready report. Its public entry verifies the candidate again and stops before obtaining credentials while any native gate remains. The prepared `production.yml` runs source/version and offline contract checks on main; optional protected preparation also requires a successful exact-source release-candidate predecessor. Its publication job is unconditionally disabled and requests no contents-write permission. Final-input bundle preparation/acquisition is implemented but held; authenticated Store SDK/installed evidence, package-ready versus public-availability orchestration and genuine native qualification remain required before activation.
 
 The prepared transaction implementation checks exact main/tag/source, all stable-release versions, reviewed notes and the complete immutable file set. It creates one draft, verifies actual existing remote bytes before resuming it, uploads only missing exact files, and publishes only after complete local/remote reconciliation. It never deletes/replaces assets, rewrites tags, edits existing notes or retries a mutation with an uncertain result. A later invocation reads the actual draft/release first. Ambiguous create/upload/publish outcomes remain held until that reconciliation; already published releases receive readback only. Each transfer has bounded bytes, response time and fixed official API/storage hosts, and tokens never follow download redirects.
 
@@ -54,11 +60,27 @@ The website's existing preparer recognizes the final manifest, binds it to its i
 
 ## Store state and remaining work
 
-Store submission stays disabled: there is no approved durable private backend. The prepared status adapter reuses the existing read-only durable reconciler. Certification pending, rejected, failed, publishing and published are separate service states; even Published is not proof of public package availability. Unknown or ambiguous outcomes never cause submission or duplicate retries. No Store credentials, account identifiers or receipt contents enter final public files. Future stores require a specific reviewed channel/producer/availability adapter; unknown manifest channels reject.
+Store submission stays disabled. The prepared same-invocation publisher handoff
+uses serialized product ownership, Partner Center reconciliation and a sanitized
+first-attempt recovery receipt. Hosted artifacts are diagnostic evidence, not
+service truth or retry authority; lost responses and missing/expired receipts
+remain holds. This route needs no separate hosting purchase. The standalone
+operator CLI retains its durable private-filesystem contract. Certification,
+publishing and authenticated public package availability remain distinct. No
+Store credentials or private receipt contents enter final public files. See
+[the held Store integration](store-automation.md) for its exact gates.
 
-PB-154 remains open. Required source/native work includes qualification and configuration of the prepared existing-certificate Windows executable/MSIX producer, authenticated final native handoffs/installed-evidence producers, real installation/upgrading/settings/file-open/interruption/unsaved-work coverage on each OS, final installer website/update-discovery adapters and approved feed/runtime media checks. Required external gates include approved publisher identities, signing/notarization access, runtime redistribution approval, protected preparation/publication configuration, Store durable storage and explicit release/Store/site authorization. No private key or credential belongs in the repository or selection JSON.
+PB-154 remains open. Store-only Windows requires authenticated SDK production,
+real Store installation/upgrades/settings/file-open/unsaved-work acceptance and
+qualified submission/public-availability orchestration. Mac/Linux require their
+genuine installed/update/recovery and public-discovery evidence. Existing Apple
+signing access, Partner Center product/API access, protected release approval and
+eventual release/Store/site authorization must be verified independently. These
+are separate from the unfinished source adapters. A standalone Windows
+certificate and runtime redistribution are not requirements of the Store channel.
+No private key or credential belongs in the repository or selection JSON.
 
-Prepared offline fixtures cover actual synthetic archive/source/DEB/MSIX/descriptor composition, native-origin refusal, byte mutation, missing platforms, immutable versions, exact public readback, duplicate/ambiguous transaction recovery, certification delays/rejection, no report-based authority and unchanged native/Store exclusions. They have not yet run in combined QA. Synthetic signatures and fake native verifier/service results establish no operating-system trust or installed acceptance.
+Offline fixtures cover actual synthetic archive/source/DEB/MSIX/descriptor composition, native-origin refusal, byte mutation, missing platforms, immutable versions, exact public readback, duplicate/ambiguous transaction recovery, certification delays/rejection and no report-based authority. The Store-only composition, acquisition, publisher and submission suites have executed locally; exact-source cross-platform CI remains a separate qualification. Synthetic signatures and fake native verifier/service results establish no operating-system trust or installed acceptance.
 
 The signed-PE composition follow-up is prepared, not executed: its structural PE and certificate fixtures pass through the actual strict AppInstaller consumer with a fake native boundary, and altered code/overlay or unsigned PE remain refused even after ordinary package hashes/block maps are rebuilt. This establishes only the intended content contract. Native signature verification, authenticated Windows producer origin, approved runtime redistribution and installed acceptance retain their independent blocking requirements.
 

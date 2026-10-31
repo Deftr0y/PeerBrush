@@ -10,7 +10,14 @@ The same partition is included in common four/five/six-record assessments, gener
 
 `--previous-inventory` compares against a retained publication inventory: an already published version must keep its exact source SHA and every existing asset filename/hash. Without that reconciled input, version immutability is explicitly unverified. `--require-ready` exits unsuccessfully while production gates remain blocked. Existing output reports cannot be replaced with a different decision. No tag, release file or history entry is overwritten.
 
-Pending gates are installed Windows distribution/signing, signed and notarized Mac DMG installation, final installed Ubuntu qualification and authenticated update delivery, protected publication approval, and public asset/website readback. The existing reviewed Apple signing workflow retains its source pin and protected environment; this change neither repoints nor activates it. Windows Store automation retains its existing disabled variable. No credential, environment or branch-protection setting changes are part of this implementation.
+Current Windows distribution is Microsoft Store only: authenticated SDK production,
+genuine Store installation/upgrades and qualified Store publication remain gates.
+Historical standalone Windows signing/App Installer work is separate. Other gates
+include signed/notarized Mac DMG installation, Ubuntu qualification and verified
+Mac/Linux update/recovery, protected publication and public/website readback. The
+existing Apple signing workflow retains its source pin and protected environment;
+this work neither repoints nor activates it. Store automation remains disabled.
+No credential, environment or branch-protection setting changes are included.
 
 The Ubuntu native job additionally qualifies final DEB bytes and consumes its freshly produced private installation receipt before uploading the candidate. This uses the selected portable/source inputs rather than trusting the package's report. Its separate public qualification report retains false readiness and explicit desktop, real-version migration, interrupted-update, signing, repository and publication limits. Receipt matching is a binding check; native execution provenance comes from the immediately preceding successful test in the same trusted job.
 

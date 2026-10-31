@@ -3512,7 +3512,6 @@ mod storage_tests {
     fn duplicate_source_resources_never_hide_unsupported_definitions_in_either_order() {
         for depth in [8, 16] {
             let doc = streamed_fixture(depth);
-            let expected = doc.export_png().unwrap();
             for layout in [Layout::Psd, Layout::Psb] {
                 let bytes = encode_layout(&doc, layout).unwrap();
                 let mut file = Cursor::new(&bytes);
@@ -3529,7 +3528,7 @@ mod storage_tests {
                     .read_to_end(&mut json)
                     .unwrap();
                 let mut future: Embedded = serde_json::from_slice(&json).unwrap();
-                future.format = 35;
+                future.format = u32::MAX;
                 let mut compressor = ZlibEncoder::new(Vec::new(), Compression::fast());
                 serde_json::to_writer(&mut compressor, &future).unwrap();
                 let payload = [b"PBR1".as_slice(), &compressor.finish().unwrap()].concat();
@@ -3538,6 +3537,16 @@ mod storage_tests {
                 if payload.len() % 2 != 0 {
                     future_resource.push(0);
                 }
+                // The fixture has partial alpha. Protected standard previews
+                // unmatte the stored white compatibility samples, so use the
+                // unsupported resource alone as the existing fallback oracle.
+                let mut reference = bytes[..resource_position].to_vec();
+                block(&mut reference, &future_resource);
+                reference.extend_from_slice(&bytes[standard_position..]);
+                let reference = decode(&reference).unwrap();
+                assert!(reference.read_only);
+                assert_eq!(reference.bit_depth, depth);
+                let expected = reference.export_png().unwrap();
                 for selected in [
                     [future_resource.as_slice(), resources].concat(),
                     [resources, future_resource.as_slice()].concat(),
