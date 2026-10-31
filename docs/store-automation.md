@@ -21,7 +21,11 @@ First-attempt, exact-main, native readiness and protected approval checks remain
 Before create, draft update, package upload and commit, the adapter rechecks
 the actual Partner Center product, unchanged published baseline and exact pending
 submission owner. A sanitized write-ahead receipt is retained when possible;
-it contains no credential or SAS URL. Artifacts are diagnostic evidence, never
+the complete draft metadata is also compared, preserving concurrent owner edits
+to listings or pricing. Each in-process create/update/upload/commit permission
+is consumed before its request, including when a response is lost. Unknown
+completion cannot be turned into a second upload or commit.
+The receipt contains no credential or SAS URL. Artifacts are diagnostic evidence, never
 service truth or replay authority. A crash before receipt upload leaves a
 manual/service reconciliation hold. Certification is not public availability.
 

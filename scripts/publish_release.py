@@ -402,6 +402,12 @@ class _StoreWrites:
     """Re-observe exact product and pending owner immediately before every write."""
     def __init__(self, provider):
         self.provider, self.submission_id, self.baseline = provider, None, None
+        self.phase, self.draft = 'new', None
+
+    @staticmethod
+    def snapshot(value):
+        import copy
+        return {key: copy.deepcopy(item) for key, item in value.items() if key != 'fileUploadUrl'}
 
     def check(self):
         import submit_store_release as store
@@ -416,31 +422,50 @@ class _StoreWrites:
                 raise store.SafeError('Store creation conflicts with existing state; no mutation retried.')
         elif not isinstance(pending, dict) or str(pending.get('id')) != self.submission_id:
             raise store.SafeError('Store pending submission changed; no mutation retried.')
+        elif self.snapshot(self.provider.call('/submissions/' + self.submission_id)) != self.draft:
+            raise store.SafeError('Store draft contents changed concurrently; no mutation retried.')
 
     def before_upload(self, sid):
         import submit_store_release as store
-        if self.submission_id != sid:
+        if self.submission_id != sid or self.phase != 'updated':
             raise store.SafeError('Store upload owner differs; no mutation retried.')
         self.check()
+        self.phase = 'upload-requested'
+
+    def after_upload(self, sid):
+        import submit_store_release as store
+        if self.submission_id != sid or self.phase != 'upload-requested':
+            raise store.SafeError('Store upload completion differs; no mutation retried.')
+        self.phase = 'uploaded'
 
     def call(self, path='', method='GET', data=None):
         import submit_store_release as store
         if method != 'GET':
             self.check()
             if self.submission_id is None:
-                if path != '/submissions' or method != 'POST':
+                if path != '/submissions' or method != 'POST' or self.phase != 'new':
                     raise store.SafeError('Store creation conflicts with existing state; no mutation retried.')
-            elif path not in ['/submissions/' + self.submission_id, '/submissions/' + self.submission_id + '/commit']:
-                raise store.SafeError('Store pending submission changed; no mutation retried.')
+                self.phase = 'create-requested'
+            elif path == '/submissions/' + self.submission_id and method == 'PUT' and self.phase == 'created':
+                self.phase = 'update-requested'
+            elif path == '/submissions/' + self.submission_id + '/commit' and method == 'POST' and self.phase == 'uploaded':
+                self.phase = 'commit-requested'
+            else:
+                raise store.SafeError('Store mutation was already attempted or is out of order; no retry.')
         result = self.provider.call(path, method=method, data=data)
         if path == '' and method == 'GET' and self.baseline is None:
             import copy
             self.baseline = copy.deepcopy(result.get('lastPublishedApplicationSubmission'))
         if path == '/submissions' and method == 'POST':
             sid = str(result.get('id', ''))
-            if not re.fullmatch('[0-9]+', sid):
+            if not re.fullmatch('[1-9][0-9]{0,31}', sid):
                 raise store.SafeError('Store creation result is ambiguous; no mutation retried.')
             self.submission_id = sid
+            self.draft, self.phase = self.snapshot(result), 'created'
+        elif method == 'PUT':
+            self.draft, self.phase = self.snapshot(data), 'updated'
+        elif method == 'POST':
+            self.phase = 'committed'
         return result
 
 

@@ -279,6 +279,9 @@ def submit(store, name, package, report, execute=False, journal=None):
     if before_upload is not None:
         before_upload(sid)
     request(upload, method='PUT', data=zipped.getvalue(), headers={'x-ms-blob-type': 'BlockBlob'}, binary=True)
+    after_upload = getattr(store, 'after_upload', None)
+    if after_upload is not None:
+        after_upload(sid)
     journal.phase('commit-requested')
     store.call('/submissions/' + sid + '/commit', method='POST')
     journal.phase('committed')

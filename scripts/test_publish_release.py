@@ -471,6 +471,46 @@ class LegacyTransactions(Transactions):
 
 
 class StoreWriteOwnership(unittest.TestCase):
+    def test_lost_each_write_response_consumes_its_in_process_permission(self):
+        import submit_store_release as store
+        import store_release_state as state
+        from test_submit_store_release import FakeStore, fixture
+        for failed in ['create', 'update', 'upload', 'commit']:
+            with self.subTest(phase=failed), tempfile.TemporaryDirectory(prefix='peerbrush-store-once-test-') as temporary:
+                journal = state.Journal(Path(temporary).resolve() / 'receipt.json')
+                journal.bind('v0.26.0', fixture()[0], fixture()[2])
+                provider = FakeStore()
+                original = provider.call
+                def call(path='', method='GET', data=None):
+                    if path == '/submissions/456' and method == 'GET':
+                        provider.calls.append((path, method, data))
+                        return copy.deepcopy(provider.draft)
+                    result = original(path, method, data)
+                    operation = None
+                    if path == '/submissions' and method == 'POST':
+                        provider.app['pendingApplicationSubmission'] = {'id': '456'}
+                        operation = 'create'
+                    elif path == '/submissions/456' and method == 'PUT':
+                        provider.draft = copy.deepcopy(data)
+                        operation = 'update'
+                    elif path.endswith('/commit') and method == 'POST': operation = 'commit'
+                    if operation == failed: raise store.RemoteError(None)
+                    return result
+                provider.call = call
+                selected = publishing._StoreWrites(provider)
+                with mock.patch.object(store, 'request', side_effect=store.RemoteError(None) if failed == 'upload' else None,
+                                       return_value=b'') as upload:
+                    with self.assertRaises(store.RemoteError):
+                        store.submit(selected, *fixture(), execute=True, journal=journal)
+                    before = (len(provider.calls), upload.call_count)
+                    if failed == 'create': action = lambda: selected.call('/submissions', method='POST')
+                    elif failed == 'update': action = lambda: selected.call('/submissions/456', method='PUT', data=provider.draft)
+                    elif failed == 'upload': action = lambda: selected.before_upload('456')
+                    else: action = lambda: selected.call('/submissions/456/commit', method='POST')
+                    with self.assertRaises(store.SafeError): action()
+                    self.assertEqual(upload.call_count, before[1])
+                    self.assertTrue(all(method == 'GET' for _, method, _ in provider.calls[before[0]:]))
+
     def test_actual_writer_rechecks_product_baseline_and_pending_owner_before_each_write(self):
         import submit_store_release as store
         import store_release_state as state
@@ -481,9 +521,14 @@ class StoreWriteOwnership(unittest.TestCase):
             provider = FakeStore()
             original = provider.call
             def call(path='', method='GET', data=None):
+                if path == '/submissions/456' and method == 'GET':
+                    provider.calls.append((path, method, data))
+                    return copy.deepcopy(provider.draft)
                 result = original(path, method, data)
                 if path == '/submissions' and method == 'POST':
                     provider.app['pendingApplicationSubmission'] = {'id': '456'}
+                if path == '/submissions/456' and method == 'PUT':
+                    provider.draft = copy.deepcopy(data)
                 return result
             provider.call = call
             selected = publishing._StoreWrites(provider)
@@ -492,6 +537,9 @@ class StoreWriteOwnership(unittest.TestCase):
             upload.assert_called_once()
             self.assertEqual(journal.state['phase'], 'committed')
             self.assertEqual(journal.state['service_status'], 'PreProcessing')
+            self.assertEqual(selected.phase, 'committed')
+            with self.assertRaises(store.SafeError):
+                selected.call('/submissions/456/commit', method='POST')
             # Initial preflight plus create, update, upload and commit observations.
             self.assertGreaterEqual(sum(path == '' and method == 'GET' for path, method, _ in provider.calls), 5)
             for change in ['pending', 'published', 'identity']:
@@ -504,6 +552,9 @@ class StoreWriteOwnership(unittest.TestCase):
                     selected.call('/submissions/456/commit', method='POST')
                 self.assertTrue(all(method == 'GET' for _, method, _ in provider.calls[before:]))
                 provider.app = saved
+            provider.draft['listings'] = {'concurrent-owner-edit': 'preserve this'}
+            with self.assertRaisesRegex(store.SafeError, 'contents changed concurrently'):
+                selected.check()
 
     def test_lost_create_response_and_competing_draft_cannot_be_recreated(self):
         import submit_store_release as store
