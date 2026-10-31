@@ -1,5 +1,11 @@
 # Photoshop fidelity
 
+Unreleased source-resource protection: multiple PeerBrush `PBR1` resources are
+ambiguous and retain a read-only standard preview, including identical duplicates.
+A supported resource cannot hide an unsupported source definition by appearing
+after it. Native 8/16-bit samples and the original file remain protected. This
+guard does not introduce a new source format or expand the canvas limits.
+
 PeerBrush 0.2 implements the documented RGB subset: standard raster clipping, pass-through folders, full layer locks, supported RGB ICC previews and explicit native-depth sRGB copies. Unsupported Photoshop settings remain protected. The v0.1.4 checkpoint predates these changes; [v0.2 packages](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.2) contain the documented support.
 
 ## PSB support — unreleased PB-104

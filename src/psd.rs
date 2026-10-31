@@ -2355,6 +2355,12 @@ fn decode_parts(
         }
         let payload = rr.block()?;
         if key == 4000 && payload.starts_with(b"PBR1") {
+            if embedded.is_some() {
+                warnings.push(
+                    "Duplicate PeerBrush source resources are protected; using the saved composite"
+                        .into(),
+                );
+            }
             embedded = Some(&payload[4..]);
         }
         // VersionInfo marks a missing compatibility composite explicitly.
@@ -3501,6 +3507,67 @@ pub fn validate(doc: &Document) -> Result<(), String> {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn duplicate_source_resources_never_hide_unsupported_definitions_in_either_order() {
+        for depth in [8, 16] {
+            let doc = streamed_fixture(depth);
+            let expected = doc.export_png().unwrap();
+            for layout in [Layout::Psd, Layout::Psb] {
+                let bytes = encode_layout(&doc, layout).unwrap();
+                let mut file = Cursor::new(&bytes);
+                file.bytes(26).unwrap();
+                file.block().unwrap();
+                let resource_position = file.pos;
+                let resources = file.block().unwrap();
+                let standard_position = file.pos;
+                assert_eq!(&resources[..20], b"8BIM\x0f\xa0\x0cPeerBrush.v1\0");
+                let payload_length =
+                    u32::from_be_bytes(resources[20..24].try_into().unwrap()) as usize;
+                let mut json = Vec::new();
+                ZlibDecoder::new(&resources[28..24 + payload_length])
+                    .read_to_end(&mut json)
+                    .unwrap();
+                let mut future: Embedded = serde_json::from_slice(&json).unwrap();
+                future.format = 35;
+                let mut compressor = ZlibEncoder::new(Vec::new(), Compression::fast());
+                serde_json::to_writer(&mut compressor, &future).unwrap();
+                let payload = [b"PBR1".as_slice(), &compressor.finish().unwrap()].concat();
+                let mut future_resource = resources[..20].to_vec();
+                block(&mut future_resource, &payload);
+                if payload.len() % 2 != 0 {
+                    future_resource.push(0);
+                }
+                for selected in [
+                    [future_resource.as_slice(), resources].concat(),
+                    [resources, future_resource.as_slice()].concat(),
+                    [resources, resources].concat(),
+                ] {
+                    let mut changed = bytes[..resource_position].to_vec();
+                    block(&mut changed, &selected);
+                    changed.extend_from_slice(&bytes[standard_position..]);
+                    for restored in [
+                        decode(&changed).unwrap(),
+                        decode_reader(
+                            &mut std::io::Cursor::new(&changed),
+                            &crate::loading::Control::default(),
+                        )
+                        .unwrap(),
+                    ] {
+                        assert!(restored.read_only);
+                        assert!(restored
+                            .warnings
+                            .iter()
+                            .any(|warning| warning
+                                .starts_with("Duplicate PeerBrush source resources")));
+                        assert_eq!(restored.bit_depth, depth);
+                        assert_eq!(restored.export_png().unwrap(), expected);
+                        assert!(encode_layout(&restored, layout).is_err());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn source_resource_framing_keeps_native_sources_history_and_standard_bytes() {
