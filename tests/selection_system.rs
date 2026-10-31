@@ -11,6 +11,60 @@ fn edit(e: &mut Engine, c: Value) {
 }
 
 #[test]
+fn overlapping_selection_seeds_revisit_rejected_neighbors_across_word_boundaries() {
+    for depth in [8, 16] {
+        for kind in ["wand", "quick"] {
+            let mut engine = Engine::new();
+            engine.doc = Document::new_depth(130, 3, depth).unwrap();
+            let layer = &mut engine.doc.layers[0];
+            for y in 0..3 {
+                for x in 0..130 {
+                    layer.pixels.set16(
+                        x,
+                        y,
+                        if x < 65 {
+                            [10001, 20003, 30007, 65535]
+                        } else {
+                            [50001, 40003, 10007, 65535]
+                        },
+                    );
+                }
+            }
+            let id = layer.id.clone();
+            let original = layer.pixels.rgba16();
+            edit(
+                &mut engine,
+                json!({"op":"selection","kind":kind,"layer":id,
+                "point":[0,1],"points":[[0,1],[65,1],[0,1],[129,1]],"radius":256,
+                "tolerance":0,"color_similarity":true,"contiguous":true,"sample_merged":false}),
+            );
+            let selected = selection::current(&engine.doc).unwrap();
+            assert_eq!(selected.bounds, [0, 0, 130, 3]);
+            for y in 0..3 {
+                for x in 0..130 {
+                    assert_eq!(selected.value(x, y), 1.);
+                }
+            }
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), original);
+            engine.undo("human").unwrap();
+            assert!(selection::current(&engine.doc).is_none());
+            assert_eq!(engine.doc.layers[0].pixels.rgba16(), original);
+            engine.redo("human").unwrap();
+            for encoded in [
+                psd::encode(&engine.doc).unwrap(),
+                psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let restored = psd::decode(&encoded).unwrap();
+                assert!(!restored.read_only);
+                assert_eq!(restored.bit_depth, depth);
+                assert_eq!(restored.layers[0].pixels.rgba16(), original);
+                assert_eq!(selection::current(&restored).unwrap(), selected);
+            }
+        }
+    }
+}
+
+#[test]
 fn color_similarity_is_opt_in_and_distinguishes_native_colors_in_each_sampler() {
     for depth in [8, 16] {
         let (mut e, id) = fixture(depth);

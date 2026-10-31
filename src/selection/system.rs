@@ -451,7 +451,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                     }
                 }
             } else {
-                let mut visited = vec![0u32; (w * h) as usize];
+                let mut visited = super::visited::Visited::new((w * h) as usize);
                 let mut queue = VecDeque::new();
                 let seeds: Vec<[f32; 2]> = serde_json::from_value(c["points"].clone())
                     .unwrap_or_else(|_| vec![[at[0] as f32, at[1] as f32]]);
@@ -464,8 +464,8 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                     return Err("Use at most 8192 selection brush seeds".into());
                 }
                 let mut work = 0usize;
-                for (seed_number, seed) in seeds.into_iter().enumerate() {
-                    let stamp = seed_number as u32 + 1;
+                for seed in seeds {
+                    visited.reset();
                     let seed = [seed[0].floor() as i32, seed[1].floor() as i32];
                     if !valid(seed[0], seed[1]) {
                         continue;
@@ -473,7 +473,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                     let si = ((seed[1] as u32 * w + seed[0] as u32) * 4) as usize;
                     let seed_color = &pixels[si..si + 4];
                     queue.push_back(seed);
-                    visited[(seed[1] as u32 * w + seed[0] as u32) as usize] = stamp;
+                    visited.mark((seed[1] as u32 * w + seed[0] as u32) as usize);
                     while let Some([x, y]) = queue.pop_front() {
                         let i = (y as u32 * w + x as u32) as usize;
                         work += 1;
@@ -497,8 +497,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                         for [nx, ny] in [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] {
                             if valid(nx, ny) {
                                 let ni = (ny as u32 * w + nx as u32) as usize;
-                                if visited[ni] != stamp {
-                                    visited[ni] = stamp;
+                                if visited.mark(ni) {
                                     queue.push_back([nx, ny]);
                                 }
                             }

@@ -292,6 +292,7 @@
     "src/selection/masks.rs",
     "src/selection/refine.rs",
     "src/selection/system.rs",
+    "src/selection/visited.rs",
     "src/server.rs",
     "src/server/fonts.rs",
     "src/settings.rs",

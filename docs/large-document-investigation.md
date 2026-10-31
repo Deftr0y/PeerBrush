@@ -1,5 +1,20 @@
 # Larger-document investigation — PB-105
 
+## Packed flood visitation preparation (unreleased)
+
+Contiguous Wand and Quick Selection now use one visit bit per canvas pixel,
+clearing only words touched by the preceding seed. Repeated or overlapping seeds
+can revisit a pixel rejected for a different seed color. The native helper's
+boundary, seed-replay and allocation tests passed: at the existing 32MP ceiling,
+the two vectors' fully touched payload capacity is at most 8 MiB on 64-bit
+targets, compared with the former 128 MiB generation array. This excludes the
+snapshot, coverage raster, queue, native sources and allocator overhead. Isolated
+visit traces showed timing scatter and some slower packed samples; there is no
+end-to-end speed or non-regression claim. Shared-engine native8/16 selection,
+history, save/reopen, actual UI latency and cross-platform qualification remain
+required. Canvas, source and work limits remain unchanged; this is neither
+16000-square admission nor an out-of-core source store.
+
 Investigation completed on 2026-10-10 against the unreleased PSB implementation at `93d5af7`. **Keep the current limits until streaming and memory accounting are implemented.** PSB's wider lengths do not remove PeerBrush's allocation, effect, supplementary-source or save limits. This report proposes further development; it does not announce larger-document support.
 
 ## Measured costs

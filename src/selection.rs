@@ -5,6 +5,7 @@ pub mod import;
 pub mod masks;
 pub mod refine;
 mod system;
+mod visited;
 pub use system::*;
 
 pub fn rectangle(area: [i32; 4]) -> Vec<[f32; 2]> {
