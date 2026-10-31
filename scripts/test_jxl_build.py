@@ -1,6 +1,7 @@
 """Offline selection/privacy/notices; native build tools never execute."""
 import importlib.util
 import base64
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import sys
 from pathlib import Path
 import subprocess
 import tempfile
+import textwrap
 import tomllib
 import unittest
 from unittest import mock
@@ -674,8 +676,8 @@ exit $LASTEXITCODE
         self.assertLess(save, regression)
         restore_block = text[restore:text.index("      - if: runner.os == 'Linux'", restore)]
         save_block = text[save:regression]
-        self.assertEqual(text.count('actions/cache/restore@' + pin), 1)
-        self.assertEqual(text.count('actions/cache/save@' + pin), 1)
+        self.assertEqual(text.count('actions/cache/restore@' + pin), 2)
+        self.assertEqual(text.count('actions/cache/save@' + pin), 2)
         self.assertNotIn('actions/cache@', text)
         self.assertIn('        id: cargo_cache\n', restore_block)
         self.assertIn("key: peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py') }}", restore_block)
@@ -687,14 +689,59 @@ exit $LASTEXITCODE
             self.assertEqual([line.strip() for line in actual[1].splitlines()], paths)
         self.assertIn("if: success() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''\n", save_block)
         self.assertIn('key: ${{ steps.cargo_cache.outputs.cache-primary-key }}\n', save_block)
-        self.assertEqual(text.count('outputs.cache-hit'), 1, 'Cache hits never gate build or acceptance')
+        self.assertEqual(text.count('outputs.cache-hit'), 2, 'Cache hits only gate the two cache saves')
         self.assertIn('run: cargo build --locked --bin peerbrush\n', text[build:save])
         self.assertNotIn('        if:', text[build:save])
         self.assertNotIn('always()', save_block)
         self.assertNotIn('continue-on-error:', save_block)
+        release_restore = text.index('      - name: Restore release compilation outputs')
+        release_build = text.index('      - run: python scripts/build_release.py\n', release_restore)
+        release_save = text.index('      - name: Save release compilation outputs', release_build)
+        acceptance = text.index('      - name: Verify fixed-offer setup feature component tests', release_save)
+        self.assertLess(regression, release_restore)
+        self.assertLess(release_restore, release_build)
+        self.assertLess(release_build, release_save)
+        self.assertLess(release_save, acceptance)
+        release_restore_block = text[release_restore:release_build]
+        release_save_block = text[release_save:acceptance]
+        self.assertIn('        id: release_cache\n', release_restore_block)
+        self.assertIn("key: peerbrush-release-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ steps.compiler.outputs.native }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py', 'scripts/jxl_build.py', 'vendor/cmake/**', 'vendor/jpegxl-src/**') }}\n", release_restore_block)
+        self.assertNotIn('restore-keys:', release_restore_block)
+        release_paths = ['target/release/.fingerprint', 'target/release/build',
+                         'target/release/deps', 'target/release/incremental']
+        for block in [release_restore_block, release_save_block]:
+            actual = re.search(r'(?m)^          path: \|\n((?:            [^\n]+\n)+)', block)
+            self.assertIsNotNone(actual)
+            self.assertEqual([line.strip() for line in actual[1].splitlines()], release_paths)
+        self.assertIn("if: success() && steps.release_cache.outputs.cache-hit != 'true' && steps.release_cache.outputs.cache-primary-key != ''\n", release_save_block)
+        self.assertIn('key: ${{ steps.release_cache.outputs.cache-primary-key }}\n', release_save_block)
+        for block in [release_restore_block, text[release_build:release_save]]:
+            self.assertNotIn('        if:', block)
+        self.assertNotIn('always()', release_save_block)
+        self.assertNotIn('continue-on-error:', release_save_block)
         for name in ['release.yml', 'macos-qualification.yml']:
             with self.subTest(workflow=name):
                 self.assertNotIn('actions/cache', (root / name).read_text(encoding='utf-8'))
+
+    def test_ci_native_cache_fingerprint_hashes_versions_without_exporting_environment(self):
+        workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        step = workflow.split('      - name: Identify compiler cache\n', 1)[1].split('      - name:', 1)[0]
+        program = textwrap.dedent(step.split("          python - <<'PY'\n", 1)[1].rsplit('          PY\n', 1)[0])
+        versions = {'compiler': '21.1.8', 'cmake': '3.31.12', 'ninja': '1.13.2'}
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / 'github-output'
+            with mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(destination)}), \
+                    mock.patch.object(jxl_build, 'configure', return_value=({'PRIVATE_TOKEN': 'NEVER_PRINT_PRIVATE_DATA'}, versions)), \
+                    mock.patch.object(subprocess, 'check_output', return_value='rustc 1.92.0 (test 2025-12-11)\n'), \
+                    mock.patch('builtins.print') as output:
+                before = sys.path[:]
+                try:
+                    exec(program, {})
+                finally:
+                    sys.path[:] = before
+            digest = hashlib.sha256(json.dumps(versions, sort_keys=True).encode()).hexdigest()
+            self.assertEqual(destination.read_text(encoding='utf-8'), f'version=1.92.0\nnative={digest}\n')
+            output.assert_not_called()
 
 
 if __name__ == '__main__':
