@@ -355,8 +355,12 @@ pub struct Reply {
     pub selected: Option<String>,
     pub selected_layers: Vec<String>,
 }
+enum Work {
+    Edit(Request),
+    Dimensions(mpsc::Sender<Result<[u32; 2], String>>),
+}
 pub struct Worker {
-    tx: mpsc::SyncSender<Request>,
+    tx: mpsc::SyncSender<Work>,
     pub replies: mpsc::Receiver<Reply>,
 }
 impl Default for Worker {
@@ -367,12 +371,27 @@ impl Default for Worker {
 impl Worker {
     #[cfg(test)]
     pub(crate) fn memory(ctx: eframe::egui::Context) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Request>(1);
+        Self::memory_images(ctx, vec![])
+    }
+    #[cfg(test)]
+    pub(crate) fn memory_images(
+        ctx: eframe::egui::Context,
+        images: Vec<Result<Image, String>>,
+    ) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Work>(1);
         let (reply_tx, replies) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut clipboard = tests::Fake::default();
+            let mut clipboard = tests::Fake::with_images(images);
             let mut session = Session::default();
             while let Ok(request) = rx.recv() {
+                let request = match request {
+                    Work::Edit(request) => request,
+                    Work::Dimensions(reply) => {
+                        let _ = reply.send(image_dimensions(&mut clipboard));
+                        ctx.request_repaint();
+                        continue;
+                    }
+                };
                 if reply_tx
                     .send(session.process(&mut clipboard, request))
                     .is_err()
@@ -385,7 +404,7 @@ impl Worker {
         Self { tx, replies }
     }
     pub fn new(ctx: eframe::egui::Context) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Request>(1);
+        let (tx, rx) = mpsc::sync_channel::<Work>(1);
         let (reply_tx, replies) = mpsc::channel();
         std::thread::spawn(move || {
             // Retain ownership for Linux clipboard providers while the application is open.
@@ -405,10 +424,22 @@ impl Worker {
                     Ok(request) => request,
                     Err(_) => break,
                 };
-                let document = request.document().to_owned();
                 if clipboard.is_none() {
                     clipboard = arboard::Clipboard::new().ok();
                 }
+                let request = match request {
+                    Work::Edit(request) => request,
+                    Work::Dimensions(reply) => {
+                        let result = clipboard
+                            .as_mut()
+                            .ok_or_else(|| "The system clipboard is unavailable".to_owned())
+                            .and_then(image_dimensions);
+                        let _ = reply.send(result);
+                        ctx.request_repaint();
+                        continue;
+                    }
+                };
+                let document = request.document().to_owned();
                 let reply = if let Some(clipboard) = clipboard.as_mut() {
                     session.process(clipboard, request)
                 } else {
@@ -424,9 +455,22 @@ impl Worker {
     }
     pub fn request(&self, request: Request) -> Result<(), String> {
         self.tx
-            .try_send(request)
+            .try_send(Work::Edit(request))
             .map_err(|_| "Finish the current clipboard operation first".into())
     }
+    pub fn image_dimensions(&self) -> Result<mpsc::Receiver<Result<[u32; 2], String>>, String> {
+        let (reply, receive) = mpsc::channel();
+        self.tx
+            .try_send(Work::Dimensions(reply))
+            .map_err(|_| "Finish the current clipboard operation first".to_owned())?;
+        Ok(receive)
+    }
+}
+
+fn image_dimensions(provider: &mut impl Provider) -> Result<[u32; 2], String> {
+    let image = provider.read_image()?;
+    check_size(image.width, image.height)?;
+    Ok([image.width, image.height])
 }
 
 // Native transport is replaceable in tests; safety tests never alter the real clipboard.
@@ -461,7 +505,7 @@ impl Provider for arboard::Clipboard {
         }
         let pixels = self
             .get_image()
-            .map_err(|_| "Copy an image, image file or layers before pasting".to_owned());
+            .map_err(|_| "No readable clipboard image is available".to_owned());
         #[cfg(windows)]
         let pixels = match pixels {
             Ok(pixels) => pixels,
@@ -742,11 +786,21 @@ mod tests {
     pub(super) struct Fake {
         text: Option<String>,
         image: Option<Image>,
+        image_reads: std::collections::VecDeque<Result<Image, String>>,
         fail_write: bool,
+        fail_read: bool,
         files: Vec<PathBuf>,
         sequence: Option<u64>,
         change_on_read: bool,
         edit_on_write: Option<(Shared, Value)>,
+    }
+    impl Fake {
+        pub(super) fn with_images(images: Vec<Result<Image, String>>) -> Self {
+            Self {
+                image_reads: images.into(),
+                ..Default::default()
+            }
+        }
     }
     impl Provider for Fake {
         fn write_image(&mut self, image: &Image) -> Result<(), String> {
@@ -766,6 +820,12 @@ mod tests {
             Ok(())
         }
         fn read_image(&mut self) -> Result<Image, String> {
+            if let Some(image) = self.image_reads.pop_front() {
+                return image;
+            }
+            if self.fail_read {
+                return Err("clipboard read denied".into());
+            }
             if self.change_on_read {
                 self.sequence = self.sequence.map(|n| n + 1);
             }
@@ -797,6 +857,48 @@ mod tests {
         let doc = e.doc.clone();
         let id = doc.layers[0].id.clone();
         (Arc::new(Mutex::new(e)), doc, id)
+    }
+    #[test]
+    fn dimension_reads_preserve_clipboard_images_native_words_text_files_and_sequence() {
+        let mut pixels = Raster::new_depth(7, 5, 16);
+        pixels.set16(2, 3, [12347, 33559, 51237, 65535]);
+        let image = Image::from_raster(pixels);
+        let mut fake = Fake {
+            image: Some(image.clone()),
+            text: Some("clipboard marker".into()),
+            files: vec![PathBuf::from("synthetic.png")],
+            sequence: Some(17),
+            ..Default::default()
+        };
+        assert_eq!(image_dimensions(&mut fake).unwrap(), [7, 5]);
+        assert_eq!(fake.image.as_ref().unwrap().samples16, image.samples16);
+        assert_eq!(fake.image.as_ref().unwrap().bytes, image.bytes);
+        assert_eq!(fake.text.as_deref(), Some("clipboard marker"));
+        assert_eq!(fake.files, vec![PathBuf::from("synthetic.png")]);
+        assert_eq!(fake.sequence, Some(17));
+        fake.fail_read = true;
+        assert!(image_dimensions(&mut fake).is_err());
+        fake.fail_read = false;
+        fake.image.as_mut().unwrap().width = 8193;
+        assert!(image_dimensions(&mut fake).is_err());
+        fake.image = None;
+        assert!(image_dimensions(&mut fake).is_err());
+        assert_eq!(fake.text.as_deref(), Some("clipboard marker"));
+        assert_eq!(fake.sequence, Some(17));
+    }
+    #[test]
+    fn dimension_worker_returns_separate_read_only_replies_without_editing() {
+        let worker = Worker::memory(eframe::egui::Context::default());
+        let result = worker
+            .image_dimensions()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(result.is_err());
+        assert!(matches!(
+            worker.replies.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
     #[test]
     fn selected_cut_paste_retains_coordinates_native_depth_and_separate_undo_steps() {

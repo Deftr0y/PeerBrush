@@ -335,7 +335,7 @@ fn editable_shape_reflection_preserves_definition_and_native_color_through_reope
             },
         };
         let mut e = fixture(depth);
-        e.doc.layers[0].source = Some(source.clone());
+        e.doc.layers[0].source = Some(source.clone().into());
         e.doc.layers[0].pixels = source.render(16, 12, depth).unwrap();
         let before = e.doc.clone();
         edit(&mut e, json!({"mirror_x":true,"selection_only":false}));

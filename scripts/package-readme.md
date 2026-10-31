@@ -26,3 +26,7 @@ Release packaging requires a reviewed Git commit and the explicit policy in `scr
 PeerBrush retains GPL v3 in `LICENSE`. Fonts and dependencies retain their notices under `licenses/` in the platform ZIP and their source notices. Private operational records, credentials, runtime connection data, generated QA output and installed development tools are excluded.
 
 Official [repository](https://github.com/Deftr0y/PeerBrush), [releases](https://github.com/Deftr0y/PeerBrush/releases) and [roadmap](https://github.com/Deftr0y/PeerBrush/blob/main/FOLLOWUPS.MD).
+
+macOS candidates additionally require `python scripts/package.py --sparkle-archive /absolute/downloads/Sparkle-for-Swift-Package-Manager.zip` with the exact committed public Sparkle archive pin. Acquire that dependency separately; preparation performs no download. The dormant bundle does not enable updates or establish native installation acceptance. See [Sparkle preparation](docs/sparkle-preparation.md).
+
+The dormant package/component preparation does not implement application update execution, verified native termination completion or failed-install recovery. Those source changes remain required in addition to feed/public-key/native-policy setup; updater installation cannot be activated by configuration in this build.

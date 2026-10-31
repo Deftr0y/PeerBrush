@@ -219,7 +219,7 @@ impl Animation {
                     .find(|f| f.id == filter.id && f.kind == filter.kind)
                 {
                     filter.weight = lerp(old.weight, filter.weight, t);
-                    values(&old.settings, &mut filter.settings, t);
+                    values(&old.settings, Arc::make_mut(&mut filter.settings), t);
                 }
             }
         }
@@ -249,7 +249,7 @@ impl Animation {
                         .find(|e| e.id == effect.id && e.kind == effect.kind)
                     {
                         effect.weight = lerp(old.weight, effect.weight, t);
-                        values(&old.settings, &mut effect.settings, t);
+                        values(&old.settings, Arc::make_mut(&mut effect.settings), t);
                     }
                 }
                 if let (Some(old), Some(mask)) = (&old.mask, &mut l.mask) {

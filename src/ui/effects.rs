@@ -1,5 +1,21 @@
 use super::*;
 use crate::{effects, engine::Layer};
+// Bitmap bytes are displayed/imported through the original Effect, never these controls.
+fn inspector_values(kind: &str, source: &Value) -> Value {
+    match source
+        .as_object()
+        .filter(|_| crate::effects::patterns::active(kind, source))
+    {
+        Some(fields) => Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != "bitmap_png")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        None => source.clone(),
+    }
+}
 pub(super) fn settings(
     ui: &mut egui::Ui,
     kind: &str,
@@ -882,7 +898,7 @@ impl PeerBrush {
                                 {
                                     self.activate_liquify(Some(effect.id.clone()));
                                 }
-                                let mut values = effect.settings.clone();
+                                let mut values = inspector_values(&effect.kind, &effect.settings);
                                 let document_id = self.doc_snapshot.id.clone();
                                 let response = ui
                                     .push_id(("settings source", document_id), |ui| {
@@ -890,6 +906,11 @@ impl PeerBrush {
                                     })
                                     .inner;
                                 if let Some(response) = response {
+                                    if crate::effects::patterns::active(&effect.kind, &values) {
+                                        if let Some(png) = effect.settings.get("bitmap_png") {
+                                            values["bitmap_png"] = png.clone();
+                                        }
+                                    }
                                     self.layer_parameter(
                                         json!({"effect":effect.id,"settings":values}),
                                         "Effect parameter",
@@ -1687,4 +1708,275 @@ fn levels_slider(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Respon
     let changed = response.changed();
     let response = response.on_hover_text("Drag the black, midtone and white input handles");
     changed.then_some(response)
+}
+
+#[cfg(test)]
+mod bitmap_inspector_tests {
+    use super::super::workspace_tests as workspace;
+    use super::*;
+    const SIZE: Vec2 = Vec2::new(1100., 1800.);
+    fn bitmap_png(depth: u16, offset: u16) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let mut words = Vec::new();
+        for y in 0..16u16 {
+            for x in 0..32u16 {
+                words.extend([
+                    12347u16.wrapping_add(x * 1459).wrapping_add(offset),
+                    23459u16.wrapping_add(y * 2311).wrapping_add(offset),
+                    34571u16.wrapping_add((x + y) * 977),
+                    if (x + y) % 5 == 0 { 32769 } else { 65535 },
+                ]);
+            }
+        }
+        let png = if depth == 16 {
+            crate::raster::png16(32, 16, &words)
+        } else {
+            crate::raster::png(
+                32,
+                16,
+                &words
+                    .into_iter()
+                    .map(crate::raster::project16)
+                    .collect::<Vec<_>>(),
+            )
+        }
+        .unwrap();
+        STANDARD.encode(png)
+    }
+    fn fixture(depth: u16, kind: &str) -> (PeerBrush, egui::Context, String) {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let png = bitmap_png(depth, 0);
+        let effect = {
+            let mut engine = app.shared.lock().unwrap();
+            let layer = engine.doc.layers[0].id.clone();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"effect.add","layer":layer,"kind":kind,
+                "settings":{"pattern":"bitmap","bitmap_png":png,"sampling":"nearest",
+                    "bitmap_scale":2.,"bitmap_angle":17.25,"phase_x":3.,"phase_y":-2.}})],
+                    None,
+                    None,
+                    "Embedded inspector source",
+                )
+                .unwrap();
+            let effect = engine.doc.layers[0].effects[0].id.clone();
+            for opacity in [0.9, 0.8] {
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"layer.update","layer":layer,"opacity":opacity})],
+                        None,
+                        None,
+                        "Human layer setting",
+                    )
+                    .unwrap();
+            }
+            engine.undo("human").unwrap();
+            assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+            effect
+        };
+        app.select_effect(&app.selected.clone(), false, &effect);
+        (app, ctx, png)
+    }
+    fn frame(
+        app: &mut PeerBrush,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        workspace::draw(app, ctx, SIZE, events)
+    }
+    fn settle_canvas(app: &mut PeerBrush, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            frame(app, ctx, vec![]);
+            if !app.pending
+                && app.canvas_preview.is_some()
+                && app.canvas_preview == app.last_preview
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Actual bitmap preview did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn button(at: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+    fn drag_opacity(app: &mut PeerBrush, ctx: &egui::Context) -> Pos2 {
+        frame(app, ctx, vec![]);
+        let output = frame(app, ctx, vec![]);
+        let at = workspace::label(&output, "75%");
+        frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerMoved(at), button(at, true)],
+        );
+        let moved = at - Vec2::new(28., 0.);
+        frame(app, ctx, vec![egui::Event::PointerMoved(moved)]);
+        frame(app, ctx, vec![egui::Event::PointerMoved(moved)]);
+        assert!(app.parameter_gesture.is_some());
+        moved
+    }
+    #[test]
+    fn idle_bitmap_inspector_omits_only_png_from_controls_and_preserves_exact_native_work() {
+        for depth in [8, 16] {
+            for kind in ["pattern_overlay", "texture"] {
+                let (mut app, ctx, png) = fixture(depth, kind);
+                let source = app.shared.lock().unwrap().doc.layers[0].effects[0]
+                    .settings
+                    .clone();
+                let before = workspace::source(&app);
+                for _ in 0..8 {
+                    let values = inspector_values(kind, &source);
+                    assert!(values.get("bitmap_png").is_none());
+                    assert_eq!(
+                        values.as_object().unwrap().len() + 1,
+                        source.as_object().unwrap().len()
+                    );
+                    for (key, value) in source.as_object().unwrap() {
+                        if key != "bitmap_png" {
+                            assert_eq!(values.get(key), Some(value));
+                        }
+                    }
+                    frame(&mut app, &ctx, vec![]);
+                    let engine = app.shared.lock().unwrap();
+                    assert!(Arc::ptr_eq(
+                        &engine.doc.layers[0].effects[0].settings,
+                        &source
+                    ));
+                    assert_eq!(
+                        engine.doc.layers[0].effects[0].settings["bitmap_png"],
+                        json!(png)
+                    );
+                }
+                assert_eq!(workspace::source(&app), before);
+                let procedural = crate::effects::styles::defaults(kind);
+                assert_eq!(inspector_values(kind, &procedural), procedural);
+                let curves = json!({"points":[[0.,0.],[1.,1.]],"interpolation":"smooth"});
+                assert_eq!(inspector_values("curves", &curves), curves);
+            }
+        }
+    }
+    #[test]
+    fn bitmap_inspector_actual_drag_restores_png_for_shared_native_preview_and_one_history_commit()
+    {
+        for depth in [8, 16] {
+            for kind in ["pattern_overlay", "texture"] {
+                let (mut app, ctx, png) = fixture(depth, kind);
+                let before = app.shared.lock().unwrap().doc.clone();
+                let source = workspace::source(&app);
+                let history = app.shared.lock().unwrap().undo.len();
+                let moved = drag_opacity(&mut app, &ctx);
+                let commands = app.parameter_gesture.as_ref().unwrap().commands.clone();
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0]["settings"]["bitmap_png"], json!(png));
+                let original = &before.layers[0].effects[0].settings;
+                for (key, value) in original.as_object().unwrap() {
+                    if key != "opacity" {
+                        assert_eq!(commands[0]["settings"].get(key), Some(value));
+                    }
+                }
+                let preview =
+                    crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
+                assert_ne!(preview.export_png().unwrap(), before.export_png().unwrap());
+                settle_canvas(&mut app, &ctx);
+                let (w, h, pixels) = app.canvas_pixels.as_ref().unwrap();
+                assert_eq!(
+                    *pixels,
+                    preview.preview(None, (*w).max(*h), None, false).unwrap().2
+                );
+                assert_eq!(workspace::source(&app), source);
+                frame(&mut app, &ctx, vec![button(moved, false)]);
+                let mut engine = app.shared.lock().unwrap();
+                assert_eq!(engine.undo.len(), history + 1);
+                assert_eq!(
+                    engine.doc.layers[0].effects[0].settings["bitmap_png"],
+                    json!(png)
+                );
+                assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+                assert_eq!(engine.doc.bit_depth, depth);
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    preview.export_png().unwrap()
+                );
+                engine.undo("human").unwrap();
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    before.export_png().unwrap()
+                );
+                engine.redo("human").unwrap();
+                assert_eq!(
+                    engine.doc.export_png().unwrap(),
+                    preview.export_png().unwrap()
+                );
+            }
+        }
+    }
+    #[test]
+    fn bitmap_inspector_cancel_newer_source_and_reservations_cannot_rebind_the_old_png() {
+        for depth in [8, 16] {
+            for interruption in ["escape", "newer", "reserved"] {
+                let (mut app, ctx, _) = fixture(depth, "pattern_overlay");
+                let moved = drag_opacity(&mut app, &ctx);
+                let layer = app.selected.clone();
+                if interruption == "newer" {
+                    let mut engine = app.shared.lock().unwrap();
+                    let effect = engine.doc.layers[0].effects[0].id.clone();
+                    let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
+                    settings["bitmap_png"] = json!(bitmap_png(depth, 19001));
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"effect.update","layer":layer,"effect":effect,
+                        "settings":settings})],
+                            None,
+                            None,
+                            "Newer human bitmap",
+                        )
+                        .unwrap();
+                } else if interruption == "reserved" {
+                    app.shared
+                        .lock()
+                        .unwrap()
+                        .reserve(
+                            "other",
+                            "Keep human source",
+                            vec![crate::engine::Scope::layer(&layer)],
+                        )
+                        .unwrap();
+                }
+                let retained = workspace::source(&app);
+                let reservations = json!(app.shared.lock().unwrap().leases);
+                let events = if interruption == "escape" {
+                    vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }]
+                } else {
+                    vec![]
+                };
+                frame(&mut app, &ctx, events);
+                let late = moved - Vec2::new(18., 0.);
+                frame(&mut app, &ctx, vec![egui::Event::PointerMoved(late)]);
+                frame(&mut app, &ctx, vec![button(late, false)]);
+                frame(&mut app, &ctx, vec![]);
+                assert!(app.parameter_gesture.is_none());
+                assert_eq!(workspace::source(&app), retained, "{depth}/{interruption}");
+                assert_eq!(json!(app.shared.lock().unwrap().leases), reservations);
+                assert_eq!(app.shared.lock().unwrap().doc.bit_depth, depth);
+            }
+        }
+    }
 }

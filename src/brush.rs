@@ -930,20 +930,16 @@ impl Session {
         if visible {
             work_budget(&next, self.clip)?;
         }
-        let append = next.starts_with(&self.dabs);
-        let prefix = if append {
-            self.dabs.len()
-        } else {
-            self.coverage.clear();
-            self.coverage16.clear();
-            self.raster = self.baseline.clone();
-            0
-        };
-        self.last_update_dabs = next.len() - prefix;
+        let prefix = next
+            .iter()
+            .zip(&self.dabs)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let append = prefix == self.dabs.len();
         self.last_update_bounds = if visible {
             next[prefix..]
                 .iter()
-                .chain(self.dabs.iter().filter(|_| !append))
+                .chain(&self.dabs[prefix..])
                 .map(|&dab| {
                     let b = dab_bounds(dab);
                     [
@@ -965,12 +961,61 @@ impl Session {
         } else {
             None
         };
+        let mut clip = self.clip;
+        let replay = if visible && !append {
+            clip = self.last_update_bounds.map_or([0; 4], |b| {
+                let tile = TILE as i32;
+                [
+                    (b[0] / tile * tile).max(self.clip[0]),
+                    (b[1] / tile * tile).max(self.clip[1]),
+                    ((b[2] + tile - 1) / tile * tile).min(self.clip[2]),
+                    ((b[3] + tile - 1) / tile * tile).min(self.clip[3]),
+                ]
+            });
+            if clip[0] < clip[2] && clip[1] < clip[3] {
+                // A reshaped tail invalidates coverage only in these tiles. Rebuild
+                // their complete current coverage to retain quantized dab order.
+                for y in clip[1] as u32 / TILE..=(clip[3] - 1) as u32 / TILE {
+                    for x in clip[0] as u32 / TILE..=(clip[2] - 1) as u32 / TILE {
+                        let key = (x, y);
+                        self.coverage.remove(&key);
+                        self.coverage16.remove(&key);
+                        if self.baseline.depth == 16 {
+                            if let Some(tile) = self.baseline.samples16.get(&key) {
+                                self.raster.samples16.insert(key, tile.clone());
+                            } else {
+                                self.raster.samples16.remove(&key);
+                            }
+                        } else if let Some(tile) = self.baseline.tiles.get(&key) {
+                            self.raster.tiles.insert(key, tile.clone());
+                        } else {
+                            self.raster.tiles.remove(&key);
+                        }
+                    }
+                }
+            }
+            next.iter()
+                .copied()
+                .filter(|&dab| {
+                    let b = dab_bounds(dab);
+                    b[0].max(clip[0]) < b[2].min(clip[2]) && b[1].max(clip[1]) < b[3].min(clip[3])
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let update = if visible && !append {
+            replay.as_slice()
+        } else {
+            &next[prefix..]
+        };
+        self.last_update_dabs = update.len();
         if visible && self.baseline.depth == 16 {
             let touched = accumulate16(
                 &mut self.coverage16,
-                &next[prefix..],
+                update,
                 self.settings,
-                self.clip,
+                clip,
                 self.polygon.as_deref(),
             );
             for key in touched {
@@ -1000,9 +1045,9 @@ impl Session {
         if visible {
             let touched = accumulate(
                 &mut self.coverage,
-                &next[prefix..],
+                update,
                 self.settings,
-                self.clip,
+                clip,
                 self.polygon.as_deref(),
             );
             for key in touched {

@@ -317,7 +317,7 @@ impl Editor {
         if let Some(f) = doc.filters.last() {
             editor.target = Some(f.id.clone());
             editor.kind = f.kind.clone();
-            editor.settings = f.settings.clone();
+            editor.settings = f.settings.as_ref().clone();
             editor.weight = f.weight;
             editor.preset = None;
             editor.name = effects::effect_name(&f.kind).into();
@@ -370,14 +370,8 @@ impl Editor {
 impl PeerBrush {
     pub(super) fn document_filter_stack(&mut self, ui: &mut egui::Ui, doc: &Document) {
         let mut display = self.animation.document(doc, ui.input(|i| i.time), false);
-        if let Some(edit) = &self.parameter_gesture {
-            if edit.document == doc.id && edit.revision == doc.revision {
-                if let Ok(preview) =
-                    crate::engine::Engine::preview_edits(doc.clone(), &edit.commands)
-                {
-                    display = preview;
-                }
-            }
+        if let Some(preview) = self.pending_parameter_document(ui.ctx(), doc) {
+            display = preview;
         }
         ui.set_min_width(290.);
         ui.add_enabled_ui(!doc.read_only && !self.busy, |ui| {
@@ -533,7 +527,7 @@ impl PeerBrush {
                             ui.push_id(&f.id,|ui|ui.horizontal(|ui| {
                                 let mut enabled=f.enabled;
                                 if ui.checkbox(&mut enabled,"").on_hover_text("Bypass filter").changed(){stack_edit=Some(json!({"op":"filter.update","filter":f.id,"enabled":enabled}));}
-                                if ui.selectable_label(editor.target.as_deref()==Some(&f.id),effects::effect_name(&f.kind)).clicked(){editor.target=Some(f.id.clone());editor.kind=f.kind.clone();editor.settings=f.settings.clone();editor.weight=f.weight;editor.preset=None;editor.name=effects::effect_name(&f.kind).into();editor.category=crate::effects::catalog::get(&f.kind).map_or("Custom",|e|e.category).into();editor.error=None;}
+                                if ui.selectable_label(editor.target.as_deref()==Some(&f.id),effects::effect_name(&f.kind)).clicked(){editor.target=Some(f.id.clone());editor.kind=f.kind.clone();editor.settings=f.settings.as_ref().clone();editor.weight=f.weight;editor.preset=None;editor.name=effects::effect_name(&f.kind).into();editor.category=crate::effects::catalog::get(&f.kind).map_or("Custom",|e|e.category).into();editor.error=None;}
                                 ui.label(format!("{:.0}%",f.weight*100.));
                                 if index+1<doc.filters.len()&&icons::small_button(ui,Icon::Up,"Move filter up").clicked(){stack_edit=Some(json!({"op":"filter.reorder","filter":f.id,"index":index+1}));}
                                 if index>0&&icons::small_button(ui,Icon::Down,"Move filter down").clicked(){stack_edit=Some(json!({"op":"filter.reorder","filter":f.id,"index":index-1}));}

@@ -10,6 +10,14 @@ use serde_json::{json, Value};
 pub struct Original {
     pub pixels: Box<Raster>,
     pub matrix: [f64; 6],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projective: Option<[f64; 9]>,
+    #[serde(
+        default,
+        deserialize_with = "crate::warp::stages",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub warps: Vec<crate::warp::Stage>,
 }
 pub const IDENTITY: [f64; 6] = [1., 0., 0., 1., 0., 0.];
 fn exact(v: f64) -> f64 {
@@ -37,6 +45,8 @@ impl Original {
         r.retained.as_deref().cloned().unwrap_or_else(|| Self {
             pixels: Box::new(r.clone()),
             matrix: IDENTITY,
+            projective: None,
+            warps: Vec::new(),
         })
     }
     pub fn validate(&self, depth: u16) -> Result<(), String> {
@@ -52,7 +62,71 @@ impl Original {
         {
             return Err("Invalid retained transform source or placement".into());
         }
+        if !self.warps.is_empty() {
+            self.prepared()?.bounds(self.support())?;
+        } else if self.projective.is_some() {
+            self.placement()?.bounds([
+                0.,
+                0.,
+                self.pixels.width as f64,
+                self.pixels.height as f64,
+            ])?;
+        }
         Ok(())
+    }
+    fn support(&self) -> [f64; 4] {
+        [
+            -1.,
+            -1.,
+            self.pixels.width as f64 + 1.,
+            self.pixels.height as f64 + 1.,
+        ]
+    }
+    fn prepared(&self) -> Result<crate::warp::Placement, String> {
+        crate::warp::Placement::new(&self.warps, self.placement()?)
+    }
+    pub(crate) fn support_bounds_in(
+        &self,
+        frame: crate::projective::Map,
+    ) -> Result<[f64; 4], String> {
+        self.validate(self.pixels.depth)?;
+        crate::warp::Placement::new(&self.warps, frame.compose(self.placement()?)?)?
+            .bounds(self.support())
+    }
+    pub(crate) fn placement(&self) -> Result<crate::projective::Map, String> {
+        let affine = crate::projective::Map::affine_matrix(self.matrix);
+        self.projective
+            .map(crate::projective::Map::from_matrix)
+            .transpose()?
+            .map_or(Ok(affine), |p| affine.compose(p))
+    }
+    fn prepend(&mut self, delta: crate::projective::Map) -> Result<(), String> {
+        let map = delta.compose(self.placement()?)?;
+        if let Some(matrix) = map.as_affine() {
+            self.matrix = matrix;
+            self.projective = None;
+        } else {
+            self.matrix = IDENTITY;
+            self.projective = Some(map.matrix());
+        }
+        self.validate(self.pixels.depth)
+    }
+    fn append_warp(
+        &mut self,
+        grid: &crate::warp::Grid,
+        frame: crate::projective::Map,
+        after: crate::projective::Map,
+    ) -> Result<(), String> {
+        if self.warps.len() >= crate::warp::MAX_STAGES {
+            return Err("Retained Warp stage limit reached; undo an earlier Warp or cancel".into());
+        }
+        self.warps.push(crate::warp::Stage {
+            before: frame.compose(self.placement()?)?.matrix(),
+            grid: grid.clone(),
+        });
+        self.matrix = IDENTITY;
+        self.projective = None;
+        self.prepend(after)
     }
     pub fn render(mut self, w: u32, h: u32) -> Result<Raster, String> {
         self.matrix = self.matrix.map(exact);
@@ -62,6 +136,18 @@ impl Original {
         let det = a * d - b * c;
         let mut out = if self.pixels.bytes() == 0 {
             Raster::new_depth(w, h, self.pixels.depth)
+        } else if !self.warps.is_empty() {
+            crate::warp::work_budget(w, h, 1, self.warps.len(), 0)?;
+            let placement = self.prepared()?;
+            crate::transform::resample(&self.pixels, w, h, None, |x, y| {
+                placement.sample([x as f64 + 0.5, y as f64 + 0.5])
+            })
+        } else if self.projective.is_some() {
+            let inverse = crate::projective::Map::affine_matrix([1., 0., 0., 1., -0.5, -0.5])
+                .compose(self.placement()?.inverse()?)?;
+            crate::transform::resample(&self.pixels, w, h, None, |x, y| {
+                inverse.sample([x as f64 + 0.5, y as f64 + 0.5])
+            })
         } else if self.matrix == IDENTITY && (w, h) == (self.pixels.width, self.pixels.height) {
             (*self.pixels).clone()
         } else {
@@ -76,7 +162,7 @@ impl Original {
         out.retained = Some(Box::new(self));
         Ok(out)
     }
-    fn bounds(&self, full: bool) -> [f64; 4] {
+    fn bounds(&self, full: bool) -> Result<[f64; 4], String> {
         let p = if full {
             [0, 0, self.pixels.width as i32, self.pixels.height as i32]
         } else {
@@ -87,6 +173,14 @@ impl Original {
                 self.pixels.height as i32,
             ])
         };
+        if !self.warps.is_empty() {
+            self.validate(self.pixels.depth)?;
+            return self.prepared()?.bounds(p.map(|v| v as f64));
+        }
+        if self.projective.is_some() {
+            self.validate(self.pixels.depth)?;
+            return self.placement()?.bounds(p.map(|v| v as f64));
+        }
         let [a, b, c, d, tx, ty] = self.matrix;
         let ps = [[p[0], p[1]], [p[2], p[1]], [p[2], p[3]], [p[0], p[3]]].map(|[x, y]| {
             [
@@ -94,17 +188,37 @@ impl Original {
                 exact(b * x as f64 + d * y as f64 + ty),
             ]
         });
-        [
+        Ok([
             ps.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min),
             ps.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min),
             ps.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max),
             ps.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max),
-        ]
+        ])
     }
 }
 pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     if c["op"] == "move" {
         return crate::transform::move_layer(layer, c);
+    }
+    let projective = crate::projective::parse(c)?;
+    let warp = crate::warp::parse(c)?;
+    let warped = warp
+        .as_ref()
+        .map(|_| {
+            crate::warp::CommandMap::new(
+                c,
+                [
+                    layer.x as f64 + layer.pixels.width as f64 / 2.,
+                    layer.y as f64 + layer.pixels.height as f64 / 2.,
+                ],
+            )
+        })
+        .transpose()?;
+    if (projective.is_some() || warp.is_some()) && layer.source.is_some() {
+        return Err(
+            "Rasterize the editable source at its native precision before Distort, Perspective or Warp"
+                .into(),
+        );
     }
     let n = |key: &str, d: f64| c[key].as_f64().unwrap_or(d);
     let angle = n("angle", 0.);
@@ -113,27 +227,45 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         return Err("Transform scale must be 0.05–20 and rotation must be finite".into());
     }
     let (px, py) = (
-        c["pivot"][0]
-            .as_f64()
-            .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.),
-        c["pivot"][1]
-            .as_f64()
-            .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.),
+        c["pivot"][0].as_f64().unwrap_or_else(|| {
+            projective
+                .map(|p| p.center()[0])
+                .or_else(|| warp.as_ref().map(|w| (w.rect[0] + w.rect[2]) * 0.5))
+                .unwrap_or(layer.x as f64 + layer.pixels.width as f64 / 2.)
+        }),
+        c["pivot"][1].as_f64().unwrap_or_else(|| {
+            projective
+                .map(|p| p.center()[1])
+                .or_else(|| warp.as_ref().map(|w| (w.rect[1] + w.rect[3]) * 0.5))
+                .unwrap_or(layer.y as f64 + layer.pixels.height as f64 / 2.)
+        }),
     );
     if !px.is_finite() || !py.is_finite() || px.abs() > 100000. || py.abs() > 100000. {
         return Err("Invalid transform pivot".into());
     }
-    if angle.rem_euclid(360.) == 0. && sx == 1. && sy == 1. {
+    let [dx, dy] = crate::transform::translation(c)?;
+    if projective.is_none()
+        && warp.is_none()
+        && angle.rem_euclid(360.) == 0.
+        && sx == 1.
+        && sy == 1.
+        && dx == 0.
+        && dy == 0.
+        && crate::transform::skewed([1., 0., 0., 1.], c)? == [1., 0., 0., 1.]
+    {
         return Ok(());
     }
     let (sin, cos) = angle.to_radians().sin_cos();
-    let (a, b, cc, d) = (
-        exact(cos) * sx,
-        exact(sin) * sx,
-        -exact(sin) * sy,
-        exact(cos) * sy,
-    );
-    let delta = [
+    let [a, b, cc, d] = crate::transform::skewed(
+        [
+            exact(cos) * sx,
+            exact(sin) * sx,
+            -exact(sin) * sy,
+            exact(cos) * sy,
+        ],
+        c,
+    )?;
+    let mut delta = [
         a,
         b,
         cc,
@@ -141,12 +273,32 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         px + a * (layer.x as f64 - px) + cc * (layer.y as f64 - py),
         py + b * (layer.x as f64 - px) + d * (layer.y as f64 - py),
     ];
+    if dx != 0. {
+        delta[4] += dx;
+    }
+    if dy != 0. {
+        delta[5] += dy;
+    }
+    let projective_delta = projective
+        .map(|p| {
+            crate::projective::affine(c, p.center())?
+                .compose(p.map)?
+                .compose(crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]))
+        })
+        .transpose()?;
     let world = ["group", "adjustment"].contains(&layer.kind.as_str());
     if world && layer.mask.is_none() {
         return Ok(());
     }
     let mut color = (!world && layer.source.is_none()).then(|| Original::from(&layer.pixels));
-    if layer.kind == "fill" {
+    if layer.kind == "fill" && warp.is_none() {
         if let Some(color) = &mut color {
             let mut r =
                 Raster::new_depth(layer.pixels.width, layer.pixels.height, layer.pixels.depth);
@@ -159,7 +311,24 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         }
     }
     if let Some(color) = &mut color {
-        color.matrix = compose(delta, color.matrix);
+        if let (Some(grid), Some(map)) = (&warp, &warped) {
+            color.append_warp(
+                grid,
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]),
+                map.after,
+            )?;
+        } else if let Some(map) = projective_delta {
+            color.prepend(map)?;
+        } else {
+            color.matrix = compose(delta, color.matrix);
+        }
     }
     let mut masks: Vec<_> = layer
         .mask
@@ -169,18 +338,36 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
                 .iter()
                 .map(|s| {
                     let mut r = Original::from(&s.pixels);
-                    r.matrix = compose(delta, r.matrix);
-                    r
+                    if let (Some(grid), Some(map)) = (&warp, &warped) {
+                        r.append_warp(
+                            grid,
+                            crate::projective::Map::affine_matrix([
+                                1.,
+                                0.,
+                                0.,
+                                1.,
+                                layer.x as f64,
+                                layer.y as f64,
+                            ]),
+                            map.after,
+                        )?;
+                    } else if let Some(map) = projective_delta {
+                        r.prepend(map)?;
+                    } else {
+                        r.matrix = compose(delta, r.matrix);
+                    }
+                    Ok(r)
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()
         })
+        .transpose()?
         .unwrap_or_default();
     let full = layer.mask.as_ref().is_some_and(|m| {
         m.steps
             .iter()
             .any(|s| s.kind == "paint" && s.pixels.bytes() > 0)
     });
-    let mut bounds = color.as_ref().map(|s| s.bounds(full));
+    let mut bounds = color.as_ref().map(|s| s.bounds(full)).transpose()?;
     for (s, o) in layer
         .mask
         .as_ref()
@@ -189,7 +376,7 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         .zip(&masks)
     {
         if s.kind == "paint" && o.pixels.bytes() > 0 {
-            let b = o.bounds(true);
+            let b = o.bounds(true)?;
             bounds = Some(
                 bounds
                     .map(|a| {
@@ -211,8 +398,25 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
             layer.pixels.height,
             layer.pixels.depth,
         ));
-        r.matrix = delta;
-        let b = r.bounds(true);
+        if let (Some(grid), Some(map)) = (&warp, &warped) {
+            r.append_warp(
+                grid,
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]),
+                map.after,
+            )?;
+        } else if let Some(map) = projective_delta {
+            r.prepend(map)?;
+        } else {
+            r.matrix = delta;
+        }
+        let b = r.bounds(true)?;
         bounds = Some(
             bounds
                 .map(|a| {
@@ -226,13 +430,19 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
                 .unwrap_or(b),
         );
     }
-    let b = bounds.unwrap();
-    let (left, top, right, bottom) = (
-        exact(b[0]).floor(),
-        exact(b[1]).floor(),
-        exact(b[2]).ceil(),
-        exact(b[3]).ceil(),
-    );
+    let mut b = bounds.unwrap();
+    if projective_delta.is_none()
+        && warp.is_none()
+        && color
+            .as_ref()
+            .is_none_or(|s| s.projective.is_none() && s.warps.is_empty())
+        && masks
+            .iter()
+            .all(|s| s.projective.is_none() && s.warps.is_empty())
+    {
+        b = b.map(exact);
+    }
+    let (left, top, right, bottom) = (b[0].floor(), b[1].floor(), b[2].ceil(), b[3].ceil());
     if [left, top, right, bottom]
         .iter()
         .any(|v| !v.is_finite() || v.abs() > 100000.)
@@ -246,6 +456,31 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
         h,
         1 + masks.iter().filter(|o| o.pixels.bytes() > 0).count(),
     )?;
+    let stages = color
+        .as_ref()
+        .map_or(0, |o| o.warps.len())
+        .max(masks.iter().map(|o| o.warps.len()).max().unwrap_or(0));
+    if stages > 0 {
+        crate::warp::work_budget(
+            w,
+            h,
+            1 + masks.iter().filter(|o| o.pixels.bytes() > 0).count(),
+            stages,
+            0,
+        )?;
+    }
+    if layer.kind == "fill" && warp.is_some() {
+        if let Some(color) = &mut color {
+            let mut r =
+                Raster::new_depth(color.pixels.width, color.pixels.height, color.pixels.depth);
+            for y in 0..r.height {
+                for x in 0..r.width {
+                    r.set(x as i32, y as i32, layer.color);
+                }
+            }
+            color.pixels = Box::new(r);
+        }
+    }
     let local = [1., 0., 0., 1., -left, -top];
     let before = layer.source.is_some().then(|| layer.clone());
     layer.pixels = if let Some(mut o) = color {
@@ -278,6 +513,20 @@ pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
 /// Mask-only placement keeps Color and other mask steps unchanged. Off-frame
 /// mask samples remain in the retained original, including through a PSD save.
 pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    let projective = crate::projective::combined(c)?;
+    let warp = crate::warp::parse(c)?;
+    let warped = warp
+        .as_ref()
+        .map(|_| {
+            crate::warp::CommandMap::new(
+                c,
+                [
+                    layer.x as f64 + layer.pixels.width as f64 / 2.,
+                    layer.y as f64 + layer.pixels.height as f64 / 2.,
+                ],
+            )
+        })
+        .transpose()?;
     let moving = c["op"] == "move";
     let (sx, sy) = if moving {
         (1., 1.)
@@ -289,15 +538,13 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
     } else {
         c["angle"].as_f64().unwrap_or(0.)
     };
-    let dx = if moving {
-        c["dx"].as_f64().unwrap_or(0.).round()
+    let [dx, dy] = if moving {
+        [
+            c["dx"].as_f64().unwrap_or(0.).round(),
+            c["dy"].as_f64().unwrap_or(0.).round(),
+        ]
     } else {
-        0.
-    };
-    let dy = if moving {
-        c["dy"].as_f64().unwrap_or(0.).round()
-    } else {
-        0.
+        crate::transform::translation(c)?
     };
     let px = c["pivot"][0]
         .as_f64()
@@ -330,33 +577,130 @@ pub(crate) fn mask(layer: &mut Layer, c: &Value) -> Result<(), String> {
         return Err("Select a paint mask step to transform".into());
     }
     crate::transform::work_budget(layer.pixels.width, layer.pixels.height, indices.len())?;
+    let stages = indices
+        .iter()
+        .map(|&i| Original::from(&mask.steps[i].pixels).warps.len() + usize::from(warp.is_some()))
+        .max()
+        .unwrap_or(0);
+    if stages > 0 {
+        crate::warp::work_budget(
+            layer.pixels.width,
+            layer.pixels.height,
+            indices.len(),
+            stages,
+            0,
+        )?;
+    }
     let (sin, cos) = angle.to_radians().sin_cos();
-    let (a, b, cc, d) = (
-        exact(cos) * sx,
-        exact(sin) * sx,
-        -exact(sin) * sy,
-        exact(cos) * sy,
-    );
+    let [a, b, cc, d] = crate::transform::skewed(
+        [
+            exact(cos) * sx,
+            exact(sin) * sx,
+            -exact(sin) * sy,
+            exact(cos) * sy,
+        ],
+        c,
+    )?;
     for index in indices {
         let mut original = Original::from(&mask.steps[index].pixels);
-        original.matrix = compose(
-            [
-                a,
-                b,
-                cc,
-                d,
-                px - a * px - cc * py + dx,
-                py - b * px - d * py + dy,
-            ],
-            original.matrix,
-        );
+        if let (Some(grid), Some(map)) = (&warp, &warped) {
+            original.append_warp(
+                grid,
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]),
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    -(layer.x as f64),
+                    -(layer.y as f64),
+                ])
+                .compose(map.after)?,
+            )?;
+        } else if let Some(map) = projective {
+            original.prepend(
+                crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    -(layer.x as f64),
+                    -(layer.y as f64),
+                ])
+                .compose(map)?
+                .compose(crate::projective::Map::affine_matrix([
+                    1.,
+                    0.,
+                    0.,
+                    1.,
+                    layer.x as f64,
+                    layer.y as f64,
+                ]))?,
+            )?;
+        } else {
+            original.matrix = compose(
+                [
+                    a,
+                    b,
+                    cc,
+                    d,
+                    px - a * px - cc * py + dx,
+                    py - b * px - d * py + dy,
+                ],
+                original.matrix,
+            );
+        }
         mask.steps[index].pixels = original.render(layer.pixels.width, layer.pixels.height)?;
     }
     mask.cache_key = crate::engine::id();
     Ok(())
 }
 pub fn observe(r: &Raster) -> Value {
-    r.retained.as_ref().map(|s|json!({"width":s.pixels.width,"height":s.pixels.height,"bit_depth":s.pixels.depth,"matrix":s.matrix,"bytes":s.pixels.bytes()})).unwrap_or(Value::Null)
+    r.retained.as_ref().map(|s| {
+        let mut value = json!({"width":s.pixels.width,"height":s.pixels.height,"bit_depth":s.pixels.depth,"matrix":s.matrix,"bytes":s.pixels.bytes()});
+        if let Some(map) = s.projective { value["projective"] = json!(map); }
+        if !s.warps.is_empty(){value["warp_stages"]=json!(s.warps);}
+        value
+    }).unwrap_or(Value::Null)
+}
+pub fn has_projective(doc: &Document) -> bool {
+    doc.layers.iter().any(|l| {
+        l.pixels
+            .retained
+            .as_ref()
+            .is_some_and(|o| o.projective.is_some())
+            || l.mask.as_ref().is_some_and(|m| {
+                m.steps.iter().any(|s| {
+                    s.pixels
+                        .retained
+                        .as_ref()
+                        .is_some_and(|o| o.projective.is_some())
+                })
+            })
+    })
+}
+pub fn has_warps(doc: &Document) -> bool {
+    doc.layers.iter().any(|l| {
+        l.pixels
+            .retained
+            .as_ref()
+            .is_some_and(|o| !o.warps.is_empty())
+            || l.mask.as_ref().is_some_and(|m| {
+                m.steps.iter().any(|s| {
+                    s.pixels
+                        .retained
+                        .as_ref()
+                        .is_some_and(|o| !o.warps.is_empty())
+                })
+            })
+    })
 }
 pub fn has_originals(doc: &Document) -> bool {
     doc.layers.iter().any(|l| {

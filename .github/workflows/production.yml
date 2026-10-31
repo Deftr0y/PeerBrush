@@ -1,0 +1,337 @@
+name: PeerBrush production preparation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact reviewed main SHA; all final inputs must bind this source
+        type: string
+        required: true
+      candidate_run_id:
+        description: Successful same-source release-candidate run; data inputs only
+        type: string
+        required: true
+      final_inputs_run_id:
+        description: Independent successful final-inputs.yml producer run ID
+        type: string
+        required: true
+      final_inputs_artifact_id:
+        description: Exact selected final-input data artifact ID
+        type: string
+        required: true
+      final_inputs_artifact_sha256:
+        description: Independent outer Actions artifact SHA-256
+        type: string
+        required: true
+      final_inputs_bundle_sha256:
+        description: Independent inner final-inputs.zip SHA-256
+        type: string
+        required: true
+      final_inputs_index_sha256:
+        description: Independent strict final-inputs.json SHA-256
+        type: string
+        required: true
+      release_notes_sha256:
+        description: Independent SHA-256 of reviewed docs/release-0.30.md public notes
+        type: string
+        required: true
+      selection_sha256:
+        description: Independent portable selection.json SHA-256; selectors never grant readiness
+        type: string
+        required: true
+
+      site_selection_json:
+        description: Reviewed public site_commit, final_inventory_sha256, notes and caution JSON; no readiness claims
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: peerbrush-microsoft-store-submission
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  gate:
+    if: github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact source and existing version checks
+        run: python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - name: Verify offline composition and transaction contracts
+        run: |
+          python -B scripts/test_final_release.py
+          python -B scripts/test_final_inputs.py
+          python -B scripts/test_publish_release.py
+      - name: Report disabled production authority
+        run: |
+          echo 'Final composition and immutable transaction are prepared. Windows signing/qualification handoff is prepared but inactive and unverified. Authenticated installed producers and complete native acceptance remain source work; publication and Store submission are disabled.' >> "$GITHUB_STEP_SUMMARY"
+
+  compose:
+    # Explicit activation and independent authority provisioning remain required.
+    if: ${{ false }}
+    needs: gate
+    runs-on: ubuntu-24.04
+    environment: production-preparation
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+      FINAL_INPUTS_RUN: ${{ inputs.final_inputs_run_id }}
+      FINAL_INPUTS_ARTIFACT: ${{ inputs.final_inputs_artifact_id }}
+      FINAL_INPUTS_ARTIFACT_SHA256: ${{ inputs.final_inputs_artifact_sha256 }}
+      FINAL_INPUTS_BUNDLE_SHA256: ${{ inputs.final_inputs_bundle_sha256 }}
+      FINAL_INPUTS_INDEX_SHA256: ${{ inputs.final_inputs_index_sha256 }}
+      SELECTION_SHA256: ${{ inputs.selection_sha256 }}
+      RELEASE_NOTES_SHA256: ${{ inputs.release_notes_sha256 }}
+    steps:
+      - name: Require exact reviewed production invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ['EXPECTED_COMMIT']
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or os.environ.get('GITHUB_SHA') != expected or os.environ.get('GITHUB_WORKFLOW_SHA') != expected
+                  or os.environ.get('GITHUB_REPOSITORY') != 'Deftr0y/PeerBrush'
+                  or os.environ.get('GITHUB_REF') != 'refs/heads/main'
+                  or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
+                  or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/production.yml@refs/heads/main'):
+              raise SystemExit('Require reviewed exact main production preparation.')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact source
+        run: python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - name: Acquire separate exact final-input producer data
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          python -B scripts/acquire_final_inputs.py --source-root "$GITHUB_WORKSPACE" \
+            --commit "$EXPECTED_COMMIT" --candidate-run-id "$CANDIDATE_RUN" \
+            --run-id "$FINAL_INPUTS_RUN" --artifact-id "$FINAL_INPUTS_ARTIFACT" \
+            --artifact-sha256 "$FINAL_INPUTS_ARTIFACT_SHA256" --bundle-sha256 "$FINAL_INPUTS_BUNDLE_SHA256" \
+            --index-sha256 "$FINAL_INPUTS_INDEX_SHA256" --selection-sha256 "$SELECTION_SHA256" \
+            --output "$RUNNER_TEMP/peerbrush-final-inputs"
+      - name: Revalidate actual final inputs through the publication preflight
+        run: |
+          set +e
+          python -B scripts/publish_release.py --source-root "$GITHUB_WORKSPACE" \
+            --directory "$RUNNER_TEMP/peerbrush-final-inputs/data" --selection-sha256 "$SELECTION_SHA256" \
+            --final-input-index "$RUNNER_TEMP/peerbrush-final-inputs/final-inputs.json" \
+            --final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256" \
+            --notes "$GITHUB_WORKSPACE/docs/release-0.30.md" --notes-sha256 "$RELEASE_NOTES_SHA256" \
+            --work "$RUNNER_TEMP/peerbrush-final-verification" --output "$RUNNER_TEMP/peerbrush-final-candidate"
+          result=$?
+          set -e
+          if [ "$result" -ne 2 ]; then exit 1; fi
+          echo 'Final byte composition retained; installed/public/production authority remains blocked.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain exact public candidate files only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: final-release-composition-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-final-candidate/*
+          if-no-files-found: error
+
+
+  publish:
+    # Reviewable calls only: activation, write permission, native acceptance and
+    # explicit protected approval remain independent unconfigured requirements.
+    if: ${{ false }}
+    needs: compose
+    runs-on: ubuntu-24.04
+    environment: production-preparation
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+      FINAL_INPUTS_RUN: ${{ inputs.final_inputs_run_id }}
+      FINAL_INPUTS_ARTIFACT: ${{ inputs.final_inputs_artifact_id }}
+      FINAL_INPUTS_ARTIFACT_SHA256: ${{ inputs.final_inputs_artifact_sha256 }}
+      FINAL_INPUTS_BUNDLE_SHA256: ${{ inputs.final_inputs_bundle_sha256 }}
+      FINAL_INPUTS_INDEX_SHA256: ${{ inputs.final_inputs_index_sha256 }}
+      SELECTION_SHA256: ${{ inputs.selection_sha256 }}
+      RELEASE_NOTES_SHA256: ${{ inputs.release_notes_sha256 }}
+      PEERBRUSH_PRODUCTION_APPROVED: 'false'
+      PEERBRUSH_STORE_HANDOFF_ENABLED: 'false'
+    steps:
+      - name: Require exact reviewed production invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ['EXPECTED_COMMIT']
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or os.environ.get('GITHUB_SHA') != expected or os.environ.get('GITHUB_WORKFLOW_SHA') != expected
+                  or os.environ.get('GITHUB_REPOSITORY') != 'Deftr0y/PeerBrush'
+                  or os.environ.get('GITHUB_REF') != 'refs/heads/main'
+                  or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
+                  or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/production.yml@refs/heads/main'):
+              raise SystemExit('Require reviewed exact main production preparation.')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact source
+        run: python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - name: Acquire separate exact final-input producer data
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          python -B scripts/acquire_final_inputs.py --source-root "$GITHUB_WORKSPACE" \
+            --commit "$EXPECTED_COMMIT" --candidate-run-id "$CANDIDATE_RUN" \
+            --run-id "$FINAL_INPUTS_RUN" --artifact-id "$FINAL_INPUTS_ARTIFACT" \
+            --artifact-sha256 "$FINAL_INPUTS_ARTIFACT_SHA256" --bundle-sha256 "$FINAL_INPUTS_BUNDLE_SHA256" \
+            --index-sha256 "$FINAL_INPUTS_INDEX_SHA256" --selection-sha256 "$SELECTION_SHA256" \
+            --output "$RUNNER_TEMP/peerbrush-final-inputs"
+      - name: Publish only through actual composition and immutable reconciliation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MSSTORE_TENANT_ID: ${{ secrets.MSSTORE_TENANT_ID }}
+          MSSTORE_CLIENT_ID: ${{ secrets.MSSTORE_CLIENT_ID }}
+          MSSTORE_CLIENT_SECRET: ${{ secrets.MSSTORE_CLIENT_SECRET }}
+        run: |
+          umask 077
+          python -B scripts/publish_release.py --source-root "$GITHUB_WORKSPACE" \
+            --directory "$RUNNER_TEMP/peerbrush-final-inputs/data" --selection-sha256 "$SELECTION_SHA256" \
+            --final-input-index "$RUNNER_TEMP/peerbrush-final-inputs/final-inputs.json" \
+            --final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256" \
+            --notes "$GITHUB_WORKSPACE/docs/release-0.30.md" --notes-sha256 "$RELEASE_NOTES_SHA256" \
+            --work "$RUNNER_TEMP/peerbrush-final-verification" --output "$RUNNER_TEMP/peerbrush-final-candidate" --execute
+      - name: Retain final manifest only after exact public release readback
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: published-final-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-final-candidate/final-release-inventory.json
+          if-no-files-found: error
+      - name: Retain sanitized Store intent and submission receipt for reconciliation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: store-submission-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-store-handoff/submission.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  site:
+    # A review overlay/exclusion report only. No branch, Pages or Store mutation.
+    if: ${{ false }}
+    needs: publish
+    runs-on: ubuntu-24.04
+    environment: production-preparation
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      SITE_SELECTION: ${{ inputs.site_selection_json }}
+    steps:
+      - name: Require exact reviewed production invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ['EXPECTED_COMMIT']
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or os.environ.get('GITHUB_SHA') != expected or os.environ.get('GITHUB_WORKFLOW_SHA') != expected
+                  or os.environ.get('GITHUB_REPOSITORY') != 'Deftr0y/PeerBrush'
+                  or os.environ.get('GITHUB_REF') != 'refs/heads/main'
+                  or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
+                  or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/production.yml@refs/heads/main'):
+              raise SystemExit('Require reviewed exact main production preparation.')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact source
+        run: python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - name: Validate explicit public site selection
+        run: |
+          umask 077
+          python -B - <<'PY'
+          import json, os, re, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from production_readiness import unique_fields
+          from prepare_site_release import encode
+          raw = os.environ['SITE_SELECTION']
+          if len(raw.encode('utf-8')) > 128 * 1024:
+              raise SystemExit('Reviewed public site selection is oversized.')
+          selected = json.loads(raw, object_pairs_hook=unique_fields)
+          if (not isinstance(selected, dict)
+                  or set(selected) != {'site_commit', 'final_inventory_sha256', 'notes', 'caution'}
+                  or type(selected['site_commit']) is not str or not re.fullmatch('[0-9a-f]{40}', selected['site_commit'])
+                  or type(selected['final_inventory_sha256']) is not str or not re.fullmatch('[0-9a-f]{64}', selected['final_inventory_sha256'])
+                  or not isinstance(selected['notes'], list) or not 1 <= len(selected['notes']) <= 30
+                  or any(type(n) is not str or not 0 < len(n) <= 2000 for n in selected['notes'])
+                  or type(selected['caution']) is not str or len(selected['caution']) > 4000):
+              raise SystemExit('Select exact public site source, final manifest digest, notes and caution only.')
+          with (Path(os.environ['RUNNER_TEMP']) / 'peerbrush-site-notes.json').open('xb') as stream:
+              stream.write(encode({key: selected[key] for key in ['notes', 'caution']}))
+          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as stream:
+              stream.write('SITE_COMMIT=' + selected['site_commit'] + '\nFINAL_INVENTORY_SHA256=' + selected['final_inventory_sha256'] + '\n')
+          PY
+      - name: Acquire exact selected site-content objects without changing release source
+        run: git fetch --no-tags --depth=1 origin "$SITE_COMMIT"
+      - name: Acquire independently selected bounded public final manifest
+        run: |
+          umask 077
+          python -B - <<'PY'
+          import json, os, re, sys, tomllib
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from final_release import MANIFEST, encode, read, validate_manifest
+          from package_macos_dmg import private_inspection_directory
+          from prepare_site_release import DOWNLOAD, public_get, sha
+          from production_readiness import unique_fields
+          source = Path(os.environ['GITHUB_WORKSPACE'])
+          version = tomllib.loads((source / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
+          expected = os.environ['FINAL_INVENTORY_SHA256']
+          commit = os.environ['EXPECTED_COMMIT']
+          if (type(version) is not str or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
+                  or not re.fullmatch('[0-9a-f]{64}', expected) or not re.fullmatch('[0-9a-f]{40}', commit)):
+              raise SystemExit('Select a stable exact-source release and independent final manifest digest.')
+          raw = public_get(DOWNLOAD + 'v' + version + '/' + MANIFEST, 128 * 1024)
+          if type(raw) is not bytes or not 0 < len(raw) <= 128 * 1024 or sha(raw) != expected:
+              raise ValueError('Public final manifest differs from its independent bounded selection.')
+          manifest = json.loads(raw, object_pairs_hook=unique_fields)
+          validate_manifest(manifest)
+          if raw != encode(manifest) or manifest['version'] != version or manifest['commit'] != commit:
+              raise ValueError('Public final manifest is not the canonical selected source and version.')
+          output = private_inspection_directory(Path(os.environ['RUNNER_TEMP']) / 'peerbrush-site-manifest', source, fresh=True)
+          output.mkdir(mode=0o700)
+          target = output / MANIFEST
+          with target.open('xb') as stream:
+              stream.write(raw)
+          if read(target, 128 * 1024, expected) != raw:
+              raise ValueError('Owned public final manifest changed during readback.')
+          PY
+      - name: Prepare website only from selected exact public final bytes
+        run: |
+          umask 077
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          set +e
+          python -B scripts/prepare_site_release.py --site-commit "$SITE_COMMIT" \
+            --tag "v$VERSION" --commit "$EXPECTED_COMMIT" \
+            --final-inventory "$RUNNER_TEMP/peerbrush-site-manifest/final-release-inventory.json" \
+            --final-inventory-sha256 "$FINAL_INVENTORY_SHA256" \
+            --notes "$RUNNER_TEMP/peerbrush-site-notes.json" --output "$RUNNER_TEMP/peerbrush-site-preparation"
+          result=$?
+          set -e
+          if [ "$result" -ne 0 ] && [ "$result" -ne 2 ]; then exit 1; fi
+          echo 'Review only: unavailable builds stay excluded; no site branch or Pages deployment changed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain reviewable site overlay or explicit exclusions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: site-release-preparation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-site-preparation/*
+          if-no-files-found: error

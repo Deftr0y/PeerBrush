@@ -147,6 +147,7 @@ impl PeerBrush {
         let mut open = true;
         let mut restore = None;
         egui::Window::new("Previous saves").id(egui::Id::new("previous saves")).open(&mut open).resizable(false).default_width(460.).show(ctx, |ui| {
+            dialogs::body(ui, 460.);
             ui.label(RichText::new(browser.original.file_name().unwrap_or_default().to_string_lossy()).strong());
             ui.label("Choose a version to inspect in a new unsaved project. Your current project and saved file stay available.");
             if let Some(error) = &browser.error { ui.label(RichText::new(error).color(ACCENT)); }

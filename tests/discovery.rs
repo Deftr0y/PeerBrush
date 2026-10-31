@@ -1,6 +1,9 @@
 use peerbrush::discovery::{self, ClientConfig, ClientKind, DiscoveryPaths, Manifest};
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 struct Fixture {
     root: PathBuf,
@@ -63,6 +66,9 @@ impl Fixture {
     }
     fn connect(&self) -> discovery::Report {
         discovery::connect_at(&self.executable, &self.state, &self.paths).unwrap()
+    }
+    fn status(&self, requested: Option<&Path>) -> Value {
+        serde_json::to_value(discovery::status_at(&self.paths, requested)).unwrap()
     }
 }
 impl Drop for Fixture {
@@ -376,4 +382,249 @@ fn installed_alias_migrates_old_portable_target_and_repeats_without_rewrites() {
     );
     assert_eq!(config["mcp_servers"].as_table().unwrap().len(), 1);
     assert!(f.connect().clients.iter().all(|client| !client.changed));
+}
+
+fn file_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(file_snapshot(&path));
+        } else {
+            files.insert(path.clone(), fs::read(path).unwrap());
+        }
+    }
+    files
+}
+
+#[test]
+fn discovery_status_rejects_invalid_stale_and_mismatched_routes_without_leaking_metadata() {
+    let f = Fixture::new(&[]);
+    assert_eq!(f.status(None)["manifest_status"], "missing");
+    f.connect();
+    fs::remove_file(f.state.join("connection.json")).unwrap();
+    let original = fs::read(&f.paths.manifest).unwrap();
+    let base: Value = serde_json::from_slice(&original).unwrap();
+    for (field, value) in [
+        ("schema_version", json!(2)),
+        ("name", json!("Other app")),
+        ("version", json!("not a version")),
+        ("transport", json!("http")),
+        ("command", json!("relative/peerbrush")),
+        ("args", json!(["mcp", "--state-dir", "relative-state"])),
+        ("args", json!(["mcp", "--state-dir", f.state, "extra"])),
+        (
+            "connection_file",
+            json!(f.root.join("other/connection.json")),
+        ),
+        (
+            "http_endpoint_template",
+            json!("https://example.invalid/DO_NOT_LEAK_PRIVATE_METADATA"),
+        ),
+    ] {
+        let mut changed = base.clone();
+        changed[field] = value;
+        fs::write(&f.paths.manifest, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let before = file_snapshot(&f.root);
+        let status = f.status(None);
+        assert_eq!(status["manifest_status"], "invalid", "{field}");
+        assert!(status["connection"].is_null() && status["stdio"].is_null());
+        assert!(!status.to_string().contains("DO_NOT_LEAK"));
+        assert_eq!(file_snapshot(&f.root), before);
+    }
+    fs::write(&f.paths.manifest, &original).unwrap();
+    let status = f.status(Some(&f.root.join("different state")));
+    assert_eq!(status["manifest_status"], "state_mismatch");
+    assert!(status["connection"].is_null());
+    fs::remove_file(&f.executable).unwrap();
+    assert_eq!(f.status(None)["manifest_status"], "executable_missing");
+    fs::write(&f.paths.manifest, b"DO_NOT_LEAK_BROKEN_MANIFEST").unwrap();
+    assert_eq!(f.status(None)["manifest_status"], "invalid");
+    fs::remove_file(&f.paths.manifest).unwrap();
+    fs::create_dir(&f.paths.manifest).unwrap();
+    assert_eq!(f.status(None)["manifest_status"], "unreadable");
+}
+
+#[test]
+fn discovery_status_assesses_each_client_without_registration_or_policy_writes() {
+    let f = Fixture::new(&[
+        ClientKind::Codex,
+        ClientKind::ClaudeDesktop,
+        ClientKind::Cursor,
+        ClientKind::Gemini,
+    ]);
+    f.connect();
+    fs::remove_file(f.state.join("connection.json")).unwrap();
+    let before = file_snapshot(&f.root);
+    let status = f.status(None);
+    assert_eq!(status["manifest_status"], "ready");
+    assert_eq!(status["connection"]["category"], "connection_missing");
+    assert_eq!(status["stdio"]["command"], json!(f.executable));
+    assert_eq!(
+        status["stdio"]["args"],
+        json!(["mcp", "--state-dir", f.state])
+    );
+    assert!(status["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|client| client["category"] == "matching"));
+    assert_eq!(file_snapshot(&f.root), before);
+    for (index, client) in f.paths.clients.iter().enumerate() {
+        let original = fs::read(&client.path).unwrap();
+        for (bytes, expected) in [
+            (b"{{ DO_NOT_LEAK_PRIVATE_CONFIG".to_vec(), "invalid"),
+            (
+                if client.kind == ClientKind::Codex {
+                    b"# no registration\n".to_vec()
+                } else {
+                    b"{}\n".to_vec()
+                },
+                "needs_refresh",
+            ),
+        ] {
+            fs::write(&client.path, &bytes).unwrap();
+            let before = file_snapshot(&f.root);
+            let status = f.status(None);
+            assert_eq!(status["clients"][index]["category"], expected);
+            assert!(!status.to_string().contains("DO_NOT_LEAK"));
+            assert_eq!(file_snapshot(&f.root), before);
+        }
+        let changed = if client.kind == ClientKind::Codex {
+            let mut document = std::str::from_utf8(&original)
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            document["mcp_servers"]["peerbrush"]["command"] = toml_edit::value("other-executable");
+            document.to_string().into_bytes()
+        } else {
+            let mut document: Value = serde_json::from_slice(&original).unwrap();
+            document["mcpServers"]["peerbrush"]["command"] = json!("other-executable");
+            serde_json::to_vec(&document).unwrap()
+        };
+        fs::write(&client.path, &changed).unwrap();
+        let before = file_snapshot(&f.root);
+        assert_eq!(
+            f.status(None)["clients"][index]["category"],
+            "needs_refresh"
+        );
+        assert_eq!(file_snapshot(&f.root), before);
+        fs::remove_file(&client.path).unwrap();
+        assert_eq!(f.status(None)["clients"][index]["category"], "missing");
+        let mut undetected = f.paths.clone();
+        undetected.clients[index].detected = false;
+        let status = serde_json::to_value(discovery::status_at(&undetected, None)).unwrap();
+        assert_eq!(status["clients"][index]["category"], "not_detected");
+        fs::create_dir(&client.path).unwrap();
+        assert_eq!(f.status(None)["clients"][index]["category"], "unreadable");
+        fs::remove_dir(&client.path).unwrap();
+        fs::write(&client.path, original).unwrap();
+    }
+    let original = f.text(0);
+    let mut disabled = original.parse::<toml_edit::DocumentMut>().unwrap();
+    disabled["mcp_servers"]["peerbrush"]["enabled"] = toml_edit::value(false);
+    f.write(0, &disabled.to_string());
+    let before = file_snapshot(&f.root);
+    assert_eq!(f.status(None)["clients"][0]["category"], "needs_refresh");
+    assert_eq!(file_snapshot(&f.root), before);
+    f.write(0, &original);
+    let mut blocked: Value = serde_json::from_str(&f.text(3)).unwrap();
+    blocked["mcp"] = json!({"excluded":["peerbrush"], "private":"DO_NOT_LEAK_PRIVATE_POLICY"});
+    f.write(3, &serde_json::to_string(&blocked).unwrap());
+    let before = file_snapshot(&f.root);
+    let status = f.status(None);
+    assert_eq!(status["clients"][3]["category"], "blocked");
+    assert!(!status.to_string().contains("DO_NOT_LEAK"));
+    assert_eq!(file_snapshot(&f.root), before);
+}
+
+#[test]
+fn discovery_status_probes_only_the_selected_route_with_a_read_only_ping() {
+    let f = Fixture::new(&[]);
+    f.connect();
+    let listener = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.server_addr().to_ip().unwrap());
+    fs::write(
+        f.state.join("connection.json"),
+        serde_json::to_vec(&json!({
+        "url":url, "token":"DO_NOT_LEAK_DUMMY_TOKEN"}))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = file_snapshot(&f.root);
+    let worker = std::thread::spawn(move || {
+        let mut request = listener
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .expect("one status ping");
+        assert_eq!(request.method().as_str(), "POST");
+        assert_eq!(request.url(), "/rpc");
+        assert!(request
+            .headers()
+            .iter()
+            .any(|header| header.field.equiv("Authorization")
+                && header.value.as_str() == "Bearer DO_NOT_LEAK_DUMMY_TOKEN"));
+        let payload: Value = serde_json::from_reader(request.as_reader()).unwrap();
+        assert_eq!(payload["method"], "mcp");
+        let ping = &payload["params"]["request"];
+        assert_eq!(ping["method"], "ping");
+        assert!(ping["_client"]
+            .as_str()
+            .unwrap()
+            .starts_with("discovery-probe-"));
+        request
+            .respond(tiny_http::Response::from_string(
+                serde_json::to_string(&json!({
+                    "ok":true, "result":{"jsonrpc":"2.0", "id":ping["id"], "result":{}}
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+    });
+    let status = f.status(Some(&f.state));
+    worker.join().unwrap();
+    assert_eq!(status["connection"]["category"], "ready");
+    assert!(!status.to_string().contains("DO_NOT_LEAK"));
+    assert_eq!(file_snapshot(&f.root), before);
+}
+
+#[test]
+fn discovery_status_cli_keeps_raw_discovery_and_never_starts_a_workspace() {
+    let f = Fixture::new(&[]);
+    f.connect();
+    fs::remove_file(f.state.join("connection.json")).unwrap();
+    let before = file_snapshot(&f.root);
+    let invoke = |args: &[&std::ffi::OsStr]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_peerbrush"));
+        command
+            .args(args)
+            .env_clear()
+            .env("HOME", &f.root)
+            .env("USERPROFILE", &f.root)
+            .env("CODEX_HOME", f.root.join(".codex"))
+            .env("LOCALAPPDATA", f.root.join("AppData/Local"))
+            .env("APPDATA", f.root.join("AppData/Roaming"));
+        if let Some(system) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system);
+        }
+        command.output().unwrap()
+    };
+    let raw = invoke(&["discover".as_ref()]);
+    assert!(raw.status.success());
+    assert_eq!(raw.stdout, before[&f.paths.manifest]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw.stdout).unwrap(),
+        serde_json::from_slice::<Value>(&before[&f.paths.manifest]).unwrap()
+    );
+    let output = invoke(&[
+        "discover".as_ref(),
+        "--status".as_ref(),
+        "--state-dir".as_ref(),
+        f.state.as_os_str(),
+    ]);
+    assert!(output.status.success());
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["manifest_status"], "ready");
+    assert_eq!(status["connection"]["category"], "connection_missing");
+    assert_eq!(file_snapshot(&f.root), before);
 }

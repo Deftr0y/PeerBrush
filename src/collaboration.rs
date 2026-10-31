@@ -72,6 +72,12 @@ fn raster_tiles(r: &Raster, out: &mut HashMap<usize, usize>) {
         out.insert(Arc::as_ptr(tile) as usize, tile.len() * 2);
     }
     if let Some(original) = &r.retained {
+        if !original.warps.is_empty() {
+            out.insert(
+                original.warps.as_ptr() as usize,
+                original.warps.capacity() * std::mem::size_of::<crate::warp::Stage>(),
+            );
+        }
         raster_tiles(&original.pixels, out);
     }
 }
@@ -385,6 +391,41 @@ mod tests {
                 .sum::<usize>(),
             2 * 256 * 256 * 4 * 2
         );
+    }
+    #[test]
+    fn warp_metadata_is_counted_for_each_owned_chain_while_original_tiles_stay_shared() {
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(16, 16, depth).unwrap();
+            doc.layers[0]
+                .pixels
+                .set16(1, 1, [12347, 23459, 34571, 65535]);
+            let mut original = crate::retained::Original::from(&doc.layers[0].pixels);
+            original.warps.push(crate::warp::Stage {
+                before: crate::projective::Map::IDENTITY.matrix(),
+                grid: crate::warp::Grid::identity([-2., -2., 18., 18.]).unwrap(),
+            });
+            original.validate(depth).unwrap();
+            let metadata = original.warps.capacity() * std::mem::size_of::<crate::warp::Stage>();
+            let tiles = original.pixels.bytes();
+            doc.layers[0].pixels.retained = Some(Box::new(original));
+            assert_eq!(doc.layers[0].pixels.stored_bytes(), 2 * tiles + metadata);
+            let clone = doc.clone();
+            let cloned_metadata = clone.layers[0]
+                .pixels
+                .retained
+                .as_ref()
+                .unwrap()
+                .warps
+                .capacity()
+                * std::mem::size_of::<crate::warp::Stage>();
+            let mut shared = HashMap::new();
+            doc_tiles(&doc, &mut shared);
+            doc_tiles(&clone, &mut shared);
+            assert_eq!(
+                shared.values().sum::<usize>(),
+                tiles + metadata + cloned_metadata
+            );
+        }
     }
     #[test]
     fn proposal_expiry_drops_sources_without_history_or_document_changes() {

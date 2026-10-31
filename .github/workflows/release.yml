@@ -1,6 +1,8 @@
 name: PeerBrush release candidates
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       expected_commit:
@@ -19,7 +21,7 @@ on:
         default: false
         type: boolean
       store_package_version:
-        description: Optional approved Store version A.B.C.0; blank maps Cargo version
+        description: Optional canonical Store version A.B.C.0; blank maps Cargo version
         required: false
         type: string
       previous_store_version:
@@ -38,33 +40,202 @@ jobs:
         os: [windows-2025, macos-26, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     env:
-      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
-      - uses: actions/checkout@v4
+      - name: Require exact release invocation
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ.get('EXPECTED_COMMIT', '')
+          ref = os.environ.get('GITHUB_REF', '')
+          event = os.environ.get('GITHUB_EVENT_NAME', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_SHA': expected, 'GITHUB_WORKFLOW_SHA': expected,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/release.yml@' + ref,
+          }
+          manual_ref = any(ref.startswith(prefix) and len(ref) > len(prefix) for prefix in ['refs/heads/', 'refs/tags/'])
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or not ((event == 'push' and ref == 'refs/heads/main')
+                          or (event == 'workflow_dispatch' and manual_ref))):
+              raise SystemExit('Release source must match its exact reviewed workflow invocation before checkout or signing.')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.expected_commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Pin existing Python for native packaging
+        if: runner.os == 'macOS'
+        run: python -I scripts/select_native_python.py
       - name: Check exact release source
         shell: bash
         run: python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
       - name: Check committed package source
         run: python scripts/package.py --check-source
-      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Windows'
+        name: Initialize existing MSVC SDK for native codec
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nativeTools = @{}
+          foreach ($name in @('clang-cl', 'cmake', 'ninja')) {
+            $nativeTools[$name] = (Get-Command $name -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $installation) { throw 'Existing Visual Studio C++ tools unavailable' }
+          $launch = Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1'
+          & $launch -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          python -B scripts/jxl_build.py --github-env --selected-clang-cl ($nativeTools['clang-cl']) --selected-cmake ($nativeTools['cmake']) --selected-ninja ($nativeTools['ninja'])
+          if ($LASTEXITCODE -ne 0) { throw 'Native codec tool qualification failed' }
+      - if: runner.os != 'Windows'
+        name: Select existing native codec tools
+        run: python3 -B scripts/jxl_build.py --github-env
+      - name: Verify native codec tool selection regressions
+        run: python -B scripts/test_jxl_build.py
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
         with:
+          toolchain: 1.92.0
           components: rustfmt, clippy, rust-docs
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
+      - run: python -B scripts/test_ci_diagnostics.py
+      - run: python -B scripts/test_release_source_guard.py
       - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
+      - run: rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
+      - name: Build source-matched JPEG XL worker for integration tests
+        run: cargo build --locked --bin peerbrush
+      - name: Check the separate setup entry in the ordinary non-test configuration
+        run: cargo check --locked --features windows-setup --bin peerbrush-setup
       - run: cargo test --locked
+      - name: Verify native installed-font inventory without registration
+        run: cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact
+      - run: cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
+      - if: runner.os == 'Windows'
+        run: cargo test --locked --test clipboard -- --ignored
       - run: cargo clippy --all-targets --locked
+      - name: Verify native macOS document delivery and icon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo run --locked --example macos_activation
+          cargo run --locked --example macos_quit
+          sips -s format png assets/peerbrush.icns --out "$RUNNER_TEMP/peerbrush-icon.png"
       - run: python scripts/test_package.py
       - run: python scripts/test_msix.py
+      - run: python -B scripts/test_signed_msix.py
+      - run: python -B scripts/test_windows_executable_signing.py
+      - run: python -B scripts/test_windows_qualification.py
+      - run: python -B scripts/test_appinstaller.py
+      - run: python -B scripts/test_store_msix_preflight.py
+      - run: python -B scripts/test_store_msix_handoff.py
       - run: python scripts/test_sign_macos.py
+      - run: python -B scripts/test_macos_signing_producer.py
+      - run: python -B scripts/test_deb.py
+      - run: python -B scripts/test_deb_version_upgrade_checks.py
+      - run: python -B scripts/test_deb_installed_gui_checks.py
+      - run: python -B scripts/test_macos_dmg.py
+      - run: python -B scripts/test_final_macos_dmg.py
+      - run: python -B scripts/test_dmg_file_identity.py
+      - run: python -B scripts/test_dmg_handoff.py
+      - run: python -B scripts/test_macos_qualification_attestation.py
+      - run: python -B scripts/test_macos_qualification_producer.py
+      - run: python -B scripts/test_macos_qualification_job.py
+      - run: python -B scripts/test_sign_macos_dmg.py
+      - name: Native DMG round trip with synthetic unsigned data
+        if: runner.os == 'macOS'
+        run: python3 -B scripts/test_macos_dmg_native.py
+      - run: python -B scripts/test_prepare_sparkle.py
+      - run: python -B scripts/test_sparkle_bundle.py
+      - name: Verify disabled native Sparkle preparation
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/Sparkle-2.10.0.zip" 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip'
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --output "$RUNNER_TEMP/peerbrush-sparkle-preparation"
+          cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-preparation/Sparkle.framework"
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --native-audit-output "$RUNNER_TEMP/peerbrush-sparkle-native-audit"
+          cat "$RUNNER_TEMP/peerbrush-sparkle-native-audit/native-policy-candidate.json"
       - run: python scripts/test_submit_store_release.py
+      - run: python -B scripts/test_store_workflow.py
+      - run: python scripts/test_store_release_state.py
+      - run: python scripts/test_production_readiness.py
+      - run: python -B scripts/test_final_release.py
+      - run: python -B scripts/test_final_inputs.py
+      - run: python -B scripts/test_publish_release.py
+      - run: python -B scripts/test_prepare_site_release.py
+      - run: python -B scripts/test_readback_site_release.py
       - run: python scripts/build_release.py
+      - name: Verify fixed-offer setup feature component tests
+        run: cargo test --locked --features windows-setup --lib updates::windows::bootstrap
+      - name: Build dormant setup entry without an offer
+        run: python -B scripts/build_release.py --setup-entry
+      - name: Verify fixed-offer setup contracts and read-only runtime
+        run: python -B scripts/test_windows_setup.py
+      - run: python -B scripts/test_windows_version.py
       - run: python scripts/test_msix_runtime_tests.py
-      - run: python scripts/package.py
+      - name: Package exact platform with dormant macOS dependency
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            python scripts/package.py --sparkle-archive "$RUNNER_TEMP/Sparkle-2.10.0.zip"
+          else
+            python scripts/package.py
+          fi
+      - name: Round-trip exact dormant app framework and native continuations
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          COMMIT=$(git rev-parse HEAD)
+          python3 -B scripts/check_bundled_sparkle.py --archive "dist/PeerBrush-$VERSION-macOS-arm64.zip" --work "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture" --commit "$COMMIT" --version "$VERSION"
+          cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture/payload/PeerBrush.app" --bundled
+      - name: Build and test Ubuntu installation candidate in a disposable container
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          PORTABLE="dist/PeerBrush-$VERSION-Linux-x64.zip"
+          DIGEST=$(sha256sum "$PORTABLE" | cut -d ' ' -f 1)
+          python3 -B scripts/package_deb.py --portable "$PORTABLE" --portable-sha256 "$DIGEST" --output dist/deb --maintainer 'PeerBrush CI fixture <builds@example.invalid>'
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          HASHES=$(python3 -c 'import pathlib,sys; sys.path.insert(0,"scripts"); from verify_release import inspect_archive; record=inspect_archive(pathlib.Path(sys.argv[1]),sys.argv[2],sys.argv[3])["manifest"]; print(record["executable_sha256"],record["source_sha256"])' "$PORTABLE" "$SOURCE_COMMIT" "$VERSION")
+          read -r EXECUTABLE_SHA SOURCE_SHA <<< "$HASHES"
+          set -- dist/deb/*.deb
+          test "$#" -eq 1
+          DEB="$1"
+          DEB_SHA=$(sha256sum "$DEB" | cut -d ' ' -f 1)
+          EVIDENCE=$(mktemp -d "$RUNNER_TEMP/peerbrush-deb-acceptance.XXXXXX")
+          docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
+            --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
+            bash -eu -c 'apt-get update; apt-get install -y python3 xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd; python3 -B /checks/test_deb_installation.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installation.json' \
+            peerbrush-deb-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
+          python3 -B scripts/production_readiness.py --deb "$DEB" --deb-sha256 "$DEB_SHA" \
+            --portable "$PORTABLE" --portable-sha256 "$DIGEST" \
+            --installation-receipt "$EVIDENCE/installation.json" --commit "$SOURCE_COMMIT" --version "$VERSION" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' --output "$DEB.qualification.json"
+
+          # Actual published portable -> current installed application; no historical DEB is invented.
+          docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env PEERBRUSH_DISPOSABLE_REAL_UPGRADE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
+            --volume "$PWD/dist/deb:/packages:ro" --volume "$PWD/scripts:/checks:ro" --volume "$EVIDENCE:/evidence" ubuntu:24.04 \
+            bash -eu -c 'apt-get update; apt-get install -y python3 git ca-certificates xdg-utils shared-mime-info desktop-file-utils libfile-mimeinfo-perl file passwd xvfb xauth dbus-x11 libglib2.0-bin openbox wmctrl xdotool mesa-vulkan-drivers libgl1-mesa-dri;
+              git init --quiet /historical-source;
+              git -C /historical-source remote add origin https://github.com/Deftr0y/PeerBrush.git;
+              git -C /historical-source fetch --quiet --no-tags --depth=1 origin a00cf47accde87400fad3f0fcfc5fe96fc4f5be1;
+              git -C /historical-source checkout --quiet --detach FETCH_HEAD;
+              python3 -B /checks/test_deb_version_upgrade.py --old-source-root /historical-source --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/portable-to-deb.json
+              python3 -B /checks/test_deb_installed_gui.py --package "/packages/$1" --package-sha256 "$2" --commit "$3" --version "$4" --executable-sha256 "$5" --source-sha256 "$6" --output /evidence/installed-gui.json' \
+            peerbrush-real-version-acceptance "${DEB##*/}" "$DEB_SHA" "$SOURCE_COMMIT" "$VERSION" "$EXECUTABLE_SHA" "$SOURCE_SHA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: runner.os == 'Linux'
+        with:
+          name: DEB-installation-candidate
+          path: dist/deb/*
+          if-no-files-found: error
       - name: Prepare exact-identity Store MSIX candidate
         if: runner.os == 'Windows' && inputs.build_store_msix
         shell: pwsh
@@ -77,19 +248,22 @@ jobs:
           $product = Get-Content -Raw 'packaging/msix/product.store.json' | ConvertFrom-Json
           $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])'
           $packageArgs = @('scripts/package_msix.py', '--portable', "dist/PeerBrush-$version-Windows-x64.zip", '--identity', $identityPath, '--expected-package-family', $product.package_family_name, '--output', 'dist/store-candidate')
+          $canonicalVersion = python -c 'import sys; sys.path.insert(0,"scripts"); from package_msix import package_version; print(package_version(sys.argv[1]))' "$version"
+          if ($LASTEXITCODE -ne 0) { throw 'Canonical Store version mapping failed' }
+          if ($env:STORE_PACKAGE_VERSION -and $env:STORE_PACKAGE_VERSION -cne $canonicalVersion) { throw 'Store handoff requires the canonical Cargo-to-Store version mapping' }
           if ($env:STORE_PACKAGE_VERSION) { $packageArgs += @('--package-version', $env:STORE_PACKAGE_VERSION) }
           if (-not $env:PREVIOUS_STORE_VERSION) { throw 'Read the actual current Store version and supply previous_store_version before building an update candidate.' }
           $packageArgs += @('--previous-version', $env:PREVIOUS_STORE_VERSION)
           $packageArgs += @('--portable-sha256', (Get-FileHash -Algorithm SHA256 "dist/PeerBrush-$version-Windows-x64.zip").Hash.ToLowerInvariant())
           python @packageArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: runner.os == 'Windows' && inputs.build_store_msix
         with:
           name: unsigned-store-msix-candidate
           path: dist/store-candidate/*
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: candidate-${{ runner.os }}
           path: dist/*.zip
@@ -99,23 +273,97 @@ jobs:
     needs: native
     runs-on: ubuntu-24.04
     env:
-      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Require exact release invocation
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ.get('EXPECTED_COMMIT', '')
+          ref = os.environ.get('GITHUB_REF', '')
+          event = os.environ.get('GITHUB_EVENT_NAME', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_SHA': expected, 'GITHUB_WORKFLOW_SHA': expected,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/release.yml@' + ref,
+          }
+          manual_ref = any(ref.startswith(prefix) and len(ref) > len(prefix) for prefix in ['refs/heads/', 'refs/tags/'])
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or not ((event == 'push' and ref == 'refs/heads/main')
+                          or (event == 'workflow_dispatch' and manual_ref))):
+              raise SystemExit('Release source must match its exact reviewed workflow invocation before checkout or signing.')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.expected_commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: candidate-*
           path: candidates
+      - name: Download the same-workflow Ubuntu candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: DEB-installation-candidate
+          path: deb-candidate
+      - name: Download the same-workflow Store MSIX candidate
+        if: inputs.build_store_msix
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-store-msix-candidate
+          path: store-msix-candidate
       - name: Inspect matching archives and checksums
         shell: bash
         run: |
           python scripts/release_gate.py --commit "$EXPECTED_COMMIT"
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
-          python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
-      - uses: actions/upload-artifact@v4
+          python scripts/verify_release.py --directory candidates --commit "$EXPECTED_COMMIT" --version "$VERSION" --output verified-portable
+          set -- deb-candidate/*.deb
+          test "$#" -eq 1
+          DEB="$1"
+          DEB_SHA=$(sha256sum "$DEB" | cut -d ' ' -f 1)
+          PORTABLE_SHA=$(sha256sum "verified-portable/PeerBrush-$VERSION-Linux-x64.zip" | cut -d ' ' -f 1)
+          # Job success supplies producer provenance; report JSON grants no authority.
+          python3 -B scripts/production_readiness.py --directory verified-portable --include-deb "$DEB" \
+            --deb-sha256 "$DEB_SHA" --portable-sha256 "$PORTABLE_SHA" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' \
+            --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
+          echo 'Exact-source candidate archives verified. Production publication remains blocked pending native signing, installed acceptance, protected approval and public asset reconciliation.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Bind a separate immutable Store content bundle
+        if: inputs.build_store_msix
+        id: store_handoff
+        shell: bash
+        env:
+          PREVIOUS_STORE_VERSION: ${{ inputs.previous_store_version }}
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          set -- store-msix-candidate/*.msix
+          test "$#" -eq 1
+          MSIX="$1"
+          REPORT="$MSIX.json"
+          INVENTORY_SHA=$(sha256sum dist/release-inventory.json | cut -d ' ' -f 1)
+          WINDOWS_SHA=$(sha256sum "dist/PeerBrush-$VERSION-Windows-x64.zip" | cut -d ' ' -f 1)
+          MSIX_SHA=$(sha256sum "$MSIX" | cut -d ' ' -f 1)
+          REPORT_SHA=$(sha256sum "$REPORT" | cut -d ' ' -f 1)
+          PRIVATE_PARENT=$(mktemp -d "$RUNNER_TEMP/peerbrush-store-handoff.XXXXXX")
+          OUTPUT="$PRIVATE_PARENT/bundle"
+          python3 -B scripts/handoff_store_msix.py --source-root "$PWD" --directory dist \
+            --package "$MSIX" --report "$REPORT" --output "$OUTPUT" \
+            --commit "$EXPECTED_COMMIT" --version "$VERSION" --previous-version "$PREVIOUS_STORE_VERSION" \
+            --inventory-sha256 "$INVENTORY_SHA" --portable-sha256 "$WINDOWS_SHA" \
+            --package-sha256 "$MSIX_SHA" --report-sha256 "$REPORT_SHA" \
+            --maintainer 'PeerBrush CI fixture <builds@example.invalid>'
+          echo "directory=$OUTPUT" >> "$GITHUB_OUTPUT"
+      - name: Retain the separate Store auxiliary bundle
+        if: inputs.build_store_msix
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-store-msix-content
+          path: ${{ steps.store_handoff.outputs.directory }}/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: verified-release-candidate
           path: dist/*
@@ -128,20 +376,42 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Require exact release invocation
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re
+          expected = os.environ.get('EXPECTED_COMMIT', '')
+          ref = os.environ.get('GITHUB_REF', '')
+          event = os.environ.get('GITHUB_EVENT_NAME', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush',
+              'GITHUB_SHA': expected, 'GITHUB_WORKFLOW_SHA': expected,
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/release.yml@' + ref,
+          }
+          manual_ref = any(ref.startswith(prefix) and len(ref) > len(prefix) for prefix in ['refs/heads/', 'refs/tags/'])
+          if (not re.fullmatch('[0-9a-f]{40}', expected)
+                  or any(os.environ.get(key) != value for key, value in required.items())
+                  or not ((event == 'push' and ref == 'refs/heads/main')
+                          or (event == 'workflow_dispatch' and manual_ref))):
+              raise SystemExit('Release source must match its exact reviewed workflow invocation before checkout or signing.')
+          PY
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: verified-release-candidate
           path: dist
       - name: Sign and verify packages, source and checksums
         uses: sigstore/gh-action-sigstore-python@a5caf349bc536fbef3668a10ed7f5cd309a4b53d # v3.2.0
         with:
-          inputs: dist/*.zip dist/SHA256SUMS dist/release-inventory.json
+          inputs: dist/*.zip dist/*.deb dist/SHA256SUMS dist/release-inventory.json
           verify: true
           verify-cert-identity: https://github.com/${{ github.workflow_ref }}
           verify-oidc-issuer: https://token.actions.githubusercontent.com
           release-signing-artifacts: false
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: signed-release-candidate
           path: dist/*

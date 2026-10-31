@@ -9,8 +9,60 @@ pub(super) struct Editor {
     pub x: i32,
     pub y: i32,
     pub error: Option<String>,
+    pub placement: Option<Placement>,
+    apply_error: Option<String>,
+    font_search: String,
+    validation: Option<Validation>,
+    #[cfg(test)]
+    pub(super) validation_runs: usize,
+}
+struct Validation {
+    source: Source,
+    font: ab_glyph::FontArc,
+    result: Result<(), String>,
+}
+pub(super) struct Placement {
+    anchor: [f32; 2],
+    dragged: bool,
 }
 impl Editor {
+    fn invalid(&mut self) -> Option<String> {
+        use ab_glyph::Font;
+        let Content::Text {
+            layout: crate::source::TextLayout::Shaped,
+            font,
+            ..
+        } = &self.source.content
+        else {
+            self.validation = None;
+            return self.source.validate().err();
+        };
+        let font = match crate::fonts::snapshot(font) {
+            Ok(font) => font,
+            Err(error) => {
+                self.validation = None;
+                return Some(error.to_string());
+            }
+        };
+        if let Some(validation) = &self.validation {
+            if validation.source == self.source
+                && std::ptr::eq(validation.font.font_data(), font.font_data())
+            {
+                return validation.result.clone().err();
+            }
+        }
+        let result = self.source.validate_shaped_snapshot(&font);
+        #[cfg(test)]
+        {
+            self.validation_runs += 1;
+        }
+        self.validation = Some(Validation {
+            source: self.source.clone(),
+            font,
+            result: result.clone(),
+        });
+        result.err()
+    }
     pub fn command(&self) -> Value {
         json!({"op":if self.layer.is_some(){"source.update"}else{"source.add"},"layer":self.layer,"parent":self.parent,"source":self.source,"x":self.x,"y":self.y,"document_id":self.document,"source_revision":self.revision})
     }
@@ -50,7 +102,7 @@ impl PeerBrush {
             };
             (
                 Some(layer.id.clone()),
-                layer.source.clone().unwrap(),
+                layer.source.as_deref().cloned().unwrap(),
                 layer.x,
                 layer.y,
                 layer.parent.clone(),
@@ -68,9 +120,11 @@ impl PeerBrush {
             let content = if kind == "text" {
                 Content::Text {
                     text: "Text".into(),
+                    layout: crate::source::TextLayout::Legacy,
                     font: "regular".into(),
                     size: 48.,
                     line_height: 1.2,
+                    letter_spacing: 0.,
                     align: "left".into(),
                     color,
                 }
@@ -117,6 +171,12 @@ impl PeerBrush {
             x,
             y,
             error: None,
+            placement: None,
+            apply_error: None,
+            font_search: String::new(),
+            validation: None,
+            #[cfg(test)]
+            validation_runs: 0,
         });
         self.last_preview = None;
     }
@@ -126,6 +186,158 @@ impl PeerBrush {
             .retain(|c| !c["op"].as_str().is_some_and(|op| op.starts_with("source.")));
         self.last_preview = None;
     }
+    pub(super) fn text_field_outline(&self, painter: &egui::Painter, rect: Rect, scale: f32) {
+        let Some(editor) = self
+            .source_editor
+            .as_ref()
+            .filter(|editor| matches!(editor.source.content, Content::Text { .. }))
+        else {
+            return;
+        };
+        let [a, b, c, d, tx, ty] = editor.source.matrix;
+        let w = editor.source.width as f32;
+        let h = editor.source.height as f32;
+        let points = [[0., 0.], [w, 0.], [w, h], [0., h], [0., 0.]].map(|[x, y]| {
+            self.view.point(
+                [
+                    editor.x as f32 + a * x + c * y + tx,
+                    editor.y as f32 + b * x + d * y + ty,
+                ],
+                rect,
+                scale,
+            )
+        });
+        painter.add(egui::Shape::line(points.to_vec(), Stroke::new(1., ACCENT)));
+    }
+    pub(super) fn text_canvas(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &Document,
+        response: &egui::Response,
+        painter: &egui::Painter,
+        rect: Rect,
+        scale: f32,
+    ) {
+        let cancelled = ui.input(|input| {
+            !input.focused
+                || input.key_pressed(egui::Key::Escape)
+                || input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        });
+        let stale = self
+            .source_editor
+            .as_ref()
+            .is_some_and(|editor| editor.document != doc.id || editor.revision != doc.revision);
+        if cancelled || stale || doc.read_only || self.busy {
+            if self
+                .source_editor
+                .as_ref()
+                .is_some_and(|editor| editor.placement.is_some())
+            {
+                self.cancel_source();
+            }
+            return;
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
+        let mut first_event = 0;
+        if self.source_editor.is_none() {
+            let press = ui.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, event)| match event {
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            ..
+                        } => Some((index, *pos)),
+                        _ => None,
+                    })
+            });
+            let Some((index, press)) = press.filter(|(_, point)| {
+                response.rect.contains(*point)
+                    && self.view.contains(*point, rect, scale)
+                    && ui.ctx().layer_id_at(*point) == Some(ui.layer_id())
+            }) else {
+                return;
+            };
+            first_event = index;
+            let anchor = self.view.document(press, rect, scale);
+            if let Some(id) = text_hit(doc, anchor) {
+                if let Err(error) = crate::placement::unlocked(doc, &id) {
+                    self.message = error;
+                    return;
+                }
+                self.select_content(&id);
+                self.open_source(doc, "edit");
+                return;
+            }
+            self.open_source(doc, "text");
+            let editor = self.source_editor.as_mut().unwrap();
+            editor.x = anchor[0].floor() as i32;
+            editor.y = anchor[1].floor() as i32;
+            editor.placement = Some(Placement {
+                anchor,
+                dragged: false,
+            });
+        }
+        let positions = ui.input(|input| {
+            input
+                .events
+                .iter()
+                .skip(first_event)
+                .filter_map(|event| match event {
+                    egui::Event::PointerMoved(pos) => Some((*pos, false)),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    } => Some((*pos, true)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        let editor = self.source_editor.as_mut().unwrap();
+        for (pointer, released) in positions {
+            let Some(placement) = &mut editor.placement else {
+                break;
+            };
+            let anchor = placement.anchor;
+            let point = self.view.document(pointer, rect, scale);
+            placement.dragged |= (point[0] - anchor[0])
+                .abs()
+                .max((point[1] - anchor[1]).abs())
+                * scale
+                > 3.;
+            if placement.dragged {
+                let left = point[0].min(anchor[0]).floor();
+                let top = point[1].min(anchor[1]).floor();
+                editor.x = left as i32;
+                editor.y = top as i32;
+                editor.source.width = ((point[0].max(anchor[0]).ceil() - left) as u32)
+                    .clamp(1, crate::raster::MAX_EDGE);
+                editor.source.height = ((point[1].max(anchor[1]).ceil() - top) as u32)
+                    .clamp(1, crate::raster::MAX_EDGE);
+            }
+            if released {
+                editor.placement = None;
+                break;
+            }
+        }
+        if !ui.input(|input| input.pointer.primary_down()) {
+            editor.placement = None;
+        }
+        self.transient = vec![editor.command()];
+        self.text_field_outline(painter, rect, scale);
+        ui.ctx().request_repaint();
+    }
     pub(super) fn source_window(&mut self, ctx: &egui::Context, doc: &Document) {
         let Some(mut e) = self.source_editor.take() else {
             return;
@@ -134,10 +346,15 @@ impl PeerBrush {
             self.cancel_source();
             return;
         }
+        if e.placement.is_some() {
+            self.source_editor = Some(e);
+            return;
+        }
         let before = e.command();
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
+        let mut valid = false;
         egui::Window::new(e.source.label())
             .open(&mut open)
             .collapsible(false)
@@ -150,6 +367,15 @@ impl PeerBrush {
                         controls::numeric(ui, &mut e.x, -100000..=100000);
                         ui.label("Y");
                         controls::numeric(ui, &mut e.y, -100000..=100000);
+                        ui.label("px");
+                    });
+                }
+                if matches!(e.source.content, Content::Text { .. }) {
+                    ui.horizontal(|ui| {
+                        ui.label("Field width");
+                        controls::numeric(ui, &mut e.source.width, 1..=crate::raster::MAX_EDGE);
+                        ui.label("Height");
+                        controls::numeric(ui, &mut e.source.height, 1..=crate::raster::MAX_EDGE);
                         ui.label("px");
                     });
                 }
@@ -195,9 +421,11 @@ impl PeerBrush {
                     }
                     Content::Text {
                         text,
+                        layout,
                         font,
                         size,
                         line_height,
+                        letter_spacing,
                         align,
                         color,
                     } => {
@@ -208,16 +436,19 @@ impl PeerBrush {
                                 .char_limit(4096)
                                 .frame(false),
                         );
+                        let mut shaped = *layout == crate::source::TextLayout::Shaped;
+                        if ui.checkbox(&mut shaped, "Ligatures and joining").on_hover_text("Enable font shaping and bidirectional ordering. Existing text keeps its original layout until enabled.").changed() {
+                            *layout = if shaped { crate::source::TextLayout::Shaped } else { crate::source::TextLayout::Legacy };
+                        }
                         ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("text font")
-                                .selected_text(format!("Ubuntu Sans {font}"))
-                                .show_ui(ui, |ui| {
-                                    for name in ["regular", "medium", "semibold"] {
-                                        ui.selectable_value(font, name.into(), name);
-                                    }
-                                });
+                            font_picker(ui, font, &mut e.font_search);
                             ui.label("Size");
                             controls::numeric(ui, size, 1. ..=1024.);
+                            ui.label("px");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Letter spacing");
+                            controls::numeric(ui, letter_spacing, -1024. ..=1024.);
                             ui.label("px");
                         });
                         ui.horizontal(|ui| {
@@ -298,8 +529,33 @@ impl PeerBrush {
                         });
                     }
                 }
-                let invalid = e.source.validate().err();
-                if let Some(error) = invalid.as_ref().or(e.error.as_ref()) {
+                let invalid = e.invalid();
+                valid = invalid.is_none();
+                let pending = |error: &String| {
+                    [
+                        crate::fonts::FontError::Loading,
+                        crate::fonts::FontError::Busy,
+                    ]
+                    .iter()
+                    .any(|pending| error == &pending.to_string())
+                };
+                if invalid.as_ref().is_some_and(pending) {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+                if valid {
+                    if e.error.as_ref().is_some_and(pending) {
+                        e.error = None;
+                        self.last_preview = None;
+                    }
+                    if e.apply_error.as_ref().is_some_and(pending) {
+                        e.apply_error = None;
+                    }
+                }
+                if let Some(error) = invalid
+                    .as_ref()
+                    .or(e.error.as_ref())
+                    .or(e.apply_error.as_ref())
+                {
                     ui.colored_label(ACCENT, error);
                 }
                 ui.horizontal(|ui| {
@@ -315,29 +571,253 @@ impl PeerBrush {
         let command = e.command();
         if command != before {
             e.error = None;
+            e.apply_error = None;
         }
         if apply {
-            let creating = e.layer.is_none();
-            self.cancel_source();
-            self.edit(vec![command], "Edit text/vector source");
-            if creating {
-                let layer = self
-                    .shared
-                    .lock()
-                    .unwrap()
-                    .doc
-                    .layers
-                    .first()
-                    .map(|l| l.id.clone());
-                if let Some(id) = layer {
-                    self.select_content(&id);
-                }
+            if self.try_edit(vec![command.clone()], "Edit text/vector source") {
+                self.cancel_source();
+            } else {
+                e.apply_error = Some(self.message.clone());
+                self.transient = vec![command];
+                self.source_editor = Some(e);
             }
         } else if !open || cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cancel_source();
         } else {
-            self.transient = vec![command];
+            if valid {
+                self.transient = vec![command];
+            } else {
+                // Keep the saved raster when a font cannot reproduce this draft.
+                self.transient.retain(|command| {
+                    !command["op"]
+                        .as_str()
+                        .is_some_and(|op| op.starts_with("source."))
+                });
+            }
             self.source_editor = Some(e);
+        }
+    }
+}
+
+fn text_hit(doc: &Document, point: [f32; 2]) -> Option<String> {
+    crate::compositor::effect_order(doc)
+        .into_iter()
+        .rev()
+        .find_map(|index| {
+            let layer = &doc.layers[index];
+            let source = layer.source.as_ref()?;
+            if !matches!(source.content, Content::Text { .. }) {
+                return None;
+            }
+            let mut current = Some(layer.id.as_str());
+            for _ in 0..=16 {
+                let Some(id) = current else { break };
+                let ancestor = doc.layers.iter().find(|candidate| candidate.id == id)?;
+                if !ancestor.visible {
+                    return None;
+                }
+                current = ancestor.parent.as_deref();
+            }
+            if current.is_some() {
+                return None;
+            }
+            let [a, b, c, d, tx, ty] = source.matrix.map(f64::from);
+            let det = a * d - b * c;
+            if !det.is_finite() || det.abs() < 0.000001 {
+                return None;
+            }
+            let x = f64::from(point[0]) - f64::from(layer.x) - tx;
+            let y = f64::from(point[1]) - f64::from(layer.y) - ty;
+            let local = [(d * x - c * y) / det, (-b * x + a * y) / det];
+            (local[0] >= 0.
+                && local[1] >= 0.
+                && local[0] < f64::from(source.width)
+                && local[1] < f64::from(source.height))
+            .then(|| layer.id.clone())
+        })
+}
+
+fn font_picker(ui: &mut egui::Ui, font: &mut crate::fonts::TextFont, search: &mut String) {
+    use crate::fonts::{self, CatalogStatus, TextFont};
+    let label = font.label().into_owned();
+    let short: String = label.chars().take(44).collect();
+    egui::ComboBox::from_id_salt("text font")
+        .selected_text(if short.len() < label.len() {
+            format!("{short}…")
+        } else {
+            short
+        })
+        .width(220.)
+        .show_ui(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            for name in ["regular", "medium", "semibold"] {
+                ui.selectable_value(font, name.into(), format!("Ubuntu Sans {name}"));
+            }
+            ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text("Search installed fonts")
+                    .char_limit(128)
+                    .frame(false),
+            );
+            if ui.button("Refresh installed fonts").clicked() {
+                if let Err(error) = fonts::refresh() {
+                    ui.colored_label(ACCENT, error.to_string());
+                }
+            }
+            let catalog = fonts::catalog();
+            match catalog.status {
+                CatalogStatus::Loading => {
+                    ui.label("Reading installed fonts…");
+                    ui.ctx().request_repaint_after(Duration::from_millis(50));
+                }
+                CatalogStatus::Unavailable(error) => {
+                    ui.colored_label(ACCENT, error.to_string());
+                }
+                CatalogStatus::Ready => {}
+            }
+            let search = search.to_lowercase();
+            let faces: Vec<_> = catalog
+                .faces
+                .iter()
+                .filter(|face| {
+                    search.is_empty()
+                        || face.family.to_lowercase().contains(&search)
+                        || face.postscript.to_lowercase().contains(&search)
+                })
+                .collect();
+            if faces.is_empty() && matches!(catalog.status, CatalogStatus::Ready) {
+                ui.label("No matching installed fonts");
+            }
+            let height = ui
+                .spacing()
+                .interact_size
+                .y
+                .max(ui.text_style_height(&egui::TextStyle::Button));
+            egui::ScrollArea::vertical()
+                .id_salt("installed font rows")
+                .max_height(220.)
+                .show_rows(ui, height, faces.len(), |ui, range| {
+                    for index in range {
+                        let face = faces[index];
+                        if let Some(value) = &face.font {
+                            let candidate = TextFont::Installed(value.clone());
+                            let label = candidate.label().into_owned();
+                            ui.selectable_value(font, candidate, label);
+                        } else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(format!("{} · unavailable", face.family)),
+                            )
+                            .on_disabled_hover_text(
+                                face.error
+                                    .unwrap_or(fonts::FontError::Unsupported)
+                                    .to_string(),
+                            );
+                        }
+                    }
+                });
+        })
+        .response
+        .on_hover_text(label);
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::fonts::{self, FontError, InstalledFont, TextFont};
+    #[test]
+    fn shaped_validation_reuses_only_current_source_and_owned_ready_font_and_retries_status_changes(
+    ) {
+        let reference = InstalledFont {
+            family: "Synthetic validation fixture".into(),
+            postscript: "PeerBrushSynthetic-Regular".into(),
+            style: "normal".into(),
+            weight: 400,
+            stretch: 5,
+            index: 0,
+            sha256: "0".repeat(64),
+        };
+        let font = ab_glyph::FontArc::new(crate::source::font("regular").unwrap());
+        let source = Source {
+            width: 180,
+            height: 96,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: Content::Text {
+                text: "office a\u{0301}".into(),
+                layout: crate::source::TextLayout::Shaped,
+                font: TextFont::Installed(reference.clone()),
+                size: 24.,
+                line_height: 1.2,
+                letter_spacing: 0.,
+                align: "left".into(),
+                color: [12501, 23003, 34507, 65535],
+            },
+        };
+        let mut editor = Editor {
+            document: "synthetic-document".into(),
+            revision: 0,
+            layer: None,
+            parent: None,
+            source,
+            x: 0,
+            y: 0,
+            error: None,
+            placement: None,
+            apply_error: None,
+            font_search: String::new(),
+            validation: None,
+            validation_runs: 0,
+        };
+        {
+            let guard = fonts::test_fonts(vec![(reference.clone(), Ok(font.clone()))]);
+            assert_eq!(editor.invalid(), None);
+            assert_eq!(editor.validation_runs, 1);
+            for _ in 0..8 {
+                assert_eq!(editor.invalid(), None);
+            }
+            assert_eq!(editor.validation_runs, 1);
+            assert_eq!(
+                guard.requests(),
+                9,
+                "One cache-only snapshot check per validation; no second resolution"
+            );
+            if let Content::Text { text, .. } = &mut editor.source.content {
+                *text = "\u{10ffff}".into();
+            }
+            assert!(editor.invalid().is_some());
+            assert_eq!(editor.validation_runs, 2);
+            assert!(editor.invalid().is_some());
+            assert_eq!(
+                editor.validation_runs, 2,
+                "Invalid layout is cached only for the same Source and snapshot"
+            );
+            if let Content::Text { text, .. } = &mut editor.source.content {
+                *text = "office".into();
+            }
+            assert_eq!(editor.invalid(), None);
+            assert_eq!(editor.validation_runs, 3);
+        }
+        {
+            let _guard = fonts::test_fonts(vec![(reference.clone(), Err(FontError::Loading))]);
+            assert_eq!(editor.invalid(), Some(FontError::Loading.to_string()));
+            assert!(editor.validation.is_none());
+        }
+        {
+            let _guard = fonts::test_fonts(vec![(reference.clone(), Ok(font.clone()))]);
+            assert_eq!(editor.invalid(), None);
+            assert_eq!(editor.validation_runs, 4);
+        }
+        {
+            let same_bytes = ab_glyph::FontArc::try_from_vec(
+                include_bytes!("../../assets/fonts/UbuntuSans-Regular.ttf").to_vec(),
+            )
+            .unwrap();
+            let _guard = fonts::test_fonts(vec![(reference, Ok(same_bytes))]);
+            assert_eq!(editor.invalid(), None);
+            assert_eq!(
+                editor.validation_runs, 5,
+                "A different owned snapshot invalidates derived layout validation"
+            );
         }
     }
 }

@@ -6,6 +6,104 @@ use serde_json::Value;
 pub const MOVE_SNAP: f64 = 8.0;
 pub const ANGLE_SNAP: f64 = 15.0;
 pub const SCALE_SNAP: f64 = 0.1;
+pub const SKEW_LIMIT: f64 = 80.0;
+
+pub(crate) fn fractional_translation(c: &Value) -> Result<bool, String> {
+    let enabled = c.get("fractional_translation").map_or(Ok(false), |value| {
+        value
+            .as_bool()
+            .ok_or("Transform fractional_translation must be true or false")
+    })?;
+    if enabled && c["op"] != "transform" {
+        return Err(
+            "Fractional translation requires a transform command; move stays integer".into(),
+        );
+    }
+    Ok(enabled)
+}
+/// Translation after affine placement; legacy commands keep rounded pixels.
+pub(crate) fn translation(c: &Value) -> Result<[f64; 2], String> {
+    let fractional = fractional_translation(c)?;
+    let mut delta = [0.; 2];
+    for (index, name) in ["dx", "dy"].into_iter().enumerate() {
+        let value = c.get(name).map_or(Ok(0.), |value| {
+            value
+                .as_f64()
+                .ok_or("Transform translation must be a number")
+        })?;
+        if !value.is_finite() || value.abs() > 100000. {
+            return Err("Transform translation must be between -100000 and 100000 pixels".into());
+        }
+        delta[index] = if fractional { value } else { value.round() };
+    }
+    Ok(delta)
+}
+
+fn skew_angles(c: &Value) -> Result<[f64; 2], String> {
+    let mut angles = [0.; 2];
+    if c["op"] == "move" {
+        return Ok(angles);
+    }
+    for (index, name) in ["skew_x", "skew_y"].into_iter().enumerate() {
+        let angle = c.get(name).map_or(Ok(0.), |value| {
+            value.as_f64().ok_or("Transform skew must be a number")
+        })?;
+        if !angle.is_finite() || angle.abs() > SKEW_LIMIT {
+            return Err("Transform skew must be between -80 and 80 degrees".into());
+        }
+        angles[index] = angle;
+    }
+    Ok(angles)
+}
+
+/// Horizontal then vertical shear precede the existing scale/reflection/rotation.
+pub(crate) fn skewed([a, b, c, d]: [f64; 4], command: &Value) -> Result<[f64; 4], String> {
+    let angles = skew_angles(command)?;
+    if angles == [0., 0.] {
+        return Ok([a, b, c, d]);
+    }
+    let [x, y] = angles.map(|angle| angle.to_radians().tan());
+    Ok([
+        a + c * y,
+        b + d * y,
+        a * x + c * (1. + x * y),
+        b * x + d * (1. + x * y),
+    ])
+}
+
+pub(crate) fn selected_shear(c: &Value) -> Result<[f32; 2], String> {
+    crate::projective::parse(c)?;
+    crate::warp::parse(c)?;
+    fractional_translation(c)?;
+    if c["op"] != "move" {
+        translation(c)?;
+    }
+    Ok(skew_angles(c)?.map(|angle| angle.to_radians().tan() as f32))
+}
+
+/// Selected forward geometry also encloses actual f32 shear/fractional scope bounds.
+pub(crate) fn selected_point(
+    [x, y]: [f32; 2],
+    [px, py]: [f32; 2],
+    [dx, dy]: [f32; 2],
+    [sx, sy]: [f32; 2],
+    [sin, cos]: [f32; 2],
+    [kx, ky]: [f32; 2],
+) -> [f32; 2] {
+    if [kx, ky] == [0., 0.] {
+        return [
+            px + (x - px) * sx * cos - (y - py) * sy * sin + dx,
+            py + (x - px) * sx * sin + (y - py) * sy * cos + dy,
+        ];
+    }
+    let (mut u, mut v) = (x - px, y - py);
+    u += kx * v;
+    v += ky * u;
+    [
+        px + u * sx * cos - v * sy * sin + dx,
+        py + u * sx * sin + v * sy * cos + dy,
+    ]
+}
 
 pub(crate) fn work_budget(width: u32, height: u32, rasters: usize) -> Result<(), String> {
     if u64::from(width) * u64::from(height) * rasters as u64 > 128_000_000 {
@@ -37,8 +135,13 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
     if !matches!(command["op"].as_str(), Some("move" | "transform")) {
         return Ok(command.clone());
     }
+    fractional_translation(command)?;
+    crate::projective::parse(command)?;
+    crate::warp::parse(command)?;
     if command["op"] == "transform" {
         scales(command)?;
+        skew_angles(command)?;
+        translation(command)?;
     }
     let Some(snap) = command.get("snap") else {
         return Ok(command.clone());
@@ -50,7 +153,7 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
         return Ok(command.clone());
     }
     let mut resolved = command.clone();
-    let fields = if command["op"] == "move" {
+    let mut fields = if command["op"] == "move" {
         vec![
             ("dx", 0., MOVE_SNAP, -100000., 100000.),
             ("dy", 0., MOVE_SNAP, -100000., 100000.),
@@ -62,6 +165,18 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
             ("scale_y", 1., SCALE_SNAP, 0.05, 20.),
         ]
     };
+    if command["op"] == "transform" {
+        for name in ["dx", "dy"] {
+            if command.get(name).is_some() {
+                fields.push((name, 0., MOVE_SNAP, -100000., 100000.));
+            }
+        }
+        for name in ["skew_x", "skew_y"] {
+            if command.get(name).is_some() {
+                fields.push((name, 0., ANGLE_SNAP, -SKEW_LIMIT, SKEW_LIMIT));
+            }
+        }
+    }
     for (key, default, step, min, max) in fields {
         let number = command.get(key).map_or(Ok(default), |v| {
             v.as_f64().ok_or("Snapped transform values must be numbers")
@@ -77,8 +192,15 @@ pub fn resolve_command(command: &Value) -> Result<Value, String> {
 }
 pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> {
     for command in &mut commands {
+        if matches!(command["op"].as_str(), Some("move" | "transform")) {
+            fractional_translation(command)?;
+            crate::projective::parse(command)?;
+            crate::warp::parse(command)?;
+        }
         if command["op"] == "transform" {
             scales(command)?;
+            skew_angles(command)?;
+            translation(command)?;
         }
         if command.get("snap").is_some()
             && matches!(command["op"].as_str(), Some("move" | "transform"))
@@ -137,6 +259,8 @@ pub fn selection_with_polygon(
     polygon: &[[f32; 2]],
     c: &Value,
 ) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
+    selected_shear(c)?;
+    warp_selection_preflight(layer, polygon, c)?;
     if layer.mask.as_ref().is_some_and(|mask| mask.linked) {
         return linked_selection(layer, polygon, c, None);
     }
@@ -150,10 +274,29 @@ pub fn selection_with_coverage(
     coverage: &crate::selection::Coverage,
     c: &Value,
 ) -> Result<crate::selection::Coverage, String> {
+    let shear = selected_shear(c)?;
+    let warped = crate::warp::parse(c)?
+        .map(|_| crate::warp::CommandMap::new(c, [0., 0.]))
+        .transpose()?;
+    let projective = crate::projective::combined(c)?;
+    let inverse = projective
+        .map(|p| {
+            crate::projective::Map::affine_matrix([
+                1.,
+                0.,
+                0.,
+                1.,
+                -(coverage.origin[0] as f64) - 0.5,
+                -(coverage.origin[1] as f64) - 0.5,
+            ])
+            .compose(p.inverse()?)
+        })
+        .transpose()?;
     if coverage.bounds[0] >= coverage.bounds[2] {
         return Ok(coverage.clone());
     }
     let polygon = crate::selection::rectangle(coverage.bounds);
+    warp_selection_preflight(layer, &polygon, c)?;
     let (bounds, _) = if layer.mask.as_ref().is_some_and(|mask| mask.linked) {
         linked_selection(layer, &polygon, c, Some(coverage))?
     } else if c["mask"] == true && c["step"].is_null() {
@@ -166,7 +309,8 @@ pub fn selection_with_coverage(
     let (dx, dy) = if moving {
         (n("dx", 0.).round(), n("dy", 0.).round())
     } else {
-        (0., 0.)
+        let [dx, dy] = translation(c)?;
+        (dx as f32, dy as f32)
     };
     let (sx, sy) = if moving {
         (1., 1.)
@@ -174,11 +318,19 @@ pub fn selection_with_coverage(
         let (sx, sy) = scales(c)?;
         (sx as f32, sy as f32)
     };
-    let (sin, cos) = if moving {
+    let (mut sin, mut cos) = if moving {
         (0., 1.)
     } else {
         n("angle", 0.).to_radians().sin_cos()
     };
+    if shear != [0., 0.] {
+        if sin.abs() < 0.000001 {
+            sin = 0.;
+        }
+        if cos.abs() < 0.000001 {
+            cos = 0.;
+        }
+    }
     let px = c["pivot"][0]
         .as_f64()
         .unwrap_or((coverage.bounds[0] as f64 + coverage.bounds[2] as f64) / 2.)
@@ -195,15 +347,71 @@ pub fn selection_with_coverage(
         for x in bounds[0]..bounds[2] {
             let rx = x as f32 + 0.5 - px - dx;
             let ry = y as f32 + 0.5 - py - dy;
-            let ux = (rx * cos + ry * sin) / sx + px - coverage.origin[0] as f32 - 0.5;
-            let uy = (-rx * sin + ry * cos) / sy + py - coverage.origin[1] as f32 - 0.5;
-            let v = coverage.mask.sample(ux, uy)[0];
+            let mut u = (rx * cos + ry * sin) / sx;
+            let mut v = (-rx * sin + ry * cos) / sy;
+            if shear != [0., 0.] {
+                // Undo Hy then Hx after the existing inverse rotation/scale.
+                v -= shear[1] * u;
+                u -= shear[0] * v;
+            }
+            let [ux, uy] = if let Some(map) = &warped {
+                map.sample(
+                    [x as f64 + 0.5, y as f64 + 0.5],
+                    coverage.origin.map(|v| v as f64),
+                )
+            } else if let Some(map) = inverse {
+                map.sample([x as f64 + 0.5, y as f64 + 0.5])
+            } else {
+                [
+                    u + px - coverage.origin[0] as f32 - 0.5,
+                    v + py - coverage.origin[1] as f32 - 0.5,
+                ]
+            };
+            // Coverage is scalar; RGBA sampling would unpremultiply its edge values.
+            let (ix, iy) = (ux.floor() as i32, uy.floor() as i32);
+            let (fx, fy) = (ux - ix as f32, uy - iy as f32);
+            let at = |x, y| coverage.mask.get(x, y)[0] as f32;
+            let v = (at(ix, iy) * (1. - fx) * (1. - fy)
+                + at(ix + 1, iy) * fx * (1. - fy)
+                + at(ix, iy + 1) * (1. - fx) * fy
+                + at(ix + 1, iy + 1) * fx * fy)
+                .round() as u8;
             if v > 0 {
                 mask.set(x - bounds[0], y - bounds[1], [v; 4]);
             }
         }
     }
     Ok(crate::selection::from_mask(mask)?.local(-bounds[0], -bounds[1]))
+}
+fn warp_selection_preflight(layer: &Layer, polygon: &[[f32; 2]], c: &Value) -> Result<(), String> {
+    if crate::warp::parse(c)?.is_none() {
+        return Ok(());
+    }
+    if layer.source.is_some() {
+        return Err("Rasterize editable sources at native precision before Warp".into());
+    }
+    let area = crate::selection::bounds(polygon)?;
+    let map = crate::warp::CommandMap::new(c, [0., 0.])?;
+    map.covers([
+        area[0] as f64 - 1.,
+        area[1] as f64 - 1.,
+        area[2] as f64 + 1.,
+        area[3] as f64 + 1.,
+    ])?;
+    let transformed = map.polygon(polygon)?;
+    let b = crate::selection::bounds(&transformed)?;
+    map.bounds(area.map(|v| v as f64))?;
+    let w = (layer.x + layer.pixels.width as i32).max(b[2]) - layer.x.min(b[0]);
+    let h = (layer.y + layer.pixels.height as i32).max(b[3]) - layer.y.min(b[1]);
+    check_size(w as u32, h as u32)?;
+    let steps = layer.mask.as_ref().map_or(0, |m| m.steps.len());
+    crate::warp::work_budget(
+        w as u32,
+        h as u32,
+        1 + steps * (1 + steps),
+        1,
+        polygon.len() + transformed.len(),
+    )
 }
 fn selection_impl(
     layer: &mut Layer,
@@ -212,15 +420,39 @@ fn selection_impl(
     coverage: Option<&crate::selection::Coverage>,
 ) -> Result<([i32; 4], Vec<[f32; 2]>), String> {
     let area = crate::selection::bounds(polygon)?;
+    let projective = crate::projective::combined(c)?;
+    let warped = crate::warp::parse(c)?
+        .map(|_| crate::warp::CommandMap::new(c, [0., 0.]))
+        .transpose()?;
+    if let Some(map) = &warped {
+        map.covers([
+            area[0] as f64 - 1.,
+            area[1] as f64 - 1.,
+            area[2] as f64 + 1.,
+            area[3] as f64 + 1.,
+        ])?;
+        map.bounds(area.map(|v| v as f64))?;
+        if layer.source.is_some() {
+            return Err("Rasterize editable sources at native precision before Warp".into());
+        }
+    }
+    if let Some(map) = projective.filter(|_| warped.is_none()) {
+        map.bounds(area.map(|v| v as f64))?;
+        if layer.source.is_some() {
+            return Err("Rasterize the editable source at its native precision before Distort, Perspective or Warp".into());
+        }
+    }
     if layer.kind == "group" {
         return Err("Transform a paint layer or its mask".into());
     }
+    let shear = selected_shear(c)?;
     let n = |key: &str, default: f32| c[key].as_f64().unwrap_or(default as f64) as f32;
     let move_only = c["op"] == "move";
     let (dx, dy) = if move_only {
         (n("dx", 0.0).round(), n("dy", 0.0).round())
     } else {
-        (0.0, 0.0)
+        let [dx, dy] = translation(c)?;
+        (dx as f32, dy as f32)
     };
     let angle = if move_only { 0.0 } else { n("angle", 0.0) };
     let (sx, sy) = if move_only {
@@ -251,18 +483,55 @@ fn selection_impl(
         cos = 0.0;
     }
     let f = |x: f32, y: f32| {
-        [
-            px + (x - px) * sx * cos - (y - py) * sy * sin + dx,
-            py + (x - px) * sx * sin + (y - py) * sy * cos + dy,
-        ]
+        if shear != [0., 0.] {
+            selected_point([x, y], [px, py], [dx, dy], [sx, sy], [sin, cos], shear)
+        } else {
+            [
+                px + (x - px) * sx * cos - (y - py) * sy * sin + dx,
+                py + (x - px) * sx * sin + (y - py) * sy * cos + dy,
+            ]
+        }
     };
-    let transformed = polygon.iter().map(|p| f(p[0], p[1])).collect::<Vec<_>>();
+    let transformed = if let Some(map) = &warped {
+        map.polygon(polygon)?
+    } else if let Some(map) = projective {
+        polygon
+            .iter()
+            .map(|p| {
+                map.point([p[0] as f64, p[1] as f64])
+                    .map(|p| p.map(|v| v as f32))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        polygon.iter().map(|p| f(p[0], p[1])).collect::<Vec<_>>()
+    };
     let b = crate::selection::bounds(&transformed)?;
-    if dx == 0.0 && dy == 0.0 && angle.rem_euclid(360.0) == 0.0 && sx == 1.0 && sy == 1.0 {
+    if projective.is_none()
+        && warped.is_none()
+        && dx == 0.0
+        && dy == 0.0
+        && angle.rem_euclid(360.0) == 0.0
+        && sx == 1.0
+        && sy == 1.0
+        && shear == [0., 0.]
+    {
         return Ok((b, transformed));
     }
     let mask = c["mask"].as_bool().unwrap_or(false);
     let (ox, oy) = (layer.x, layer.y);
+    let inverse = projective
+        .map(|p| {
+            crate::projective::Map::affine_matrix([
+                1.,
+                0.,
+                0.,
+                1.,
+                -(ox as f64) - 0.5,
+                -(oy as f64) - 0.5,
+            ])
+            .compose(p.inverse()?)
+        })
+        .transpose()?;
     let left = ox.min(b[0]);
     let top = oy.min(b[1]);
     let right = (ox + layer.pixels.width as i32).max(b[2]);
@@ -270,6 +539,15 @@ fn selection_impl(
     let (w, h) = ((right - left) as u32, (bottom - top) as u32);
     check_size(w, h)?;
     work_budget(w, h, 1 + layer.mask.as_ref().map_or(0, |m| m.steps.len()))?;
+    if warped.is_some() {
+        crate::warp::work_budget(
+            w,
+            h,
+            1 + layer.mask.as_ref().map_or(0, |m| m.steps.len()),
+            1,
+            polygon.len() + transformed.len(),
+        )?;
+    }
     let mask_step = if mask {
         let m = layer.mask.as_ref().ok_or("Layer has no mask")?;
         Some(
@@ -326,8 +604,19 @@ fn selection_impl(
             }
             let rx = x as f32 + 0.5 - px - dx;
             let ry = y as f32 + 0.5 - py - dy;
-            let ux = (rx * cos + ry * sin) / sx + px - ox as f32 - 0.5;
-            let uy = (-rx * sin + ry * cos) / sy + py - oy as f32 - 0.5;
+            let mut u = (rx * cos + ry * sin) / sx;
+            let mut v = (-rx * sin + ry * cos) / sy;
+            if shear != [0., 0.] {
+                v -= shear[1] * u;
+                u -= shear[0] * v;
+            }
+            let [ux, uy] = if let Some(map) = &warped {
+                map.sample([x as f64 + 0.5, y as f64 + 0.5], [ox as f64, oy as f64])
+            } else if let Some(map) = inverse {
+                map.sample([x as f64 + 0.5, y as f64 + 0.5])
+            } else {
+                [u + px - ox as f32 - 0.5, v + py - oy as f32 - 0.5]
+            };
             if cut.depth == 16 {
                 let pixel = cut.sample16(ux, uy);
                 if pixel[3] > 0 {
@@ -395,7 +684,7 @@ fn selection_impl(
             if effect.kind == "liquify" {
                 crate::geometry::map_effect(
                     &effect.kind,
-                    &mut effect.settings,
+                    std::sync::Arc::make_mut(&mut effect.settings),
                     [1., 1.],
                     [ox - left, oy - top],
                     true,
@@ -472,7 +761,13 @@ pub(crate) fn plain_mask(layer: &Layer) -> Result<(), String> {
     Ok(())
 }
 
-fn reframe_mask(layer: &mut Layer, x: i32, y: i32, width: u32, height: u32) -> Result<(), String> {
+pub(crate) fn reframe_mask(
+    layer: &mut Layer,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
     if (layer.x, layer.y) == (x, y)
         && layer.mask.as_ref().is_none_or(|mask| {
             mask.steps
@@ -775,6 +1070,7 @@ pub(crate) fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
     crate::retained::layer(layer, c)
 }
 pub(crate) fn move_layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
+    fractional_translation(c)?;
     let nx = layer.x as f64 + c["dx"].as_f64().unwrap_or(0.);
     let ny = layer.y as f64 + c["dy"].as_f64().unwrap_or(0.);
     if !nx.is_finite() || !ny.is_finite() || nx.abs() > 100000. || ny.abs() > 100000. {
@@ -863,10 +1159,20 @@ pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), St
     if doc.layers.iter().any(|l| ids.contains(&l.id) && l.locked) {
         return Err("A layer inside the folder is locked".into());
     }
+    let projective = crate::projective::parse(c)?;
+    let warp = crate::warp::parse(c)?;
+    if (projective.is_some() || warp.is_some())
+        && doc.layers.iter().any(|l| {
+            ids.contains(&l.id)
+                && (l.source.is_some() || !matches!(l.kind.as_str(), "group" | "paint" | "fill"))
+        })
+    {
+        return Err("Rasterize editable text/vector or adjustment children at their native precision before folder Distort, Perspective or Warp".into());
+    }
     if doc.selection.is_some() && c["selection_only"] != false {
         let coverage = crate::selection::current(doc).ok_or("Selection no longer exists")?;
         let mut command = c.clone();
-        if command["pivot"].is_null() {
+        if command["pivot"].is_null() && projective.is_none() && warp.is_none() {
             command["pivot"] = serde_json::json!([
                 (coverage.bounds[0] as f64 + coverage.bounds[2] as f64) / 2.,
                 (coverage.bounds[1] as f64 + coverage.bounds[3] as f64) / 2.
@@ -892,7 +1198,7 @@ pub(crate) fn folder(doc: &mut Document, root: &str, c: &Value) -> Result<(), St
     let bounds =
         tree_bounds(doc, &[root.into()]).unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
     let mut command = c.clone();
-    if command["pivot"].is_null() {
+    if command["pivot"].is_null() && projective.is_none() && warp.is_none() {
         command["pivot"] = serde_json::json!([
             (bounds[0] as f64 + bounds[2] as f64) / 2.,
             (bounds[1] as f64 + bounds[3] as f64) / 2.

@@ -385,7 +385,7 @@ impl PeerBrush {
                         .add_sized([28., 28.], egui::Button::new("+").frame(false))
                         .on_hover_text("New project");
                     if new.clicked() {
-                        self.show_new = true;
+                        self.open_new_canvas();
                     }
                     let picker = ui
                         .menu_button(" ", |ui| {

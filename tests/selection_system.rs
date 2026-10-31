@@ -659,6 +659,164 @@ fn selected_transform_preserves_native_words_holes_and_shared_multilayer_geometr
         );
     }
 }
+
+#[test]
+fn transformed_coverage_samples_its_red_channel_independently_of_rgba_alpha() {
+    let mut mask = peerbrush::raster::Raster::new(2, 2);
+    for y in 0..2 {
+        mask.set(0, y, [64, 7, 9, 255]);
+        mask.set(1, y, [192, 9, 7, 0]);
+    }
+    let coverage = selection::from_mask(mask).unwrap();
+    coverage.validate().unwrap();
+    let mut layer = Layer::new("Scalar coverage", "paint", 2, 2);
+    let transformed = peerbrush::transform::selection_with_coverage(
+        &mut layer,
+        &coverage,
+        &json!({"op":"transform","scale_x":2.,"scale_y":2.,"pivot":[0.,0.]}),
+    )
+    .unwrap();
+    for (x, expected) in [48, 96, 160, 144].into_iter().enumerate() {
+        assert_eq!(
+            (transformed.value(x as i32, 1) * 255.).round() as u8,
+            expected
+        );
+    }
+}
+
+#[test]
+fn fractional_selected_scale_interpolates_scalar_coverage_for_color_masks_and_folders() {
+    for depth in [8, 16] {
+        for target_kind in ["color", "mask", "folder"] {
+            let mut engine = Engine::new();
+            engine.doc = Document::new_depth(32, 24, depth).unwrap();
+            let layer = &mut engine.doc.layers[0];
+            let id = layer.id.clone();
+            for y in 2..6 {
+                for x in 2..6 {
+                    layer.pixels.set16(x, y, [10001, 20003, 30007, 65535]);
+                }
+            }
+            layer.pixels.set16(10, 16, [11111, 22223, 33337, 0]);
+            let mask = target_kind == "mask";
+            if mask {
+                layer.mask = Some(peerbrush::engine::Mask {
+                    linked: false,
+                    enabled: true,
+                    cache_key: peerbrush::engine::id(),
+                    steps: vec![peerbrush::engine::MaskStep {
+                        id: peerbrush::engine::id(),
+                        kind: "paint".into(),
+                        enabled: true,
+                        value: 255.,
+                        weight: 1.,
+                        pixels: layer.pixels.clone(),
+                        settings: json!({}),
+                    }],
+                });
+            }
+            let target = if target_kind == "folder" {
+                let folder = Layer::new("Folder", "group", 32, 24);
+                let target = folder.id.clone();
+                engine.doc.layers[0].parent = Some(target.clone());
+                engine.doc.layers.insert(0, folder);
+                target
+            } else {
+                id.clone()
+            };
+            let mut selection_mask = peerbrush::raster::Raster::new(32, 24);
+            for y in 2..6 {
+                for (x, value) in [255, 64, 0, 128].into_iter().enumerate() {
+                    selection_mask.set(x as i32 + 2, y, [value; 4]);
+                }
+            }
+            let original_coverage = selection::from_mask(selection_mask).unwrap();
+            engine.doc.selection = Some(original_coverage.bounds);
+            engine.doc.selection_coverage = Some(original_coverage.clone());
+            let before = engine.doc.clone();
+            let command = json!({"op":"transform","layer":target,"mask":mask,"scale_x":2.,"scale_y":2.,"pivot":[-16.,0.]});
+            let preview = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
+            edit(&mut engine, command);
+            assert_eq!(engine.undo.len(), 1);
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                preview.export_png().unwrap()
+            );
+            let coverage = selection::current(&engine.doc).unwrap();
+            assert_eq!(coverage.bounds, [20, 4, 28, 12]);
+            // These are the independently calculated quarter-position samples of
+            // [0, 255, 64, 0, 128, 0], before rounding and vertical edge coverage.
+            let columns = [191.25_f32, 207.25, 111.75, 48., 16., 32., 96., 96.];
+            for y in 0..24 {
+                for x in 0..32 {
+                    let expected = if (20..28).contains(&x) && (4..12).contains(&y) {
+                        let vertical = if y == 4 || y == 11 { 0.75 } else { 1. };
+                        (columns[(x - 20) as usize] * vertical).round() as u8
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        (coverage.value(x, y) * 255.).round() as u8,
+                        expected,
+                        "{depth}-bit {target_kind} coverage at {x},{y}"
+                    );
+                }
+            }
+            let layer = engine.doc.layers.iter().find(|l| l.id == id).unwrap();
+            let original = before.layers.iter().find(|l| l.id == id).unwrap();
+            let pixels = if mask {
+                &layer.mask.as_ref().unwrap().steps[0].pixels
+            } else {
+                &layer.pixels
+            };
+            assert_eq!(
+                pixels.get16(4, 3),
+                original.pixels.get16(4, 3),
+                "Selection hole must keep original native samples"
+            );
+            assert_eq!(
+                pixels.get16(10, 16),
+                original.pixels.get16(10, 16),
+                "Unselected hidden RGB must remain intact"
+            );
+            if mask {
+                assert_eq!(layer.pixels.rgba16(), original.pixels.rgba16());
+            }
+            for bytes in [
+                psd::encode(&engine.doc).unwrap(),
+                psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = psd::decode(&bytes).unwrap();
+                assert_eq!(reopened.bit_depth, depth);
+                assert_eq!(
+                    reopened.export_png().unwrap(),
+                    engine.doc.export_png().unwrap()
+                );
+                assert_eq!(selection::current(&reopened).unwrap(), coverage);
+            }
+            let transformed = engine.doc.clone();
+            engine.undo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                before.export_png().unwrap()
+            );
+            assert_eq!(selection::current(&engine.doc).unwrap(), original_coverage);
+            for (restored, original) in engine.doc.layers.iter().zip(&before.layers) {
+                assert_eq!(restored.pixels.rgba16(), original.pixels.rgba16());
+                assert_eq!(
+                    serde_json::to_value(&restored.mask).unwrap(),
+                    serde_json::to_value(&original.mask).unwrap()
+                );
+            }
+            engine.redo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                transformed.export_png().unwrap()
+            );
+            assert_eq!(selection::current(&engine.doc).unwrap(), coverage);
+        }
+    }
+}
 #[test]
 fn visibility_does_not_conflict_with_ai_pixels_or_unrelated_structure() {
     let (mut e, id) = fixture(16);

@@ -1,7 +1,8 @@
 //! Production settings and preview remain outside document state and history.
 use super::*;
 use crate::production_export::{
-    self as export, jobs::Existing, Control, Crop, DuplicateNames, Resampling, Settings, Variant,
+    self as export, jobs::Existing, Control, Crop, DuplicateNames, Format, Resampling, Settings,
+    Variant,
 };
 use std::time::Instant;
 struct Pending {
@@ -191,7 +192,40 @@ impl PeerBrush {
         let mut cancel = false;
         egui::Window::new("Production export").id(egui::Id::new("production export")).open(&mut open).collapsible(false).default_width(800.).show(ctx,|ui| {
             ui.label(RichText::new(&doc.name).strong());
-            ui.label(format!("PNG · native {} bit · {}",doc.bit_depth,if doc.icc_profile.is_some()||doc.srgb_tagged {"ICC retained"} else {"untagged working RGB"}));
+            ui.horizontal(|ui| {
+                ui.label("Format");
+                ui.selectable_value(&mut editor.settings.format,Format::Png,"PNG");
+                ui.selectable_value(&mut editor.settings.format,Format::Jxl,"JPEG XL");
+                ui.selectable_value(&mut editor.settings.format,Format::Webp,"WebP · lossless 8-bit");
+            });
+            ui.label(format!("{} · {}",match editor.settings.format {
+                Format::Png=>format!("Native {}-bit output",doc.bit_depth),
+                Format::Jxl=>format!("Native {}-bit JPEG XL output",doc.bit_depth),
+                Format::Webp=>format!("8-bit output · {}-bit project unchanged",doc.bit_depth),
+            },if editor.settings.format == Format::Jxl {
+                if doc.icc_profile.is_none() && !doc.srgb_tagged { "Untagged RGB encoded as sRGB" }
+                else if editor.settings.jxl.lossless { "ICC retained" }
+                else { "Decoded output may convert to sRGB" }
+            } else if doc.icc_profile.is_some()||doc.srgb_tagged { "ICC retained" } else { "untagged working RGB" }));
+            if editor.settings.format == Format::Jxl {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut editor.settings.jxl.lossless, "Lossless");
+                    if !editor.settings.jxl.lossless {
+                        ui.label("Distance");
+                        controls::range(ui, "JPEG XL distance", &mut editor.settings.jxl.distance,
+                            0.1..=15., 110., "", 1, false);
+                    }
+                    ui.label("Effort");
+                    let mut effort = editor.settings.jxl.effort as f32;
+                    if controls::range(ui, "JPEG XL effort", &mut effort, 1.0..=9.,
+                        95., "", 0, false).changed() {
+                        editor.settings.jxl.effort = effort.round() as u32;
+                    }
+                });
+                if !editor.settings.jxl.lossless {
+                    ui.label(RichText::new("Lower distance preserves more detail. Alpha stays lossless.").small().color(MUTED));
+                }
+            }
             if !valid {
                 ui.label(RichText::new("The document source changed. Settings are retained; choose the current document before exporting.").color(ACCENT));
                 if ui.button("Use current document").clicked(){editor.document=doc.id.clone();editor.targets=self.selected_layer_ids(doc);editor.selected_only=false;}
@@ -276,7 +310,7 @@ impl PeerBrush {
                 });
                 let button=ui.add_enabled(valid&&!running&&!self.busy&&!editor.directory.trim().is_empty(),egui::Button::new("Export batch"));editor.start_rect=Some(button.rect);start=button.clicked();
                 cancel=ui.add_enabled(running,egui::Button::new("Cancel batch")).clicked();
-                ui.label(RichText::new("Completed PNGs are retained when a batch stops. Sources stay editable.").small().color(MUTED));
+                ui.label(RichText::new("Completed exports are retained when a batch stops. Sources stay editable.").small().color(MUTED));
             });
             if let Some(error)=&editor.error {ui.label(RichText::new(error).color(ACCENT));}
         });
@@ -385,9 +419,13 @@ impl PeerBrush {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn frame(app: &mut PeerBrush, ctx: &egui::Context, events: Vec<egui::Event>) {
+    fn frame(
+        app: &mut PeerBrush,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let doc = app.shared.lock().unwrap().doc.clone();
-        let _ = ctx.run(
+        ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
                 focused: true,
@@ -395,7 +433,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| app.exports_window(ctx, &doc),
-        );
+        )
     }
     fn click(app: &mut PeerBrush, ctx: &egui::Context, save: bool) {
         for _ in 0..4 {
@@ -455,16 +493,49 @@ mod tests {
     fn preview(app: &mut PeerBrush, ctx: &egui::Context) {
         frame(app, ctx, vec![]);
         app.export_editor.as_mut().unwrap().changed_at = Instant::now() - Duration::from_secs(1);
-        for _ in 0..400 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
             frame(app, ctx, vec![]);
             let e = app.export_editor.as_ref().unwrap();
             if e.preview.is_some() {
                 return;
             }
             assert!(e.error.is_none(), "{:?}", e.error);
+            assert!(
+                Instant::now() < deadline,
+                "Native export preview did not complete"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
-        panic!("Native export preview did not complete");
+    }
+    fn click_text(app: &mut PeerBrush, ctx: &egui::Context, text: &str) {
+        frame(app, ctx, vec![]);
+        let output = frame(app, ctx, vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(value) if value.galley.job.text == text => {
+                    Some(value.pos + value.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Actual export control missing: {text}"));
+        for pressed in [true, false] {
+            frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
     }
     #[test]
     fn native_export_preview_preset_and_batch_buttons_preserve_native_sources() {
@@ -510,10 +581,12 @@ mod tests {
                 .expect("Export button starts shared batch");
             let library = shared.lock().unwrap().export_library.clone();
             let mut state = export::jobs::state(&library, &run).unwrap();
-            for _ in 0..400 {
-                if state.status != "running" {
-                    break;
-                }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while state.status == "running" {
+                assert!(
+                    Instant::now() < deadline,
+                    "Native export batch did not complete"
+                );
                 std::thread::sleep(Duration::from_millis(2));
                 frame(&mut app, &ctx, vec![]);
                 state = export::jobs::state(&library, &run).unwrap();
@@ -580,5 +653,138 @@ mod tests {
         drop(app);
         drop(shared);
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn actual_derived_format_controls_preview_preset_and_batch_keep_native_sources() {
+        for format in [Format::Webp, Format::Jxl] {
+            for depth in [8, 16] {
+                let (mut app, ctx, shared, root) = fixture(depth);
+                let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+                click_text(
+                    &mut app,
+                    &ctx,
+                    if format == Format::Jxl {
+                        "JPEG XL"
+                    } else {
+                        "WebP · lossless 8-bit"
+                    },
+                );
+                assert_eq!(app.export_editor.as_ref().unwrap().settings.format, format);
+                if format == Format::Jxl {
+                    assert!(app.export_editor.as_ref().unwrap().settings.jxl.lossless);
+                    click_text(&mut app, &ctx, "Lossless");
+                    assert!(!app.export_editor.as_ref().unwrap().settings.jxl.lossless);
+                    for value in ["3", "1.0"] {
+                        click_text(&mut app, &ctx, value);
+                        frame(
+                            &mut app,
+                            &ctx,
+                            vec![egui::Event::Key {
+                                key: egui::Key::ArrowRight,
+                                physical_key: Some(egui::Key::ArrowRight),
+                                pressed: true,
+                                repeat: false,
+                                modifiers: Default::default(),
+                            }],
+                        );
+                    }
+                    let options = app.export_editor.as_ref().unwrap().settings.jxl;
+                    assert!(options.effort > 3 && options.distance > 1.);
+                }
+                app.export_editor.as_mut().unwrap().directory = root.to_string_lossy().into();
+                preview(&mut app, &ctx);
+                let output = app
+                    .export_editor
+                    .as_ref()
+                    .unwrap()
+                    .preview_output
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(
+                    output.bit_depth,
+                    if format == Format::Webp { 8 } else { depth }
+                );
+                assert_eq!(output.native_source_depth, depth);
+                let texture = app
+                    .export_editor
+                    .as_ref()
+                    .unwrap()
+                    .preview
+                    .as_ref()
+                    .unwrap()
+                    .id();
+                let shown = frame(&mut app, &ctx, vec![]);
+                assert!(shown.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Mesh(mesh)if mesh.texture_id==texture)),"Actual encoded-output preview is painted");
+                click(&mut app, &ctx, true);
+                let library = export::library::Library::load(root.join("presets.json"));
+                assert_eq!(
+                    library.snapshot().presets[0].settings,
+                    app.export_editor.as_ref().unwrap().settings
+                );
+                click(&mut app, &ctx, false);
+                let run = app.export_editor.as_ref().unwrap().run.as_deref().unwrap();
+                let library = shared.lock().unwrap().export_library.clone();
+                let mut state = export::jobs::state(&library, run).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while state.status == "running" {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Derived export batch did not complete"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                    state = export::jobs::state(&library, run).unwrap();
+                }
+                assert_eq!(state.status, "completed", "{:?}", state.error);
+                assert_eq!(state.outputs[0].output.format, format);
+                let bytes = std::fs::read(&state.outputs[0].path).unwrap();
+                if format == Format::Webp {
+                    assert_eq!(&bytes[8..12], b"WEBP");
+                    assert_eq!(
+                        image::load_from_memory(&bytes).unwrap().color(),
+                        image::ColorType::Rgba8
+                    );
+                } else {
+                    let decoded = crate::jpeg_xl::decode(&bytes, &|| Ok(())).unwrap();
+                    assert_eq!(
+                        (
+                            decoded.info.width,
+                            decoded.info.height,
+                            decoded.info.bit_depth
+                        ),
+                        (16, 12, depth)
+                    );
+                    let expected =
+                        image::load_from_memory(&shared.lock().unwrap().doc.export_png().unwrap())
+                            .unwrap()
+                            .into_rgba16()
+                            .into_raw();
+                    let actual = match decoded.pixels {
+                        crate::jpeg_xl::Pixels::Eight(bytes) => bytes
+                            .into_iter()
+                            .map(|v| u16::from(v) * 257)
+                            .collect::<Vec<_>>(),
+                        crate::jpeg_xl::Pixels::Sixteen(words) => words,
+                    };
+                    assert!(actual
+                        .iter()
+                        .skip(3)
+                        .step_by(4)
+                        .eq(expected.iter().skip(3).step_by(4)));
+                    if depth == 16 {
+                        assert!(actual
+                            .chunks_exact(4)
+                            .any(|p| p[3] != 0 && p[..3].iter().any(|v| v % 257 != 0)));
+                    }
+                }
+                assert_eq!(
+                    serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                    before
+                );
+                assert!(shared.lock().unwrap().undo.is_empty());
+                drop(app);
+                drop(shared);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 }

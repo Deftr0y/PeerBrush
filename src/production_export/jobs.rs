@@ -1,4 +1,4 @@
-//! Cancellable per-output publication. Completed PNGs are receipts; originals stay editable.
+//! Cancellable per-output publication. Completed exports are receipts; originals stay editable.
 use super::{Control, Output, Settings};
 use crate::server::Shared;
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,7 @@ pub fn start(
     existing: Existing,
     actor: &str,
 ) -> Result<State, String> {
+    let operation = crate::server::FileOperation::begin(shared)?;
     settings.validate()?;
     if actor.trim().is_empty() || actor.len() > 64 || actor.chars().any(char::is_control) {
         return Err("Use a readable export actor of up to 64 characters".into());
@@ -153,6 +154,7 @@ pub fn start(
     }
     let shared = shared.clone();
     std::thread::spawn(move || {
+        let _operation = operation;
         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<(),String> {
             let plan=super::plan(&doc,&targets,&settings,&control)?;
             {
@@ -163,17 +165,16 @@ pub fn start(
                 control.check()?;
                 job.state.lock().unwrap().stage=format!("Rendering {} ({}/{})",output.filename,index+1,plan.outputs.len());
                 let path=directory.join(&output.filename);
-                let mut byte_count=0;
-                let published=crate::server::export_derived_guarded(&shared,&path,&json!({"document_id":doc.id,"expected_revision":doc.revision,"overwrite":existing==Existing::Replace,"skip_existing":existing==Existing::Skip}),&control, |source| {
-                    let bytes=super::render(source,output,&settings,&control)?;byte_count=bytes.len();Ok(bytes)
+                let published=crate::server::export_derived_to_guarded(&shared,&path,&json!({"document_id":doc.id,"expected_revision":doc.revision,"overwrite":existing==Existing::Replace,"skip_existing":existing==Existing::Skip}),&control, |source,writer| {
+                    super::render_to(source,output,&settings,&control,writer)
                 });
                 let published=match published {
                     Ok(published)=>published,
                     Err(error)=>{let mut state=job.state.lock().unwrap();state.outputs[index].status="failed".into();state.outputs[index].message=Some(error.clone());return Err(error);}
                 };
                 let mut state=job.state.lock().unwrap();let receipt=&mut state.outputs[index];
-                receipt.status=if published {"written"} else {"skipped"}.into();receipt.bytes=published.then_some(byte_count);
-                if !published {receipt.message=Some("Existing destination retained".into());}
+                receipt.status=if published.is_some() {"written"} else {"skipped"}.into();receipt.bytes=published;
+                if published.is_none() {receipt.message=Some("Existing destination retained".into());}
             }
             Ok(())
         })).unwrap_or_else(|_|Err("Export could not complete; source remains unchanged".into()));

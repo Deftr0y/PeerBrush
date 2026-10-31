@@ -79,6 +79,7 @@ impl PeerBrush {
         let mut legacy = None;
         let mut discard = None;
         egui::Window::new("Recover autosaved work").open(&mut open).default_width(590.).show(ctx, |ui| {
+            dialogs::body(ui, 590.);
             ui.label("Restore a complete version into a new tab. Original files stay intact.");
             ui.label(RichText::new("Restored work is unsaved. Choose a destination with Save As; recovery versions remain until discarded.").color(MUTED));
             if let Some(error) = &failure { ui.colored_label(ACCENT, error); }
@@ -102,7 +103,7 @@ impl PeerBrush {
             });
             if self.recovery.entries.is_empty() && self.recovery.legacy.is_empty() { ui.label("No complete recovery versions are available."); }
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.busy && self.recovery.selected.is_some(),egui::Button::new("Restore selected version")).clicked() { restore = self.recovery.selected.clone(); }
+                if ui.add_enabled(!self.busy && self.recovery.selected.is_some(),dialogs::primary("Restore selected version")).clicked() { restore = self.recovery.selected.clone(); }
                 if ui.add_enabled(!self.busy && self.recovery.selected.is_some(),egui::Button::new("Discard selected…")).clicked() { self.recovery.discard = self.recovery.selected.clone(); }
                 if ui.button("Refresh").clicked() { self.recovery = Browser::new(&self.connection.state_dir); }
                 if ui.button("Later").clicked() { later = true; }
@@ -117,7 +118,11 @@ impl PeerBrush {
         });
         self.recovery.open = open && !later;
         if let Some(snapshot) = discard {
-            match crate::recovery::discard(&self.connection.state_dir, &snapshot) {
+            match crate::recovery::discard_in(
+                &self.workspace,
+                &self.connection.state_dir,
+                &snapshot,
+            ) {
                 Ok(()) => {
                     self.recovery = Browser::new(&self.connection.state_dir);
                     self.recovery.open = true;

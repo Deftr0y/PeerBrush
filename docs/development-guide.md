@@ -1,6 +1,6 @@
 # PeerBrush development guide
 
-PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26 is unreleased; published downloads remain 0.25.
+PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store 0.26 remains pending. The active [v0.3 milestone](development-0.3.md) proposes the remaining backlog and installation/release foundations, with PB-108 first. Its approved application version is 0.30.0; development packages are unreleased.
 
 ## Branches and pull requests
 
@@ -8,12 +8,17 @@ PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu.
 | --- | --- | --- |
 | `main` | Production source | Receives `dev` |
 | `dev` | Final integration and release acceptance | `main` |
+| `version/0.3` | Active v0.3 milestone; application version 0.30.0 | `dev` |
+| `feature/0.3/<topic>` | One focused v0.3 feature or foundation | `version/0.3` |
+| `fix/0.3/<topic>` | One focused v0.3 bug fix | `version/0.3` |
 | `version/0.26` | Changes and acceptance work intended for 0.26 | `dev` |
 | `feature/0.26/<topic>` | One focused feature or documentation change | `version/0.26` |
 | `fix/0.26/<topic>` | One focused bug fix | `version/0.26` |
 | `site-content` | Reviewed public website output | Website deployment workflow |
 | `maintenance/archive-<checkpoint>` | Retained historical packaging corrections | No normal development promotion |
 | `maintenance/site-<topic>` | A reviewed website content change | `site-content` |
+
+The active `version/0.3` integration branch starts from synchronized `dev`/`main`. Use `feature/0.3/<topic>` or `fix/0.3/<topic>` targeting it; do not mix new development into published 0.26 artifacts. The installation/release foundations are explicitly proposed for v0.3 in its development queue, with PB-108 still first.
 
 The normal promotion order is **feature or fix → matching version → dev → main**. Use lowercase names and a descriptive topic, for example `fix/0.26/selection-coverage`. Never create a `codex/` branch, regardless of capitalization. `origin/` is the remote-tracking prefix, not part of a branch name. Git cannot hold both `version/0.26` and `version/0.26/selection-coverage`; feature and fix names use their own namespace.
 
@@ -34,14 +39,16 @@ The CI branch-policy check rejects forbidden names and incorrect PR destinations
 
 ## Build and verification
 
-Install stable Rust and the native platform prerequisites. Linux CI installs `libxkbcommon-dev`, `libwayland-dev`, `libxcb-shape0-dev` and `libxcb-xfixes0-dev`. Windows development can use the ignored toolchain prepared by `scripts/dev.ps1`; it does not modify persistent PATH.
+Use the committed Rust 1.92.0 toolchain and [native JPEG XL build prerequisites](jpeg-xl-build.md). Linux CI installs `libxkbcommon-dev`, `libwayland-dev`, `libxcb-shape0-dev` and `libxcb-xfixes0-dev`. On Windows, start in an existing MSVC/SDK developer shell with the reviewed Clang/CMake/Ninja on PATH. The command wrapper selects these tools only for its child; the older ignored GNU bootstrap is no longer selected.
 
 ```sh
-cargo run --locked
+python scripts/jxl_build.py -- run --locked -- --state-dir .runtime
 cargo fmt --all -- --check
-cargo test --locked
-cargo clippy --all-targets --locked
+python scripts/jxl_build.py -- build --locked --bin peerbrush
+python scripts/jxl_build.py -- test --locked
+python scripts/jxl_build.py -- clippy --all-targets --locked
 python scripts/test_package.py
+python -B scripts/test_windows_executable_signing.py
 ```
 
 ```powershell
@@ -64,10 +71,20 @@ Use the Ember palette, compact unboxed controls and the connected Color/Mask sel
 
 Use only an approved human Git identity from `.github/human-contributors.json`. Never add an AI author, committer, co-author or contributor badge. Keep the README's AI-development disclosure. Do not commit credentials, runtime state, recovery files, local tools, QA captures or build output. Required bundled artwork, fonts and licenses belong in source and packages. Review the actual diff and package contents through the [privacy/security gate](release-maintenance.md#privacy-and-security-publication-gate).
 
+Default launches use the versioned [per-user preferences profile](settings.md). Explicit `--state-dir` development workspaces retain instance-local settings and cache; keep their MCP launch arguments unchanged. Never copy entire runtime directories into settings migration or package inputs: recovery files, discovery tokens, artwork and unknown private files have separate ownership.
+
 ## Release promotion and website
 
 Before version → dev, complete the intended scope and report unresolved acceptance work. Before dev → main, confirm the release version and notes, all required checks, native acceptance evidence and a clean reviewed release source. Production publication must use Windows, macOS and Linux packages built and verified from the exact same production commit and version; never relabel an older platform binary.
 
-The intended automated production sequence is **main → exact-source tests/builds → verified packages → versioned GitHub release → matching website release information and deployment**. The existing CI builds and inspects all three platforms. Currently `release.yml` prepares candidates through manual dispatch, and `pages.yml` deploys a specifically reviewed `site-content` commit through manual dispatch from `main`. The `github-pages` environment restricts eligible deployment branches; preserve that protection. Merging application source into `main` does not currently publish a release or synchronize website release data. Do not describe the complete production sequence as active until it is configured and verified.
+The intended automated production sequence is **main → exact-source tests/builds → verified packages → versioned GitHub release → matching website release information and deployment**. The existing CI builds and inspects all three platforms. Currently `release.yml` prepares candidates through manual dispatch, and `pages.yml` deploys a specifically reviewed `site-content` commit through manual dispatch from `main`. The `github-pages` environment restricts eligible deployment branches; preserve that protection. Merging application source into `main` does not currently publish a release or synchronize website release data. Do not describe the complete production sequence as active until it is configured and verified. The unreleased [final composition and immutable publication controller](production-publishing.md) adds source/version checks on main and a protected preparation path; publication remains unconditionally disabled while native producers and installed acceptance are incomplete.
 
 Follow the [release-maintenance playbook](release-maintenance.md) for actual publication, checksums, version history and read-back verification. Keep the site's development-guide link pointed at a published branch or a verified source commit containing this guide. Keep unreleased version queues separate from published downloads. Website content changes use `maintenance/site-<topic>` based on `site-content`; review the public diff before promoting the result to `site-content`, then dispatch the website workflow from an eligible branch with its exact site commit. Confirm the deployed content, not just workflow completion. Do not merge the website output branch into application source or delete it while the deployment workflow uses it.
+
+JPEG XL builds require the committed Rust 1.92 toolchain and native CMake/Ninja/Clang prerequisites. See [JPEG XL build inputs](jpeg-xl-build.md); do not install a global toolchain or workload to bypass an unqualified compiler.
+
+Integration codec tests launch the application worker in the matching Cargo profile directory. Build that source-matched main before running tests; the development test helper and all current native CI callers do so. Installed application launches use their exact current executable, including renamed installations; no PATH-selected worker or configurable executable is accepted.
+
+macOS native workflows qualify the already installed `python` as Python 3.11 or newer before native tool setup and pin its existing directory through `GITHUB_PATH`. Both `python` and `python3` in that directory must resolve to the qualified executable; no interpreter is installed. This preserves the qualified runtime when codec tool selection exports a PATH that could otherwise shadow it. A fixed numeric Python version is recorded; filesystem paths are not printed.
+
+Release native flags retain the inherited `cc` mode: absent/empty/`0`/`false`/`no` means ASCII whitespace splitting; other values opt into shell quoting. The release wrapper reserializes standard C/C++/archiver flag families and target variants before enabling shell parsing and adding path remaps. Malformed shell syntax and control values are rejected. The same-version CMake 0.1.58 patch preserves complete discovered compiler arguments when forwarding them as a CMake command fragment; default flags and explicit CMake fragments remain intact. Its upstream archive hash, licenses and change scope are recorded in `vendor/cmake/README.md`. A later package test runs a small offline, locked cc/CMake C-and-C++ fixture only with qualified native tools; it proves actual argv, preprocessing and object file-prefix mapping for legacy/shell flag modes, including spaces, quotes, backslashes and Unicode. This does not qualify other host/generator combinations.

@@ -50,7 +50,7 @@ pub struct Effect {
     pub enabled: bool,
     #[serde(default = "full_weight")]
     pub weight: f32,
-    pub settings: Value,
+    pub settings: Arc<Value>,
 }
 pub fn full_weight() -> f32 {
     1.0

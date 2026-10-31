@@ -86,14 +86,14 @@ fn dab_regions_match_full_native_renders_for_masks_effects_and_changed_settings(
                     kind: "blur".into(),
                     enabled: true,
                     weight: 0.8,
-                    settings: json!({"radius":2}),
+                    settings: json!({"radius":2}).into(),
                 }];
                 base.filters = vec![Effect {
                     id: id(),
                     kind: "posterize".into(),
                     enabled: true,
                     weight: 0.7,
-                    settings: json!({"levels":7}),
+                    settings: json!({"levels":7}).into(),
                 }];
                 base.layers[0].mask = Some(Mask {
                     linked: true,
@@ -273,7 +273,7 @@ fn cache_resets_for_baselines_and_unbounded_effects() {
         id: id(),
         kind: "liquify".into(),
         enabled: true,
-        settings: peerbrush::liquify::defaults(),
+        settings: peerbrush::liquify::defaults().into(),
     });
     assert!(!preview::supports_dirty(&doc));
     assert!(cache
@@ -316,28 +316,28 @@ fn whole_image_filters_use_exact_padded_native_regions_and_reset_changed_setting
                     kind: "posterize".into(),
                     enabled: true,
                     weight: 0.63,
-                    settings: json!({"levels":5}),
+                    settings: json!({"levels":5}).into(),
                 },
                 Effect {
                     id: id(),
                     kind: "blur".into(),
                     enabled: true,
                     weight: 0.7,
-                    settings: json!({"radius":2}),
+                    settings: json!({"radius":2}).into(),
                 },
                 Effect {
                     id: id(),
                     kind: "bloom".into(),
                     enabled: true,
                     weight: 0.4,
-                    settings: json!({"spread":3,"threshold":0.3,"strength":0.8}),
+                    settings: json!({"spread":3,"threshold":0.3,"strength":0.8}).into(),
                 },
                 Effect {
                     id: id(),
                     kind: "channel_clamp".into(),
                     enabled: true,
                     weight: 0.8,
-                    settings: json!({"channel":"o","minimum":0.2,"maximum":0.9}),
+                    settings: json!({"channel":"o","minimum":0.2,"maximum":0.9}).into(),
                 },
             ];
             let target = base.layers[2].id.clone();
@@ -393,7 +393,7 @@ fn whole_image_filters_use_exact_padded_native_regions_and_reset_changed_setting
                     baseline
                 );
                 let mut changed = base.clone();
-                changed.filters[0].settings = json!({"levels":9});
+                changed.filters[0].settings = json!({"levels":9}).into();
                 let reset = cache
                     .render(
                         &changed,
@@ -482,7 +482,7 @@ fn document_filter_regions_match_full_native_canvas_edges_and_pointwise_kinds() 
                     kind: kind.into(),
                     enabled: true,
                     weight: 0.7,
-                    settings: peerbrush::effects::defaults(kind),
+                    settings: peerbrush::effects::defaults(kind).into(),
                 }];
                 let target = base.layers[0].id.clone();
                 let mut cache = Cache::default();
@@ -689,7 +689,7 @@ fn filtered_fixture(depth: u16) -> Document {
         id: id(),
         kind: "blur".into(),
         enabled: true,
-        settings: json!({"radius":2}),
+        settings: json!({"radius":2}).into(),
     });
     let mut paint = Layer::new("Offset painting", "paint", 149, 103);
     paint.x = 11;
@@ -701,14 +701,14 @@ fn filtered_fixture(depth: u16) -> Document {
             id: id(),
             kind: "levels".into(),
             enabled: true,
-            settings: json!({"gamma":0.8}),
+            settings: json!({"gamma":0.8}).into(),
         },
         Effect {
             weight: 1.0,
             id: id(),
             kind: "bloom".into(),
             enabled: true,
-            settings: json!({"threshold":0.1,"spread":3,"strength":0.8}),
+            settings: json!({"threshold":0.1,"spread":3,"strength":0.8}).into(),
         },
     ];
     paint.mask = Some(Mask {
@@ -762,7 +762,7 @@ fn filtered_fixture(depth: u16) -> Document {
         id: id(),
         kind: "hsl".into(),
         enabled: true,
-        settings: json!({"hue":32,"saturation":0.2}),
+        settings: json!({"hue":32,"saturation":0.2}).into(),
     });
     let mut backdrop = Layer::new("Backdrop", "fill", 199, 131);
     backdrop.color = [20, 40, 60, 255];
@@ -947,14 +947,14 @@ fn retained_filters_reset_for_changed_layout_settings_and_failed_frames() {
         assert!(reset.dirty.is_none());
         assert_eq!(reset.bytes, doc.preview(None, 113, None, false).unwrap().2);
         // Model an invalid draft without changing the baseline revision.
-        doc.layers[2].effects[1].settings["spread"] = json!(900);
+        std::sync::Arc::make_mut(&mut doc.layers[2].effects[1].settings)["spread"] = json!(900);
         for layer in &mut doc.layers {
             layer.effect_key = id();
         }
         assert!(cache
             .render(&doc, "metadata", Some([10, 10, 20, 20]), 113, None, false)
             .is_err());
-        doc.layers[2].effects[1].settings["spread"] = json!(8);
+        std::sync::Arc::make_mut(&mut doc.layers[2].effects[1].settings)["spread"] = json!(8);
         let restored = cache
             .render(&doc, "metadata", Some([10, 10, 20, 20]), 113, None, false)
             .unwrap();
