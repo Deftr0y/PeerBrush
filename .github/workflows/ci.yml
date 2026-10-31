@@ -94,13 +94,18 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import os, re, subprocess
+          import hashlib, json, os, re, subprocess, sys
           from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from jxl_build import configure
           version = subprocess.check_output(['rustc', '--version'], text=True).split()[1]
           if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
               raise SystemExit('Unexpected stable compiler version')
           with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
               output.write(f'version={version}\n')
+              _, native = configure()
+              native = hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest()
+              output.write(f'native={native}\n')
           PY
       - name: Restore Rust dependencies and build outputs
         id: cargo_cache
@@ -367,7 +372,29 @@ jobs:
       - run: python -B scripts/test_publish_release.py
       - run: python -B scripts/test_prepare_site_release.py
       - run: python -B scripts/test_readback_site_release.py
+      # Keep release dependencies separately: the earlier immutable cache is
+      # saved before release compilation. Exclude runtime profiles and test work.
+      - name: Restore release compilation outputs
+        id: release_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
+        with:
+          path: |
+            target/release/.fingerprint
+            target/release/build
+            target/release/deps
+            target/release/incremental
+          key: peerbrush-release-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ steps.compiler.outputs.native }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py', 'scripts/jxl_build.py', 'vendor/cmake/**', 'vendor/jpegxl-src/**') }}
       - run: python scripts/build_release.py
+      - name: Save release compilation outputs
+        if: success() && steps.release_cache.outputs.cache-hit != 'true' && steps.release_cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
+        with:
+          path: |
+            target/release/.fingerprint
+            target/release/build
+            target/release/deps
+            target/release/incremental
+          key: ${{ steps.release_cache.outputs.cache-primary-key }}
       - name: Verify fixed-offer setup feature component tests
         run: cargo test --locked --features windows-setup --lib updates::windows::bootstrap
       - name: Build dormant setup entry without an offer
