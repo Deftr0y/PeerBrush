@@ -420,7 +420,7 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
                                   url=assets[name]['browser_download_url'], bytes=record['bytes'], sha256=record['sha256'],
                                   nativeSigning=trust, packageReadiness='portable-archive-verified',
                                   description=f'{architecture} · Portable ZIP · Native trust {trust}'))
-    if final is not None:
+    if final is not None and 'windows-direct' in final['channels']:
         direct = final['channels']['windows-direct']
         excluded.append(dict(file=direct['file'], reason='windows-native-final-producer-and-installed-acceptance-unverified',
                              asset_binding_verified=True, content_verified=False, ready=False, production_ready=False,

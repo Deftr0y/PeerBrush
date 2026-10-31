@@ -1,6 +1,7 @@
 """Protected immutable GitHub release transaction; current native gates keep it disabled.
 
-No ready-report input, replacement/delete API, Store write or automatic mutation retry.
+No ready-report input, replacement/delete API or automatic mutation retry.
+Store handoff is limited to the same fresh protected publication invocation.
 """
 import hashlib
 import http.client
@@ -11,7 +12,7 @@ import re
 import time
 from urllib.parse import quote, urlsplit
 
-from final_release import Candidate, LIMIT, MANIFEST, checksum_bytes, encode, read, validate_manifest
+from final_release import Candidate, LIMIT, MANIFEST, STORE_FORMAT, checksum_bytes, encode, read, validate_manifest
 from package import regular_file
 from package_macos_dmg import bounded_file
 from production_readiness import unique_fields
@@ -272,7 +273,7 @@ def public_readback(manifest, get=None, notes=None):
                 production_ready=False, store=manifest['channels']['microsoft-store'])
 
 
-def _transfer(client, directory, manifest, notes, readback=None):
+def _transfer(client, directory, manifest, notes, readback=None, after_publish=None):
     """Mechanical transaction; only publish() may supply production authority.
 
     Offline tests exercise this layer with a service double, never credentials.
@@ -305,6 +306,7 @@ def _transfer(client, directory, manifest, notes, readback=None):
         release = client.create(tag, commit, name, notes)
     release_identity(release, tag, commit, name, notes)
     uploaded = remote_files(client, release, records, complete=not release['draft'])
+    published_here = False
     if release['draft']:
         for filename in sorted(set(records) - uploaded):
             path = regular_file(directory, filename)
@@ -325,6 +327,7 @@ def _transfer(client, directory, manifest, notes, readback=None):
                 or (resolved is not None and (not isinstance(resolved, dict) or resolved.get('sha') != commit))):
             raise ValueError('Main or selected tag changed before publication; preserve the immutable draft.')
         client.publish(release['id'])
+        published_here = True
     # Public visibility can lag a successful PATCH. Never turn that into another
     # create/publish request or ready website row: a later run reads back only.
     release = client.release(tag)
@@ -335,7 +338,110 @@ def _transfer(client, directory, manifest, notes, readback=None):
     result = readback(manifest)
     if not isinstance(result, dict) or result.get('public_availability') != 'verified':
         raise ValueError('Publication remains unverified until actual public readback succeeds.')
+    if after_publish is not None:
+        # A response-lost PATCH never reaches here. Already-public releases may
+        # only reconcile: neither reruns nor lost/expired receipts recreate a
+        # Store mutation permit. The callback never crosses a process boundary.
+        if published_here:
+            result['store_handoff'] = after_publish()
+        else:
+            result['store_handoff'] = dict(submission_attempted=False,
+                reason='existing-publication-read-only-reconciliation-required', public_availability='unverified')
     return result
+
+
+def _prepare_store_handoff(candidate):
+    """Read-only credential/product/pending/version preflight before GitHub writes."""
+    import submit_store_release as store
+    candidate.verify()
+    manifest = candidate.manifest
+    records = validate_manifest(manifest)
+    package = manifest['channels']['microsoft-store']['file']
+    report = json.loads(read(candidate.directory / (package + '.json'), 64 * 1024,
+        records[package + '.json']['sha256']), object_pairs_hook=unique_fields)
+    data = read(candidate.directory / package, LIMIT, records[package]['sha256'])
+    provider = _StoreWrites(store.Store())
+    store.submit(provider, package, data, report, execute=False)
+    return provider
+
+
+def _store_handoff(candidate, environment, provider):
+    """One fresh protected publication, one submission attempt; never replay receipts.
+
+    Local write-ahead records aid diagnosis. Artifact retention is not write
+    authority: a new process cannot resume this callback from a record. A lost
+    response or competing draft needs service reconciliation, not a retry.
+    """
+    import submit_store_release as store
+    from store_release_state import locked
+    from package_macos_dmg import private_inspection_directory
+    candidate.verify()
+    manifest = candidate.manifest
+    if manifest['format'] != STORE_FORMAT:
+        raise ValueError('Automatic Store handoff requires the exact Store-only final composition.')
+    directory = private_inspection_directory(Path(environment['RUNNER_TEMP']) / 'peerbrush-store-handoff',
+                                             candidate.root, fresh=True)
+    directory.mkdir(mode=0o700)
+    records = validate_manifest(manifest)
+    package = manifest['channels']['microsoft-store']['file']
+    portable = next(r['file'] for r in manifest['base_inventory']['assets'] if r.get('platform') == 'Windows')
+    # Reopen actual published bytes against independent final inventory hashes.
+    name, data, report = store.released_assets('v' + manifest['version'], candidate.root,
+        records[portable]['sha256'], records[package]['sha256'])
+    if name != package:
+        raise ValueError('Published Store package differs from final composition.')
+    candidate.verify()
+    with locked(directory / 'submission.json') as journal:
+        journal.bind('v' + manifest['version'], name, report)
+        store.submit(provider, name, data, report, execute=True, journal=journal)
+        return dict(submission_attempted=True, service_status=journal.state['service_status'],
+                    public_availability='unverified')
+
+
+class _StoreWrites:
+    """Re-observe exact product and pending owner immediately before every write."""
+    def __init__(self, provider):
+        self.provider, self.submission_id, self.baseline = provider, None, None
+
+    def check(self):
+        import submit_store_release as store
+        app = self.provider.call()
+        if (app.get('id') != store.STORE_ID or app.get('packageIdentityName') != store.IDENTITY
+                or app.get('publisherName') != store.PUBLISHER or app.get('packageFamilyName') != store.FAMILY
+                or app.get('lastPublishedApplicationSubmission') != self.baseline):
+            raise store.SafeError('Store product or published baseline changed before mutation; reconcile without retry.')
+        pending = app.get('pendingApplicationSubmission')
+        if self.submission_id is None:
+            if pending:
+                raise store.SafeError('Store creation conflicts with existing state; no mutation retried.')
+        elif not isinstance(pending, dict) or str(pending.get('id')) != self.submission_id:
+            raise store.SafeError('Store pending submission changed; no mutation retried.')
+
+    def before_upload(self, sid):
+        import submit_store_release as store
+        if self.submission_id != sid:
+            raise store.SafeError('Store upload owner differs; no mutation retried.')
+        self.check()
+
+    def call(self, path='', method='GET', data=None):
+        import submit_store_release as store
+        if method != 'GET':
+            self.check()
+            if self.submission_id is None:
+                if path != '/submissions' or method != 'POST':
+                    raise store.SafeError('Store creation conflicts with existing state; no mutation retried.')
+            elif path not in ['/submissions/' + self.submission_id, '/submissions/' + self.submission_id + '/commit']:
+                raise store.SafeError('Store pending submission changed; no mutation retried.')
+        result = self.provider.call(path, method=method, data=data)
+        if path == '' and method == 'GET' and self.baseline is None:
+            import copy
+            self.baseline = copy.deepcopy(result.get('lastPublishedApplicationSubmission'))
+        if path == '/submissions' and method == 'POST':
+            sid = str(result.get('id', ''))
+            if not re.fullmatch('[0-9]+', sid):
+                raise store.SafeError('Store creation result is ambiguous; no mutation retried.')
+            self.submission_id = sid
+        return result
 
 
 def publish(candidate, client, notes, *, execute=False, environment=None):
@@ -352,10 +458,16 @@ def publish(candidate, client, notes, *, execute=False, environment=None):
     required = {'GITHUB_REPOSITORY': REPOSITORY, 'GITHUB_REF': 'refs/heads/main',
                 'GITHUB_SHA': commit, 'GITHUB_WORKFLOW_SHA': commit, 'GITHUB_EVENT_NAME': 'workflow_dispatch',
                 'GITHUB_WORKFLOW_REF': REPOSITORY + '/.github/workflows/production.yml@refs/heads/main',
-                'PEERBRUSH_PRODUCTION_APPROVED': 'true'}
+                'PEERBRUSH_PRODUCTION_APPROVED': 'true', 'GITHUB_RUN_ATTEMPT': '1'}
     if any(env.get(key) != value for key, value in required.items()):
         raise ValueError('Publication requires the exact reviewed main workflow and protected explicit approval.')
-    return _transfer(client, candidate.directory, candidate.manifest, notes)
+    if candidate.manifest['format'] != STORE_FORMAT:
+        raise ValueError('Current production distribution requires Store-only Windows composition; historical direct layouts are readback only.')
+    if env.get('PEERBRUSH_STORE_HANDOFF_ENABLED') != 'true':
+        raise ValueError('Store-only publication requires its explicitly approved Store handoff before any GitHub write.')
+    provider = _prepare_store_handoff(candidate)
+    handoff = lambda: _store_handoff(candidate, env, provider)
+    return _transfer(client, candidate.directory, candidate.manifest, notes, after_publish=handoff)
 
 
 def main(argv=None):

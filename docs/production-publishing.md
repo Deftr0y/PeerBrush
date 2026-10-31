@@ -1,13 +1,25 @@
 # Production composition and immutable publication (unreleased)
 
-The current composer emits `PeerBrushFinalReleaseV2`. Its Windows install file is
+The Windows release policy is Microsoft Store only. A selection with `store`
+emits `PeerBrushFinalReleaseV3`, with exactly `microsoft-store`, `macos-direct`
+and `linux-direct` channels. It binds the unsigned Store submission MSIX,
+source-matched producer report and checksum through the actual Store content
+preflight, alongside the same inspected Mac/Linux assets and corresponding
+source. It requires no direct Windows certificate, runtime redistribution or
+App Installer descriptor. Content validation remains separate from authenticated
+SDK production, installed acceptance, submission and public availability; those
+readiness gates remain held. The Store source producer/installed evidence,
+upstream acquisition and public-availability integrations still need qualification.
+
+V1 and V2 remain strict historical direct-Windows layouts. A selection with
+`windows` retains `PeerBrushFinalReleaseV2`. Its Windows install file is
 the exact signed MSIX, with the explicit runtime as its dependency and
 `update_route: verified-local`. The versioned and stable `.appinstaller` files
 are separate discovery metadata, never the installation entry point. Their
 canonical bytes, hashes, identities and public readback remain required. The
 strict V1 reader retains its original descriptor entry point for historical
 readback only; it cannot be silently rewritten into V2 for an existing version.
-Both layouts retain false readiness and unverified installed acceptance. This
+All layouts retain false readiness and unverified installed acceptance. This
 alignment does not supply a verified fresh-install bootstrapper, trusted signing,
 native installed evidence or a selectable website download.
 

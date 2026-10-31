@@ -275,6 +275,9 @@ def submit(store, name, package, report, execute=False, journal=None):
     zipped = io.BytesIO()
     with zipfile.ZipFile(zipped, 'w', zipfile.ZIP_STORED) as archive:
         archive.writestr(name, package)
+    before_upload = getattr(store, 'before_upload', None)
+    if before_upload is not None:
+        before_upload(sid)
     request(upload, method='PUT', data=zipped.getvalue(), headers={'x-ms-blob-type': 'BlockBlob'}, binary=True)
     journal.phase('commit-requested')
     store.call('/submissions/' + sid + '/commit', method='POST')

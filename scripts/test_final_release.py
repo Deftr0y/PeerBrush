@@ -623,5 +623,115 @@ class StoreStatus(unittest.TestCase):
             self.assertFalse(result['ready'])
 
 
+class StoreOnlyComposition(unittest.TestCase):
+    def setUp(self):
+        self.fixture = Composition(methodName='runTest')
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
+
+    def compose(self):
+        f = self.fixture
+        # This seam checks composition/transport, not SDK or package qualification.
+        # The separate StoreBinding tests run the actual content preflight.
+        package = f.direct / 'PeerBrush-1.2.0.0-Windows-x64.msix'
+        package.write_bytes(b'SYNTHETIC_STORE_COMPOSITION_BYTES_NOT_AN_MSIX')
+        raw = b'{"synthetic":"composition-only"}\n'
+        selection = dict(package=package, package_sha256=digest(package), report='unused',
+                         report_sha256=hashlib.sha256(raw).hexdigest(), previous_version='1.1.0.0')
+        sidecars = {package.name + '.json': raw,
+                    package.name + '.sha256': (digest(package) + '  ' + package.name + '\n').encode()}
+        value = ([package], final.store_package_channel(package.name), [(package, final.LIMIT, digest(package))],
+                 {'content_verified': True, 'native_sdk_validation': 'not-performed-by-consumer'}, sidecars)
+        with mock.patch.object(final, 'store_binding', return_value=value) as store, \
+                mock.patch.object(final, 'windows_binding', side_effect=AssertionError('No direct Windows signing')):
+            candidate = f.compose(windows=None, store=selection)
+        store.assert_called_once()
+        return candidate
+
+    def test_store_only_composition_and_public_consumers_preserve_all_authority_holds(self):
+        import prepare_site_release as site
+        candidate = self.compose()
+        manifest = candidate.manifest
+        self.assertEqual((manifest['schema'], manifest['format']), (3, final.STORE_FORMAT))
+        self.assertEqual(set(manifest['channels']), {'microsoft-store', 'macos-direct', 'linux-direct'})
+        self.assertEqual(manifest['channels']['microsoft-store']['update_route'], 'microsoft-store')
+        self.assertFalse(candidate.assessment['production_ready'])
+        self.assertIn('store-native-sdk-producer-not-authenticated', candidate.blockers)
+        self.assertNotIn('windows-executable-signing-and-installed-acceptance-not-established', candidate.blockers)
+        self.assertNotIn('windows-runtime-redistribution-approval-not-authenticated', candidate.blockers)
+        self.assertFalse(any(name.endswith('.appinstaller') for name in final.validate_manifest(manifest)))
+        self.assertEqual(set(final.validate_manifest(manifest)) | {final.MANIFEST, 'SHA256SUMS'},
+                         {path.name for path in candidate.directory.iterdir()})
+        candidate.verify()
+        with self.assertRaisesRegex(ValueError, 'no direct Windows'):
+            final.windows_files(manifest)
+        # Actual public byte reader accepts this format; a download cannot grant installed readiness.
+        import test_publish_release as publishing_tests
+        service = publishing_tests.Service(manifest)
+        publishing_tests.publishing._transfer(service, candidate.directory, manifest, 'Synthetic notes', readback=lambda m: dict(public_availability='verified'))
+        readback = publish_release.public_readback(manifest, service.public_get, notes='Synthetic notes')
+        self.assertEqual(readback['public_availability'], 'verified')
+        self.assertFalse(readback['production_ready'])
+        entry, excluded = site.published(self.fixture.root, manifest, 'v' + manifest['version'],
+            manifest['commit'], dict(notes=['Synthetic notes'], caution='Not release qualification.'),
+            service.public_get, maintainer=test_deb.MAINTAINER)
+        self.assertEqual(entry['platforms'], [])
+        self.assertTrue(any(r.get('reason') == 'store-public-availability-unverified' for r in excluded))
+        for field, value in [('ready', True), ('submission_enabled', True), ('public_availability', 'verified'),
+                             ('signing', 'trusted'), ('installed_acceptance', 'passed'), ('file', 'foreign.msix')]:
+            changed = copy.deepcopy(manifest)
+            changed['channels']['microsoft-store'][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                final.validate_manifest(changed)
+        changed = copy.deepcopy(manifest)
+        changed['channels']['windows-direct'] = self.fixture.windows
+        with self.assertRaises(ValueError): final.validate_manifest(changed)
+        changed = copy.deepcopy(manifest)
+        changed['files'] = [r for r in changed['files'] if not r['file'].endswith('.msix.json')]
+        with self.assertRaises(ValueError): final.validate_manifest(changed)
+
+    def test_store_only_data_roles_need_no_direct_signer_or_runtime(self):
+        import prepare_final_inputs as inputs
+        f = self.fixture
+        selected = copy.deepcopy(f.options)
+        del selected['windows']
+        selected['store'] = dict(package='windows/PeerBrush-1.2.0.0-Windows-x64.msix', package_sha256='a' * 64,
+            report='windows/PeerBrush-1.2.0.0-Windows-x64.msix.json', report_sha256='b' * 64, previous_version='1.1.0.0')
+        # Portable selectors use JSON strings rather than process-local Paths.
+        selected = json.loads(json.dumps(selected, default=str))
+        roles, trusts = inputs.paths(selected)
+        windows = [record for record in roles if record[0][0] == 'store']
+        self.assertEqual({record[0][1] for record in windows}, {'package', 'report'})
+        self.assertEqual([platform for _, platform in trusts], ['macos'])
+        selected['store']['ready'] = True
+        with self.assertRaises(ValueError): inputs.paths(selected)
+
+
+class StoreBinding(unittest.TestCase):
+    def test_actual_store_payload_source_and_report_are_bound_and_foreign_bytes_refused(self):
+        import test_store_msix_preflight as fixture_tests
+        fixture = fixture_tests.StorePreflight(methodName='runTest')
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        options = fixture.inputs
+        portable = fixture.fixture.portable
+        inventory = dict(commit=options['commit'], version=options['version'],
+                         assets=[dict(platform='Windows', file=portable.name, sha256=options['portable_sha256'])])
+        selection = {key: options[key] for key in ['package_sha256', 'report_sha256', 'previous_version']}
+        selection.update(package=fixture.package, report=fixture.report)
+        result = final.store_binding(fixture.root, inventory, portable.parent, selection)
+        self.assertEqual(result[0], [fixture.package])
+        self.assertTrue(result[3]['content_verified'])
+        self.assertFalse(result[1]['ready'])
+        self.assertEqual(result[1]['native_sdk_validation'], 'not-performed-by-consumer')
+        self.assertEqual(result[4][fixture.report.name], fixture.report.read_bytes())
+        for key, replacement in [('package_sha256', '0' * 64), ('report_sha256', '1' * 64),
+                                 ('previous_version', '1.26.0.0')]:
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                final.store_binding(fixture.root, inventory, portable.parent, dict(selection, **{key: replacement}))
+        with self.assertRaises(ValueError):
+            final.store_binding(fixture.root, inventory, portable.parent, dict(selection, ready=True))
+
+
 if __name__ == '__main__':
     unittest.main()

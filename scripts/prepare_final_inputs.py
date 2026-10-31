@@ -31,6 +31,7 @@ MAX_TOTAL = transport.MAX_ARTIFACT
 WORKFLOW = '.github/workflows/final-inputs.yml'
 SELECTION = {'commit', 'version', 'macos', 'windows', 'maintainer',
              'linux_receipt', 'linux_receipt_sha256'}
+STORE_SELECTION = SELECTION - {'windows'} | {'store'}
 
 
 def json_input(path, limit, checksum):
@@ -47,29 +48,34 @@ def safe_name(name):
 
 def paths(selected):
     """The two concrete native trust callers and existing Windows/Linux roles only."""
-    if not isinstance(selected, dict) or set(selected) not in [SELECTION, SELECTION | {'linux_native'}]:
+    if not isinstance(selected, dict) or set(selected) not in [SELECTION, SELECTION | {'linux_native'},
+                                                              STORE_SELECTION, STORE_SELECTION | {'linux_native'}]:
         raise ValueError('Exact existing final selection required; no readiness or credential fields.')
     mac = selected['macos']
     if not isinstance(mac, dict) or set(mac) != {'qualification', 'qualification_sha256', 'team_id', 'trust'}:
         raise ValueError('Exact Mac qualification selection required.')
-    windows = selected['windows']
+    store_only = 'store' in selected
+    windows = selected['store'] if store_only else selected['windows']
     required = {'unsigned', 'unsigned_sha256', 'package', 'package_sha256', 'runtime', 'runtime_sha256',
                 'identity', 'identity_sha256', 'package_family', 'descriptor', 'descriptor_sha256',
                 'descriptor_uri', 'package_uri', 'runtime_uri'}
-    if not isinstance(windows, dict) or set(windows) not in [required, required | {'native'}]:
+    allowed = [{'package', 'package_sha256', 'report', 'report_sha256', 'previous_version'}] if store_only else [required, required | {'native'}]
+    if not isinstance(windows, dict) or set(windows) not in allowed:
         raise ValueError('Exact existing Windows selection required.')
     records = [(('linux_receipt',), 'linux/installation.json', readiness.MAX_INSTALLATION_RECEIPT_BYTES,
                 selected['linux_receipt_sha256']),
                (('macos', 'qualification'), 'native/macos/dmg-qualification.json', LIMITS['qualification'],
                 mac['qualification_sha256'])]
-    for key, limit in [('unsigned', final.LIMIT), ('package', final.LIMIT), ('runtime', final.LIMIT),
-                       ('descriptor', 16 * 1024), ('identity', 16 * 1024)]:
+    windows_roles = [('package', final.LIMIT), ('report', 64 * 1024)] if store_only else [
+        ('unsigned', final.LIMIT), ('package', final.LIMIT), ('runtime', final.LIMIT),
+        ('descriptor', 16 * 1024), ('identity', 16 * 1024)]
+    for key, limit in windows_roles:
         name = Path(windows[key]).name if type(windows[key]) is str else ''
         if not safe_name(name):
             raise ValueError('Selected Windows role requires a bounded canonical filename.')
-        records.append((('windows', key), 'windows/' + name, limit, windows[key + '_sha256']))
+        records.append(((('store' if store_only else 'windows'), key), 'windows/' + name, limit, windows[key + '_sha256']))
     trusts = [(('macos', 'trust'), 'macos')]
-    if 'native' in windows:
+    if not store_only and 'native' in windows:
         from verify_windows_qualification import FIELDS
         native = windows['native']
         if not isinstance(native, dict) or set(native) != FIELDS:
@@ -229,7 +235,8 @@ def consume(root, directory, output, work, index, selection_sha256):
     runtime_selection.chmod(0o400)
     candidate = final.from_selection(root, directory / 'base', output, runtime_selection, hashlib.sha256(raw).hexdigest())
     if (candidate.assessment['production_ready'] is not False or not candidate.blockers
-            or candidate.manifest['channels']['microsoft-store'] != final.store_channel()
+            or (candidate.manifest['format'] != final.STORE_FORMAT
+                and candidate.manifest['channels']['microsoft-store'] != final.store_channel())
             or any(channel['ready'] is not False for channel in candidate.manifest['channels'].values())):
         raise ValueError('Data handoff cannot grant production, installed or Store readiness.')
     if final.read(runtime_selection, MAX_INDEX) != raw:

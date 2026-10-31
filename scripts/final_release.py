@@ -19,6 +19,7 @@ import qualify_signed_msix as signed
 
 FORMAT = 'PeerBrushFinalReleaseV2'
 LEGACY_FORMAT = 'PeerBrushFinalReleaseV1'
+STORE_FORMAT = 'PeerBrushFinalReleaseV3'
 MANIFEST = 'final-release-inventory.json'
 LIMIT = 512 * 1024 * 1024
 _CONSTRUCTED = object()
@@ -80,13 +81,24 @@ def _windows_files(value):
 def windows_files(value):
     """Validated file roles only; these grant no installation or native authority."""
     validate_manifest(value)
+    if value['format'] == STORE_FORMAT:
+        raise ValueError('Store-only releases have no direct Windows installer or discovery files.')
     return _windows_files(value)
+
+
+def store_package_channel(filename):
+    from submit_store_release import FAMILY
+    return dict(platform='Windows', file=filename, dependencies=[], package_family_name=FAMILY,
+        update_route='microsoft-store', signing='unsigned-store-submission-input',
+        content_verified=True, native_sdk_validation='not-performed-by-consumer',
+        installed_acceptance='unverified', submission_enabled=False, service_state='disabled',
+        public_availability='unverified', ready=False)
 
 
 def validate_manifest(value):
     fields = {'schema', 'format', 'version', 'commit', 'base_inventory', 'channels', 'files'}
     if (not isinstance(value, dict) or set(value) != fields or type(value['schema']) is not int
-            or (value['schema'], value['format']) not in [(1, LEGACY_FORMAT), (2, FORMAT)]
+            or (value['schema'], value['format']) not in [(1, LEGACY_FORMAT), (2, FORMAT), (3, STORE_FORMAT)]
             or type(value['commit']) is not str or not re.fullmatch('[0-9a-f]{40}', value['commit'])
             or type(value['version']) is not str
             or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', value['version'])):
@@ -109,11 +121,16 @@ def validate_manifest(value):
     if any(records.get(name) != {key: record[key] for key in ['file', 'bytes', 'sha256']} for name, record in base.items()):
         raise ValueError('Final files differ from the inspected base inventory.')
     channels = value['channels']
-    if not isinstance(channels, dict) or set(channels) != {'windows-direct', 'macos-direct', 'linux-direct', 'microsoft-store'}:
+    store_only = value['format'] == STORE_FORMAT
+    channel_names = {'macos-direct', 'linux-direct', 'microsoft-store'}
+    if not store_only:
+        channel_names.add('windows-direct')
+    if not isinstance(channels, dict) or set(channels) != channel_names:
         raise ValueError('Each distribution needs its explicit reviewed channel adapter.')
     legacy = value['format'] == LEGACY_FORMAT
-    expected_platform = {'windows-direct': ('Windows', '.appinstaller' if legacy else '.msix'), 'macos-direct': ('macOS', '.dmg'),
-                         'linux-direct': ('Linux', '.deb')}
+    expected_platform = {'macos-direct': ('macOS', '.dmg'), 'linux-direct': ('Linux', '.deb')}
+    if not store_only:
+        expected_platform['windows-direct'] = ('Windows', '.appinstaller' if legacy else '.msix')
     for channel, (platform, suffix) in expected_platform.items():
         entry = channels[channel]
         fields = {'platform', 'file', 'dependencies', 'installed_acceptance', 'ready'}
@@ -128,6 +145,16 @@ def validate_manifest(value):
                 or any(type(name) is not str or name not in records for name in entry['dependencies'])
                 or len(set(entry['dependencies'])) != len(entry['dependencies'])):
             raise ValueError('Final channel binding or explicit unverified installed state differs.')
+    if store_only:
+        package = f"PeerBrush-{msix.package_version(value['version'])}-Windows-x64.msix"
+        if channels['microsoft-store'] != store_package_channel(package):
+            raise ValueError('Store package content cannot assert native, submission or public availability authority.')
+        selected = {package, package + '.json', package + '.sha256'}
+        dmg, deb = channels['macos-direct']['file'], channels['linux-direct']['file']
+        expected = set(base) | selected | {dmg + '.qualification.json', dmg + '.sha256', deb + '.json', deb + '.sha256'}
+        if dmg not in base or deb not in base or set(records) != expected:
+            raise ValueError('Store-only release permits only exact Store, Mac/Linux and source-bound assets.')
+        return records
     if channels['microsoft-store'] != store_channel():
         raise ValueError('Store submission remains disabled; a manifest cannot assert public availability.')
     windows = channels['windows-direct']
@@ -266,8 +293,29 @@ def windows_binding(root, base, directory, selection, *, for_setup=False):
     return [package, runtime, descriptor], channel, originals, origin
 
 
-def compose(root, directory, output, *, commit, version, macos, windows, maintainer,
-            linux_receipt, linux_receipt_sha256, previous=None, linux_native=None):
+def store_binding(root, inventory, directory, selection):
+    import qualify_store_msix as preflight
+    required = {'package', 'package_sha256', 'report', 'report_sha256', 'previous_version'}
+    if not isinstance(selection, dict) or set(selection) != required:
+        raise ValueError('Exact Store package, report, hashes and previous version selection required.')
+    portable = next(r for r in inventory['assets'] if r.get('platform') == 'Windows')
+    checked = preflight.qualify(root, directory / portable['file'], selection['package'], selection['report'],
+        commit=inventory['commit'], version=inventory['version'], previous_version=selection['previous_version'],
+        portable_sha256=portable['sha256'], package_sha256=selection['package_sha256'],
+        report_sha256=selection['report_sha256'])
+    package = readiness.handoff_path(selection['package'])
+    raw = read(selection['report'], 64 * 1024, selection['report_sha256'])
+    originals = [(package, LIMIT, selection['package_sha256']),
+                 (Path(selection['report']), 64 * 1024, selection['report_sha256'])]
+    sidecars = {package.name + '.json': raw,
+                package.name + '.sha256': (selection['package_sha256'] + '  ' + package.name + '\n').encode('ascii')}
+    return [package], store_package_channel(package.name), originals, checked, sidecars
+
+
+def compose(root, directory, output, *, commit, version, macos, maintainer,
+            linux_receipt, linux_receipt_sha256, windows=None, store=None, previous=None, linux_native=None):
+    if (windows is None) == (store is None):
+        raise ValueError('Select exactly one Store-only or historical direct Windows composition.')
     root, directory = readiness.handoff_path(root), readiness.handoff_path(directory)
     signed._source(root, commit)
     inventory_bytes = readiness.read_inventory(directory)
@@ -301,18 +349,26 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
         import verify_linux_qualification as linux_verifier
         linux_origin, linux_originals = linux_verifier.bind(root, linux_native, installation=receipt,
             assessment=linux, commit=commit, version=version, portable_sha256=portable['sha256'], maintainer=maintainer)
-    direct, windows_channel, windows_originals, windows_origin = windows_binding(root, inventory, directory, windows)
+    store_only = store is not None
+    if store_only:
+        direct, windows_channel, windows_originals, store_checked, store_sidecars = store_binding(root, inventory, directory, store)
+        windows_origin = None
+    else:
+        direct, windows_channel, windows_originals, windows_origin = windows_binding(root, inventory, directory, windows)
     outputs = {record['file']: directory / record['file'] for record in inventory['assets']}
     outputs.update({path.name: path for path in direct})
-    if len(outputs) != 9:
+    if len(outputs) != (7 if store_only else 9):
         raise ValueError('Final platform filenames collide; no output was prepared.')
     # These are strict public candidate metadata, not private acceptance evidence.
     deb_report = dict(schema=1, file=deb['file'], version=version, commit=commit, architecture='amd64',
         binary_source_commit=commit, sha256=deb['sha256'], source_sha256=deb['source_sha256'],
         target='Ubuntu 24.04 amd64', update_owner='apt-dpkg', update_repository='not-configured',
         signing='not-performed', installation_test='not-performed', default_app='user-choice-only', release_ready=False)
-    sidecars = {dmg['file'] + '.qualification.json': qualification, deb['file'] + '.json': encode(deb_report),
-                installer.STABLE_DESCRIPTOR: read(windows['descriptor'], 16 * 1024, windows['descriptor_sha256'])}
+    sidecars = {dmg['file'] + '.qualification.json': qualification, deb['file'] + '.json': encode(deb_report)}
+    if store_only:
+        sidecars.update(store_sidecars)
+    else:
+        sidecars[installer.STABLE_DESCRIPTOR] = read(windows['descriptor'], 16 * 1024, windows['descriptor_sha256'])
     for record in [dmg, deb]:
         sidecars[record['file'] + '.sha256'] = (record['sha256'] + '  ' + record['file'] + '\n').encode('ascii')
     if set(sidecars) & set(outputs):
@@ -320,16 +376,23 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
     records = [dict(file=name, bytes=size, sha256=checksum) for name, path in outputs.items()
                for checksum, size in [bounded_file(path, LIMIT)]]
     expected_hashes = {record['file']: record['sha256'] for record in inventory['assets']}
-    expected_hashes.update({Path(windows[key]).name: windows[key + '_sha256'] for key in ['package', 'runtime', 'descriptor']})
+    if store_only:
+        expected_hashes[Path(store['package']).name] = store['package_sha256']
+    else:
+        expected_hashes.update({Path(windows[key]).name: windows[key + '_sha256'] for key in ['package', 'runtime', 'descriptor']})
     if any(record['sha256'] != expected_hashes[record['file']] for record in records):
         raise ValueError('Final input changed between validation and composition.')
     records += [dict(file=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest()) for name, data in sidecars.items()]
-    manifest = dict(schema=2, format=FORMAT, version=version, commit=commit, base_inventory=inventory,
+    manifest = dict(schema=3 if store_only else 2, format=STORE_FORMAT if store_only else FORMAT,
+        version=version, commit=commit, base_inventory=inventory,
         files=sorted(records, key=lambda r: r['file']), channels={
             'windows-direct': windows_channel,
             'macos-direct': dict(platform='macOS', file=dmg['file'], dependencies=[], installed_acceptance='unverified', ready=False),
             'linux-direct': dict(platform='Linux', file=deb['file'], dependencies=[], installed_acceptance='unverified', ready=False),
             'microsoft-store': store_channel()})
+    if store_only:
+        del manifest['channels']['windows-direct']
+        manifest['channels']['microsoft-store'] = windows_channel
     validate_manifest(manifest)
     if previous is not None:
         immutable(previous, manifest)
@@ -371,16 +434,22 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
                 raise ValueError('Native Mac original or owned authentication input changed after composition.')
     if bounded_file(Path(trust['work']) / 'dmg-qualification.json', readiness.MAX_DMG_QUALIFICATION_BYTES)[0] != macos['qualification_sha256']:
         raise ValueError('Owned native Mac qualification changed after composition.')
-    if windows_origin is None:
+    if store_only:
+        report['blockers'].remove('windows-installed-distribution-and-signing-not-verified')
+        report['blockers'] += ['store-native-sdk-producer-not-authenticated',
+            'store-installed-upgrade-acceptance-not-established', 'store-submission-automation-not-qualified']
+        report['store_package'] = store_checked
+    elif windows_origin is None:
         report['blockers'] += ['windows-native-final-producer-not-authenticated',
             'windows-executable-signing-and-installed-acceptance-not-established']
     else:
         report['blockers'].remove('windows-installed-distribution-and-signing-not-verified')
         report['blockers'].append('windows-installed-acceptance-not-established')
     report['blockers'] += [
-        'windows-runtime-redistribution-approval-not-authenticated',
         'linux-installed-evidence-producer-not-authenticated',
         'installed-upgrade-interruption-and-visible-native-acceptance-not-established']
+    if not store_only:
+        report['blockers'].append('windows-runtime-redistribution-approval-not-authenticated')
     if linux_origin is not None:
         report['blockers'].remove('linux-installed-evidence-producer-not-authenticated')
         linux['installation_receipt_provenance'] = 'verified-pinned-workflow-oidc-attestation-and-successful-job'
@@ -389,7 +458,8 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
         report['linux_native_origin'] = linux_origin
     report['publication_phases'] = readiness._publication_phases(report['blockers'])
     report.update(format='PeerBrushFinalCompositionAssessmentV1', production_ready=False,
-        final_files_bound=True, windows_native_signature=('verified-by-authenticated-native-qualification' if windows_origin else 'not-authenticated-by-aggregate'),
+        final_files_bound=True, windows_native_signature=('store-signs-after-submission' if store_only else
+            'verified-by-authenticated-native-qualification' if windows_origin else 'not-authenticated-by-aggregate'),
         linux_installation_binding=linux['installation_receipt_binding'],
         linux_installation_provenance=linux['installation_receipt_provenance'], store=store_channel())
     if windows_origin is not None:
@@ -402,7 +472,8 @@ def compose(root, directory, output, *, commit, version, macos, windows, maintai
 def from_selection(root, directory, output, selection, selection_sha256):
     selected = json.loads(read(selection, 64 * 1024, selection_sha256), object_pairs_hook=readiness.unique_fields)
     required = {'commit', 'version', 'macos', 'windows', 'maintainer', 'linux_receipt', 'linux_receipt_sha256'}
-    if (not isinstance(selected, dict) or set(selected) not in [required, required | {'linux_native'}]
+    store_required = required - {'windows'} | {'store'}
+    if (not isinstance(selected, dict) or set(selected) not in [required, required | {'linux_native'}, store_required, store_required | {'linux_native'}]
             or ('linux_native' in selected and not isinstance(selected['linux_native'], dict))):
         raise ValueError('Strict reviewed final selection required; reports cannot grant authority.')
     return compose(root, directory, output, **selected)

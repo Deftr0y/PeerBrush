@@ -52,8 +52,9 @@ permissions:
   actions: read
 
 concurrency:
-  group: production-${{ github.sha }}
+  group: peerbrush-microsoft-store-submission
   cancel-in-progress: false
+  queue: max
 
 jobs:
   gate:
@@ -163,6 +164,7 @@ jobs:
       SELECTION_SHA256: ${{ inputs.selection_sha256 }}
       RELEASE_NOTES_SHA256: ${{ inputs.release_notes_sha256 }}
       PEERBRUSH_PRODUCTION_APPROVED: 'false'
+      PEERBRUSH_STORE_HANDOFF_ENABLED: 'false'
     steps:
       - name: Require exact reviewed production invocation
         run: |
@@ -197,6 +199,9 @@ jobs:
       - name: Publish only through actual composition and immutable reconciliation
         env:
           GH_TOKEN: ${{ github.token }}
+          MSSTORE_TENANT_ID: ${{ secrets.MSSTORE_TENANT_ID }}
+          MSSTORE_CLIENT_ID: ${{ secrets.MSSTORE_CLIENT_ID }}
+          MSSTORE_CLIENT_SECRET: ${{ secrets.MSSTORE_CLIENT_SECRET }}
         run: |
           umask 077
           python -B scripts/publish_release.py --source-root "$GITHUB_WORKSPACE" \
@@ -211,6 +216,14 @@ jobs:
           name: published-final-manifest-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/peerbrush-final-candidate/final-release-inventory.json
           if-no-files-found: error
+      - name: Retain sanitized Store intent and submission receipt for reconciliation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: store-submission-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-store-handoff/submission.json
+          if-no-files-found: ignore
+          retention-days: 90
 
   site:
     # A review overlay/exclusion report only. No branch, Pages or Store mutation.

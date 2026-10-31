@@ -70,6 +70,7 @@ permissions:
 concurrency:
   group: peerbrush-microsoft-store-submission
   cancel-in-progress: false
+  queue: max
 
 jobs:
   submit:

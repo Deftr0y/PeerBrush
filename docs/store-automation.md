@@ -5,6 +5,33 @@ This infrastructure is **not an active end-to-end release integration**. Keep
 not build MSIX packages or publish GitHub releases. No Store credentials are
 included, and no real submission has been tested.
 
+Windows distribution for 0.30.0 is Store only; standalone installer certificates
+and the dormant direct Windows updater are not requirements of this channel.
+Store-only final composition binds the unsigned SDK submission package and its
+reports without an App Installer or direct signing dependency. Store-managed
+installation and upgrades still require genuine native acceptance.
+
+The protected publisher has an explicit same-invocation Store handoff. It can
+run only after that invocation freshly publishes the exact final release and
+reads back its public bytes. An already-public release, rerun, lost publish
+response or missing/expired receipt cannot start another automatic Store write.
+First-attempt, exact-main, native readiness and protected approval checks remain.
+`PEERBRUSH_STORE_HANDOFF_ENABLED` is literally false; no live writer is qualified.
+
+Before create, draft update, package upload and commit, the adapter rechecks
+the actual Partner Center product, unchanged published baseline and exact pending
+submission owner. A sanitized write-ahead receipt is retained when possible;
+it contains no credential or SAS URL. Artifacts are diagnostic evidence, never
+service truth or replay authority. A crash before receipt upload leaves a
+manual/service reconciliation hold. Certification is not public availability.
+
+The publisher and read-only Store workflow share product concurrency with
+`cancel-in-progress: false` and `queue: max` (at most 100 pending runs). Overflow,
+cancellation and an existing Store draft remain visible holds. This bounded
+route needs no separate hosting purchase. The standalone `--submit --state` CLI
+retains its durable private filesystem contract for explicit operator recovery;
+hosted artifacts do not replace that contract.
+
 ## Missing integration gates
 
 1. Integrate and review the Windows Store packaging/runtime changes into the
@@ -17,8 +44,8 @@ included, and no real submission has been tested.
    the GitHub release **before publishing it**. Use the reviewed MSIX packager;
    do not fabricate these reports for arbitrary binaries. The current candidate
    workflow does not publish releases or provide this end-to-end contract.
-3. Select and review the actual publisher and durable private state host before
-   implementing a hosted writer. Neither exists in this workflow. Its retained
+3. Review and qualify the publisher's same-invocation handoff described above.
+   This separate workflow's retained
    `release` and reusable declarations are explicitly blocked by the job and
    pre-checkout guards; do not wire an assumed publisher or inherit credentials
    into an unreviewed caller. A `release: published` listener alone is also
@@ -48,8 +75,8 @@ included, and no real submission has been tested.
    reviewed full main automation/workflow SHA, plus `tag`, `source_commit`,
    `portable_sha256` and `msix_sha256` for the real published stable release.
    It authenticates and checks Store state without creating a submission.
-   An approved durable host/backend and its actual caller, next-version
-   submission, certification and public readback remain required for end-to-end
+   Genuine next-version submission, crash/reconciliation qualification,
+   certification and public readback remain required for end-to-end
    success. No account, credential, permission or enable setting is configured
    by preparing this code.
 

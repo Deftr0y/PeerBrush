@@ -150,6 +150,40 @@ class Transactions(unittest.TestCase):
         self.transfer()
         self.assertEqual(self.service.mutations, first)
 
+    def test_store_handoff_occurs_only_in_the_fresh_confirmed_publication_invocation(self):
+        handoff = mock.Mock(return_value=dict(submission_attempted=True, public_availability='unverified'))
+        readback = lambda m: publishing.public_readback(m, self.service.public_get)
+        result = publishing._transfer(self.service, self.directory, self.manifest, self.notes,
+                                      readback, after_publish=handoff)
+        self.assertTrue(result['store_handoff']['submission_attempted'])
+        handoff.assert_called_once_with()
+        # Missing/expired recovery receipts cannot grant another mutation permit.
+        result = publishing._transfer(self.service, self.directory, self.manifest, self.notes,
+                                      readback, after_publish=handoff)
+        handoff.assert_called_once()
+        self.assertFalse(result['store_handoff']['submission_attempted'])
+
+    def test_lost_publication_or_store_responses_never_reenter_the_mutation_callback(self):
+        readback = lambda m: publishing.public_readback(m, self.service.public_get)
+        handoff = mock.Mock(side_effect=publishing.AmbiguousMutation('Uncertain Store outcome'))
+        with self.assertRaises(publishing.AmbiguousMutation):
+            publishing._transfer(self.service, self.directory, self.manifest, self.notes,
+                                 readback, after_publish=handoff)
+        publishing._transfer(self.service, self.directory, self.manifest, self.notes,
+                             readback, after_publish=handoff)
+        handoff.assert_called_once()
+
+    def test_lost_github_publish_response_never_starts_store_writes(self):
+        self.service.failure = 'publish'
+        handoff = mock.Mock()
+        with self.assertRaises(publishing.AmbiguousMutation):
+            publishing._transfer(self.service, self.directory, self.manifest, self.notes,
+                                 after_publish=handoff)
+        handoff.assert_not_called()
+        publishing._transfer(self.service, self.directory, self.manifest, self.notes,
+                             lambda m: publishing.public_readback(m, self.service.public_get), after_publish=handoff)
+        handoff.assert_not_called()
+
     def test_ambiguous_create_upload_and_publish_are_not_retried_until_fresh_reconciliation(self):
         for failure in ['create', 'upload', 'publish']:
             self.service = Service(self.manifest)
@@ -434,6 +468,65 @@ class Transactions(unittest.TestCase):
 class LegacyTransactions(Transactions):
     """Retained V1 bytes have the same immutable readback/retry protections."""
     legacy = True
+
+
+class StoreWriteOwnership(unittest.TestCase):
+    def test_actual_writer_rechecks_product_baseline_and_pending_owner_before_each_write(self):
+        import submit_store_release as store
+        import store_release_state as state
+        from test_submit_store_release import FakeStore, fixture
+        with tempfile.TemporaryDirectory(prefix='peerbrush-store-publisher-test-') as temporary:
+            journal = state.Journal(Path(temporary).resolve() / 'receipt.json')
+            journal.bind('v0.26.0', fixture()[0], fixture()[2])
+            provider = FakeStore()
+            original = provider.call
+            def call(path='', method='GET', data=None):
+                result = original(path, method, data)
+                if path == '/submissions' and method == 'POST':
+                    provider.app['pendingApplicationSubmission'] = {'id': '456'}
+                return result
+            provider.call = call
+            selected = publishing._StoreWrites(provider)
+            with mock.patch.object(store, 'request', return_value=b'') as upload:
+                store.submit(selected, *fixture(), execute=True, journal=journal)
+            upload.assert_called_once()
+            self.assertEqual(journal.state['phase'], 'committed')
+            self.assertEqual(journal.state['service_status'], 'PreProcessing')
+            # Initial preflight plus create, update, upload and commit observations.
+            self.assertGreaterEqual(sum(path == '' and method == 'GET' for path, method, _ in provider.calls), 5)
+            for change in ['pending', 'published', 'identity']:
+                before = len(provider.calls)
+                saved = copy.deepcopy(provider.app)
+                if change == 'pending': provider.app['pendingApplicationSubmission'] = {'id': '999'}
+                elif change == 'published': provider.app['lastPublishedApplicationSubmission'] = {'id': '999'}
+                else: provider.app['packageIdentityName'] = 'Foreign.Product'
+                with self.subTest(change=change), self.assertRaises(store.SafeError):
+                    selected.call('/submissions/456/commit', method='POST')
+                self.assertTrue(all(method == 'GET' for _, method, _ in provider.calls[before:]))
+                provider.app = saved
+
+    def test_lost_create_response_and_competing_draft_cannot_be_recreated(self):
+        import submit_store_release as store
+        import store_release_state as state
+        from test_submit_store_release import FakeStore, fixture
+        with tempfile.TemporaryDirectory(prefix='peerbrush-store-publisher-test-') as temporary:
+            journal = state.Journal(Path(temporary).resolve() / 'receipt.json')
+            journal.bind('v0.26.0', fixture()[0], fixture()[2])
+            provider = FakeStore()
+            original = provider.call
+            def call(path='', method='GET', data=None):
+                result = original(path, method, data)
+                if path == '/submissions' and method == 'POST':
+                    provider.app['pendingApplicationSubmission'] = {'id': '456'}
+                    raise store.RemoteError(None)
+                return result
+            provider.call = call
+            with self.assertRaises(store.RemoteError):
+                store.submit(publishing._StoreWrites(provider), *fixture(), execute=True, journal=journal)
+            self.assertEqual(journal.state['phase'], 'create-requested')
+            with self.assertRaises(store.SafeError):
+                store.submit(publishing._StoreWrites(provider), *fixture(), execute=True, journal=journal)
+            self.assertEqual(sum(method == 'POST' for _, method, _ in provider.calls), 1)
 
 
 if __name__ == '__main__':
