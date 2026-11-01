@@ -183,6 +183,14 @@ fn native_color(
 }
 impl PeerBrush {
     pub(super) fn open_source<'a>(&mut self, doc: impl Into<DocumentView<'a>>, kind: &str) {
+        if self
+            .source_editor
+            .as_ref()
+            .is_some_and(|editor| editor.pending)
+        {
+            self.message = "Wait for the pending source edit before opening another draft".into();
+            return;
+        }
         let doc = doc.into();
         self.cancel_filters();
         self.cancel_geometry();
@@ -342,6 +350,13 @@ impl PeerBrush {
         self.last_preview = None;
     }
     pub(super) fn cancel_source(&mut self) {
+        if self
+            .source_editor
+            .as_ref()
+            .is_some_and(|editor| editor.pending)
+        {
+            return;
+        }
         self.transient
             .retain(|c| !c["op"].as_str().is_some_and(|op| op.starts_with("source.")));
         self.source_editor = None;
@@ -355,6 +370,7 @@ impl PeerBrush {
         {
             return;
         }
+        self.source_editor.as_mut().unwrap().pending = false;
         match result {
             Ok(()) => self.cancel_source(),
             Err(error) => {
