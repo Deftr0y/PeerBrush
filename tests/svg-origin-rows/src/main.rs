@@ -55,7 +55,9 @@ fn main() {
         live: Arc::new(AtomicUsize::new(0)),
     };
     for case in corpus::cases() {
-        if baseline && case.name == "reused-identical-clip-sites" {
+        if baseline
+            && (case.name == "reused-identical-clip-sites" || case.name.starts_with("hairline"))
+        {
             continue;
         }
 

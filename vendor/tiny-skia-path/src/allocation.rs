@@ -11,6 +11,9 @@ mod scoped {
     /// Pure captured cancellation; no I/O, engine mutation or FFI unwinding.
     pub trait Cancellation: Send + Sync {
         fn check(&self) -> Result<(), String>;
+        fn work(&self, _units: usize) -> Result<(), String> {
+            self.check()
+        }
     }
     /// Real caller-owned accounting token retained through returned data drop.
     pub trait MemoryOwner: Send {}
@@ -97,6 +100,9 @@ mod scoped {
         current().is_some()
     }
     pub fn checkpoint() {
+        work(1);
+    }
+    pub fn work(units: usize) {
         if let Some(state) = current() {
             let mut at = Some(state.clone());
             while let Some(scope) = at {
@@ -107,19 +113,19 @@ mod scoped {
                 if scope
                     .work
                     .get()
-                    .checked_add(1)
+                    .checked_add(units)
                     .is_none_or(|n| n > scope.limits.work)
                 {
                     refuse(&state, Refusal::Work);
                 }
-                if let Err(error) = scope.limits.cancellation.check() {
+                if let Err(error) = scope.limits.cancellation.work(units) {
                     refuse(&state, Refusal::Cancelled(error));
                 }
                 at = scope.parent.clone();
             }
             let mut at = Some(state);
             while let Some(scope) = at {
-                scope.work.set(scope.work.get() + 1);
+                scope.work.set(scope.work.get() + units);
                 at = scope.parent.clone();
             }
         }
@@ -248,11 +254,13 @@ mod scoped {
 }
 #[cfg(feature = "std")]
 pub use scoped::{
-    charge, checkpoint, is_active, reserve, with_limits, Bounded, Cancellation, Failure, Limits,
-    MemoryOwner, Refusal,
+    charge, checkpoint, is_active, reserve, with_limits, work, Bounded, Cancellation, Failure,
+    Limits, MemoryOwner, Refusal,
 };
 #[cfg(not(feature = "std"))]
 pub fn checkpoint() {}
+#[cfg(not(feature = "std"))]
+pub fn work(_: usize) {}
 #[cfg(not(feature = "std"))]
 pub fn charge(_: usize) {}
 #[cfg(not(feature = "std"))]
@@ -385,6 +393,44 @@ mod tests {
         assert!(
             matches!(result,Err(Failure::Refused(Refusal::Cancelled(ref m)))if m=="path canceled")
         );
+    }
+    #[test]
+    fn weighted_work_charges_every_nested_scope_and_captured_control() {
+        struct Weighted(Arc<AtomicUsize>);
+        impl Cancellation for Weighted {
+            fn check(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn work(&self, units: usize) -> Result<(), String> {
+                self.0.fetch_add(units, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = |maximum| Limits {
+            bytes: 4096,
+            elements: 128,
+            work: maximum,
+            cancellation: Arc::new(Weighted(calls.clone())),
+        };
+        let result = with_limits(config(23), Box::new(()), || {
+            work(11);
+            let _ignored = with_limits(config(100), Box::new(()), || {
+                work(13);
+                Ok::<_, ()>(())
+            });
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(result, Err(Failure::Refused(Refusal::Work))));
+        assert!(calls.load(Ordering::SeqCst) >= 11);
+        assert!(!is_active());
+        let result = with_limits(config(100), Box::new(()), || {
+            let start = calls.load(Ordering::SeqCst);
+            work(17);
+            assert_eq!(calls.load(Ordering::SeqCst) - start, 17);
+            Ok::<_, ()>(())
+        });
+        assert!(result.is_ok());
     }
     #[test]
     fn replacement_capacity_and_both_nested_limits_are_enforced() {

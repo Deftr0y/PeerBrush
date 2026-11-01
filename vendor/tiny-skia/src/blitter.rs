@@ -24,6 +24,16 @@ pub struct Mask {
 /// for the destination and how src/generated pixels map to the destination.
 /// The coordinates passed to the `blit_*` calls are in destination pixel space.
 pub trait Blitter {
+    #[cfg(feature = "std")]
+    fn hairline_kernel(&mut self, _kernel: crate::scan::hairline_plan::Kernel) -> bool {
+        false
+    }
+    #[cfg(feature = "std")]
+    fn hairline_band(&self) -> Option<[u32; 2]> {
+        None
+    }
+    #[cfg(feature = "std")]
+    fn refuse_hairline(&mut self, _message: &'static str) {}
     /// Blits a horizontal run of one or more pixels.
     fn blit_h(&mut self, _x: u32, _y: u32, _width: LengthU32) {
         unreachable!()

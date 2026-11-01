@@ -38,7 +38,9 @@ Path building, cloning, stroking, dashing, edge conversion and gradient vectors
 have a scoped monotonic allocation/work ledger. New capacity is charged before
 fallible reservation, counting both old and replacement capacities. The current
 per-operation limits are 128MiB, 262144 elements per vector and 32 million explicit
-work checkpoints. The real working ticket is owned by the scoped state and kept
+work units. Point transformations charge their actual point count as well as
+checking captured cancellation; off-canvas paths cannot evade whole-operation
+work admission. The real working ticket is owned by the scoped state and kept
 alive through returned `Bounded<T>` payloads, including caller-error payloads.
 Nested states retain both real owners, enforce and charge every ancestor, and
 cannot turn an ignored inner refusal into an outer success. The returned image
@@ -68,8 +70,8 @@ to the exact qualified source, never to a later edited prototype.
 Open mandatory work: independently executed oracle parity, whole-application
 shared-pool/lifetime tests, source-bound streamed tile-band staging, native8/16
 projection and full editing/history/save/reopen/recovery acceptance. The legacy stateless band entry
-replays scan-conversion prefixes. The ascending prototype below retains fill
-and ordinary-stroke scan state; its remaining integration gates stay open. A production caller must emit
+replays scan-conversion prefixes. The ascending prototype below retains fill,
+ordinary-stroke and hairline scan state; its integration gates stay open. A production caller must emit
 each full-width band once rather than repeat it for horizontal tiles, and needs
 qualified bounded scan continuation if prefix replay is too expensive. No full
 frame allocation, virtual full-frame slice, guessed halo, tolerance relaxation
@@ -112,10 +114,21 @@ cancellation-control reset and nested ledgers. Qualification receipts must bind
 the exact tested sources and platform; earlier primitive receipts never qualify
 later edits.
 
-Hairline continuation is an explicit unfinished route in this intermediate plan;
-it refuses instead of silently choosing another coverage algorithm. Ordinary
-stroke outlines are still rebuilt under admitted temporary scopes, which also
-needs throughput qualification. Legacy uncached rendering remains available at
+Hairlines retain the original subdivision, clipped fixed-point kernels, cap
+coverage and draw order. AA and aliased kernels emit only provably contributing
+integer steps for a band. Integer jumps preserve the original repeated clamp
+recurrence and endpoint state; no floating-point slope multiplication replaces
+the original arithmetic. The exact primitive corpus includes fractional caps,
+curves, dashes and both8191 tiler seams; focused tests compare actual legacy
+zero-width aliased and subpixel AA pixels, negative-border recurrences, owner
+lifetimes and mid-band work refusal. Invalid kernel state refuses the whole plan.
+
+`maximum_rows()` supplies a guaranteed band height under the original logical
+isolated-group width bound and128KiPixel physical allocation limit; it does not
+translate geometry or guess an interpolation halo. The caller may emit smaller
+bands. Ordinary stroke outlines and dashed paths are still rebuilt under admitted
+temporary scopes and cumulative point-count work admission; their throughput
+still requires qualification. Legacy uncached rendering remains available at
 its existing supported limits. Full 16000-square resource/performance tests,
 source-bound tile-band staging, native8/16 editor/history/save/reopen/recovery and
 cross-platform qualification remain mandatory before live adoption or any cap
