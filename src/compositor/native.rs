@@ -2,7 +2,7 @@
 //! prepared source/derived regions; sampling performs no backing-file I/O.
 use crate::{
     engine::{
-        native::{LayerMetadata, Metadata},
+        native::LayerMetadata,
         scene::{Document36, SceneSnapshot},
     },
     large_document::{Reservation, ResidentBudget},
@@ -507,6 +507,9 @@ mod tests {
         }
     }
     pub(super) fn capture(doc: &Document) -> (SceneSnapshot, std::path::PathBuf) {
+        capture_kind(doc, false)
+    }
+    fn capture_kind(doc: &Document, native: bool) -> (SceneSnapshot, std::path::PathBuf) {
         let budget = ResidentBudget::new(32 * 1024 * 1024).unwrap();
         let disk = DiskBudget::new(128 * 1024 * 1024, 16).unwrap();
         let path = std::fs::canonicalize(std::env::temp_dir())
@@ -541,17 +544,22 @@ mod tests {
             disk,
         )
         .unwrap();
-        let scene = SceneSnapshot::new(
-            SceneIdentity {
-                project_id: "regional-test".into(),
-                document_id: doc.id.clone(),
-                revision: doc.revision,
-            },
-            pending,
-            vec![],
-            None,
-            None,
-        )
+        let identity = SceneIdentity {
+            project_id: "regional-test".into(),
+            document_id: doc.id.clone(),
+            revision: doc.revision,
+        };
+        let scene = if native {
+            SceneSnapshot::from_native(
+                identity,
+                crate::engine::native::NativeDocument::from_pending(pending).unwrap(),
+                vec![],
+                None,
+                None,
+            )
+        } else {
+            SceneSnapshot::new(identity, pending, vec![], None, None)
+        }
         .unwrap();
         (scene, path)
     }
@@ -715,6 +723,65 @@ mod tests {
         cleanup(&path);
         cleanup(&other_path);
     }
+    #[test]
+    fn one_native_topology_reuses_its_admission_across_regions_and_rejects_foreign_scene() {
+        for depth in [8, 16] {
+            let doc = doc(depth, true, "multiply");
+            let (scene, path) = capture_kind(&doc, true);
+            let full = Region::new([0, 0, 9, 7]).unwrap();
+            drop(RawLayers::prepare(&scene, full, &mut || Ok(())).unwrap());
+            let baseline = scene.budget().used();
+            let topology = Topology::new(&scene).unwrap();
+            let charge = topology._topology.bytes();
+            assert_eq!(scene.budget().used(), baseline + charge);
+            for rect in [[0, 0, 3, 4], [3, 2, 8, 6], [8, 6, 9, 7]] {
+                let region = Region::new(rect).unwrap();
+                let provider = RawLayers::prepare(&scene, region, &mut || Ok(())).unwrap();
+                let pinned = scene.budget().used();
+                if depth == 8 {
+                    let plan =
+                        Plan::<Native8, _>::with_topology(topology.clone(), &provider, region)
+                            .unwrap();
+                    assert_eq!(scene.budget().used(), pinned);
+                    let masks = vec![None; doc.layers.len()];
+                    let colors = vec![None; doc.layers.len()];
+                    let expected = crate::compositor::Plan::new(&doc, &masks, &colors);
+                    for y in rect[1]..rect[3] {
+                        for x in rect[0]..rect[2] {
+                            assert_eq!(
+                                plan.pixel(x, y).unwrap(),
+                                expected.sample(expected.group(None), x, y)
+                            );
+                        }
+                    }
+                } else {
+                    let plan =
+                        Plan::<Native16, _>::with_topology(topology.clone(), &provider, region)
+                            .unwrap();
+                    assert_eq!(scene.budget().used(), pinned);
+                    let expected = crate::depth16::Plan16::new(&doc).unwrap();
+                    for y in rect[1]..rect[3] {
+                        for x in rect[0]..rect[2] {
+                            assert_eq!(plan.pixel(x, y).unwrap(), expected.pixel(x, y));
+                        }
+                    }
+                }
+                assert_eq!(std::sync::Arc::strong_count(&topology), 1);
+                drop(provider);
+                assert_eq!(scene.budget().used(), baseline + charge);
+            }
+            let (other, other_path) = capture_kind(&doc, true);
+            let wrong = RawLayers::prepare(&other, full, &mut || Ok(())).unwrap();
+            assert!(Plan::<Native8, _>::with_topology(topology.clone(), &wrong, full).is_err());
+            drop(wrong);
+            drop(other);
+            cleanup(&other_path);
+            drop(topology);
+            assert_eq!(scene.budget().used(), baseline);
+            drop(scene);
+            cleanup(&path);
+        }
+    }
 }
 impl<P: Precision> PreparedLayers<P> for RawLayers<'_> {
     fn scene(&self) -> &SceneSnapshot {
@@ -747,37 +814,22 @@ enum Kind {
     Adjustment,
 }
 
-pub(crate) struct Plan<'a, P: Precision, S: PreparedLayers<P>> {
+/// Immutable metadata/topology is compiled once per captured frame or save.
+/// Regional providers keep only the pins for the current bounded footprint.
+pub(crate) struct Topology<'a> {
+    scene: &'a SceneSnapshot,
     layers: Vec<LayerMetadata<'a>>,
-    prepared: &'a S,
-    region: Region,
     groups: Vec<Vec<usize>>,
     parent_group: Vec<usize>,
     group_owner: Vec<Option<usize>>,
     kinds: Vec<Kind>,
     clips: Vec<Vec<usize>>,
-    _precision: std::marker::PhantomData<P>,
-    // Declared last so every topology allocation is released before its charge.
     _topology: Reservation,
 }
-
-impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
-    pub(crate) fn new(scene: &'a SceneSnapshot, prepared: &'a S, region: Region) -> Result<Self> {
-        if !std::ptr::eq(scene, prepared.scene()) {
-            return Err("Regional provider belongs to another captured scene".into());
-        }
-        if scene.metadata().depth() != P::DEPTH {
-            return Err("Regional compositor precision differs from captured native depth".into());
-        }
-        Self::compile(scene.metadata(), scene.budget(), prepared, region)
-    }
-
-    fn compile(
-        doc: Metadata<'a>,
-        budget: &ResidentBudget,
-        prepared: &'a S,
-        region: Region,
-    ) -> Result<Self> {
+impl<'a> Topology<'a> {
+    pub(crate) fn new(scene: &'a SceneSnapshot) -> Result<std::sync::Arc<Self>> {
+        let doc = scene.metadata();
+        let budget = scene.budget();
         let count = doc.layers().len();
         if count > 4096 {
             return Err("Regional composition exceeds its topology admission".into());
@@ -868,12 +920,6 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
             } else if layer.visible() {
                 groups[group].push(i);
             }
-            let needs_colour = layer
-                .effects()
-                .any(|effect| effect.enabled() && effect.weight() > 0.0);
-            if needs_colour && !prepared.has_colour(i) {
-                return Err("Enabled regional effects have no prepared native output".into());
-            }
         }
         for children in &mut groups {
             children.reverse();
@@ -881,20 +927,59 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
         for children in &mut clips {
             children.reverse();
         }
-        Ok(Self {
+        Ok(std::sync::Arc::new(Self {
+            scene,
             layers,
-            prepared,
-            region,
             groups,
             parent_group,
             group_owner,
             kinds,
             clips,
-            _precision: std::marker::PhantomData,
             _topology: charge,
+        }))
+    }
+}
+
+pub(crate) struct Plan<'a, P: Precision, S: PreparedLayers<P>> {
+    topology: std::sync::Arc<Topology<'a>>,
+    prepared: &'a S,
+    region: Region,
+    _precision: std::marker::PhantomData<P>,
+}
+impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
+    pub(crate) fn new(scene: &'a SceneSnapshot, prepared: &'a S, region: Region) -> Result<Self> {
+        if !std::ptr::eq(scene, prepared.scene()) {
+            return Err("Regional provider belongs to another captured scene".into());
+        }
+        Self::with_topology(Topology::new(scene)?, prepared, region)
+    }
+    pub(crate) fn with_topology(
+        topology: std::sync::Arc<Topology<'a>>,
+        prepared: &'a S,
+        region: Region,
+    ) -> Result<Self> {
+        if !std::ptr::eq(topology.scene, prepared.scene()) {
+            return Err("Regional provider belongs to another captured scene".into());
+        }
+        if topology.scene.metadata().depth() != P::DEPTH {
+            return Err("Regional compositor precision differs from captured native depth".into());
+        }
+        for (i, layer) in topology.layers.iter().enumerate() {
+            if layer
+                .effects()
+                .any(|effect| effect.enabled() && effect.weight() > 0.0)
+                && !prepared.has_colour(i)
+            {
+                return Err("Enabled regional effects have no prepared native output".into());
+            }
+        }
+        Ok(Self {
+            topology,
+            prepared,
+            region,
+            _precision: std::marker::PhantomData,
         })
     }
-
     fn check_point(&self, x: i32, y: i32) -> Result<()> {
         let [l, t, r, b] = self.region.bounds();
         if x < l || y < t || x >= r || y >= b {
@@ -908,7 +993,7 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
     }
     pub(crate) fn layer(&self, index: usize, x: i32, y: i32) -> Result<P::Pixel> {
         self.check_point(x, y)?;
-        if index >= self.kinds.len() {
+        if index >= self.topology.kinds.len() {
             return Err("Unknown regional layer".into());
         }
         self.raw(index, x, y)
@@ -921,6 +1006,7 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
     }
     fn mask_value(&self, index: usize, x: i32, y: i32, raw: bool) -> Result<P::Amount> {
         let layer = self
+            .topology
             .layers
             .get(index)
             .ok_or("Unknown regional mask layer")?;
@@ -938,33 +1024,35 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
     pub(crate) fn adjustment_input(&self, index: usize, x: i32, y: i32) -> Result<P::Pixel> {
         self.check_point(x, y)?;
         let layer = self
+            .topology
             .layers
             .get(index)
             .ok_or("Unknown regional adjustment")?;
         if let Some(id) = layer.clip_to() {
             let base = self
+                .topology
                 .layers
                 .iter()
                 .position(|l| l.id() == id)
                 .ok_or("Missing regional clip base")?;
             self.unit(base, index + 1, x, y)
         } else {
-            let group = self.parent_group[index];
+            let group = self.topology.parent_group[index];
             self.below(group, index + 1, x, y, self.backdrop(group, x, y)?)
         }
     }
     fn backdrop(&self, group: usize, x: i32, y: i32) -> Result<P::Pixel> {
-        let Some(index) = self.group_owner[group] else {
+        let Some(index) = self.topology.group_owner[group] else {
             return Ok(P::zero());
         };
-        if self.layers[index].blend() != "pass_through" {
+        if self.topology.layers[index].blend() != "pass_through" {
             return Ok(P::zero());
         }
-        let parent = self.parent_group[index];
+        let parent = self.topology.parent_group[index];
         self.below(parent, index + 1, x, y, self.backdrop(parent, x, y)?)
     }
     fn amount(&self, i: usize, x: i32, y: i32) -> Result<P::Amount> {
-        let layer = &self.layers[i];
+        let layer = &self.topology.layers[i];
         let opacity = P::opacity(layer.opacity());
         Ok(P::multiply(opacity, self.mask_value(i, x, y, false)?))
     }
@@ -972,8 +1060,8 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
         if self.prepared.has_colour(i) {
             return self.prepared.colour(i, x, y);
         }
-        let layer = &self.layers[i];
-        match self.kinds[i] {
+        let layer = &self.topology.layers[i];
+        match self.topology.kinds[i] {
             Kind::Group(group) => self.below(group, 0, x, y, P::zero()),
             Kind::Adjustment => Ok(P::zero()),
             Kind::Fill | Kind::Raster => {
@@ -986,7 +1074,7 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
                 {
                     return Ok(P::zero());
                 }
-                if matches!(self.kinds[i], Kind::Fill) {
+                if matches!(self.topology.kinds[i], Kind::Fill) {
                     return Ok(P::fill(layer.color()));
                 }
                 self.prepared.source(i, lx as i32, ly as i32)
@@ -995,17 +1083,17 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
     }
     fn unit(&self, base: usize, above: usize, x: i32, y: i32) -> Result<P::Pixel> {
         let mut pixel = self.raw(base, x, y)?;
-        for &i in &self.clips[base] {
+        for &i in &self.topology.clips[base] {
             if i < above {
                 continue;
             }
-            if matches!(self.kinds[i], Kind::Adjustment) && !self.prepared.has_colour(i) {
+            if matches!(self.topology.kinds[i], Kind::Adjustment) && !self.prepared.has_colour(i) {
                 continue;
             }
             let source = self.raw(i, x, y)?;
             let amount = self.amount(i, x, y)?;
-            let blend = &self.layers[i].blend();
-            pixel = if matches!(self.kinds[i], Kind::Adjustment) {
+            let blend = &self.topology.layers[i].blend();
+            pixel = if matches!(self.topology.kinds[i], Kind::Adjustment) {
                 P::adjust(pixel, source, amount, blend)
             } else {
                 P::alpha_from(P::compose(P::opaque(pixel), source, amount, blend), pixel)
@@ -1021,12 +1109,12 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
         y: i32,
         mut out: P::Pixel,
     ) -> Result<P::Pixel> {
-        for &i in &self.groups[group] {
+        for &i in &self.topology.groups[group] {
             if i < above {
                 continue;
             }
-            let layer = &self.layers[i];
-            if let Kind::Group(children) = self.kinds[i] {
+            let layer = &self.topology.layers[i];
+            if let Kind::Group(children) = self.topology.kinds[i] {
                 if layer.blend() == "pass_through" {
                     out = P::mix(
                         out,
@@ -1036,7 +1124,7 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
                     continue;
                 }
             }
-            if matches!(self.kinds[i], Kind::Adjustment) {
+            if matches!(self.topology.kinds[i], Kind::Adjustment) {
                 if self.prepared.has_colour(i) {
                     let image = self.prepared.colour(i, x, y)?;
                     let amount = self.amount(i, x, y)?;
