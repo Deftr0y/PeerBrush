@@ -1,6 +1,8 @@
 //! Immutable native document owners. No live Engine field is switched here.
 #[path = "native/batch.rs"]
 mod batch;
+#[path = "native/effect_patch.rs"]
+mod effect_patch;
 #[path = "native/history.rs"]
 mod history;
 #[path = "native/intent.rs"]
@@ -22,6 +24,7 @@ pub(crate) use batch::{
     CoveragePatch, CoveragePixels, LayerPatch, RasterBatch, RefusedBatch, SelectionPatch,
     SourceUpdate,
 };
+pub(crate) use effect_patch::{EffectClipPatch, EffectPatch};
 pub(crate) use history::{
     Direction, HistoryRequest, HistorySnapshot, NativeHistory, PreparedCommit, PreparedMove,
     Publication, RefusedCommit, RefusedMove, RetiredHistory,
