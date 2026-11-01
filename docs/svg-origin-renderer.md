@@ -67,10 +67,56 @@ to the exact qualified source, never to a later edited prototype.
 
 Open mandatory work: independently executed oracle parity, whole-application
 shared-pool/lifetime tests, source-bound streamed tile-band staging, native8/16
-projection and full editing/history/save/reopen/recovery acceptance. Separate
-bands currently replay scan-conversion prefixes. A production caller must emit
+projection and full editing/history/save/reopen/recovery acceptance. The legacy stateless band entry
+replays scan-conversion prefixes. The ascending prototype below retains fill
+and ordinary-stroke scan state; its remaining integration gates stay open. A production caller must emit
 each full-width band once rather than repeat it for horizontal tiles, and needs
 qualified bounded scan continuation if prefix replay is too expensive. No full
 frame allocation, virtual full-frame slice, guessed halo, tolerance relaxation
 or arbitrary-write staging is an accepted substitute. Real16000-square resource
 and performance qualification remains a release gate.
+
+
+## Ascending scan continuation (unreleased)
+
+`resvg::rows::RowPlan` binds one immutable borrowed tree, matrix and full frame.
+It accepts only consecutive complete bands, and a refusal or unwinding attempt
+permanently closes the plan. Its retained cache has an actual separate allocation
+owner; temporary row working tickets do not replace that owner. Exact tagged
+traversal ancestry distinguishes reused clips and repeated geometry at distinct
+draw sites. Each cached invocation also verifies unchanged geometry bits, full
+logical clip and the next expected local band. No lossy key hash or global cache
+flag controls admission.
+
+The prepared fill and ordinary stroke route retains sorted mutable edges, the
+next subscan and its pending edge insertion. Integer-band cuts flush completed AA
+rows with the original arithmetic; they do not restart an earlier scan prefix.
+All original tile transforms and restorations remain, including inactive tiles.
+Group-pixmap rectangles use the same prepared route where the original renderer
+uses path scanning. Physical destination row filtering preserves original shader
+coordinates and horizontal SIMD/tail grouping.
+
+The caller explicitly supplies retained byte, invocation and whole-operation
+work limits. One shared work/cancellation counter covers validation and every
+band; per-band temporary scope resets cannot reset it. The ordinary qualification
+fixture admits 64MiB retained state and verifies that it stays charged until plan
+drop, independently of row output lifetimes. This is primitive ownership evidence,
+not total app RAM qualification. The renderer grants no SourceSession or Engine
+publication authority: the caller must preserve its actual source/capture/session
+owners and recheck them before/after bands and at final adoption.
+
+The independent corpus now includes identical reused clip sites, legacy rows,
+bands and a complete ascending plan. Selected tests also cover repeated/gapped
+bands, geometry/matrix/frame changes, resource refusal, cumulative work,
+cancellation-control reset and nested ledgers. Qualification receipts must bind
+the exact tested sources and platform; earlier primitive receipts never qualify
+later edits.
+
+Hairline continuation is an explicit unfinished route in this intermediate plan;
+it refuses instead of silently choosing another coverage algorithm. Ordinary
+stroke outlines are still rebuilt under admitted temporary scopes, which also
+needs throughput qualification. Legacy uncached rendering remains available at
+its existing supported limits. Full 16000-square resource/performance tests,
+source-bound tile-band staging, native8/16 editor/history/save/reopen/recovery and
+cross-platform qualification remain mandatory before live adoption or any cap
+increase.

@@ -70,7 +70,25 @@ pub fn fill_path(
     paint.anti_alias = path.rendering_mode().use_shape_antialiasing();
     paint.blend_mode = blend_mode;
 
-    pixmap.fill_path(path.data(), &paint, rule, transform, None);
+    if let Some(prepared) = ctx.prepared {
+        let key = ctx.path_key(path, 0)?;
+        if let Err(error) = pixmap.fill_path_prepared(
+            path.data(),
+            &paint,
+            rule,
+            transform,
+            None,
+            prepared.cache,
+            key,
+        ) {
+            if let Some(rows) = ctx.rows {
+                rows.refuse(&error);
+            }
+            return None;
+        }
+    } else {
+        pixmap.fill_path(path.data(), &paint, rule, transform, None);
+    }
     Some(())
 }
 
@@ -137,7 +155,25 @@ fn stroke_path(
     } else {
         stroke.to_tiny_skia()
     };
-    pixmap.stroke_path(path.data(), &paint, &prepared_stroke, transform, None);
+    if let Some(prepared) = ctx.prepared {
+        let key = ctx.path_key(path, 1)?;
+        if let Err(error) = pixmap.stroke_path_prepared(
+            path.data(),
+            &paint,
+            &prepared_stroke,
+            transform,
+            None,
+            prepared.cache,
+            key,
+        ) {
+            if let Some(rows) = ctx.rows {
+                rows.refuse(&error);
+            }
+            return None;
+        }
+    } else {
+        pixmap.stroke_path(path.data(), &paint, &prepared_stroke, transform, None);
+    }
 
     Some(())
 }

@@ -2,6 +2,11 @@
 // Upstream copyright and BSD notices remain in LICENSE and original modules.
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "std")]
+#[path = "rows/cache.rs"]
+mod cache;
+#[cfg(feature = "std")]
+pub use cache::{InvocationKey, ScanCache};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct Rows {

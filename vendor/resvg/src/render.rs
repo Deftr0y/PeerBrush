@@ -3,11 +3,99 @@
 
 use crate::OptionLog;
 
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedContext<'a> {
+    pub cache: &'a tiny_skia::ScanCache,
+    pub key: tiny_skia::InvocationKey,
+}
 pub struct Context<'a> {
     pub max_bbox: tiny_skia::IntRect,
     pub rows: Option<&'a crate::rows::RowContext<'a>>,
+    pub prepared: Option<PreparedContext<'a>>,
 }
-impl Context<'_> {
+impl<'a> Context<'a> {
+    pub(crate) fn child(&self, tag: u8, site: u64) -> Option<Self> {
+        let prepared = if let Some(prepared) = self.prepared {
+            let Some(key) = prepared.key.child(tag, site) else {
+                prepared
+                    .cache
+                    .refuse("SVG invocation ancestry exceeded admission");
+                if let Some(rows) = self.rows {
+                    rows.refuse("SVG invocation ancestry exceeded admission");
+                }
+                return None;
+            };
+            Some(PreparedContext {
+                cache: prepared.cache,
+                key,
+            })
+        } else {
+            None
+        };
+        Some(Self {
+            max_bbox: self.max_bbox,
+            rows: self.rows,
+            prepared,
+        })
+    }
+    pub(crate) fn path_key(
+        &self,
+        path: &usvg::Path,
+        phase: u64,
+    ) -> Option<tiny_skia::InvocationKey> {
+        let key = self
+            .prepared?
+            .key
+            .child(3, path as *const usvg::Path as usize as u64)
+            .and_then(|key| key.child(4, phase));
+        if key.is_none() {
+            self.prepared?
+                .cache
+                .refuse("SVG invocation ancestry exceeded admission");
+            if let Some(rows) = self.rows {
+                rows.refuse("SVG invocation ancestry exceeded admission");
+            }
+        }
+        key
+    }
+
+    pub(crate) fn draw_pixmap(
+        &self,
+        destination: &mut tiny_skia::PixmapMut,
+        x: i32,
+        y: i32,
+        source: tiny_skia::PixmapRef,
+        paint: &tiny_skia::PixmapPaint,
+        site: u64,
+    ) {
+        if let Some(prepared) = self.prepared {
+            let Some(key) = prepared.key.child(5, site) else {
+                prepared
+                    .cache
+                    .refuse("SVG invocation ancestry exceeded admission");
+                if let Some(rows) = self.rows {
+                    rows.refuse("SVG invocation ancestry exceeded admission");
+                }
+                return;
+            };
+            if let Err(error) = destination.draw_pixmap_prepared(
+                x,
+                y,
+                source,
+                paint,
+                tiny_skia::Transform::identity(),
+                None,
+                prepared.cache,
+                key,
+            ) {
+                if let Some(rows) = self.rows {
+                    rows.refuse(&error);
+                }
+            }
+        } else {
+            destination.draw_pixmap(x, y, source, paint, tiny_skia::Transform::identity(), None);
+        }
+    }
     pub(crate) fn new_pixmap(
         &self,
         w: u32,
@@ -25,6 +113,14 @@ impl Context<'_> {
         }
     }
     pub(crate) fn check(&self) -> bool {
+        if let Some(prepared) = self.prepared {
+            if let Err(error) = prepared.cache.status() {
+                if let Some(rows) = self.rows {
+                    rows.refuse(&error);
+                }
+                return false;
+            }
+        }
         self.rows.is_none_or(|rows| rows.check())
     }
     pub(crate) fn valid_transform(&self, transform: tiny_skia::Transform) -> bool {
@@ -61,7 +157,10 @@ pub fn render_node(
     }
     match node {
         usvg::Node::Group(group) => {
-            render_group(group, ctx, transform, pixmap);
+            if let Some(child) = ctx.child(1, group.as_ref() as *const usvg::Group as usize as u64)
+            {
+                render_group(group, &child, transform, pixmap);
+            }
         }
         usvg::Node::Path(path) => {
             crate::path::render(
@@ -181,14 +280,7 @@ fn render_group(
         quality: tiny_skia::FilterQuality::Nearest,
     };
 
-    pixmap.draw_pixmap(
-        ibbox.x(),
-        ibbox.y(),
-        sub_pixmap.as_ref(),
-        &paint,
-        tiny_skia::Transform::identity(),
-        None,
-    );
+    ctx.draw_pixmap(pixmap, ibbox.x(), ibbox.y(), sub_pixmap.as_ref(), &paint, 0);
     if sub_pixmap.row_storage_failed() {
         if let Some(rows) = ctx.rows {
             rows.refuse("SVG group required an unprepared source row");
