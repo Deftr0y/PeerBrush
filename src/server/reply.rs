@@ -38,6 +38,18 @@ pub(super) struct ReplyAdmission {
     index: Option<Reservation>,
 }
 impl ReplyAdmission {
+    pub(super) fn absorb_projection(&mut self, other: &mut Self) -> Result<(), String> {
+        if !other.slots.is_empty() {
+            return Err("Edit response has unexpected image slots".into());
+        }
+        let pool = other.pool()?.clone();
+        self.admit(&pool, 0)?;
+        if other.tickets.len() > TICKETS - self.tickets.len() {
+            return Err("Combined response tickets exceed their bound".into());
+        }
+        self.tickets.append(&mut other.tickets);
+        Ok(())
+    }
     pub(super) fn new(allowed: bool) -> Self {
         Self {
             allowed,
