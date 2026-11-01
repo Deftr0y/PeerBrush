@@ -9,6 +9,8 @@ mod descriptor;
 mod effect_patch;
 #[path = "native/history.rs"]
 mod history;
+#[path = "native/insertion.rs"]
+mod insertion;
 #[path = "native/intent.rs"]
 mod intent;
 #[path = "native/output.rs"]
@@ -38,6 +40,7 @@ pub(crate) use history::{
     Direction, HistoryRequest, HistorySnapshot, NativeHistory, PreparedCommit, PreparedMove,
     Publication, RefusedCommit, RefusedMove, RetiredHistory,
 };
+pub(crate) use insertion::RefusedInsertion;
 pub use intent::{Intent, IntentKind};
 pub use output::{OutputDraft, RefusedOutput, StagedOutput};
 pub use patch::{RasterPatch, RefusedPatch, RetainedUpdate};
