@@ -2,6 +2,7 @@ pub(crate) mod authority;
 pub mod backed;
 pub mod native;
 pub(crate) mod reframe_scope;
+pub(crate) mod runtime_value;
 pub mod scene;
 pub(crate) mod view;
 use crate::raster::{blend, check_size, Pixel, Raster};
@@ -463,7 +464,7 @@ pub struct Engine {
     pub(crate) file_operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub feedback: BTreeMap<String, String>,
     pub path: Option<std::path::PathBuf>,
-    pub status: String,
+    pub status: runtime_value::RuntimeValue<String>,
     pub file_version: Option<crate::file_safety::Version>,
     pub(crate) file_ownership: Option<std::sync::Arc<crate::file_ownership::Ownership>>,
     pub capture_ui: Option<std::path::PathBuf>,
@@ -472,7 +473,7 @@ pub struct Engine {
     pub capture_panel: Option<String>,
     pub mcp_clients: BTreeMap<String, u64>,
     pub activity: String,
-    pub ai_change: Option<AiChange>,
+    pub ai_change: Option<runtime_value::RuntimeValue<AiChange>>,
     ai_serial: u64,
     pub focus_requested: bool,
     pub loading: Option<crate::loading::Control>,
@@ -551,6 +552,35 @@ pub fn rect(v: &Value) -> Option<[i32; 4]> {
         out[i] = n as i32;
     }
     (out[2] >= out[0] && out[3] >= out[1]).then_some(out)
+}
+
+pub(crate) fn activity_tool(command: &Value) -> &'static str {
+    match text(command, "op", "") {
+        "paint" if command["erase"] == true => "eraser",
+        "paint.clear_selection" => "eraser",
+        "paint" => "brush",
+        "smudge" => "smudge",
+        "clone" => "clone",
+        "heal" => "heal",
+        "crop" => "selection",
+        "canvas.resize" | "image.resize" | "resize" => "scale",
+        "liquify.stroke" => "liquify",
+        "adjustment.add" => "effects",
+        op if op.starts_with("source.") => "layers",
+        op if op.starts_with("path.") => "pen",
+        "move" => "move",
+        "transform" if num(command, "angle", 0.0) != 0.0 => "rotate",
+        "transform" => "scale",
+        "image.place" | "image.import" | "image.paste" | "image.patch" => "place",
+        "layer.update" if command.get("opacity").is_some() => "opacity",
+        "fill" | "paint.fill" => "fill",
+        op if op.starts_with("effect.") || op.starts_with("filter.") => "effects",
+        op if op.starts_with("mask.") => "mask",
+        "selection" => "selection",
+        op if op.starts_with("selection.") => "selection",
+        op if op.starts_with("layer.") => "layers",
+        _ => "canvas",
+    }
 }
 
 #[derive(Default)]
@@ -734,14 +764,17 @@ impl Engine {
             return;
         }
         self.ai_serial += 1;
-        self.ai_change = Some(AiChange {
-            serial: self.ai_serial,
-            actor: actor.into(),
-            label: label.into(),
-            tool: tool.into(),
-            scopes,
-            at: now(),
-        });
+        self.ai_change = Some(
+            AiChange {
+                serial: self.ai_serial,
+                actor: actor.into(),
+                label: label.into(),
+                tool: tool.into(),
+                scopes,
+                at: now(),
+            }
+            .into(),
+        );
     }
     pub fn state(&mut self) -> Result<Value, String> {
         let mut result = self.state_core()?;
@@ -1680,32 +1713,7 @@ impl Engine {
             visual_scopes
         };
         let command = &commands[commands.len() - 1];
-        let tool = match text(command, "op", "") {
-            "paint" if command["erase"] == true => "eraser",
-            "paint.clear_selection" => "eraser",
-            "paint" => "brush",
-            "smudge" => "smudge",
-            "clone" => "clone",
-            "heal" => "heal",
-            "crop" => "selection",
-            "canvas.resize" | "image.resize" | "resize" => "scale",
-            "liquify.stroke" => "liquify",
-            "adjustment.add" => "effects",
-            op if op.starts_with("source.") => "layers",
-            op if op.starts_with("path.") => "pen",
-            "move" => "move",
-            "transform" if num(command, "angle", 0.0) != 0.0 => "rotate",
-            "transform" => "scale",
-            "image.place" | "image.import" | "image.paste" | "image.patch" => "place",
-            "layer.update" if command.get("opacity").is_some() => "opacity",
-            "fill" | "paint.fill" => "fill",
-            op if op.starts_with("effect.") || op.starts_with("filter.") => "effects",
-            op if op.starts_with("mask.") => "mask",
-            "selection" => "selection",
-            op if op.starts_with("selection.") => "selection",
-            op if op.starts_with("layer.") => "layers",
-            _ => "canvas",
-        };
+        let tool = activity_tool(command);
         self.mark_ai(actor, label, tool, visual_scopes);
         let continuous = gesture.is_some()
             && self
