@@ -141,3 +141,11 @@ and pixels for one undo/redo record. Prepared native8/16 fixtures reproduce the
 former loss and compare the corrected engine with the staged native result;
 their runtime qualification remains required. Neither these adapters nor a
 metadata-only compile establish large-document or desktop acceptance.
+
+The original-frame smudge adapter retains one session-owned provisional tile
+map across all dabs. Explicit strip/tile preparation sees completed prior dabs;
+memory-only reservoir sampling never opens storage. A borrowing run entry point
+preserves the owner on error for registered fragment retirement. Soft coverage
+is applied once against the captured original after the full stroke. Reframed
+strokes are refused by their binding until a complete working-frame adapter is
+provided; this is an integration gate, not permission to clip requested work.

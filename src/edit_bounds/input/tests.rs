@@ -813,3 +813,86 @@ fn native_fill_refuses_unresolved_folder_and_editable_source_kinds() {
         assert_eq!(runtime.disk().used().unwrap(), before);
     }
 }
+
+#[test]
+fn ordered_session_smudge_matches_native_resident_with_one_final_soft_selection() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(9, 7, depth).unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                source.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [
+                        12347 + x as u16 * 911,
+                        23521 + y as u16 * 617,
+                        43217,
+                        (if (x + y) % 4 == 0 { 0 } else { 49153 }),
+                    ],
+                );
+            }
+        }
+        source.selection = Some([0, 0, 9, 7]);
+        let mut coverage = Raster::new_depth(9, 7, 16);
+        for y in 0..7 {
+            for x in 0..9 {
+                coverage.set16(x, y, [if x < 4 { 32769 } else { 49153 }, 0, 0, 0]);
+            }
+        }
+        source.selection_coverage = Some(crate::selection::Coverage {
+            mask: coverage,
+            bounds: source.selection.unwrap(),
+            origin: [0, 0],
+            contours: vec![],
+        });
+        let command = serde_json::json!({"op":"smudge","layer":source.layers[0].id,
+            "points":[[2.25,2.5,0.7],[5.25,3.25,0.9],[7.,5.,0.6]],"color":[37,83,127,193],
+            "radius":1.8,"spacing":0.8,"hardness":0.4,"flow":0.6,"opacity":0.7,
+            "load":0.3,"pickup":0.4,"wetness":0.8});
+        let (points, pressures) = crate::brush::points_from_command(&command).unwrap();
+        let settings = crate::brush::Settings::from_command(&command).unwrap();
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[command], None, None, "Smudge")
+            .unwrap();
+        assert_eq!(legacy.undo.len(), 1);
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let stroke =
+            LocalStroke::new(&input, &points, pressures.as_deref(), &mut || Ok(())).unwrap();
+        let before = runtime.disk().used().unwrap();
+        let BuiltTiles::Draft(draft) = crate::smudge::input::stage(
+            &input,
+            &stroke,
+            settings,
+            [37, 83, 127, 193],
+            &session,
+            &mut || Ok(()),
+        )
+        .unwrap() else {
+            panic!("No smudge output")
+        };
+        let output = draft.seal(&|| Ok(())).ok().unwrap();
+        let region = output
+            .surface()
+            .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    legacy.doc.layers[0].pixels.get16(x, y),
+                    "depth{depth} at{x},{y}"
+                );
+            }
+        }
+        drop(region);
+        output.abort(&session, &|| Ok(())).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), before);
+        assert_eq!(document.key(), input.binding().generation());
+    }
+}

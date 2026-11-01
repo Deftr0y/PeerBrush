@@ -174,6 +174,17 @@ impl<'a> PreparedSmudge<'a> {
         mut working: W,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<W, String> {
+        self.run_in_place(&mut working, check)?;
+        Ok(working)
+    }
+
+    /// Session-owned callers retain the working owner on every error so they
+    /// can explicitly retire unpublished fragments after all readers drop.
+    pub(crate) fn run_in_place<W: WorkingSource>(
+        &self,
+        working: &mut W,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
         check()?;
         if working.frame() != self.geometry.frame()
             || working.depth() != self.depth
@@ -182,7 +193,7 @@ impl<'a> PreparedSmudge<'a> {
             return Err("Native smudge working frame, depth or pool differs".into());
         }
         if self.settings.opacity == 0. || self.settings.flow == 0. || self.settings.wetness == 0. {
-            return Ok(working);
+            return Ok(());
         }
         let base_tip = Tip::new(self.settings);
         let mut carry = None;
@@ -306,7 +317,7 @@ impl<'a> PreparedSmudge<'a> {
             }
         }
         check()?;
-        Ok(working)
+        Ok(())
     }
     fn selected(&self, x: i32, y: i32) -> bool {
         self.polygon
