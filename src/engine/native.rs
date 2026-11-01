@@ -19,6 +19,8 @@ mod metadata;
 mod output;
 #[path = "native/patch.rs"]
 mod patch;
+#[path = "native/pixel_inverse.rs"]
+mod pixel_inverse;
 #[path = "native/publication.rs"]
 mod publication;
 #[path = "native/scopes.rs"]
