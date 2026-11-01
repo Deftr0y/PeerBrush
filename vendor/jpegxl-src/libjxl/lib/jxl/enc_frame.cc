@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <utility>
@@ -1511,11 +1512,15 @@ Status EncodeGroups(const FrameHeader& frame_header,
 // encoder computes group patches serially, even when pixel conversion is pooled.
 static size_t resampled_test_groups = 0;
 static size_t resampled_test_nonzero_groups = 0;
+static size_t resampled_test_verified_patches = 0;
 extern "C" size_t PeerBrushResampledGroupsForTest() {
   return resampled_test_groups;
 }
 extern "C" size_t PeerBrushResampledNonzeroGroupsForTest() {
   return resampled_test_nonzero_groups;
+}
+extern "C" size_t PeerBrushResampledVerifiedPatchesForTest() {
+  return resampled_test_verified_patches;
 }
 #endif
 
@@ -1689,6 +1694,72 @@ Status PrepareResampledPatch(
   for (size_t y = height; y < patch.ysize(); ++y)
     std::copy(alpha.Row(height - 1), alpha.Row(height - 1) + patch.xsize(),
               alpha.Row(y));
+#if defined(JPEGXL_PEERBRUSH_RESAMPLING_ORACLE_TEST) && \
+    defined(JPEGXL_PEERBRUSH_RESAMPLING_STREAMING_TEST)
+  // Tiny diagnostic only: reconstruct original RGB before whole-image ToXYB,
+  // then compare prepared fields before any streaming quantization heuristic.
+  // Normal builds contain no full-image oracle, and qualification refuses more
+  // than 1 MiB raw even when the actual streaming producer could accept it.
+  JXL_ENSURE(data.xsize * data.ysize <= 1024 * 1024 / 8);
+  JXL_ASSIGN_OR_RETURN(Image3F reference,
+                       Image3F::Create(manager, data.xsize, data.ysize));
+  JXL_ASSIGN_OR_RETURN(Image3F reference_piece,
+                       Image3F::Create(manager, resampled_rows::kNativeEdge,
+                                       resampled_rows::kBand));
+  JXL_ASSIGN_OR_RETURN(ImageF reference_alpha,
+                       ImageF::Create(manager, data.xsize, data.ysize));
+  JXL_ASSIGN_OR_RETURN(ImageF reference_alpha_piece,
+                       ImageF::Create(manager, resampled_rows::kNativeEdge,
+                                      resampled_rows::kBand));
+  for (size_t y = 0; y < data.ysize; y += resampled_rows::kBand)
+    for (size_t x = 0; x < data.xsize; x += resampled_rows::kNativeEdge) {
+      const size_t w = std::min(resampled_rows::kNativeEdge, data.xsize - x),
+                   h = std::min(resampled_rows::kBand, data.ysize - y);
+      JXL_RETURN_IF_ERROR(reference_piece.ShrinkTo(w, h));
+      bool interleaved = false;
+      JXL_RETURN_IF_ERROR(CopyColorChannels(
+          input, Rect(x, y, w, h), frame_info, metadata->m, pool,
+          &reference_piece, nullptr, &interleaved));
+      JXL_ENSURE(!interleaved);
+      JXL_RETURN_IF_ERROR(reference_alpha_piece.ShrinkTo(w, h));
+      JXL_RETURN_IF_ERROR(copy_alpha(Rect(x, y, w, h), &reference_alpha_piece));
+      for (size_t iy = 0; iy < h; ++iy) {
+        for (size_t c = 0; c < 3; ++c)
+          std::copy(reference_piece.ConstPlaneRow(c, iy),
+                    reference_piece.ConstPlaneRow(c, iy) + w,
+                    reference.PlaneRow(c, y + iy) + x);
+        std::copy(reference_alpha_piece.Row(iy),
+                  reference_alpha_piece.Row(iy) + w,
+                  reference_alpha.Row(y + iy) + x);
+      }
+    }
+  Image3F reference_linear;
+  if (want_linear) {
+    JXL_ASSIGN_OR_RETURN(reference_linear,
+                         Image3F::Create(manager, data.xsize, data.ysize));
+  }
+  JXL_RETURN_IF_ERROR(ToXYB(metadata->m.color_encoding,
+                            metadata->m.IntensityTarget(), nullptr, pool,
+                            &reference, cms,
+                            want_linear ? &reference_linear : nullptr));
+  JXL_RETURN_IF_ERROR(PadImageToBlockMultipleInPlace(&reference));
+  JXL_RETURN_IF_ERROR(DownsampleColorChannels(cparams, *header, false, &reference));
+  JXL_ASSIGN_OR_RETURN(reference_alpha, DownsampleImage(reference_alpha, 2));
+  for (size_t y = 0; y < patch.ysize(); ++y) {
+    for (size_t c = 0; c < 3; ++c)
+      JXL_ENSURE(std::memcmp(
+          color->ConstPlaneRow(c, y),
+          reference.ConstPlaneRow(c, patch.y0() + y) + patch.x0(),
+          patch.xsize() * sizeof(float)) == 0);
+    for (size_t x = 0; x < patch.xsize(); ++x) {
+      const float expected = reference_alpha.Row(
+          std::min(patch.y0() + y, reference_alpha.ysize() - 1))[
+          std::min(patch.x0() + x, reference_alpha.xsize() - 1)];
+      JXL_ENSURE(std::memcmp(alpha.Row(y) + x, &expected, sizeof(float)) == 0);
+    }
+  }
+  ++resampled_test_verified_patches;
+#endif
   return PadImageToBlockMultipleInPlace(color);
 }
 
