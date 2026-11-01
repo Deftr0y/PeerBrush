@@ -10,7 +10,7 @@ use crate::{
 };
 #[path = "native/bounds.rs"]
 mod bounds;
-pub(crate) use bounds::source_bounds;
+pub(crate) use bounds::{content_bounds, source_bounds};
 #[path = "native/output.rs"]
 mod output;
 pub(crate) use output::{write_fill, write_plane};
@@ -122,7 +122,7 @@ impl Work {
     fn step(&mut self) -> Result<(), String> {
         self.claim(1)
     }
-    fn claim(&mut self, amount: u64) -> Result<(), String> {
+    pub(crate) fn claim(&mut self, amount: u64) -> Result<(), String> {
         let used = self
             .used
             .checked_add(amount)

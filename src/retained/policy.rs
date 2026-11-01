@@ -10,6 +10,24 @@ pub(crate) fn source_matrix(
     matrix: [f32; 6],
     command: &Value,
 ) -> Result<[f32; 6], String> {
+    source_matrix_with_pivot(
+        before_origin,
+        before_frame,
+        after_origin,
+        matrix,
+        command,
+        None,
+    )
+}
+
+pub(super) fn source_matrix_with_pivot(
+    before_origin: [i32; 2],
+    before_frame: [u32; 2],
+    after_origin: [i32; 2],
+    matrix: [f32; 6],
+    command: &Value,
+    default_pivot: Option<[f64; 2]>,
+) -> Result<[f32; 6], String> {
     if crate::projective::parse(command)?.is_some() || crate::warp::parse(command)?.is_some() {
         return Err("Rasterize the editable source at its native precision before Distort, Perspective or Warp".into());
     }
@@ -29,11 +47,21 @@ pub(crate) fn source_matrix(
     let px = command["pivot"][0]
         .as_f64()
         .map(|v| v as f32)
-        .unwrap_or(before_origin[0] as f32 + before_frame[0] as f32 * 0.5);
+        .unwrap_or_else(|| {
+            default_pivot.map_or(
+                before_origin[0] as f32 + before_frame[0] as f32 * 0.5,
+                |p| p[0] as f32,
+            )
+        });
     let py = command["pivot"][1]
         .as_f64()
         .map(|v| v as f32)
-        .unwrap_or(before_origin[1] as f32 + before_frame[1] as f32 * 0.5);
+        .unwrap_or_else(|| {
+            default_pivot.map_or(
+                before_origin[1] as f32 + before_frame[1] as f32 * 0.5,
+                |p| p[1] as f32,
+            )
+        });
     let [a, b, c, d] = crate::transform::skewed(
         [cos * sx, sin * sx, -sin * sy, cos * sy].map(f64::from),
         command,

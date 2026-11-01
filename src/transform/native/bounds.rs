@@ -12,6 +12,29 @@ pub(crate) fn source_bounds(
     work: &mut Work,
     check: &dyn Fn() -> Result<()>,
 ) -> std::result::Result<Option<[i32; 4]>, String> {
+    data_bounds(source, pool, disk, work, check, true)
+}
+
+/// Folder pivots use visible current alpha support, unlike original-source
+/// support, which includes editable RGB underneath transparent pixels.
+pub(crate) fn content_bounds(
+    source: &Surface,
+    pool: &ResidentBudget,
+    disk: &DiskBudget,
+    work: &mut Work,
+    check: &dyn Fn() -> Result<()>,
+) -> std::result::Result<Option<[i32; 4]>, String> {
+    data_bounds(source, pool, disk, work, check, false)
+}
+
+fn data_bounds(
+    source: &Surface,
+    pool: &ResidentBudget,
+    disk: &DiskBudget,
+    work: &mut Work,
+    check: &dyn Fn() -> Result<()>,
+    hidden: bool,
+) -> std::result::Result<Option<[i32; 4]>, String> {
     check().map_err(|e| e.to_string())?;
     if !source.uses_budget(pool) || !source.uses_disk_budget(disk) {
         return Err("Transform support source differs from shared admission".into());
@@ -38,7 +61,8 @@ pub(crate) fn source_bounds(
                 let at = (y * TILE + x) as usize * stride;
                 // Red/green/blue under zero alpha remain editable source data;
                 // native16 low bits must not pass through a display projection.
-                if bytes[at..at + stride].iter().any(|v| *v != 0) {
+                let first = if hidden { at } else { at + stride / 4 * 3 };
+                if bytes[first..at + stride].iter().any(|v| *v != 0) {
                     let x = (left + x) as i32;
                     let y = (top + y) as i32;
                     bounds = [
@@ -98,6 +122,12 @@ mod tests {
                 input.source_bounds()
             );
             assert_eq!(work.used(), 256 * 256 + 3);
+            let mut visible_work = Work::new(100_000).unwrap();
+            assert_eq!(
+                content_bounds(&source, &pool, &disk, &mut visible_work, &|| Ok(())).unwrap(),
+                input.content_bounds()
+            );
+            assert_eq!(visible_work.used(), 256 * 256 + 3);
             assert!(
                 source_bounds(&source, &pool, &disk, &mut Work::new(10).unwrap(), &|| Ok(
                     ()

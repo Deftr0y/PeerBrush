@@ -47,7 +47,7 @@ Retained layer planning reads borrowed native metadata and keeps its placement
 arrays charged. It includes linked mask support, independent mask reframing,
 mask-only paint-step selection and complete editable-source frame placement.
 Planning does not publish pixels. The ordinary size and work checks still apply;
-selected-pixel/folder transactions and the concrete regional editable-source
+selected-pixel transactions and the concrete regional editable-source
 evaluator are separate integration requirements.
 
 The final consumer must use the common captured edit, generation-bound source
@@ -79,8 +79,14 @@ producer does not perform final guarded Engine adoption.
 The production entry accepts a captured command token, looks up its immutable
 normalized parameters in that exact descriptor, and checks every proposed
 logical write frame against the Engine's derived command scopes. Caller-built
-plan arrays are private to preparation. Selected-pixel and folder commands remain
-closed until their complete policies and outputs use the same transaction.
+plan arrays are private to preparation. Folder plans include hidden descendants
+and nested groups, reject locked children, and keep linked and independent mask
+placement. Their default affine pivot uses current native alpha support; hidden
+RGB and padding cannot move that pivot. Hierarchy visits and alpha scans consume
+the same work allowance. A shared default-pivot argument preserves the original
+normalized command without allocating modified JSON per child. Selected-pixel
+commands remain closed until their complete policies and outputs use the same
+transaction.
 
 Linked and unlinked mask/selection command integration,
 cancellation/history acceptance and

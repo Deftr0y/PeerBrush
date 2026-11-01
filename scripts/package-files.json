@@ -356,6 +356,7 @@
     "src/retained.rs",
     "src/retained/geometry.rs",
     "src/retained/planning.rs",
+    "src/retained/planning/folder.rs",
     "src/retained/planning/tests.rs",
     "src/retained/policy.rs",
     "src/retained/pose.rs",
