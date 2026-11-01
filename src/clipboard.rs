@@ -1,4 +1,5 @@
 //! Selection pixels and OS clipboard transport. Editing stays in the shared engine.
+pub(crate) mod native;
 use crate::{
     engine::{Document, Layer},
     raster::{check_size, png, Raster},

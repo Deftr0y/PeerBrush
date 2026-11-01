@@ -5,7 +5,7 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
-pub(super) struct Writer {
+pub(crate) struct Writer {
     width: u32,
     height: u32,
     depth: u16,

@@ -344,7 +344,7 @@ fn stage_plane(
     }
 }
 
-pub(super) fn stage(
+pub(crate) fn stage(
     base: &NativeDocument,
     session: &impl Session,
     check: &dyn Fn() -> Result<(), String>,

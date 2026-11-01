@@ -10,6 +10,7 @@ pub(crate) mod image_source;
 pub mod import;
 pub mod masks;
 mod native_tiles;
+pub(crate) use native_tiles::Writer as NativeTileWriter;
 pub mod refine;
 pub mod regional_import;
 pub mod regional_masks;
