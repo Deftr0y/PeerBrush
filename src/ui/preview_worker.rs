@@ -20,13 +20,18 @@ enum Job {
         epoch: Arc<AtomicU64>,
         replies: NativeReplies,
         ready: Box<dyn FnOnce() + Send>,
+        uploads: Option<(super::native_texture::Retirement, usize)>,
     },
 }
 
 pub(super) struct NativeReply {
     pub job: u64,
     pub tag: crate::render::native_preview::Tag,
-    pub result: Result<crate::render::native_preview::Frame, String>,
+    pub result: Result<NativeOutput, String>,
+}
+pub(super) enum NativeOutput {
+    Pixels(crate::render::native_preview::Frame),
+    Uploads(super::native_texture::Prepared),
 }
 /// At most one completed pixel-only frame is retained while UI is busy.
 #[derive(Clone, Default)]
@@ -107,6 +112,33 @@ impl Worker {
                 epoch: self.epoch.clone(),
                 replies,
                 ready: Box::new(ready),
+                uploads: None,
+            },
+            |queue| {
+                thread::Builder::new()
+                    .name("peerbrush-preview".into())
+                    .spawn(move || run(queue))
+            },
+        )
+    }
+
+    pub fn request_native_uploads(
+        &mut self,
+        request: crate::render::native_preview::Request,
+        job: u64,
+        replies: NativeReplies,
+        retirement: super::native_texture::Retirement,
+        max_texture_side: usize,
+        ready: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
+        self.enqueue(
+            Job::Native {
+                request,
+                job,
+                epoch: self.epoch.clone(),
+                replies,
+                ready: Box::new(ready),
+                uploads: Some((retirement, max_texture_side)),
             },
             |queue| {
                 thread::Builder::new()
@@ -190,9 +222,10 @@ fn run(queue: Arc<Queue>) {
                 epoch,
                 replies,
                 ready,
+                uploads,
             } => {
                 let tag = request.tag();
-                let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     request.render(&mut || {
                         if epoch.load(Ordering::Relaxed) == job {
                             Ok(())
@@ -205,6 +238,30 @@ fn run(queue: Arc<Queue>) {
                 // No scene, Surface, source session or profile operation escapes
                 // into the UI reply. Release all of them before notifying UI.
                 drop(request);
+                let mut result = result.and_then(|frame| {
+                    if let Some((retirement, side)) = uploads {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            super::native_texture::Prepared::from_frame(
+                                frame,
+                                &retirement,
+                                side,
+                                &mut || {
+                                    if epoch.load(Ordering::Relaxed) == job {
+                                        Ok(())
+                                    } else {
+                                        Err("Preview superseded".into())
+                                    }
+                                },
+                            )
+                            .map(NativeOutput::Uploads)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err("Native display upload preparation could not complete".into())
+                        })
+                    } else {
+                        Ok(NativeOutput::Pixels(frame))
+                    }
+                });
                 if epoch.load(Ordering::Relaxed) != job {
                     result = Err("Preview superseded".into());
                 }
