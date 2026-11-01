@@ -123,6 +123,15 @@ registered session's independent retirement checks. Unguarded differential
 entry points exist only in test builds. Final atomic adoption/history, resolved
 folder insertion and shared composed-source providers remain separate gates.
 
+Folder foreground fill prepares a genuinely new zero-baseline document canvas
+through the same session-owned seed. It uses document depth/origin and current
+selection, independently of the folder's unused dummy raster frame/depth.
+The existing folder slot identifies only the captured authorization target;
+its plane is never replaced. Empty requested areas produce no operation, while
+transparent color over a nonempty area still produces the empty child required
+by legacy insertion semantics. The engine's typed child insertion must bind the
+same command token, construct hierarchy/metadata and commit one history record.
+
 `edit_bounds::output::TileOutput` stages one plane through the actual
 `SourceSession` and the engine's `OutputDraft`. It compares full original padded
 tiles, keeps mutable proposal/index allocations charged, creates a fragment only
