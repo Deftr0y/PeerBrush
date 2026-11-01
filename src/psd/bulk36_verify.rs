@@ -49,7 +49,12 @@ impl BulkPlan<'_> {
         let mut references = 0u64;
         for (i, raster) in self.rasters.iter().enumerate() {
             check()?;
-            if raster.id as usize != i + 1 {
+            if raster.id as usize != i + 1
+                || raster.width == 0
+                || raster.height == 0
+                || raster.width > 16000
+                || raster.height > 16000
+            {
                 return Err("Source36 raster roster is not canonical".into());
             }
             Spec::new(raster.depth)?;

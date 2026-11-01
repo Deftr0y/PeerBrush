@@ -57,6 +57,12 @@ Temporary accounting can be reduced only after the corresponding buffers drop
 and all surviving capacities remain covered. Transitioning legacy document
 clones retains its separate bounds and does not establish a total RAM claim.
 
+The typed transition consumes the admitted canonical tree and moves the document
+metadata into the exhaustive DTO. Its exact canonical roundtrip rejects ignored,
+inserted or narrowed fields. The engine must also validate document ID/revision,
+every raster reference and semantic feature admission. Moving a DTO does not
+itself establish that a standard Photoshop section faithfully represents it.
+
 ## Manifest and hash bindings
 
 The manifest contains format 36, source document ID/revision, typed document
@@ -155,3 +161,13 @@ they coexist. Dropping a failed writer does not release a charge for bytes left
 on disk. Startup recovery requires independently retained inventory authority;
 an arbitrary directory scan does not grant ownership. Capacity or I/O failure
 preserves current sources, existing destinations and foreign replacements.
+
+Container replay is append-only and has an explicit 64 GiB operation ceiling,
+separate from unchanged live document limits. Its header and all section/resource
+lengths are checked before writing. It requires whole bulk and standard-data
+completion proofs, rechecks the compressed manifest and exact standard SHA while
+copying bounded read-only ranges, and returns an opaque whole-file SHA/length
+observation. That observation binds the complete manifest and header, not merely
+the core hash. A sealed owned file, current render/metadata fidelity, source lease
+and final publication checks are still required. A failed replay never grants
+completion; its partially written owned candidate must be retired explicitly.

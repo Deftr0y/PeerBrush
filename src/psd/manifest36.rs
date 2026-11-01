@@ -16,6 +16,20 @@ pub(crate) fn inflate<R: Read>(
     bulk: BulkLimits,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Manifest, String> {
+    Manifest::parse(
+        &inflate_bytes(input, encoded_bytes, metadata, check)?,
+        metadata,
+        bulk,
+        check,
+    )
+}
+
+fn inflate_bytes<R: Read>(
+    input: &mut R,
+    encoded_bytes: u64,
+    metadata: Limits,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
     metadata.validate()?;
     check()?;
     if encoded_bytes < 6 || encoded_bytes > u64::from(u32::MAX) - 4 {
@@ -81,12 +95,54 @@ pub(crate) fn inflate<R: Read>(
                 return Err("Source36 compressed range has extra bytes".into());
             }
             check()?;
-            return Manifest::parse(&bytes, metadata, bulk, check);
+            return Ok(bytes);
         }
         if consumed == 0 && produced == 0 && (remaining == 0 || begin != end) {
             return Err("Incomplete Source36 metadata zlib stream".into());
         }
     }
+}
+
+/// Complete the raw/preflight/DOM/manifest transition under retained same-pool
+/// charges. Raw capacity is admitted before the first compressed byte is read.
+/// Decoder scratch is a conservative component envelope, not a process RAM or
+/// allocator bound. The caller must also retain source/file and tile I/O owners.
+pub(crate) fn inflate_admitted<R: Read>(
+    input: &mut R,
+    encoded_bytes: u64,
+    metadata: Limits,
+    bulk: BulkLimits,
+    working: super::memory36::WorkingSet,
+    budget: &crate::large_document::ResidentBudget,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<super::memory36::Admitted<Manifest>, String> {
+    use super::{
+        canonical36::Stats,
+        memory36::{Admission, MetadataCharge},
+    };
+    metadata.validate()?;
+    if working.raw_bytes == 0 || working.raw_bytes > metadata.bytes {
+        return Err("Source36 raw inflation capacity exceeds its metadata byte admission".into());
+    }
+    let metadata = Limits {
+        bytes: working.raw_bytes,
+        ..metadata
+    };
+    let raw_owner = MetadataCharge::reserve(budget, working.raw_bytes, check)?;
+    // Escaped JSON strings can require a growing parser scratch buffer before
+    // Stats knows their decoded length. Charge its worst byte envelope first.
+    let preflight_bytes = working
+        .raw_bytes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(2 * 1024 * 1024))
+        .ok_or("Source36 preflight workspace overflow")?;
+    let preflight_owner = MetadataCharge::reserve(budget, preflight_bytes, check)?;
+    let bytes = inflate_bytes(input, encoded_bytes, metadata, check)?;
+    let stats = Stats::scan(&bytes, metadata, check)?;
+    drop(preflight_owner);
+    let admission = Admission::reserve(stats, metadata, working, budget, &raw_owner, check)?;
+    let canonical = admission.parse_owned(bytes, check)?;
+    canonical.map_unique(|canonical, _| Manifest::from_canonical(canonical, metadata, bulk, check))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -456,6 +512,13 @@ impl<T> Manifest<T> {
             chunks: &self.chunks,
         }
     }
+    pub(crate) fn standard_binding(&self) -> (u64, u64, Digest) {
+        (
+            self.standard_layer_bytes,
+            self.standard_composite_bytes,
+            self.standard_sha256,
+        )
+    }
     pub(crate) fn verify_standard<L: Read, C: Read>(
         &self,
         layer: &mut L,
@@ -655,6 +718,17 @@ mod tests {
         let mut c = core();
         c.metadata = json!({"oversized":"x".repeat(8193)});
         assert!(StagedCore::new(c, metadata_limits(), bulk_limits(), &check).is_err());
+        for (width, height) in [(0, 1), (1, 0), (16001, 1), (1, 16001)] {
+            let mut c = core();
+            c.rasters.push(Raster {
+                id: 1,
+                width,
+                height,
+                depth: 16,
+                references: 0,
+            });
+            assert!(StagedCore::new(c, metadata_limits(), bulk_limits(), &check).is_err());
+        }
     }
 
     #[test]
@@ -814,5 +888,70 @@ mod tests {
         assert!(changed
             .into_typed::<NarrowedNumber>(metadata_limits(), &check, |_, _, _, _| Ok(()))
             .is_err());
+    }
+
+    #[test]
+    fn compressed_admission_precedes_io_and_keeps_the_result_charged_through_handoff() {
+        use super::super::memory36::WorkingSet;
+        use crate::large_document::ResidentBudget;
+        let check = || Ok(());
+        let canonical = fixture().canonical(metadata_limits(), &check).unwrap();
+        let mut zipped = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        zipped.write_all(canonical.bytes()).unwrap();
+        let zipped = zipped.finish().unwrap();
+        let working = WorkingSet {
+            raw_bytes: metadata_limits().bytes,
+            canonical_core_bytes: metadata_limits().bytes,
+            canonical_manifest_bytes: metadata_limits().bytes,
+            typed_metadata_bytes: 65536,
+            tile_scratch_bytes: bulk36::MAX_TILE_BYTES,
+            index_scratch_bytes: 4096,
+        };
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let admitted = inflate_admitted(
+            &mut zipped.as_slice(),
+            zipped.len() as u64,
+            metadata_limits(),
+            bulk_limits(),
+            working,
+            &pool,
+            &check,
+        )
+        .unwrap();
+        assert_eq!(admitted.core().revision(), 7);
+        assert!(admitted.owner().uses_budget(&pool));
+        assert!(pool.used() > working.raw_bytes);
+        let retained = admitted.clone();
+        drop(admitted);
+        assert!(pool.used() > 0);
+        drop(retained);
+        assert_eq!(pool.used(), 0);
+        let refused = ResidentBudget::new(working.raw_bytes + 1).unwrap();
+        let mut cursor = std::io::Cursor::new(&zipped);
+        assert!(inflate_admitted(
+            &mut cursor,
+            zipped.len() as u64,
+            metadata_limits(),
+            bulk_limits(),
+            working,
+            &refused,
+            &check
+        )
+        .is_err());
+        assert_eq!(cursor.position(), 0);
+        assert_eq!(refused.used(), 0);
+        let mut corrupt = zipped.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(inflate_admitted(
+            &mut corrupt.as_slice(),
+            corrupt.len() as u64,
+            metadata_limits(),
+            bulk_limits(),
+            working,
+            &pool,
+            &check
+        )
+        .is_err());
+        assert_eq!(pool.used(), 0);
     }
 }
