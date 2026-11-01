@@ -103,6 +103,10 @@ rounding and must not be applied a second time to selected clear.
 capacities before allocation. It creates the actual brush, clone/heal and smudge
 plans with the captured storage origin; another generation/frame cannot reuse
 that geometry accidentally.
+`StrokePoints` admits the shared parser's temporary document-space point and
+pressure capacities before allocation. Both owners stay charged while geometry
+is shifted into `LocalStroke`; releasing the parsed owner cannot release the
+shifted owner's admission. Pressure overrides reuse their existing capacity.
 
 `edit_bounds::output::TileOutput` stages one plane through the actual
 `SourceSession` and the engine's `OutputDraft`. It compares full original padded

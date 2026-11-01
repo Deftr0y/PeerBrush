@@ -2,10 +2,78 @@
 use super::{native::PreparedBrush, Settings};
 use crate::{
     edit_bounds::input::{InputBinding, InputFrame, RasterInput},
-    large_document::Reservation,
+    large_document::{Reservation, ResidentBudget},
     retouch::native::PreparedRetouch,
     smudge::native::PreparedSmudge,
 };
+
+/// Charged temporary document-space geometry from the shared command parser.
+/// Its capacities stay admitted until shifted LocalStroke data owns its charge.
+pub(crate) struct StrokePoints {
+    points: Vec<[f32; 2]>,
+    pressures: Option<Vec<f32>>,
+    _charge: Reservation,
+}
+impl StrokePoints {
+    pub(crate) fn from_parameters(
+        parameters: &serde_json::Value,
+        pool: &ResidentBudget,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        check()?;
+        let count = parameters["points"]
+            .as_array()
+            .filter(|p| !p.is_empty() && p.len() <= 10000)
+            .ok_or("Stroke needs 1-10000 points")?
+            .len();
+        let bytes = count
+            .checked_mul(std::mem::size_of::<[f32; 2]>() + 2 * std::mem::size_of::<f32>())
+            .and_then(|n| n.checked_add(256))
+            .ok_or("Native parsed stroke admission overflow")?;
+        let charge = pool
+            .reserve_bytes(bytes, bytes)
+            .map_err(|e| e.to_string())?;
+        let (points, pressures) = super::points_from_command(parameters)?;
+        let actual = points
+            .capacity()
+            .checked_mul(std::mem::size_of::<[f32; 2]>())
+            .and_then(|n| {
+                pressures.as_ref().map_or(Some(n), |p| {
+                    p.capacity()
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .and_then(|b| n.checked_add(b))
+                })
+            })
+            .ok_or("Native parsed stroke capacity overflow")?;
+        if actual > bytes {
+            return Err("Native parsed stroke allocator exceeded admission".into());
+        }
+        check()?;
+        Ok(Self {
+            points,
+            pressures,
+            _charge: charge,
+        })
+    }
+    pub(crate) fn points(&self) -> &[[f32; 2]] {
+        &self.points
+    }
+    pub(crate) fn pressures(&self) -> Option<&[f32]> {
+        self.pressures.as_deref()
+    }
+    pub(crate) fn local(
+        &self,
+        input: &RasterInput<'_>,
+        frame: Option<&InputFrame>,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<LocalStroke, String> {
+        if let Some(frame) = frame {
+            LocalStroke::for_frame(input, frame, self.points(), self.pressures(), check)
+        } else {
+            LocalStroke::new(input, self.points(), self.pressures(), check)
+        }
+    }
+}
 
 pub(crate) struct LocalStroke {
     binding: InputBinding,

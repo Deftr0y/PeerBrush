@@ -1327,3 +1327,49 @@ fn reframed_session_smudge_matches_resident_after_all_dabs_and_once_only_soft_co
         assert_eq!(runtime.disk().used().unwrap(), before);
     }
 }
+
+#[test]
+fn parsed_command_points_keep_admission_through_shifted_owner_and_refuse_before_allocation() {
+    use crate::brush::input::StrokePoints;
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let source = source(16);
+    let document = native(&source, &session);
+    let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+    for command in [
+        serde_json::json!({"points":[[1.,2.],[3.,5.],[7.,9.]],"pressures":[0.25,0.5,0.75],"stroke_axis":"axis","stroke_axis_from":1}),
+        serde_json::json!({"points":[[1.,2.,0.25],[3.,5.],[7.,9.,0.75]],"stroke_axis":"vertical"}),
+        serde_json::json!({"points":[[1.,2.],[3.,5.]]}),
+    ] {
+        let expected = crate::brush::points_from_command(&command).unwrap();
+        let before = runtime.resident().used();
+        let points = StrokePoints::from_parameters(&command, input.pool(), &mut || Ok(())).unwrap();
+        assert_eq!(points.points(), expected.0.as_slice());
+        assert_eq!(points.pressures(), expected.1.as_deref());
+        assert!(runtime.resident().used() > before);
+        let local = points.local(&input, None, &mut || Ok(())).unwrap();
+        let overlap = runtime.resident().used();
+        drop(points);
+        assert!(runtime.resident().used() < overlap);
+        assert!(runtime.resident().used() > before);
+        drop(local);
+        assert_eq!(runtime.resident().used(), before);
+    }
+    let small = crate::large_document::ResidentBudget::new(128).unwrap();
+    assert!(StrokePoints::from_parameters(
+        &serde_json::json!({"points":[[1,2],[3,4]]}),
+        &small,
+        &mut || Ok(())
+    )
+    .is_err());
+    assert_eq!(small.used(), 0);
+    let before = runtime.resident().used();
+    assert!(StrokePoints::from_parameters(
+        &serde_json::json!({"points":[[1,2,0.5]],"pressures":[0.7]}),
+        input.pool(),
+        &mut || Ok(())
+    )
+    .is_err());
+    assert_eq!(runtime.resident().used(), before);
+}
