@@ -1,0 +1,320 @@
+use super::{handle_http, Shared};
+use std::{
+    fs::File,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread::{self, JoinHandle},
+};
+
+#[derive(Default)]
+struct State {
+    stopping: bool,
+    running: usize,
+}
+
+#[derive(Default)]
+pub(super) struct Requests {
+    state: Mutex<State>,
+    idle: Condvar,
+}
+
+pub(super) struct Request(Arc<Requests>);
+
+impl Requests {
+    pub(super) fn begin(self: &Arc<Self>) -> Option<Request> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopping {
+            return None;
+        }
+        state.running = state.running.checked_add(1)?;
+        Some(Request(self.clone()))
+    }
+    fn stop(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopping = true;
+    }
+    fn drain(&self) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        drop(
+            self.idle
+                .wait_while(state, |state| state.running != 0)
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.running -= 1;
+        if state.running == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+/// Owns the exact instance file until all admitted network/recovery writers end.
+/// It is never cloned or transferred to a worker.
+pub struct InstanceLock {
+    requests: Arc<Requests>,
+    availability: Arc<AtomicBool>,
+    recovery: crate::recovery::Worker,
+    listener: Option<JoinHandle<()>>,
+    http: Arc<tiny_http::Server>,
+    // Field order also closes the listener before releasing writer admission.
+    _file: File,
+}
+
+impl InstanceLock {
+    pub(super) fn start(
+        file: File,
+        http: tiny_http::Server,
+        shared: Shared,
+        workspace: crate::workspace::Registry,
+        dir: std::path::PathBuf,
+        auth: String,
+        port: u16,
+        availability: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let recovery = crate::recovery::Worker::start(workspace, dir).map_err(|e| e.to_string())?;
+        let requests = Arc::new(Requests::default());
+        let accepting = requests.clone();
+        let http = Arc::new(http);
+        let incoming = http.clone();
+        let listening = availability.clone();
+        let listener = thread::Builder::new()
+            .name("peerbrush-http".into())
+            .spawn(move || {
+                let _availability = super::ServerAvailability(listening);
+                let mut sessions = std::collections::BTreeMap::new();
+                while let Ok(request) = incoming.recv() {
+                    let Some(_request) = accepting.begin() else {
+                        break;
+                    };
+                    handle_http(request, &shared, &auth, port, &mut sessions, &accepting);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            requests,
+            availability,
+            recovery,
+            listener: Some(listener),
+            http,
+            _file: file,
+        })
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        self.requests.stop();
+        self.availability.store(false, Ordering::Release);
+        self.http.unblock();
+        self.recovery.stop();
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
+        }
+        self.requests.drain();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpStream,
+        path::PathBuf,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    fn directory() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("peerbrush-instance-tests-{}", crate::engine::id()));
+        fs::create_dir(&dir).unwrap();
+        fs::canonicalize(dir).unwrap()
+    }
+
+    fn cleanup(dir: &std::path::Path) {
+        let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(dir.is_absolute() && dir.starts_with(temp));
+        assert!(dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("peerbrush-instance-tests-"));
+        assert_eq!(fs::canonicalize(dir).unwrap(), dir);
+        assert!(!fs::symlink_metadata(dir).unwrap().file_type().is_symlink());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "Instance test did not reach its controlled boundary"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn lock(dir: &std::path::Path) -> File {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("instance.lock"))
+            .unwrap()
+    }
+
+    fn save_brush() -> serde_json::Value {
+        json!({"method":"brushes","params":{"action":"save","name":"Preserved admitted work","category":"Custom","settings":crate::brush::Settings::default()}})
+    }
+
+    #[test]
+    fn stop_refuses_new_requests_and_drains_admitted_children() {
+        let requests = Arc::new(Requests::default());
+        let unrelated = Arc::new(Requests::default());
+        let request = requests.begin().unwrap();
+        let child = requests.begin().unwrap();
+        requests.stop();
+        assert!(requests.begin().is_none());
+        assert!(unrelated.begin().is_some());
+        let stopping = requests.clone();
+        let (finished, done) = mpsc::channel();
+        let wait = thread::spawn(move || {
+            stopping.drain();
+            finished.send(()).unwrap();
+        });
+        drop(request);
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(25)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(child);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        wait.join().unwrap();
+        assert!(requests.begin().is_none());
+    }
+
+    #[test]
+    fn connection_drop_waits_for_actual_profile_writer_before_unlock_and_stops_old_rpc() {
+        let dir = directory();
+        let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+        let connection = super::super::start(shared.clone(), dir.clone()).unwrap();
+        let workspace = crate::workspace::attach(&shared);
+        let library = shared.lock().unwrap().brush_library.clone();
+        let held = library.lock().unwrap();
+        let request_dir = dir.clone();
+        let request =
+            thread::spawn(move || super::super::client(&request_dir, "rpc", &save_brush()));
+        until(|| {
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire)
+                != 0
+        });
+        let old_port = connection.port;
+        let old_token = connection.token.clone();
+        let (finished, done) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(25)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(
+            lock(&dir).try_lock().is_err(),
+            "Writer admission must remain held while profile I/O is pending"
+        );
+        drop(held);
+        assert_eq!(request.join().unwrap().unwrap()["ok"], true);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        dropper.join().unwrap();
+        let next_owner = lock(&dir);
+        next_owner.try_lock().unwrap();
+        let before = fs::read(dir.join("brushes.json")).unwrap();
+        assert!(matches!(
+            ureq::post(&format!("http://127.0.0.1:{old_port}/rpc"))
+                .set("Authorization", &format!("Bearer {old_token}"))
+                .timeout(Duration::from_secs(1))
+                .send_json(save_brush()),
+            Err(ureq::Error::Transport(_))
+        ));
+        assert_eq!(fs::read(dir.join("brushes.json")).unwrap(), before);
+        drop(next_owner);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn parsed_request_cannot_start_a_candidate_after_shutdown_admission_closes() {
+        let dir = directory();
+        let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+        let connection = super::super::start(shared.clone(), dir.clone()).unwrap();
+        let requests = connection.instance_lock.as_ref().unwrap().requests.clone();
+        let mut body = serde_json::to_vec(&save_brush()).unwrap();
+        // tiny_http buffers bodies <=1024 bytes before exposing their Request.
+        body.resize(2048, b' ');
+        let mut stream = TcpStream::connect(("127.0.0.1", connection.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(stream, "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", connection.port, connection.token, body.len()).unwrap();
+        stream.write_all(&body[..1]).unwrap();
+        until(|| requests.state.lock().unwrap().running == 1);
+        let dropper = thread::spawn(move || drop(connection));
+        until(|| requests.state.lock().unwrap().stopping);
+        assert!(lock(&dir).try_lock().is_err());
+        stream.write_all(&body[1..]).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        dropper.join().unwrap();
+        assert!(!dir.join("brushes.json").exists());
+        assert!(shared.lock().unwrap().undo.is_empty());
+        let next_owner = lock(&dir);
+        next_owner.try_lock().unwrap();
+        drop(next_owner);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn update_seal_preserves_writer_admission_until_connection_quiesces() {
+        let dir = directory();
+        let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+        let connection = super::super::start(shared.clone(), dir.clone()).unwrap();
+        let workspace = crate::workspace::attach(&shared);
+        let reviewed = crate::workspace::lifecycle::update_readiness(&workspace).unwrap();
+        crate::workspace::lifecycle::finish_update_exit(&workspace, &reviewed).unwrap();
+        assert!(lock(&dir).try_lock().is_err());
+        super::super::checkpoint_projects(
+            &workspace,
+            &dir,
+            &mut super::super::RecoveryVersions::new(),
+        );
+        assert!(crate::recovery::catalog(&dir).is_empty());
+        let reply = super::super::client(&dir, "rpc", &save_brush()).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(!dir.join("brushes.json").exists());
+        drop(connection);
+        let next_owner = lock(&dir);
+        next_owner.try_lock().unwrap();
+        drop(next_owner);
+        cleanup(&dir);
+    }
+}

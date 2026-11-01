@@ -1,4 +1,5 @@
 //! Complete immutable recovery versions. No source file is used as a destination.
+mod worker;
 use crate::{engine, psd, server, workspace};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -10,6 +11,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
+pub(crate) use worker::Worker;
 
 pub const VERSIONS_PER_PROJECT: usize = 3;
 pub const MAX_PROJECTS: usize = 64;

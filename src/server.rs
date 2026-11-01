@@ -1,9 +1,11 @@
 mod fonts;
+mod instance;
 use crate::{
     engine::{self, Engine, Scope},
     psd, raster,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+pub use instance::InstanceLock;
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -52,7 +54,7 @@ pub struct Connection {
     pub port: u16,
     pub token: String,
     pub state_dir: PathBuf,
-    pub instance_lock: Option<fs::File>,
+    pub instance_lock: Option<InstanceLock>,
     pub(crate) availability: Arc<AtomicBool>,
 }
 impl Connection {
@@ -2439,8 +2441,13 @@ fn touch_http_presence(shared: &Shared, client: &str) {
 fn http_work(
     request: tiny_http::Request,
     shared: &Shared,
+    requests: &Arc<instance::Requests>,
     work: impl FnOnce(&Shared) -> Value + Send + 'static,
 ) {
+    let Some(operation) = requests.begin() else {
+        fail_http(request, 503, None, -32000, "PeerBrush workspace is closing");
+        return;
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUNNING: AtomicUsize = AtomicUsize::new(0);
     if RUNNING
@@ -2460,6 +2467,7 @@ fn http_work(
     }
     let shared = shared.clone();
     thread::spawn(move || {
+        let _operation = operation;
         struct Permit;
         impl Drop for Permit {
             fn drop(&mut self) {
@@ -2491,6 +2499,7 @@ fn decode_name_header(value: &str) -> Option<String> {
 fn handle_modern_http(
     request: tiny_http::Request,
     shared: &Shared,
+    requests: &Arc<instance::Requests>,
     mut q: Value,
     version: Option<&str>,
 ) {
@@ -2564,7 +2573,7 @@ fn handle_modern_http(
     // Identity is presentation only. One bounded presence entry covers stateless clients.
     q["_client"] = json!("http-stateless");
     touch_http_presence(shared, "http-stateless");
-    http_work(request, shared, move |shared| {
+    http_work(request, shared, requests, move |shared| {
         let mut result = if method == "server/discover" {
             json!({"jsonrpc":"2.0","id":q["id"],"result":{
                 "supportedVersions":MCP_HTTP_VERSIONS,"capabilities":{"tools":{}},
@@ -2593,6 +2602,7 @@ fn handle_http(
     auth: &str,
     port: u16,
     sessions: &mut std::collections::BTreeMap<String, HttpSession>,
+    requests: &Arc<instance::Requests>,
 ) {
     let localhost = format!("localhost:{port}");
     let loopback = format!("127.0.0.1:{port}");
@@ -2807,7 +2817,7 @@ fn handle_http(
     };
     if !is_mcp {
         // The private authenticated bridge lets stdio keep its offline handshake and reconnect.
-        http_work(request, shared, move |shared| {
+        http_work(request, shared, requests, move |shared| {
             let result = if q["method"] == "mcp" {
                 if q["params"]["request"].is_object() {
                     if q["params"]["request"].get("id").is_none() {
@@ -2905,7 +2915,7 @@ fn handle_http(
                 "Stateless HTTP clients cannot send JSON-RPC responses",
             );
         } else {
-            handle_modern_http(request, shared, q, version.as_deref());
+            handle_modern_http(request, shared, requests, q, version.as_deref());
         }
         return;
     }
@@ -3021,7 +3031,7 @@ fn handle_http(
         respond_http(request, 202, None, None);
     } else {
         q["_client"] = json!(client);
-        http_work(request, shared, move |shared| {
+        http_work(request, shared, requests, move |shared| {
             let result = mcp(shared, &q);
             touch_http_presence(shared, &client);
             result
@@ -3092,23 +3102,17 @@ pub fn start_with_preferences(
     let token = engine::id();
     let auth = format!("Bearer {token}");
     atomic_write(&state_dir.join("connection.json"),serde_json::to_string_pretty(&json!({"url":format!("http://127.0.0.1:{port}"),"token":token,"pid":std::process::id()})).unwrap().as_bytes())?;
-    let recovery_dir = state_dir.clone();
-    thread::spawn(move || {
-        let mut previous = std::collections::HashMap::new();
-        loop {
-            thread::sleep(std::time::Duration::from_secs(5));
-            checkpoint_projects(&workspace, &recovery_dir, &mut previous);
-        }
-    });
     let availability = Arc::new(AtomicBool::new(true));
-    let listening = availability.clone();
-    thread::spawn(move || {
-        let _availability = ServerAvailability(listening);
-        let mut sessions = std::collections::BTreeMap::new();
-        for request in http.incoming_requests() {
-            handle_http(request, &shared, &auth, port, &mut sessions);
-        }
-    });
+    let instance_lock = InstanceLock::start(
+        instance_lock,
+        http,
+        shared,
+        workspace,
+        state_dir.clone(),
+        auth,
+        port,
+        availability.clone(),
+    )?;
     Ok(Connection {
         port,
         token,
