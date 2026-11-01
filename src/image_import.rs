@@ -9,6 +9,8 @@ use std::{
 };
 
 mod png_rows;
+#[path = "image_import/prepared_png.rs"]
+pub(crate) mod prepared_png;
 
 pub const EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp", "jxl", "ico", "pbm", "pgm", "ppm",

@@ -1,5 +1,7 @@
 //! Bounded RGB matrix/TRC and classic LUT ICC conversion. Source samples stay in their profile;
 //! only display previews and an explicitly requested sRGB copy are converted.
+#[path = "color_profile/prepared.rs"]
+pub(crate) mod prepared;
 use moxcms::{
     ColorProfile, DataColorSpace, Layout, ProfileClass, RenderingIntent, Transform16BitExecutor,
     Transform8BitExecutor, TransformOptions,
