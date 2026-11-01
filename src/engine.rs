@@ -3,6 +3,7 @@ pub mod backed;
 pub mod native;
 pub(crate) mod reframe_scope;
 pub(crate) mod runtime_value;
+pub use runtime_value::RuntimeValue;
 pub mod scene;
 pub(crate) mod view;
 use crate::raster::{blend, check_size, Pixel, Raster};
