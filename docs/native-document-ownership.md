@@ -96,8 +96,14 @@ initial and working command scopes, and enters one history record. Foreign,
 duplicate, out-of-order or cancelled steps cannot advance the working state.
 An intermediate step receipt cannot enter history or publish independently, even
 when its first working generation still equals the public document generation.
-Superseded intermediate fragments currently remain conservatively retained;
-reachability retirement/compaction remains required before full admission.
+History preparation admits a final physical Store reachability plan. Publication
+marks only surviving fragments and returns every intermediate output view/token
+with the retired history owners. After leaving the engine mutex, the caller uses
+its retained source session to retire unreachable provisional fragments. Every
+output view/checkpoint drops before the first unique-owner abort. Escaped previews
+refuse retirement and retain exact bytes and charged debt. Cleanup failure follows
+a committed edit; it does not roll back history. Published-source retirement and
+compaction still require their complete retained-owner/marker inventory.
 
 The normalized metadata dispatcher handles layer creation, updates, deletion,
 ordering, clipping and parenting, plus mask removal, enable and link changes.
