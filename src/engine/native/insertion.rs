@@ -202,7 +202,14 @@ impl CapturedEdit {
                 .admission
                 .as_ref()
                 .ok_or("Missing fill insertion admission")?
-                .with_scopes(&self.base, descriptor.shared_scopes(), output_charge)?;
+                .with_scopes(
+                    &self.base,
+                    descriptor.shared_scopes(),
+                    output_charge,
+                    self.admission
+                        .as_ref()
+                        .is_some_and(|a| a.is_transaction_step()),
+                )?;
             let mut outputs = Vec::new();
             outputs
                 .try_reserve_exact(1)
