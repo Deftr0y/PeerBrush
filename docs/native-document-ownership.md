@@ -85,8 +85,17 @@ Prepared publication inherits the engine-derived command scopes after checking
 its actual targets. A command view exposes those exact scopes and checks a typed
 producer's baseline-to-proposed logical write box. Read halos remain independent.
 Producers must retain their actual changed-tile/write proof; semantic fill
-materialization is a distinct baseline proof. Sequential working-metadata scope
-planning for state-dependent multi-command batches remains a transaction gate.
+materialization is a distinct baseline proof.
+
+A native transaction derives each next command from the original immutable
+descriptor, recomputes its scopes against the current private working metadata,
+and retains every provisional output. Intermediate generations keep the original
+source revision and do not publish blocks or enter history. The final candidate
+advances once, retains the original document generation guard and the union of
+initial and working command scopes, and enters one history record. Foreign,
+duplicate, out-of-order or cancelled steps cannot advance the working state.
+Superseded intermediate fragments currently remain conservatively retained;
+reachability retirement/compaction remains required before full admission.
 
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,

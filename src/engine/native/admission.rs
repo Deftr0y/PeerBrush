@@ -10,6 +10,7 @@ pub(super) struct EditAdmission {
     base: DocumentKey,
     scopes: Arc<Intent>,
     descriptor: Option<Arc<CommandDescriptor>>,
+    _output_charge: Option<Arc<Reservation>>,
     _charge: Reservation,
 }
 impl NativeDocument {
@@ -148,12 +149,48 @@ impl NativeDocument {
             base: self.key(),
             scopes,
             descriptor: None,
+            _output_charge: None,
             _charge: charge,
         }));
         Ok(edit)
     }
 }
 impl EditAdmission {
+    pub(super) fn shared_descriptor(&self) -> Option<Arc<CommandDescriptor>> {
+        self.descriptor.clone()
+    }
+    pub(super) fn actor(&self) -> &str {
+        &self.actor
+    }
+    pub(super) fn with_scopes(
+        &self,
+        base: &NativeDocument,
+        scopes: Arc<Intent>,
+        output_charge: Arc<Reservation>,
+    ) -> Result<Arc<Self>> {
+        let bytes = self
+            .actor
+            .len()
+            .checked_add(std::mem::size_of::<Self>() + 128)
+            .ok_or("Native transaction admission footprint overflow")?;
+        let charge = base
+            .budget()
+            .reserve_bytes(bytes, bytes)
+            .map_err(|e| e.to_string())?;
+        let mut actor = String::new();
+        actor
+            .try_reserve_exact(self.actor.len())
+            .map_err(|_| "Native transaction actor allocation refused")?;
+        actor.push_str(&self.actor);
+        Ok(Arc::new(Self {
+            actor,
+            base: base.key(),
+            scopes,
+            descriptor: self.descriptor.clone(),
+            _output_charge: Some(output_charge),
+            _charge: charge,
+        }))
+    }
     pub(super) fn descriptor(&self) -> Option<&CommandDescriptor> {
         self.descriptor.as_deref()
     }

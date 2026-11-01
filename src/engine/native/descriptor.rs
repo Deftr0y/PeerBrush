@@ -88,6 +88,7 @@ pub(crate) struct CommandDescriptor {
     generation: DocumentKey,
     revision: u64,
     identity: DocumentKey,
+    offset: u32,
     commands: Admitted<Vec<Value>>,
     methods: Vec<Method>,
     scope_ranges: Vec<std::ops::Range<usize>>,
@@ -265,6 +266,7 @@ impl CommandDescriptor {
             generation: base.key(),
             revision,
             identity: key(),
+            offset: 0,
             commands,
             methods,
             scope_ranges,
@@ -282,7 +284,7 @@ impl CommandDescriptor {
             .map(move |(index, (parameters, method))| Command {
                 descriptor: self.identity,
                 generation: self.generation,
-                index: index as u32,
+                index: self.offset + index as u32,
                 method: *method,
                 parameters,
                 scopes: &self.scopes.scopes()[self.scope_ranges[index].clone()],
@@ -299,6 +301,26 @@ impl CommandDescriptor {
     }
     pub(super) fn identity(&self) -> DocumentKey {
         self.identity
+    }
+    /// A transaction derives the next command from the immutable original
+    /// parameters, while scopes and raster slots bind to its working generation.
+    pub(super) fn step(
+        &self,
+        working: &NativeDocument,
+        index: usize,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Arc<Self>> {
+        let command = self
+            .commands
+            .get(index)
+            .ok_or("Native transaction command is exhausted")?;
+        let mut step =
+            Self::from_normalized(working, self.revision, std::slice::from_ref(command), check)?;
+        let step_mut =
+            Arc::get_mut(&mut step).ok_or("Native step descriptor unexpectedly shared")?;
+        step_mut.identity = self.identity;
+        step_mut.offset = index as u32;
+        Ok(step)
     }
     pub(super) fn shared_scopes(&self) -> Arc<Intent> {
         self.scopes.clone()
