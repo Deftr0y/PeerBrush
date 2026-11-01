@@ -222,3 +222,27 @@ whole-file hashes cannot replace this fidelity comparison. CompletedSave36 is
 closed to generic callbacks or digest-only constructors; publication requires
 the actual scene driver to combine complete source, native and fidelity proofs
 while retaining the exact snapshot and owned PhotoshopContainer bytes.
+
+## Provisional import handoff
+
+The importer receives an already retained source handle, a pre-admitted exact
+structural index, and the caller's authenticated fresh backing session. It
+streams verified TILE bytes into that session, then builds the complete native
+surface roster without exposing editable document state. Manifest, index and
+physical-reference allocation owners remain with the provisional candidate.
+No saved path or runtime store identity grants ownership of an import session.
+
+The caller validates all supported scene semantics and prepares actual native
+rows from this exact provisional snapshot. Every standard layer, raw mask and
+current composite sample must match before qualification. The comparison is
+bound to this candidate, rather than reusable for another import with similar
+metadata. Whole source bytes, held identity and active session must be checked
+again during the final guarded adoption; a session revoked during the source
+hash pass prevents the adoption callback. The caller retains responsibility for
+file identity, lease, profile lock and final engine revision checks throughout
+that callback. Failure must preserve unsupported/read-only protection and must
+not fall through to an editable ordinary-Photoshop interpretation of broken
+recognized private sources.
+
+These closed save/import components do not activate a larger live canvas or
+claim complete editor, history, recovery or installed-profile qualification.
