@@ -44,8 +44,9 @@ and the session's registered Store owners, retaining selected checkpoints and
 FreshFragment tokens. Empty or unused fragments must be retired before sealing.
 Preparation and final publication refusals return those owners to the caller;
 cleanup releases candidate/preview/checkpoint owners before requesting registered
-fragment retirement outside the engine lock. Closing cleanup remains fail closed
-until the concrete service supplies its cleanup-only retained-instance admission.
+fragment retirement outside the engine lock. The concrete service supplies its
+cleanup-only retained-instance admission for verified retirement during closing;
+staging, sealing and publication retain the ordinary closing refusal.
 
 Prepared edits retain typed scopes. The publication path rechecks current leases,
 closed/read-only state, exact generation/revision and cancellation before marking
