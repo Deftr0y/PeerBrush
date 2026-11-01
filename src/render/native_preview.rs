@@ -13,6 +13,10 @@ use crate::{
 };
 use std::sync::Arc;
 type Result<T> = std::result::Result<T, String>;
+mod transient;
+pub(crate) use transient::{
+    preview_shared, render_prepared, Origin, SourceSupplement, TransientFrame,
+};
 
 /// Field order releases every source owner before the final session owner.
 #[derive(Clone)]
