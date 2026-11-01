@@ -1,8 +1,10 @@
 //! Original raster samples and accumulated placement are editable source data.
+pub(crate) mod geometry;
 use crate::{
     engine::{Document, Layer},
     raster::{check_size, Raster},
 };
+use geometry::exact;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -20,13 +22,6 @@ pub struct Original {
     pub warps: Vec<crate::warp::Stage>,
 }
 pub const IDENTITY: [f64; 6] = [1., 0., 0., 1., 0., 0.];
-fn exact(v: f64) -> f64 {
-    if (v - v.round()).abs() < 1e-8 {
-        v.round()
-    } else {
-        v
-    }
-}
 pub fn compose(n: [f64; 6], m: [f64; 6]) -> [f64; 6] {
     let [a, b, c, d, x, y] = m;
     let [e, f, g, h, u, v] = n;
@@ -55,24 +50,15 @@ impl Original {
         }
         check_size(self.pixels.width, self.pixels.height)?;
         self.pixels.validate_layout()?;
-        let [a, b, c, d, _, _] = self.matrix;
-        if self.pixels.depth != depth
-            || self.matrix.iter().any(|v| !v.is_finite() || v.abs() > 1e8)
-            || (a * d - b * c).abs() < 1e-12
-        {
-            return Err("Invalid retained transform source or placement".into());
-        }
-        if !self.warps.is_empty() {
-            self.prepared()?.bounds(self.support())?;
-        } else if self.projective.is_some() {
-            self.placement()?.bounds([
-                0.,
-                0.,
-                self.pixels.width as f64,
-                self.pixels.height as f64,
-            ])?;
-        }
-        Ok(())
+        geometry::validate(
+            self.pixels.width,
+            self.pixels.height,
+            self.pixels.depth,
+            depth,
+            self.matrix,
+            self.projective,
+            &self.warps,
+        )
     }
     fn support(&self) -> [f64; 4] {
         [
@@ -94,11 +80,7 @@ impl Original {
             .bounds(self.support())
     }
     pub(crate) fn placement(&self) -> Result<crate::projective::Map, String> {
-        let affine = crate::projective::Map::affine_matrix(self.matrix);
-        self.projective
-            .map(crate::projective::Map::from_matrix)
-            .transpose()?
-            .map_or(Ok(affine), |p| affine.compose(p))
+        geometry::placement(self.matrix, self.projective)
     }
     fn prepend(&mut self, delta: crate::projective::Map) -> Result<(), String> {
         let map = delta.compose(self.placement()?)?;
