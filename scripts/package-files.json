@@ -485,6 +485,7 @@
     "src/smudge/native.rs",
     "src/source.rs",
     "src/source/prepared.rs",
+    "src/source/native_svg.rs",
     "src/source/prepared/shape.rs",
     "src/source/prepared/tests.rs",
     "src/source/prepared/text.rs",

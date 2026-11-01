@@ -6,6 +6,8 @@ use crate::{
 use ab_glyph::{point, Font, FontArc, FontRef, PxScale, ScaleFont};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[path = "source/native_svg.rs"]
+mod native_svg;
 #[path = "source/prepared.rs"]
 pub(crate) mod prepared;
 mod shaping;

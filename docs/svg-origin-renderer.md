@@ -141,3 +141,35 @@ its existing supported limits. Full 16000-square resource/performance tests,
 source-bound tile-band staging, native8/16 editor/history/save/reopen/recovery and
 cross-platform qualification remain mandatory before live adoption or any cap
 increase.
+
+## Native source staging (unreleased)
+
+`source::stage::render_captured` supplies the actual captured native edit's pure
+cancellation token to the row plan. Source/session checks stay outside the
+synchronous renderer and repeat before and after bands, during real tile writes
+and at output sealing. The earlier staging entry refuses SVG without this token;
+analytic and text generation retain their existing regional route.
+
+SVG uses the existing intrinsic scale followed by its source matrix, rendering
+directly in full logical output coordinates. This preserves `svg::render`;
+rendering an untransformed base and then applying a raster affine sampler would
+produce different pixels. Row pixels use the original demultiply operation and
+native16 byte-times257 uplift before entering the standard tile writer.
+
+Each full-width band is rendered once. A native tile-row frontier retains at
+most16000×256×8 =32,768,000 bytes, under its actual resident reservation, while
+the existing writer consumes horizontal tiles in order. Edge padding is cleared,
+band geometry and complete consumption are checked, and final output uses the
+existing registered `OutputDraft` seal and verified retirement handling. The
+frontier grants no source or publication authority and holds no output-file pins.
+
+The staging policy explicitly admits16MiB retained renderer state,16384 total
+geometry/scan invocations and one billion cumulative work units; row temporaries
+retain their separate128MiB admission. Existing parser/source/index reservations,
+the frontier and the tile scratch also remain charged. An exhausted pool or
+operation refuses; it never substitutes transparent pixels or bypasses a quota.
+These are bounded allocation contracts, not whole-application RAM or throughput
+measurements. Dense native8/16 transformed source-session staging, cancellation
+and inventory tests require execution on the final integrated candidate. Guarded
+runtime caller integration, full16000-square acceptance and every existing
+document-limit gate remain open until that evidence qualifies them.

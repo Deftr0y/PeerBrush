@@ -2,7 +2,7 @@
 //! remain guarded by the captured Native batch at final Engine adoption.
 use super::prepared::PreparedSource;
 use crate::{
-    engine::native::{NativeDocument, OutputDraft, StagedOutput},
+    engine::native::{Cancellation, NativeDocument, OutputDraft, StagedOutput},
     large_document::{Error, FreshFragment, ScratchBytes, TileSpec},
     raster::{
         backed::{Plane, Region},
@@ -16,6 +16,40 @@ use std::collections::BTreeMap;
 #[path = "stage_tests.rs"]
 mod tests;
 
+/// Renderer output only. This private adapter cannot publish or grant source
+/// authority. The common actual tile writer owns all provisional file handling.
+pub(super) trait TileProducer {
+    fn fill_tile(
+        &mut self,
+        tx: u32,
+        ty: u32,
+        tile: &mut [u8],
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String>;
+    fn complete(&self) -> Result<(), String>;
+}
+
+/// SVG kernel work requires the real captured edit's pure cancellation token.
+/// Session/source callbacks stay outside the synchronous renderer boundary.
+pub(crate) fn render_captured(
+    source: &PreparedSource<'_>,
+    frame: [u32; 2],
+    depth: u16,
+    base: &NativeDocument,
+    session: &SourceSession,
+    cancellation: &Cancellation,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<StagedOutput, String> {
+    cancellation.check()?;
+    if source.svg_plan().is_some() {
+        return super::native_svg::render(source, frame, depth, base, session, cancellation, check);
+    }
+    render_inner(source, frame, depth, base, session, None, &mut || {
+        cancellation.check()?;
+        check()
+    })
+}
+
 /// No file is published here. Seal under the same document/session while the
 /// proposal index ticket remains held; only Engine may adopt an atomic batch.
 pub(crate) fn render(
@@ -26,8 +60,25 @@ pub(crate) fn render(
     session: &SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<StagedOutput, String> {
+    if source.svg_plan().is_some() {
+        return Err("SVG staging requires its captured native cancellation token".into());
+    }
+    render_inner(source, frame, depth, base, session, None, check)
+}
+pub(super) fn render_inner(
+    source: &PreparedSource<'_>,
+    frame: [u32; 2],
+    depth: u16,
+    base: &NativeDocument,
+    session: &SourceSession,
+    mut producer: Option<&mut dyn TileProducer>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<StagedOutput, String> {
     session.check()?;
     check()?;
+    if source.svg_plan().is_some() != producer.is_some() {
+        return Err("SVG staging must consume its captured complete-band producer".into());
+    }
     let pool = session.resident();
     if !source.uses_budget(&pool)
         || !base.budget().same_pool(&pool)
@@ -67,25 +118,30 @@ pub(crate) fn render(
                 let top = ty * TILE;
                 let right = (left + TILE).min(frame[0]);
                 let bottom = (top + TILE).min(frame[1]);
-                let columns = (right - left).min(source.region_pixels() as u32);
-                let rows = (source.region_pixels() / columns as usize).clamp(1, 32) as u32;
-                for y in (top..bottom).step_by(rows as usize) {
-                    for x in (left..right).step_by(columns as usize) {
-                        let end = (y + rows).min(bottom);
-                        let end_x = (x + columns).min(right);
-                        let region = Region::new([x as i32, y as i32, end_x as i32, end as i32])
-                            .map_err(|e| e.to_string())?;
-                        let pixels =
-                            source.render_region(frame, region, depth, &pool, &mut guarded)?;
-                        for (row, bytes) in pixels
-                            .bytes()
-                            .chunks_exact((end_x - x) as usize * stride)
-                            .enumerate()
-                        {
-                            let at = (((y - top) as usize + row) * TILE as usize
-                                + (x - left) as usize)
-                                * stride;
-                            tile[at..at + bytes.len()].copy_from_slice(bytes);
+                if let Some(producer) = producer.as_deref_mut() {
+                    producer.fill_tile(tx, ty, &mut tile, &mut guarded)?;
+                } else {
+                    let columns = (right - left).min(source.region_pixels() as u32);
+                    let rows = (source.region_pixels() / columns as usize).clamp(1, 32) as u32;
+                    for y in (top..bottom).step_by(rows as usize) {
+                        for x in (left..right).step_by(columns as usize) {
+                            let end = (y + rows).min(bottom);
+                            let end_x = (x + columns).min(right);
+                            let region =
+                                Region::new([x as i32, y as i32, end_x as i32, end as i32])
+                                    .map_err(|e| e.to_string())?;
+                            let pixels =
+                                source.render_region(frame, region, depth, &pool, &mut guarded)?;
+                            for (row, bytes) in pixels
+                                .bytes()
+                                .chunks_exact((end_x - x) as usize * stride)
+                                .enumerate()
+                            {
+                                let at = (((y - top) as usize + row) * TILE as usize
+                                    + (x - left) as usize)
+                                    * stride;
+                                tile[at..at + bytes.len()].copy_from_slice(bytes);
+                            }
                         }
                     }
                 }
@@ -111,6 +167,9 @@ pub(crate) fn render(
                 #[cfg(test)]
                 tests::observe_completed_tile();
             }
+        }
+        if let Some(producer) = producer.as_deref() {
+            producer.complete()?;
         }
         guarded()?;
         let surface = if let Some(held) = fragment.as_ref() {

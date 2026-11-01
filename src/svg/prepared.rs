@@ -22,6 +22,12 @@ pub(crate) struct PreparedSvg {
     _charge: Reservation,
 }
 impl PreparedSvg {
+    pub(crate) fn tree(&self) -> &usvg::Tree {
+        &self.tree
+    }
+    pub(crate) fn intrinsic(&self) -> [u32; 2] {
+        self.intrinsic
+    }
     pub(crate) fn new(
         markup: &str,
         intrinsic: [u32; 2],
