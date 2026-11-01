@@ -6,12 +6,15 @@
 mod access;
 mod budget;
 mod disk;
+mod linear;
 mod planar;
+mod scalar;
 mod store;
 
 pub use budget::{Reservation, ResidentBudget};
 pub use disk::{DiskBudget, DiskReservation};
 pub use planar::{CompletedPlanar, PlanarRole, PlanarScratch, PlanarSpec};
+pub use scalar::{CompletedScalar, ScalarScratch, ScalarSpec};
 pub use store::{
     BlockRef, CommitRef, Limits, PinnedBytes, PinnedTile, ScratchBytes, Snapshot, Store, TileSpec,
 };
