@@ -21,8 +21,11 @@ mod segments;
 mod staging;
 pub(crate) use segments::{SessionJxlOutput, SessionSegmentLog, SessionSegments};
 pub(crate) use staging::{SessionBytes, SessionTemporary};
+#[path = "source_runtime/checkpoints.rs"]
+mod checkpoints;
 #[path = "source_runtime/recovery_marker.rs"]
 mod recovery_marker;
+pub(crate) use checkpoints::CheckpointCensus;
 pub(crate) use recovery_marker::{NativeMarker, NativeMarkerIds};
 
 pub(crate) struct Limits {
@@ -102,6 +105,7 @@ struct Inventory {
     locations: BTreeMap<[u8; 16], Location>,
     lineages: BTreeMap<[u8; 16], [u8; 16]>,
     staging: BTreeMap<[u8; 16], staging::Location>,
+    checkpoints: checkpoints::Registry,
     directories: usize,
     // Payload/index/path allocations above must drop before their accounting.
     _charges: Vec<Reservation>,
@@ -186,6 +190,7 @@ impl SourceRuntime {
             );
             remaining -= count;
         }
+        let checkpoints = checkpoints::Registry::new(self.limits.max_files)?;
         let owner_path = directory.path().join("owner.pbr");
         let mut owner = match fs::symlink_metadata(&owner_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -266,6 +271,7 @@ impl SourceRuntime {
             locations: BTreeMap::new(),
             lineages: BTreeMap::new(),
             staging: BTreeMap::new(),
+            checkpoints,
             directories: 0,
             _charges: charges,
         };

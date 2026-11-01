@@ -20,6 +20,13 @@ impl NativeMarkerIds {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct MarkerIdentity {
+    pub(super) snapshot: [u8; 16],
+    pub(super) identity: (u64, u64),
+    pub(super) bytes: u64,
+    pub(super) modified: std::time::SystemTime,
+}
 pub(crate) struct NativeMarker<'a> {
     session: &'a SourceSession,
     snapshot: [u8; 16],
@@ -30,6 +37,60 @@ pub(crate) struct NativeMarker<'a> {
     modified: std::time::SystemTime,
 }
 impl NativeMarker<'_> {
+    pub(super) fn check_session(&self, session: &SourceSession) -> Result<(), String> {
+        if !std::ptr::eq(self.session, session) {
+            return Err("Checkpoint marker belongs to another operation".into());
+        }
+        self.check()
+    }
+    pub(super) fn verify_digest(
+        &mut self,
+        expected: [u8; 32],
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<MarkerIdentity, String> {
+        check()?;
+        self.check()?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Cannot inspect checkpoint marker")?;
+        let mut scratch = crate::large_document::ScratchBytes::new(
+            &self.session.resident(),
+            64 * 1024,
+            64 * 1024,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut remaining = self.bytes;
+        while remaining != 0 {
+            check()?;
+            self.check()?;
+            let count = remaining.min(scratch.len() as u64) as usize;
+            self.file
+                .read_exact(&mut scratch[..count])
+                .map_err(|_| "Checkpoint marker is truncated")?;
+            hash.update(&scratch[..count]);
+            remaining -= count as u64;
+        }
+        let mut extra = [0];
+        if self
+            .file
+            .read(&mut extra)
+            .map_err(|_| "Checkpoint final read failed")?
+            != 0
+            || hash.finish().as_ref() != expected
+        {
+            return Err("Checkpoint complete SHA or EOF differs; roots retained".into());
+        }
+        check()?;
+        self.check()?;
+        Ok(MarkerIdentity {
+            snapshot: self.snapshot,
+            identity: self.identity,
+            bytes: self.bytes,
+            modified: self.modified,
+        })
+    }
+
     pub(crate) fn snapshot(&self) -> [u8; 16] {
         self.snapshot
     }
@@ -257,5 +318,43 @@ impl SourceSession {
         };
         marker.check()?;
         Ok(marker)
+    }
+}
+
+#[cfg(test)]
+impl SourceSession {
+    /// Fault injection through the actual owned writer, never a production API.
+    pub(crate) fn corrupt_checkpoint_for_test(
+        &self,
+        id: [u8; 16],
+        offset: u64,
+    ) -> Result<(), String> {
+        self.check()?;
+        let path = self
+            .directory
+            .join(format!("recovery-v3-{}.pbr", uuid::Uuid::from_bytes(id)));
+        let state = self.runtime.inventory.lock().unwrap();
+        let held = state
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .find(|held| held.path == path)
+            .ok_or("Missing test marker")?;
+        if offset >= held.bytes {
+            return Err("Test offset exceeds marker".into());
+        }
+        let mut file = &held.file;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        let mut byte = [0];
+        file.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        byte[0] ^= 0x55;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        file.write_all(&byte).map_err(|e| e.to_string())?;
+        file.set_times(std::fs::FileTimes::new().set_modified(held.modified))
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
