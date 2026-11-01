@@ -999,12 +999,12 @@ impl PeerBrush {
         self.last_preview = None;
         true
     }
-    fn free_transform_stale(&self, doc: &Document) -> bool {
+    fn free_transform_stale<'a>(&self, doc: impl Into<DocumentView<'a>>) -> bool {
+        let doc = doc.into();
         self.free_transform.as_ref().is_some_and(|editor| {
-            editor.document != doc.id
-                || editor.revision != doc.revision
-                || editor.roots
-                    != crate::tree::roots(doc, &self.selection_layers.iter().cloned().collect())
+            editor.document != doc.id()
+                || editor.revision != doc.revision()
+                || editor.roots != crate::tree::roots_view(doc, &self.selection_layers)
                 || editor.mask != self.mask
                 || editor.step != self.mask_step
         })
@@ -1121,7 +1121,12 @@ impl PeerBrush {
             self.last_preview = None;
         }
     }
-    pub(super) fn sync_free_transform(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn sync_free_transform<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         let lost = ctx.input(|i| {
             !i.focused
                 || i.events
@@ -1146,7 +1151,12 @@ impl PeerBrush {
             self.message="Free Transform cancelled after focus, target or source changed; current work is preserved.".into();
         }
     }
-    pub(super) fn free_transform_keys(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn free_transform_keys<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         self.sync_free_transform(ctx, doc);
         let mut fresh_escape = false;
         ctx.input(|input| {
@@ -1218,10 +1228,10 @@ impl PeerBrush {
             }
         }
     }
-    pub(super) fn free_transform_canvas(
+    pub(super) fn free_transform_canvas<'a>(
         &mut self,
         ui: &mut egui::Ui,
-        doc: &Document,
+        doc: impl Into<DocumentView<'a>>,
         rect: Rect,
         scale: f32,
         available: Rect,
@@ -1418,10 +1428,10 @@ impl PeerBrush {
         }
         self.free_transform = Some(editor);
     }
-    pub(super) fn free_transform_window(
+    pub(super) fn free_transform_window<'a>(
         &mut self,
         ctx: &egui::Context,
-        doc: &Document,
+        doc: impl Into<DocumentView<'a>>,
         drawn_generation: u64,
     ) {
         self.sync_free_transform(ctx, doc);
