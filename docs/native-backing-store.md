@@ -152,3 +152,25 @@ Drop preserves conservative accounting; directories are not recursively removed.
 Application startup/session admission, authoritative surface migration, durable
 recovery markers, source-store retirement and compatible profile backup still
 need their actual callers and native qualification before larger documents open.
+
+## Exact derived scalar fields
+
+`ScalarScratch` and `CompletedScalar` represent one finite f64 component in
+canonical big-endian row order. They are distinct from the strict four-channel
+native8/16 planar types. A scalar file has its own header and hash domains and
+cannot become a Source36 raster or recovery authority. Geometry is local to the
+captured producer frame; placement remains part of the external stage binding.
+
+The producer appends complete sequential rows, then finishes with its stage SHA.
+`value_sha256` is the pure SHA256 of the emitted BE f64 values, allowing comparison
+with an independent full-emission token. The separate seal binds geometry, type,
+role, stage, ordered chunk hashes and the index. Nonfinite or partial samples are
+rejected. Exact bits, including negative zero and finite subnormal values, remain
+unchanged.
+
+Full-row reads retain the explicit 256-row and 64 MiB allocation limits. Rectangle
+reads admit at most 128 KiPixel and 256 rows, verify every intersecting 64 KiB
+chunk, and use the same shared resident pool. Field files remain fully charged in
+the operation's shared disk quota until verified retirement; the disposable
+512 MiB image-cache limit cannot account for a 2.048 GB field. The opt-in scalar
+test qualifies storage and readback, not the effects producer, editor or total RAM.
