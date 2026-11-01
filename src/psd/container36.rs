@@ -824,6 +824,36 @@ mod tests {
                         &check,
                     )
                     .unwrap();
+                let owned_index = std::sync::Arc::new(parsed.clone());
+                let movable = crate::psd::read36::verify(
+                    &source,
+                    &owned_index,
+                    digest(&output),
+                    &restored,
+                    crate::psd::read36::VerificationLimits {
+                        bulk: limits(),
+                        native_streams: 5,
+                    },
+                    &mut entries,
+                    &mut counters,
+                    &mut scratch,
+                    &check,
+                    |_| Ok(()),
+                )
+                .unwrap()
+                .own_index(owned_index.clone())
+                .unwrap();
+                let reopened = manifest36::inflate(
+                    &mut &bytes[4..],
+                    (bytes.len() - 4) as u64,
+                    metadata(),
+                    limits(),
+                    &check,
+                )
+                .unwrap();
+                let (_, binding) = reopened.into_source_parts();
+                movable.recheck(&binding, &mut scratch, &check).unwrap();
+                assert!(std::ptr::eq(movable.index(), owned_index.as_ref()));
                 assert!(source_proof
                     .check(&source, &parsed.clone(), &restored, digest(&output), &check)
                     .is_err());

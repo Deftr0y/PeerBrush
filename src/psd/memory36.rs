@@ -183,6 +183,16 @@ impl<T> Admitted<T> {
     pub(crate) fn owner(&self) -> &Arc<MetadataCharge> {
         &self.owner
     }
+    /// Transfer an already admitted side allocation into the same payload
+    /// lifetime. No payload clone, new reservation or uncharged extraction.
+    pub(crate) fn retain_owner(
+        mut self,
+        owner: &Arc<MetadataCharge>,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        self.owner = MetadataCharge::combine(&[self.owner.clone(), owner.clone()], check)?;
+        Ok(self)
+    }
     /// The closure's new allocations must fit the already-reserved typed/candidate
     /// envelope. The owner travels through errors and the successful handoff.
     pub(crate) fn map_unique<U>(
@@ -360,6 +370,23 @@ mod tests {
         drop(b);
         assert_eq!(pool.used(), 0);
         assert_eq!(other.used(), 0);
+    }
+    #[test]
+    fn admitted_side_owner_transfer_preserves_exact_payload_and_both_existing_charges() {
+        let check = || Ok(());
+        let pool = ResidentBudget::new(1024 * 1024).unwrap();
+        let a = MetadataCharge::reserve(&pool, 65536, &check).unwrap();
+        let b = MetadataCharge::reserve(&pool, 32768, &check).unwrap();
+        let payload = Admitted::from_parts(Arc::new(vec![1u8, 2, 3]), a.clone());
+        let pointer = payload.as_ptr();
+        let payload = payload.retain_owner(&b, &check).unwrap();
+        assert_eq!(payload.as_ptr(), pointer);
+        assert_eq!(payload.owner().bytes(), 98304);
+        drop(a);
+        drop(b);
+        assert_eq!(pool.used(), 98304);
+        drop(payload);
+        assert_eq!(pool.used(), 0);
     }
     #[test]
     fn typed_handoff_keeps_owners_and_refuses_foreign_pools_and_unadmitted_byte_sources() {

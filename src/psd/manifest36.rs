@@ -575,6 +575,27 @@ impl<T> Manifest<T> {
     pub(super) fn into_metadata(self) -> T {
         self.core.wire.metadata
     }
+    /// Split only while the caller carries the original Admitted owner with
+    /// BOTH moved results. This header has no metadata/editability authority.
+    pub(super) fn into_source_parts(self) -> (T, SourceBinding) {
+        let metadata = self.core.wire.metadata;
+        (
+            metadata,
+            SourceBinding {
+                core: self.core.sha256,
+                rasters: self.core.rasters,
+                tiles: self.core.wire.tiles,
+                references: self.core.wire.references,
+                tile_root: self.core.tile_root,
+                reference_root: self.core.reference_root,
+                chunks: self.chunks,
+                layer_bytes: self.standard_layer_bytes,
+                composite_bytes: self.standard_composite_bytes,
+                standard: self.standard_sha256,
+                origin: self.origin,
+            },
+        )
+    }
     pub(crate) fn verify_standard<L: Read, C: Read>(
         &self,
         layer: &mut L,
@@ -602,6 +623,41 @@ impl<T> Manifest<T> {
     }
 }
 
+/// Immutable original byte bindings after typed metadata moves into a
+/// provisional SceneSnapshot. No serializer or bare editable payload escape.
+pub(crate) struct SourceBinding {
+    core: Digest,
+    rasters: Vec<RasterSpec>,
+    tiles: u32,
+    references: u32,
+    tile_root: Digest,
+    reference_root: Digest,
+    chunks: Vec<Descriptor>,
+    layer_bytes: u64,
+    composite_bytes: u64,
+    standard: Digest,
+    origin: Option<(u64, Digest)>,
+}
+impl SourceBinding {
+    pub(crate) fn plan(&self) -> BulkPlan<'_> {
+        BulkPlan {
+            core: self.core,
+            rasters: &self.rasters,
+            tiles: self.tiles,
+            references: self.references,
+            tile_root: self.tile_root,
+            reference_root: self.reference_root,
+            chunks: &self.chunks,
+        }
+    }
+    pub(crate) fn origin(&self) -> Option<(u64, Digest)> {
+        self.origin
+    }
+    pub(crate) fn core_sha256(&self) -> Digest {
+        self.core
+    }
+}
+
 /// A byte/hash observation only. Native row completions, typed DTO/metadata,
 /// composite freshness and final source/lease publication checks remain required.
 #[must_use = "Standard binding must be combined with all source and native stream proofs"]
@@ -619,6 +675,16 @@ impl CompletedStandard {
             || self.sha256 != manifest.standard_sha256
         {
             return Err("Source36 standard completion belongs to another manifest".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn check_binding(&self, binding: &SourceBinding) -> Result<(), String> {
+        if self.core != binding.core
+            || self.layer_bytes != binding.layer_bytes
+            || self.composite_bytes != binding.composite_bytes
+            || self.sha256 != binding.standard
+        {
+            return Err("Source36 standard completion belongs to another retained binding".into());
         }
         Ok(())
     }
