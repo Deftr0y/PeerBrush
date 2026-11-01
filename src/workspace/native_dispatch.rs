@@ -1,5 +1,6 @@
 //! Capture the configured workspace service without retaining an engine or
 //! registry lock. Actual source admission and I/O happen only after capture.
+use super::source_runtime::SourceReadSession;
 use super::{
     source_runtime::{SourceRuntime, SourceSession},
     *,
@@ -58,6 +59,19 @@ pub(crate) fn begin_scene(shared: &Shared, scene: &SceneSnapshot) -> Result<Sour
     // session for a project replaced or closed while that admission was running.
     validate_scene(shared, scene)?;
     session.check()?;
+    Ok(session)
+}
+/// Display-only capture preserves blank/health profile absence. It has no source
+/// mutation API; nonzero physical sources retain ordinary inventory admission.
+pub(crate) fn begin_read_scene(
+    shared: &Shared,
+    scene: &SceneSnapshot,
+) -> Result<SourceReadSession, String> {
+    let runtime = runtime_for(shared)?;
+    validate_scene(shared, scene)?;
+    let session = runtime.begin_read(scene)?;
+    validate_scene(shared, scene)?;
+    session.check_scene(scene)?;
     Ok(session)
 }
 fn validate_scene(shared: &Shared, scene: &SceneSnapshot) -> Result<(), String> {

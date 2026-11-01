@@ -21,6 +21,8 @@ mod segments;
 mod staging;
 pub(crate) use segments::{SessionJxlOutput, SessionSegmentLog, SessionSegments};
 pub(crate) use staging::{SessionBytes, SessionTemporary};
+mod read_session;
+pub(crate) use read_session::SourceReadSession;
 #[path = "source_runtime/checkpoints.rs"]
 mod checkpoints;
 #[path = "source_runtime/recovery_marker.rs"]
@@ -937,6 +939,129 @@ mod tests {
                 manifest_bytes: 1024 * 1024,
             },
         }
+    }
+    #[test]
+    fn three_zero_native_read_frames_keep_default_data_absent_and_source_permits_bounded() {
+        use crate::engine::{
+            native::NativeDocument,
+            scene::{SceneIdentity, SceneSnapshot},
+        };
+        let f = Fixture::new();
+        let profile =
+            crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).unwrap();
+        let (shared, connection) = f.connection();
+        let context =
+            PersistentRootContext::from_profile(&connection, profile.source_profile().unwrap())
+                .unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let document =
+            NativeDocument::new_blank(7, 5, 16, &runtime.resident(), &runtime.disk(), &|| Ok(()))
+                .unwrap();
+        let scene = Arc::new(
+            SceneSnapshot::from_native(
+                SceneIdentity {
+                    project_id: shared.lock().unwrap().project_id.clone(),
+                    document_id: document.metadata().id().into(),
+                    revision: document.metadata().revision(),
+                },
+                document.clone(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let workspace = crate::workspace::attach(&shared);
+        let baseline = runtime.resident().used();
+        assert!(!f.locations().data.exists());
+        let guard = runtime.begin_read(&scene).unwrap();
+        let other =
+            NativeDocument::new_blank(7, 5, 16, &runtime.resident(), &runtime.disk(), &|| Ok(()))
+                .unwrap();
+        let other_scene = SceneSnapshot::from_native(
+            SceneIdentity {
+                project_id: scene.identity().project_id.clone(),
+                document_id: other.metadata().id().into(),
+                revision: other.metadata().revision(),
+            },
+            other.clone(),
+            Vec::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(guard.check_scene(&other_scene).is_err());
+        drop((guard, other_scene, other));
+        assert_eq!(runtime.resident().used(), baseline);
+        let refused = runtime
+            .resident()
+            .reserve_bytes(
+                runtime.resident().limit() - baseline - 512,
+                runtime.resident().limit(),
+            )
+            .unwrap();
+        assert!(runtime.begin_read(&scene).is_err());
+        drop(refused);
+        assert!(!f.locations().data.exists());
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            0
+        );
+        for _ in 0..3 {
+            let guard = runtime.begin_read(&scene).unwrap();
+            assert!(
+                workspace
+                    .lock()
+                    .unwrap()
+                    .file_operations
+                    .load(Ordering::Acquire)
+                    > 0
+            );
+            assert_eq!(runtime.resident().used(), baseline + 1024);
+            let request = crate::render::native_preview::Request::capture(
+                scene.clone(),
+                guard,
+                None,
+                7,
+                None,
+                false,
+            )
+            .unwrap();
+            let frame = request.render(&mut || Ok(())).unwrap();
+            assert!(frame
+                .stripes()
+                .iter()
+                .all(|stripe| stripe.bytes().iter().all(|byte| *byte == 0)));
+            drop((request, frame));
+            assert_eq!(runtime.resident().used(), baseline);
+            assert_eq!(
+                workspace
+                    .lock()
+                    .unwrap()
+                    .file_operations
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert!(!f.locations().data.exists());
+        }
+        drop((scene, document));
+        assert_eq!(runtime.disk().used().unwrap(), 0);
+        assert_eq!(runtime.resident().used(), 0);
+        assert!(runtime.inventory.lock().unwrap().is_none());
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!f.locations().data.exists());
+        drop((runtime, context, profile, connection));
     }
     #[test]
     fn actual_default_profile_is_lazy_persistent_and_keeps_the_exact_lease() {
