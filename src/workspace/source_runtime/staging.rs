@@ -240,6 +240,20 @@ impl<'a> SessionTemporary<'a> {
     }
 }
 impl SessionBytes<'_> {
+    #[cfg(test)]
+    pub(crate) fn test_corrupt_payload(
+        &self,
+        session: &SourceSession,
+        offset: u64,
+        bytes: &[u8],
+        restore_modified: bool,
+    ) -> Result<(), String> {
+        self.check_session(session)?;
+        self.bytes
+            .test_corrupt_payload(offset, bytes, restore_modified)
+            .map_err(|e| e.to_string())?;
+        self.namespace.check()
+    }
     pub(crate) fn check_session(&self, session: &SourceSession) -> Result<(), String> {
         if !std::ptr::eq(self.namespace.session, session) {
             return Err("Operation spool belongs to another source operation".into());

@@ -30,6 +30,32 @@ no header/index/seal payload. A successful exact-spool finish additionally reads
 its complete `encoded_bytes` (header, payload, frozen index and seal). These
 ceilings bound requested native file reads, without credit for filesystem cache.
 
+The broker keeps four original 64 KiB payload chunks in a charged 256 KiB LRU.
+Each miss loads a complete original chunk through the sealed source's frozen
+index and charges that exact authenticated read before I/O. A hit still checks
+the actual source session, file owner, stage nonce, source SHA and exact
+configuration/transport binding. The cache accepts no caller pixel arrays,
+converted samples or encoded replies. A changed source admission or failed
+replacement latches refusal; an incomplete replacement never becomes a hit.
+Fresh whole-source hashes before/after encoding and replay bypass this cache.
+
+This prevents narrow rows from reading the same complete authenticated chunk
+once per row. It does not raise either work ceiling: every logical rectangle
+still counts against `8*raw_bytes+32MiB`, and actual chunk misses and fresh proof
+reads count against `64*raw_bytes+256MiB`. Those are bounded implementation
+policies, not qualification of every geometry, effort or dense 16000 export.
+The original frozen source index has its own retained source admission.
+
+Wire subwindows use at most 2048 by 2000 native RGBA pixels. At 16 bits the
+window occupies 32768000 bytes. Four cache chunks, three 64 KiB transport/
+segment/verifier buffers, one 16 KiB row, 4 KiB cache headers and the existing
+64 KiB worker header admission total at most 33312768 bytes, below the unchanged
+33554432-byte parent envelope. The cache's buffers and charge owners also travel
+in the retained child resources: uncertain stop cannot release them before a
+known owned-child exit. The autonomous retained-child reaper drops those owners
+after verified exit, including while the profile is closing. No cache grants
+fresh I/O or source authority during retention. This is not total process RAM.
+
 The log independently counts every child event, including Ready, rectangle
 requests/releases and zero-byte controls. Its event ceiling is the protocol's
 checked `4*max_records + 4*ceil(raw_bytes/65536) + 64`, at most 1048576. DATA is

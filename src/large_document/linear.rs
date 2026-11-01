@@ -485,6 +485,34 @@ pub(super) struct Complete {
     pub(super) budget: ResidentBudget,
 }
 impl Complete {
+    #[cfg(test)]
+    pub(super) fn test_corrupt_payload(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+        restore_modified: bool,
+    ) -> Result<()> {
+        self.owned.check()?;
+        if bytes.is_empty()
+            || bytes.len() > 4096
+            || offset
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|end| end > self.spec.payload_bytes())
+        {
+            return Err(Error::Invalid("Test corruption exceeds sealed payload"));
+        }
+        let modified = self.owned.file.metadata()?.modified()?;
+        write_all_at(&self.owned.file, HEADER + offset, bytes)?;
+        self.owned.file.sync_all()?;
+        if restore_modified {
+            self.owned
+                .file
+                .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        }
+        // Deliberately retain the original stamp and immutable chunk index.
+        // No path or write handle escapes, even in the test executable.
+        self.owned.check_identity()
+    }
     pub fn uses_budgets(&self, resident: &ResidentBudget, disk: &DiskBudget) -> bool {
         self.budget.same_pool(resident) && self.owned.disk.uses_budget(disk)
     }

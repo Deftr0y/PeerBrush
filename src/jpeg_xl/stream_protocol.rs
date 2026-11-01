@@ -8,8 +8,8 @@ use std::io::{self, Read, Write};
 pub(crate) type Digest = [u8; 32];
 pub(crate) const BUFFER_BYTES: usize = 64 * 1024;
 /// Leaves room inside the parent32MiB callback envelope for transport, completed
-/// segment, source-verification and short row buffers, with no raw-file cache.
-pub(crate) const WINDOW_ROWS: usize = 2032;
+/// segment, source-verification, original-chunk cache, headers and short rows.
+pub(crate) const WINDOW_ROWS: usize = 2000;
 pub(crate) const MAX_RECT_BYTES: u64 = 2048 * 2048 * 8;
 pub(crate) const MAX_HELD_BYTES: u32 = 128 * 1024 * 1024;
 pub(crate) const MAX_HELD_BUFFERS: u16 = 8;

@@ -7,6 +7,7 @@ mod process_limits;
 mod stream_native;
 pub(crate) mod stream_parent;
 pub(crate) mod stream_protocol;
+mod stream_chunks;
 pub use native::{Decoded, Info, Options, Pixels, PixelsRef, ENCODED_LIMIT};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -42,6 +43,7 @@ struct RetainedWorker {
 struct ChildResources {
     charges: Vec<crate::large_document::Reservation>,
     _headers: crate::large_document::Reservation,
+    _original_chunks: Option<Arc<Mutex<stream_chunks::OriginalChunks>>>,
 }
 static RETAINED: Mutex<Option<RetainedWorker>> = Mutex::new(None);
 static RETAINED_WAKE: Condvar = Condvar::new();
