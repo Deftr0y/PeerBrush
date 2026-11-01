@@ -171,3 +171,14 @@ observation. That observation binds the complete manifest and header, not merely
 the core hash. A sealed owned file, current render/metadata fidelity, source lease
 and final publication checks are still required. A failed replay never grants
 completion; its partially written owned candidate must be retired explicitly.
+
+Source verification consumes the exact indexed PBR1 compressed range, retaining
+its completed encoded SHA observation through typed conversion. It checks that
+resource again, the full global Pb36 set, the strong original standard binding,
+every native layer/mask channel and the single merged planar stream. Every row
+reader must finish its checksum/end validation. Whole-source SHA and length
+observations bracket this work. The resulting opaque token is tied to the exact
+borrowed source/index and complete manifest proofs; row counts cannot construct
+it. A separate whole-source recheck precedes handoff, alongside the caller's file
+identity/lease and engine revision checks. Stream validity still does not prove
+that a styled layer or merged composite equals the current typed scene render.
