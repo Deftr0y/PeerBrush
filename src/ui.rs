@@ -60,7 +60,7 @@ mod view;
 mod workspace_tests;
 use crate::{controls, thumbnails};
 use crate::{
-    engine::Document,
+    engine::{view::DocumentView, Document},
     raster::Pixel,
     server::{self, Connection, Shared},
 };
@@ -1149,11 +1149,11 @@ impl PeerBrush {
             }
         });
     }
-    fn selected_layer_ids(&self, doc: &Document) -> Vec<String> {
-        doc.layers
-            .iter()
-            .filter(|l| self.selection_layers.contains(&l.id))
-            .map(|l| l.id.clone())
+    fn selected_layer_ids<'a>(&self, doc: impl Into<DocumentView<'a>>) -> Vec<String> {
+        let doc = doc.into();
+        doc.layers()
+            .filter(|l| self.selection_layers.contains(l.id()))
+            .map(|l| l.id().to_owned())
             .collect()
     }
     fn copy_request(
@@ -1194,7 +1194,8 @@ impl PeerBrush {
             })
         }
     }
-    fn create_folder(&mut self, doc: &Document) {
+    fn create_folder<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         if self.busy {
             return;
         }
@@ -1203,15 +1204,15 @@ impl PeerBrush {
         let ids = self.selected_layer_ids(doc);
         let result = {
             let mut engine = self.shared.lock().unwrap();
-            if engine.doc.id != doc.id {
+            if crate::engine::view::current(&engine).id() != doc.id() {
                 Err("The document changed before grouping layers".into())
-            } else if engine.doc.revision != doc.revision {
+            } else if crate::engine::view::current(&engine).revision() != doc.revision() {
                 Err("The project revision changed before grouping layers".into())
             } else {
                 engine.edit(
                     "human",
                     &[json!({"op":"group.create_selected","layers":ids,"name":"Folder"})],
-                    Some(doc.revision),
+                    Some(doc.revision()),
                     None,
                     "Group selected layers",
                 )
@@ -1234,21 +1235,26 @@ impl PeerBrush {
             Err(error) => self.message = error,
         }
     }
-    fn selection_points(&self, doc: &Document, rect: Rect, scale: f32) -> Vec<Pos2> {
+    fn selection_points<'a>(
+        &self,
+        doc: impl Into<DocumentView<'a>>,
+        rect: Rect,
+        scale: f32,
+    ) -> Vec<Pos2> {
+        let doc = doc.into();
         let preview = self
             .canvas_selection
             .as_ref()
-            .filter(|p| p.document == doc.id && p.revision == doc.revision);
-        let (bounds, polygon) = preview
-            .map_or((doc.selection, doc.selection_polygon.as_ref()), |p| {
-                (p.bounds, p.polygon.as_ref())
-            });
+            .filter(|p| p.document == doc.id() && p.revision == doc.revision());
+        let (bounds, polygon) = preview.map_or((doc.selection(), doc.selection_polygon()), |p| {
+            (p.bounds, p.polygon.as_deref())
+        });
         let Some(bounds) = bounds else {
             return vec![];
         };
         let corners;
         let points = if let Some(polygon) = polygon {
-            polygon.as_slice()
+            polygon
         } else {
             corners = [
                 [bounds[0] as f32, bounds[1] as f32],
@@ -1263,14 +1269,15 @@ impl PeerBrush {
             .map(|p| self.view.point(*p, rect, scale))
             .collect()
     }
-    fn duplicate_layers(&mut self, doc: &Document) {
+    fn duplicate_layers<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         let ids = self.selected_layer_ids(doc);
         let result = {
             let mut e = self.shared.lock().unwrap();
             e.edit(
                 "human",
                 &[json!({"op":"layer.duplicate","layers":ids})],
-                Some(doc.revision),
+                Some(doc.revision()),
                 None,
                 "Duplicate layers",
             )
@@ -1282,7 +1289,7 @@ impl PeerBrush {
                     .filter_map(Value::as_str)
                     .map(str::to_string)
                     .collect::<HashSet<_>>();
-                crate::tree::roots(&e.doc, &created)
+                crate::tree::roots_view(crate::engine::view::current(&e), &created)
             })
         };
         match result {
@@ -1298,12 +1305,13 @@ impl PeerBrush {
             Err(e) => self.message = e,
         }
     }
-    fn duplicate_selection(&mut self, doc: &Document) {
+    fn duplicate_selection<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         self.close_proposal();
         let result = self.shared.lock().unwrap().edit(
             "human",
-            &[json!({"op":"layer.duplicate_selection","layer":self.selected,"document_id":doc.id,"source_revision":doc.revision})],
-            Some(doc.revision), None, "Duplicate layer selection",
+            &[json!({"op":"layer.duplicate_selection","layer":self.selected,"document_id":doc.id(),"source_revision":doc.revision()})],
+            Some(doc.revision()), None, "Duplicate layer selection",
         );
         match result {
             Ok(result) => {
@@ -1658,24 +1666,24 @@ impl PeerBrush {
             .join(" ");
         // Client presence belongs to the live MCP handshake, never to a setup result.
     }
-    fn merge_layers(&mut self, ctx: &egui::Context, doc: &Document) {
+    fn merge_layers<'a>(&mut self, ctx: &egui::Context, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         if self.busy {
             return;
         }
         self.close_proposal();
         self.finish_parameter(true);
         let mut ids = doc
-            .layers
-            .iter()
-            .filter(|l| self.selection_layers.contains(&l.id))
-            .map(|l| l.id.clone())
+            .layers()
+            .filter(|l| self.selection_layers.contains(l.id()))
+            .map(|l| l.id().to_owned())
             .collect::<Vec<_>>();
         if ids.is_empty() {
             ids.push(self.selected.clone());
         }
-        let document = doc.id.clone();
+        let document = doc.id().to_owned();
         let project = self.project_id.clone();
-        let revision = doc.revision;
+        let revision = doc.revision();
         let shared = self.shared.clone();
         let tx = self.merge_tx.clone();
         let ctx = ctx.clone();
@@ -2968,23 +2976,24 @@ impl PeerBrush {
             }
         });
     }
-    fn add_selected_masks(&mut self, doc: &Document) {
+    fn add_selected_masks<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         let mut ids = self.selected_layer_ids(doc);
         if !ids.contains(&self.selected) {
             ids.push(self.selected.clone());
         }
-        let commands: Vec<_> = doc
-            .layers
-            .iter()
-            .filter(|layer| ids.contains(&layer.id) && layer.mask.is_none())
-            .map(|layer| json!({"op":"mask.add","layer":layer.id,"value":255,"document_id":doc.id,"source_revision":doc.revision}))
+        let commands: Vec<_> = doc.layers()
+            .filter(|layer| ids.iter().any(|id|id==layer.id()) && layer.mask().is_none())
+            .map(|layer| json!({"op":"mask.add","layer":layer.id(),"value":255,"document_id":doc.id(),"source_revision":doc.revision()}))
             .collect();
         let result = {
             let mut engine = self.shared.lock().unwrap();
-            if engine.doc.id != doc.id || engine.doc.revision != doc.revision {
+            if crate::engine::view::current(&engine).id() != doc.id()
+                || crate::engine::view::current(&engine).revision() != doc.revision()
+            {
                 Err("The document changed before adding masks".into())
             } else {
-                engine.edit("human", &commands, Some(doc.revision), None, "Add masks")
+                engine.edit("human", &commands, Some(doc.revision()), None, "Add masks")
             }
         };
         match result {
@@ -2997,7 +3006,13 @@ impl PeerBrush {
             Err(error) => self.message = error,
         }
     }
-    fn channel_tabs(&mut self, ui: &mut egui::Ui, doc: &Document, has_mask: bool) {
+    fn channel_tabs<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: impl Into<DocumentView<'a>>,
+        has_mask: bool,
+    ) {
+        let doc = doc.into();
         ui.spacing_mut().item_spacing.x = 0.0;
         let color = ui.add(
             egui::Button::new("Color")
@@ -3016,7 +3031,7 @@ impl PeerBrush {
             self.select_channel(false);
         }
         let mask = ui.add_enabled(
-            has_mask || !doc.read_only,
+            has_mask || !doc.read_only(),
             egui::Button::new(if has_mask { "Mask" } else { "Add mask" })
                 .selected(self.mask && has_mask)
                 .corner_radius(egui::CornerRadius {
@@ -3038,7 +3053,7 @@ impl PeerBrush {
         }
         mask.on_hover_text(if has_mask {
             "Edit mask"
-        } else if doc.selection.is_some() {
+        } else if doc.selection().is_some() {
             "Create masks from the selection for selected layers that do not have one"
         } else {
             "Create white masks for selected layers that do not have one"

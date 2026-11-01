@@ -8,6 +8,51 @@ pub(crate) enum DocumentView<'a> {
     Resident(&'a Document),
     Native(&'a native::NativeDocument),
 }
+/// An immutable frame owner. Native snapshots share the admitted source and
+/// metadata owners; creating or cloning one never materializes raster pixels.
+#[derive(Clone)]
+pub(crate) enum DocumentSnapshot {
+    Resident(std::sync::Arc<Document>),
+    Native(native::NativeDocument),
+}
+impl DocumentSnapshot {
+    pub(crate) fn view(&self) -> DocumentView<'_> {
+        match self {
+            Self::Resident(doc) => DocumentView::Resident(doc),
+            Self::Native(doc) => DocumentView::Native(doc),
+        }
+    }
+}
+impl From<Document> for DocumentSnapshot {
+    fn from(doc: Document) -> Self {
+        Self::Resident(std::sync::Arc::new(doc))
+    }
+}
+impl From<native::NativeDocument> for DocumentSnapshot {
+    fn from(doc: native::NativeDocument) -> Self {
+        Self::Native(doc)
+    }
+}
+impl<'a> From<&'a Document> for DocumentView<'a> {
+    fn from(doc: &'a Document) -> Self {
+        Self::Resident(doc)
+    }
+}
+impl<'a> From<&'a native::NativeDocument> for DocumentView<'a> {
+    fn from(doc: &'a native::NativeDocument) -> Self {
+        Self::Native(doc)
+    }
+}
+impl<'a> From<&'a DocumentSnapshot> for DocumentView<'a> {
+    fn from(doc: &'a DocumentSnapshot) -> Self {
+        doc.view()
+    }
+}
+impl<'a> From<&'a Layer> for LayerView<'a> {
+    fn from(layer: &'a Layer) -> Self {
+        Self::Resident(layer)
+    }
+}
 /// The active engine still has resident authority until the coordinated switch.
 pub(crate) fn current(engine: &Engine) -> DocumentView<'_> {
     DocumentView::Resident(&engine.doc)
@@ -117,6 +162,9 @@ impl<'a> DocumentView<'a> {
             Self::Resident(doc) => doc.layers.get(index).map(LayerView::Resident),
             Self::Native(doc) => doc.metadata().layer(index).map(LayerView::Native),
         }
+    }
+    pub(crate) fn find_layer(self, id: &str) -> Option<LayerView<'a>> {
+        self.layers().find(|layer| layer.id() == id)
     }
     pub(crate) fn layers(self) -> Layers<'a> {
         Layers {
