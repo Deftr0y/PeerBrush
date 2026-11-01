@@ -2554,35 +2554,82 @@ fn respond_http(
     let _ = request.respond(response);
 }
 
+struct CheckedResponse<R, C> {
+    reader: R,
+    check: C,
+    _header: Option<crate::large_document::Reservation>,
+}
+impl<R: Read, C: Fn() -> Result<(), String>> Read for CheckedResponse<R, C> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        (self.check)().map_err(std::io::Error::other)?;
+        self.reader.read(bytes)
+    }
+}
+#[cfg(test)]
 fn owned_response(body: reply::OwnedReply) -> Result<tiny_http::ResponseBox, String> {
+    owned_response_checked(body, || Ok(()))
+}
+fn owned_response_checked(
+    body: reply::OwnedReply,
+    check: impl Fn() -> Result<(), String> + Send + 'static,
+) -> Result<tiny_http::ResponseBox, String> {
+    check()?;
+    let header = body
+        .response_pool()
+        .map(|pool| pool.reserve_bytes(4096, 4096).map_err(|e| e.to_string()))
+        .transpose()?;
     let headers = vec![
         tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap(),
         tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
     ];
     let response = if body.admitted() {
-        let bytes = body.serialized(&mut || Ok(()))?;
+        let bytes = body.serialized(&mut || check())?;
         let length = bytes.len();
+        let reader = CheckedResponse {
+            reader: bytes.reader(),
+            check,
+            _header: header,
+        };
         tiny_http::Response::new(
             tiny_http::StatusCode(200),
             headers,
-            bytes.reader(),
+            reader,
             Some(length),
             None,
         )
         .boxed()
     } else {
         let bytes = serde_json::to_vec(&body).map_err(|_| "Response serialization failed")?;
-        tiny_http::Response::from_data(bytes)
-            .with_header(headers[0].clone())
-            .with_header(headers[1].clone())
-            .boxed()
+        check()?;
+        let length = bytes.len();
+        let reader = CheckedResponse {
+            reader: std::io::Cursor::new(bytes),
+            check,
+            _header: header,
+        };
+        tiny_http::Response::new(
+            tiny_http::StatusCode(200),
+            headers,
+            reader,
+            Some(length),
+            None,
+        )
+        .boxed()
     };
     // The private adapter validates an exact Content-Length before forwarding.
     // tiny_http otherwise switches a known large body to chunks at 32 KiB.
     Ok(response.with_chunked_threshold(512 * 1024 * 1024 + 1))
 }
+#[cfg(test)]
 fn respond_owned(request: tiny_http::Request, body: reply::OwnedReply) {
-    match owned_response(body) {
+    respond_owned_checked(request, body, || Ok(()))
+}
+fn respond_owned_checked(
+    request: tiny_http::Request,
+    body: reply::OwnedReply,
+    check: impl Fn() -> Result<(), String> + Send + 'static,
+) {
+    match owned_response_checked(body, check) {
         Ok(response) => {
             let _ = request.respond(response);
         }
@@ -2648,7 +2695,7 @@ fn http_work(
     }
     let shared = shared.clone();
     thread::spawn(move || {
-        let _operation = operation;
+        let _operation = Arc::new(operation);
         struct Permit;
         impl Drop for Permit {
             fn drop(&mut self) {
@@ -2657,7 +2704,9 @@ fn http_work(
         }
         let _permit = Permit;
         let result = work(&shared);
-        respond_owned(request, result);
+        drop(shared);
+        let response_operation = _operation.clone();
+        respond_owned_checked(request, result, move || response_operation.check());
     });
 }
 

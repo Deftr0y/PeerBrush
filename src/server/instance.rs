@@ -22,6 +22,37 @@ pub(super) struct Requests {
 
 pub(super) struct Request(Arc<Requests>);
 
+impl Request {
+    pub(super) fn check(&self) -> Result<(), String> {
+        if self.0.stopping() {
+            Err("PeerBrush workspace is closing".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_checks {
+    use super::*;
+    #[test]
+    fn closing_check_refuses_progress_without_releasing_the_drain_guard() {
+        let requests = Arc::new(Requests::default());
+        let request = requests.begin().unwrap();
+        assert!(request.check().is_ok());
+        requests.stop();
+        assert_eq!(
+            request.check().unwrap_err(),
+            "PeerBrush workspace is closing"
+        );
+        assert_eq!(requests.state.lock().unwrap().running, 1);
+        assert!(requests.begin().is_none());
+        drop(request);
+        assert_eq!(requests.state.lock().unwrap().running, 0);
+        requests.drain();
+    }
+}
+
 impl Requests {
     fn stopping(&self) -> bool {
         self.state

@@ -182,6 +182,9 @@ impl OwnedReply {
     pub(super) fn admitted(&self) -> bool {
         self.admission.pool.is_some()
     }
+    pub(super) fn response_pool(&self) -> Option<&ResidentBudget> {
+        self.admission.pool.as_ref()
+    }
     pub(super) fn ordered_rpc(mut self) -> Result<Self, String> {
         if self.value.get("id").is_none() || self.value["jsonrpc"] != "2.0" {
             return Err("Private MCP stream requires a JSON-RPC reply".into());
