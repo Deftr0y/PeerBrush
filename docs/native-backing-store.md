@@ -82,6 +82,13 @@ provisional until the complete call succeeds, including its final integrity and
 ownership checks. A loader must build a pending document and commit it only after
 all native blocks, metadata and source/revision guards succeed.
 
+`Store::snapshot` selects a retained checkpoint through an existing held owner,
+so another tab can recover without acquiring a second exclusive file lock. It
+checks the complete selected prefix and record boundaries without advancing the
+owner's publication head. Unknown tails remain held; embedded record-like pixel
+bytes cannot become checkpoint authority. `Store::identity` is only a lineage
+identifier for source keys, not filesystem authority or permission to skip pins.
+
 Source-store compaction/retirement, profile upgrades, global retained-owner
 accounting, actual power-loss acceptance and the integration with self-contained
 standard PSD/PSB saves are not provided by this primitive. The opt-in multi-layer
