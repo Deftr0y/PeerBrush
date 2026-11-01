@@ -116,9 +116,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/registry/src
             target
-          key: peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py') }}
-          restore-keys: |
-            peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-
+          key: peerbrush-build-v2-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ steps.compiler.outputs.native }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py', 'scripts/jxl_build.py', 'vendor/cmake/**', 'vendor/jpegxl-src/**') }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
       - run: cargo fmt --all -- --check

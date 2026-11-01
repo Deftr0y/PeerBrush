@@ -680,8 +680,8 @@ exit $LASTEXITCODE
         self.assertEqual(text.count('actions/cache/save@' + pin), 2)
         self.assertNotIn('actions/cache@', text)
         self.assertIn('        id: cargo_cache\n', restore_block)
-        self.assertIn("key: peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py') }}", restore_block)
-        self.assertIn('restore-keys: |\n            peerbrush-build-v1-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-\n', restore_block)
+        self.assertIn("key: peerbrush-build-v2-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ steps.compiler.outputs.native }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py', 'scripts/jxl_build.py', 'vendor/cmake/**', 'vendor/jpegxl-src/**') }}\n", restore_block)
+        self.assertNotIn('restore-keys:', restore_block, 'A fallback must not mix compiled native tools or recipes')
         paths = ['~/.cargo/registry/index', '~/.cargo/registry/cache', '~/.cargo/registry/src', 'target']
         for block in [restore_block, save_block]:
             actual = re.search(r'(?m)^          path: \|\n((?:            [^\n]+\n)+)', block)
