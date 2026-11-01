@@ -1,0 +1,29 @@
+# Native document ownership
+
+`engine::native::NativeDocument` is an immutable owner of typed Source36 metadata
+and an admitted, shared source roster. It does not replace the live engine's
+resident document yet. Current canvas admission limits remain active.
+
+Clones share the same metadata allocation and its charge. The roster has a
+separate lifetime admission, so sharing it with a new header never depends on a
+retired header ticket. Raster slots are opaque and bound to the exact immutable
+document generation. Reading a slot returns a Surface; source I/O still requires
+explicit fallible preparation outside engine/root/registry locks.
+
+The metadata projection exposes borrowed values instead of Arc payloads. Its
+serialization emits metadata only. NativeDocument itself has no serde or Deref
+implementation. A consumer cannot sample backed pixels through a legacy getter.
+
+The initial visibility operation prepares a fresh deep metadata copy after
+measuring its bounded wire bytes and admitting parser/typed storage. It compares
+the copied serialization before changing the requested value. The resulting
+header owns its fresh admission and does not inherit old header credits. Its
+unchanged source roster remains shared. Final adoption checks the exact base
+generation, revision, document identity, read-only state and cancellation without
+I/O or callbacks.
+
+This is the data preparation boundary. Engine actor/reservation enforcement,
+history publication, complete source mutation/renumbering, native operators,
+recovery and coordinated live document replacement must be connected and tested
+before enabling larger documents. The metadata-copy path is conservative; it is
+not a performance or total application RAM qualification.
