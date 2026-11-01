@@ -394,6 +394,10 @@ precision!(
 /// spatial style expansion and adjustment backdrops have already been prepared.
 pub(crate) trait PreparedLayers<P: Precision> {
     fn scene(&self) -> &SceneSnapshot;
+    /// Derived backdrops belong to the same isolated tree as the final plan.
+    fn target(&self) -> Option<&str> {
+        None
+    }
     fn has_colour(&self, layer: usize) -> bool;
     fn colour(&self, layer: usize, x: i32, y: i32) -> Result<P::Pixel>;
     fn source(&self, layer: usize, x: i32, y: i32) -> Result<P::Pixel>;
@@ -404,12 +408,28 @@ pub(crate) trait PreparedLayers<P: Precision> {
 /// work rather than falling back to an unprepared legacy full-image cache.
 pub(crate) struct RawLayers<'a> {
     scene: &'a SceneSnapshot,
+    target: Option<&'a str>,
     sources: Vec<Option<SurfaceRegion>>,
     _index: Reservation,
 }
 impl<'a> RawLayers<'a> {
     pub(crate) fn prepare(
         scene: &'a SceneSnapshot,
+        region: Region,
+        check: &mut dyn FnMut() -> crate::large_document::Result<()>,
+    ) -> Result<Self> {
+        Self::prepare_inner(scene, None, region, check)
+    }
+    pub(crate) fn for_topology(
+        topology: &Topology<'a>,
+        region: Region,
+        check: &mut dyn FnMut() -> crate::large_document::Result<()>,
+    ) -> Result<Self> {
+        Self::prepare_inner(topology.scene, Some(topology), region, check)
+    }
+    fn prepare_inner(
+        scene: &'a SceneSnapshot,
+        topology: Option<&Topology<'a>>,
         region: Region,
         check: &mut dyn FnMut() -> crate::large_document::Result<()>,
     ) -> Result<Self> {
@@ -428,8 +448,12 @@ impl<'a> RawLayers<'a> {
             .try_reserve_exact(layers.len())
             .map_err(|_| "Regional source index allocation refused")?;
         let [l, t, r, b] = region.bounds();
-        for layer in layers {
+        for (index, layer) in layers.enumerate() {
             check().map_err(|e| e.to_string())?;
+            if topology.is_some_and(|topology| !topology.active[index]) {
+                sources.push(None);
+                continue;
+            }
             if layer.mask().is_some_and(|mask| mask.enabled())
                 || layer
                     .effects()
@@ -467,6 +491,7 @@ impl<'a> RawLayers<'a> {
         check().map_err(|e| e.to_string())?;
         Ok(Self {
             scene,
+            target: topology.and_then(Topology::target),
             sources,
             _index: charge,
         })
@@ -509,7 +534,10 @@ pub(crate) mod tests {
     pub(super) fn capture(doc: &Document) -> (SceneSnapshot, std::path::PathBuf) {
         capture_kind(doc, false)
     }
-    pub(crate) fn capture_kind(doc: &Document, native: bool) -> (SceneSnapshot, std::path::PathBuf) {
+    pub(crate) fn capture_kind(
+        doc: &Document,
+        native: bool,
+    ) -> (SceneSnapshot, std::path::PathBuf) {
         let budget = ResidentBudget::new(32 * 1024 * 1024).unwrap();
         let disk = DiskBudget::new(128 * 1024 * 1024, 16).unwrap();
         let path = std::fs::canonicalize(std::env::temp_dir())
@@ -787,6 +815,9 @@ impl<P: Precision> PreparedLayers<P> for RawLayers<'_> {
     fn scene(&self) -> &SceneSnapshot {
         self.scene
     }
+    fn target(&self) -> Option<&str> {
+        self.target
+    }
     fn has_colour(&self, _: usize) -> bool {
         false
     }
@@ -819,6 +850,8 @@ enum Kind {
 pub(crate) struct Topology<'a> {
     scene: &'a SceneSnapshot,
     layers: Vec<LayerMetadata<'a>>,
+    active: Vec<bool>,
+    root: Option<usize>,
     groups: Vec<Vec<usize>>,
     parent_group: Vec<usize>,
     group_owner: Vec<Option<usize>>,
@@ -828,7 +861,19 @@ pub(crate) struct Topology<'a> {
 }
 impl<'a> Topology<'a> {
     pub(crate) fn new(scene: &'a SceneSnapshot) -> Result<std::sync::Arc<Self>> {
+        Self::for_target(scene, None)
+    }
+    pub(crate) fn target(&self) -> Option<&'a str> {
+        self.root.map(|root| self.layers[root].id())
+    }
+    pub(crate) fn for_target(
+        scene: &'a SceneSnapshot,
+        target: Option<&str>,
+    ) -> Result<std::sync::Arc<Self>> {
         let doc = scene.metadata();
+        if target.is_some() && doc.read_only() {
+            return Err("Protected documents cannot isolate editable source trees".into());
+        }
         let budget = scene.budget();
         let count = doc.layers().len();
         if count > 4096 {
@@ -846,10 +891,19 @@ impl<'a> Topology<'a> {
             .try_reserve_exact(count)
             .map_err(|_| "Composition layer index allocation refused")?;
         layers.extend(doc.layers());
-        let mut ids = HashMap::with_capacity(count);
-        let mut parents = HashMap::with_capacity(count + 1);
+        let mut ids = HashMap::new();
+        ids.try_reserve(count)
+            .map_err(|_| "Composition identity index allocation refused")?;
+        let mut parents = HashMap::new();
+        parents
+            .try_reserve(count + 1)
+            .map_err(|_| "Composition folder index allocation refused")?;
         parents.insert(None, 0);
-        let mut group_owner = vec![None];
+        let mut group_owner = Vec::new();
+        group_owner
+            .try_reserve_exact(count + 1)
+            .map_err(|_| "Composition folder owners allocation refused")?;
+        group_owner.push(None);
         for (i, layer) in layers.iter().enumerate() {
             if ids.insert(layer.id(), i).is_some() || layer.id().is_empty() {
                 return Err("Duplicate or empty regional layer identity".into());
@@ -869,13 +923,62 @@ impl<'a> Topology<'a> {
                 group_owner.push(Some(i));
             }
         }
-        let mut groups = vec![Vec::new(); group_owner.len()];
-        let mut parent_group = Vec::with_capacity(count);
-        let mut kinds = Vec::with_capacity(count);
-        let mut clips = vec![Vec::new(); count];
+        let root = target
+            .map(|target| ids.get(target).copied().ok_or("Export layer is missing"))
+            .transpose()?;
+        if let Some(root) = root {
+            if layers[root].kind() == "adjustment" {
+                return Err("An adjustment export requires its backdrop".into());
+            }
+            if layers[root].clip_to().is_some() {
+                return Err("A clipped export requires its base inside a folder".into());
+            }
+        }
+        let mut active = Vec::new();
+        active
+            .try_reserve_exact(count)
+            .map_err(|_| "Composition tree membership allocation refused")?;
+        for (index, layer) in layers.iter().enumerate() {
+            let mut kept = root.is_none() || root == Some(index);
+            let mut parent = layer.parent();
+            let mut depth = 0;
+            while let Some(id) = parent {
+                depth += 1;
+                if depth > 16 || id == layer.id() {
+                    return Err("Cyclic or too-deep regional hierarchy".into());
+                }
+                let owner = *ids.get(id).ok_or("Unknown regional ancestor")?;
+                kept |= root == Some(owner);
+                parent = layers[owner].parent();
+            }
+            active.push(kept);
+        }
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(group_owner.len())
+            .map_err(|_| "Composition groups allocation refused")?;
+        groups.resize_with(group_owner.len(), Vec::new);
+        let mut parent_group = Vec::new();
+        parent_group
+            .try_reserve_exact(count)
+            .map_err(|_| "Composition parent index allocation refused")?;
+        let mut kinds = Vec::new();
+        kinds
+            .try_reserve_exact(count)
+            .map_err(|_| "Composition layer kinds allocation refused")?;
+        let mut clips = Vec::new();
+        clips
+            .try_reserve_exact(count)
+            .map_err(|_| "Composition clipping index allocation refused")?;
+        clips.resize_with(count, Vec::new);
         for (i, layer) in layers.iter().enumerate() {
+            let parent = if root == Some(i) {
+                None
+            } else {
+                layer.parent()
+            };
             let group = *parents
-                .get(&layer.parent())
+                .get(&parent)
                 .ok_or("Unknown regional parent folder")?;
             parent_group.push(group);
             let mut parent = layer.parent();
@@ -914,10 +1017,19 @@ impl<'a> Topology<'a> {
                 if b.id() != id || b.kind() == "adjustment" || b.blend() == "pass_through" {
                     return Err("Regional clipping base is inconsistent".into());
                 }
-                if layer.visible() {
+                if active[i] && !active[base] {
+                    return Err("Export folder has a clipping reference outside its tree".into());
+                }
+                if active[i] && layer.visible() {
+                    clips[base]
+                        .try_reserve(1)
+                        .map_err(|_| "Composition clipping members allocation refused")?;
                     clips[base].push(i);
                 }
-            } else if layer.visible() {
+            } else if active[i] && (layer.visible() || root == Some(i)) {
+                groups[group]
+                    .try_reserve(1)
+                    .map_err(|_| "Composition group members allocation refused")?;
                 groups[group].push(i);
             }
         }
@@ -930,6 +1042,8 @@ impl<'a> Topology<'a> {
         Ok(std::sync::Arc::new(Self {
             scene,
             layers,
+            active,
+            root,
             groups,
             parent_group,
             group_owner,
@@ -961,13 +1075,17 @@ impl<'a, P: Precision, S: PreparedLayers<P>> Plan<'a, P, S> {
         if !std::ptr::eq(topology.scene, prepared.scene()) {
             return Err("Regional provider belongs to another captured scene".into());
         }
+        if topology.target() != prepared.target() {
+            return Err("Regional provider belongs to another isolated tree".into());
+        }
         if topology.scene.metadata().depth() != P::DEPTH {
             return Err("Regional compositor precision differs from captured native depth".into());
         }
         for (i, layer) in topology.layers.iter().enumerate() {
-            if layer
-                .effects()
-                .any(|effect| effect.enabled() && effect.weight() > 0.0)
+            if topology.active[i]
+                && layer
+                    .effects()
+                    .any(|effect| effect.enabled() && effect.weight() > 0.0)
                 && !prepared.has_colour(i)
             {
                 return Err("Enabled regional effects have no prepared native output".into());
