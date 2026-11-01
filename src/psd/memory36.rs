@@ -183,6 +183,10 @@ impl<T> Admitted<T> {
     pub(crate) fn owner(&self) -> &Arc<MetadataCharge> {
         &self.owner
     }
+    /// Observation only; map_unique still performs the actual fallible unwrap.
+    pub(crate) fn is_unique(&self) -> bool {
+        Arc::strong_count(&self.value) == 1
+    }
     /// Transfer an already admitted side allocation into the same payload
     /// lifetime. No payload clone, new reservation or uncharged extraction.
     pub(crate) fn retain_owner(
@@ -263,6 +267,21 @@ impl Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admitted_payload_uniqueness_observes_clones_without_detaching_charge() {
+        let pool = ResidentBudget::new(1024).unwrap();
+        let charge = MetadataCharge::reserve(&pool, 64, &|| Ok(())).unwrap();
+        let value = Admitted::from_parts(Arc::new(7u32), charge);
+        assert!(value.is_unique());
+        let shared = value.clone();
+        assert!(!value.is_unique());
+        assert!(!shared.is_unique());
+        assert_eq!(pool.used(), 64);
+        drop(shared);
+        assert!(value.is_unique());
+        drop(value);
+        assert_eq!(pool.used(), 0);
+    }
     fn limits() -> Limits {
         Limits {
             bytes: 4096,
