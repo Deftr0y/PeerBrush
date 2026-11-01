@@ -2,6 +2,42 @@
 use crate::{engine::Document, psd};
 use serde::Serialize;
 use std::collections::HashMap;
+mod native;
+
+/// A native report retains its allocation admission through review and response
+/// serialization. It cannot be converted into an uncharged owned report.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct PreparedReport {
+    report: SaveReport,
+    #[serde(skip)]
+    _admission: Option<crate::large_document::Reservation>,
+}
+impl PreparedReport {
+    pub(crate) fn data(&self) -> &SaveReport {
+        &self.report
+    }
+}
+impl From<SaveReport> for PreparedReport {
+    fn from(report: SaveReport) -> Self {
+        Self {
+            report,
+            _admission: None,
+        }
+    }
+}
+pub(crate) fn report_snapshot(
+    snapshot: &crate::engine::view::DocumentSnapshot,
+) -> Result<PreparedReport, String> {
+    match snapshot {
+        crate::engine::view::DocumentSnapshot::Resident(document) => {
+            report(document).map(Into::into)
+        }
+        crate::engine::view::DocumentSnapshot::Native(document) => {
+            native::report(document, &|| Ok(()))
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

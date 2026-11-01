@@ -248,6 +248,8 @@
     "src/color_profile/prepared/display.rs",
     "src/color_profile/prepared/display/tests.rs",
     "src/compatibility.rs",
+    "src/compatibility/native.rs",
+    "src/compatibility/native/tests.rs",
     "src/compositor.rs",
     "src/compositor/native.rs",
     "src/compositor/region.rs",
