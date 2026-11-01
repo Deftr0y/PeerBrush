@@ -13,7 +13,7 @@ use std::{
     io::Write,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 
@@ -21,8 +21,8 @@ use std::{
 pub struct DocumentKey([u8; 16]);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RasterSlot {
-    document: DocumentKey,
-    ordinal: u32,
+    pub(super) document: DocumentKey,
+    pub(super) ordinal: u32,
 }
 
 struct Core {
@@ -31,6 +31,7 @@ struct Core {
     resident: ResidentBudget,
     disk: DiskBudget,
     key: DocumentKey,
+    render_key: OnceLock<[u8; 32]>,
 }
 struct OwnedRoster {
     roster: RasterRoster,
@@ -68,6 +69,7 @@ impl NativeDocument {
                 resident,
                 disk,
                 key: key(),
+                render_key: OnceLock::new(),
             })
         })?;
         Ok(Self { core })
@@ -76,13 +78,24 @@ impl NativeDocument {
         self.core.key
     }
     pub fn metadata(&self) -> Metadata<'_> {
-        Metadata(&self.core.metadata)
+        Metadata(&self.core.metadata, self.key())
     }
     pub fn budget(&self) -> &ResidentBudget {
         &self.core.resident
     }
     pub fn disk_budget(&self) -> &DiskBudget {
         &self.core.disk
+    }
+    pub(super) fn roster(&self) -> &RasterRoster {
+        &self.core.roster.roster
+    }
+    pub fn render_key(&self) -> Result<[u8; 32]> {
+        if let Some(key) = self.core.render_key.get() {
+            return Ok(*key);
+        }
+        let key = super::scene::hash_metadata(&self.metadata(), self.roster())?;
+        let _ = self.core.render_key.set(key);
+        Ok(key)
     }
     pub fn layer_slot(&self, layer: &str) -> Result<RasterSlot> {
         let layer = self
@@ -101,14 +114,7 @@ impl NativeDocument {
         if slot.document != self.key() {
             return Err("Native raster slot belongs to another immutable document".into());
         }
-        let mut found = None;
-        self.core.metadata.visit_rasters(|reference| {
-            if reference.id == slot.ordinal {
-                found = Some(self.core.roster.roster.get(reference)?);
-            }
-            Ok(())
-        })?;
-        found.ok_or_else(|| "Missing native raster slot".into())
+        self.core.roster.roster.ordinal(slot.ordinal)
     }
     pub fn raster_slot(&self, reference: &RasterRef36) -> Result<RasterSlot> {
         self.core.roster.roster.get(reference)?;
@@ -142,19 +148,33 @@ impl NativeDocument {
         Ok(prepared.candidate)
     }
 }
-fn key() -> DocumentKey {
+pub(super) fn key() -> DocumentKey {
     DocumentKey(*uuid::Uuid::new_v4().as_bytes())
 }
 
 /// Read-only metadata projection. Large Arc payloads cannot escape this view.
 /// Serializing the projection emits metadata only and performs no source I/O.
-pub struct Metadata<'a>(&'a Document36);
+#[derive(Clone, Copy)]
+pub struct Metadata<'a>(&'a Document36, DocumentKey);
 impl Serialize for Metadata<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
     }
 }
 impl Metadata<'_> {
+    pub(super) fn from_wire(wire: &Document36, key: DocumentKey) -> Metadata<'_> {
+        Metadata(wire, key)
+    }
+    pub fn binding(&self) -> DocumentKey {
+        self.1
+    }
+    pub fn visit_rasters(
+        &self,
+        mut visit: impl FnMut(RasterMetadata<'_>) -> Result<()>,
+    ) -> Result<usize> {
+        self.0
+            .visit_rasters(|reference| visit(RasterMetadata(reference, self.1)))
+    }
     pub fn id(&self) -> &str {
         &self.0.id
     }
@@ -195,19 +215,26 @@ impl Metadata<'_> {
         self.0.selection_polygon.as_deref()
     }
     pub fn selection_coverage(&self) -> Option<CoverageMetadata<'_>> {
-        self.0.selection_coverage.as_ref().map(CoverageMetadata)
+        self.0
+            .selection_coverage
+            .as_ref()
+            .map(|c| CoverageMetadata(c, self.1))
     }
     pub fn selection_previous(&self) -> Option<CoverageMetadata<'_>> {
-        self.0.selection_previous.as_ref().map(CoverageMetadata)
+        self.0
+            .selection_previous
+            .as_ref()
+            .map(|c| CoverageMetadata(c, self.1))
     }
     pub fn layers(&self) -> impl ExactSizeIterator<Item = LayerMetadata<'_>> {
-        self.0.layers.iter().map(LayerMetadata)
+        self.0.layers.iter().map(|l| LayerMetadata(l, self.1))
     }
     pub fn filters(&self) -> impl ExactSizeIterator<Item = EffectMetadata<'_>> {
-        self.0.filters.iter().map(EffectMetadata)
+        self.0.filters.iter().map(|e| EffectMetadata(e, self.1))
     }
 }
-pub struct LayerMetadata<'a>(&'a Layer36);
+#[derive(Clone, Copy)]
+pub struct LayerMetadata<'a>(&'a Layer36, DocumentKey);
 impl LayerMetadata<'_> {
     pub fn id(&self) -> &str {
         &self.0.id
@@ -233,8 +260,8 @@ impl LayerMetadata<'_> {
     pub fn origin(&self) -> [i32; 2] {
         [self.0.x, self.0.y]
     }
-    pub fn pixels(&self) -> &RasterRef36 {
-        &self.0.pixels
+    pub fn pixels(&self) -> RasterMetadata<'_> {
+        RasterMetadata(&self.0.pixels, self.1)
     }
     pub fn parent(&self) -> Option<&str> {
         self.0.parent.as_deref()
@@ -246,10 +273,10 @@ impl LayerMetadata<'_> {
         self.0.color
     }
     pub fn mask(&self) -> Option<MaskMetadata<'_>> {
-        self.0.mask.as_ref().map(MaskMetadata)
+        self.0.mask.as_ref().map(|m| MaskMetadata(m, self.1))
     }
     pub fn effects(&self) -> impl ExactSizeIterator<Item = EffectMetadata<'_>> {
-        self.0.effects.iter().map(EffectMetadata)
+        self.0.effects.iter().map(|e| EffectMetadata(e, self.1))
     }
     pub fn psd_metadata(&self) -> &[crate::psd::LayerMetadata] {
         &self.0.psd_metadata
@@ -258,10 +285,11 @@ impl LayerMetadata<'_> {
         self.0.source.as_ref()
     }
 }
-pub struct CoverageMetadata<'a>(&'a super::scene::Coverage36);
+#[derive(Clone, Copy)]
+pub struct CoverageMetadata<'a>(&'a super::scene::Coverage36, DocumentKey);
 impl CoverageMetadata<'_> {
-    pub fn mask(&self) -> &RasterRef36 {
-        &self.0.mask
+    pub fn mask(&self) -> RasterMetadata<'_> {
+        RasterMetadata(&self.0.mask, self.1)
     }
     pub fn bounds(&self) -> [i32; 4] {
         self.0.bounds
@@ -273,7 +301,8 @@ impl CoverageMetadata<'_> {
         &self.0.contours
     }
 }
-pub struct EffectMetadata<'a>(&'a super::scene::Effect36);
+#[derive(Clone, Copy)]
+pub struct EffectMetadata<'a>(&'a super::scene::Effect36, DocumentKey);
 impl EffectMetadata<'_> {
     pub fn id(&self) -> &str {
         &self.0.id
@@ -294,10 +323,11 @@ impl EffectMetadata<'_> {
         self.0
             .clips
             .iter()
-            .map(|clip| (clip.stroke, CoverageMetadata(&clip.coverage)))
+            .map(|clip| (clip.stroke, CoverageMetadata(&clip.coverage, self.1)))
     }
 }
-pub struct MaskMetadata<'a>(&'a super::scene::Mask36);
+#[derive(Clone, Copy)]
+pub struct MaskMetadata<'a>(&'a super::scene::Mask36, DocumentKey);
 impl MaskMetadata<'_> {
     pub fn enabled(&self) -> bool {
         self.0.enabled
@@ -306,10 +336,11 @@ impl MaskMetadata<'_> {
         self.0.linked
     }
     pub fn steps(&self) -> impl ExactSizeIterator<Item = MaskStepMetadata<'_>> {
-        self.0.steps.iter().map(MaskStepMetadata)
+        self.0.steps.iter().map(|s| MaskStepMetadata(s, self.1))
     }
 }
-pub struct MaskStepMetadata<'a>(&'a super::scene::MaskStep36);
+#[derive(Clone, Copy)]
+pub struct MaskStepMetadata<'a>(&'a super::scene::MaskStep36, DocumentKey);
 impl MaskStepMetadata<'_> {
     pub fn id(&self) -> &str {
         &self.0.id
@@ -326,11 +357,55 @@ impl MaskStepMetadata<'_> {
     pub fn value(&self) -> f32 {
         self.0.value
     }
-    pub fn pixels(&self) -> &RasterRef36 {
-        &self.0.pixels
+    pub fn pixels(&self) -> RasterMetadata<'_> {
+        RasterMetadata(&self.0.pixels, self.1)
     }
     pub fn settings(&self) -> &serde_json::Value {
         &self.0.settings
+    }
+}
+#[derive(Clone, Copy)]
+pub struct RasterMetadata<'a>(&'a RasterRef36, DocumentKey);
+impl RasterMetadata<'_> {
+    pub fn ordinal(&self) -> u32 {
+        self.0.id
+    }
+    pub fn width(&self) -> u32 {
+        self.0.width
+    }
+    pub fn height(&self) -> u32 {
+        self.0.height
+    }
+    pub fn depth(&self) -> u16 {
+        self.0.depth
+    }
+    pub fn slot(&self) -> RasterSlot {
+        RasterSlot {
+            document: self.1,
+            ordinal: self.0.id,
+        }
+    }
+    pub fn retained(&self) -> Option<RetainedMetadata<'_>> {
+        self.0
+            .retained
+            .as_deref()
+            .map(|r| RetainedMetadata(r, self.1))
+    }
+}
+#[derive(Clone, Copy)]
+pub struct RetainedMetadata<'a>(&'a super::scene::Retained36, DocumentKey);
+impl RetainedMetadata<'_> {
+    pub fn pixels(&self) -> RasterMetadata<'_> {
+        RasterMetadata(&self.0.pixels, self.1)
+    }
+    pub fn matrix(&self) -> [f64; 6] {
+        self.0.matrix
+    }
+    pub fn projective(&self) -> Option<[f64; 9]> {
+        self.0.projective
+    }
+    pub fn warps(&self) -> &[super::scene::Warp36] {
+        &self.0.warps
     }
 }
 
@@ -408,6 +483,7 @@ impl CapturedEdit {
                 resident,
                 disk,
                 key: key(),
+                render_key: OnceLock::new(),
             })
         })?;
         check()?;
@@ -674,5 +750,51 @@ mod tests {
                 .unwrap(),
         };
         assert!(protected.capture_edit().is_err());
+    }
+    #[test]
+    fn native_snapshots_share_owned_headers_and_bind_the_common_projection_to_exact_slots() {
+        use crate::engine::scene::{SceneIdentity, SceneSnapshot};
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let document = document(&pool);
+        let before = pool.used();
+        let make = |doc: NativeDocument| {
+            let identity = SceneIdentity {
+                project_id: "native-project".into(),
+                document_id: doc.metadata().id().into(),
+                revision: doc.metadata().revision(),
+            };
+            SceneSnapshot::from_native(identity, doc, vec![], None, None).unwrap()
+        };
+        let first = make(document.clone());
+        let second = make(document.clone());
+        assert_eq!(pool.used(), before);
+        let first_metadata = first.metadata();
+        let layer = first_metadata.layers().next().unwrap();
+        let slot = layer.pixels().slot();
+        assert!(std::ptr::eq(
+            first.raster(slot).unwrap(),
+            second.raster(slot).unwrap()
+        ));
+        assert_eq!(first.render_key().unwrap(), second.render_key().unwrap());
+        assert_eq!(first.render_key().unwrap(), document.render_key().unwrap());
+        let wire: Document36 =
+            serde_json::from_slice(&serde_json::to_vec(&first.metadata()).unwrap()).unwrap();
+        assert_eq!(
+            wire.icc_profile.as_deref().map(Vec::as_slice),
+            document.metadata().profile()
+        );
+        let prepared = document
+            .capture_edit()
+            .unwrap()
+            .visibility(layer.id(), false, &|| Ok(()))
+            .unwrap();
+        let changed = document.adopt(prepared).unwrap();
+        let changed = make(changed);
+        assert!(changed.raster(slot).is_err());
+        assert!(changed.into_provisional_pending().is_err());
+        drop(first);
+        drop(second);
+        drop(document);
+        assert_eq!(pool.used(), 0);
     }
 }
