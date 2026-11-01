@@ -988,6 +988,101 @@ mod tests {
         assert_eq!(pool.used(), 0);
     }
     #[test]
+    fn existing_coverage_translation_preserves_complete_retained_sources_in_both_slots() {
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let original = document(&pool);
+        let metadata = copy_metadata(&original.core.metadata, &pool, &|| Ok(())).unwrap();
+        let metadata = metadata
+            .map_unique(|mut metadata, _| {
+                metadata.selection_coverage.as_mut().unwrap().mask.retained =
+                    Some(Box::new(Retained36 {
+                        pixels: RasterRef36 {
+                            id: 4,
+                            width: 8,
+                            height: 8,
+                            depth: 8,
+                            retained: None,
+                        },
+                        matrix: [1., 0., 0., 1., 2., 3.],
+                        projective: None,
+                        warps: vec![],
+                    }));
+                Ok(metadata)
+            })
+            .unwrap();
+        let mut entries = original
+            .roster()
+            .iter()
+            .map(|(_, surface)| surface.clone())
+            .collect::<Vec<_>>();
+        entries.push(Surface::zero(8, 8, 8).unwrap());
+        let base = NativeDocument::from_pending(
+            PendingScene::new(
+                metadata,
+                RasterRoster::new(entries).unwrap(),
+                pool.clone(),
+                original.disk_budget().clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let coverage = base.metadata().selection_coverage().unwrap().mask();
+        let source = base.source(coverage.slot()).unwrap().key();
+        let retained = base
+            .source(coverage.retained().unwrap().pixels().slot())
+            .unwrap()
+            .key();
+        let contours = admitted(&pool, vec![vec![[2., 3.], [5., 3.], [2., 6.]]]);
+        let make = || CoveragePatch {
+            pixels: CoveragePixels::Existing(coverage.slot()),
+            bounds: [2, 3, 5, 6],
+            origin: [1, 2],
+            contours: contours.clone(),
+        };
+        let batch = RasterBatch {
+            rasters: vec![],
+            layers: vec![],
+            effects: vec![],
+            selection: Some(SelectionPatch {
+                bounds: Some([2, 3, 5, 6]),
+                polygon: None,
+                current: Some(make()),
+                previous: Some(make()),
+            }),
+        };
+        let prepared = base
+            .capture_edit()
+            .unwrap()
+            .batch(batch, &|| Ok(()))
+            .unwrap_or_else(|e| panic!("{}", e.reason()));
+        let current = base.adopt(prepared).unwrap();
+        for mask in [
+            current.metadata().selection_coverage().unwrap().mask(),
+            current.metadata().selection_previous().unwrap().mask(),
+        ] {
+            assert_eq!(current.source(mask.slot()).unwrap().key(), source);
+            let original = mask.retained().unwrap();
+            assert_eq!(original.matrix(), [1., 0., 0., 1., 2., 3.]);
+            assert_eq!(
+                current.source(original.pixels().slot()).unwrap().key(),
+                retained
+            );
+        }
+        assert_eq!(
+            current.metadata().selection_coverage().unwrap().origin(),
+            [1, 2]
+        );
+        assert_eq!(
+            current.metadata().selection_coverage().unwrap().contours(),
+            &[vec![[2., 3.], [5., 3.], [2., 6.]]]
+        );
+        drop(current);
+        drop(base);
+        drop(original);
+        drop(contours);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
     fn a_late_conflict_refuses_every_output_and_registered_cleanup_releases_them() {
         let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
         let base = document(&pool);
