@@ -39,6 +39,19 @@ result is revalidated against the strict 1..N reference rule before adoption.
 Hierarchical and clipping reorder policy remains part of the pending dispatcher
 migration.
 
+Generated raster updates use an owned OutputDraft. Sealing checks shared pools
+and the session's registered Store owners, retaining selected checkpoints and
+FreshFragment tokens. Empty or unused fragments must be retired before sealing.
+Preparation and final publication refusals return those owners to the caller;
+cleanup releases candidate/preview/checkpoint owners before requesting registered
+fragment retirement outside the engine lock. Closing cleanup remains fail closed
+until the concrete service supplies its cleanup-only retained-instance admission.
+
+Prepared edits retain typed scopes. The publication path rechecks current leases,
+closed/read-only state, exact generation/revision and cancellation before marking
+source fragments. Marking and document adoption perform no source I/O or caller
+callbacks. Metadata-only adoption cannot publish a generated raster update.
+
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,
 recovery and coordinated live document replacement must be connected and tested
