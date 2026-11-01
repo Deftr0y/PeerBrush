@@ -25,9 +25,10 @@ observation after its last admission callback. Unknown/partial entries are kept;
 they cannot become transparent pixels or an inferred newest checkpoint.
 
 Runtime directory/file/path indexes have a conservative resident reservation.
-Source block/cache index accounting remains a separate required admission before
-resident eviction or larger-canvas activation. A derived mirror of existing
-resident rasters does not establish bounded total application memory.
+Source block/cache buffer capacities separately retain conservative charges in
+that same pool, including transient replacement buffers and recovered indexes.
+A derived mirror of existing resident rasters does not establish bounded total
+application memory or authorize resident eviction/larger-canvas activation.
 
 Stores are resolved by inventoried immutable identity and an explicit selected
 `CommitRef`. Serialized recovery data never supplies runtime paths or offset
