@@ -228,8 +228,15 @@ impl<R: Read + Seek> Input<'_, R> {
             .layers
             .get(record)
             .and_then(|r| r.channels.get(channel))
-            .and_then(|c| c.encoding.as_ref())
-            .ok_or_else(|| "Missing native Photoshop channel geometry".into())
+            .ok_or_else(|| "Missing native Photoshop channel".to_string())
+            .and_then(|channel| {
+                channel.encoding.as_ref().ok_or_else(|| {
+                    channel
+                        .encoding_error
+                        .clone()
+                        .unwrap_or_else(|| "Missing native Photoshop channel geometry".into())
+                })
+            })
     }
 }
 
@@ -301,6 +308,15 @@ impl<R: Read + Seek> IndexedChannels for Input<'_, R> {
         limit: usize,
         control: &crate::loading::Control,
     ) -> Result<Embedded, String> {
+        if self
+            .index
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.channels)
+            .any(|c| c.encoding_error.is_some())
+        {
+            return Err("Invalid original standard Photoshop channel".into());
+        }
         let check = || control.check();
         let span = self
             .embedded
@@ -417,7 +433,7 @@ pub(super) fn decode<R: Read + Seek>(
         bytes,
         control,
     )?;
-    let index = structural::index(reader, structural::Limits::current(), || control.check())?;
+    let index = structural::index_for_decode(reader, || control.check())?;
     let source = row_stream::Source::new(reader, index.file_bytes)?;
     let section_hash = hash_range(&source, index.layer_and_mask, control)?;
     let composite_hash = hash_range(&source, index.composite.span, control)?;
@@ -536,6 +552,22 @@ mod tests {
             )
         );
         assert_eq!(actual.warnings, expected.warnings);
+        assert_eq!(
+            serde_json::to_value(&actual.source_structure).unwrap(),
+            serde_json::to_value(&expected.source_structure).unwrap()
+        );
+        assert_eq!(
+            (
+                &actual.icc_profile,
+                actual.srgb_tagged,
+                &actual.psd_global_mask
+            ),
+            (
+                &expected.icc_profile,
+                expected.srgb_tagged,
+                &expected.psd_global_mask
+            )
+        );
         assert_eq!(actual.layers.len(), expected.layers.len());
         for (a, b) in actual.layers.iter().zip(&expected.layers) {
             assert_eq!(
@@ -811,6 +843,72 @@ mod tests {
                     .warnings
                     .iter()
                     .any(|w| w.contains("Duplicate Photoshop layer channel")));
+                compare(&actual, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn formerly_ignored_resource_and_protected_layer_tag_counts_keep_legacy_behavior() {
+        for bytes in [
+            structural::tests::many_resources_fixture(),
+            structural::tests::many_layer_tags_fixture(),
+        ] {
+            let expected = super::super::decode(&bytes).unwrap();
+            let actual =
+                decode_reader(&mut std::io::Cursor::new(&bytes), &Default::default()).unwrap();
+            assert!(actual.read_only);
+            compare(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn documented_odd_raw_layer_rows_and_nonzero_layer_info_padding_keep_native_samples() {
+        for format in [structural::Format::Psd, structural::Format::Psb] {
+            for padded in [false, true] {
+                let bytes = structural::tests::odd_raw_fixture(format, padded);
+                let actual =
+                    decode_reader(&mut std::io::Cursor::new(&bytes), &Default::default()).unwrap();
+                assert!(!actual.read_only);
+                for y in 0..3i32 {
+                    for x in 0..3i32 {
+                        assert_eq!(
+                            actual.layers[0].pixels.get(x, y),
+                            [0, 1, 2, 3].map(|c| if c == 3 {
+                                255
+                            } else {
+                                c * 70 + x as u8 * 3 + y as u8 * 11 + 7
+                            })
+                        );
+                    }
+                }
+                if !padded {
+                    compare(&actual, &super::super::decode(&bytes).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protected_adjustment_records_keep_undefined_channel_data_out_of_editable_decoding() {
+        for format in [structural::Format::Psd, structural::Format::Psb] {
+            for depth in [8, 16] {
+                let mut bytes = structural::tests::fixture(format, depth, false);
+                let index = structural::index(
+                    &mut std::io::Cursor::new(&bytes),
+                    structural::Limits::current(),
+                    || Ok(()),
+                )
+                .unwrap();
+                let record = &index.layers[0];
+                bytes[record.record.offset as usize..record.record.offset as usize + 16].fill(0);
+                let tag = record.tags.iter().find(|tag| tag.key == *b"abcd").unwrap();
+                bytes[tag.data.offset as usize - 8..tag.data.offset as usize - 4]
+                    .copy_from_slice(b"SoCo");
+                let expected = super::super::decode(&bytes).unwrap();
+                let actual =
+                    decode_reader(&mut std::io::Cursor::new(&bytes), &Default::default()).unwrap();
+                assert!(actual.read_only);
                 compare(&actual, &expected);
             }
         }

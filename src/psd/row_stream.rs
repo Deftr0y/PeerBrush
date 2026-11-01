@@ -113,6 +113,11 @@ impl<R: Read + Seek> Source<R> {
         if ![8, 16].contains(&encoding.depth)
             || encoding.row_bytes > MAX_ROW_BYTES
             || encoding.row_bytes % u64::from(encoding.depth / 8) != 0
+            || encoding.row_padding > 1
+            || (encoding.row_padding != 0
+                && (encoding.compression != Compression::Raw
+                    || encoding.row_bytes % 2 != 1
+                    || encoding.depth != 8))
             || encoding.span.end()? > self.bytes
             || encoding.payload.end()? != encoding.span.end()?
             || encoding.payload.offset < encoding.span.offset
@@ -158,7 +163,9 @@ impl<R: Read + Seek> Source<R> {
                 Compression::Raw => {
                     if encoding.counts.is_some()
                         || encoding.payload.offset != after
-                        || encoding.rows.checked_mul(encoding.row_bytes)
+                        || encoding
+                            .rows
+                            .checked_mul(encoding.row_bytes + u64::from(encoding.row_padding))
                             != Some(encoding.payload.bytes)
                     {
                         return Err("Indexed raw Photoshop channel differs".into());
@@ -409,9 +416,16 @@ impl<'a, R: Read + Seek> Rows<'a, R> {
         let check = self.check;
         let failure = |message: &str| check().err().unwrap_or_else(|| message.into());
         match &mut self.state {
-            State::Raw(input) => input
-                .read_exact(out)
-                .map_err(|_| failure("Truncated raw Photoshop row"))?,
+            State::Raw(input) => {
+                input
+                    .read_exact(out)
+                    .map_err(|_| failure("Truncated raw Photoshop row"))?;
+                if self.encoding.row_padding != 0 {
+                    input
+                        .read_exact(&mut [0; 1])
+                        .map_err(|_| failure("Truncated Photoshop row padding"))?;
+                }
+            }
             State::Zip(input) => input
                 .read_exact(out)
                 .map_err(|_| failure("Invalid or truncated Photoshop ZIP row"))?,
@@ -565,6 +579,41 @@ mod tests {
     use std::cell::Cell;
     use std::io::{Cursor, Write};
 
+    #[test]
+    fn native_layer_raw_rows_accept_explicit_odd_padding_while_composite_has_none() {
+        for format in [Format::Psd, Format::Psb] {
+            for padded in [false, true] {
+                let bytes = super::super::structural::tests::odd_raw_fixture(format, padded);
+                let index = super::super::structural::index(
+                    &mut Cursor::new(&bytes),
+                    super::super::structural::Limits::current(),
+                    || Ok(()),
+                )
+                .unwrap();
+                let source = Source::new(Cursor::new(&bytes), bytes.len() as u64).unwrap();
+                let check = || Ok(());
+                for (c, channel) in index.layers[0].channels.iter().enumerate() {
+                    let encoding = channel.encoding.as_ref().unwrap();
+                    assert_eq!(encoding.row_padding, u8::from(padded));
+                    let mut rows = source.rows(encoding, &check).unwrap();
+                    for y in 0..3u8 {
+                        let mut row = [0; 3];
+                        assert!(rows.read_row(&mut row).unwrap());
+                        assert_eq!(
+                            row,
+                            std::array::from_fn(|x| c as u8 * 70 + x as u8 * 3 + y * 11 + 7)
+                        );
+                    }
+                    rows.finish()
+                        .unwrap()
+                        .check(&source, encoding, &check)
+                        .unwrap();
+                }
+                assert_eq!(index.composite.row_padding, 0);
+            }
+        }
+    }
+
     fn raw(depth: u16, width: u32, height: u32, channel: u16) -> Vec<u8> {
         let mut bytes = Vec::new();
         for y in 0..height {
@@ -657,6 +706,7 @@ mod tests {
             },
             rows: u64::from(height),
             row_bytes: row_bytes as u64,
+            row_padding: 0,
             counts,
             payload: Span {
                 offset,

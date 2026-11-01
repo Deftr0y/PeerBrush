@@ -135,6 +135,7 @@ pub(crate) struct Encoding {
     pub compression: Compression,
     pub rows: u64,
     pub row_bytes: u64,
+    pub row_padding: u8,
     pub counts: Option<Span>,
     pub payload: Span,
     pub depth: u16,
@@ -149,6 +150,7 @@ pub(crate) struct Channel {
     // never guessed from the layer's rectangle.
     pub dimensions: Option<[u32; 2]>,
     pub encoding: Option<Encoding>,
+    pub encoding_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,6 +202,7 @@ struct Scanner<'a, R, C> {
     check: &'a mut C,
     limits: Limits,
     tags: usize,
+    semantic_only: bool,
 }
 
 impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
@@ -358,6 +361,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
         depth: u16,
         format: Format,
         mask: bool,
+        layer_padding: bool,
     ) -> Result<Encoding, String> {
         let end = span.end()?;
         let rows = u64::from(height)
@@ -381,6 +385,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                 compression: Compression::Empty,
                 rows,
                 row_bytes,
+                row_padding: 0,
                 counts: None,
                 payload: span,
                 depth,
@@ -431,13 +436,21 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
             offset: self.position()?,
             bytes: end - self.position()?,
         };
-        if compression == Compression::Raw
-            && rows
+        let mut row_padding = 0;
+        if compression == Compression::Raw {
+            let expected = rows
                 .checked_mul(row_bytes)
-                .ok_or("Photoshop raw size overflow")?
-                != payload.bytes
-        {
-            return Err("Photoshop raw channel size differs".into());
+                .ok_or("Photoshop raw size overflow")?;
+            if expected != payload.bytes {
+                if layer_padding
+                    && row_bytes % 2 == 1
+                    && rows.checked_mul(row_bytes + 1) == Some(payload.bytes)
+                {
+                    row_padding = 1;
+                } else {
+                    return Err("Photoshop raw channel size differs".into());
+                }
+            }
         }
         if matches!(compression, Compression::Zip | Compression::PredictedZip) && payload.bytes == 0
         {
@@ -449,6 +462,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
             compression,
             rows,
             row_bytes,
+            row_padding,
             counts,
             payload,
             depth,
@@ -499,6 +513,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                         None
                     },
                     encoding: None,
+                    encoding_error: None,
                 });
             }
             if self.read::<4>(end)? != *b"8BIM" {
@@ -542,7 +557,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
             self.pad(length + 1, 4, extra_end)?;
             let mut tags = Vec::new();
             let mut keys = HashSet::new();
-            while self.position()? < extra_end {
+            while !self.semantic_only && self.position()? < extra_end {
                 if extra_end - self.position()? < 12 {
                     // The semantic parser protects nonzero unframed layer
                     // metadata using the saved composite. Preserve those raw
@@ -587,7 +602,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
             for channel in &mut layer.channels {
                 channel.span = self.span(channel.span.bytes, end)?;
                 if let Some([width, height]) = channel.dimensions {
-                    channel.encoding = Some(self.encoding(
+                    let result = self.encoding(
                         channel.span,
                         width,
                         height,
@@ -595,8 +610,18 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                         header.depth,
                         header.format,
                         channel.id == -2,
-                    )?);
-                } else if channel.span.bytes != 0 {
+                        true,
+                    );
+                    match result {
+                        Ok(encoding) => channel.encoding = Some(encoding),
+                        Err(reason) if self.semantic_only => {
+                            (self.check)()?;
+                            channel.encoding_error = Some(reason);
+                            self.seek(channel.span.end()?)?;
+                        }
+                        Err(reason) => return Err(reason),
+                    }
+                } else if channel.span.bytes != 0 && !self.semantic_only {
                     let next = self.position()?;
                     self.seek(channel.span.offset)?;
                     if self.u16(channel.span.end()?)? > 3 {
@@ -609,7 +634,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
         if end - self.position()? > 1 {
             return Err("Unframed Photoshop layer information".into());
         }
-        self.zeros(end)?;
+        self.seek(end)?;
         Ok((layers, transparency))
     }
 }
@@ -619,6 +644,25 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
 pub(crate) fn index<R: Read + Seek>(
     input: &mut R,
     limits: Limits,
+    check: impl FnMut() -> Result<(), String>,
+) -> Result<Index, String> {
+    index_with(input, limits, false, check)
+}
+
+/// Match the active decoder's semantic resource/record policy without retaining
+/// ignored resources or imposing a new cumulative layer-tag admission. Invalid
+/// channel encodings stay provisional until the semantic parser admits a layer.
+pub(crate) fn index_for_decode<R: Read + Seek>(
+    input: &mut R,
+    check: impl FnMut() -> Result<(), String>,
+) -> Result<Index, String> {
+    index_with(input, Limits::current(), true, check)
+}
+
+fn index_with<R: Read + Seek>(
+    input: &mut R,
+    limits: Limits,
+    semantic_only: bool,
     mut check: impl FnMut() -> Result<(), String>,
 ) -> Result<Index, String> {
     check()?;
@@ -633,6 +677,7 @@ pub(crate) fn index<R: Read + Seek>(
         check: &mut check,
         limits,
         tags: 0,
+        semantic_only,
     };
     scan.seek(0)?;
     if scan.read::<4>(file_bytes)? != *b"8BPS" {
@@ -683,7 +728,7 @@ pub(crate) fn index<R: Read + Seek>(
     let mut peerbrush = false;
     let mut profile = false;
     while scan.position()? < resource_section.end()? {
-        if resources.len() >= limits.resources {
+        if !semantic_only && resources.len() >= limits.resources {
             return Err("Too many Photoshop image resources".into());
         }
         if scan.read::<4>(resource_section.end()?)? != *b"8BIM" {
@@ -701,22 +746,35 @@ pub(crate) fn index<R: Read + Seek>(
         } else {
             false
         };
-        if source && peerbrush {
+        if source && peerbrush && !ambiguities.contains(&Ambiguity::PeerBrushSources) {
             ambiguities.push(Ambiguity::PeerBrushSources);
         }
         peerbrush |= source;
         if id == 1039 {
-            if profile {
+            if profile && !ambiguities.contains(&Ambiguity::ColorProfiles) {
                 ambiguities.push(Ambiguity::ColorProfiles);
             }
             profile = true;
         }
-        resources.push(Resource {
+        let resource = Resource {
             id,
             name,
             data,
             peerbrush_source: source,
-        });
+        };
+        if !semantic_only {
+            resources.push(resource);
+        } else if id == 1057 {
+            if let Some(previous) = resources.iter_mut().find(|old| old.id == 1057) {
+                *previous = resource;
+            } else {
+                resources.push(resource);
+            }
+        } else if (source && resources.iter().filter(|old| old.peerbrush_source).count() < 2)
+            || (id == 1039 && resources.iter().filter(|old| old.id == 1039).count() < 2)
+        {
+            resources.push(resource);
+        }
         scan.seek(after)?;
         scan.pad(data.bytes, 2, resource_section.end()?)?;
     }
@@ -784,6 +842,7 @@ pub(crate) fn index<R: Read + Seek>(
         depth,
         format,
         false,
+        false,
     )?;
     (scan.check)()?;
     if scan
@@ -815,6 +874,127 @@ pub(crate) fn index<R: Read + Seek>(
 pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
+
+    pub(crate) fn odd_raw_fixture(format: Format, padded_rows: bool) -> Vec<u8> {
+        let mut channels = vec![];
+        for c in 0..3u8 {
+            let mut data = vec![0, 0];
+            for y in 0..3u8 {
+                for x in 0..3u8 {
+                    data.push(c * 70 + x * 3 + y * 11 + 7);
+                }
+                if padded_rows {
+                    data.push(0xda);
+                }
+            }
+            channels.push(data);
+        }
+        let mut info = 1i16.to_be_bytes().to_vec();
+        for v in [0i32, 0, 3, 3] {
+            info.extend_from_slice(&v.to_be_bytes());
+        }
+        info.extend_from_slice(&3u16.to_be_bytes());
+        for (c, data) in channels.iter().enumerate() {
+            info.extend_from_slice(&(c as i16).to_be_bytes());
+            length(&mut info, data.len(), format.large());
+        }
+        info.extend_from_slice(b"8BIMnorm");
+        info.extend_from_slice(&[255, 0, 0, 0]);
+        let mut extra = vec![0; 8];
+        extra.extend_from_slice(&[3, b'o', b'd', b'd']);
+        block(&mut info, &extra, false);
+        for data in &channels {
+            info.extend_from_slice(data);
+        }
+        if info.len() % 2 != 0 {
+            info.push(0xa5);
+        }
+        let mut section = vec![];
+        block(&mut section, &info, format.large());
+        section.extend_from_slice(&0u32.to_be_bytes());
+        let mut bytes = b"8BPS".to_vec();
+        bytes.extend_from_slice(&(if format.large() { 2u16 } else { 1 }).to_be_bytes());
+        bytes.extend_from_slice(&[0; 6]);
+        bytes.extend_from_slice(&3u16.to_be_bytes());
+        bytes.extend_from_slice(&3u32.to_be_bytes());
+        bytes.extend_from_slice(&3u32.to_be_bytes());
+        bytes.extend_from_slice(&8u16.to_be_bytes());
+        bytes.extend_from_slice(&3u16.to_be_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        block(&mut bytes, &section, format.large());
+        bytes.extend_from_slice(&[0; 2]);
+        for c in 0..3u8 {
+            for y in 0..3u8 {
+                for x in 0..3u8 {
+                    bytes.push(c * 70 + x * 3 + y * 11 + 7);
+                }
+            }
+        }
+        bytes
+    }
+
+    pub(crate) fn many_resources_fixture() -> Vec<u8> {
+        let original = fixture(Format::Psd, 8, false);
+        let old = u32::from_be_bytes(original[30..34].try_into().unwrap()) as usize;
+        let mut resources = vec![];
+        for id in 10_000..15_000u16 {
+            resources.extend_from_slice(b"8BIM");
+            resources.extend_from_slice(&id.to_be_bytes());
+            resources.extend_from_slice(&[0; 6]);
+        }
+        resources.extend_from_slice(&original[34..34 + old]);
+        let mut bytes = original[..30].to_vec();
+        block(&mut bytes, &resources, false);
+        bytes.extend_from_slice(&original[34 + old..]);
+        bytes
+    }
+
+    pub(crate) fn many_layer_tags_fixture() -> Vec<u8> {
+        let original = fixture(Format::Psd, 8, false);
+        let indexed = index(&mut Cursor::new(&original), Limits::current(), || Ok(())).unwrap();
+        let extra = indexed.layers[0].extra;
+        let info = indexed.active_layer_info;
+        let mut tags = vec![];
+        for n in 0..5000usize {
+            let key = [
+                b'X',
+                b'A' + (n / 676) as u8,
+                b'A' + (n / 26 % 26) as u8,
+                b'A' + (n % 26) as u8,
+            ];
+            tag(&mut tags, Format::Psd, key, &[], 2);
+        }
+        let mut changed = original[info.offset as usize..info.end().unwrap() as usize].to_vec();
+        let insert = (extra.end().unwrap() - info.offset) as usize;
+        changed.splice(insert..insert, tags.iter().copied());
+        let extra_length_at = (extra.offset - info.offset - 4) as usize;
+        changed[extra_length_at..extra_length_at + 4]
+            .copy_from_slice(&((extra.bytes as usize + tags.len()) as u32).to_be_bytes());
+        let mut section = vec![];
+        block(&mut section, &changed, false);
+        section.extend_from_slice(
+            &original[info.end().unwrap() as usize..indexed.layer_and_mask.end().unwrap() as usize],
+        );
+        let mut bytes = original[..indexed.layer_and_mask.offset as usize - 4].to_vec();
+        block(&mut bytes, &section, false);
+        bytes.extend_from_slice(&original[indexed.composite.span.offset as usize..]);
+        bytes
+    }
+
+    #[test]
+    fn decoder_scan_does_not_add_resource_or_cumulative_layer_tag_restrictions() {
+        for bytes in [many_resources_fixture(), many_layer_tags_fixture()] {
+            assert!(index(&mut Cursor::new(&bytes), Limits::current(), || Ok(())).is_err());
+            let indexed = index_for_decode(&mut Cursor::new(&bytes), || Ok(())).unwrap();
+            assert_eq!(indexed.layers.len(), 1);
+            assert_eq!(indexed.resources.len(), 1);
+            assert!(indexed.layers[0].tags.is_empty());
+            assert!(indexed.layers[0]
+                .channels
+                .iter()
+                .all(|c| c.encoding.is_some()));
+        }
+    }
 
     fn length(out: &mut Vec<u8>, n: usize, large: bool) {
         if large {
