@@ -2556,3 +2556,187 @@ fn expanded_fill_mask_preserves_old_visible_color_and_pairs_one_native_history_e
         assert_eq!(document.metadata().layer(0).unwrap().pixels().width(), 4);
     }
 }
+
+#[test]
+fn guarded_brush_transaction_replans_working_sources_and_publishes_one_history_entry() {
+    use crate::{
+        brush::input::StrokePoints,
+        engine::native::{
+            CommandDescriptor, Direction, HistoryRequest, NativeHistory, Publication, RasterPatch,
+            RetainedUpdate,
+        },
+    };
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(9, 7, depth).unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                source.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [12347 + x as u16 * 911, 23521 + y as u16 * 617, 43217, 49153],
+                );
+            }
+        }
+        let commands = [
+            serde_json::json!({"op":"paint","layer":source.layers[0].id,"points":[[3,3],[4,3]],"radius":1.0,"color":[211,17,71,193],"source_revision":0}),
+            serde_json::json!({"op":"paint","layer":source.layers[0].id,"points":[[4,3],[5,3]],"radius":1.0,"color":[37,83,219,127],"source_revision":0}),
+        ];
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &commands, None, None, "Two strokes")
+            .unwrap();
+        assert_eq!(legacy.undo.len(), 1);
+        let mut document = native(&source, &session);
+        let original_key = document.key();
+        let source_bytes = session.disk().used().unwrap();
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &commands, &|| Ok(())).unwrap();
+        let capture = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let mut transaction = capture.transaction().unwrap();
+        for index in 0..commands.len() {
+            let step = transaction.next(&|| Ok(())).unwrap();
+            let (output, slot) = {
+                let command = step.descriptor().unwrap().commands().next().unwrap();
+                assert_eq!(
+                    command.token(),
+                    descriptor.commands().nth(index).unwrap().token()
+                );
+                assert_eq!(command.parameters()["source_revision"], 0);
+                let input =
+                    RasterInput::from_parameters(step.document(), command.parameters()).unwrap();
+                assert_eq!(input.binding().generation(), transaction.working().key());
+                let points =
+                    StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+                let frame = input
+                    .stroke_frame(command, &points, &mut || Ok(()))
+                    .unwrap();
+                assert!(frame.is_none());
+                let stroke = points.local(&input, None, &mut || Ok(())).unwrap();
+                let guard = WriteGuard::new(&step, command, &input, None).unwrap();
+                let BuiltTiles::Draft(draft) = crate::brush::input::stage_guarded(
+                    &input,
+                    &stroke,
+                    None,
+                    &guard,
+                    &session,
+                    &mut || Ok(()),
+                )
+                .unwrap() else {
+                    panic!("No transaction stroke output")
+                };
+                (draft.seal(&|| Ok(())).ok().unwrap(), input.binding().slot())
+            };
+            let delta = step
+                .raster_patch(
+                    RasterPatch {
+                        target: slot,
+                        output,
+                        retained: RetainedUpdate::Clear,
+                        layer_origin: None,
+                    },
+                    &|| Ok(()),
+                )
+                .unwrap_or_else(|refused| {
+                    let reason = refused.reason().to_owned();
+                    refused.abort(&session, &|| Ok(())).unwrap();
+                    panic!("Native stroke step refused: {reason}")
+                });
+            transaction.complete(delta, &|| Ok(())).unwrap();
+            assert_eq!(transaction.completed(), index + 1);
+            assert_eq!(document.key(), original_key);
+            assert_eq!(document.metadata().revision(), 0);
+        }
+        let delta = transaction.finish(&|| Ok(())).unwrap();
+        let mut history = NativeHistory::new(&runtime.resident(), 20).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Two strokes",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        let retained_bytes = session.disk().used().unwrap();
+        let retired = history
+            .commit(
+                &mut document,
+                Publication {
+                    actor: "human",
+                    leases: &[],
+                    now: 1,
+                    closed: false,
+                    write_available: true,
+                },
+                commit,
+            )
+            .unwrap();
+        assert!(retired.has_provisional_sources());
+        assert_eq!(session.disk().used().unwrap(), retained_bytes);
+        // This is outside publication. Only the superseded first stroke Store
+        // can retire; final pixels remain owned by the document and history.
+        retired.retire(&session, &|| Ok(())).unwrap();
+        let published_bytes = session.disk().used().unwrap();
+        assert!(published_bytes < retained_bytes);
+        assert!(published_bytes > source_bytes);
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(document.metadata().revision(), 1);
+        let region = document
+            .source(document.metadata().layer(0).unwrap().pixels().slot())
+            .unwrap()
+            .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    legacy.doc.layers[0].pixels.get16(x, y)
+                );
+            }
+        }
+        drop(region);
+        let undo = history
+            .snapshot()
+            .prepare_move(&document, Direction::Undo, "human", &|| Ok(()))
+            .unwrap();
+        drop(
+            history
+                .move_cursor(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    undo,
+                )
+                .unwrap(),
+        );
+        let region = document
+            .source(document.metadata().layer(0).unwrap().pixels().slot())
+            .unwrap()
+            .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    source.layers[0].pixels.get16(x, y)
+                );
+            }
+        }
+    }
+}
