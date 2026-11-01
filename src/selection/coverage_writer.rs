@@ -147,8 +147,9 @@ mod tests {
         selection::rows::Feather,
     };
     fn store(pool: ResidentBudget) -> (Store, std::path::PathBuf) {
-        let path =
-            std::env::temp_dir().join(format!("peerbrush-coverage-writer-{}", crate::engine::id()));
+        let path = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-coverage-writer-{}", crate::engine::id()));
         let store = Store::create(
             &path,
             pool,

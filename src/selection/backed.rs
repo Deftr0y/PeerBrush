@@ -234,6 +234,9 @@ impl CoverageSource {
     pub fn metadata_bytes(&self) -> usize {
         self.contours.charge.bytes()
     }
+    pub fn uses_budget(&self, budget: &ResidentBudget) -> bool {
+        self.mask.uses_budget(budget) && self.contours.pool.same_pool(budget)
+    }
 
     /// `region` is in document coordinates. Only its exact physical mask
     /// intersection is pinned; metadata-proven exterior coverage is zero.
@@ -244,7 +247,7 @@ impl CoverageSource {
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<PreparedCoverageRegion> {
         check()?;
-        if !self.mask.uses_budget(budget) || !self.contours.pool.same_pool(budget) {
+        if !self.uses_budget(budget) {
             return Err(Error::Invalid(
                 "Selection source uses a different payload ledger",
             ));
@@ -284,6 +287,9 @@ impl PreparedCoverageRegion {
     }
     pub fn region(&self) -> Region {
         self.region
+    }
+    pub fn uses_budget(&self, budget: &ResidentBudget) -> bool {
+        self.source.uses_budget(budget)
     }
     pub fn value(&self, x: i32, y: i32) -> Result<f32> {
         let [left, top, right, bottom] = self.region.bounds();
@@ -328,8 +334,9 @@ mod tests {
     use super::*;
     use crate::{large_document::Limits, raster::Raster};
     fn store(pool: ResidentBudget) -> (Store, std::path::PathBuf) {
-        let path =
-            std::env::temp_dir().join(format!("peerbrush-coverage-source-{}", crate::engine::id()));
+        let path = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-coverage-source-{}", crate::engine::id()));
         let store = Store::create(
             &path,
             pool,
@@ -539,5 +546,27 @@ mod tests {
         assert_eq!(pool.used(), charge);
         drop(source);
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn raw_coverage_preserves_nonzero_pixels_outside_unproven_hint_bounds() {
+        let pool = ResidentBudget::new(4 * 1024 * 1024).unwrap();
+        let (store, path) = store(pool.clone());
+        let mut legacy = legacy();
+        legacy.bounds = [3, 1, 4, 2];
+        legacy.validate().unwrap();
+        let source = CoverageSource::stage_legacy(&legacy, store.clone(), &mut || Ok(())).unwrap();
+        let view = source
+            .prepare_region(Region::new([3, 1, 7, 3]).unwrap(), &pool, &mut || Ok(()))
+            .unwrap();
+        assert!(view.uses_budget(&pool));
+        assert!(!view.uses_budget(&ResidentBudget::new(pool.limit()).unwrap()));
+        assert_eq!(view.value(6, 2).unwrap(), 91. / 255.);
+        assert_eq!(view.value(6, 2).unwrap(), legacy.value(6, 2));
+        drop(view);
+        drop(source);
+        drop(store);
+        assert_eq!(pool.used(), 0);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
