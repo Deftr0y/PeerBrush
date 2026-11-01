@@ -29,6 +29,8 @@ mod publication;
 mod scopes;
 #[path = "native/transaction.rs"]
 mod transaction;
+#[path = "native/worker.rs"]
+pub(crate) mod worker;
 #[cfg(test)]
 use super::scene::wire_copy;
 use super::scene::{Document36, Layer36, PendingScene, RasterRef36, RasterRoster, Result};
@@ -673,12 +675,24 @@ impl RefusedDelta {
         session: &impl super::scene::StageSession,
         cleanup: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        self.prepared.abort(session, cleanup)
+    }
+}
+impl PreparedDelta {
+    /// Discard a completed preview or superseded proposal outside Engine locks.
+    /// All preview scenes/source views must be dropped first; escaped owners
+    /// cause verified retirement refusal and retain the actual disk debt.
+    pub(crate) fn abort(
+        self,
+        session: &impl super::scene::StageSession,
+        cleanup: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
         let PreparedDelta {
             candidate,
             outputs,
             admission,
             ..
-        } = self.prepared;
+        } = self;
         drop(candidate);
         let result = output::abort_outputs(outputs, session, cleanup);
         drop(admission);

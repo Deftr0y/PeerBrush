@@ -128,6 +128,9 @@ impl CapturedEdit {
     }
 }
 impl NativeTransaction {
+    pub(super) fn captured_command_count(&self) -> usize {
+        self.descriptor.commands().len()
+    }
     pub fn working(&self) -> &NativeDocument {
         &self.working
     }
