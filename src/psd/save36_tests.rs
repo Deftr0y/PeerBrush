@@ -605,6 +605,108 @@ fn closed_driver_resident_admission_refusal_preserves_source_before_any_staging_
     f.finish();
 }
 
+/// Actual profile/session and fully compared native candidate for filesystem
+/// component tests. It supplies no Engine commit fence or publication receipt.
+pub(crate) fn with_session_candidate<R>(
+    depth: u16,
+    call: impl FnOnce(
+        &SourceSession,
+        &CompletedSave36<'_>,
+        &Arc<crate::workspace::source_runtime::SourceRuntime>,
+        &std::path::Path,
+        &mut Option<crate::server::Connection>,
+    ) -> R,
+) -> R {
+    with_session_candidate_join(depth, |session, candidate, runtime, root, connection| {
+        (call(session, candidate, runtime, root, connection), None)
+    })
+}
+
+pub(crate) fn with_session_candidate_join<R>(
+    depth: u16,
+    call: impl FnOnce(
+        &SourceSession,
+        &CompletedSave36<'_>,
+        &Arc<crate::workspace::source_runtime::SourceRuntime>,
+        &std::path::Path,
+        &mut Option<crate::server::Connection>,
+    ) -> (R, Option<std::thread::JoinHandle<()>>),
+) -> R {
+    use crate::{
+        large_document::root::PersistentRootContext,
+        workspace::source_runtime::{Limits as RuntimeLimits, SourceRuntime},
+    };
+    let mut f = Fixture::new();
+    fs::create_dir(f.root.join("legacy")).unwrap();
+    let profile = crate::settings::Profile::open(
+        crate::settings::Locations {
+            config: f.root.join("config"),
+            data: f.root.join("data"),
+            cache: f.root.join("cache"),
+        },
+        &f.root.join("legacy"),
+    )
+    .unwrap();
+    let shared = Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
+    let mut connection =
+        Some(crate::server::start(shared.clone(), f.root.join("runtime")).unwrap());
+    let context = PersistentRootContext::from_profile(
+        connection.as_ref().unwrap(),
+        profile.source_profile().unwrap(),
+    )
+    .unwrap();
+    let runtime = SourceRuntime::new(
+        context.clone(),
+        RuntimeLimits {
+            resident_bytes: 64 * 1024 * 1024,
+            disk_bytes: 64 * 1024 * 1024,
+            max_files: 64,
+            store: StoreLimits {
+                disk_bytes: 16 * 1024 * 1024,
+                max_blocks: 64,
+                max_resident_blocks: 8,
+                manifest_bytes: 1024 * 1024,
+            },
+        },
+    )
+    .unwrap();
+    let session = runtime.begin().unwrap();
+    f.store = session.store_for_lineage([62; 16]).unwrap();
+    f.pool = runtime.resident();
+    f.disk = runtime.disk();
+    let doc = document(depth);
+    let scene = native_capture(&f, &doc);
+    let mut rows = provider(&scene);
+    let candidate = prepare(
+        &scene,
+        Format::Psb,
+        &session,
+        &mut rows,
+        limits(),
+        &|| Ok(()),
+        &|| Ok(()),
+    )
+    .unwrap();
+    candidate.check_session(&session).unwrap();
+    candidate.recheck(&|| Ok(())).unwrap();
+    let (result, closer) = call(&session, &candidate, &runtime, &f.root, &mut connection);
+    candidate.retire(&|| session.cleanup_check()).unwrap();
+    drop(rows);
+    drop(scene);
+    drop(doc);
+    drop(session);
+    if let Some(closer) = closer {
+        closer.join().unwrap();
+    }
+    drop(connection);
+    drop(runtime);
+    drop(context);
+    drop(profile);
+    drop(shared);
+    f.finish();
+    result
+}
+
 #[test]
 fn actual_profile_session_save_keeps_cursor_guard_and_retires_only_owned_spools_after_closing() {
     use crate::{
