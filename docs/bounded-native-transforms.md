@@ -39,6 +39,16 @@ store, retaining its index admission through permanent descriptor conversion.
 It emits explicit known zero when every physical byte is zero. Its caller must
 retire any unused fragment, then seal nonzero output through the common session
 before requesting a prepared edit; a completed plane alone grants no authority.
+New fill originals use bounded canonical tiles with the existing authored-color
+conversion and zero physical edge padding. Their staged original and transformed
+current plane must both survive until one batch is accepted or retired.
+
+Retained layer planning reads borrowed native metadata and keeps its placement
+arrays charged. It includes linked mask support, independent mask reframing,
+mask-only paint-step selection and complete editable-source frame placement.
+Planning does not publish pixels. The ordinary size and work checks still apply;
+selected-pixel/folder transactions and the concrete regional editable-source
+evaluator are separate integration requirements.
 
 The final consumer must use the common captured edit, generation-bound source
 slots, sealed source-session output, retained-source action and guarded
