@@ -217,7 +217,7 @@ fn seal_sources<S: StageSession>(
     for (_, (store, mut blocks)) in stores {
         session.check()?;
         check()?;
-        blocks.sort_unstable_by_key(|b| b.digest());
+        blocks.sort_unstable_by_key(|b| b.fingerprint());
         blocks.dedup();
         seals.push(session.seal_store(&store, &blocks, &key)?);
     }

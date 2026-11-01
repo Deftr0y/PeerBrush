@@ -545,13 +545,7 @@ impl RefusedDelta {
             candidate, outputs, ..
         } = self.prepared;
         drop(candidate);
-        let mut error = None;
-        for output in outputs {
-            if let Err(reason) = output.abort(session, cleanup) {
-                error.get_or_insert(reason);
-            }
-        }
-        error.map_or(Ok(()), Err)
+        output::abort_outputs(outputs, session, cleanup)
     }
 }
 impl PreparedDelta {

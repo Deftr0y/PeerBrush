@@ -64,15 +64,20 @@ impl RasterBatch {
         session: &impl super::super::scene::StageSession,
         cleanup: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        let mut error = None;
+        let count = self
+            .rasters
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(2))
+            .ok_or("Native retirement footprint overflow")?;
+        let mut outputs = Vec::new();
+        outputs.try_reserve_exact(count).map_err(|_| {
+            "Native retirement allocation refused; provisional bytes remain charged"
+        })?;
         for raster in self.rasters {
-            if let Err(reason) = raster.output.abort(session, cleanup) {
-                error.get_or_insert(reason);
-            }
+            outputs.push(raster.output);
             if let RetainedUpdate::ReplaceOutput { source, .. } = raster.retained {
-                if let Err(reason) = source.abort(session, cleanup) {
-                    error.get_or_insert(reason);
-                }
+                outputs.push(source);
             }
         }
         if let Some(selection) = self.selection {
@@ -81,13 +86,11 @@ impl RasterBatch {
                 .flatten()
             {
                 if let CoveragePixels::Output(output) = coverage.pixels {
-                    if let Err(reason) = output.into_draft().abort(session, cleanup) {
-                        error.get_or_insert(reason);
-                    }
+                    outputs.push(output);
                 }
             }
         }
-        error.map_or(Ok(()), Err)
+        super::output::abort_outputs(outputs, session, cleanup)
     }
 }
 impl CapturedEdit {
