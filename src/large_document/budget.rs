@@ -27,6 +27,22 @@ impl Reservation {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+    /// External frozen owners only: all replaced growth buffers must already be
+    /// dropped, and `bytes` must still cover every surviving allocation capacity.
+    /// Payload fields must drop before this charge; no growth or escaping owner
+    /// is permitted after the final reservation is reduced.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) -> Result<()> {
+        let release = self.bytes.checked_sub(bytes).ok_or(Error::Budget)?;
+        self.budget
+            .0
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_sub(release)
+            })
+            .map_err(|_| Error::Corrupt)?;
+        self.bytes = bytes;
+        Ok(())
+    }
     pub(super) fn uses_budget(&self, budget: &ResidentBudget) -> bool {
         self.budget.same_pool(budget)
     }
@@ -141,5 +157,31 @@ mod tests {
             assert!(bytes.iter().all(|b| *b == 0));
         }
         assert!(matches!(allocate(usize::MAX), Err(Error::Budget)));
+    }
+
+    #[test]
+    fn frozen_external_owner_can_release_only_its_unused_peak_reservation() {
+        let budget = ResidentBudget::new(1024).unwrap();
+        let shared = budget.clone();
+        let mut peak = budget.reserve_bytes(768, 1024).unwrap();
+        let other = shared.reserve_bytes(128, 128).unwrap();
+        assert_eq!(shared.used(), 896);
+        assert!(matches!(peak.shrink_to(769), Err(Error::Budget)));
+        assert_eq!(peak.bytes(), 768);
+        assert_eq!(shared.used(), 896);
+        peak.shrink_to(256).unwrap();
+        assert_eq!(peak.bytes(), 256);
+        assert_eq!(shared.used(), 384);
+        peak.shrink_to(256).unwrap();
+        assert_eq!(shared.used(), 384);
+        let released = shared.reserve_bytes(640, 640).unwrap();
+        assert_eq!(shared.used(), 1024);
+        assert!(matches!(shared.reserve_bytes(1, 1), Err(Error::Budget)));
+        assert!(matches!(peak.shrink_to(usize::MAX), Err(Error::Budget)));
+        drop(released);
+        drop(other);
+        assert_eq!(shared.used(), 256);
+        drop(peak);
+        assert_eq!(shared.used(), 0);
     }
 }
