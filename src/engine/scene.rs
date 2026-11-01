@@ -1120,7 +1120,10 @@ mod tests {
         assert_eq!(snapshot.metadata().layers().len(), 1);
         assert_eq!(resident.used(), 64 * 1024);
         assert_eq!(disk.used().unwrap(), 0);
-        drop(snapshot);
+        let pending = snapshot.into_provisional_pending().unwrap();
+        assert_eq!(pending.rasters().len(), 1);
+        assert_eq!(resident.used(), 64 * 1024);
+        drop(pending);
         assert_eq!(resident.used(), 0);
     }
     #[test]
@@ -1130,6 +1133,56 @@ mod tests {
         let mut value = serde_json::to_value(&metadata).unwrap();
         value["layers"][0]["unexpected_native_bytes"] = serde_json::json!([1, 2, 3]);
         assert!(serde_json::from_value::<Document36>(value).is_err());
+    }
+    #[test]
+    fn provisional_handoff_refuses_reservation_and_protected_inspection_owners() {
+        let resident = ResidentBudget::new(1024 * 1024).unwrap();
+        let make = || {
+            let mut capture = Capture::default();
+            let metadata =
+                Document36::capture(&Document::new(4, 4).unwrap(), &mut capture).unwrap();
+            let identity = SceneIdentity {
+                project_id: super::super::id(),
+                document_id: metadata.id.clone(),
+                revision: metadata.revision,
+            };
+            let pending = PendingScene::new(
+                admitted(metadata, &resident),
+                RasterRoster::new(vec![Surface::zero(4, 4, 8).unwrap()]).unwrap(),
+                resident.clone(),
+                DiskBudget::new(1024 * 1024, 8).unwrap(),
+            )
+            .unwrap();
+            SceneSnapshot::new(identity, pending, vec![], None, None).unwrap()
+        };
+        let mut leased = make();
+        leased.leases = Arc::new(vec![super::super::Lease {
+            id: "held".into(),
+            owner: "human".into(),
+            description: "held".into(),
+            scopes: vec![],
+            expires: u64::MAX,
+        }]);
+        assert!(leased.into_provisional_pending().is_err());
+        assert_eq!(resident.used(), 0);
+        let mut inspected = make();
+        inspected
+            .runtime_views
+            .structure
+            .push(crate::psd::SourceLayerInfo {
+                source_index: 0,
+                parent_index: None,
+                name: "Protected".into(),
+                kind: "paint".into(),
+                bounds: [0, 0, 4, 4],
+                visible: true,
+                has_mask: false,
+                tags: vec![],
+                warnings: vec![],
+                details_truncated: false,
+            });
+        assert!(inspected.into_provisional_pending().is_err());
+        assert_eq!(resident.used(), 0);
     }
     #[test]
     fn liquify_clip_pixels_are_roster_sources_never_inline_metadata() {
@@ -1165,3 +1218,4 @@ mod tests {
         assert!(invalid.visit_rasters(|_| Ok(())).is_err());
     }
 }
+
