@@ -11,6 +11,34 @@ pub(crate) use permissions::preserve as preserve_permissions;
 #[cfg(windows)]
 pub(crate) use permissions::wide_absolute_file_path;
 
+#[derive(Clone, Copy)]
+enum FilePolicy {
+    Legacy,
+    Source36,
+}
+impl FilePolicy {
+    fn file_bytes(self) -> u64 {
+        match self {
+            Self::Legacy => 256 * 1024 * 1024,
+            Self::Source36 => 64 * 1024 * 1024 * 1024,
+        }
+    }
+    fn backup_bytes(self) -> u64 {
+        match self {
+            Self::Legacy => 1024 * 1024 * 1024,
+            Self::Source36 => 64 * 1024 * 1024 * 1024,
+        }
+    }
+    fn exceeded(self) -> &'static str {
+        match self {
+            Self::Legacy => "File exceeds the 256 MiB safety-check limit; original retained",
+            Self::Source36 => {
+                "File exceeds the 64 GiB Source36 safety-check limit; original retained"
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Version {
     pub identity: (u64, u64),
@@ -118,12 +146,19 @@ pub(crate) fn version_with_check(
     path: &Path,
     check: impl Fn() -> Result<(), String>,
 ) -> Result<Version, String> {
+    version_bounded(path, FilePolicy::Legacy, check)
+}
+fn version_bounded(
+    path: &Path,
+    policy: FilePolicy,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<Version, String> {
     check()?;
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
     let identity = identity(&file)?;
     let before = stamp(&file)?;
-    if before.0 > 256 * 1024 * 1024 {
-        return Err("File exceeds the 256 MiB safety-check limit; original retained".into());
+    if before.0 > policy.file_bytes() {
+        return Err(policy.exceeded().into());
     }
     let mut fingerprint = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = [0u8; 64 * 1024];
@@ -135,7 +170,7 @@ pub(crate) fn version_with_check(
             break;
         }
         total += n as u64;
-        if total > 256 * 1024 * 1024 {
+        if total > policy.file_bytes() {
             return Err("File grew beyond its safety-check limit; original retained".into());
         }
         fingerprint.update(&buffer[..n]);
@@ -155,8 +190,16 @@ pub(crate) fn version_with_check(
     })
 }
 pub fn snapshot(path: &Path) -> Result<Option<Version>, String> {
+    snapshot_bounded(path, FilePolicy::Legacy, || Ok(()))
+}
+fn snapshot_bounded(
+    path: &Path,
+    policy: FilePolicy,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<Option<Version>, String> {
+    check()?;
     match fs::metadata(path) {
-        Ok(_) => version(path).map(Some),
+        Ok(_) => version_bounded(path, policy, check).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
     }
@@ -236,9 +279,18 @@ pub struct Lease {
     _file: LockedFile,
     pub path: PathBuf,
     pub expected: Option<Version>,
+    policy: FilePolicy,
 }
 impl Lease {
     pub fn acquire(path: &Path) -> Result<Self, String> {
+        Self::acquire_bounded(path, FilePolicy::Legacy, || Ok(()))
+    }
+    fn acquire_bounded(
+        path: &Path,
+        policy: FilePolicy,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        check()?;
         let path = canonical_destination(path)?;
         let dir = path
             .parent()
@@ -267,15 +319,19 @@ impl Lease {
             "Another PeerBrush save is using this directory. Retry when it finishes.".to_string()
         })?;
         let file = LockedFile(file);
-        let expected = snapshot(&path)?;
+        let expected = snapshot_bounded(&path, policy, check)?;
         Ok(Self {
             _file: file,
             path,
             expected,
+            policy,
         })
     }
     pub fn validate(&self) -> Result<(), String> {
-        if snapshot(&self.path)? != self.expected {
+        self.validate_checked(|| Ok(()))
+    }
+    fn validate_checked(&self, check: impl Fn() -> Result<(), String>) -> Result<(), String> {
+        if snapshot_bounded(&self.path, self.policy, check)? != self.expected {
             return Err(
                 "Destination changed while saving. Current work preserved; use a new Save As path."
                     .into(),
@@ -285,10 +341,16 @@ impl Lease {
     }
     /// Keep up to three preceding byte-exact files, never prune before publishing.
     pub fn preserve(&self) -> Result<Option<PathBuf>, String> {
+        self.preserve_checked(|| Ok(()))
+    }
+    fn preserve_checked(
+        &self,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<Option<PathBuf>, String> {
         let Some(expected) = self.expected else {
             return Ok(None);
         };
-        self.validate()?;
+        self.validate_checked(&check)?;
         let dir = self.path.parent().unwrap().join(".peerbrush-versions");
         let quota = dir.join("quota.lock");
         if quota.exists() && !regular(&quota) {
@@ -309,9 +371,16 @@ impl Lease {
             .filter(|e| regular(&e.path()))
             .filter_map(|e| e.metadata().ok())
             .map(|m| m.len())
-            .sum::<u64>();
-        if total.saturating_add(expected.bytes) > 1024 * 1024 * 1024 {
-            return Err("Previous-save storage is full (1 GiB per directory). Preserve or remove old versions before overwriting; Save As to a new directory is available.".into());
+            .try_fold(0u64, |total, bytes| {
+                total
+                    .checked_add(bytes)
+                    .ok_or("Previous-save byte accounting overflow")
+            })?;
+        if total.saturating_add(expected.bytes) > self.policy.backup_bytes() {
+            return Err(match self.policy {
+                FilePolicy::Legacy => "Previous-save storage is full (1 GiB per directory). Preserve or remove old versions before overwriting; Save As to a new directory is available.",
+                FilePolicy::Source36 => "Source36 previous-save storage is full (64 GiB per directory). Current file retained; preserve old versions or choose a new Save As directory.",
+            }.into());
         }
         let key = destination_key(&self.path);
         let name = format!(
@@ -328,10 +397,27 @@ impl Lease {
             .write(true)
             .open(&backup)
             .map_err(|e| e.to_string())?;
+        let backup_identity = identity(&output)?;
         let result = (|| {
             preserve_permissions(&self.path, &backup)?;
-            let copied = std::io::copy(&mut (&mut source).take(expected.bytes + 1), &mut output)
-                .map_err(|e| e.to_string())?;
+            let mut buffer = [0u8; 64 * 1024];
+            let mut copied = 0u64;
+            loop {
+                check()?;
+                let n = source.read(&mut buffer).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                copied = copied
+                    .checked_add(n as u64)
+                    .ok_or("Previous-save length overflow")?;
+                if copied > expected.bytes {
+                    return Err(
+                        "Previous file grew while preserving it; destination retained".into(),
+                    );
+                }
+                output.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
+            }
             if copied != expected.bytes {
                 return Err(
                     "Previous file changed while preserving it; destination retained".into(),
@@ -340,16 +426,26 @@ impl Lease {
             output.flush().map_err(|e| e.to_string())?;
             output.sync_all().map_err(|e| e.to_string())?;
             drop(output);
-            let saved = version(&backup)?;
-            if saved.bytes != expected.bytes || saved.fingerprint != expected.fingerprint {
+            let saved = version_bounded(&backup, self.policy, &check)?;
+            if saved.identity != backup_identity
+                || saved.bytes != expected.bytes
+                || saved.fingerprint != expected.fingerprint
+            {
                 return Err("Previous-save verification failed; original file retained".into());
             }
-            self.validate()?;
+            self.validate_checked(&check)?;
             crate::server::sync_parent(&backup)?;
             Ok(Some(backup.clone()))
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&backup);
+            // A replacement at this freshly generated name is never ours to delete.
+            if open_for_identity(&backup)
+                .ok()
+                .and_then(|file| identity(&file).ok())
+                == Some(backup_identity)
+            {
+                let _ = fs::remove_file(&backup);
+            }
         }
         result
     }
@@ -390,10 +486,201 @@ impl Lease {
     }
 }
 
+/// Explicit Source36 save guard. Legacy callers retain their existing file and
+/// backup limits. This lease grants no scene/codec/publication authority; the
+/// native save driver must retain its SourceOperation and completed scene proof.
+pub(crate) struct NativeLease(Lease);
+impl NativeLease {
+    pub(crate) fn acquire(
+        path: &Path,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        Lease::acquire_bounded(path, FilePolicy::Source36, check).map(Self)
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.0.path
+    }
+    pub(crate) fn expected(&self) -> Option<Version> {
+        self.0.expected
+    }
+    pub(crate) fn same_destination(
+        &self,
+        source: &Path,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if canonical_destination(source)? == self.0.path {
+            return Ok(true);
+        }
+        Ok(
+            match (
+                snapshot_bounded(source, FilePolicy::Source36, check)?,
+                self.0.expected,
+            ) {
+                (Some(a), Some(b)) => a.identity == b.identity,
+                _ => false,
+            },
+        )
+    }
+    pub(crate) fn validate(&self, check: impl Fn() -> Result<(), String>) -> Result<(), String> {
+        self.0.validate_checked(check)
+    }
+    pub(crate) fn preserve(
+        &self,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<Option<PathBuf>, String> {
+        self.0.preserve_checked(check)
+    }
+    pub(crate) fn prune(&self, newest: &Path) {
+        self.0.prune(newest)
+    }
+    pub(crate) fn verified_version(
+        &self,
+        path: &Path,
+        bytes: u64,
+        sha256: [u8; 32],
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<Version, String> {
+        let actual = version_bounded(path, FilePolicy::Source36, check)?;
+        if actual.bytes != bytes || actual.fingerprint != sha256 {
+            return Err("Source36 file changed before final verification; current work and previous version retained".into());
+        }
+        Ok(actual)
+    }
+}
+
 pub fn source_conflict(path: Option<&Path>, expected: Option<Version>) -> bool {
     match (path, expected) {
-        (Some(path), Some(expected)) => snapshot(path).map_or(true, |v| v != Some(expected)),
+        (Some(path), Some(expected)) => {
+            let policy = if expected.bytes > FilePolicy::Legacy.file_bytes() {
+                FilePolicy::Source36
+            } else {
+                FilePolicy::Legacy
+            };
+            snapshot_bounded(path, policy, || Ok(())).map_or(true, |v| v != Some(expected))
+        }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod native_lease_tests {
+    use super::*;
+    use std::cell::Cell;
+    fn directory() -> PathBuf {
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let path = parent.join(format!("pb-native-save-guard-{}", crate::engine::id()));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+    fn cleanup(path: &Path) {
+        assert_eq!(fs::canonicalize(path).unwrap(), path);
+        assert_eq!(
+            path.parent().unwrap(),
+            fs::canonicalize(std::env::temp_dir()).unwrap()
+        );
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("pb-native-save-guard-"));
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn explicit_native_lease_preserves_exact_small_file_and_verifies_final_bytes() {
+        let dir = directory();
+        let path = dir.join("native.psb");
+        let bytes: Vec<_> = (0..200123).map(|i| (i * 29 + 17) as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+        let calls = Cell::new(0);
+        let backup = lease
+            .preserve(|| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(calls.get() > 8);
+        assert_eq!(fs::read(&backup).unwrap(), bytes);
+        assert!(lease.same_destination(&path, || Ok(())).unwrap());
+        let sha = finish_fingerprint({
+            let mut h = ring::digest::Context::new(&ring::digest::SHA256);
+            h.update(&bytes);
+            h
+        });
+        assert_eq!(
+            lease
+                .verified_version(&path, bytes.len() as u64, sha, || Ok(()))
+                .unwrap(),
+            lease.expected().unwrap()
+        );
+        assert!(lease
+            .verified_version(&path, bytes.len() as u64, [0; 32], || Ok(()))
+            .is_err());
+        lease.validate(|| Ok(())).unwrap();
+        fs::write(&path, b"changed source").unwrap();
+        assert!(lease.validate(|| Ok(())).is_err());
+        assert_eq!(fs::read(&backup).unwrap(), bytes);
+        drop(lease);
+        cleanup(&dir);
+    }
+    #[test]
+    fn cancelled_stream_and_missing_destination_still_run_admission() {
+        let dir = directory();
+        let path = dir.join("native.psb");
+        fs::write(&path, vec![71; 200123]).unwrap();
+        let calls = Cell::new(0);
+        assert!(version_bounded(&path, FilePolicy::Source36, || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                Err("cancelled exact stream".into())
+            } else {
+                Ok(())
+            }
+        })
+        .is_err());
+        assert_eq!(calls.get(), 3);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 200123);
+        assert!(
+            NativeLease::acquire(&dir.join("absent.psb"), || Err("closed session".into())).is_err()
+        );
+        assert!(!dir.join("absent.psb").exists());
+        cleanup(&dir);
+    }
+    #[test]
+    fn late_foreign_backup_replacement_is_refused_and_retained() {
+        let dir = directory();
+        let path = dir.join("native.psb");
+        let bytes = vec![31; 200123];
+        fs::write(&path, &bytes).unwrap();
+        let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+        let foreign = std::cell::RefCell::new(None);
+        let held = dir.join("original-owned-partial.psb");
+        let result = lease.preserve(|| {
+            if foreign.borrow().is_none() {
+                let file = fs::read_dir(dir.join(".peerbrush-versions"))
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path())
+                    .find(|p| {
+                        p.extension().is_some_and(|e| e == "psb")
+                            && fs::metadata(p).is_ok_and(|m| m.len() > 0)
+                    });
+                if let Some(file) = file {
+                    fs::rename(&file, &held).unwrap();
+                    fs::write(&file, b"foreign bytes stay").unwrap();
+                    *foreign.borrow_mut() = Some(file);
+                }
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        let foreign = foreign.into_inner().unwrap();
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign bytes stay");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(held.exists());
+        drop(lease);
+        cleanup(&dir);
     }
 }
 #[derive(Clone)]
