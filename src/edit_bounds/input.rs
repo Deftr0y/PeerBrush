@@ -399,6 +399,80 @@ pub(crate) struct InputTile {
     key: (u32, u32),
     bytes: PinnedBytes,
 }
+
+/// Actual semantic baseline->proposal writes, excluding unchanged physical
+/// padding. Call before staging the SAME immutable proposal through its token.
+/// This box is input to the engine command guard, never a permission itself.
+pub(crate) fn changed_bounds(
+    input: &RasterInput<'_>,
+    frame: Option<&InputFrame>,
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Option<[i32; 4]>, String> {
+    check()?;
+    let (shape, origin) = if let Some(frame) = frame {
+        input.validate(frame.binding())?;
+        (frame.geometry().new_shape(), frame.geometry().new_origin())
+    } else {
+        (input.shape(), input.origin())
+    };
+    let bpp = if input.depth() == 16 { 8 } else { 4 };
+    let length = (TILE * TILE) as usize * bpp;
+    if key.0 >= shape[0].div_ceil(TILE)
+        || key.1 >= shape[1].div_ceil(TILE)
+        || !before.uses_budget(input.pool())
+        || !after.uses_budget(input.pool())
+        || before.len() != length
+        || after.len() != length
+    {
+        return Err("Native write comparison differs from its captured owner or frame".into());
+    }
+    let left = key.0 * TILE;
+    let top = key.1 * TILE;
+    let stride = TILE as usize * bpp;
+    let mut bounds: Option<[i32; 4]> = None;
+    for (y, (old, new)) in before
+        .chunks_exact(stride)
+        .zip(after.chunks_exact(stride))
+        .enumerate()
+    {
+        check()?;
+        if old == new {
+            continue;
+        }
+        if top + y as u32 >= shape[1] {
+            return Err("Native edit changed bottom physical padding".into());
+        }
+        for (x, (old, new)) in old.chunks_exact(bpp).zip(new.chunks_exact(bpp)).enumerate() {
+            if old == new {
+                continue;
+            }
+            if left + x as u32 >= shape[0] {
+                return Err("Native edit changed right physical padding".into());
+            }
+            let x = origin[0]
+                .checked_add((left + x as u32) as i32)
+                .ok_or("Native write coordinate overflow")?;
+            let y = origin[1]
+                .checked_add((top + y as u32) as i32)
+                .ok_or("Native write coordinate overflow")?;
+            let right = x.checked_add(1).ok_or("Native write coordinate overflow")?;
+            let bottom = y.checked_add(1).ok_or("Native write coordinate overflow")?;
+            bounds = Some(bounds.map_or([x, y, right, bottom], |old| {
+                [
+                    old[0].min(x),
+                    old[1].min(y),
+                    old[2].max(right),
+                    old[3].max(bottom),
+                ]
+            }));
+        }
+    }
+    check()?;
+    Ok(bounds)
+}
 pub(crate) struct PreparedPixels<'a> {
     binding: InputBinding,
     area: [i32; 4],

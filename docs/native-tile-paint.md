@@ -107,6 +107,11 @@ that geometry accidentally.
 pressure capacities before allocation. Both owners stay charged while geometry
 is shifted into `LocalStroke`; releasing the parsed owner cannot release the
 shifted owner's admission. Pressure overrides reuse their existing capacity.
+The write comparator derives document-coordinate boxes from actual semantic
+baseline/proposal bytes, including native16 low bits and hidden RGB. A changed
+physical padding sample is refused. These boxes must pass the captured engine
+command's write guard before the same immutable proposal is staged; they grant
+no independent write permission and exclude read halos.
 
 `edit_bounds::output::TileOutput` stages one plane through the actual
 `SourceSession` and the engine's `OutputDraft`. It compares full original padded

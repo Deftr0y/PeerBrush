@@ -1373,3 +1373,85 @@ fn parsed_command_points_keep_admission_through_shifted_owner_and_refuse_before_
     .is_err());
     assert_eq!(runtime.resident().used(), before);
 }
+
+#[test]
+fn actual_changed_pixel_boxes_include_native_low_bits_but_refuse_physical_padding() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let source = source(depth);
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let original = input.prepare_tile((0, 0), &mut || Ok(())).unwrap();
+        assert_eq!(
+            changed_bounds(
+                &input,
+                None,
+                (0, 0),
+                original.bytes(),
+                original.bytes(),
+                &mut || Ok(())
+            )
+            .unwrap(),
+            None
+        );
+        let mut changed =
+            ScratchBytes::new(input.pool(), original.bytes().len(), original.bytes().len())
+                .unwrap();
+        changed.copy_from_slice(original.bytes());
+        let bpp = if depth == 16 { 8 } else { 4 };
+        let at = (6 * 256 + 8) * bpp;
+        changed[at + usize::from(depth == 16)] ^= 1;
+        let changed = changed.freeze();
+        assert_eq!(
+            changed_bounds(
+                &input,
+                None,
+                (0, 0),
+                original.bytes(),
+                &changed,
+                &mut || Ok(())
+            )
+            .unwrap(),
+            Some([5, 8, 6, 9])
+        );
+        let mut padding =
+            ScratchBytes::new(input.pool(), original.bytes().len(), original.bytes().len())
+                .unwrap();
+        padding.copy_from_slice(original.bytes());
+        padding[9 * bpp] ^= 1;
+        assert!(changed_bounds(
+            &input,
+            None,
+            (0, 0),
+            original.bytes(),
+            &padding.freeze(),
+            &mut || Ok(())
+        )
+        .is_err());
+        let mut padding =
+            ScratchBytes::new(input.pool(), original.bytes().len(), original.bytes().len())
+                .unwrap();
+        padding.copy_from_slice(original.bytes());
+        padding[7 * 256 * bpp] ^= 1;
+        assert!(changed_bounds(
+            &input,
+            None,
+            (0, 0),
+            original.bytes(),
+            &padding.freeze(),
+            &mut || Ok(())
+        )
+        .is_err());
+        assert!(changed_bounds(
+            &input,
+            None,
+            (0, 0),
+            original.bytes(),
+            &changed,
+            &mut || Err("Cancelled write proof".into())
+        )
+        .is_err());
+    }
+}
