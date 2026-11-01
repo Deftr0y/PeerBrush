@@ -212,6 +212,54 @@ impl<'a> RasterInput<'a> {
     ) -> Result<PreparedPixels<'a>, String> {
         self.prepare_linear(area, 16000, crate::raster::backed::MAX_REGION_PIXELS, check)
     }
+    /// Inclusive floating queries in document coordinates, with the exact
+    /// bilinear integer support admitted separately. Only physical source
+    /// intersections are read; exterior zero follows from captured geometry.
+    pub(crate) fn prepare_samples(
+        &self,
+        queries: [f32; 4],
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<PreparedSamples<'a>, String> {
+        check()?;
+        if queries.iter().any(|v| !v.is_finite() || v.abs() > 800_000.)
+            || queries[0] > queries[2]
+            || queries[1] > queries[3]
+        {
+            return Err("Invalid native sampling query footprint".into());
+        }
+        let local = [
+            queries[0] - self.origin()[0] as f32,
+            queries[1] - self.origin()[1] as f32,
+            queries[2] - self.origin()[0] as f32,
+            queries[3] - self.origin()[1] as f32,
+        ];
+        let support = [
+            local[0].floor() as i32,
+            local[1].floor() as i32,
+            local[2].floor() as i32 + 2,
+            local[3].floor() as i32 + 2,
+        ];
+        if support[2] - support[0] > 385 || support[3] - support[1] > 385 {
+            return Err("Native bilinear footprint exceeds one complete healing halo".into());
+        }
+        let clipped = [
+            support[0].max(0),
+            support[1].max(0),
+            support[2].min(self.shape()[0] as i32),
+            support[3].min(self.shape()[1] as i32),
+        ];
+        let pixels = if clipped[0] < clipped[2] && clipped[1] < clipped[3] {
+            Some(self.prepare_linear(clipped, 385, 385 * 385, check)?)
+        } else {
+            None
+        };
+        check()?;
+        Ok(PreparedSamples {
+            binding: self.binding,
+            queries,
+            pixels,
+        })
+    }
     fn prepare_linear(
         &self,
         area: [i32; 4],
@@ -356,6 +404,39 @@ pub(crate) struct PreparedPixels<'a> {
     area: [i32; 4],
     bytes: PinnedBytes,
     _document: &'a NativeDocument,
+}
+pub(crate) struct PreparedSamples<'a> {
+    binding: InputBinding,
+    queries: [f32; 4],
+    pixels: Option<PreparedPixels<'a>>,
+}
+impl PreparedSamples<'_> {
+    pub(crate) fn sample16(&self, x: f32, y: f32) -> Result<[u16; 4], String> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || x < self.queries[0]
+            || y < self.queries[1]
+            || x > self.queries[2]
+            || y > self.queries[3]
+        {
+            return Err("Retouch sample is outside its declared source queries".into());
+        }
+        let x = x - self.binding.origin[0] as f32;
+        let y = y - self.binding.origin[1] as f32;
+        let shape = self.binding.shape;
+        if x <= -1. || y <= -1. || x >= shape[0] as f32 || y >= shape[1] as f32 {
+            return Ok([0; 4]);
+        }
+        crate::retouch::native::bilinear(x, y, |x, y| {
+            if x < 0 || y < 0 || x >= shape[0] as i32 || y >= shape[1] as i32 {
+                return Ok([0; 4]);
+            }
+            self.pixels
+                .as_ref()
+                .ok_or("Native sampling source is not prepared")?
+                .pixel16(x, y)
+        })
+    }
 }
 impl PreparedPixels<'_> {
     pub(crate) fn binding(&self) -> InputBinding {
