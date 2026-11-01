@@ -3,6 +3,7 @@ use crate::{
     raster::{blend, check_size, Raster},
 };
 use serde_json::Value;
+pub(crate) mod native;
 pub const MOVE_SNAP: f64 = 8.0;
 pub const ANGLE_SNAP: f64 = 15.0;
 pub const SCALE_SNAP: f64 = 0.1;
