@@ -201,9 +201,27 @@ mod tests {
             &|| Ok(())
         )
         .is_err());
+        // Locate the terminal user check through a successful identical build,
+        // and prove it observes the completed runtime ownership, not the old
+        // broad construction ticket that rehome correctly releases.
+        let observed_checks = Cell::new(0usize);
+        let completed = NativeDocument::new_blank(7, 5, 16, &pool, &disk, &|| {
+            observed_checks.set(observed_checks.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        let terminal_check = observed_checks.get();
+        assert!(terminal_check >= 2);
+        let completed_bytes = pool.used();
+        assert!(completed_bytes > 0);
+        drop(completed);
+        assert_eq!(pool.used(), 0);
+        let checks = Cell::new(0usize);
         let reached = Cell::new(false);
         let result = NativeDocument::new_blank(7, 5, 16, &pool, &disk, &|| {
-            if pool.used() > HEADER_BYTES {
+            checks.set(checks.get() + 1);
+            if checks.get() == terminal_check {
+                assert_eq!(pool.used(), completed_bytes);
                 reached.set(true);
                 Err("cancel after native source/header construction".into())
             } else {
@@ -211,6 +229,7 @@ mod tests {
             }
         });
         assert!(reached.get());
+        assert_eq!(checks.get(), terminal_check);
         assert!(result.is_err());
         assert_eq!(pool.used(), 0);
         assert_eq!(disk.used().unwrap(), 0);
