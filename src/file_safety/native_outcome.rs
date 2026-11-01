@@ -1,0 +1,72 @@
+//! Closed filesystem outcome boundary for external-disk accounting.
+//! Raw fact records and journal checksums never implement this authority.
+use super::NativeExternalFile;
+
+mod sealed {
+    pub trait RootOutcome {}
+}
+
+/// Implemented by the native destination writer's held publication/abort
+/// receipts, after all named identities and retired owners are reobserved.
+/// Validation may perform I/O and therefore precedes the ledger mutex.
+pub(crate) trait ExternalOutcomeProof: sealed::RootOutcome {
+    fn validate(&self, intent: [u8; 32], target: [u8; 32], growth: u64) -> Result<(), String>;
+    fn facts(&self) -> &[NativeExternalFile];
+    fn retired(&self) -> &[(u64, u64)];
+}
+
+// Concrete filesystem receipts belong to this module's native writer. Until
+// that writer is integrated there is intentionally no production implementor.
+
+#[cfg(test)]
+pub(crate) struct AccountingOutcome {
+    intent: [u8; 32],
+    target: [u8; 32],
+    growth: u64,
+    facts: Vec<NativeExternalFile>,
+    retired: Vec<(u64, u64)>,
+    accepted: bool,
+}
+#[cfg(test)]
+impl AccountingOutcome {
+    /// Accounting-only fixture. This cannot qualify filesystem publication,
+    /// source integrity or recovery authority; it is absent from production.
+    pub(crate) fn new(
+        intent: [u8; 32],
+        target: [u8; 32],
+        growth: u64,
+        facts: Vec<NativeExternalFile>,
+        retired: Vec<(u64, u64)>,
+    ) -> Self {
+        Self {
+            intent,
+            target,
+            growth,
+            facts,
+            retired,
+            accepted: true,
+        }
+    }
+    pub(crate) fn refuse(mut self) -> Self {
+        self.accepted = false;
+        self
+    }
+}
+#[cfg(test)]
+impl sealed::RootOutcome for AccountingOutcome {}
+#[cfg(test)]
+impl ExternalOutcomeProof for AccountingOutcome {
+    fn validate(&self, intent: [u8; 32], target: [u8; 32], growth: u64) -> Result<(), String> {
+        if self.accepted && (self.intent, self.target, self.growth) == (intent, target, growth) {
+            Ok(())
+        } else {
+            Err("Accounting fixture outcome refused".into())
+        }
+    }
+    fn facts(&self) -> &[NativeExternalFile] {
+        &self.facts
+    }
+    fn retired(&self) -> &[(u64, u64)] {
+        &self.retired
+    }
+}
