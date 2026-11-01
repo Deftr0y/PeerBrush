@@ -55,6 +55,7 @@
 #include "lib/jxl/enc_fields.h"
 #include "lib/jxl/enc_group.h"
 #include "lib/jxl/enc_heuristics.h"
+#include "lib/jxl/enc_iterative_rows.h"
 #include "lib/jxl/enc_modular.h"
 #include "lib/jxl/enc_noise.h"
 #include "lib/jxl/enc_params.h"
@@ -62,6 +63,8 @@
 #include "lib/jxl/enc_photon_noise.h"
 #include "lib/jxl/enc_progressive_split.h"
 #include "lib/jxl/enc_quant_weights.h"
+#include "lib/jxl/enc_resampled_rows.h"
+#include "lib/jxl/enc_sharper_rows.h"
 #include "lib/jxl/enc_splines.h"
 #include "lib/jxl/enc_toc.h"
 #include "lib/jxl/enc_xyb.h"
@@ -662,13 +665,10 @@ struct PixelStatsForChromacityAdjustment {
   }
 };
 
-void ComputeChromacityAdjustments(const CompressParams& cparams,
-                                  const Image3F& opsin, const Rect& rect,
-                                  FrameHeader* frame_header) {
-  if (frame_header->encoding != FrameEncoding::kVarDCT ||
-      cparams.max_error_mode) {
-    return;
-  }
+void SetChromacityAdjustments(
+    const CompressParams& cparams,
+    const PixelStatsForChromacityAdjustment& pixel_stats,
+    FrameHeader* frame_header) {
   // 1) Distance based approach for chromacity adjustment:
   float x_qm_scale_steps[3] = {2.5f, 5.5f, 9.5f};
   frame_header->x_qm_scale = 3;
@@ -680,15 +680,24 @@ void ComputeChromacityAdjustments(const CompressParams& cparams,
   // 2) Pixel-based approach for chromacity adjustment:
   // look at the individual pixels and make a guess how difficult
   // the image would be based on the worst case pixel.
-  PixelStatsForChromacityAdjustment pixel_stats;
-  if (cparams.speed_tier <= SpeedTier::kSquirrel) {
-    pixel_stats.Calc(&opsin, rect);
-  }
   // For X take the most severe adjustment.
   frame_header->x_qm_scale = std::max<int>(
       frame_header->x_qm_scale, 2 + pixel_stats.HowMuchIsXChannelPixelized());
   // B only adjusted by pixel-based approach.
   frame_header->b_qm_scale = 2 + pixel_stats.HowMuchIsBChannelPixelized();
+}
+
+void ComputeChromacityAdjustments(const CompressParams& cparams,
+                                  const Image3F& opsin, const Rect& rect,
+                                  FrameHeader* frame_header) {
+  if (frame_header->encoding != FrameEncoding::kVarDCT ||
+      cparams.max_error_mode) {
+    return;
+  }
+  PixelStatsForChromacityAdjustment pixel_stats;
+  if (cparams.speed_tier <= SpeedTier::kSquirrel)
+    pixel_stats.Calc(&opsin, rect);
+  SetChromacityAdjustments(cparams, pixel_stats, frame_header);
 }
 
 void ComputeNoiseParams(const CompressParams& cparams, bool streaming_mode,
@@ -1497,6 +1506,192 @@ Status EncodeGroups(const FrameHeader& frame_header,
   return true;
 }
 
+#ifdef JPEGXL_PEERBRUSH_RESAMPLING_STREAMING_TEST
+// Private component qualification counters; absent from normal builds. The
+// encoder computes group patches serially, even when pixel conversion is pooled.
+static size_t resampled_test_groups = 0;
+static size_t resampled_test_nonzero_groups = 0;
+extern "C" size_t PeerBrushResampledGroupsForTest() {
+  return resampled_test_groups;
+}
+extern "C" size_t PeerBrushResampledNonzeroGroupsForTest() {
+  return resampled_test_nonzero_groups;
+}
+#endif
+
+// Internal resampling2 producer. Original samples are requested only as bounded
+// pieces; all band/working fields use the existing native memory manager.
+Status PrepareResampledPatch(
+    JxlMemoryManager* manager, const CompressParams& cparams,
+    const FrameInfo& frame_info, const CodecMetadata* metadata,
+    JxlEncoderChunkedFrameAdapter& data, const JxlCmsInterface& cms,
+    ThreadPool* pool, const Rect& patch, size_t raw_group_width,
+    size_t raw_group_height, bool first, FrameHeader* header, Image3F* color,
+    std::vector<ImageF>* extra) {
+  JxlChunkedFrameInputSource input = data.GetInputSource();
+  const bool want_linear = cparams.speed_tier <= SpeedTier::kKitten;
+  auto copy_color = [&](Rect rect, Image3F* target, Image3F* linear) -> Status {
+    bool interleaved = false;
+    JXL_RETURN_IF_ERROR(CopyColorChannels(input, rect, frame_info, metadata->m,
+                                          pool, target, nullptr, &interleaved));
+    JXL_ENSURE(!interleaved);
+    return ToXYB(metadata->m.color_encoding, metadata->m.IntensityTarget(),
+                 nullptr, pool, target, cms, linear);
+  };
+  auto copy_alpha = [&](Rect rect, ImageF* target) -> Status {
+    JxlPixelFormat format = {1, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+    input.get_extra_channel_pixel_format(input.opaque, 0, &format);
+    format.num_channels = 1;
+    const size_t bits = GetBitDepth(frame_info.image_bit_depth,
+                                    metadata->m.extra_channel_info[0], format);
+    size_t stride = 0;
+    auto buffer = GetExtraChannelBuffer(input, 0, rect.x0(), rect.y0(),
+                                        rect.xsize(), rect.ysize(), &stride);
+    JXL_ENSURE(buffer);
+    return ConvertFromExternalPlaneNoSizeCheck(
+        reinterpret_cast<const uint8_t*>(buffer.get()), rect.xsize(),
+        rect.ysize(), stride, bits, format, 0, pool, target);
+  };
+  resampled_rows::Bands<decltype(copy_color), decltype(copy_alpha)> bands(
+      data.xsize, data.ysize, copy_color, copy_alpha, want_linear);
+  JXL_RETURN_IF_ERROR(bands.Init(manager));
+  // The pinned first-group statistics inspect ORIGINAL XYB, before filtering.
+  if (first) {
+    PixelStatsForChromacityAdjustment stats;
+    if (cparams.speed_tier <= SpeedTier::kSquirrel) {
+      const size_t width = RoundUpToBlockDim(raw_group_width),
+                   height = RoundUpToBlockDim(raw_group_height);
+      JXL_ASSIGN_OR_RETURN(Image3F rows, Image3F::Create(manager, width, 2));
+      for (size_t c = 0; c < 3; ++c)
+        JXL_ENSURE(bands.Color(c, 0, 0, width, rows.PlaneRow(c, 0)));
+      for (size_t y = 1; y < height; ++y) {
+        const size_t current = y % 2, previous = 1 - current;
+        for (size_t c = 0; c < 3; ++c)
+          JXL_ENSURE(bands.Color(c, y, 0, width, rows.PlaneRow(c, current)));
+        for (size_t x = 1; x < width; ++x) {
+          const float cx = rows.ConstPlaneRow(0, current)[x],
+                      px = rows.ConstPlaneRow(0, current)[x - 1],
+                      py = rows.ConstPlaneRow(0, previous)[x];
+          stats.dx = std::max(stats.dx,
+                              std::max(std::abs(cx - px), std::abs(cx - py)));
+          const float cy = rows.ConstPlaneRow(1, current)[x],
+                      cb = rows.ConstPlaneRow(2, current)[x];
+          const float prev = rows.ConstPlaneRow(2, current)[x - 1],
+                      prev_row = rows.ConstPlaneRow(2, previous)[x];
+          const float diff = cb - cy,
+                      diff_prev = prev - rows.ConstPlaneRow(1, current)[x - 1],
+                      diff_row = prev_row - rows.ConstPlaneRow(1, previous)[x];
+          stats.db = std::max(stats.db, std::max(std::abs(diff - diff_prev),
+                                                 std::abs(diff - diff_row)));
+          float exposed = cb - cy * 1.2;
+          if (exposed >= 0) {
+            exposed *= std::abs(cb - prev) + std::abs(cb - prev_row);
+            stats.exposed_blue = std::max(stats.exposed_blue, exposed);
+          }
+        }
+      }
+    }
+    SetChromacityAdjustments(cparams, stats, header);
+  }
+  const size_t padded_width = RoundUpToBlockDim(data.xsize),
+               padded_height = RoundUpToBlockDim(data.ysize);
+  if (cparams.speed_tier <= SpeedTier::kGlacier) {
+    const size_t fw = std::min(iterative_rows::kSide, DivCeil(padded_width, 2)),
+                 fh =
+                     std::min(iterative_rows::kSide, DivCeil(padded_height, 2));
+    JXL_ASSIGN_OR_RETURN(ImageF initial, ImageF::Create(manager, fw, fh));
+    JXL_ASSIGN_OR_RETURN(ImageF ping, ImageF::Create(manager, fw, fh));
+    JXL_ASSIGN_OR_RETURN(ImageF pong, ImageF::Create(manager, fw, fh));
+    JXL_ASSIGN_OR_RETURN(
+        ImageF scratch,
+        ImageF::Create(manager, iterative_rows::kScratchFloats, 1));
+    const size_t stride = static_cast<size_t>(initial.PixelsPerRow());
+    JXL_ENSURE(stride == static_cast<size_t>(ping.PixelsPerRow()) &&
+               stride == static_cast<size_t>(pong.PixelsPerRow()));
+    const iterative_rows::Workspace work{
+        initial.Row(0),
+        ping.Row(0),
+        pong.Row(0),
+        stride,
+        fh,
+        stride * fh,
+        scratch.Row(0),
+        static_cast<size_t>(scratch.PixelsPerRow())};
+    for (size_t c = 0; c < 3; ++c)
+      for (size_t y = 0; y < patch.ysize(); y += iterative_rows::kTarget)
+        for (size_t x = 0; x < patch.xsize(); x += iterative_rows::kTarget) {
+          JXL_ENSURE(iterative_rows::Region(
+              padded_width, padded_height, patch.x0() + x, patch.y0() + y,
+              std::min(iterative_rows::kTarget, patch.xsize() - x),
+              std::min(iterative_rows::kTarget, patch.ysize() - y), work,
+              [&](size_t row, size_t first, size_t count, float* target) {
+                return bands.Color(c, row, first, count, target);
+              },
+              [&](size_t row, size_t first, size_t count, const float* values) {
+                std::copy(
+                    values, values + count,
+                    color->PlaneRow(c, row - patch.y0()) + first - patch.x0());
+                return true;
+              }));
+        }
+  } else {
+    JXL_ASSIGN_OR_RETURN(
+        ImageF scratch,
+        ImageF::Create(manager, sharper_rows::kWorkspaceFloats, 1));
+    for (size_t c = 0; c < 3; ++c)
+      for (size_t x = 0; x < patch.xsize(); x += sharper_rows::kMaxWidth) {
+        JXL_ENSURE(sharper_rows::Region(
+            padded_width, padded_height, patch.x0() + x, patch.y0(),
+            std::min(sharper_rows::kMaxWidth, patch.xsize() - x), patch.ysize(),
+            scratch.Row(0), static_cast<size_t>(scratch.PixelsPerRow()),
+            [&](size_t row, size_t first, size_t count, float* target) {
+              return bands.Color(c, row, first, count, target);
+            },
+            [&](size_t row, size_t first, size_t count, const float* values) {
+              std::copy(
+                  values, values + count,
+                  color->PlaneRow(c, row - patch.y0()) + first - patch.x0());
+              return true;
+            }));
+      }
+  }
+  // Alpha's pinned box rule uses the unpadded source, including odd-edge
+  // counts.
+  JXL_ENSURE(extra->size() == 1);
+  const size_t alpha_width = DivCeil(data.xsize, 2),
+               alpha_height = DivCeil(data.ysize, 2);
+  JXL_ENSURE(patch.x0() < alpha_width && patch.y0() < alpha_height);
+  const size_t width = std::min(patch.xsize(), alpha_width - patch.x0()),
+               height = std::min(patch.ysize(), alpha_height - patch.y0());
+  const size_t start = 2 * patch.x0(),
+               count = std::min(2 * width, data.xsize - start);
+  JXL_ASSIGN_OR_RETURN(ImageF rows, ImageF::Create(manager, count, 2));
+  ImageF& alpha = (*extra)[0];
+  for (size_t y = 0; y < height; ++y) {
+    const size_t sy = 2 * (patch.y0() + y),
+                 ny = std::min<size_t>(2, data.ysize - sy);
+    for (size_t iy = 0; iy < ny; ++iy)
+      JXL_ENSURE(bands.Alpha(sy + iy, start, count, rows.Row(iy)));
+    float* target = alpha.Row(y);
+    for (size_t x = 0; x < width; ++x) {
+      float sum = 0;
+      size_t samples = 0;
+      const size_t nx = std::min<size_t>(2, data.xsize - (start + 2 * x));
+      for (size_t iy = 0; iy < ny; ++iy)
+        for (size_t ix = 0; ix < nx; ++ix) {
+          sum += rows.Row(iy)[2 * x + ix];
+          ++samples;
+        }
+      target[x] = sum / samples;
+    }
+    std::fill(target + width, target + patch.xsize(), target[width - 1]);
+  }
+  for (size_t y = height; y < patch.ysize(); ++y)
+    std::copy(alpha.Row(height - 1), alpha.Row(height - 1) + patch.xsize(),
+              alpha.Row(y));
+  return PadImageToBlockMultipleInPlace(color);
+}
+
 Status ComputeEncodingData(
     const CompressParams& cparams, const FrameInfo& frame_info,
     const CodecMetadata* metadata, JxlEncoderChunkedFrameAdapter& frame_data,
@@ -1511,12 +1706,17 @@ Status ComputeEncodingData(
   const FrameHeader& frame_header = mutable_frame_header;
   PassesSharedState& shared = enc_state.shared;
   shared.metadata = metadata;
+  const bool resampled = enc_state.streaming_mode && cparams.resampling == 2;
+  const size_t raw_width =
+      resampled ? std::min(xsize * 2, frame_data.xsize - x0 * 2) : xsize;
+  const size_t raw_height =
+      resampled ? std::min(ysize * 2, frame_data.ysize - y0 * 2) : ysize;
   if (enc_state.streaming_mode) {
     shared.frame_dim.Set(
-        xsize, ysize, frame_header.group_size_shift,
+        raw_width, raw_height, frame_header.group_size_shift,
         /*max_hshift=*/0, /*max_vshift=*/0,
         mutable_frame_header.encoding == FrameEncoding::kModular,
-        /*upsampling=*/1);
+        /*upsampling=*/resampled ? 2 : 1);
   } else {
     shared.frame_dim = frame_header.ToFrameDimensions();
   }
@@ -1553,15 +1753,21 @@ Status ComputeEncodingData(
   const size_t num_extra_channels = metadata->m.num_extra_channels;
   const ExtraChannelInfo* alpha_eci = metadata->m.Find(ExtraChannel::kAlpha);
   const ExtraChannelInfo* black_eci = metadata->m.Find(ExtraChannel::kBlack);
-  const size_t alpha_idx = alpha_eci - metadata->m.extra_channel_info.data();
-  const size_t black_idx = black_eci - metadata->m.extra_channel_info.data();
+  const size_t alpha_idx =
+      alpha_eci ? alpha_eci - metadata->m.extra_channel_info.data() : 0;
+  const size_t black_idx =
+      black_eci ? black_eci - metadata->m.extra_channel_info.data() : 0;
   const ColorEncoding c_enc = metadata->m.color_encoding;
 
   // Make the image patch bigger than the currently processed group in
   // streaming mode so that we can take into account border pixels around the
   // group when computing inverse Gaborish and adaptive quantization map.
   int max_border = enc_state.streaming_mode ? kBlockDim : 0;
-  Rect frame_rect(0, 0, frame_data.xsize, frame_data.ysize);
+  Rect frame_rect(0, 0,
+                  resampled ? DivCeil(RoundUpToBlockDim(frame_data.xsize), 2)
+                            : frame_data.xsize,
+                  resampled ? DivCeil(RoundUpToBlockDim(frame_data.ysize), 2)
+                            : frame_data.ysize);
   Rect frame_area_rect = Rect(x0, y0, xsize, ysize);
   Rect patch_rect = frame_area_rect.Extend(max_border, frame_rect);
   JXL_ENSURE(patch_rect.IsInside(frame_rect));
@@ -1582,21 +1788,32 @@ Status ComputeEncodingData(
   ImageF* black = black_eci ? &extra_channels[black_idx] : nullptr;
   bool has_interleaved_alpha = false;
   JxlChunkedFrameInputSource input = frame_data.GetInputSource();
-  if (!jpeg_data) {
-    JXL_RETURN_IF_ERROR(CopyColorChannels(input, patch_rect, frame_info,
-                                          metadata->m, pool, &color, alpha,
-                                          &has_interleaved_alpha));
+  if (resampled) {
+    JXL_RETURN_IF_ERROR(PrepareResampledPatch(
+        memory_manager, cparams, frame_info, metadata, frame_data, cms, pool,
+        patch_rect, raw_width, raw_height, enc_state.initialize_global_state,
+        &mutable_frame_header, &color, &extra_channels));
+#ifdef JPEGXL_PEERBRUSH_RESAMPLING_STREAMING_TEST
+    ++resampled_test_groups;
+    if (x0 != 0 || y0 != 0) ++resampled_test_nonzero_groups;
+#endif
+  } else {
+    if (!jpeg_data) {
+      JXL_RETURN_IF_ERROR(CopyColorChannels(input, patch_rect, frame_info,
+                                            metadata->m, pool, &color, alpha,
+                                            &has_interleaved_alpha));
+    }
+    JXL_RETURN_IF_ERROR(CopyExtraChannels(input, patch_rect, frame_info,
+                                          metadata->m, has_interleaved_alpha,
+                                          pool, &extra_channels));
   }
-  JXL_RETURN_IF_ERROR(CopyExtraChannels(input, patch_rect, frame_info,
-                                        metadata->m, has_interleaved_alpha,
-                                        pool, &extra_channels));
 
   enc_state.cparams = cparams;
 
   Image3F linear_storage;
   Image3F* linear = nullptr;
 
-  if (!jpeg_data) {
+  if (!jpeg_data && !resampled) {
     if (frame_header.color_transform == ColorTransform::kXYB &&
         frame_info.ib_needs_color_transform) {
       if (frame_header.encoding == FrameEncoding::kVarDCT &&
@@ -1634,7 +1851,7 @@ Status ComputeEncodingData(
   Rect group_rect(x0 - patch_rect.x0(), y0 - patch_rect.y0(),
                   RoundUpToBlockDim(xsize), RoundUpToBlockDim(ysize));
 
-  if (enc_state.initialize_global_state && !jpeg_data) {
+  if (enc_state.initialize_global_state && !jpeg_data && !resampled) {
     ComputeChromacityAdjustments(cparams, color, group_rect,
                                  &mutable_frame_header);
   }
@@ -1644,10 +1861,12 @@ Status ComputeEncodingData(
                      frame_dim, &mutable_frame_header,
                      &shared.image_features.noise_params);
 
-  JXL_RETURN_IF_ERROR(
-      DownsampleColorChannels(cparams, frame_header, has_jpeg_data, &color));
+  if (!resampled)
+    JXL_RETURN_IF_ERROR(
+        DownsampleColorChannels(cparams, frame_header, has_jpeg_data, &color));
 
-  if (cparams.ec_resampling != 1 && !cparams.already_downsampled) {
+  if (!resampled && cparams.ec_resampling != 1 &&
+      !cparams.already_downsampled) {
     for (ImageF& ec : extra_channels) {
       JXL_ASSIGN_OR_RETURN(ec, DownsampleImage(ec, cparams.ec_resampling));
     }
@@ -1801,7 +2020,7 @@ Status PermuteGroups(const CompressParams& cparams,
 bool CanDoStreamingEncoding(const CompressParams& cparams,
                             const FrameInfo& frame_info,
                             const CodecMetadata& metadata,
-                            const JxlEncoderChunkedFrameAdapter& frame_data) {
+                            JxlEncoderChunkedFrameAdapter& frame_data) {
   if (cparams.buffering == -1) {
     if (cparams.speed_tier < SpeedTier::kTortoise) return false;
     if (cparams.speed_tier < SpeedTier::kSquirrel &&
@@ -1843,7 +2062,25 @@ bool CanDoStreamingEncoding(const CompressParams& cparams,
     return false;
   }
   if (cparams.resampling != 1 || cparams.ec_resampling != 1) {
+#ifndef JPEGXL_PEERBRUSH_RESAMPLING_STREAMING_TEST
     return false;
+#else
+    // Private qualification only. Normal builds keep the original admission.
+    if (cparams.resampling != 2 || cparams.ec_resampling != 2 ||
+        cparams.modular_mode || cparams.keep_invisible != Override::kOn ||
+        !frame_info.ib_needs_color_transform || cparams.photon_noise_iso != 0 ||
+        !cparams.manual_noise.empty() || metadata.m.num_extra_channels != 1 ||
+        metadata.m.extra_channel_info[0].type != ExtraChannel::kAlpha ||
+        metadata.m.extra_channel_info[0].alpha_associated ||
+        metadata.m.extra_channel_info[0].dim_shift != 0)
+      return false;
+    const auto input = frame_data.GetInputSource();
+    JxlPixelFormat format = {0, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+    input.get_color_channels_pixel_format(input.opaque, &format);
+    if (format.num_channels != 3 || (format.data_type != JXL_TYPE_UINT8 &&
+                                     format.data_type != JXL_TYPE_UINT16))
+      return false;
+#endif
   }
   if (cparams.lossy_palette) {
     return false;
@@ -2069,13 +2306,18 @@ JXL_NOINLINE Status EncodeFrameStreaming(
       ModularFrameEncoder::Create(memory_manager, frame_header, cparams, true));
   std::vector<coeff_order_t> permutation;
   std::vector<size_t> dc_group_order;
-  size_t group_size = frame_header.ToFrameDimensions().group_dim;
-  JXL_RETURN_IF_ERROR(ComputePermutationForStreaming(
-      frame_data.xsize, frame_data.ysize, group_size, num_passes, permutation,
-      dc_group_order));
+  const auto full_dimensions = frame_header.ToFrameDimensions();
+  const size_t encoded_width =
+      cparams.resampling == 2 ? full_dimensions.xsize : frame_data.xsize;
+  const size_t encoded_height =
+      cparams.resampling == 2 ? full_dimensions.ysize : frame_data.ysize;
+  size_t group_size = full_dimensions.group_dim;
+  JXL_RETURN_IF_ERROR(
+      ComputePermutationForStreaming(encoded_width, encoded_height, group_size,
+                                     num_passes, permutation, dc_group_order));
   enc_state->shared.num_histograms = dc_group_order.size();
   size_t dc_group_size = group_size * kBlockDim;
-  size_t dc_group_xsize = DivCeil(frame_data.xsize, dc_group_size);
+  size_t dc_group_xsize = DivCeil(encoded_width, dc_group_size);
   size_t min_dc_global_size = 0;
   size_t group_data_offset = 0;
   PaddedBytes frame_header_bytes{memory_manager};
@@ -2094,7 +2336,7 @@ JXL_NOINLINE Status EncodeFrameStreaming(
       streaming ? 0 : total_sections);
 
   // Compute group_order_perm for all modes (centerfirst, if requested).
-  // For ooo mode, also compute inv_perm (encoding_pos → canonical_idx).
+  // For ooo mode, also compute inv_perm (encoding_pos -> canonical_idx).
   std::vector<coeff_order_t> group_order_perm;
   JXL_RETURN_IF_ERROR(PermuteGroups(cparams, frame_header.ToFrameDimensions(),
                                     num_passes, &group_order_perm, nullptr));
@@ -2140,8 +2382,8 @@ JXL_NOINLINE Status EncodeFrameStreaming(
     size_t dc_x = dc_ix % dc_group_xsize;
     size_t y0 = dc_y * dc_group_size;
     size_t x0 = dc_x * dc_group_size;
-    size_t ysize = std::min<size_t>(dc_group_size, frame_data.ysize - y0);
-    size_t xsize = std::min<size_t>(dc_group_size, frame_data.xsize - x0);
+    size_t ysize = std::min<size_t>(dc_group_size, encoded_height - y0);
+    size_t xsize = std::min<size_t>(dc_group_size, encoded_width - x0);
     size_t group_xsize = DivCeil(xsize, group_size);
     size_t group_ysize = DivCeil(ysize, group_size);
     JXL_DEBUG_V(2,
