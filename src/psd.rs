@@ -1,4 +1,5 @@
 //! Bounded PSD v1 / PSB v2 codecs. Unsupported Photoshop features are never silently rewritten.
+pub(crate) mod import36;
 pub(crate) mod bulk36;
 pub(crate) mod canonical36;
 mod composite;
