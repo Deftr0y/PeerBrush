@@ -1,5 +1,11 @@
 # PeerBrush v0.3 — development
 
+Native preview rows (unreleased) now retain admitted display stripes independently
+of their captured source session. The raw provider preserves the existing 8/16-bit
+preview sampling grid, target isolation and display projection; unsupported ICC,
+mask, effect and editable-source providers fail explicitly. Live native routing
+and complete provider qualification remain integration gates.
+
 November 1 native-source foundations (unreleased): explicit captured scenes,
 fallible prepared regions, native tile edit kernels and complete bounded Source36
 container verification are being integrated. Source36 has its own strict metadata,
