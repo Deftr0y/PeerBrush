@@ -375,12 +375,13 @@ mod tests {
         assert_eq!(source.origin(), original.origin);
         assert_eq!(source.contours(), &original.contours);
         let metadata = source.metadata_bytes();
-        assert_eq!(pool.used(), metadata);
+        let descriptors = source.mask().physical_tiles().count() * 512 + 128;
+        assert_eq!(pool.used(), metadata + descriptors);
         let prepared = source
             .prepare_region(Region::new([0, 0, 8, 4]).unwrap(), &pool, &mut || Ok(()))
             .unwrap();
         assert_eq!(prepared.key(), source.key());
-        assert_eq!(pool.used(), 256 * 256 * 4 + metadata);
+        assert_eq!(pool.used(), 256 * 256 * 4 + metadata + descriptors);
         for y in 0..4 {
             for x in 0..8 {
                 assert_eq!(prepared.value(x, y).unwrap(), original.value(x, y));
@@ -393,7 +394,7 @@ mod tests {
         assert!(prepared.copy_row(1, &mut row[..2]).is_err());
         drop(source);
         drop(store);
-        assert_eq!(pool.used(), 256 * 256 * 4 + metadata);
+        assert_eq!(pool.used(), 256 * 256 * 4 + metadata + descriptors);
         assert_eq!(prepared.value(3, 1).unwrap(), 31. / 255.);
         drop(prepared);
         assert_eq!(pool.used(), 0);
@@ -408,6 +409,8 @@ mod tests {
             let source =
                 CoverageSource::stage_legacy(&legacy(), store.clone(), &mut || Ok(())).unwrap();
             let metadata = source.metadata_bytes();
+            let descriptors = source.mask().physical_tiles().count() * 512 + 128;
+            let baseline = metadata + descriptors;
             assert!(source
                 .prepare_region(
                     Region::new([3, 1, 7, 3]).unwrap(),
@@ -417,7 +420,7 @@ mod tests {
                 .is_err());
             let result =
                 source.prepare_region(Region::new([3, 1, 7, 3]).unwrap(), &pool, &mut || {
-                    if cancel && pool.used() > metadata {
+                    if cancel && pool.used() > baseline {
                         Err(Error::Cancelled)
                     } else {
                         Ok(())
@@ -427,7 +430,7 @@ mod tests {
                 (cancel, result),
                 (false, Err(Error::Budget)) | (true, Err(Error::Cancelled))
             ));
-            assert_eq!(pool.used(), metadata);
+            assert_eq!(pool.used(), baseline);
             drop(source);
             drop(store);
             std::fs::remove_dir_all(path).unwrap();
