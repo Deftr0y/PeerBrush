@@ -63,7 +63,7 @@ impl Sealed {
         sealed.check(file)?;
         Ok(sealed)
     }
-    fn check(&self, file: &File) -> Result<(), String> {
+    pub(in crate::file_safety) fn check(&self, file: &File) -> Result<(), String> {
         let metadata = file
             .metadata()
             .map_err(|_| "Owned staging file unavailable")?;
@@ -210,7 +210,7 @@ pub(crate) fn publish_new(
     Ok(())
 }
 
-fn open_directory(path: &Path) -> Result<File, String> {
+pub(in crate::file_safety) fn open_directory(path: &Path) -> Result<File, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -231,7 +231,10 @@ fn open_directory(path: &Path) -> Result<File, String> {
         .map_err(|_| "Owned directory handle unavailable".into())
 }
 #[cfg(windows)]
-fn pin_directories(path: &Path, expected: (u64, u64)) -> Result<Vec<File>, String> {
+pub(in crate::file_safety) fn pin_directories(
+    path: &Path,
+    expected: (u64, u64),
+) -> Result<Vec<File>, String> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     let mut pins = Vec::new();
     pins.try_reserve_exact(64)
