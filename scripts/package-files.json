@@ -601,6 +601,7 @@
     "src/warp/command.rs",
     "src/workspace.rs",
     "src/workspace/lifecycle.rs",
+    "src/workspace/native_dispatch.rs",
     "src/workspace/source_runtime.rs",
     "src/workspace/source_runtime/checkpoints.rs",
     "src/workspace/source_runtime/recovery_marker.rs",
