@@ -226,6 +226,9 @@ impl Deref for PinnedBytes {
     }
 }
 impl PinnedBytes {
+    pub fn uses_budget(&self, budget: &ResidentBudget) -> bool {
+        self.0._charge.uses_budget(budget)
+    }
     pub fn allocated_bytes(&self) -> usize {
         self.0.bytes.len()
     }
