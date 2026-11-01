@@ -667,6 +667,7 @@
     "tests/svg-origin-oracle/src/main.rs",
     "tests/svg-origin-rows/Cargo.lock",
     "tests/svg-origin-rows/Cargo.toml",
+    "tests/svg-origin-rows/resvg-tests/Cargo.toml",
     "tests/svg-origin-rows/src/bin/abort_profile.rs",
     "tests/svg-origin-rows/src/main.rs",
     "tests/svg_import.rs",
