@@ -73,6 +73,9 @@ strip = true
 
 
 [patch.crates-io]
+tiny-skia = { path = "vendor/tiny-skia" }
+tiny-skia-path = { path = "vendor/tiny-skia-path" }
+resvg = { path = "vendor/resvg" }
 cmake = { path = "vendor/cmake" }
 egui-winit = { path = "vendor/egui-winit" }
 jpegxl-src = { path = "vendor/jpegxl-src" }

@@ -1,0 +1,11 @@
+[package]
+name = "peerbrush-svg-origin-oracle"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Deliberately separate: no parent path patches may affect the registry oracle.
+[workspace]
+
+[dependencies]
+resvg = { version = "=0.48.1", default-features = false, features = ["text"] }

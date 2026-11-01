@@ -6,6 +6,8 @@ use std::{collections::HashMap, str::FromStr};
 pub const MARKUP_LIMIT: usize = 512 * 1024;
 #[path = "svg/prepared.rs"]
 pub(crate) mod prepared;
+#[path = "svg/row_budget.rs"]
+pub(crate) mod row_budget;
 const NODES: usize = 4096;
 const GEOMETRY: usize = 65536;
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
