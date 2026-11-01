@@ -9,8 +9,12 @@ use image::metadata::Orientation;
 use ring::digest::{digest, SHA256};
 use std::{
     cell::RefCell,
-    io::{Cursor, Read, Seek, SeekFrom},
+    io::{BufRead, Cursor, Read, Seek, SeekFrom},
 };
+
+#[path = "png_file.rs"]
+mod file;
+pub(crate) use file::{FileLimits, FilePng};
 
 const DECODER_LIMIT: usize = 8 * 1024 * 1024;
 // Includes decoder-limit allocations, raw-chunk reallocation peaks, inflater,
@@ -56,6 +60,24 @@ impl Limits {
         Ok(())
     }
 }
+/// Opaque captured source proof; only admitted transports can construct it.
+#[derive(Clone)]
+pub(super) struct SourceBinding {
+    source: [u8; 32],
+    transport: Option<[u8; 32]>,
+    pool: ResidentBudget,
+}
+impl SourceBinding {
+    pub(super) fn source_sha256(&self) -> [u8; 32] {
+        self.source
+    }
+    pub(super) fn base64_sha256(&self) -> Option<[u8; 32]> {
+        self.transport
+    }
+    pub(super) fn uses_budget(&self, pool: &ResidentBudget) -> bool {
+        self.pool.same_pool(pool)
+    }
+}
 pub(crate) struct EncodedPng {
     bytes: PinnedBytes,
     length: usize,
@@ -63,6 +85,16 @@ pub(crate) struct EncodedPng {
     base64_sha256: Option<[u8; 32]>,
 }
 impl EncodedPng {
+    pub(super) fn binding(&self, pool: &ResidentBudget) -> Result<SourceBinding, String> {
+        if !self.uses_budget(pool) {
+            return Err("PNG source uses a foreign resident pool".into());
+        }
+        Ok(SourceBinding {
+            source: self.source_sha256,
+            transport: self.base64_sha256,
+            pool: pool.clone(),
+        })
+    }
     pub(crate) fn source_sha256(&self) -> [u8; 32] {
         self.source_sha256
     }
@@ -184,24 +216,24 @@ impl Complete {
 
 /// The input factory runs cancellation checks even inside decoder reads. The
 /// caller cannot inject an uncharged encoded buffer through this interface.
-struct Checked<'a, 'b, 'c> {
-    input: Cursor<&'a [u8]>,
+struct Checked<'b, 'c, R> {
+    input: R,
     check: &'b RefCell<&'c mut dyn FnMut() -> Result<(), String>>,
 }
-impl Read for Checked<'_, '_, '_> {
+impl<R: BufRead + Seek> Read for Checked<'_, '_, R> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         (self.check.borrow_mut())().map_err(std::io::Error::other)?;
         let length = bytes.len().min(64 * 1024);
         self.input.read(&mut bytes[..length])
     }
 }
-impl Seek for Checked<'_, '_, '_> {
+impl<R: BufRead + Seek> Seek for Checked<'_, '_, R> {
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
         (self.check.borrow_mut())().map_err(std::io::Error::other)?;
         self.input.seek(to)
     }
 }
-impl std::io::BufRead for Checked<'_, '_, '_> {
+impl<R: BufRead + Seek> BufRead for Checked<'_, '_, R> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         (self.check.borrow_mut())().map_err(std::io::Error::other)?;
         self.input.fill_buf()
@@ -376,14 +408,38 @@ fn decode_native_pass_rows(
     if !encoded.bytes.uses_budget(pool) || encoded.length > limits.encoded {
         return Err("Prepared PNG input pool or transport admission differs".into());
     }
-    let (width, height, declared_profile) = container(encoded.bytes(), limits, color, check)?;
+    let facts = container(encoded.bytes(), limits, color, check)?;
+    decode_input(
+        Cursor::new(encoded.bytes()),
+        facts,
+        encoded.binding(pool)?,
+        color,
+        pool,
+        check,
+        row,
+    )
+}
+
+fn decode_input(
+    input: impl BufRead + Seek,
+    (width, height, declared_profile): (u32, u32, bool),
+    binding: SourceBinding,
+    color: ColorPolicy,
+    pool: &ResidentBudget,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    mut row: impl FnMut(Header, PassRow, &[u8]) -> Result<(), String>,
+) -> Result<Complete, String> {
+    check()?;
+    if !binding.uses_budget(pool) {
+        return Err("PNG decoder input pool differs".into());
+    }
     let decoder_charge = pool
         .reserve_bytes(DECODER_BYTES, DECODER_BYTES)
         .map_err(|e| e.to_string())?;
     // The decoder and every allocation it can retain drop before this charge.
     let cancellation = RefCell::new(check);
     let mut checked = Checked {
-        input: Cursor::new(encoded.bytes()),
+        input,
         check: &cancellation,
     };
     let mut decoder = png::Decoder::new_with_limits(
@@ -595,8 +651,8 @@ fn decode_native_pass_rows(
     (cancellation.borrow_mut())()?;
     Ok(Complete {
         header,
-        source_sha256: encoded.source_sha256,
-        base64_sha256: encoded.base64_sha256,
+        source_sha256: binding.source,
+        base64_sha256: binding.transport,
         profile,
         color_policy: color,
     })
@@ -767,67 +823,107 @@ fn container(
     color: ColorPolicy,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(u32, u32, bool), String> {
-    if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") {
+    container_stream(
+        &mut Cursor::new(bytes),
+        bytes.len() as u64,
+        limits.edge,
+        limits.pixels,
+        color,
+        check,
+    )
+}
+
+/// Reads every original chunk, including ignored text/ICC/APNG chunks, with a
+/// fixed prefix and CRC state. No chunk length becomes an allocation request.
+fn container_stream(
+    input: &mut impl BufRead,
+    length: u64,
+    edge: u32,
+    pixels: u64,
+    color: ColorPolicy,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(u32, u32, bool), String> {
+    check()?;
+    let mut signature = [0; 8];
+    input
+        .read_exact(&mut signature)
+        .map_err(|_| "Truncated prepared PNG signature")?;
+    if &signature != b"\x89PNG\r\n\x1a\n" {
         return Err("Prepared source is not a PNG".into());
     }
-    let mut at = 8usize;
+    let mut at = 8u64;
     let mut shape = None;
-    let mut profiles = 0;
+    let mut profiles = 0u32;
     let mut managed = false;
     let mut nonstandard = false;
-    while at < bytes.len() {
+    while at < length {
         check()?;
-        let head = bytes
-            .get(at..at.checked_add(8).ok_or("PNG offset overflow")?)
-            .ok_or("Truncated prepared PNG chunk")?;
-        let length = u32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
+        let mut head = [0; 8];
+        input
+            .read_exact(&mut head)
+            .map_err(|_| "Truncated prepared PNG chunk")?;
+        let size = u32::from_be_bytes(head[..4].try_into().unwrap()) as u64;
         let end = at
-            .checked_add(length)
+            .checked_add(size)
             .and_then(|v| v.checked_add(12))
             .ok_or("PNG chunk overflow")?;
-        if end > bytes.len() {
+        if end > length {
             return Err("Truncated prepared PNG payload".into());
         }
-        // png0.18.1 skips CRC when a chunk (notably unused ICC/text) is ignored.
-        // Validate the immutable original container before any row is staged.
-        let expected = u32::from_be_bytes(bytes[end - 4..end].try_into().unwrap());
+        let kind: &[u8; 4] = head[4..].try_into().unwrap();
         let mut crc = !0u32;
-        for part in bytes[at + 4..end - 4].chunks(64 * 1024) {
+        crc_update(&mut crc, kind);
+        let mut prefix = [0; 32];
+        let mut consumed = 0u64;
+        while consumed < size {
             check()?;
-            for &byte in part {
-                crc = (crc >> 8) ^ CRC_TABLE[((crc ^ u32::from(byte)) & 255) as usize];
+            let part = input.fill_buf().map_err(|e| e.to_string())?;
+            let count = part.len().min((size - consumed).min(64 * 1024) as usize);
+            if count == 0 {
+                return Err("Truncated prepared PNG payload".into());
             }
+            crc_update(&mut crc, &part[..count]);
+            if consumed < prefix.len() as u64 {
+                let copied = count.min(prefix.len() - consumed as usize);
+                prefix[consumed as usize..consumed as usize + copied]
+                    .copy_from_slice(&part[..copied]);
+            }
+            input.consume(count);
+            consumed += count as u64;
         }
-        if !crc != expected {
+        let mut expected = [0; 4];
+        input
+            .read_exact(&mut expected)
+            .map_err(|_| "Truncated prepared PNG checksum")?;
+        if !crc != u32::from_be_bytes(expected) {
             return Err("Prepared PNG original chunk checksum differs".into());
         }
-        let kind = &head[4..8];
-        let data = &bytes[at + 8..end - 4];
+        let data = &prefix[..(size.min(32) as usize)];
         if at == 8 && kind != b"IHDR" {
             return Err("Prepared PNG starts without IHDR".into());
         }
         match kind {
             b"IHDR" => {
-                if shape.is_some() || length != 13 {
+                if shape.is_some() || size != 13 {
                     return Err("Invalid prepared PNG header".into());
                 }
-                let width = u32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap());
-                let height = u32::from_be_bytes(bytes[at + 12..at + 16].try_into().unwrap());
+                let width = u32::from_be_bytes(data[..4].try_into().unwrap());
+                let height = u32::from_be_bytes(data[4..8].try_into().unwrap());
                 if width == 0
                     || height == 0
-                    || width > limits.edge
-                    || height > limits.edge
-                    || u64::from(width) * u64::from(height) > limits.pixels
+                    || width > edge
+                    || height > edge
+                    || u64::from(width) * u64::from(height) > pixels
                 {
                     return Err("Prepared PNG dimensions exceed admission".into());
                 }
                 shape = Some((width, height));
             }
-            b"acTL" | b"fcTL" | b"fdAT" if !matches!(color, ColorPolicy::RawSelection) => {
+            b"acTL" | b"fcTL" | b"fdAT" if color != ColorPolicy::RawSelection => {
                 return Err(
                     "Prepared PNG requires one static image; choose an animation frame explicitly"
                         .into(),
-                )
+                );
             }
             b"iCCP" => {
                 managed = true;
@@ -837,17 +933,17 @@ fn container(
                 }
             }
             b"sRGB" => managed = true,
-            b"cICP" if matches!(color, ColorPolicy::ToSrgb) && data != [1, 13, 0, 1] => {
-                return Err("Prepared PNG HDR/non-sRGB CICP requires explicit conversion".into())
+            b"cICP" if color == ColorPolicy::ToSrgb && (size != 4 || data != [1, 13, 0, 1]) => {
+                return Err("Prepared PNG HDR/non-sRGB CICP requires explicit conversion".into());
             }
             b"gAMA" => {
-                if length != 4 {
+                if size != 4 {
                     return Err("Invalid prepared PNG gamma chunk".into());
                 }
                 nonstandard |= u32::from_be_bytes(data.try_into().unwrap()) != 45455;
             }
             b"cHRM" => {
-                if length != 32 {
+                if size != 32 {
                     return Err("Invalid prepared PNG chromaticity chunk".into());
                 }
                 nonstandard |= data
@@ -856,10 +952,10 @@ fn container(
                     .ne([31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000]);
             }
             b"IEND" => {
-                if length != 0 || end != bytes.len() {
+                if size != 0 || end != length {
                     return Err("Prepared PNG end or trailing data differs".into());
                 }
-                if matches!(color, ColorPolicy::ToSrgb) && nonstandard && !managed {
+                if color == ColorPolicy::ToSrgb && nonstandard && !managed {
                     return Err(
                         "Prepared PNG non-sRGB gamma/chromaticities require explicit conversion"
                             .into(),
@@ -874,6 +970,11 @@ fn container(
         at = end;
     }
     Err("Prepared PNG has no complete end chunk".into())
+}
+fn crc_update(crc: &mut u32, bytes: &[u8]) {
+    for &byte in bytes {
+        *crc = (*crc >> 8) ^ CRC_TABLE[(((*crc) ^ u32::from(byte)) & 255) as usize];
+    }
 }
 
 const CRC_TABLE: [u32; 256] = crc_table();

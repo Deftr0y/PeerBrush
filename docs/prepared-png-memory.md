@@ -203,3 +203,28 @@ Unexpected drops retain private files/inventory. Failed, busy, foreign or
 uncertain retirement reports retained inventory and never falls back to generic
 deletion. These mechanisms do not raise the application's current canvas limits
 or establish dense16K editing/recovery qualification.
+
+`prepared_png::FilePng` is the separate held-file transport for a command's
+authorized PNG path. It borrows the actual `SourceSession` until the file owner
+drops. A read-only file handle and its parent directory stay bound to their
+filesystem identities, byte length, modification stamp and single-link checks.
+Windows also denies writes/deletion while the handle survives; Unix opens with
+no-follow. Unexpected source changes fail the operation.
+
+The transport retains one charged64KiB input buffer and a conservative bounded
+path reservation. Its streaming preflight hashes every original byte and checks
+all chunk CRCs using fixed-size prefixes, including ignored chunks, without
+allocating a chunk-sized buffer. Decoding then uses the same native pass decoder
+and session sink as resident input. A second hash covers the actual monotonic
+bytes fed to that decoder and must equal the admitted source hash before a
+completion escapes. This catches changed decoder bytes even when a same-inode
+writer restores the original file length/stamp. Unexpected decoder seeks fail
+explicitly rather than invalidating that proof. Final source checks remain
+mandatory before engine adoption.
+
+Resident/base64 limits remain unchanged. `FileLimits::SELECTION` retains the
+existing64MiB/8192-edge/16,000,000-pixel policy. A future fully admitted native
+import command can choose separate explicit file/shape limits under the source
+payload ceiling; doing so never creates a full encoded-file allocation or raises
+the live document caps. Small held-file and lifecycle tests cannot establish
+arbitrary dense16K import, editing, save or recovery readiness.
