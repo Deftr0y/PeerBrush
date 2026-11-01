@@ -1087,9 +1087,37 @@ mod tests {
     fn immutable_clones_share_sources_and_header_charge_until_last_owner() {
         let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
         let first = document(&pool);
-        let second = first.clone();
         let baseline = pool.used();
-        assert!(baseline > 64 * 1024);
+        let second = first.clone();
+        let metadata = &first.core.metadata;
+        assert_eq!(metadata.layers.len(), 1);
+        assert!(metadata.layers[0].effects.is_empty());
+        assert!(metadata.layers[0].mask.is_none() && metadata.layers[0].source.is_none());
+        assert!(metadata.filters.is_empty());
+        assert!(metadata.psd_global_mask.is_none() && metadata.selection_polygon.is_none());
+        assert!(metadata.selection_coverage.is_none() && metadata.selection_previous.is_none());
+        assert!(first
+            .roster()
+            .iter()
+            .all(|(_, surface)| surface.is_known_zero()));
+        let physical_assets = metadata
+            .icc_profile
+            .as_ref()
+            .unwrap()
+            .retained_bytes()
+            .unwrap()
+            + metadata.layers[0].psd_metadata.retained_bytes().unwrap()
+            + metadata.warnings.retained_bytes().unwrap();
+        assert_eq!(
+            baseline,
+            first.core.owner().bytes() + first.core.roster._charge.bytes() + physical_assets
+        );
+        assert!(first.core.owner().bytes() > 0);
+        assert!(
+            baseline < 64 * 1024,
+            "The discarded parser envelope must not remain on the runtime owner"
+        );
+        assert!(Arc::ptr_eq(first.core.owner(), second.core.owner()));
         assert_eq!(first.key(), second.key());
         assert_eq!(pool.used(), baseline);
         let layer = first.metadata().layers().next().unwrap().id().to_string();
@@ -1162,11 +1190,20 @@ mod tests {
         let key = current.key();
         let baseline = pool.used();
         let layer = current.metadata().layers().next().unwrap().id().to_string();
+        // Leave less than one runtime header/intent can admit, independently
+        // of how much of the original parser envelope was correctly released.
+        let free = pool.limit() - pool.used();
+        assert!(free > 1);
+        let ballast = pool.reserve_bytes(free - 1, free).unwrap();
+        let full = pool.used();
         assert!(current
             .capture_edit()
             .unwrap()
             .visibility(&layer, false, &|| Ok(()))
             .is_err());
+        assert_eq!(pool.used(), full);
+        drop(ballast);
+        assert_eq!(pool.used(), baseline);
         assert!(current
             .capture_edit()
             .unwrap()
@@ -1176,6 +1213,8 @@ mod tests {
         assert_eq!(current.metadata().revision(), 0);
         assert!(current.metadata().layers().next().unwrap().visible());
         assert_eq!(pool.used(), baseline);
+        drop(current);
+        assert_eq!(pool.used(), 0);
     }
     #[test]
     fn cancellation_after_preparation_prevents_pure_adoption() {
