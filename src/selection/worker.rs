@@ -171,10 +171,12 @@ mod tests {
     };
     use std::cell::RefCell;
     fn store(pool: ResidentBudget) -> (Store, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "peerbrush-selection-worker-{}",
-            crate::engine::id()
-        ));
+        let path = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "peerbrush-selection-worker-{}",
+                crate::engine::id()
+            ));
         let store = Store::create(
             &path,
             pool,
@@ -399,5 +401,317 @@ mod tests {
         assert_eq!(pool.used(), 0);
         drop(store);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "Opt-in real2GB native16 selection pipeline; component only, not editor/Save/history qualification"]
+    fn dense_16000_native16_owned_source_selection_preserves_full_file_and_native_hashes() {
+        use crate::{
+            large_document::{DiskBudget, TileSpec},
+            raster::{backed::Plane, surface::SurfaceRegion, TILE},
+        };
+        use ring::digest::{Context, SHA256};
+        use std::{cell::Cell, collections::BTreeMap, io::Read, time::Instant};
+        fn native(x: u32, y: u32) -> [u16; 4] {
+            let mut value = (u64::from(x) | (u64::from(y) << 16)).wrapping_mul(0x9e3779b185ebca87);
+            value ^= value >> 29;
+            [
+                value as u16,
+                (value >> 16) as u16,
+                (value >> 32) as u16,
+                65535,
+            ]
+        }
+        fn finish(hash: Context) -> [u8; 32] {
+            hash.finish().as_ref().try_into().unwrap()
+        }
+        fn hex(hash: [u8; 32]) -> String {
+            hash.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        fn file_hash(path: &std::path::Path) -> [u8; 32] {
+            let mut file = std::fs::File::open(path).unwrap();
+            let mut buffer = [0; 65536];
+            let mut hash = Context::new(&SHA256);
+            loop {
+                let n = file.read(&mut buffer).unwrap();
+                if n == 0 {
+                    break;
+                }
+                hash.update(&buffer[..n]);
+            }
+            finish(hash)
+        }
+        fn native_hash(source: &Surface) -> [u8; 32] {
+            let mut hash = Context::new(&SHA256);
+            hash.update(b"PeerBrush-dense-selection-native-tiles-v1\0");
+            for ty in 0..source.height().div_ceil(TILE) {
+                for tx in 0..source.width().div_ceil(TILE) {
+                    let tile = source.prepare_tile((tx, ty), &mut || Ok(())).unwrap();
+                    hash.update(&tx.to_be_bytes());
+                    hash.update(&ty.to_be_bytes());
+                    hash.update(tile.bytes().expect("Dense source tile cannot be absent"));
+                }
+            }
+            finish(hash)
+        }
+        const W: u32 = 16000;
+        const H: u32 = 16000;
+        let started = Instant::now();
+        let pool = ResidentBudget::new(256 * 1024 * 1024).unwrap();
+        let disk = DiskBudget::new(6 * 1024 * 1024 * 1024, 8).unwrap();
+        let peak = Cell::new(0usize);
+        let observe = || {
+            peak.set(peak.get().max(pool.used()));
+            Ok(())
+        };
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-selection-dense-{}", crate::engine::id()));
+        std::fs::create_dir(&base).unwrap();
+        let input_path = base.join("input");
+        let output_path = base.join("output");
+        let limits = Limits {
+            disk_bytes: 4 * 1024 * 1024 * 1024,
+            max_blocks: 8192,
+            max_resident_blocks: 512,
+            manifest_bytes: 16 * 1024 * 1024,
+        };
+        let input = Store::create_with_disk_budget(&input_path, pool.clone(), disk.clone(), limits)
+            .unwrap();
+        let spec = TileSpec::new(256, 256, 16).unwrap();
+        let mut blocks = BTreeMap::new();
+        let mut generated = Context::new(&SHA256);
+        generated.update(b"PeerBrush-dense-selection-native-tiles-v1\0");
+        for ty in 0..H.div_ceil(TILE) {
+            for tx in 0..W.div_ceil(TILE) {
+                let mut tile = ScratchBytes::new(&pool, spec.bytes(), spec.bytes()).unwrap();
+                for y in 0..TILE {
+                    for x in 0..TILE {
+                        let gx = tx * TILE + x;
+                        let gy = ty * TILE + y;
+                        let pixel = if gx < W && gy < H {
+                            native(gx, gy)
+                        } else {
+                            [0; 4]
+                        };
+                        let at = ((y * TILE + x) * 8) as usize;
+                        for (channel, bytes) in
+                            pixel.into_iter().zip(tile[at..at + 8].chunks_exact_mut(2))
+                        {
+                            bytes.copy_from_slice(&channel.to_be_bytes());
+                        }
+                    }
+                }
+                generated.update(&tx.to_be_bytes());
+                generated.update(&ty.to_be_bytes());
+                generated.update(&tile);
+                blocks.insert((tx, ty), input.put(spec, &tile, &mut || observe()).unwrap());
+            }
+        }
+        let generated = finish(generated);
+        let refs: Vec<_> = blocks.values().copied().collect();
+        let snapshot = input
+            .commit(
+                [37; 16],
+                1,
+                None,
+                b"DenseNative16SelectionInputV1",
+                &refs,
+                &mut || observe(),
+            )
+            .unwrap();
+        let selected = snapshot.reference();
+        drop(snapshot);
+        drop(input);
+        let input_file = input_path.join("blocks.pbt");
+        let input_bytes = std::fs::metadata(&input_file).unwrap().len();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&input_file).unwrap().file_attributes() & (0x200 | 0x800),
+                0,
+                "Dense source must not be a sparse or filesystem-compressed fixture"
+            );
+        }
+        assert!(
+            input_bytes > 2_000_000_000,
+            "Source must be actual unique dense bytes, not sparse/deduplicated input"
+        );
+        let file_before = file_hash(&input_file);
+        let snapshot = Store::recover_with_disk_budget(
+            &input_path,
+            selected,
+            pool.clone(),
+            disk.clone(),
+            limits,
+            &mut || observe(),
+        )
+        .unwrap();
+        let input = snapshot.store();
+        drop(snapshot);
+        let source =
+            Surface::from_plane(Plane::from_blocks(W, H, 16, input.clone(), blocks).unwrap())
+                .unwrap();
+        assert!(source.uses_disk_budget(&disk));
+        assert!(source.uses_budget(&pool));
+        let native_before = native_hash(&source);
+        assert_eq!(native_before, generated);
+        let staged_seconds = started.elapsed().as_secs_f64();
+        let output =
+            Store::create_with_disk_budget(&output_path, pool.clone(), disk.clone(), limits)
+                .unwrap();
+        let request = Request {
+            width: W,
+            height: H,
+            seeds: &[[0, 0]],
+            quick_radius: None,
+            feather: 0,
+            mode: Combine::Replace,
+            maximum_work: 256_000_000,
+        };
+        let mut candidate = None;
+        let mut cancel_samples = 0u64;
+        let mut selected_samples = 0u64;
+        let selection_started = Instant::now();
+        for cancel in [true, false] {
+            let cache = RefCell::new(Vec::<(u32, SurfaceRegion)>::new());
+            let samples = Cell::new(0u64);
+            let check = || {
+                observe()?;
+                if cancel && samples.get() >= 100_000 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            };
+            let result = prepare(
+                &request,
+                output.clone(),
+                None,
+                &check,
+                |y| {
+                    let tile_row = y / TILE;
+                    let mut cache = cache.borrow_mut();
+                    let found = cache.iter().position(|(key, _)| *key == tile_row);
+                    if found.is_some_and(|index| {
+                        let b = cache[index].1.region().bounds();
+                        y as i32 >= b[1] && (y as i32) < b[3]
+                    }) {
+                        return Ok(());
+                    }
+                    if found.is_none() && cache.len() == 2 {
+                        cache.remove(0);
+                    }
+                    let top = y / 8 * 8;
+                    let view = source.prepare_region(
+                        Region::new([0, top as i32, W as i32, (top + 8).min(H) as i32])?,
+                        &mut || check(),
+                    )?;
+                    if let Some(index) = found {
+                        cache[index] = (tile_row, view);
+                    } else {
+                        cache.push((tile_row, view));
+                    }
+                    Ok(())
+                },
+                |_, x, y| {
+                    let cache = cache.borrow();
+                    let view = &cache
+                        .iter()
+                        .find(|(_, view)| {
+                            let b = view.region().bounds();
+                            (y as i32) >= b[1] && (y as i32) < b[3]
+                        })
+                        .ok_or(Error::Invalid("Dense native row was not prepared"))?
+                        .1;
+                    let pixel = view.pixel16(x as i32, y as i32)?;
+                    if pixel != native(x, y) {
+                        return Err(Error::Corrupt);
+                    }
+                    samples.set(samples.get() + 1);
+                    Ok(true)
+                },
+            );
+            if cancel {
+                assert!(result.is_err());
+                cancel_samples = samples.get();
+                assert!(cancel_samples >= 100_000);
+            } else {
+                candidate = Some(result.unwrap());
+                selected_samples = samples.get();
+            }
+            drop(cache);
+            if cancel {
+                assert_eq!(pool.used(), 0);
+            }
+        }
+        let selection_seconds = selection_started.elapsed().as_secs_f64();
+        assert_eq!(selected_samples, u64::from(W) * u64::from(H));
+        let candidate = candidate.unwrap();
+        assert_eq!(candidate.bounds(), [0, 0, W as i32, H as i32]);
+        assert_eq!(candidate.origin(), [0, 0]);
+        assert_eq!(candidate.contours().len(), 1);
+        assert_eq!(candidate.contours()[0].len(), 4);
+        let mask_bounds = candidate.bounds();
+        let mask_contours = candidate.contours().to_vec();
+        let mut corners: Vec<_> = mask_contours[0]
+            .iter()
+            .map(|point| [point[0] as u32, point[1] as u32])
+            .collect();
+        corners.sort();
+        let mut expected = vec![[0, 0], [W, 0], [W, H], [0, H]];
+        expected.sort();
+        assert_eq!(corners, expected);
+        assert!(candidate.mask().uses_disk_budget(&disk));
+        let mut mask_hash = Context::new(&SHA256);
+        for ty in 0..H.div_ceil(TILE) {
+            for tx in 0..W.div_ceil(TILE) {
+                let tile = candidate
+                    .mask()
+                    .prepare_tile((tx, ty), &mut || observe())
+                    .unwrap();
+                let bytes = tile.bytes().expect("Full selection cannot be sparse");
+                mask_hash.update(bytes);
+                for y in 0..TILE {
+                    for x in 0..TILE {
+                        let at = ((y * TILE + x) * 4) as usize;
+                        assert_eq!(
+                            &bytes[at..at + 4],
+                            if tx * TILE + x < W && ty * TILE + y < H {
+                                &[255; 4]
+                            } else {
+                                &[0; 4]
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        let native_after = native_hash(&source);
+        assert_eq!(native_before, native_after);
+        let output_file = output_path.join("blocks.pbt");
+        let output_bytes = std::fs::metadata(&output_file).unwrap().len();
+        let disk_bytes = disk.used().unwrap();
+        assert_eq!(disk_bytes, input_bytes + output_bytes);
+        assert!(peak.get() <= pool.limit());
+        drop(candidate);
+        drop(source);
+        drop(input);
+        drop(output);
+        assert_eq!(pool.used(), 0);
+        let file_after = file_hash(&input_file);
+        assert_eq!(file_before, file_after);
+        let receipt = serde_json::json!({"scope":"Actual dense native16 Surface selection candidate component only; no editor, styled composite, Save/history, installed or performance qualification", "width":W,"height":H,"native_depth":16,"source_file_bytes":input_bytes,"source_blocks":refs.len(),"source_file_sha256_before":hex(file_before),"source_file_sha256_after":hex(file_after),"full_native_tile_sha256_before":hex(native_before),"full_native_tile_sha256_after":hex(native_after),"mask_native_sha256":hex(finish(mask_hash)),"mask_bounds":mask_bounds,"mask_contours":mask_contours,"selected_samples":selected_samples,"cancelled_after_samples":cancel_samples,"resident_ledger_peak_bytes":peak.get(),"resident_ledger_limit_bytes":pool.limit(),"resident_after_close":pool.used(),"disk_ledger_bytes":disk_bytes,"disk_limit_bytes":disk.limit(),"output_file_bytes":output_bytes,"staging_seconds":staged_seconds,"selection_including_cancel_seconds":selection_seconds,"total_seconds":started.elapsed().as_secs_f64(),"exclusions":"Fixture/index/allocator metadata and OS caches are not total process RAM; shared ledger peak is admitted payload accounting. Private owned files retained for independent review."});
+        std::fs::write(
+            base.join("receipt.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+        println!(
+            "DENSE_SELECTION_RECEIPT {}",
+            base.join("receipt.json").display()
+        );
+        println!("{}", receipt);
     }
 }
