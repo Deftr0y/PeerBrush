@@ -386,8 +386,9 @@ fn concurrent_pins(duplicate: bool) {
             let mut calls = 0;
             source
                 .pin(block, &mut || {
-                    assert!(source.0.state.try_lock().is_ok());
-                    assert!(source.0.cache.try_lock().is_ok());
+                    // A competing loader may briefly hold either mutex. The
+                    // isolated reentrant-callback test below proves that this
+                    // callback never owns them itself.
                     calls += 1;
                     if calls == 2 {
                         arrivals.fetch_add(1, Ordering::Release);
