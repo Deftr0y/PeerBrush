@@ -538,7 +538,13 @@ pub(crate) mod tests {
         doc: &Document,
         native: bool,
     ) -> (SceneSnapshot, std::path::PathBuf) {
-        let budget = ResidentBudget::new(32 * 1024 * 1024).unwrap();
+        capture_kind_with_budget(doc, native, ResidentBudget::new(32 * 1024 * 1024).unwrap())
+    }
+    pub(crate) fn capture_kind_with_budget(
+        doc: &Document,
+        native: bool,
+        budget: ResidentBudget,
+    ) -> (SceneSnapshot, std::path::PathBuf) {
         let disk = DiskBudget::new(128 * 1024 * 1024, 16).unwrap();
         let path = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
