@@ -177,6 +177,11 @@ impl super::PeerBrush {
             }
         };
         self.pending = false;
+        let previous_warning = self
+            .native_canvas
+            .current()
+            .and_then(|canvas| canvas.profile_warning());
+        let warning = prepared.profile_warning();
         let tag = prepared.tag().clone();
         let epoch = self.preview_epoch.clone();
         let job = self.preview_job;
@@ -187,6 +192,11 @@ impl super::PeerBrush {
                 Err("Native display superseded".into())
             }
         })?;
+        if let Some(warning) = warning {
+            self.message = warning.into();
+        } else if previous_warning.is_some_and(|warning| self.message == warning) {
+            self.message.clear();
+        }
         self.canvas_generation = self.canvas_generation.wrapping_add(1);
         Ok(true)
     }
@@ -269,6 +279,12 @@ mod tests {
             }
         }
         fn runtime(&self) -> (Arc<SourceRuntime>, crate::server::Connection) {
+            self.runtime_with_budget(32 * 1024 * 1024)
+        }
+        fn runtime_with_budget(
+            &self,
+            resident_bytes: usize,
+        ) -> (Arc<SourceRuntime>, crate::server::Connection) {
             let connection =
                 crate::server::start(Arc::new(Mutex::new(Engine::new())), self.path.join("state"))
                     .unwrap();
@@ -276,7 +292,7 @@ mod tests {
             let runtime = SourceRuntime::new(
                 context,
                 RuntimeLimits {
-                    resident_bytes: 32 * 1024 * 1024,
+                    resident_bytes,
                     disk_bytes: 16 * 1024 * 1024,
                     max_files: 16,
                     store: Limits {
@@ -336,7 +352,15 @@ mod tests {
         }
     }
     fn capture(session: &SourceSession, depth: u16) -> (Document, Arc<SceneSnapshot>) {
+        capture_profile(session, depth, None)
+    }
+    fn capture_profile(
+        session: &SourceSession,
+        depth: u16,
+        profile: Option<Arc<Vec<u8>>>,
+    ) -> (Document, Arc<SceneSnapshot>) {
         let mut doc = Document::new_depth(9, 7, depth).unwrap();
+        doc.icc_profile = profile;
         doc.layers[0].kind = "fill".into();
         doc.layers[0].color = [19, 43, 71, 199];
         let mut collector = ZeroSources { sources: vec![] };
@@ -475,5 +499,115 @@ mod tests {
         drop(presentation);
         drop(runtime);
         drop(connection);
+    }
+    #[test]
+    fn actual_session_native_upload_worker_preserves_pixels_feedback_and_last_delta_admission() {
+        for depth in [8, 16] {
+            for unsupported in [false, true] {
+                let fixture = Fixture::new();
+                let (runtime, connection) = fixture.runtime_with_budget(256 * 1024 * 1024);
+                let pool = runtime.resident();
+                let session = Arc::new(runtime.begin().unwrap());
+                let (doc, scene) =
+                    capture_profile(&session, depth, unsupported.then(|| Arc::new(vec![0; 128])));
+                let source = scene.key();
+                let weak_scene = Arc::downgrade(&scene);
+                let weak_session = Arc::downgrade(&session);
+                let request = Request::capture(
+                    scene.clone(),
+                    session.clone(),
+                    None,
+                    48,
+                    Some(&doc.layers[0].id),
+                    false,
+                )
+                .unwrap();
+                let retirement = super::super::native_texture::Retirement::new(&pool).unwrap();
+                let mut worker = Worker::new(Arc::new(AtomicU64::new(7)));
+                let mut presentation = Presentation::default();
+                let ctx = egui::Context::default();
+                presentation
+                    .request_uploads(&mut worker, request, 7, retirement.clone(), 8, &ctx)
+                    .unwrap();
+                drop(scene);
+                drop(session);
+                let end = Instant::now() + Duration::from_secs(5);
+                let prepared = loop {
+                    if let Some(prepared) =
+                        presentation.take_uploads(source, doc.revision, 7).unwrap()
+                    {
+                        break prepared;
+                    }
+                    assert!(
+                        Instant::now() < end,
+                        "Native upload preparation did not complete"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                };
+                assert!(weak_scene.upgrade().is_none());
+                assert!(weak_session.upgrade().is_none());
+                assert_eq!(prepared.profile_warning().is_some(), unsupported);
+                let tag = prepared.tag().clone();
+                let mut presenter = super::super::native_texture::Presenter::default();
+                presenter
+                    .present(prepared, &tag, &ctx, &mut || Ok(()))
+                    .unwrap();
+                assert_eq!(presenter.current().unwrap().key().source, source);
+                assert_eq!(
+                    presenter.current().unwrap().profile_warning().is_some(),
+                    unsupported
+                );
+                let expected = doc
+                    .preview(None, 48, Some(&doc.layers[0].id), false)
+                    .unwrap()
+                    .2;
+                let expected = egui::Color32::from_rgba_unmultiplied(
+                    expected[0],
+                    expected[1],
+                    expected[2],
+                    expected[3],
+                );
+                let delta = ctx.tex_manager().write().take_delta();
+                let ids: std::collections::HashSet<_> =
+                    presenter.current().unwrap().texture_ids().collect();
+                assert_eq!(ids.len(), 2);
+                assert_eq!(
+                    delta.set.iter().filter(|(id, _)| ids.contains(id)).count(),
+                    ids.len()
+                );
+                for (_, image) in delta.set.iter().filter(|(id, _)| ids.contains(id)) {
+                    let egui::ImageData::Color(image) = &image.image else {
+                        panic!("Native upload must contain color pixels")
+                    };
+                    assert!(image.pixels.iter().all(|pixel| *pixel == expected));
+                }
+                let retained_renderer = delta.clone();
+                drop(delta);
+                presenter.clear();
+                drop(presenter);
+                drop(tag);
+                presentation.clear();
+                worker.stop();
+                drop(worker);
+                drop(presentation);
+                drop(ctx);
+                drop(retirement);
+                drop(runtime);
+                drop(connection);
+                assert!(
+                    pool.used() > 0,
+                    "Last renderer image must retain native admission"
+                );
+                drop(retained_renderer);
+                let end = Instant::now() + Duration::from_secs(5);
+                while pool.used() != 0 {
+                    assert!(
+                        Instant::now() < end,
+                        "Native image admission was not retired"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
     }
 }

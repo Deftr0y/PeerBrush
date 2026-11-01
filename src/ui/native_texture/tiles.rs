@@ -220,6 +220,10 @@ pub(super) struct Textures {
     _charge: Reservation,
 }
 impl Textures {
+    #[cfg(test)]
+    pub(super) fn ids(&self) -> impl Iterator<Item = egui::TextureId> + '_ {
+        self.tiles.iter().map(|tile| tile.texture.id())
+    }
     pub fn paint_with(
         &self,
         painter: &egui::Painter,
