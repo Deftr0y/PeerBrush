@@ -11,8 +11,8 @@ mod color;
 mod compatibility;
 mod contour_points;
 mod dialogs;
-mod effect_color;
 mod edit_job;
+mod effect_color;
 mod effects;
 mod exports;
 mod file_drop;
@@ -2805,9 +2805,22 @@ impl PeerBrush {
         self.thumbs.get(&key).map(|(_, texture)| texture.clone())
     }
     fn layer_menu(&mut self, ui: &mut egui::Ui, doc: &Document, l: &crate::engine::Layer) {
+        if self.layer_menu_contents(ui, doc, l) {
+            self.open_source(doc, "edit");
+        }
+    }
+    fn layer_menu_contents<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: impl Into<DocumentView<'a>>,
+        l: impl Into<LayerView<'a>>,
+    ) -> bool {
+        let doc = doc.into();
+        let l = l.into();
+        let mut edit_source = false;
         if ui
             .add_enabled(
-                !self.busy && !doc.read_only,
+                !self.busy && !doc.read_only(),
                 egui::Button::new("Group layers").shortcut_text(if cfg!(target_os = "macos") {
                     "⌘ G"
                 } else {
@@ -2816,15 +2829,15 @@ impl PeerBrush {
             )
             .clicked()
         {
-            if !self.selection_layers.contains(&l.id) {
-                self.select_content(&l.id);
+            if !self.selection_layers.contains(l.id()) {
+                self.select_content(l.id());
             }
             self.create_folder(doc);
             ui.close_menu();
         }
         if ui
             .add_enabled(
-                !self.busy && !doc.read_only,
+                !self.busy && !doc.read_only(),
                 egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os = "macos") {
                     "⌘ ⇧ G"
                 } else {
@@ -2836,8 +2849,8 @@ impl PeerBrush {
             )
             .clicked()
         {
-            if !self.selection_layers.contains(&l.id) {
-                self.select_content(&l.id);
+            if !self.selection_layers.contains(l.id()) {
+                self.select_content(l.id());
             }
             self.merge_layers(ui.ctx(), doc);
             ui.close_menu();
@@ -2847,26 +2860,26 @@ impl PeerBrush {
             ("Rename", "rename", json!({})),
             ("Duplicate", "layer.duplicate", json!({})),
             (
-                if l.locked { "Unlock" } else { "Lock" },
+                if l.locked() { "Unlock" } else { "Lock" },
                 "layer.update",
-                json!({"locked":!l.locked}),
+                json!({"locked":!l.locked()}),
             ),
             ("Add mask", "mask.add", json!({"value":255})),
         ] {
             if ui
                 .add_enabled(
-                    !(op == "layer.duplicate" && l.kind == "group")
-                        && !(op == "mask.add" && l.mask.is_some()),
+                    !(op == "layer.duplicate" && l.kind() == "group")
+                        && !(op == "mask.add" && l.mask().is_some()),
                     egui::Button::new(title),
                 )
                 .clicked()
             {
-                self.selected = l.id.clone();
+                self.selected = l.id().to_owned();
                 if op == "rename" {
-                    self.begin_rename(doc, &l.id);
+                    self.begin_rename(doc, l.id());
                 } else {
                     let extra = if op == "mask.add" {
-                        json!({"value":255,"document_id":doc.id,"source_revision":doc.revision})
+                        json!({"value":255,"document_id":doc.id(),"source_revision":doc.revision()})
                     } else {
                         extra
                     };
@@ -2875,60 +2888,57 @@ impl PeerBrush {
                 ui.close_menu();
             }
         }
-        if l.mask.is_some() && ui.button("Remove mask").clicked() {
-            self.selected = l.id.clone();
+        if l.mask().is_some() && ui.button("Remove mask").clicked() {
+            self.selected = l.id().to_owned();
             self.layer_cmd("mask.remove", json!({}), "Remove mask");
             self.mask = false;
             ui.close_menu();
         }
-        if l.source.is_some() && ui.button("Edit text/vector properties…").clicked() {
-            self.select_content(&l.id);
-            self.open_source(doc, "edit");
+        if l.source().is_some() && ui.button("Edit text/vector properties…").clicked() {
+            self.select_content(l.id());
+            edit_source = true;
             ui.close_menu();
         }
         ui.separator();
-        if l.parent.is_some() && ui.button("Move out of group").clicked() {
-            self.selected = l.id.clone();
+        if l.parent().is_some() && ui.button("Move out of group").clicked() {
+            self.selected = l.id().to_owned();
             self.layer_cmd("layer.parent", json!({"parent":null}), "Move out of group");
             ui.close_menu();
         }
         ui.menu_button("Move into group", |ui| {
             for group in doc
-                .layers
-                .iter()
-                .filter(|g| g.kind == "group" && g.id != l.id)
+                .layers()
+                .filter(|g| g.kind() == "group" && g.id() != l.id())
             {
-                if ui.button(&group.name).clicked() {
-                    self.selected = l.id.clone();
+                if ui.button(group.name()).clicked() {
+                    self.selected = l.id().to_owned();
                     self.layer_cmd(
                         "layer.parent",
-                        json!({"parent":group.id}),
+                        json!({"parent":group.id()}),
                         "Move into group",
                     );
                     ui.close_menu();
                 }
             }
         });
-        let doc = self.shared.lock().unwrap().doc.clone();
         if ui
-            .button(if l.clip_to.is_some() {
+            .button(if l.clip_to().is_some() {
                 "Release clipping"
             } else {
                 "Clip to layer below"
             })
             .clicked()
         {
-            let base = if l.clip_to.is_some() {
+            let base = if l.clip_to().is_some() {
                 None
             } else {
-                doc.layers
-                    .iter()
-                    .skip_while(|b| b.id != l.id)
+                doc.layers()
+                    .skip_while(|b| b.id() != l.id())
                     .skip(1)
-                    .find(|b| b.parent == l.parent)
-                    .map(|b| b.clip_to.clone().unwrap_or_else(|| b.id.clone()))
+                    .find(|b| b.parent() == l.parent())
+                    .map(|b| b.clip_to().unwrap_or_else(|| b.id()).to_owned())
             };
-            self.selected = l.id.clone();
+            self.selected = l.id().to_owned();
             self.layer_cmd("layer.clip", json!({"base":base}), "Layer clipping");
             ui.close_menu();
         }
@@ -2937,10 +2947,11 @@ impl PeerBrush {
             .button(RichText::new("Delete layer").color(Color32::from_rgb(255, 154, 144)))
             .clicked()
         {
-            self.selected = l.id.clone();
+            self.selected = l.id().to_owned();
             self.layer_cmd("layer.delete", json!({}), "Delete layer");
             ui.close_menu();
         }
+        edit_source
     }
     fn layer_footer<'a>(&mut self, ui: &mut egui::Ui, l: impl Into<LayerView<'a>>) {
         let l = l.into();
