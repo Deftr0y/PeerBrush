@@ -78,3 +78,13 @@ still grants no document authority: the common scene/revision/lease transaction
 must adopt it with one history entry. The small resident differential fixture is
 an operator oracle; the max-radius strip test is a footprint check, not dense16K
 document admission or native desktop/performance qualification.
+
+`edit_bounds::native::FrameExpansion` computes the existing canvas/source union
+with checked geometry and supplies an exact old-source read rectangle for each
+new tile. Its memory-only remap preserves native samples and hidden RGB inside
+the original logical frame; original physical padding never becomes image
+content. New space and new padding are explicit zero. Missing source pixels and
+cancellation fail the tile. Color, mask steps, retained placement, vector source
+placement and effect coordinates must all be staged together before the common
+engine transaction changes a layer's frame. This component does not replace
+those metadata guards or widen live source admission.
