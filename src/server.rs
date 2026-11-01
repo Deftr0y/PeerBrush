@@ -2,6 +2,7 @@ mod fonts;
 mod instance;
 mod native_edit;
 pub(crate) use native_edit::{edit_shared, edit_shared_controlled, EditControl, EditReply};
+pub(crate) mod observation;
 mod reply;
 mod stream;
 #[cfg(test)]
@@ -1310,6 +1311,9 @@ fn observation(
     p: &Value,
     admission: &mut reply::ReplyAdmission,
 ) -> Result<Value, String> {
+    if let Some(captured) = observation::capture(shared, p, admission)? {
+        return captured.observe(shared, p, admission);
+    }
     let (state, doc) = {
         let mut e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, p)?;
