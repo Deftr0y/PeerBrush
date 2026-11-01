@@ -218,3 +218,119 @@ fn worker_preflight_late_parameter_refusal_and_cancel_preserve_live_authority() 
     assert_eq!(session.disk().used().unwrap(), disk);
     drop((state, session, runtime, connection));
 }
+
+#[test]
+fn shared_worker_brush_fill_and_clear_match_legacy_native_pixels_at_both_depths() {
+    let fixture = Fixture::new();
+    let (runtime, connection) = fixture.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let doc = NativeDocument::new_blank(
+            4,
+            2,
+            depth,
+            &runtime.resident(),
+            &runtime.disk(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let mut state = DocumentAuthority::from_native(doc, 8).unwrap();
+        let layer = state.view().layer(0).unwrap().id().to_owned();
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = crate::engine::Document::new_depth(4, 2, depth).unwrap();
+        let commands = [
+            serde_json::json!({"op":"paint","layer":layer,"points":[[0.5,0.5,0.4],[3.5,1.5,0.8]],"radius":0.8,"hardness":0.3,"flow":0.8,"opacity":0.6,"color":[239,39,71,233]}),
+            serde_json::json!({"op":"paint.fill","layer":layer,"rect":[1,0,3,2],"color":[20,101,201,177]}),
+        ];
+        let mut oracle = commands.to_vec();
+        for command in &mut oracle {
+            command["layer"] = serde_json::json!(legacy.doc.layers[0].id);
+        }
+        legacy
+            .edit("human", &oracle, Some(0), None, "Paint")
+            .unwrap();
+        let prepared = prepare(capture(&state, &commands), &session, &|| Ok(())).unwrap();
+        let compare = |native: &NativeDocument, legacy: &crate::engine::Document| {
+            let pixels = native
+                .source(native.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap();
+            let region = pixels
+                .prepare_region(
+                    crate::raster::backed::Region::new([0, 0, 4, 2]).unwrap(),
+                    &mut || Ok(()),
+                )
+                .unwrap();
+            for y in 0..2 {
+                for x in 0..4 {
+                    assert_eq!(
+                        region.pixel16(x, y).unwrap(),
+                        legacy.layers[0].pixels.get16(x, y)
+                    );
+                }
+            }
+        };
+        compare(prepared.preview(), &legacy.doc);
+        let (base, history, delta) = prepared.into_parts();
+        let commit = history
+            .prepare_commit(
+                &base,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Paint",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        state
+            .commit_native(
+                Publication {
+                    actor: "human",
+                    leases: &[],
+                    now: 0,
+                    closed: false,
+                    write_available: true,
+                },
+                commit,
+            )
+            .unwrap()
+            .retire(&session, &|| session.cleanup_check())
+            .unwrap();
+        assert_eq!(state.history_lengths(), [1, 0]);
+        let current = state.native().unwrap().clone();
+        drop((base, history, state));
+        let selected = current
+            .capture_edit()
+            .unwrap()
+            .batch(
+                RasterBatch {
+                    rasters: vec![],
+                    layers: vec![],
+                    effects: vec![],
+                    selection: Some(SelectionPatch {
+                        bounds: Some([1, 0, 3, 2]),
+                        polygon: None,
+                        current: None,
+                        previous: None,
+                    }),
+                },
+                &|| Ok(()),
+            )
+            .unwrap_or_else(|refused| panic!("{}", refused.reason()));
+        let current = current.adopt(selected).unwrap();
+        let state = DocumentAuthority::from_native(current, 8).unwrap();
+        legacy.doc.selection = Some([1, 0, 3, 2]);
+        legacy.doc.revision = state.view().revision();
+        let command = serde_json::json!({"op":"paint.clear_selection","layer":layer});
+        legacy.edit("human",&[serde_json::json!({"op":"paint.clear_selection","layer":legacy.doc.layers[0].id})],Some(state.view().revision()),None,"Clear").unwrap();
+        let prepared = prepare(capture(&state, &[command]), &session, &|| Ok(())).unwrap();
+        compare(prepared.preview(), &legacy.doc);
+        prepared
+            .abort(&session, &|| session.cleanup_check())
+            .unwrap();
+        drop(state);
+    }
+    drop((session, runtime, connection));
+}
