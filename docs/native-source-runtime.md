@@ -51,6 +51,19 @@ uncertain cleanup keeps conservative inventory; it never recursively deletes.
 The session permit remains held through cleanup. Its caller's cleanup check may
 ignore an obsolete gesture revision, while actual profile/session checks remain.
 
+`SourceSession::byte_temporary` is the admitted factory for codec operation
+spools. It chooses a fresh internal bytes namespace, reserves the directory slot,
+and registers the primitive's exact held file/directory identities before
+exposing its append-only writer. The temporary and completed-byte wrappers
+borrow the active session through the last read and publication check. They
+accept no input path. Explicit abort or retirement first proves the primitive's
+sole owned file, then retires the exact empty directory and unregisters its slot.
+Drop, an escaped byte-owner clone, a failed callback or foreign replacement keeps
+conservative inventory and charge. Startup observes recognized orphan spools as
+disk debt; it does not infer source or publication authority from their presence.
+The codec still combines session checks with its captured source/revision/lease
+checks. The wrapper preserves a specific callback failure across the storage API.
+
 Live inventory entries retain filesystem file and directory identities even when
 their weak Store owner expires. Resolving a selected checkpoint checks those IDs
 before and after reopening, including a final named-file observation. A copied
@@ -64,6 +77,14 @@ both domains. A ticket can be reserved only after the caller durably records its
 orphan intent. Drop or a failed receipt keeps the debt. Authenticated startup
 journal recovery can restore the exact intent/byte count idempotently; conflicting
 counts refuse admission.
+
+The runtime constructs its disk ledger with the same resident pool. Intent index
+capacity is admitted before fallible allocation; settled intents retain charged
+tombstones until ledger teardown, bounded to 65,536 distinct intents. Reusing a
+settled intent refuses admission so an old checked receipt cannot settle a later
+operation. A legacy ledger without an admitted resident pool refuses coexistence
+tickets. Cross-process replay protection still depends on the authenticated
+durable journal; in-memory tombstones cannot replace it.
 
 Settlement requires the destination owner's checked held-identity receipt,
 validated outside the meter lock. It removes operation admission after verified

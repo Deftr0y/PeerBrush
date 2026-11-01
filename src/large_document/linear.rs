@@ -149,6 +149,9 @@ pub(super) struct Scratch {
 }
 
 impl Scratch {
+    pub(super) fn filesystem_identity(&self) -> ((u64, u64), (u64, u64)) {
+        (self.owned.directory_id, self.owned.identity)
+    }
     pub fn uses_budgets(&self, resident: &ResidentBudget, disk: &DiskBudget) -> bool {
         self.budget.same_pool(resident) && self.owned.disk.uses_budget(disk)
     }
