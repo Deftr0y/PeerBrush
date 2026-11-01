@@ -633,7 +633,7 @@ impl Complete {
 }
 
 #[cfg(unix)]
-fn unlink_owned(_file: &File, path: &Path) -> Result<()> {
+pub(super) fn unlink_owned(_file: &File, path: &Path) -> Result<()> {
     // The retained private directory and actual profile writer admission are
     // required; no arbitrary path or disposable-cache deletion is admitted.
     fs::remove_file(path)?;
@@ -641,7 +641,7 @@ fn unlink_owned(_file: &File, path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn unlink_owned(file: &File, _path: &Path) -> Result<()> {
+pub(super) fn unlink_owned(file: &File, _path: &Path) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     extern "system" {
