@@ -19,6 +19,9 @@ impl StageRuntime for Arc<SourceRuntime> {
     }
 }
 impl StageSession for SourceSession {
+    fn fresh_fragment(&self) -> Result<crate::large_document::FreshFragment, String> {
+        SourceSession::fresh_fragment(self)
+    }
     fn cleanup_check(&self) -> Result<(), String> {
         SourceSession::cleanup_check(self)
     }

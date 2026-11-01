@@ -89,8 +89,8 @@ pub(crate) struct TaskRequest {
 pub(crate) struct TaskCapture {
     current: NativeDocument,
     request: TaskRequest,
-    history: DocumentKey,
-    epoch: u64,
+    pub(super) history: DocumentKey,
+    pub(super) epoch: u64,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct TaskEntry<'a> {

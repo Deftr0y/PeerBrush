@@ -158,6 +158,46 @@ impl NativeDocument {
     }
 }
 impl EditAdmission {
+    /// Only a captured, generation/epoch-bound task can mint this admission.
+    /// The source resolver derived these scopes; no client scope setter exists.
+    pub(super) fn task(
+        capture: &super::history::TaskCapture,
+        scopes: &Intent,
+        output_charge: Option<Arc<Reservation>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Arc<Self>> {
+        capture.cancellation().check()?;
+        check()?;
+        let base = capture.current();
+        let bytes = capture
+            .actor()
+            .len()
+            .checked_add(std::mem::size_of::<Self>() + 128)
+            .ok_or("Native task admission footprint overflow")?;
+        let charge = base
+            .budget()
+            .reserve_bytes(bytes, bytes)
+            .map_err(|e| e.to_string())?;
+        let mut actor = String::new();
+        actor
+            .try_reserve_exact(capture.actor().len())
+            .map_err(|_| "Native task actor allocation refused")?;
+        actor.push_str(capture.actor());
+        let scopes = Arc::new(Intent::from_scopes(
+            IntentKind::History,
+            scopes.scopes(),
+            base.budget(),
+        )?);
+        Ok(Arc::new(Self {
+            actor,
+            base: base.key(),
+            scopes,
+            descriptor: None,
+            transaction_step: false,
+            _output_charge: output_charge,
+            _charge: charge,
+        }))
+    }
     pub(super) fn is_transaction_step(&self) -> bool {
         self.transaction_step
     }
