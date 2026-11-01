@@ -1455,3 +1455,79 @@ fn actual_changed_pixel_boxes_include_native_low_bits_but_refuse_physical_paddin
         .is_err());
     }
 }
+
+#[test]
+fn immutable_command_projection_keeps_raw_mask_steps_and_composed_sources_distinct() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = source(16);
+    source.layers[0].mask = Some(crate::engine::Mask {
+        enabled: false,
+        linked: false,
+        cache_key: crate::engine::id(),
+        steps: ["first", "second"]
+            .into_iter()
+            .map(|id| crate::engine::MaskStep {
+                id: id.into(),
+                kind: "paint".into(),
+                enabled: false,
+                weight: 0.4,
+                value: 0.,
+                pixels: Raster::new_depth(3, 2, 16),
+                settings: serde_json::json!({}),
+            })
+            .collect(),
+    });
+    let document = native(&source, &session);
+    let id = &source.layers[0].id;
+    let parameters = serde_json::json!({"layer":id,"mask":true});
+    let target = RasterInput::from_parameters(&document, &parameters).unwrap();
+    let second = RasterInput::mask_step(&document, id, "second").unwrap();
+    assert_eq!(target.binding(), second.binding());
+    let first = RasterInput::from_parameters(
+        &document,
+        &serde_json::json!({"layer":id,"mask":true,"step":"first"}),
+    )
+    .unwrap();
+    assert_ne!(first.binding().slot(), second.binding().slot());
+    match target.retouch_source(&parameters).unwrap() {
+        RetouchInput::ComposedMask {
+            document: captured,
+            layer,
+        } => {
+            assert_eq!(captured.key(), document.key());
+            assert_eq!(layer.id(), id);
+        }
+        _ => panic!("Composed mask was replaced with a raw paint step"),
+    }
+    match target
+        .retouch_source(&serde_json::json!({"mask":true,"source_step":"first"}))
+        .unwrap()
+    {
+        RetouchInput::Raster(raw) => assert_eq!(raw.binding(), first.binding()),
+        _ => panic!("Explicit raw source step was not retained"),
+    }
+    let color = RasterInput::from_parameters(&document, &serde_json::json!({"layer":id})).unwrap();
+    match color
+        .retouch_source(&serde_json::json!({"sample_merged":true}))
+        .unwrap()
+    {
+        RetouchInput::Merged(captured) => assert_eq!(captured.key(), document.key()),
+        _ => panic!("Merged artwork was replaced with a raw source"),
+    }
+    assert!(
+        RasterInput::from_parameters(&document, &serde_json::json!({"layer":id,"mask":7})).is_err()
+    );
+    assert!(RasterInput::from_parameters(
+        &document,
+        &serde_json::json!({"layer":id,"mask":true,"step":"missing"})
+    )
+    .is_err());
+    assert!(color
+        .retouch_source(&serde_json::json!({"source_step":"first"}))
+        .is_err());
+    assert!(target
+        .retouch_source(&serde_json::json!({"mask":true,"sample_merged":true}))
+        .is_err());
+}
