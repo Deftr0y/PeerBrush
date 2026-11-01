@@ -4,6 +4,7 @@ use crate::{
     large_document::Reservation,
 };
 
+#[derive(Clone, Copy)]
 pub enum IntentKind {
     Visibility { visible: bool },
     Reorder,
