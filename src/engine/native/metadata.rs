@@ -390,7 +390,7 @@ mod tests {
     use serde_json::json;
     struct ZeroSources(Vec<Surface>);
     impl RasterCollector for ZeroSources {
-        fn resident(&mut self, raster: &crate::Raster) -> Result<RasterRef36> {
+        fn resident(&mut self, raster: &crate::raster::Raster) -> Result<RasterRef36> {
             assert!(raster.tiles.is_empty());
             let surface = Surface::zero(raster.width, raster.height, raster.depth)
                 .map_err(|e| e.to_string())?;
@@ -419,7 +419,7 @@ mod tests {
             let mut layer = Layer::new(id, kind, 8, 8);
             layer.id = id.into();
             layer.parent = parent.map(String::from);
-            layer.pixels = crate::Raster::new_depth(8, 8, depth);
+            layer.pixels = crate::raster::Raster::new_depth(8, 8, depth);
             doc.layers.push(layer);
         }
         doc
