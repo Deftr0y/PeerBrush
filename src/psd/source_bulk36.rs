@@ -38,6 +38,7 @@ impl<'a> SourceIndex<'a> {
     ) -> Result<Self, String> {
         check()?;
         if scene.rasters().len() > limits.rasters
+            || limits.rasters > 65536
             || limits.references > 1_048_576
             || limits.tiles > 1_048_576
             || limits.chunks > 16384

@@ -441,15 +441,15 @@ mod tests {
     }
 
     #[test]
-    fn icc_numeric_array_node_compatibility_does_not_bypass_combined_tree_admission() {
-        // Numeric-array envelope only, not an ICC color/fidelity qualification.
+    fn large_numeric_metadata_never_bypasses_combined_tree_admission() {
+        // Generic numeric metadata only. New36 ICC is typed canonical base64.
         let check = || Ok(());
         let pool = ResidentBudget::new(128 * 1024 * 1024).unwrap();
         let raw = MetadataCharge::reserve(&pool, MAX_BYTES, &check).unwrap();
         let count = 4 * 1024 * 1024;
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(MAX_BYTES).unwrap();
-        bytes.extend_from_slice(b"{\"icc_profile\":[");
+        bytes.extend_from_slice(b"{\"numeric_values\":[");
         for i in 0..count {
             if i != 0 {
                 bytes.push(b',');

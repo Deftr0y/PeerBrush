@@ -75,6 +75,7 @@ pub(crate) struct Limits {
     pub mask_edge: u32,
     pub mask_pixels8: u64,
     pub mask_pixels16: u64,
+    pub coordinate: u32,
 }
 
 impl Limits {
@@ -92,6 +93,7 @@ impl Limits {
             mask_edge: 200_000,
             mask_pixels8: 32 * 1024 * 1024,
             mask_pixels16: 128 * 1024 * 1024,
+            coordinate: 100_000,
         }
     }
 }
@@ -338,7 +340,9 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
         } else {
             self.limits.mask_pixels8
         };
-        if bounds.iter().any(|v| v.unsigned_abs() > 100_000)
+        if bounds
+            .iter()
+            .any(|v| v.unsigned_abs() > self.limits.coordinate)
             || width < 0
             || height < 0
             || width > i64::from(self.limits.mask_edge)
@@ -530,7 +534,10 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                 let next = self.position()?;
                 self.seek(mask.offset)?;
                 let bounds = self.bounds(mask.end()?)?;
-                if bounds.iter().any(|v| v.unsigned_abs() > 100_000) {
+                if bounds
+                    .iter()
+                    .any(|v| v.unsigned_abs() > self.limits.coordinate)
+                {
                     return Err("PSD mask coordinates exceed initial limits".into());
                 }
                 let [_default, flags] = self.read::<2>(mask.end()?)?;

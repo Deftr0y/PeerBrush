@@ -282,6 +282,16 @@ impl Canonical {
         limits: Limits,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
+        let bytes = Self::serialize_raw(value, limits, check)?;
+        Self::decode(&bytes, limits, false, check)
+    }
+    /// Bounded serialization without a DOM, for writer-side shared admission.
+    /// The caller must charge raw capacity before invoking this method.
+    pub(crate) fn serialize_raw<T: Serialize>(
+        value: &T,
+        limits: Limits,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Vec<u8>, String> {
         limits.validate()?;
         let mut output = Output {
             bytes: Vec::new(),
@@ -289,7 +299,45 @@ impl Canonical {
             check,
         };
         serde_json::to_writer(&mut output, value).map_err(|e| e.to_string())?;
-        Self::decode(&output.bytes, limits, false, check)
+        check()?;
+        Ok(output.bytes)
+    }
+    pub(crate) fn raw_length<T: Serialize>(
+        value: &T,
+        limits: Limits,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<usize, String> {
+        struct Counter<'a> {
+            bytes: usize,
+            max: usize,
+            check: &'a dyn Fn() -> Result<(), String>,
+        }
+        impl Write for Counter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                (self.check)().map_err(std::io::Error::other)?;
+                self.bytes = self
+                    .bytes
+                    .checked_add(bytes.len())
+                    .filter(|n| *n <= self.max)
+                    .ok_or_else(|| {
+                        std::io::Error::other("Source36 metadata exceeds byte admission")
+                    })?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        limits.validate()?;
+        check()?;
+        let mut counter = Counter {
+            bytes: 0,
+            max: limits.bytes,
+            check,
+        };
+        serde_json::to_writer(&mut counter, value).map_err(|e| e.to_string())?;
+        check()?;
+        Ok(counter.bytes)
     }
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes

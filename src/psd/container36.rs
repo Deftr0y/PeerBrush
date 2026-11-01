@@ -25,10 +25,24 @@ pub(crate) struct CompressedManifest {
     canonical: Digest,
     bytes: u64,
     sha256: Digest,
+    decoded_bytes: usize,
 }
 impl CompressedManifest {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
+    }
+    pub(crate) fn decoded_bytes(&self) -> usize {
+        self.decoded_bytes
+    }
+    /// The parsed manifest must come from this exact completed zlib range. This
+    /// avoids retaining a dead writer DOM merely to compare a later readback.
+    pub(crate) fn check_origin<T>(&self, manifest: &Manifest<T>) -> Result<(), String> {
+        if manifest.core().sha256() != self.core
+            || manifest.resource_origin() != Some((self.bytes, self.sha256))
+        {
+            return Err("Reopened Source36 manifest differs from captured writer bytes".into());
+        }
+        Ok(())
     }
     fn check<T: Serialize>(
         &self,
@@ -46,7 +60,7 @@ impl CompressedManifest {
 
 /// Canonical buffers and compressor/transfer storage must be included in the
 /// caller's combined admission. No full-file or native-pixel buffer is made.
-pub(crate) fn compress_manifest<T: Serialize, W: Write>(
+pub(crate) fn compress_manifest<T: Serialize, W: Write + ?Sized>(
     manifest: &Manifest<T>,
     metadata: Limits,
     output: &mut W,
@@ -70,6 +84,7 @@ pub(crate) fn compress_manifest<T: Serialize, W: Write>(
         canonical: digest(canonical.bytes()),
         bytes,
         sha256,
+        decoded_bytes: canonical.bytes().len(),
     })
 }
 
@@ -151,7 +166,7 @@ impl LayoutPlan {
 /// Readers must be bounded to precisely their named range; encoded tails and
 /// short reads fail. Standard SHA is checked again during this exact replay.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write<T: Serialize, W: Write, M: Read, L: Read, C: Read>(
+pub(crate) fn write<T: Serialize, W: Write + ?Sized, M: Read, L: Read, C: Read>(
     output: &mut W,
     header: Header,
     manifest: &Manifest<T>,

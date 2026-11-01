@@ -23,6 +23,10 @@ not historical Liquify coverage. IDs are independent of runtime store UUIDs,
 pack offsets and SurfaceKey values. No runtime path belongs in the saved source.
 
 Current Bezier/Text/Shape/Svg source definitions retain their exact values.
+The format36 ICC field uses canonical STANDARD base64, capped at 4 MiB decoded
+bytes (5,592,408 encoded characters), preserving exact original profile bytes.
+Numeric byte arrays are not an alias in this new field. Legacy formats retain
+their existing wire behavior; the new typed roundtrip must enforce this choice.
 Validated embedded effect image strings retain their existing separate limits.
 Runtime-only source_structure and source_patterns inspection views remain
 protected views; they do not become editable authority through this format.
