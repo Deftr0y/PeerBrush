@@ -1,5 +1,5 @@
 //! Provisional native-source import. Neither typed JSON nor valid tile hashes
-//! alone grant editable authority. Root owns actual semantic admission, source
+//! alone grant editable authority. The caller owns semantic admission, source
 //! identity/lease/revision publication and runtime ID/lineage decisions.
 use super::{
     bulk36::{self, BulkLimits, Digest, Record, TileIndexEntry},
@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
 };
 
-/// Implemented by the root's authenticated fresh-fragment/session owner. The
+/// Implemented by the caller's authenticated fresh-fragment/session owner. The
 /// codec cannot recover ownership from a serialized path, UUID or directory.
 pub(crate) trait ImportSession {
     fn store(&self) -> &Store;
@@ -399,7 +399,7 @@ impl<'a, R: Read + Seek, S: ImportSession> ProvisionalImport<'a, R, S> {
     }
 }
 impl<R: Read + Seek, S: ImportSession> QualifiedImport<'_, R, S> {
-    /// Invoke inside the root's final source identity/lease/revision guard. The
+    /// Invoke inside the caller's final source identity/lease/revision guard. The
     /// exact source/session owners remain borrowed through the adoption callback.
     pub(crate) fn map_pending<U>(
         this: Admitted<Self>,

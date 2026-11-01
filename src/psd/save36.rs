@@ -39,7 +39,7 @@ pub(crate) struct OwnedRoots<'a> {
 }
 
 /// Stage, seal, reopen and compare an entire captured native source save before
-/// granting the closed publication result. The root publication transaction is
+/// granting the closed publication result. The final publication transaction is
 /// still responsible for destination lease/backup/identity/final revision guards.
 pub(crate) fn prepare<'a>(
     scene: &'a SceneSnapshot,
@@ -82,7 +82,7 @@ pub(crate) fn prepare<'a>(
     staging
         .try_reserve_exact(4)
         .map_err(|_| "Source36 staging receipt allocation refused")?;
-    let result:Result<ComparedStandard,String> = (|| {
+    let result: Result<ComparedStandard, String> = (|| {
         let (layers, layer_written) = stage_file(
             roots.layers,
             plan.standard().layer_bytes(),
