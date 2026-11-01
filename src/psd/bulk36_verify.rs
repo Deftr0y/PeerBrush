@@ -20,12 +20,81 @@ pub(crate) struct BulkPlan<'a> {
     pub reference_root: Digest,
     pub chunks: &'a [Descriptor],
 }
+#[derive(Clone, Copy)]
 pub(crate) struct BulkLimits {
     pub rasters: usize,
     pub tiles: usize,
     pub references: usize,
     pub chunks: usize,
     pub encoded_bytes: u64,
+}
+impl BulkPlan<'_> {
+    /// Count/geometry admission before the caller allocates native/index scratch.
+    pub(crate) fn admit_core(
+        self,
+        limits: BulkLimits,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        check()?;
+        if limits.tiles > 1_048_576
+            || limits.references > 1_048_576
+            || limits.chunks > 16384
+            || limits.rasters > 65536
+            || self.tiles as usize > limits.tiles
+            || self.references as usize > limits.references
+            || self.rasters.len() > limits.rasters
+        {
+            return Err("Source36 bulk/index admission differs".into());
+        }
+        let mut references = 0u64;
+        for (i, raster) in self.rasters.iter().enumerate() {
+            check()?;
+            if raster.id as usize != i + 1 {
+                return Err("Source36 raster roster is not canonical".into());
+            }
+            Spec::new(raster.depth)?;
+            if u64::from(raster.references)
+                > u64::from(raster.width.div_ceil(256)) * u64::from(raster.height.div_ceil(256))
+            {
+                return Err("Source36 raster reference count exceeds its geometry".into());
+            }
+            references = references
+                .checked_add(u64::from(raster.references))
+                .ok_or("Source36 reference count overflow")?;
+        }
+        if references != u64::from(self.references) {
+            return Err("Source36 roster reference counts differ".into());
+        }
+        check()
+    }
+    pub(crate) fn admit(
+        self,
+        limits: BulkLimits,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.admit_core(limits, check)?;
+        if self.chunks.len() > limits.chunks {
+            return Err("Source36 chunk count exceeds admission".into());
+        }
+        let mut bytes = 0u64;
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            check()?;
+            if chunk.ordinal as usize != i
+                || !(super::HEADER..=super::MAX_CHUNK_BYTES).contains(&chunk.bytes)
+            {
+                return Err("Source36 chunk roster is not canonical".into());
+            }
+            bytes = bytes
+                .checked_add(u64::from(chunk.bytes))
+                .ok_or("Source36 chunk byte count overflow")?;
+        }
+        if bytes > limits.encoded_bytes
+            || ((self.tiles != 0 || self.references != 0) && self.chunks.is_empty())
+        {
+            return Err("Source36 encoded byte admission differs".into());
+        }
+        check()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -111,50 +180,9 @@ impl<'a, 'b> BulkVerifier<'a, 'b> {
         raster_counts: &'b mut [u64],
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
-        check()?;
-        if limits.tiles > 1_048_576
-            || limits.references > 1_048_576
-            || limits.chunks > 16384
-            || limits.rasters > 65536
-            || plan.tiles as usize > limits.tiles
-            || plan.references as usize > limits.references
-            || plan.chunks.len() > limits.chunks
-            || plan.rasters.len() > limits.rasters
-            || entries.len() != plan.tiles as usize
-            || raster_counts.len() != plan.rasters.len()
-        {
+        plan.admit(limits, check)?;
+        if entries.len() != plan.tiles as usize || raster_counts.len() != plan.rasters.len() {
             return Err("Source36 bulk/index admission differs".into());
-        }
-        let mut references = 0u64;
-        for (i, raster) in plan.rasters.iter().enumerate() {
-            check()?;
-            if raster.id as usize != i + 1 {
-                return Err("Source36 raster roster is not canonical".into());
-            }
-            Spec::new(raster.depth)?;
-            references = references
-                .checked_add(u64::from(raster.references))
-                .ok_or("Source36 reference count overflow")?;
-        }
-        if references != u64::from(plan.references) {
-            return Err("Source36 roster reference counts differ".into());
-        }
-        let mut bytes = 0u64;
-        for (i, chunk) in plan.chunks.iter().enumerate() {
-            check()?;
-            if chunk.ordinal as usize != i
-                || !(super::HEADER..=super::MAX_CHUNK_BYTES).contains(&chunk.bytes)
-            {
-                return Err("Source36 chunk roster is not canonical".into());
-            }
-            bytes = bytes
-                .checked_add(u64::from(chunk.bytes))
-                .ok_or("Source36 chunk byte count overflow")?;
-        }
-        if bytes > limits.encoded_bytes
-            || ((plan.tiles != 0 || plan.references != 0) && plan.chunks.is_empty())
-        {
-            return Err("Source36 encoded byte admission differs".into());
         }
         for (i, entry) in entries.iter_mut().enumerate() {
             if i % 1024 == 0 {
