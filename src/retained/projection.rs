@@ -1,7 +1,7 @@
 //! Retained input selection from an immutable generation-bound native document.
 use crate::{
     engine::native::{NativeDocument, RasterMetadata, RasterSlot, RetainedMetadata},
-    large_document::Result as SourceResult,
+    large_document::{Reservation, ResidentBudget, Result as SourceResult},
     raster::Surface,
     transform::native::{self, Mapping, Tile, Work},
 };
@@ -12,6 +12,47 @@ pub(crate) struct Original<'a> {
     pixels: RasterSlot,
     retained: Option<RetainedMetadata<'a>>,
     mapping: Mapping,
+}
+
+struct Stages {
+    values: Vec<crate::warp::Stage>,
+    _charge: Reservation,
+}
+fn copy_stages(
+    retained: Option<RetainedMetadata<'_>>,
+    budget: &ResidentBudget,
+) -> Result<Stages, String> {
+    let warps = retained.map_or(&[][..], |original| original.warps());
+    if warps.len() > crate::warp::MAX_STAGES {
+        return Err("Retained Warp stage limit exceeded".into());
+    }
+    let charge = budget
+        .reserve_bytes(16 * 1024, 16 * 1024)
+        .map_err(|e| e.to_string())?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(warps.len())
+        .map_err(|_| "Native Warp preparation allocation refused")?;
+    if values
+        .capacity()
+        .checked_mul(std::mem::size_of::<crate::warp::Stage>())
+        .is_none_or(|bytes| bytes > charge.bytes())
+    {
+        return Err("Native Warp preparation exceeds its admitted metadata".into());
+    }
+    for stage in warps {
+        values.push(crate::warp::Stage {
+            before: stage.before,
+            grid: crate::warp::Grid {
+                rect: stage.grid.rect,
+                points: stage.grid.points,
+            },
+        });
+    }
+    Ok(Stages {
+        values,
+        _charge: charge,
+    })
 }
 
 #[cfg(test)]
@@ -97,6 +138,20 @@ mod tests {
         assert_eq!(input.metadata().unwrap().matrix(), input.mapping().matrix());
         assert_eq!(pool.used(), baseline);
         let mut work = Work::new(1024 * 1024).unwrap();
+        assert_eq!(
+            input.bounds(true, &mut work, &|| Ok(())).unwrap(),
+            [2., 3., 8., 10.]
+        );
+        assert_eq!(
+            input.bounds(false, &mut work, &|| Ok(())).unwrap(),
+            [2., 3., 8., 10.]
+        );
+        assert!(input
+            .bounds(false, &mut work, &|| Err(
+                crate::large_document::Error::Cancelled
+            ))
+            .is_err());
+        assert_eq!(pool.used(), baseline);
         let tile = input
             .render_tile([8, 8], (0, 0), &mut work, &|| Ok(()))
             .unwrap();
@@ -149,36 +204,9 @@ impl<'a> Original<'a> {
         if source.depth() != current.depth() {
             return Err("Native retained source precision differs".into());
         }
-        let warps = retained.map_or(&[][..], |original| original.warps());
-        if warps.len() > crate::warp::MAX_STAGES {
-            return Err("Retained Warp stage limit exceeded".into());
-        }
         // Copy only bounded fixed-size placement records. Original pixels and
         // all metadata owners stay in the borrowed NativeDocument generation.
-        let charge = document
-            .budget()
-            .reserve_bytes(16 * 1024, 16 * 1024)
-            .map_err(|e| e.to_string())?;
-        let mut stages = Vec::new();
-        stages
-            .try_reserve_exact(warps.len())
-            .map_err(|_| "Native Warp preparation allocation refused")?;
-        if stages
-            .capacity()
-            .checked_mul(std::mem::size_of::<crate::warp::Stage>())
-            .is_none_or(|bytes| bytes > charge.bytes())
-        {
-            return Err("Native Warp preparation exceeds its admitted metadata".into());
-        }
-        for stage in warps {
-            stages.push(crate::warp::Stage {
-                before: stage.before,
-                grid: crate::warp::Grid {
-                    rect: stage.grid.rect,
-                    points: stage.grid.points,
-                },
-            });
-        }
+        let stages = copy_stages(retained, document.budget())?;
         let matrix = retained.map_or(super::IDENTITY, |original| original.matrix());
         let projective = retained.and_then(|original| original.projective());
         let mapping = Mapping::retained(
@@ -187,11 +215,10 @@ impl<'a> Original<'a> {
             source.depth(),
             matrix,
             projective,
-            &stages,
+            &stages.values,
             document.budget(),
         )?;
         drop(stages);
-        drop(charge);
         Ok(Self {
             document,
             current: current_slot,
@@ -217,6 +244,55 @@ impl<'a> Original<'a> {
     }
     pub(crate) fn mapping(&self) -> &Mapping {
         &self.mapping
+    }
+    pub(crate) fn bounds(
+        &self,
+        full: bool,
+        work: &mut Work,
+        check: &dyn Fn() -> SourceResult<()>,
+    ) -> Result<[f64; 4], String> {
+        check().map_err(|e| e.to_string())?;
+        let source = self.source()?;
+        let frame = [0, 0, source.width() as i32, source.height() as i32];
+        let pixels = if full {
+            frame
+        } else {
+            native::source_bounds(
+                source,
+                self.document.budget(),
+                self.document.disk_budget(),
+                work,
+                check,
+            )?
+            .unwrap_or(frame)
+        };
+        let stages = copy_stages(self.retained, self.document.budget())?;
+        let _prepared = if stages.values.is_empty() {
+            None
+        } else {
+            Some(
+                self.document
+                    .budget()
+                    .reserve_bytes(64 * 1024, 64 * 1024)
+                    .map_err(|e| e.to_string())?,
+            )
+        };
+        let matrix = self
+            .retained
+            .map_or(super::IDENTITY, |original| original.matrix());
+        let projective = self.retained.and_then(|original| original.projective());
+        super::geometry::validate(
+            source.width(),
+            source.height(),
+            source.depth(),
+            source.depth(),
+            matrix,
+            projective,
+            &stages.values,
+        )?;
+        let bounds = super::geometry::bounds(pixels, matrix, projective, &stages.values)?;
+        check().map_err(|e| e.to_string())?;
+        Ok(bounds)
     }
     pub(crate) fn render_tile(
         &self,

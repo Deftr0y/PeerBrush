@@ -24,7 +24,10 @@ Native support bounds scan one admitted physical tile at a time, including
 hidden RGB and native16 low bits while excluding physical padding. The scan
 charges logical visited samples before reading a tile. Retained placement
 validation is shared with the resident `Original` validator, whose existing
-layout and live-size checks remain in place.
+layout and live-size checks remain in place. Native input frame planning uses
+the same placement-bounds helper as the resident original. Bounds retain raw
+coefficients and snap mapped points; rendering separately snaps coefficients
+before producing and retaining its pixels.
 
 Warp preparation retains a separate bounded metadata reservation. Output,
 coordinate scratch, source pins and permanent source descriptors use the same
