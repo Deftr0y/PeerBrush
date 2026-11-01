@@ -1,5 +1,6 @@
 //! Original raster samples and accumulated placement are editable source data.
 pub(crate) mod geometry;
+pub(crate) mod projection;
 use crate::{
     engine::{Document, Layer},
     raster::{check_size, Raster},

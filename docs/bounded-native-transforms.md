@@ -33,7 +33,11 @@ admissions, not a total application RAM or performance claim.
 The final consumer must use the common captured edit, generation-bound source
 slots, sealed source-session output, retained-source action and guarded
 `PreparedDelta`. Original sources and placement metadata remain in their owning
-native document until that adoption succeeds. Runtime registration, linked and
+native document until that adoption succeeds. The read-only retained input
+projection binds both current and original slots to that exact generation and
+borrows the complete original placement. It also accepts mask/coverage raster
+projections without converting them into resident pixels. A foreign generation
+refuses before source preparation. Runtime registration, linked and
 unlinked mask/selection command integration, cancellation/history acceptance and
 full dense16K qualification are separate gates. Existing live limits remain
 unchanged.
