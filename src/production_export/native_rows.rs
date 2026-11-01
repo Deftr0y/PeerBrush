@@ -128,6 +128,40 @@ impl<'a> Rows<'a> {
     }
 }
 
+impl super::native_png::CapturedExportRows for Rows<'_> {
+    fn scene(&self) -> &SceneSnapshot {
+        self.scene
+    }
+    fn fill(
+        &mut self,
+        request: super::native_png::RowRequest<'_>,
+        output: &mut [u8],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let expected = match request.output.format {
+            super::Format::Png | super::Format::Jxl => {
+                super::native_png::binding(self.scene, request.output, request.resampling, check)?
+            }
+            super::Format::Webp => {
+                super::native_webp::binding(self.scene, request.output, request.resampling, check)?
+            }
+        };
+        if request.provenance != expected {
+            return Err("Native row request differs from its captured encoding plan".into());
+        }
+        Rows::fill(
+            self,
+            request.output,
+            request.sample_depth,
+            request.resampling,
+            request.first_row,
+            request.rows,
+            output,
+            check,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +317,131 @@ mod tests {
                             assert_eq!(actual, expected, "{depth} root{index} {method:?} {x},{y}");
                         }
                     }
+                }
+            }
+            drop(scene);
+            crate::compositor::native::tests::cleanup(&path);
+        }
+    }
+    #[test]
+    fn actual_captured_compositor_encodes_native_png_and_projected_webp_with_exact_pixels() {
+        for depth in [8, 16] {
+            let doc = crate::compositor::native::tests::doc(depth, true, "screen");
+            let (scene, path) = crate::compositor::native::tests::capture_kind(&doc, true);
+            for target in [None, Some(doc.layers[0].id.clone())] {
+                let expected = Image::render(&doc, target.as_deref(), &Control::default()).unwrap();
+                for format in [Format::Png, Format::Webp] {
+                    let output = Output {
+                        target: target.clone(),
+                        target_name: String::new(),
+                        variant: String::new(),
+                        filename: format!("test.{}", format.extension()),
+                        document_rect: [-3, -2, 12, 10],
+                        width: 23,
+                        height: 19,
+                        format,
+                        native_source_depth: depth,
+                        bit_depth: if format == Format::Webp { 8 } else { depth },
+                        scale_xy: [23. / 15., 19. / 12.],
+                    };
+                    let settings = super::super::Settings {
+                        format,
+                        ..Default::default()
+                    };
+                    let mut provider = Rows::for_target(&scene, target.as_deref()).unwrap();
+                    let mut encoded = Vec::new();
+                    if format == Format::Png {
+                        let counted = super::super::native_png::write_to(
+                            &scene,
+                            &output,
+                            &settings,
+                            &mut provider,
+                            &mut std::io::sink(),
+                            1024 * 1024,
+                            &|| Ok(()),
+                        )
+                        .unwrap();
+                        let written = super::super::native_png::write_to(
+                            &scene,
+                            &output,
+                            &settings,
+                            &mut provider,
+                            &mut encoded,
+                            counted.bytes(),
+                            &|| Ok(()),
+                        )
+                        .unwrap();
+                        counted.same_encoding(&written, &|| Ok(())).unwrap();
+                    } else {
+                        let counted = super::super::native_webp::write_to(
+                            &scene,
+                            &output,
+                            &settings,
+                            &mut provider,
+                            &mut std::io::sink(),
+                            1024 * 1024,
+                            &|| Ok(()),
+                        )
+                        .unwrap();
+                        let written = super::super::native_webp::write_to(
+                            &scene,
+                            &output,
+                            &settings,
+                            &mut provider,
+                            &mut encoded,
+                            counted.bytes(),
+                            &|| Ok(()),
+                        )
+                        .unwrap();
+                        counted.same_encoding(&written, &|| Ok(())).unwrap();
+                    }
+                    let decoded = image::load_from_memory_with_format(
+                        &encoded,
+                        if format == Format::Png {
+                            image::ImageFormat::Png
+                        } else {
+                            image::ImageFormat::WebP
+                        },
+                    )
+                    .unwrap()
+                    .to_rgba16();
+                    let grid =
+                        native_grid::Grid::new(&output, settings.resampling, 0, output.height)
+                            .unwrap();
+                    for y in 0..output.height {
+                        for x in 0..output.width {
+                            let [sx, sy] = grid.position(x, y).unwrap();
+                            let mut pixel = expected.resampled(sx, sy, settings.resampling);
+                            if format == Format::Webp && depth == 16 {
+                                pixel =
+                                    pixel.map(|value| u16::from(crate::raster::project16(value)));
+                            }
+                            if output.bit_depth == 8 {
+                                pixel = pixel.map(|value| value * 257);
+                            }
+                            assert_eq!(
+                                decoded.get_pixel(x, y).0,
+                                pixel,
+                                "{depth} {format:?} {x},{y}"
+                            );
+                        }
+                    }
+                    use super::super::native_png::{CapturedExportRows, RowRequest};
+                    let mut bytes = vec![0; output.width as usize * usize::from(depth / 2)];
+                    assert!(CapturedExportRows::fill(
+                        &mut provider,
+                        RowRequest {
+                            output: &output,
+                            sample_depth: depth,
+                            resampling: settings.resampling,
+                            first_row: 0,
+                            rows: 1,
+                            provenance: [0; 32]
+                        },
+                        &mut bytes,
+                        &|| Ok(())
+                    )
+                    .is_err());
                 }
             }
             drop(scene);

@@ -2,7 +2,9 @@
 pub mod jobs;
 pub mod library;
 pub(crate) mod native_grid;
+pub(crate) mod native_png;
 pub(crate) mod native_rows;
+pub(crate) mod native_webp;
 mod png;
 use crate::engine::Document;
 use serde::{Deserialize, Serialize};
