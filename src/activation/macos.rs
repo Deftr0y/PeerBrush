@@ -217,7 +217,7 @@ define_class!(
             })).unwrap_or_else(|_| Err("Finder document delivery could not complete; current work remains open".into()));
             if let Err(error) = result {
                 if let Ok(mut engine) = self.ivars().lock() {
-                    engine.status = error;
+                    engine.status = error.into();
                 }
                 if let Some(reply) = reply {
                     let error = NSAppleEventDescriptor::descriptorWithInt32(-10000);
