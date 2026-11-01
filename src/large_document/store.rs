@@ -325,6 +325,12 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct Store(Arc<Inner>);
+pub(crate) struct WeakStore(Weak<Inner>);
+impl WeakStore {
+    pub(crate) fn upgrade(&self) -> Option<Store> {
+        self.0.upgrade().map(Store)
+    }
+}
 
 /// A source fragment which has never been exposed as document/history/recovery
 /// authority. The actual session and workspace I/O admission belongs to its caller.
@@ -421,6 +427,16 @@ impl Snapshot {
 }
 
 impl Store {
+    pub(crate) fn downgrade(&self) -> WeakStore {
+        WeakStore(Arc::downgrade(&self.0))
+    }
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    /// Known in-memory checkpoint only; never scans for a latest commit.
+    pub(crate) fn checkpoint_reference(&self) -> Result<Option<CommitRef>> {
+        Ok(self.state()?.head)
+    }
     fn retire_unpublished(self, check: Check<'_>) -> Result<()> {
         if self.0.may_be_published.load(Ordering::Acquire) {
             return Err(Error::Invalid(
@@ -1529,39 +1545,8 @@ pub(super) fn open_directory(path: &Path) -> Result<File> {
     Ok(options.open(path)?)
 }
 
-#[cfg(unix)]
 pub(super) fn links(file: &File) -> Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(file.metadata()?.nlink())
-}
-#[cfg(windows)]
-pub(super) fn links(file: &File) -> Result<u64> {
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    #[derive(Default)]
-    struct Info {
-        attributes: u32,
-        created: [u32; 2],
-        accessed: [u32; 2],
-        written: [u32; 2],
-        volume: u32,
-        size_high: u32,
-        size_low: u32,
-        links: u32,
-        index_high: u32,
-        index_low: u32,
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut Info) -> i32;
-    }
-    let mut info = Info::default();
-    // SAFETY: The live File supplies a valid handle; Info has the Win32
-    // BY_HANDLE_FILE_INFORMATION layout and remains writable for the whole call.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(info.links as u64)
+    crate::file_safety::link_count(file).map_err(|_| Error::Changed)
 }
 
 #[cfg(test)]
