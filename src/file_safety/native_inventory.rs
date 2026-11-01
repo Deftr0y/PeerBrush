@@ -47,13 +47,23 @@ impl NativeLease {
         if fs::symlink_metadata(&quota_path).is_ok() && !regular(&quota_path) {
             return Err("Native previous-save quota is not a regular file".into());
         }
-        let quota_file = fs::OpenOptions::new()
+        let mut quota_options = fs::OpenOptions::new();
+        quota_options
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
-            .open(&quota_path)
-            .map_err(|e| e.to_string())?;
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            quota_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            quota_options.custom_flags(0x00200000);
+        }
+        let quota_file = quota_options.open(&quota_path).map_err(|e| e.to_string())?;
         quota_file.try_lock().map_err(|_| {
             "Previous-save inventory is busy; retry without changing the destination"
         })?;
@@ -110,6 +120,13 @@ fn regular_directory(path: &Path) -> Result<(), String> {
 fn open_directory(path: &Path) -> Result<fs::File, String> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -119,13 +136,30 @@ fn open_directory(path: &Path) -> Result<fs::File, String> {
     }
     options.open(path).map_err(|e| e.to_string())
 }
+fn open_inventory_file(path: &Path) -> Result<fs::File, String> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| e.to_string())?
+    };
+    #[cfg(not(unix))]
+    let file = open_for_identity(path).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Native save inventory file type changed".into());
+    }
+    Ok(file)
+}
 impl Entry {
     fn capture(directory: &Path, name: OsString) -> Result<Self, String> {
         let path = directory.join(&name);
         if !regular(&path) {
             return Err("Native previous-save inventory contains an alias or directory".into());
         }
-        let file = open_for_identity(&path).map_err(|e| e.to_string())?;
+        let file = open_inventory_file(&path)?;
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         let entry = Self {
             name,
@@ -140,7 +174,10 @@ impl Entry {
     fn validate(&self, directory: &Path) -> Result<(), String> {
         let path = directory.join(&self.name);
         let metadata = self.file.metadata().map_err(|e| e.to_string())?;
-        let named = open_for_identity(&path).map_err(|e| e.to_string())?;
+        if !regular(&path) {
+            return Err("Native save inventory name changed type".into());
+        }
+        let named = open_inventory_file(&path)?;
         if !regular(&path)
             || identity(&named)? != self.identity
             || identity(&self.file)? != self.identity
@@ -205,10 +242,8 @@ impl NativeInventory<'_> {
         if identity(&self.held_directory)? != self.directory_identity
             || identity(&open_directory(&self.directory)?)? != self.directory_identity
             || identity(&self.quota.0)? != self.quota_identity
-            || identity(
-                &open_for_identity(&self.directory.join("quota.lock"))
-                    .map_err(|e| e.to_string())?,
-            )? != self.quota_identity
+            || identity(&open_inventory_file(&self.directory.join("quota.lock"))?)?
+                != self.quota_identity
         {
             return Err("Native previous-save inventory owner changed; files retained".into());
         }
@@ -300,5 +335,25 @@ mod tests {
         assert_eq!(budget.used(), 0);
         drop(lease);
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fifo_identity_recheck_returns_without_waiting_for_a_writer() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt, sync::mpsc, time::Duration};
+        let (dir, path, _) = setup();
+        let fifo = dir.join("replaced.pipe");
+        let named = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(named.as_ptr(), 0o600) }, 0);
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let refused = open_inventory_file(&fifo).is_err();
+            let _ = send.send(refused);
+        });
+        assert!(receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("FIFO inventory open blocked cancellation"));
+        fs::remove_file(path).unwrap();
+        fs::remove_file(dir.join("replaced.pipe")).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 }
