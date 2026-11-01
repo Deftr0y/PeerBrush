@@ -72,8 +72,19 @@ class Tests(unittest.TestCase):
         self.assertIsNone(s.NoRedirect().redirect_request(None, None, 302, '', {}, 'https://other.example'))
         with patch.object(s.urllib.request, 'build_opener') as builder:
             builder.return_value.open.return_value.__enter__.return_value.read.return_value = b'{}'
+            builder.return_value.open.return_value.__enter__.return_value.headers = {}
             s.request('https://example.test', headers={'Authorization': 'Bearer fake'})
             self.assertIsInstance(builder.call_args.args[0], s.NoRedirect)
+
+    def test_default_service_json_is_bounded_and_duplicate_fields_are_rejected(self):
+        for body, header in [(b'{"id":"first","id":"second"}', None), (b'{}', '2097153'), (b'x' * 2097153, None)]:
+            with self.subTest(header=header), patch.object(s.urllib.request, 'build_opener') as builder:
+                response = builder.return_value.open.return_value.__enter__.return_value
+                response.headers = {} if header is None else {'Content-Length': header}
+                response.read.return_value = body
+                with self.assertRaises(ValueError): s.request('https://example.test')
+                if header: response.read.assert_not_called()
+                else: response.read.assert_called_once_with(2097153)
 
     def test_commit_failure_and_timeout(self):
         for status in ['CommitFailed', 'CommitStarted']:
@@ -90,7 +101,7 @@ class Tests(unittest.TestCase):
 
     def test_release_downloads_bound_headers_and_actual_reads(self):
         for header, body, valid in [('5', b'12345', True), (None, b'12345', True),
-                                    ('6', b'', False), ('bad', b'', False),
+                                    ('6', b'', False), ('5', b'123', False), ('bad', b'', False),
                                     ('-1', b'', False), (None, b'123456', False), ('1', b'123456', False)]:
             with self.subTest(header=header, bytes=len(body)), patch.object(s.urllib.request, 'build_opener') as builder:
                 response = builder.return_value.open.return_value.__enter__.return_value

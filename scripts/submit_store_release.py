@@ -21,6 +21,7 @@ import urllib.request
 import zipfile
 
 import package_msix as msix
+from production_readiness import unique_fields
 
 REPOSITORY = 'Deftr0y/PeerBrush'
 STORE_ID = '9PNR6T1Q2ZL9'
@@ -68,26 +69,28 @@ def release_version(tag):
 
 
 def request(url, *, method='GET', data=None, headers=None, binary=False, allow_redirects=False, limit=None):
+    limit = 2 * 1024 * 1024 if limit is None else limit
+    if type(limit) is not int or not 0 < limit <= msix.PACKAGE_LIMIT:
+        raise SafeError('Store/release response needs its bounded byte budget.')
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     try:
         opener = urllib.request.build_opener() if allow_redirects else urllib.request.build_opener(NoRedirect())
         with opener.open(req, timeout=120) as response:
-            if limit is None:
-                body = response.read()
-            else:
-                length = response.headers.get('Content-Length')
-                if length is not None and (not re.fullmatch(r'[0-9]{1,10}', length) or int(length) > limit):
-                    raise SafeError('Release response exceeds the download budget.')
-                body = response.read(limit + 1)
-                if len(body) > limit:
-                    raise SafeError('Release response exceeds the download budget.')
+            length = response.headers.get('Content-Length')
+            if length is not None and (not re.fullmatch(r'[0-9]{1,10}', length) or int(length) > limit):
+                raise SafeError('Release response exceeds the download budget.')
+            body = response.read(limit + 1)
+            if len(body) > limit:
+                raise SafeError('Release response exceeds the download budget.')
+            if length is not None and len(body) != int(length):
+                raise SafeError('Store/release response was truncated.')
     except (urllib.error.URLError, TimeoutError) as error:
         # Error URLs can contain upload SAS credentials. Never print the exception.
         code = getattr(error, 'code', None)
         raise RemoteError(code) from None
     if binary:
         return body
-    return json.loads(body) if body else {}
+    return json.loads(body, object_pairs_hook=unique_fields) if body else {}
 
 
 def github(path):
@@ -153,7 +156,7 @@ def released_assets(tag, source_root, portable_sha256, msix_sha256):
             raise SafeError('Portable archive differs from the independently selected SHA-256.')
         results.append(data)
     package, report_data, checksum, portable_bytes = results
-    report = json.loads(report_data)
+    report = json.loads(report_data, object_pairs_hook=unique_fields)
     with tempfile.TemporaryDirectory(prefix='peerbrush-store-verify-') as temporary:
         portable_path = Path(temporary) / portable_name
         portable_path.write_bytes(portable_bytes)
@@ -244,7 +247,7 @@ def submit(store, name, package, report, execute=False, journal=None):
         print('Read-only Store preflight passed. No submission created.')
         return
     if journal is None or journal.state is None:
-        raise SafeError('Store mutation requires a durable private release receipt.')
+        raise SafeError('Store mutation requires a release-bound private write-ahead receipt.')
     journal.bind(journal.state['tag'], name, report)
     if hashlib.sha256(package).hexdigest() != report['sha256']:
         raise SafeError('Package bytes differ from the private submission receipt.')
@@ -315,7 +318,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.submit and args.state is None:
-            raise SafeError('Submission requires --state in durable private storage; hosted CI needs a reviewed persistence adapter before activation.')
+            raise SafeError('Operator submission requires --state in durable private storage; protected publication has a separate receipt/history contract.')
         if args.state is not None:
             from store_release_state import private_path
             args.state = private_path(args.state)

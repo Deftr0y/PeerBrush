@@ -26,7 +26,7 @@ on:
         required: true
         type: string
       submit:
-        description: Write route remains blocked pending durable private host integration
+        description: Write route stays blocked; qualified publication uses the separate protected publisher
         default: false
         type: boolean
     secrets:
@@ -59,7 +59,7 @@ on:
         required: true
         type: string
       submit:
-        description: Write route remains blocked pending durable private host integration
+        description: Write route stays blocked; qualified publication uses the separate protected publisher
         default: false
         type: boolean
 
@@ -74,7 +74,7 @@ concurrency:
 
 jobs:
   submit:
-    # Missing by default; reusable/release writers remain blocked pending a real publisher/state host.
+    # Missing by default; this workflow is read-only. The protected publisher has a separate receipt/history contract.
     if: vars.MSSTORE_AUTOMATION_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.workflow_ref == 'Deftr0y/PeerBrush/.github/workflows/store-submit.yml@refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -106,7 +106,7 @@ jobs:
                          for key in ['PORTABLE_SHA256', 'MSIX_SHA256'])):
               raise SystemExit('Store preflight requires independently reviewed exact manual main automation and separate release inputs before checkout.')
           if os.environ.get('STORE_EXECUTE') != 'false':
-              raise SystemExit('Hosted Store submission remains blocked until an approved durable private host/state integration is implemented.')
+              raise SystemExit('Hosted Store submission remains blocked on this read-only preflight route; use the separately qualified protected publisher.')
           PY
       - name: Check out the reviewed automation source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

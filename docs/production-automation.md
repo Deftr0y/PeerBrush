@@ -31,17 +31,59 @@ The separate Store-only publisher handoff uses a non-resumable hosted contract:
 one first-attempt protected invocation may submit only after its own fresh
 confirmed publication and exact public-byte readback. Existing publications and
 reruns never regenerate that callback, even if receipts are missing or expired.
-Partner Center product/baseline/pending ownership is checked before every write.
-Local write-ahead records and sanitized recovery artifacts are diagnostic
-evidence; a lost response or runner is a reconciliation hold. This route needs
-no separate hosting purchase and remains literally disabled and unqualified.
+Before publication, a fresh private journal binds source, package hash and
+version with a `new` no-attempt state. Store create and commit intents precede
+their requests. Completed read-only release reconciliation therefore retains
+explicit no-attempt evidence; a lost runner or missing upload remains a hold.
+The sanitized artifact contains no credential or upload URL.
+
+`store_handoff_history.py` checks complete official production-workflow history,
+including run numbers, repository/owner/source identities and fixed publish-job
+steps. Missing/deleted runs, pagination overflow, reruns, competing writers and
+unknown step policies fail closed. Skipped writers require actual job readback.
+Every started writer needs its exact nonexpired receipt artifact, with selected
+outer digest, bounded single-member ZIP, source and strict receipt schema.
+A receipt never grants mutation authority.
+
+For prior attempts beyond `new`, the consumer requires the original published
+GitHub tag/source, package hash and actual package-byte readback, plus Partner
+Center's exact submission/package/version and `Published` status. A lost create
+ID, draft, processing, rejection or contradictory observation blocks later
+versions too. It never recreates or recommits an earlier attempt. Product,
+baseline and pending ownership checks repeat before every Store write,
+alongside the history fence. Concurrent owner edits remain visible holds.
+
+The finite observation window permits 1,000 workflow runs, 16 artifacts per
+historical run, 64 KiB per receipt ZIP, 8 KiB JSON per receipt, two package
+inspection budgets for initial historical byte readback, and a three-minute
+history deadline. Verified package bytes are reused only while their immutable
+API identity/hash remains unchanged in this invocation. Retention expiry,
+deleted history or exceeded bounds needs explicit owner reconciliation; no
+default reset or inferred successful submission exists. Configured 90-day
+artifact retention is not permanent storage. Qualify these bounds against real
+service history before enablement.
+
+Local records and artifacts are diagnostic evidence; actual workflow and
+Partner Center GETs determine whether uncertainty remains. This route needs no
+separate hosting purchase and remains literally disabled and unqualified.
+Environment protections and live service facts are not established by fixtures.
 See [Store automation](store-automation.md) for bounds and owner prerequisites.
+Run and artifact observations use the documented
+[GitHub workflow APIs](https://docs.github.com/en/rest/actions/workflow-runs)
+and [artifact APIs](https://docs.github.com/en/rest/actions/artifacts).
+The published GitHub package hash binds the original submission input; Store
+metadata readback is not a cryptographic digest of Microsoft's installed package
+and does not replace genuine installed acceptance or public Store readback.
 
 The filesystem requirements below apply to the separate, explicitly invoked
 operator `submit_store_release.py --submit --state` route and its read-only
 reconciler. They are not a Microsoft API hosting requirement.
 
-Store submission remains explicitly disabled while integration is prepared. No persistent private host or storage backend is configured. Temporary runner disks, caches and downloadable artifacts cannot substitute for a durable write-ahead journal. Activating service writes requires a reviewed durable deployment and separate explicit approval.
+The operator route requires separate deployment qualification and authorization.
+No persistent private operator host or storage backend is configured. Its
+filesystem journal must be durable; runner disks, caches and artifacts cannot
+substitute for that operator contract. The protected publisher uses the
+cross-run observation contract above. Neither route is activated.
 
 The existing MSIX writer still validates a published stable release, exact Store identity, package provenance and checksums, current published version and absence of a pending submission. Actual submission additionally requires an absolute `--state` file inside an existing durable private directory. Before release downloads or authentication, the tool rejects supplied receipt paths inside any Git checkout, including independently cloned release-source inputs and worktrees identified by a `.git` file. It also rejects symbolic links, junctions and reparse points throughout the supplied path. Locking and receipt writes recheck these boundaries. The directory and receipt must stay outside public source, release packages and Actions artifacts.
 
@@ -70,7 +112,15 @@ The [documented Store statuses](https://learn.microsoft.com/en-us/windows/uwp/mo
 
 The hosted Store workflow remains disabled. Its fixed isolated first step accepts only a first-attempt manual invocation of the official main Store workflow on a hosted Linux x64 runner. An independently repeated `automation_commit` must equal the event and workflow SHA before checkout uses `github.sha`; the existing release gate then verifies that checkout. The independent release `source_commit` remains separate input data, may differ from the automation SHA, and never selects executable automation. Both selected asset hashes and the release SHA are validated before checkout. Release-event and unknown reusable callers remain blocked until an actual reviewed publisher supplies a complete trust contract.
 
-Hosted `submit=true` is refused before checkout and any credential-bearing step, even if the existing enable variable is set. The final `submit=false` preflight retains the existing Partner Center credentials only for authenticated product/pending/version GETs after exact published-asset validation; no hosted step forwards `--submit` or guesses a state path. This is a guarded source-selection boundary, not an implemented publisher or state host. The unchanged local CLI's durable filesystem journal is already the writer interface; its deployment needs a maintainer-selected persistent private host with accepted filesystem/lock semantics, or an explicitly selected remote backend that durably commits every mutation intent before the corresponding service write. No such host or backend is supplied or configured here. Runner temp files, end-of-job uploads, public Actions artifacts and caches are not durable state. Actual host/access decisions, any required persistence adapter, provider/installed/public acceptance and explicit activation approval remain open.
+Hosted `submit=true` remains refused before checkout or credentials on this
+read-only preflight route, even when its existing enable variable is set.
+`submit=false` receives credentials only for product/pending/version GETs after
+published-asset validation; it forwards neither `--submit` nor a guessed state
+path. The local CLI's durable filesystem journal remains its separate operator
+interface, requiring maintainer-selected persistent private storage with
+accepted filesystem/lock semantics. That is not a hosting prerequisite imposed
+by Microsoft's API or the protected publisher. Provider/installed/public
+acceptance and explicit activation approval remain open for both routes.
 
 ## Website boundary and verification
 

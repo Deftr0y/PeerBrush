@@ -74,6 +74,7 @@ jobs:
           python -B scripts/test_final_release.py
           python -B scripts/test_final_inputs.py
           python -B scripts/test_publish_release.py
+          python -B scripts/test_store_handoff_history.py
       - name: Report disabled production authority
         run: |
           echo 'Final composition and immutable transaction are prepared. Windows signing/qualification handoff is prepared but inactive and unverified. Authenticated installed producers and complete native acceptance remain source work; publication and Store submission are disabled.' >> "$GITHUB_STEP_SUMMARY"
@@ -179,7 +180,8 @@ jobs:
                   or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/production.yml@refs/heads/main'):
               raise SystemExit('Require reviewed exact main production preparation.')
           PY
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout reviewed production source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
