@@ -11,6 +11,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+#[path = "geometry.rs"]
+mod geometry;
+pub(crate) use geometry::PreparedGeometry;
 
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct Site {
@@ -213,6 +216,7 @@ struct HairEntry {
 struct State {
     entries: Vec<Entry>,
     hairlines: Vec<HairEntry>,
+    geometry: Vec<geometry::Entry>,
     charged: usize,
     error: Option<String>,
 }
@@ -242,6 +246,7 @@ impl ScanCache {
             state: Mutex::new(State {
                 entries: Vec::new(),
                 hairlines: Vec::new(),
+                geometry: Vec::new(),
                 charged: 4096,
                 error: None,
             }),
@@ -343,7 +348,9 @@ impl ScanCache {
                 index
             }
             Err(index) => {
-                if state.entries.len() + state.hairlines.len() == self.maximum {
+                if state.entries.len() + state.hairlines.len() + state.geometry.len()
+                    >= self.maximum
+                {
                     state.error = Some("SVG retained scan invocation admission exceeded".into());
                     return false;
                 }
@@ -478,7 +485,9 @@ impl ScanCache {
                 index
             }
             Err(index) => {
-                if state.entries.len() + state.hairlines.len() == self.maximum {
+                if state.entries.len() + state.hairlines.len() + state.geometry.len()
+                    >= self.maximum
+                {
                     state.error = Some("SVG retained scan invocation admission exceeded".into());
                     return false;
                 }

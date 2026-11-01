@@ -56,6 +56,26 @@ impl Clone for StrokeDash {
 }
 
 impl StrokeDash {
+    /// Exact private-state binding for an admitted retained renderer program.
+    pub fn matches_bits(&self, other: &Self) -> bool {
+        crate::allocation::work(self.array.len());
+        self.offset.to_bits() == other.offset.to_bits()
+            && self.interval_len.get().to_bits() == other.interval_len.get().to_bits()
+            && self.first_len.to_bits() == other.first_len.to_bits()
+            && self.first_index == other.first_index
+            && self.array.len() == other.array.len()
+            && self
+                .array
+                .iter()
+                .zip(&other.array)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+    /// Actual retained array capacity, excluding the enclosing object.
+    pub fn allocation_bytes(&self) -> Option<usize> {
+        self.array
+            .capacity()
+            .checked_mul(core::mem::size_of::<f32>())
+    }
     /// Creates a new stroke dashing object.
     pub fn new(dash_array: Vec<f32>, dash_offset: f32) -> Option<Self> {
         crate::allocation::checkpoint();

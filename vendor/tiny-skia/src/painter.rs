@@ -275,6 +275,18 @@ impl PixmapMut<'_> {
         mask: Option<&Mask>,
         prepared: Option<PreparedDraw<'_>>,
     ) {
+        #[cfg(feature = "std")]
+        if let Some((cache, key)) = prepared {
+            let Some(geometry) =
+                cache.geometry(key, path, None, transform, [self.width(), self.height()])
+            else {
+                return;
+            };
+            self.render_prepared_geometry(
+                &geometry, paint, fill_rule, transform, mask, prepared, None,
+            );
+            return;
+        }
         if transform.is_identity() {
             // This is sort of similar to SkDraw::drawPath
 
@@ -449,6 +461,38 @@ impl PixmapMut<'_> {
             return;
         }
 
+        #[cfg(feature = "std")]
+        if let Some((cache, key)) = prepared {
+            let coverage = treat_as_hairline(paint, stroke, transform);
+            let Some(geometry) = cache.geometry(
+                key,
+                path,
+                Some((stroke, coverage.is_some())),
+                transform,
+                [self.width(), self.height()],
+            ) else {
+                return;
+            };
+            let mut paint = paint.clone();
+            if let Some(coverage) = coverage {
+                if coverage != 1.0 && paint.blend_mode.should_pre_scale_coverage() {
+                    let scale = (coverage * 256.0) as i32;
+                    let new_alpha = (255 * scale) >> 8;
+                    paint.shader.apply_opacity(new_alpha as f32 / 255.0);
+                }
+            }
+            self.render_prepared_geometry(
+                &geometry,
+                &paint,
+                FillRule::Winding,
+                transform,
+                mask,
+                prepared,
+                coverage.map(|_| stroke.line_cap),
+            );
+            return;
+        }
+
         let res_scale = PathStroker::compute_resolution_scale(&transform);
 
         let dash_path;
@@ -579,6 +623,95 @@ impl PixmapMut<'_> {
     }
 
     /// A stroking for paths with subpixel/hairline width.
+    #[cfg(feature = "std")]
+    fn render_prepared_geometry(
+        &mut self,
+        geometry: &crate::rows::PreparedGeometry,
+        paint: &Paint,
+        rule: FillRule,
+        transform: Transform,
+        mask: Option<&Mask>,
+        prepared: Option<PreparedDraw<'_>>,
+        hairline: Option<LineCap>,
+    ) {
+        if paint.blend_mode == BlendMode::Destination
+            || (paint.blend_mode == BlendMode::DestinationIn
+                && paint.shader.is_opaque()
+                && paint.is_solid_color())
+        {
+            return;
+        }
+        let mut paint = paint.clone();
+        if !transform.is_identity() {
+            paint.shader.transform(transform);
+        }
+        for piece in geometry.pieces() {
+            tiny_skia_path::allocation::checkpoint();
+            if let Some(tile) = piece.tile {
+                paint.shader.transform(Transform::from_translate(
+                    -(tile.x() as f32),
+                    -(tile.y() as f32),
+                ));
+                let Some(mut subpix) = self.subpixmap(tile.to_int_rect()) else {
+                    refuse_prepared(prepared, "SVG prepared tile storage is unavailable");
+                    return;
+                };
+                let submask = mask.and_then(|mask| mask.submask(tile.to_int_rect()));
+                let context = tile_prepared(prepared, &tile);
+                if context.is_none() {
+                    return;
+                }
+                if let Some(cap) = hairline {
+                    Self::stroke_hairline(&piece.path, &paint, cap, submask, &mut subpix, context);
+                } else {
+                    let band = [subpix.rows.start, subpix.rows.end()];
+                    let Some(mut blitter) =
+                        RasterPipelineBlitter::new(&paint, submask, &mut subpix)
+                    else {
+                        refuse_prepared(prepared, "SVG prepared shader pipeline was refused");
+                        return;
+                    };
+                    fill_scan(
+                        &piece.path,
+                        paint.anti_alias,
+                        rule,
+                        &tile.size().to_screen_int_rect(0, 0),
+                        context,
+                        band,
+                        &mut blitter,
+                    );
+                }
+                paint
+                    .shader
+                    .transform(Transform::from_translate(tile.x() as f32, tile.y() as f32));
+            } else {
+                let clip = self.size().to_screen_int_rect(0, 0);
+                let submask = mask.map(|mask| mask.as_submask());
+                let mut subpix = self.as_subpixmap();
+                if let Some(cap) = hairline {
+                    Self::stroke_hairline(&piece.path, &paint, cap, submask, &mut subpix, prepared);
+                } else {
+                    let band = [subpix.rows.start, subpix.rows.end()];
+                    let Some(mut blitter) =
+                        RasterPipelineBlitter::new(&paint, submask, &mut subpix)
+                    else {
+                        refuse_prepared(prepared, "SVG prepared shader pipeline was refused");
+                        return;
+                    };
+                    fill_scan(
+                        &piece.path,
+                        paint.anti_alias,
+                        rule,
+                        &clip,
+                        prepared,
+                        band,
+                        &mut blitter,
+                    );
+                }
+            }
+        }
+    }
+
     fn stroke_hairline(
         path: &Path,
         paint: &Paint,

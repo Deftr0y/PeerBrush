@@ -2285,6 +2285,7 @@
     "vendor/tiny-skia/src/pixmap.rs",
     "vendor/tiny-skia/src/rows.rs",
     "vendor/tiny-skia/src/rows/cache.rs",
+    "vendor/tiny-skia/src/rows/geometry.rs",
     "vendor/tiny-skia/src/scan/hairline.rs",
     "vendor/tiny-skia/src/scan/hairline_aa.rs",
     "vendor/tiny-skia/src/scan/hairline_plan.rs",
