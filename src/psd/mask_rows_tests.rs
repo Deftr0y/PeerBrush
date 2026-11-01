@@ -273,6 +273,22 @@ fn standard_psd_psb_all_compressions_keep_mask_words_defaults_disabled_state_and
                     let (bytes, words) = fixture(depth, kind, layout, enabled, 0);
                     let original = bytes.clone();
                     let doc = decode(&bytes).unwrap();
+                    let streamed =
+                        decode_reader(&mut std::io::Cursor::new(&bytes), &Default::default())
+                            .unwrap();
+                    assert_eq!(streamed.read_only, doc.read_only);
+                    assert_eq!(streamed.warnings, doc.warnings);
+                    assert_eq!(streamed.layers[0].pixels, doc.layers[0].pixels);
+                    let streamed_mask = streamed.layers[0].mask.as_ref().unwrap();
+                    assert_eq!(
+                        (streamed_mask.enabled, streamed_mask.linked),
+                        (enabled, true)
+                    );
+                    assert_eq!(streamed_mask.steps[0].value, 127.);
+                    assert_eq!(
+                        streamed_mask.steps[1].pixels,
+                        doc.layers[0].mask.as_ref().unwrap().steps[1].pixels
+                    );
                     assert!(!doc.read_only, "{:?}", doc.warnings);
                     assert_eq!(doc.bit_depth, depth);
                     assert_eq!(doc.layers.len(), 1);
@@ -351,6 +367,73 @@ fn row_cancellation_discards_partial_standard_decode_and_cannot_override_unsuppo
                 );
             }
         }
+    }
+}
+
+#[test]
+fn indexed_native16_offcanvas_masks_keep_the_existing_plane_admission_beyond_layer_edge_limit() {
+    for layout in [Layout::Psd, Layout::Psb] {
+        let (original, _) = fixture(16, 0, layout, false, 0);
+        let index = structural::index(
+            &mut std::io::Cursor::new(&original),
+            structural::Limits::current(),
+            || Ok(()),
+        )
+        .unwrap();
+        let layer = &index.layers[0];
+        let words = values(9000, 1, 16);
+        let replacement = channel(&words, 9000, 1, 16, 0, layout);
+        let mut record =
+            original[layer.record.offset as usize..layer.record.end().unwrap() as usize].to_vec();
+        let length_at = 18 + 4 * if layout.large() { 10 } else { 6 } + 2;
+        let mut new_length = vec![];
+        layout
+            .write_length(&mut new_length, replacement.len() as u64)
+            .unwrap();
+        record[length_at..length_at + new_length.len()].copy_from_slice(&new_length);
+        let mask_at = (layer.mask.offset - layer.record.offset) as usize;
+        for (i, value) in [0i32, -8000, 1, 1000].into_iter().enumerate() {
+            record[mask_at + i * 4..mask_at + i * 4 + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        let mut info = (-1i16).to_be_bytes().to_vec();
+        info.extend(record);
+        for c in &layer.channels {
+            if c.id == -2 {
+                info.extend_from_slice(&replacement);
+            } else {
+                info.extend_from_slice(
+                    &original[c.span.offset as usize..c.span.end().unwrap() as usize],
+                );
+            }
+        }
+        if info.len() % 2 != 0 {
+            info.push(0);
+        }
+        let mut section = vec![];
+        layout.write_length(&mut section, 0).unwrap();
+        u32b(&mut section, 0);
+        layout_tag(&mut section, b"Lr16", &info, layout);
+        layout_tag(&mut section, b"Mt16", &[], layout);
+        let mut bytes = original[..34].to_vec();
+        layout
+            .write_length(&mut bytes, section.len() as u64)
+            .unwrap();
+        bytes.extend(section);
+        bytes.extend_from_slice(&original[index.composite.span.offset as usize..]);
+        let legacy = decode(&bytes).unwrap();
+        let streamed =
+            decode_reader(&mut std::io::Cursor::new(&bytes), &Default::default()).unwrap();
+        assert!(!streamed.read_only);
+        let actual = &streamed.layers[0].mask.as_ref().unwrap().steps[1].pixels;
+        assert_eq!(
+            *actual,
+            legacy.layers[0].mask.as_ref().unwrap().steps[1].pixels
+        );
+        for x in 0..269 {
+            let value = words[x as usize + 8000];
+            assert_eq!(actual.get16(x, 0), [value, value, value, 65535]);
+        }
+        assert_eq!(crate::raster::MAX_EDGE, 8192);
     }
 }
 

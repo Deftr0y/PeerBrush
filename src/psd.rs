@@ -1,6 +1,9 @@
 //! Bounded PSD v1 / PSB v2 codecs. Unsupported Photoshop features are never silently rewritten.
 mod composite;
+mod indexed;
 pub mod patterns;
+mod row_stream;
+mod structural;
 mod styles;
 use crate::{
     engine::{id, Document, Layer, Mask, MaskStep},
@@ -1776,6 +1779,14 @@ fn stream_composite<R: Read>(
             control,
         )?;
     }
+    restore_saved_composite(raster, control)
+}
+
+fn restore_saved_composite(
+    mut raster: Raster,
+    control: &crate::loading::Control,
+) -> Result<(Raster, bool), String> {
+    let (w, h, depth) = (raster.width, raster.height, raster.depth);
     control.progress("Resolving saved composite transparency", 0, 1)?;
     // PSD compatibility colors are composited over white. Restore straight RGB in tiles.
     let max = if depth == 16 { 65535i64 } else { 255 };
@@ -2157,9 +2168,7 @@ pub fn decode_reader<R: Read + std::io::Seek>(
     reader: &mut R,
     control: &crate::loading::Control,
 ) -> Result<Document, String> {
-    decode_sections(reader, control, |reader, length, large, control, stage| {
-        read_section(reader, length, large, control, stage).map(Cow::Owned)
-    })
+    indexed::decode(reader, control)
 }
 fn decode_sections<'a, R: Read + std::io::Seek>(
     reader: &mut R,
@@ -2252,6 +2261,7 @@ fn decode_sections<'a, R: Read + std::io::Seek>(
         input.hash,
         layout,
         control,
+        None,
     )
 }
 fn section_size<R: Read + std::io::Seek>(
@@ -2295,6 +2305,7 @@ fn borrowed_section<'a>(
     control.progress(stage, n, n)?;
     Ok(Cow::Borrowed(bytes))
 }
+#[cfg(test)]
 fn read_section<R: Read + std::io::Seek>(
     reader: &mut R,
     length: u64,
@@ -2318,6 +2329,35 @@ fn read_section<R: Read + std::io::Seek>(
     control.progress(stage, n, n)?;
     Ok(bytes)
 }
+// The compact metadata view is parser input only. These methods always read the
+// original indexed source; its standard hash must never use the compact view.
+trait IndexedChannels {
+    fn section_hash(&self) -> u64;
+    #[cfg(test)]
+    fn embedded_len(&self) -> usize;
+    fn restore(
+        &mut self,
+        limit: usize,
+        control: &crate::loading::Control,
+    ) -> Result<Embedded, String>;
+    fn layer(
+        &mut self,
+        record: usize,
+        channel: usize,
+        raster: &mut Raster,
+        target: usize,
+        initialize: bool,
+        control: &crate::loading::Control,
+    ) -> Result<(), String>;
+    fn mask(
+        &mut self,
+        record: usize,
+        channel: usize,
+        raster: &mut Raster,
+        offset: [i32; 2],
+        control: &crate::loading::Control,
+    ) -> Result<(), String>;
+}
 fn decode_parts(
     resources: &[u8],
     layer_section: &[u8],
@@ -2329,6 +2369,7 @@ fn decode_parts(
     composite_hash: u64,
     layout: Layout,
     control: &crate::loading::Control,
+    mut streams: Option<&mut dyn IndexedChannels>,
 ) -> Result<Document, String> {
     let mut rr = Cursor::new(resources);
     let mut embedded = None;
@@ -2408,8 +2449,15 @@ fn decode_parts(
             128 * 1024 * 1024
         };
         #[cfg(test)]
-        observe_open_phase("json_start", bytes.len());
-        let result = embedded_source(ZlibDecoder::new(bytes), limit, control);
+        observe_open_phase(
+            "json_start",
+            streams.as_ref().map_or(bytes.len(), |s| s.embedded_len()),
+        );
+        let result = if let Some(streams) = streams.as_deref_mut() {
+            streams.restore(limit, control)
+        } else {
+            embedded_source(ZlibDecoder::new(bytes), limit, control).map_err(|e| e.to_string())
+        };
         #[cfg(test)]
         observe_open_phase("source_decoded", 0);
         control.check()?;
@@ -2429,7 +2477,11 @@ fn decode_parts(
                 && e.document.height == h
                 && e.document.bit_depth == depth
                 && (!high || e.format >= 5)
-                && e.standard_hash == hash(layer_section) ^ composite_hash
+                && e.standard_hash
+                    == streams
+                        .as_ref()
+                        .map_or_else(|| hash(layer_section), |s| s.section_hash())
+                        ^ composite_hash
                 && e.document.psd_global_mask == global_mask_settings
                 && validate(&e.document).is_ok()
                 && metadata_sources_match(layer_section, layout, &e.document, control) == Ok(true)
@@ -2510,8 +2562,12 @@ fn decode_parts(
                     return Err("Unsupported PSD layer channels".into());
                 }
                 let mut channels = vec![];
+                let mut channel_ids = std::collections::HashSet::new();
                 for _ in 0..nc {
                     let channel = lr.i16()?;
+                    if !channel_ids.insert(channel) {
+                        warnings.push(format!("Duplicate Photoshop layer channel: {channel}"));
+                    }
                     channels.push((channel, lr.length(layout.large())?));
                     if !(-2..=2).contains(&channel) {
                         warnings.push(format!("Unsupported Photoshop layer channel: {channel}"));
@@ -2817,9 +2873,13 @@ fn decode_parts(
                     let lh = rec.layer.pixels.height;
                     let mut pixels = Raster::new_depth(lw, lh, depth);
                     let mut initialized = false;
-                    for &(ch, size) in &rec.channels {
+                    for (channel_index, &(ch, size)) in rec.channels.iter().enumerate() {
                         control.check()?;
-                        let bytes = lr.bytes(size)?;
+                        let bytes = if streams.is_some() {
+                            &[][..]
+                        } else {
+                            lr.bytes(size)?
+                        };
                         if ch == -2 {
                             if let Some(b) = rec.mask_bounds {
                                 let mw = b[3].checked_sub(b[1]).ok_or("Invalid mask")?;
@@ -2833,15 +2893,25 @@ fn decode_parts(
                                     (lw, lh)
                                 };
                                 let mut pixels = Raster::new_depth(pw, ph, depth);
-                                stream_mask_channel(
-                                    bytes,
-                                    mw as u32,
-                                    mh as u32,
-                                    &mut pixels,
-                                    [b[1] - rec.bounds[1], b[0] - rec.bounds[0]],
-                                    layout,
-                                    control,
-                                )?;
+                                if let Some(streams) = streams.as_deref_mut() {
+                                    streams.mask(
+                                        record_index,
+                                        channel_index,
+                                        &mut pixels,
+                                        [b[1] - rec.bounds[1], b[0] - rec.bounds[0]],
+                                        control,
+                                    )?;
+                                } else {
+                                    stream_mask_channel(
+                                        bytes,
+                                        mw as u32,
+                                        mh as u32,
+                                        &mut pixels,
+                                        [b[1] - rec.bounds[1], b[0] - rec.bounds[0]],
+                                        layout,
+                                        control,
+                                    )?;
+                                }
                                 rec.layer.mask = Some(Mask {
                                     linked: true,
                                     cache_key: crate::engine::id(),
@@ -2870,14 +2940,25 @@ fn decode_parts(
                             }
                         } else if (-1..=2).contains(&ch) {
                             let c = if ch == -1 { 3 } else { ch as usize };
-                            stream_layer_channel(
-                                bytes,
-                                &mut pixels,
-                                c,
-                                !initialized,
-                                layout,
-                                control,
-                            )?;
+                            if let Some(streams) = streams.as_deref_mut() {
+                                streams.layer(
+                                    record_index,
+                                    channel_index,
+                                    &mut pixels,
+                                    c,
+                                    !initialized,
+                                    control,
+                                )?;
+                            } else {
+                                stream_layer_channel(
+                                    bytes,
+                                    &mut pixels,
+                                    c,
+                                    !initialized,
+                                    layout,
+                                    control,
+                                )?;
+                            }
                             initialized = true;
                         } else {
                             warnings.push(format!("Unsupported Photoshop layer channel: {ch}"));
@@ -3207,8 +3288,11 @@ fn metadata_sources_match(
         if channels > 8 {
             return Ok(false);
         }
+        let mut channel_ids = std::collections::HashSet::new();
         for _ in 0..channels {
-            records.i16()?;
+            if !channel_ids.insert(records.i16()?) {
+                return Ok(false);
+            }
             records.length(layout.large())?;
         }
         records.bytes(12)?;
