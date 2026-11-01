@@ -69,6 +69,9 @@ impl<'c> WriteGuard<'c> {
         if mask != input.is_mask() {
             return Err("Native paint command targets a different color or mask plane".into());
         }
+        if !mask && input.layer_metadata().source().is_some() {
+            return Err("Edit this layer's text/vector properties, paint its mask, or explicitly rasterize it first".into());
+        }
         if target != input.layer_metadata().id() {
             if method != Method::Clear || mask {
                 return Err("Native paint command targets another layer".into());
