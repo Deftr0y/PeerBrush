@@ -81,7 +81,7 @@ impl EncodedWebp<'_, '_> {
         })
     }
 }
-fn binding(
+pub(super) fn binding(
     scene: &SceneSnapshot,
     output: &Output,
     resampling: Resampling,
