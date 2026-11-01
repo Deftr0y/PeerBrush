@@ -188,6 +188,22 @@ fn capture(f: &Fixture, doc: &Document) -> SceneSnapshot {
     )
     .unwrap()
 }
+fn native_capture(f: &Fixture, doc: &Document) -> SceneSnapshot {
+    let pending = capture(f, doc).into_provisional_pending().unwrap();
+    let native = crate::engine::native::NativeDocument::from_pending(pending).unwrap();
+    SceneSnapshot::from_native(
+        SceneIdentity {
+            project_id: "source-codec-fixture".into(),
+            document_id: doc.id.clone(),
+            revision: doc.revision,
+        },
+        native,
+        vec![],
+        None,
+        None,
+    )
+    .unwrap()
+}
 fn limits() -> SaveLimits {
     SaveLimits {
         metadata: MetadataLimits {
@@ -233,7 +249,7 @@ impl NativeRows for PreparedRows<'_> {
             fs::rename(&named, &original).map_err(|e| e.to_string())?;
             fs::write(&named, b"foreign stage replacement").map_err(|e| e.to_string())?;
         }
-        let layer = &self.scene.metadata().layers[0];
+        let layer = self.scene.metadata().layers().next().unwrap();
         let merged =
             r.source == RowSource::MergedWhiteMatte || r.source == RowSource::BakedComposite;
         assert!(matches!(
@@ -244,13 +260,13 @@ impl NativeRows for PreparedRows<'_> {
                 | RowSource::BakedComposite
         ));
         let reference = if r.channel == -2 {
-            &layer.mask.as_ref().unwrap().steps[0].pixels
+            layer.mask().unwrap().steps().next().unwrap().pixels()
         } else {
-            &layer.pixels
+            layer.pixels()
         };
-        let source = self.scene.raster(reference)?;
-        let left = r.bounds[0] - layer.x;
-        let top = r.bounds[1] + r.first_row as i32 - layer.y;
+        let source = self.scene.raster(reference.slot())?;
+        let left = r.bounds[0] - layer.origin()[0];
+        let top = r.bounds[1] + r.first_row as i32 - layer.origin()[1];
         let width = (r.bounds[2] - r.bounds[0]) as usize;
         let region = Region::new([left, top, left + width as i32, top + r.rows as i32])
             .map_err(|e| e.to_string())?;
@@ -321,11 +337,20 @@ fn provider(scene: &SceneSnapshot) -> PreparedRows<'_> {
 
 #[test]
 fn actual_owned_small_native8_native16_psd_psb_driver_reopens_and_retires_complete_source() {
-    for format in [Format::Psd, Format::Psb] {
+    for (format, native) in [
+        (Format::Psd, false),
+        (Format::Psb, false),
+        (Format::Psd, true),
+        (Format::Psb, true),
+    ] {
         for depth in [8, 16] {
             let f = Fixture::new();
             let doc = document(depth);
-            let scene = capture(&f, &doc);
+            let scene = if native {
+                native_capture(&f, &doc)
+            } else {
+                capture(&f, &doc)
+            };
             let baseline = f.disk.used().unwrap();
             let (layers, composite, manifest, container) = f.roots();
             let mut rows = provider(&scene);
@@ -412,7 +437,7 @@ fn closed_driver_stale_cancel_and_foreign_scratch_fail_without_source_or_destina
             ));
         }
         let source_key = scene
-            .raster(&scene.metadata().layers[0].pixels)
+            .raster(scene.metadata().layers().next().unwrap().pixels().slot())
             .unwrap()
             .key();
         let check = || {
@@ -443,7 +468,7 @@ fn closed_driver_stale_cancel_and_foreign_scratch_fail_without_source_or_destina
         assert!(!container.exists());
         assert_eq!(
             scene
-                .raster(&scene.metadata().layers[0].pixels)
+                .raster(scene.metadata().layers().next().unwrap().pixels().slot())
                 .unwrap()
                 .key(),
             source_key
@@ -642,15 +667,26 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             &|| Ok(()),
         )
         .unwrap();
-        assert_eq!(provisional.scene().metadata().id, doc.id);
-        assert_eq!(provisional.scene().metadata().layers[0].x, -2);
-        assert!(
-            !provisional.scene().metadata().layers[0]
-                .mask
-                .as_ref()
+        assert_eq!(provisional.scene().metadata().id(), doc.id);
+        assert_eq!(
+            provisional
+                .scene()
+                .metadata()
+                .layers()
+                .next()
                 .unwrap()
-                .enabled
+                .origin()[0],
+            -2
         );
+        assert!(!provisional
+            .scene()
+            .metadata()
+            .layers()
+            .next()
+            .unwrap()
+            .mask()
+            .unwrap()
+            .enabled());
         assert!(provisional
             .compare(&mut rows, &|_| Ok(()), &|| Ok(()))
             .is_err());
@@ -668,17 +704,17 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
                 &|s| {
                     // Actual fixture semantic subset only, not the application's complete
                     // supported-source validator or installed-profile admission.
-                    if s.metadata().read_only
-                        || s.metadata().icc_profile.is_some()
-                        || s.metadata().layers.len() != 1
-                        || s.metadata().layers[0].kind != "paint"
-                        || !s.metadata().filters.is_empty()
-                        || !s.metadata().layers[0].effects.is_empty()
+                    if s.metadata().read_only()
+                        || s.metadata().profile().is_some()
+                        || s.metadata().layers().len() != 1
+                        || s.metadata().layers().next().unwrap().kind() != "paint"
+                        || s.metadata().filters().len() != 0
+                        || s.metadata().layers().next().unwrap().effects().len() != 0
                     {
                         return Err("Fixture semantics differ".into());
                     }
                     s.metadata().visit_rasters(|r| {
-                        s.raster(r)?;
+                        s.raster(r.slot())?;
                         Ok(())
                     })?;
                     Ok(())
@@ -712,7 +748,7 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             assert_ne!(
                 surface.key(),
                 scene
-                    .raster(&scene.metadata().layers[0].pixels)
+                    .raster(scene.metadata().layers().next().unwrap().pixels().slot())
                     .unwrap()
                     .key()
             );
