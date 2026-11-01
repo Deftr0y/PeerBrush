@@ -7,7 +7,12 @@ pub(super) struct Anchor {
     pub destination: Option<[f32; 2]>,
 }
 impl PeerBrush {
-    pub(super) fn begin_retouch(&mut self, doc: &Document, point: [f32; 2]) -> bool {
+    pub(super) fn begin_retouch<'a>(
+        &mut self,
+        doc: impl Into<DocumentView<'a>>,
+        point: [f32; 2],
+    ) -> bool {
+        let doc = doc.into();
         if ![Tool::Clone, Tool::Heal].contains(&self.tool) {
             return true;
         }
@@ -15,9 +20,9 @@ impl PeerBrush {
             self.message = "Alt-click to set a clone/heal source first".into();
             return false;
         };
-        if source.project != doc.id
+        if source.project != doc.id()
             || source.mask != self.mask
-            || !doc.layers.iter().any(|l| l.id == source.layer)
+            || doc.find_layer(&source.layer).is_none()
         {
             self.retouch_source = None;
             self.message = "Alt-click to set a source in this project/channel".into();
@@ -26,7 +31,7 @@ impl PeerBrush {
         if self.retouch_aligned {
             source.destination.get_or_insert(point);
         }
-        self.retouch_revision = Some(doc.revision);
+        self.retouch_revision = Some(doc.revision());
         true
     }
     pub(super) fn retouch_toolbar(&mut self, ui: &mut egui::Ui) {

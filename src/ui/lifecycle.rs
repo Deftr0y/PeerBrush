@@ -760,15 +760,16 @@ fn entries(workspace: &crate::workspace::Registry, intent: &Intent) -> Result<Ve
             .map_err(|_| "A project is still working. Try again when it finishes.")?;
         e.ensure_open()?;
         let conflicted = crate::file_safety::source_conflict(e.path.as_deref(), e.file_version);
-        let dirty = e.doc.revision != e.saved_revision || conflicted;
+        let view = crate::engine::view::current(&e);
+        let dirty = view.revision() != e.saved_revision || conflicted;
         rows.push(Entry {
             source: Reviewed {
                 project,
-                document: e.doc.id.clone(),
-                revision: e.doc.revision,
+                document: view.id().to_owned(),
+                revision: view.revision(),
                 discard: false,
             },
-            name: e.doc.name.clone(),
+            name: view.name().to_owned(),
             path: e.path.clone(),
             dirty,
             conflicted,

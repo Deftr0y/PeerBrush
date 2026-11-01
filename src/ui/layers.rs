@@ -1284,6 +1284,19 @@ mod native_metadata_tests {
             app.begin_rename(view, &child);
             assert_eq!(app.rename_edit.as_ref().unwrap().original, "Native child");
             app.rename_edit = None;
+            app.tool = Tool::Clone;
+            app.retouch_source = Some(super::super::retouch::Anchor {
+                project: view.id().to_owned(),
+                layer: child.clone(),
+                mask: false,
+                point: [2., 2.],
+                destination: None,
+            });
+            assert!(app.begin_retouch(view, [4., 3.]));
+            assert_eq!(app.retouch_revision, Some(view.revision()));
+            app.retouch_source.as_mut().unwrap().layer = "foreign layer".into();
+            assert!(!app.begin_retouch(view, [4., 3.]));
+            assert!(app.retouch_source.is_none());
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     for &(index, depth) in &visible {
