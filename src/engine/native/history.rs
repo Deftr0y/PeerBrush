@@ -131,7 +131,28 @@ pub(crate) struct PreparedCommit {
     truncated: Arc<task_capture::TruncatedTasks>,
     _retirement_charge: Reservation,
 }
+pub(crate) struct CommitRuntime<'a> {
+    pub record: DocumentKey,
+    pub base: DocumentKey,
+    pub candidate: &'a NativeDocument,
+    pub actor: &'a str,
+    pub label: &'a str,
+    pub scopes: &'a [Scope],
+    pub descriptor: Option<&'a CommandDescriptor>,
+}
 impl PreparedCommit {
+    pub(crate) fn runtime_view(&self) -> CommitRuntime<'_> {
+        CommitRuntime {
+            record: self.record.identity,
+            base: self.delta.base,
+            candidate: self.delta.preview(),
+            actor: &self.record.info.actor,
+            label: &self.record.info.label,
+            scopes: self.delta.intent.scopes(),
+            descriptor: self.delta.admission.as_ref().and_then(|a| a.descriptor()),
+        }
+    }
+
     pub(crate) fn refused(self, reason: &str) -> RefusedCommit {
         RefusedCommit {
             reason: reason.into(),
@@ -271,6 +292,10 @@ impl RefusedMove {
     }
 }
 impl NativeHistory {
+    pub(crate) fn task_complete(&self, owner: &str, task: &str) -> bool {
+        !self.truncated.contains(owner, task)
+    }
+
     pub(crate) fn entries(&self) -> HistoryEntries<'_> {
         HistoryEntries {
             records: self.undo.iter(),
