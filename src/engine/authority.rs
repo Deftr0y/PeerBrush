@@ -1,9 +1,148 @@
 //! Exclusive document and history ownership. Callers inspect borrowed views;
 //! native preparation and post-publication retirement happen outside Engine locks.
-use super::{native, view, Document, History, Lease};
+use super::{native, view, Document, Engine, History, Lease};
 use std::{collections::BTreeSet, sync::Arc};
 
 type Result<T> = std::result::Result<T, String>;
+
+/// Immutable preparation identity, captured from live Engine authority only.
+/// It is neither an editable document nor filesystem publication permission.
+pub(crate) struct NativeSeed {
+    document: native::NativeDocument,
+    project_id: String,
+    path: Option<std::path::PathBuf>,
+    file_version: Option<crate::file_safety::Version>,
+    ownership: Option<Arc<crate::file_ownership::Ownership>>,
+    _charge: Arc<crate::psd::memory36::MetadataCharge>,
+}
+impl NativeSeed {
+    pub(crate) fn document(&self) -> &native::NativeDocument {
+        &self.document
+    }
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    fn capture(engine: &Engine, document: &native::NativeDocument) -> Result<Self> {
+        let bytes = engine
+            .project_id
+            .len()
+            .checked_add(engine.path.as_ref().map_or(0, |p| p.as_os_str().len()))
+            .and_then(|n| n.checked_add(2048))
+            .ok_or("Native dispatch identity admission overflow")?;
+        let charge =
+            crate::psd::memory36::MetadataCharge::reserve(document.budget(), bytes, &|| Ok(()))?;
+        let mut project_id = String::new();
+        project_id
+            .try_reserve_exact(engine.project_id.len())
+            .map_err(|_| "Native project identity allocation refused")?;
+        project_id.push_str(&engine.project_id);
+        let path = engine
+            .path
+            .as_ref()
+            .map(|path| -> Result<_> {
+                let mut copy = std::path::PathBuf::new();
+                copy.try_reserve_exact(path.as_os_str().len())
+                    .map_err(|_| "Native path identity allocation refused")?;
+                copy.push(path);
+                Ok(copy)
+            })
+            .transpose()?;
+        Ok(Self {
+            document: document.clone(),
+            project_id,
+            path,
+            file_version: engine.file_version,
+            ownership: engine.file_ownership.clone(),
+            _charge: charge,
+        })
+    }
+    fn validate(&self, engine: &Engine) -> Result<()> {
+        let document = engine
+            .native_document()
+            .ok_or("Native dispatch authority changed")?;
+        let ownership = match (&self.ownership, &engine.file_ownership) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if document.key() != self.document.key()
+            || document.metadata().id() != self.document.metadata().id()
+            || document.metadata().revision() != self.document.metadata().revision()
+            || self.project_id != engine.project_id
+            || self.path != engine.path
+            || self.file_version != engine.file_version
+            || !ownership
+            || !document.budget().same_pool(self.document.budget())
+            || !document
+                .disk_budget()
+                .same_pool(self.document.disk_budget())
+        {
+            return Err("Native dispatch source observation is stale".into());
+        }
+        Ok(())
+    }
+}
+impl Engine {
+    // The single document field changes to DocumentAuthority only after all
+    // callers and producers are connected. This closed route installs no shadow
+    // authority and never derives native state from the live resident document.
+    fn native_authority(&self) -> Option<&DocumentAuthority> {
+        None
+    }
+    pub(crate) fn native_document(&self) -> Option<&native::NativeDocument> {
+        self.native_authority()
+            .and_then(|state| state.native().ok())
+    }
+    pub(crate) fn native_seed(&self) -> Result<Option<NativeSeed>> {
+        self.ensure_open()?;
+        self.native_document()
+            .map(|document| NativeSeed::capture(self, document))
+            .transpose()
+    }
+    pub(crate) fn capture_native(
+        &self,
+        seed: &NativeSeed,
+        descriptor: Arc<native::CommandDescriptor>,
+        actor: &str,
+        expected: Option<u64>,
+        document_id: Option<&str>,
+    ) -> Result<NativeCapture> {
+        self.ensure_write_available()?;
+        seed.validate(self)?;
+        if expected.is_some_and(|revision| revision != seed.document.metadata().revision())
+            || document_id.is_some_and(|id| id != seed.document.metadata().id())
+        {
+            return Err("Native edit differs from its observed document or revision".into());
+        }
+        self.native_authority()
+            .ok_or("Native edit authority is unavailable")?
+            .capture_native(
+                descriptor,
+                actor,
+                &self.leases,
+                super::now(),
+                self.closed,
+                true,
+            )
+    }
+    pub(crate) fn commit_native(
+        &mut self,
+        seed: &NativeSeed,
+        actor: &str,
+        prepared: native::PreparedCommit,
+    ) -> std::result::Result<native::RetiredHistory, native::RefusedCommit> {
+        if let Err(reason) = self
+            .ensure_write_available()
+            .and_then(|_| seed.validate(self))
+        {
+            return Err(prepared.refused(&reason));
+        }
+        // Replaced by the direct disjoint-field Publication match at the
+        // coordinated single-authority switch. The resident route stays closed.
+        let _ = actor;
+        Err(prepared.refused("Native publication authority is unavailable"))
+    }
+}
 
 pub(crate) enum DocumentAuthority {
     Resident(ResidentAuthority),
