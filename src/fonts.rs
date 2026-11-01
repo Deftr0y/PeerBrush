@@ -1,5 +1,7 @@
 //! Installed document fonts. Native paths and owned font bytes never enter sources.
 use ab_glyph::{Font, FontArc, FontRef, FontVec};
+#[path = "fonts/prepared.rs"]
+pub(crate) mod prepared;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
@@ -12,10 +14,13 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
+#[path = "fonts/linux.rs"]
 mod linux;
 #[cfg(target_os = "macos")]
+#[path = "fonts/macos.rs"]
 mod macos;
 #[cfg(windows)]
+#[path = "fonts/windows.rs"]
 mod windows;
 
 const FILE_BYTES: usize = 32 * 1024 * 1024;
@@ -734,13 +739,16 @@ pub fn refresh() -> Result<(), FontError> {
 }
 /// The three legacy aliases retain exactly their original bytes and face indices.
 pub fn bundled(name: &str) -> Result<FontRef<'static>, FontError> {
+    FontRef::try_from_slice(bundled_bytes(name)?).map_err(|_| FontError::Unsupported)
+}
+fn bundled_bytes(name: &str) -> Result<&'static [u8], FontError> {
     let bytes: &'static [u8] = match name {
         "regular" => include_bytes!("../assets/fonts/UbuntuSans-Regular.ttf"),
         "medium" => include_bytes!("../assets/fonts/UbuntuSans-Medium.ttf"),
         "semibold" => include_bytes!("../assets/fonts/UbuntuSans-SemiBold.ttf"),
         _ => return Err(FontError::InvalidReference),
     };
-    FontRef::try_from_slice(bytes).map_err(|_| FontError::Unsupported)
+    Ok(bytes)
 }
 /// Cache-only on the caller. Missing snapshots queue bounded background work.
 pub fn snapshot(font: &TextFont) -> Result<FontArc, FontError> {

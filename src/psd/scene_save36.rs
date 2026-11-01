@@ -7,7 +7,10 @@ use super::{
     structural::{Format, Header},
 };
 use crate::{
-    engine::scene::{Document36, Layer36, SceneSnapshot},
+    engine::{
+        native::{LayerMetadata, Metadata as DocumentMetadata},
+        scene::SceneSnapshot,
+    },
     large_document::Reservation,
 };
 use ring::digest::{Context, SHA256};
@@ -34,29 +37,31 @@ impl<'a> ScenePlan<'a> {
     ) -> Result<Self, String> {
         check()?;
         let doc = scene.metadata();
-        if doc.read_only
-            || doc.icc_profile.is_some()
-            || doc.layers.len() > 200
-            || ![8, 16].contains(&doc.bit_depth)
+        if doc.read_only()
+            || doc.profile().is_some()
+            || doc.layers().len() > 200
+            || ![8, 16].contains(&doc.depth())
         {
             return Err("Source36 save requires a supported editable captured scene".into());
         }
         validate_hierarchy(doc, check)?;
-        if let Some(mask) = &doc.psd_global_mask {
+        if let Some(mask) = doc.global_mask() {
             super::validate_global_mask_settings(&mask.data)?;
         }
-        for layer in &doc.layers {
-            super::validate_metadata(&layer.psd_metadata)?;
+        for layer in doc.layers() {
+            super::validate_metadata(layer.psd_metadata())?;
         }
         let max_records = doc
-            .layers
+            .layers()
             .len()
             .checked_mul(2)
             .and_then(|n| n.checked_add(3))
             .ok_or("Source36 standard record index overflow")?;
         let bytes = max_records
             .checked_mul(std::mem::size_of::<Record<'_>>())
-            .and_then(|n| n.checked_add(doc.layers.len() * 5 * std::mem::size_of::<Metadata<'_>>()))
+            .and_then(|n| {
+                n.checked_add(doc.layers().len() * 5 * std::mem::size_of::<Metadata<'_>>())
+            })
             .ok_or("Source36 standard metadata index overflow")?;
         let index = scene
             .budget()
@@ -73,7 +78,7 @@ impl<'a> ScenePlan<'a> {
                 synthetic(
                     RowSource::BakedComposite,
                     "PeerBrush current composite",
-                    [0, 0, doc.width as i32, doc.height as i32],
+                    [0, 0, doc.width() as i32, doc.height() as i32],
                     0,
                     true,
                 ),
@@ -110,7 +115,7 @@ impl<'a> ScenePlan<'a> {
                 synthetic(
                     RowSource::Zero,
                     "Canvas",
-                    [0, 0, doc.width as i32, doc.height as i32],
+                    [0, 0, doc.width() as i32, doc.height() as i32],
                     0,
                     true,
                 ),
@@ -119,18 +124,16 @@ impl<'a> ScenePlan<'a> {
         records.reverse();
         let header = Header {
             format,
-            width: doc.width,
-            height: doc.height,
-            depth: doc.bit_depth,
+            width: doc.width(),
+            height: doc.height(),
+            depth: doc.depth(),
             channels: 4,
         };
         let standard = standard36::Plan::new(
             header,
             provenance(scene),
             records,
-            doc.psd_global_mask
-                .as_ref()
-                .map_or(&[], |m| m.data.as_slice()),
+            doc.global_mask().map_or(&[], |m| m.data.as_slice()),
             chunks,
             check,
         )?;
@@ -165,51 +168,51 @@ pub(crate) fn provenance(scene: &SceneSnapshot) -> Digest {
     }
     hash.update(&identity.revision.to_be_bytes());
     let doc = scene.metadata();
-    hash.update(&doc.width.to_be_bytes());
-    hash.update(&doc.height.to_be_bytes());
-    hash.update(&doc.bit_depth.to_be_bytes());
+    hash.update(&doc.width().to_be_bytes());
+    hash.update(&doc.height().to_be_bytes());
+    hash.update(&doc.depth().to_be_bytes());
     for (id, source) in scene.rasters().iter() {
         hash.update(&id.to_be_bytes());
         hash.update(&source.key().bytes());
     }
     hash.finish().as_ref().try_into().unwrap()
 }
-fn needs_bake(doc: &Document36) -> bool {
-    !doc.filters.is_empty()
-        || doc.layers.iter().any(|layer| {
-            layer.kind == "adjustment"
-                || layer.kind == "group" && layer.effects.iter().any(|e| e.enabled && e.weight > 0.)
-                || layer.clip_to.as_ref().is_some_and(|id| {
-                    !["paint", "fill"].contains(&layer.kind.as_str())
+fn needs_bake(doc: DocumentMetadata<'_>) -> bool {
+    doc.filters().len() != 0
+        || doc.layers().any(|layer| {
+            layer.kind() == "adjustment"
+                || layer.kind() == "group"
+                    && layer.effects().any(|e| e.enabled() && e.weight() > 0.)
+                || layer.clip_to().is_some_and(|id| {
+                    !["paint", "fill"].contains(&layer.kind())
                         || doc
-                            .layers
-                            .iter()
-                            .find(|base| &base.id == id)
+                            .layers()
+                            .find(|base| base.id() == id)
                             .is_none_or(|base| {
-                                !["paint", "fill"].contains(&base.kind.as_str())
-                                    || base.parent != layer.parent
+                                !["paint", "fill"].contains(&base.kind())
+                                    || base.parent() != layer.parent()
                             })
                 })
         })
 }
 fn validate_hierarchy(
-    doc: &Document36,
+    doc: DocumentMetadata<'_>,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
-    for (i, layer) in doc.layers.iter().enumerate() {
+    for (i, layer) in doc.layers().enumerate() {
         check()?;
-        if layer.id.is_empty()
-            || doc.layers[..i].iter().any(|l| l.id == layer.id)
-            || !["paint", "fill", "group", "adjustment"].contains(&layer.kind.as_str())
-            || !layer.opacity.is_finite()
-            || !(0.0..=1.0).contains(&layer.opacity)
-            || layer.pixels.depth != doc.bit_depth
-            || layer.x.unsigned_abs() > 100000
-            || layer.y.unsigned_abs() > 100000
+        if layer.id().is_empty()
+            || doc.layers().take(i).any(|l| l.id() == layer.id())
+            || !["paint", "fill", "group", "adjustment"].contains(&layer.kind())
+            || !layer.opacity().is_finite()
+            || !(0.0..=1.0).contains(&layer.opacity())
+            || layer.pixels().depth() != doc.depth()
+            || layer.origin()[0].unsigned_abs() > 100000
+            || layer.origin()[1].unsigned_abs() > 100000
         {
             return Err("Source36 standard layer identity/kind/precision differs".into());
         }
-        let mut parent = layer.parent.as_deref();
+        let mut parent = layer.parent();
         let mut depth = 0;
         while let Some(id) = parent {
             depth += 1;
@@ -217,15 +220,13 @@ fn validate_hierarchy(
                 return Err("Source36 standard group topology is cyclic or too deep".into());
             }
             parent = doc
-                .layers
-                .iter()
-                .find(|l| l.id == id && l.kind == "group")
+                .layers()
+                .find(|l| l.id() == id && l.kind() == "group")
                 .ok_or("Source36 standard group parent is missing")?
-                .parent
-                .as_deref();
+                .parent();
         }
-        if let Some(id) = &layer.clip_to {
-            if id == &layer.id || !doc.layers.iter().any(|l| &l.id == id) {
+        if let Some(id) = layer.clip_to() {
+            if id == layer.id() || !doc.layers().any(|l| l.id() == id) {
                 return Err("Source36 standard clipping source is missing or cyclic".into());
             }
         }
@@ -233,22 +234,21 @@ fn validate_hierarchy(
     Ok(())
 }
 fn collect<'a>(
-    doc: &'a Document36,
+    doc: DocumentMetadata<'a>,
     parent: Option<&str>,
     originals: bool,
     out: &mut Vec<Record<'a>>,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     for (i, layer) in doc
-        .layers
-        .iter()
+        .layers()
         .enumerate()
-        .filter(|(_, l)| l.parent.as_deref() == parent)
+        .filter(|(_, l)| l.parent() == parent)
     {
         check()?;
-        if layer.kind == "group" {
+        if layer.kind() == "group" {
             push(out, record(doc, layer, i, 1, originals)?)?;
-            collect(doc, Some(&layer.id), originals, out, check)?;
+            collect(doc, Some(layer.id()), originals, out, check)?;
             push(out, record(doc, layer, i, 3, originals)?)?;
         } else {
             push(out, record(doc, layer, i, 0, originals)?)?;
@@ -290,36 +290,35 @@ fn synthetic(
     }
 }
 fn record<'a>(
-    doc: &'a Document36,
-    layer: &'a Layer36,
+    doc: DocumentMetadata<'a>,
+    layer: LayerMetadata<'a>,
     i: usize,
     section: u32,
     originals: bool,
 ) -> Result<Record<'a>, String> {
-    let canvas_frame = ["group", "adjustment"].contains(&layer.kind.as_str())
+    let canvas_frame = ["group", "adjustment"].contains(&layer.kind())
         || !originals
-            && layer
-                .effects
-                .iter()
-                .any(|e| e.enabled && e.weight > 0. && crate::effects::styles::contains(&e.kind));
+            && layer.effects().any(|e| {
+                e.enabled() && e.weight() > 0. && crate::effects::styles::contains(e.kind())
+            });
     let frame = if canvas_frame {
-        [0, 0, doc.width as i32, doc.height as i32]
+        [0, 0, doc.width() as i32, doc.height() as i32]
     } else {
         [
-            layer.x,
-            layer.y,
-            i32::try_from(i64::from(layer.x) + i64::from(layer.pixels.width))
+            layer.origin()[0],
+            layer.origin()[1],
+            i32::try_from(i64::from(layer.origin()[0]) + i64::from(layer.pixels().width()))
                 .map_err(|_| "Source36 layer right overflow")?,
-            i32::try_from(i64::from(layer.y) + i64::from(layer.pixels.height))
+            i32::try_from(i64::from(layer.origin()[1]) + i64::from(layer.pixels().height()))
                 .map_err(|_| "Source36 layer bottom overflow")?,
         ]
     };
     let mut metadata = Vec::new();
     if section != 3 {
         metadata
-            .try_reserve_exact(layer.psd_metadata.len())
+            .try_reserve_exact(layer.psd_metadata().len())
             .map_err(|_| "Source36 layer metadata index allocation refused")?;
-        for m in &layer.psd_metadata {
+        for m in layer.psd_metadata() {
             metadata.push(Metadata {
                 key: m
                     .key
@@ -338,27 +337,24 @@ fn record<'a>(
         },
         bounds: if section != 0 { [0; 4] } else { frame },
         mask: if section != 3 {
-            layer.mask.as_ref().map(|m| Mask {
+            layer.mask().map(|m| Mask {
                 bounds: frame,
-                enabled: m.enabled,
+                enabled: m.enabled(),
             })
         } else {
             None
         },
-        name: &layer.name,
-        blend: if section == 3 && layer.blend == "pass_through" {
+        name: layer.name(),
+        blend: if section == 3 && layer.blend() == "pass_through" {
             *b"norm"
         } else {
-            blend(&layer.blend)?
+            blend(layer.blend())?
         },
-        opacity: (layer.opacity * 255.).round() as u8,
-        clipped: layer.clip_to.is_some(),
-        visible: layer.visible,
-        locked: layer.locked,
-        has_clipped_layers: doc
-            .layers
-            .iter()
-            .any(|l| l.clip_to.as_deref() == Some(&layer.id)),
+        opacity: (layer.opacity() * 255.).round() as u8,
+        clipped: layer.clip_to().is_some(),
+        visible: layer.visible(),
+        locked: layer.locked(),
+        has_clipped_layers: doc.layers().any(|l| l.clip_to() == Some(layer.id())),
         section,
         metadata,
     })

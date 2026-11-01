@@ -88,3 +88,88 @@ cancellation fail the tile. Color, mask steps, retained placement, vector source
 placement and effect coordinates must all be staged together before the common
 engine transaction changes a layer's frame. This component does not replace
 those metadata guards or widen live source admission.
+
+`edit_bounds::input::RasterInput` borrows an admitted `NativeDocument` and binds
+layer or mask-step reads to its generation, raster slot, source key and frame.
+Full-tile tokens preserve physical padding. Regional and healing-halo preparation
+performs explicit worker I/O before returning fallible memory-only samplers.
+Healing halos use bounded region strips and a separately charged linear owner.
+Selection geometry and contours stay borrowed; matching coverage takes priority
+and samples its physical origin/extent using legacy red-channel projection.
+The post-edit soft-selection kernel preserves the existing premultiplied native
+rounding and must not be applied a second time to selected clear.
+
+`brush::input::LocalStroke` admits its shifted point, pressure and polygon
+capacities before allocation. It creates the actual brush, clone/heal and smudge
+plans with the captured storage origin; another generation/frame cannot reuse
+that geometry accidentally.
+`StrokePoints` admits the shared parser's temporary document-space point and
+pressure capacities before allocation. Both owners stay charged while geometry
+is shifted into `LocalStroke`; releasing the parsed owner cannot release the
+shifted owner's admission. Pressure overrides reuse their existing capacity.
+The write comparator derives document-coordinate boxes from actual semantic
+baseline/proposal bytes, including native16 low bits and hidden RGB. A changed
+physical padding sample is refused. These boxes must pass the captured engine
+command's write guard before the same immutable proposal is staged; they grant
+no independent write permission and exclude read halos.
+
+`edit_bounds::output::TileOutput` stages one plane through the actual
+`SourceSession` and the engine's `OutputDraft`. It compares full original padded
+tiles, keeps mutable proposal/index allocations charged, creates a fragment only
+for changed nonzero bytes, and poisons failed replacements. Unchanged operations
+produce no output draft. Explicit zero and unused-fragment retirement precede
+sealing. Refusals retain ownership and admission until proven cleanup; dropping
+an owner never silently deletes files or refunds disk. These source adapters do
+not replace the coordinator's atomic group, mask, frame, retained-source, actor,
+lease, revision, selection or history decisions, and do not raise canvas limits.
+
+Projected frame plans additionally bind a proposed shape/origin to the original
+generation and primary layer slot. Every mask plane receives the color frame's
+same translation while retaining its own original logical dimensions/depth.
+`stage_frame_with` remaps and edits each complete destination tile in one pass;
+it does not publish an intermediate expanded document. The brush worker uses
+that path for reframed strokes and the changed-tile path otherwise, applying
+soft coverage against the correctly reframed baseline. All source reads remain
+explicit before memory-only kernels, and a failed tile retires the unpublished
+fragment through the held session. Complete frame, mask, retained placement and
+source/effect metadata changes still belong to one coordinator batch.
+
+Resolved native fill and selected clear consume the same borrowed plane and
+session-owned output path. An opaque fill-baseline proof binds the literal
+procedural color to the original generation, slot and logical frame. It does
+not expand draw permissions: the coordinator must pair its complete output
+with the kind transition and retained-source retirement in one atomic batch.
+New frame space and padding remain zero, including when the original fill has
+partial alpha or hidden RGB. Selected clear consumes coverage once.
+
+The resident engine now materializes that literal visual baseline before frame
+expansion and soft-selection snapshots. Previously those snapshots could see
+the fill's unused raw plane, losing unselected visible color or blending at the
+wrong document coordinates. The outer transaction retains the original kind
+and pixels for one undo/redo record. Prepared native8/16 fixtures reproduce the
+former loss and compare the corrected engine with the staged native result;
+their runtime qualification remains required. Neither these adapters nor a
+metadata-only compile establish large-document or desktop acceptance.
+
+The original-frame smudge adapter retains one session-owned provisional tile
+map across all dabs. Explicit strip/tile preparation sees completed prior dabs;
+memory-only reservoir sampling never opens storage. A borrowing run entry point
+preserves the owner on error for registered fragment retirement. Soft coverage
+is applied once against the captured original after the full stroke.
+
+Reframed smudge retains an owned `FrameSeed` before constructing an output draft.
+The seed holds its complete provisional surface, registered fragments, index
+admission and actual source session across every dab. Working strip/tile reads
+see completed prior writes. Replaced append-only blocks remain charged on disk;
+unused fragments are retired only after all candidate views drop. Explicit zero
+is canonicalized before the single final draft/seal. No intermediate document
+or history state is published, and another frame cannot reuse the stroke token.
+
+The clone/heal adapter prepares a generation-matched paint source or raw paint
+mask step, including exact floating bilinear support and the complete healing
+destination halo. Bilinear support can span 385 samples because it includes the
+last adjacent sample; bounded physical strips feed its charged linear owner.
+Exterior zeros follow from source geometry, while undeclared queries fail.
+Reframed targets remap the destination baseline and halo without changing source
+document coordinates. Merged artwork and composed-mask inputs still require the
+shared prepared compositor and are not replaced with raw layer samples.

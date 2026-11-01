@@ -1,4 +1,4 @@
-//! Small owned codec fixtures, not installed-profile/runtime qualification.
+//! Small source codec fixtures; installed desktop and full editor qualification are separate.
 use super::*;
 use crate::{
     engine::{
@@ -11,7 +11,7 @@ use crate::{
     psd::standard36::{NativeRows, RowRequest, RowSource},
     raster::{backed::Region, Raster, Surface},
 };
-use std::{cell::Cell, fs, path::PathBuf};
+use std::{cell::Cell, fs, io::Seek, path::PathBuf};
 
 struct Fixture {
     root: PathBuf,
@@ -188,6 +188,22 @@ fn capture(f: &Fixture, doc: &Document) -> SceneSnapshot {
     )
     .unwrap()
 }
+fn native_capture(f: &Fixture, doc: &Document) -> SceneSnapshot {
+    let pending = capture(f, doc).into_provisional_pending().unwrap();
+    let native = crate::engine::native::NativeDocument::from_pending(pending).unwrap();
+    SceneSnapshot::from_native(
+        SceneIdentity {
+            project_id: "source-codec-fixture".into(),
+            document_id: doc.id.clone(),
+            revision: doc.revision,
+        },
+        native,
+        vec![],
+        None,
+        None,
+    )
+    .unwrap()
+}
 fn limits() -> SaveLimits {
     SaveLimits {
         metadata: MetadataLimits {
@@ -211,6 +227,7 @@ struct PreparedRows<'a> {
     stale: Option<&'a Cell<bool>>,
     fail_at: Option<usize>,
     replace: Option<(PathBuf, PathBuf)>,
+    replacement_denied: Option<std::io::ErrorKind>,
 }
 impl CapturedRows for PreparedRows<'_> {
     fn scene(&self) -> &SceneSnapshot {
@@ -230,10 +247,13 @@ impl NativeRows for PreparedRows<'_> {
         check()?;
         self.calls += 1;
         if let Some((named, original)) = self.replace.take() {
-            fs::rename(&named, &original).map_err(|e| e.to_string())?;
+            if let Err(error) = fs::rename(&named, &original) {
+                self.replacement_denied = Some(error.kind());
+                return Err(error.to_string());
+            }
             fs::write(&named, b"foreign stage replacement").map_err(|e| e.to_string())?;
         }
-        let layer = &self.scene.metadata().layers[0];
+        let layer = self.scene.metadata().layers().next().unwrap();
         let merged =
             r.source == RowSource::MergedWhiteMatte || r.source == RowSource::BakedComposite;
         assert!(matches!(
@@ -244,13 +264,13 @@ impl NativeRows for PreparedRows<'_> {
                 | RowSource::BakedComposite
         ));
         let reference = if r.channel == -2 {
-            &layer.mask.as_ref().unwrap().steps[0].pixels
+            layer.mask().unwrap().steps().next().unwrap().pixels()
         } else {
-            &layer.pixels
+            layer.pixels()
         };
-        let source = self.scene.raster(reference)?;
-        let left = r.bounds[0] - layer.x;
-        let top = r.bounds[1] + r.first_row as i32 - layer.y;
+        let source = self.scene.raster(reference.slot())?;
+        let left = r.bounds[0] - layer.origin()[0];
+        let top = r.bounds[1] + r.first_row as i32 - layer.origin()[1];
         let width = (r.bounds[2] - r.bounds[0]) as usize;
         let region = Region::new([left, top, left + width as i32, top + r.rows as i32])
             .map_err(|e| e.to_string())?;
@@ -316,20 +336,30 @@ fn provider(scene: &SceneSnapshot) -> PreparedRows<'_> {
         stale: None,
         fail_at: None,
         replace: None,
+        replacement_denied: None,
     }
 }
 
 #[test]
 fn actual_owned_small_native8_native16_psd_psb_driver_reopens_and_retires_complete_source() {
-    for format in [Format::Psd, Format::Psb] {
+    for (format, native) in [
+        (Format::Psd, false),
+        (Format::Psb, false),
+        (Format::Psd, true),
+        (Format::Psb, true),
+    ] {
         for depth in [8, 16] {
             let f = Fixture::new();
             let doc = document(depth);
-            let scene = capture(&f, &doc);
+            let scene = if native {
+                native_capture(&f, &doc)
+            } else {
+                capture(&f, &doc)
+            };
             let baseline = f.disk.used().unwrap();
             let (layers, composite, manifest, container) = f.roots();
             let mut rows = provider(&scene);
-            let done = prepare(
+            let done = prepare_fixture(
                 &scene,
                 format,
                 OwnedRoots {
@@ -354,16 +384,33 @@ fn actual_owned_small_native8_native16_psd_psb_driver_reopens_and_retires_comple
             assert_eq!(done.sha256(), done.candidate().payload_sha256());
             done.recheck(&|| Ok(())).unwrap();
             let mut guarded = || Ok(());
-            let mut input = done
+            let input = done
                 .candidate()
                 .cursor(0, done.bytes(), &mut guarded)
                 .unwrap();
-            let index =
-                structural::index(&mut input, structural::Limits::current(), || Ok(())).unwrap();
+            let source = Source::with_buffer(
+                input,
+                done.bytes(),
+                ScratchBytes::new(&f.pool, 65536, 65536).unwrap(),
+            )
+            .unwrap();
+            let index = structural::index(
+                &mut source
+                    .range(
+                        Span {
+                            offset: 0,
+                            bytes: done.bytes(),
+                        },
+                        &|| Ok(()),
+                    )
+                    .unwrap(),
+                structural::Limits::current(),
+                || Ok(()),
+            )
+            .unwrap();
             assert_eq!(index.header.depth, depth);
             assert_eq!(index.header.height, 259);
             assert_eq!(index.layers[0].bounds, [-1, -2, 258, 3]);
-            let source = Source::new(input, done.bytes()).unwrap();
             let mask = index.layers[0]
                 .channels
                 .iter()
@@ -412,7 +459,7 @@ fn closed_driver_stale_cancel_and_foreign_scratch_fail_without_source_or_destina
             ));
         }
         let source_key = scene
-            .raster(&scene.metadata().layers[0].pixels)
+            .raster(scene.metadata().layers().next().unwrap().pixels().slot())
             .unwrap()
             .key();
         let check = || {
@@ -425,7 +472,7 @@ fn closed_driver_stale_cancel_and_foreign_scratch_fail_without_source_or_destina
             }
         };
         let baseline = f.disk.used().unwrap();
-        let result = prepare(
+        let result = prepare_fixture(
             &scene,
             Format::Psb,
             OwnedRoots {
@@ -443,12 +490,21 @@ fn closed_driver_stale_cancel_and_foreign_scratch_fail_without_source_or_destina
         assert!(!container.exists());
         assert_eq!(
             scene
-                .raster(&scene.metadata().layers[0].pixels)
+                .raster(scene.metadata().layers().next().unwrap().pixels().slot())
                 .unwrap()
                 .key(),
             source_key
         );
-        if fault == 2 {
+        if fault == 2 && rows.replacement_denied.is_some() {
+            assert!(cfg!(windows));
+            assert_eq!(
+                rows.replacement_denied,
+                Some(std::io::ErrorKind::PermissionDenied)
+            );
+            assert!(!layers.exists());
+            assert_eq!(f.disk.used().unwrap(), baseline);
+        } else if fault == 2 {
+            assert_eq!(rows.replacement_denied, None);
             assert_eq!(
                 fs::read(layers.join("bytes.pbb")).unwrap(),
                 b"foreign stage replacement"
@@ -471,7 +527,7 @@ fn completed_save_recheck_refuses_replacement_and_never_regains_authority_after_
     let scene = capture(&f, &doc);
     let (layers, composite, manifest, container) = f.roots();
     let mut rows = provider(&scene);
-    let done = prepare(
+    let done = prepare_fixture(
         &scene,
         Format::Psb,
         OwnedRoots {
@@ -488,12 +544,22 @@ fn completed_save_recheck_refuses_replacement_and_never_regains_authority_after_
     .unwrap();
     let named = container.join("bytes.pbb");
     let original = f.root.join("owned-container-original.pbb");
-    fs::rename(&named, &original).unwrap();
-    fs::write(&named, b"foreign completed candidate").unwrap();
-    assert!(done.recheck(&|| Ok(())).is_err());
-    assert_eq!(fs::read(&named).unwrap(), b"foreign completed candidate");
-    fs::remove_file(&named).unwrap();
-    fs::rename(&original, &named).unwrap();
+    let renamed = fs::rename(&named, &original);
+    if let Err(error) = renamed {
+        assert!(cfg!(windows));
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!original.exists());
+        done.recheck(&|| Ok(())).unwrap();
+        assert!(done
+            .recheck(&|| Err("Cancelled final source check".into()))
+            .is_err());
+    } else {
+        fs::write(&named, b"foreign completed candidate").unwrap();
+        assert!(done.recheck(&|| Ok(())).is_err());
+        assert_eq!(fs::read(&named).unwrap(), b"foreign completed candidate");
+        fs::remove_file(&named).unwrap();
+        fs::rename(&original, &named).unwrap();
+    }
     assert!(done.recheck(&|| Ok(())).is_err());
     done.retire(&|| Ok(())).unwrap();
     drop(rows);
@@ -513,7 +579,7 @@ fn closed_driver_resident_admission_refusal_preserves_source_before_any_staging_
     let disk = f.disk.used().unwrap();
     let remaining = f.pool.limit() - baseline - 128;
     let pressure = ScratchBytes::new(&f.pool, remaining, 64 * 1024 * 1024).unwrap();
-    assert!(prepare(
+    assert!(prepare_fixture(
         &scene,
         Format::Psb,
         OwnedRoots {
@@ -536,6 +602,119 @@ fn closed_driver_resident_admission_refusal_preserves_source_before_any_staging_
     drop(rows);
     drop(scene);
     drop(doc);
+    f.finish();
+}
+
+#[test]
+fn actual_profile_session_save_keeps_cursor_guard_and_retires_only_owned_spools_after_closing() {
+    use crate::{
+        large_document::root::PersistentRootContext,
+        workspace::source_runtime::{Limits as RuntimeLimits, SourceRuntime},
+    };
+    use std::{
+        sync::{atomic::Ordering, Mutex},
+        time::{Duration, Instant},
+    };
+    let mut f = Fixture::new();
+    fs::create_dir(f.root.join("legacy")).unwrap();
+    let locations = crate::settings::Locations {
+        config: f.root.join("config"),
+        data: f.root.join("data"),
+        cache: f.root.join("cache"),
+    };
+    let profile =
+        crate::settings::Profile::open(locations.clone(), &f.root.join("legacy")).unwrap();
+    let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+    let connection = crate::server::start(shared.clone(), f.root.join("runtime")).unwrap();
+    let context =
+        PersistentRootContext::from_profile(&connection, profile.source_profile().unwrap())
+            .unwrap();
+    let runtime = SourceRuntime::new(
+        context.clone(),
+        RuntimeLimits {
+            resident_bytes: 64 * 1024 * 1024,
+            disk_bytes: 64 * 1024 * 1024,
+            max_files: 64,
+            store: StoreLimits {
+                disk_bytes: 16 * 1024 * 1024,
+                max_blocks: 64,
+                max_resident_blocks: 8,
+                manifest_bytes: 1024 * 1024,
+            },
+        },
+    )
+    .unwrap();
+    let session = runtime.begin().unwrap();
+    f.store = session.store_for_lineage([61; 16]).unwrap();
+    f.pool = runtime.resident();
+    f.disk = runtime.disk();
+    let doc = document(16);
+    let scene = native_capture(&f, &doc);
+    let baseline = f.disk.used().unwrap();
+    let mut rows = provider(&scene);
+    let saved = prepare(
+        &scene,
+        Format::Psb,
+        &session,
+        &mut rows,
+        limits(),
+        &|| Ok(()),
+        &|| Ok(()),
+    )
+    .unwrap();
+    saved.recheck(&|| Ok(())).unwrap();
+    let mut transfer = ScratchBytes::new(&f.pool, 65536, 65536).unwrap();
+    let mut check = || Ok(());
+    let mut input = saved.cursor(0, saved.bytes(), &mut check).unwrap();
+    let mut hash = Context::new(&SHA256);
+    let mut left = saved.bytes();
+    while left != 0 {
+        let count = left.min(65536) as usize;
+        input.read_exact(&mut transfer[..count]).unwrap();
+        hash.update(&transfer[..count]);
+        left -= count as u64;
+    }
+    assert_eq!(hash.finish().as_ref(), &saved.sha256()[..]);
+    assert_eq!(input.read(&mut [0]).unwrap(), 0);
+    input.seek(std::io::SeekFrom::Start(0)).unwrap();
+    let workspace = crate::workspace::attach(&shared);
+    assert!(
+        workspace
+            .lock()
+            .unwrap()
+            .file_operations
+            .load(Ordering::Acquire)
+            > 0
+    );
+    let (ended, finished) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(connection);
+        ended.send(()).unwrap();
+    });
+    let until = Instant::now() + Duration::from_secs(5);
+    while session.check().is_ok() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(finished.try_recv().is_err());
+    assert!(input.read(&mut [0]).is_err());
+    assert!(input.seek(std::io::SeekFrom::Start(0)).is_err());
+    drop(input);
+    drop(transfer);
+    assert!(saved.recheck(&|| Ok(())).is_err());
+    saved.retire(&|| Ok(())).unwrap();
+    assert_eq!(f.disk.used().unwrap(), baseline);
+    drop(rows);
+    drop(scene);
+    drop(doc);
+    drop(session);
+    finished.recv_timeout(Duration::from_secs(5)).unwrap();
+    dropper.join().unwrap();
+    drop(runtime);
+    drop(context);
+    drop(profile);
+    drop(workspace);
+    drop(shared);
     f.finish();
 }
 
@@ -564,7 +743,7 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
         let scene = capture(&f, &doc);
         let (layers, composite, manifest, container) = f.roots();
         let mut rows = provider(&scene);
-        let saved = prepare(
+        let saved = prepare_fixture(
             &scene,
             Format::Psb,
             OwnedRoots {
@@ -602,7 +781,12 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             .candidate()
             .cursor(0, saved.bytes(), &mut guarded)
             .unwrap();
-        let source = Source::new(input, saved.bytes()).unwrap();
+        let source = Source::with_buffer(
+            input,
+            saved.bytes(),
+            ScratchBytes::new(&f.pool, 65536, 65536).unwrap(),
+        )
+        .unwrap();
         let index = Arc::new(
             structural::index(
                 &mut source
@@ -642,15 +826,26 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             &|| Ok(()),
         )
         .unwrap();
-        assert_eq!(provisional.scene().metadata().id, doc.id);
-        assert_eq!(provisional.scene().metadata().layers[0].x, -2);
-        assert!(
-            !provisional.scene().metadata().layers[0]
-                .mask
-                .as_ref()
+        assert_eq!(provisional.scene().metadata().id(), doc.id);
+        assert_eq!(
+            provisional
+                .scene()
+                .metadata()
+                .layers()
+                .next()
                 .unwrap()
-                .enabled
+                .origin()[0],
+            -2
         );
+        assert!(!provisional
+            .scene()
+            .metadata()
+            .layers()
+            .next()
+            .unwrap()
+            .mask()
+            .unwrap()
+            .enabled());
         assert!(provisional
             .compare(&mut rows, &|_| Ok(()), &|| Ok(()))
             .is_err());
@@ -668,17 +863,17 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
                 &|s| {
                     // Actual fixture semantic subset only, not the application's complete
                     // supported-source validator or installed-profile admission.
-                    if s.metadata().read_only
-                        || s.metadata().icc_profile.is_some()
-                        || s.metadata().layers.len() != 1
-                        || s.metadata().layers[0].kind != "paint"
-                        || !s.metadata().filters.is_empty()
-                        || !s.metadata().layers[0].effects.is_empty()
+                    if s.metadata().read_only()
+                        || s.metadata().profile().is_some()
+                        || s.metadata().layers().len() != 1
+                        || s.metadata().layers().next().unwrap().kind() != "paint"
+                        || s.metadata().filters().len() != 0
+                        || s.metadata().layers().next().unwrap().effects().len() != 0
                     {
                         return Err("Fixture semantics differ".into());
                     }
                     s.metadata().visit_rasters(|r| {
-                        s.raster(r)?;
+                        s.raster(r.slot())?;
                         Ok(())
                     })?;
                     Ok(())
@@ -712,7 +907,7 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             assert_ne!(
                 surface.key(),
                 scene
-                    .raster(&scene.metadata().layers[0].pixels)
+                    .raster(scene.metadata().layers().next().unwrap().pixels().slot())
                     .unwrap()
                     .key()
             );

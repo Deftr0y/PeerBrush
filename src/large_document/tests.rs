@@ -949,6 +949,60 @@ fn alias_and_existing_root_refusal_preserve_original_contents() {
 }
 
 #[test]
+fn selected_owner_observation_allows_own_append_but_refuses_late_foreign_identity() {
+    let fixture = Fixture::new();
+    let store = fixture.store(&ResidentBudget::new(1024 * 1024).unwrap());
+    let selected = store
+        .commit([1; 16], 1, None, b"selected", &[], &mut okay)
+        .unwrap();
+    let snapshot = store.snapshot(selected.reference(), &mut okay).unwrap();
+    snapshot.check_owner(&mut okay).unwrap();
+    store
+        .put(TileSpec::new(1, 1, 8).unwrap(), &[9; 4], &mut okay)
+        .unwrap();
+    snapshot.check_owner(&mut okay).unwrap();
+    assert!(matches!(
+        snapshot.check_owner(&mut || Err(Error::Cancelled)),
+        Err(Error::Cancelled)
+    ));
+    let path = store.0.path.clone();
+    let original = owned_bytes(&store);
+    fs::rename(&path, path.with_file_name("retained.pbt")).unwrap();
+    fs::write(&path, &original).unwrap();
+    assert!(snapshot.check_owner(&mut okay).is_err());
+    drop(snapshot);
+    drop(store);
+    assert_eq!(fs::read(path).unwrap(), original);
+}
+
+#[test]
+fn checkpoint_snapshot_reads_known_cmit_and_refuses_late_corruption_even_with_restored_stamp() {
+    let fixture = Fixture::new();
+    let store = fixture.store(&ResidentBudget::new(1024 * 1024).unwrap());
+    assert!(store.checkpoint_snapshot(&mut okay).unwrap().is_none());
+    let block = store
+        .put(TileSpec::new(1, 1, 16).unwrap(), &[7; 8], &mut okay)
+        .unwrap();
+    let selected = store
+        .commit([1; 16], 1, None, b"metadata", &[block], &mut okay)
+        .unwrap();
+    let checkpoint = store.checkpoint_snapshot(&mut okay).unwrap().unwrap();
+    assert_eq!(checkpoint.reference(), selected.reference());
+    assert_eq!(&*checkpoint.metadata(&mut okay).unwrap(), b"metadata");
+    let before = store.0.file.metadata().unwrap().modified().unwrap();
+    write_all_at(
+        &store.0.file,
+        selected.reference().offset + RECORD_HEADER + MANIFEST_HEADER as u64,
+        b"x",
+    )
+    .unwrap();
+    store.0.file.sync_all().unwrap();
+    store.0.file.set_modified(before).unwrap();
+    assert_eq!(store.0.file.metadata().unwrap().modified().unwrap(), before);
+    assert!(store.checkpoint_snapshot(&mut okay).is_err());
+}
+
+#[test]
 fn disk_and_record_admission_refuse_before_appending_any_bytes() {
     let fixture = Fixture::new();
     let budget = ResidentBudget::new(1024).unwrap();

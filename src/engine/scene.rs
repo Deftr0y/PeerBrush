@@ -36,6 +36,13 @@ impl RasterRoster {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+    pub(crate) fn descriptor_bytes(&self) -> Result<usize> {
+        self.entries
+            .capacity()
+            .checked_mul(std::mem::size_of::<Surface>())
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or_else(|| "Native roster footprint overflow".into())
+    }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -52,6 +59,12 @@ impl RasterRoster {
             return Err("Native source shape does not match its metadata reference".into());
         }
         Ok(surface)
+    }
+    pub(crate) fn ordinal(&self, ordinal: u32) -> Result<&Surface> {
+        ordinal
+            .checked_sub(1)
+            .and_then(|index| self.entries.get(index as usize))
+            .ok_or_else(|| "Missing captured native source slot".into())
     }
     pub fn iter(&self) -> impl Iterator<Item = (u32, &Surface)> {
         self.entries
@@ -144,7 +157,12 @@ pub struct SceneSnapshot {
     // Protected runtime inspection is retained, never promoted to editable sources.
     runtime_views: RuntimeViews,
     // Metadata admission outlives the other captured metadata allocations.
-    pending: PendingScene,
+    document: SnapshotDocument,
+    binding: super::native::DocumentKey,
+}
+enum SnapshotDocument {
+    Pending(PendingScene),
+    Native(super::native::NativeDocument),
 }
 #[derive(Default)]
 struct RuntimeViews {
@@ -166,7 +184,8 @@ impl SceneSnapshot {
         }
         Ok(Self {
             identity,
-            pending,
+            document: SnapshotDocument::Pending(pending),
+            binding: super::native::key(),
             leases: Arc::new(leases),
             file_version,
             _file_ownership: file_ownership,
@@ -176,20 +195,63 @@ impl SceneSnapshot {
     pub fn identity(&self) -> &SceneIdentity {
         &self.identity
     }
-    pub fn metadata(&self) -> &Document36 {
-        self.pending.metadata()
+    pub(crate) fn from_native(
+        identity: SceneIdentity,
+        document: super::native::NativeDocument,
+        leases: Vec<super::Lease>,
+        file_version: Option<crate::file_safety::Version>,
+        file_ownership: Option<Arc<crate::file_ownership::Ownership>>,
+    ) -> Result<Self> {
+        if identity.document_id != document.metadata().id()
+            || identity.revision != document.metadata().revision()
+        {
+            return Err("Native snapshot identity differs".into());
+        }
+        let binding = document.key();
+        Ok(Self {
+            identity,
+            leases: Arc::new(leases),
+            file_version,
+            _file_ownership: file_ownership,
+            runtime_views: RuntimeViews::default(),
+            document: SnapshotDocument::Native(document),
+            binding,
+        })
+    }
+    pub fn metadata(&self) -> super::native::Metadata<'_> {
+        match &self.document {
+            SnapshotDocument::Pending(pending) => {
+                super::native::Metadata::from_wire(pending.metadata(), self.binding)
+            }
+            SnapshotDocument::Native(document) => document.metadata(),
+        }
     }
     pub fn rasters(&self) -> &RasterRoster {
-        self.pending.rasters()
+        match &self.document {
+            SnapshotDocument::Pending(p) => p.rasters(),
+            SnapshotDocument::Native(n) => n.roster(),
+        }
     }
-    pub fn raster(&self, reference: &RasterRef36) -> Result<&Surface> {
-        self.pending.roster.get(reference)
+    pub fn raster(&self, slot: super::native::RasterSlot) -> Result<&Surface> {
+        if slot.document != self.binding {
+            return Err("Native slot belongs to another captured generation".into());
+        }
+        match &self.document {
+            SnapshotDocument::Native(document) => document.source(slot),
+            SnapshotDocument::Pending(pending) => pending.roster.ordinal(slot.ordinal),
+        }
     }
     pub fn budget(&self) -> &ResidentBudget {
-        self.pending.budget()
+        match &self.document {
+            SnapshotDocument::Pending(p) => p.budget(),
+            SnapshotDocument::Native(n) => n.budget(),
+        }
     }
     pub fn disk_budget(&self) -> &DiskBudget {
-        self.pending.disk_budget()
+        match &self.document {
+            SnapshotDocument::Pending(p) => p.disk_budget(),
+            SnapshotDocument::Native(n) => n.disk_budget(),
+        }
     }
     pub fn leases(&self) -> &[super::Lease] {
         &self.leases
@@ -203,7 +265,8 @@ impl SceneSnapshot {
     pub fn source_patterns(&self) -> &[crate::psd::patterns::Source] {
         &self.runtime_views.patterns
     }
-    /// Codec-only provisional handoff; live runtime guards cannot be discarded.
+    /// Codec-only provisional handoff. Live guards/inspection owners must never
+    /// be discarded through this path, and Native authority cannot be demoted.
     pub(crate) fn into_provisional_pending(self) -> Result<PendingScene> {
         if !self.leases.is_empty()
             || self.file_version.is_some()
@@ -215,44 +278,55 @@ impl SceneSnapshot {
                 "Captured runtime guards cannot be discarded for provisional import".into(),
             );
         }
-        Ok(self.pending)
+        match self.document {
+            SnapshotDocument::Pending(pending) => Ok(pending),
+            SnapshotDocument::Native(_) => {
+                Err("Native document cannot become provisional import data".into())
+            }
+        }
     }
 
     /// Actual captured metadata and physical source identities, including gesture
     /// pixels whose owner changed without a committed document revision.
     pub fn render_key(&self) -> Result<[u8; 32]> {
-        use std::io::Write;
-        struct KeyWriter {
-            hash: ring::digest::Context,
-            remaining: usize,
+        if let SnapshotDocument::Native(document) = &self.document {
+            return document.render_key();
         }
-        impl Write for KeyWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if bytes.len() > self.remaining {
-                    return Err(std::io::Error::other(
-                        "Captured scene metadata exceeds its bounded identity",
-                    ));
-                }
-                self.remaining -= bytes.len();
-                self.hash.update(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut writer = KeyWriter {
-            hash: ring::digest::Context::new(&ring::digest::SHA256),
-            remaining: 64 * 1024 * 1024,
-        };
-        writer.hash.update(b"PeerBrush captured scene v1\0");
-        serde_json::to_writer(&mut writer, self.metadata()).map_err(|e| e.to_string())?;
-        for (id, surface) in self.rasters().iter() {
-            writer.hash.update(&id.to_be_bytes());
-            writer.hash.update(&surface.key().bytes());
-        }
-        Ok(writer.hash.finish().as_ref().try_into().unwrap())
+        hash_metadata(&self.metadata(), self.rasters())
     }
+}
+pub(super) fn hash_metadata(metadata: &impl Serialize, roster: &RasterRoster) -> Result<[u8; 32]> {
+    use std::io::Write;
+    struct KeyWriter {
+        hash: ring::digest::Context,
+        remaining: usize,
+    }
+    impl Write for KeyWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other(
+                    "Captured scene metadata exceeds its bounded identity",
+                ));
+            }
+            self.remaining -= bytes.len();
+            self.hash.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = KeyWriter {
+        hash: ring::digest::Context::new(&ring::digest::SHA256),
+        remaining: 64 * 1024 * 1024,
+    };
+    writer.hash.update(b"PeerBrush captured scene v1\0");
+    serde_json::to_writer(&mut writer, metadata).map_err(|e| e.to_string())?;
+    for (id, surface) in roster.iter() {
+        writer.hash.update(&id.to_be_bytes());
+        writer.hash.update(&surface.key().bytes());
+    }
+    Ok(writer.hash.finish().as_ref().try_into().unwrap())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -477,6 +551,50 @@ impl CapturePixels for Surface {
 }
 
 impl Document36 {
+    /// Mutation traversal for a provisional native header. A rebuilt roster and
+    /// the strict immutable traversal must validate the result before adoption.
+    pub(crate) fn remap_rasters(
+        &mut self,
+        mut visit: impl FnMut(&mut RasterRef36) -> Result<()>,
+    ) -> Result<()> {
+        fn walk(
+            reference: &mut RasterRef36,
+            visit: &mut impl FnMut(&mut RasterRef36) -> Result<()>,
+        ) -> Result<()> {
+            visit(reference)?;
+            if let Some(original) = &mut reference.retained {
+                visit(&mut original.pixels)?;
+            }
+            Ok(())
+        }
+        for layer in &mut self.layers {
+            walk(&mut layer.pixels, &mut visit)?;
+            if let Some(mask) = &mut layer.mask {
+                for step in &mut mask.steps {
+                    walk(&mut step.pixels, &mut visit)?;
+                }
+            }
+            for effect in &mut layer.effects {
+                effect.checked_clips()?;
+                for clip in &mut effect.clips {
+                    walk(&mut clip.coverage.mask, &mut visit)?;
+                }
+            }
+        }
+        for effect in &mut self.filters {
+            effect.checked_clips()?;
+            for clip in &mut effect.clips {
+                walk(&mut clip.coverage.mask, &mut visit)?;
+            }
+        }
+        for coverage in [&mut self.selection_coverage, &mut self.selection_previous]
+            .into_iter()
+            .flatten()
+        {
+            walk(&mut coverage.mask, &mut visit)?;
+        }
+        Ok(())
+    }
     /// Source36 DTO construction is metadata-only. The caller first captures an
     /// immutable document, then runs this outside engine/root/registry locks.
     pub fn capture(doc: &Document, collector: &mut impl RasterCollector) -> Result<Self> {
@@ -519,12 +637,12 @@ impl Document36 {
 
     /// Exact deterministic native-location order, including original sources.
     /// The ordinal rule rejects duplicate, unused, aliased or cyclic wire IDs.
-    pub fn visit_rasters(
-        &self,
-        mut visit: impl FnMut(&RasterRef36) -> Result<()>,
+    pub fn visit_rasters<'a>(
+        &'a self,
+        mut visit: impl FnMut(&'a RasterRef36) -> Result<()>,
     ) -> Result<usize> {
         let mut next = 1u32;
-        let mut walk = |r: &RasterRef36| -> Result<()> {
+        let mut walk = |r: &'a RasterRef36| -> Result<()> {
             visit_one(r, &mut next, &mut visit)?;
             if let Some(original) = &r.retained {
                 visit_one(&original.pixels, &mut next, &mut visit)?;
@@ -561,10 +679,10 @@ impl Document36 {
         Ok(next as usize - 1)
     }
 }
-fn visit_one(
-    r: &RasterRef36,
+fn visit_one<'a>(
+    r: &'a RasterRef36,
     next: &mut u32,
-    visit: &mut impl FnMut(&RasterRef36) -> Result<()>,
+    visit: &mut impl FnMut(&'a RasterRef36) -> Result<()>,
 ) -> Result<()> {
     if r.id != *next
         || *next as usize > MAX_RASTER_LOCATIONS
@@ -999,7 +1117,7 @@ mod tests {
         .unwrap();
         let snapshot = SceneSnapshot::new(identity.clone(), pending, vec![], None, None).unwrap();
         assert_eq!(snapshot.identity(), &identity);
-        assert_eq!(snapshot.metadata().layers.len(), 1);
+        assert_eq!(snapshot.metadata().layers().len(), 1);
         assert_eq!(resident.used(), 64 * 1024);
         assert_eq!(disk.used().unwrap(), 0);
         let pending = snapshot.into_provisional_pending().unwrap();

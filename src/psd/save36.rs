@@ -12,15 +12,26 @@ use super::{
     standard36::ComparedStandard,
     structural::{self, Format, Span},
 };
+#[cfg(test)]
+use crate::large_document::CompletedBytes;
 use crate::{
-    engine::scene::{Document36, SceneSnapshot},
-    large_document::{ByteRole, CompletedBytes, Error, LargeSourceTemporary, ScratchBytes},
+    engine::{
+        native::Metadata as DocumentMetadata,
+        scene::{Document36, SceneSnapshot},
+    },
+    large_document::{ByteRole, Error, ScratchBytes},
+    workspace::source_runtime::SourceSession,
 };
+#[path = "save36_ownership.rs"]
+mod ownership;
+pub(crate) use ownership::SaveCursor;
+use ownership::{StagedBytes, StagingFactory};
 use ring::digest::{Context, SHA256};
+#[cfg(test)]
+use std::path::Path;
 use std::{
     cell::Cell,
     io::{Read, Write},
-    path::Path,
     sync::Arc,
 };
 
@@ -29,9 +40,9 @@ pub(crate) struct SaveLimits {
     pub bulk: BulkLimits,
     pub file_bytes: u64,
 }
-/// Each path is a fresh namespace under the caller's already owned profile or
-/// session operation. Constructor checks never grant arbitrary path authority.
-pub(crate) struct OwnedRoots<'a> {
+/// Private fixture namespaces. Production construction requires SourceSession.
+#[cfg(test)]
+struct OwnedRoots<'a> {
     pub layers: &'a Path,
     pub composite: &'a Path,
     pub manifest: &'a Path,
@@ -44,12 +55,45 @@ pub(crate) struct OwnedRoots<'a> {
 pub(crate) fn prepare<'a>(
     scene: &'a SceneSnapshot,
     format: Format,
+    session: &'a SourceSession,
+    provider: &mut impl CapturedRows,
+    limits: SaveLimits,
+    check: &dyn Fn() -> Result<(), String>,
+    cleanup: &dyn Fn() -> Result<(), String>,
+) -> Result<CompletedSave36<'a>, String> {
+    prepare_owned(scene, format, &session, provider, limits, check, cleanup)
+}
+#[cfg(test)]
+fn prepare_fixture<'a>(
+    scene: &'a SceneSnapshot,
+    format: Format,
     roots: OwnedRoots<'_>,
     provider: &mut impl CapturedRows,
     limits: SaveLimits,
     check: &dyn Fn() -> Result<(), String>,
     cleanup: &dyn Fn() -> Result<(), String>,
 ) -> Result<CompletedSave36<'a>, String> {
+    prepare_owned(scene, format, &roots, provider, limits, check, cleanup)
+}
+fn prepare_owned<'a>(
+    scene: &'a SceneSnapshot,
+    format: Format,
+    factory: &impl StagingFactory<'a>,
+    provider: &mut impl CapturedRows,
+    limits: SaveLimits,
+    check: &dyn Fn() -> Result<(), String>,
+    cleanup: &dyn Fn() -> Result<(), String>,
+) -> Result<CompletedSave36<'a>, String> {
+    let active = || {
+        check()?;
+        factory.check()
+    };
+    let retiring = || {
+        cleanup()?;
+        factory.cleanup_check()
+    };
+    let check = &active;
+    let cleanup = &retiring;
     check()?;
     limits.metadata.validate()?;
     if !std::ptr::eq(scene, provider.scene())
@@ -84,7 +128,7 @@ pub(crate) fn prepare<'a>(
         .map_err(|_| "Source36 staging receipt allocation refused")?;
     let result: Result<ComparedStandard, String> = (|| {
         let (layers, layer_written) = stage_file(
-            roots.layers,
+            factory,
             plan.standard().layer_bytes(),
             ByteRole::LayerData,
             scene,
@@ -108,7 +152,7 @@ pub(crate) fn prepare<'a>(
             return Err("Source36 owned layer seal differs from emitted native data".into());
         }
         let (composite, composite_written) = stage_file(
-            roots.composite,
+            factory,
             plan.standard().composite_bytes(),
             ByteRole::CompositeData,
             scene,
@@ -222,7 +266,7 @@ pub(crate) fn prepare<'a>(
             .unwrap_or(limits.metadata.bytes)
             .min(limits.metadata.bytes);
         let (manifest_file, _) = stage_file(
-            roots.manifest,
+            factory,
             compressed.bytes(),
             ByteRole::SourceBulk,
             scene,
@@ -232,7 +276,7 @@ pub(crate) fn prepare<'a>(
             |output| container36::compress_manifest(&manifest, limits.metadata, output, check),
         )?;
         staging.push(manifest_file);
-        let profile = scene.metadata().srgb_tagged.then(|| Profile {
+        let profile = scene.metadata().srgb_tagged().then(|| Profile {
             bytes: crate::color_profile::srgb_profile(),
         });
         let layout = container36::LayoutPlan::new(
@@ -246,7 +290,7 @@ pub(crate) fn prepare<'a>(
             return Err("Source36 final output exceeds declared file admission".into());
         }
         let (candidate, written) = stage_file(
-            roots.container,
+            factory,
             layout.output_bytes(),
             ByteRole::PhotoshopContainer,
             scene,
@@ -353,13 +397,13 @@ pub(crate) fn prepare<'a>(
                 limits.metadata,
                 check,
                 |doc, roster, id, revision| {
-                    if id != scene.metadata().id
-                        || revision != scene.metadata().revision
+                    if id != scene.metadata().id()
+                        || revision != scene.metadata().revision()
                         || doc.id != id
                         || doc.revision != revision
-                        || doc.width != scene.metadata().width
-                        || doc.height != scene.metadata().height
-                        || doc.bit_depth != scene.metadata().bit_depth
+                        || doc.width != scene.metadata().width()
+                        || doc.height != scene.metadata().height()
+                        || doc.bit_depth != scene.metadata().depth()
                     {
                         return Err(
                             "Reopened Source36 typed scene identity/geometry differs".into()
@@ -449,8 +493,7 @@ pub(crate) fn prepare<'a>(
         Err(error) => {
             let mut retirement = None;
             for file in staging.into_iter().rev() {
-                let mut guarded = || io_check(cleanup);
-                if let Err(e) = file.retire(&mut guarded) {
+                if let Err(e) = file.retire(cleanup) {
                     if retirement.is_none() {
                         retirement = Some(e.to_string());
                     }
@@ -463,8 +506,8 @@ pub(crate) fn prepare<'a>(
     }
 }
 
-fn stage_file<T>(
-    root: &Path,
+fn stage_file<'a, T>(
+    factory: &impl StagingFactory<'a>,
     length: u64,
     role: ByteRole,
     scene: &SceneSnapshot,
@@ -472,41 +515,24 @@ fn stage_file<T>(
     check: &dyn Fn() -> Result<(), String>,
     cleanup: &dyn Fn() -> Result<(), String>,
     write: impl FnOnce(&mut dyn Write) -> Result<T, String>,
-) -> Result<(CompletedBytes, T), String> {
+) -> Result<(StagedBytes<'a>, T), String> {
     check()?;
-    let mut temporary = LargeSourceTemporary::create(
-        root,
-        length,
-        role,
-        scene.budget().clone(),
-        scene.disk_budget().clone(),
-    )
-    .map_err(|e| e.to_string())?;
-    let result = {
+    let mut temporary = factory.create(scene, length, role)?;
+    let result = (|| {
         let mut guarded = || io_check(check);
-        write(&mut temporary.writer(&mut guarded))
-    };
+        write(&mut temporary.temporary()?.writer(&mut guarded))
+    })();
     match result {
-        Ok(value) => {
-            let mut guarded = || io_check(check);
-            Ok((
-                temporary
-                    .finish(binding, &mut guarded)
-                    .map_err(|e| e.to_string())?,
-                value,
-            ))
-        }
-        Err(error) => {
-            let mut guarded = || io_check(cleanup);
-            match temporary.abort(&mut guarded) {
-                Ok(()) => Err(error),
-                Err(e) => Err(format!(
-                    "{error}; owned staging retirement also failed: {e}"
-                )),
-            }
-        }
+        Ok(value) => Ok((temporary.finish(binding, check)?, value)),
+        Err(error) => match temporary.abort(cleanup) {
+            Ok(()) => Err(error),
+            Err(retirement) => Err(format!(
+                "{error}; owned staging retirement also failed: {retirement}"
+            )),
+        },
     }
 }
+
 fn io_check(check: &dyn Fn() -> Result<(), String>) -> crate::large_document::Result<()> {
     check().map_err(|e| Error::Io(std::io::Error::other(e)))
 }
@@ -516,7 +542,7 @@ fn stage_core<'a>(
     index: &SourceIndex<'a>,
     limits: MetadataLimits,
     check: &dyn Fn() -> Result<(), String>,
-) -> Result<(Admitted<StagedCore<&'a Document36>>, WorkingSet), String> {
+) -> Result<(Admitted<StagedCore<DocumentMetadata<'a>>>, WorkingSet), String> {
     let header_bytes = index
         .rasters()
         .len()
@@ -591,8 +617,8 @@ fn stage_core<'a>(
 /// Retaining the snapshot keeps its metadata, Surface owners and leases alive.
 pub(crate) struct CompletedSave36<'a> {
     scene: &'a SceneSnapshot,
-    candidate: CompletedBytes,
-    staging: Vec<CompletedBytes>,
+    candidate: StagedBytes<'a>,
+    staging: Vec<StagedBytes<'a>>,
     bytes: u64,
     sha256: Digest,
     provenance: Digest,
@@ -600,11 +626,12 @@ pub(crate) struct CompletedSave36<'a> {
     _standard_fidelity: ComparedStandard,
     failed: Cell<bool>,
 }
-impl CompletedSave36<'_> {
+impl<'source> CompletedSave36<'source> {
     pub(crate) fn scene(&self) -> &SceneSnapshot {
         self.scene
     }
-    pub(crate) fn candidate(&self) -> &CompletedBytes {
+    #[cfg(test)]
+    fn candidate(&self) -> &CompletedBytes {
         &self.candidate
     }
     pub(crate) fn bytes(&self) -> u64 {
@@ -618,6 +645,33 @@ impl CompletedSave36<'_> {
     }
     pub(crate) fn core_sha256(&self) -> Digest {
         self.core_sha256
+    }
+    fn check_guards(&self) -> Result<(), String> {
+        self.candidate.check()?;
+        for file in &self.staging {
+            file.check()?;
+        }
+        Ok(())
+    }
+    fn check_cursor_guard(&self) -> Result<(), String> {
+        if self.failed.get() {
+            return Err("Source36 completed save is failed".into());
+        }
+        self.candidate.check()
+    }
+    pub(crate) fn cursor<'read>(
+        &'read self,
+        start: u64,
+        length: u64,
+        check: &'read mut dyn FnMut() -> crate::large_document::Result<()>,
+    ) -> Result<SaveCursor<'read, 'source>, String> {
+        self.check_cursor_guard()?;
+        self.check_guards()?;
+        let input = self
+            .candidate
+            .cursor(start, length, check)
+            .map_err(|e| e.to_string())?;
+        Ok(SaveCursor::new(self, input))
     }
     /// Reobserve the entire owned candidate immediately before destination copy.
     /// Source file identity/lease and engine revision are the caller's guard;
@@ -634,6 +688,7 @@ impl CompletedSave36<'_> {
     }
     fn recheck_inner(&self, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
         check()?;
+        self.check_guards()?;
         if super::scene_save36::provenance(self.scene) != self.provenance
             || self.candidate.role() != ByteRole::PhotoshopContainer
             || self.candidate.binding() != self.core_sha256
@@ -649,7 +704,11 @@ impl CompletedSave36<'_> {
         }
         let mut transfer =
             ScratchBytes::new(self.scene.budget(), 65536, 65536).map_err(|e| e.to_string())?;
-        let mut guarded = || check().map_err(|e| Error::Io(std::io::Error::other(e)));
+        let active = || {
+            check()?;
+            self.candidate.check()
+        };
+        let mut guarded = || io_check(&active);
         let mut input = self
             .candidate
             .cursor(0, self.bytes, &mut guarded)
@@ -657,7 +716,7 @@ impl CompletedSave36<'_> {
         let mut left = self.bytes;
         let mut hash = Context::new(&SHA256);
         while left != 0 {
-            check()?;
+            active()?;
             let n = left.min(65536) as usize;
             input
                 .read_exact(&mut transfer[..n])
@@ -670,7 +729,8 @@ impl CompletedSave36<'_> {
         {
             return Err("Source36 save candidate bytes changed after qualification".into());
         }
-        check()
+        check()?;
+        self.check_guards()
     }
     /// Call only after destination publication/abort no longer needs staging.
     /// Verified retirement never removes a foreign replacement. Failed remains
@@ -682,8 +742,7 @@ impl CompletedSave36<'_> {
             .into_iter()
             .chain(std::iter::once(self.candidate))
         {
-            let mut guarded = || check().map_err(|e| Error::Io(std::io::Error::other(e)));
-            if let Err(error) = file.retire(&mut guarded) {
+            if let Err(error) = file.retire(check) {
                 if first.is_none() {
                     first = Some(error.to_string());
                 }

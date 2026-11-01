@@ -192,8 +192,12 @@ charge owner into PendingScene; it does not return a bare uncharged payload.
 
 ## Captured standard save plan
 
-The new-format standard plan borrows the admitted Document36 snapshot and native
-physical references. It preserves full padded tile bytes, native low bits and
+The new-format standard plan borrows the immutable metadata projection of an
+admitted pending or native document snapshot and its native physical references.
+The projection serializes the exact Document36 wire without cloning its source,
+style or selection metadata graph. Physical sources resolve through slots bound
+to that captured generation. This does not demote a native document to pending
+import data. It preserves full padded tile bytes, native low bits and
 hidden RGB. Tile/reference roots and chunk partitions are planned from bounded
 immutable metadata; emitting a tile still pins and verifies its actual bytes.
 References sort by raster ID, tile Y, tile X, independently of runtime map order.

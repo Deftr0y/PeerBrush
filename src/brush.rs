@@ -1,4 +1,6 @@
 //! Shared, bounded brush rasterization. Opacity caps a stroke; flow accumulates per dab.
+#[path = "brush/input.rs"]
+pub(crate) mod input;
 #[path = "brush/native.rs"]
 pub(crate) mod native;
 use crate::raster::{blend, Pixel, Raster, TILE};
@@ -345,8 +347,14 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
         .as_array()
         .filter(|p| !p.is_empty() && p.len() <= 10000)
         .ok_or("Stroke needs 1–10000 points")?;
-    let mut points = Vec::with_capacity(values.len());
-    let mut pressures = Vec::with_capacity(values.len());
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(values.len())
+        .map_err(|_| "Stroke point allocation failed")?;
+    let mut pressures = Vec::new();
+    pressures
+        .try_reserve_exact(values.len())
+        .map_err(|_| "Stroke pressure allocation failed")?;
     let mut explicit = false;
     for value in values {
         let point = value
@@ -376,7 +384,10 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
             .as_array()
             .filter(|p| p.len() == points.len())
             .ok_or("Pressures must match the point count")?;
-        pressures = values.iter().map(pressure).collect::<Result<Vec<_>, _>>()?;
+        pressures.clear();
+        for value in values {
+            pressures.push(pressure(value)?);
+        }
         explicit = true;
     }
     if let Some(axis) = c.get("stroke_axis") {
@@ -449,22 +460,25 @@ pub(crate) fn dabs(
     let document_points = if settings.texture_origin == [0, 0] {
         std::borrow::Cow::Borrowed(points)
     } else {
-        std::borrow::Cow::Owned(
-            points
-                .iter()
-                .map(|p| {
-                    [
-                        p[0] + settings.texture_origin[0] as f32,
-                        p[1] + settings.texture_origin[1] as f32,
-                    ]
-                })
-                .collect::<Vec<_>>(),
-        )
+        let mut document = Vec::new();
+        document
+            .try_reserve_exact(points.len())
+            .map_err(|_| "Document stroke point allocation failed")?;
+        for p in points {
+            document.push([
+                p[0] + settings.texture_origin[0] as f32,
+                p[1] + settings.texture_origin[1] as f32,
+            ]);
+        }
+        std::borrow::Cow::Owned(document)
     };
     let points = document_points.as_ref();
     let step = (settings.radius * 2.0 * settings.spacing).max(0.5);
     let at_pressure = |index: usize| pressures.map_or(1.0, |p| p[index]);
-    let mut raw = vec![(points[0], 0.0, at_pressure(0))];
+    let mut raw = Vec::new();
+    raw.try_reserve(1)
+        .map_err(|_| "Raw stroke dab allocation failed")?;
+    raw.push((points[0], 0.0, at_pressure(0)));
     let mut previous = points[0];
     let mut until_next = step;
     let mut length = 0.0;
@@ -483,6 +497,10 @@ pub(crate) fn dabs(
         let distance = dx.hypot(dy);
         let mut along = until_next;
         while along <= distance {
+            if raw.len() == raw.capacity() {
+                raw.try_reserve(1)
+                    .map_err(|_| "Raw stroke dab allocation failed")?;
+            }
             raw.push((
                 [
                     previous[0] + dx * along / distance,
@@ -501,40 +519,42 @@ pub(crate) fn dabs(
         until_next = along - distance;
         previous = target;
     }
-    Ok(raw
-        .into_iter()
-        .map(|(point, distance, p)| {
-            let smooth = |v: f32| {
-                let v = v.clamp(0.0, 1.0);
-                v * v * (3.0 - 2.0 * v)
-            };
-            let start = if settings.taper_start > 0.0 && length > 0.0 {
-                smooth(distance / settings.taper_start)
-            } else {
-                1.0
-            };
-            let end = if settings.taper_end > 0.0 && length > 0.0 {
-                smooth((length - distance) / settings.taper_end)
-            } else {
-                1.0
-            };
-            let taper = start.min(end);
-            let p = settings.pressure_response(p);
-            let size_pressure = if settings.pressure_size { p } else { 1.0 };
-            let opacity_pressure = if settings.pressure_opacity { p } else { 1.0 };
-            let size_taper = if settings.taper_size { taper } else { 1.0 };
-            let opacity_taper = if settings.taper_opacity { taper } else { 1.0 };
-            Dab {
-                point: [
-                    point[0] - settings.texture_origin[0] as f32,
-                    point[1] - settings.texture_origin[1] as f32,
-                ],
-                document_point: point,
-                radius: settings.radius * size_pressure * size_taper,
-                opacity: opacity_pressure * opacity_taper,
-            }
-        })
-        .collect())
+    let mut prepared = Vec::new();
+    prepared
+        .try_reserve_exact(raw.len())
+        .map_err(|_| "Prepared stroke dab allocation failed")?;
+    for (point, distance, p) in raw {
+        let smooth = |v: f32| {
+            let v = v.clamp(0.0, 1.0);
+            v * v * (3.0 - 2.0 * v)
+        };
+        let start = if settings.taper_start > 0.0 && length > 0.0 {
+            smooth(distance / settings.taper_start)
+        } else {
+            1.0
+        };
+        let end = if settings.taper_end > 0.0 && length > 0.0 {
+            smooth((length - distance) / settings.taper_end)
+        } else {
+            1.0
+        };
+        let taper = start.min(end);
+        let p = settings.pressure_response(p);
+        let size_pressure = if settings.pressure_size { p } else { 1.0 };
+        let opacity_pressure = if settings.pressure_opacity { p } else { 1.0 };
+        let size_taper = if settings.taper_size { taper } else { 1.0 };
+        let opacity_taper = if settings.taper_opacity { taper } else { 1.0 };
+        prepared.push(Dab {
+            point: [
+                point[0] - settings.texture_origin[0] as f32,
+                point[1] - settings.texture_origin[1] as f32,
+            ],
+            document_point: point,
+            radius: settings.radius * size_pressure * size_taper,
+            opacity: opacity_pressure * opacity_taper,
+        });
+    }
+    Ok(prepared)
 }
 
 pub(crate) fn dab_bounds(dab: Dab) -> [i32; 4] {

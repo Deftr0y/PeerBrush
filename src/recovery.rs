@@ -1,4 +1,5 @@
 //! Complete immutable recovery versions. No source file is used as a destination.
+pub(crate) mod backed;
 mod worker;
 use crate::{engine, psd, server, workspace};
 use serde::{Deserialize, Serialize};

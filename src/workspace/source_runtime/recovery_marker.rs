@@ -9,6 +9,17 @@ use std::{
 
 const MAX_MARKER: u64 = 128 * 1024 * 1024;
 
+pub(crate) struct NativeMarkerIds {
+    entries: Vec<[u8; 16]>,
+    _charge: crate::large_document::Reservation,
+}
+impl NativeMarkerIds {
+    /// Discovery is not framing, source or editable-document qualification.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = [u8; 16]> + '_ {
+        self.entries.iter().copied()
+    }
+}
+
 pub(crate) struct NativeMarker<'a> {
     session: &'a SourceSession,
     snapshot: [u8; 16],
@@ -85,6 +96,55 @@ impl Write for Writer<'_> {
     }
 }
 impl SourceSession {
+    pub(crate) fn recovery_marker_ids(&self) -> Result<NativeMarkerIds, String> {
+        self.check()?;
+        let maximum = self.runtime.limits.max_files;
+        let bytes = maximum
+            .checked_mul(2 * std::mem::size_of::<[u8; 16]>())
+            .and_then(|n| n.checked_add(128))
+            .ok_or("Recovery discovery footprint overflow")?;
+        let charge = self
+            .resident()
+            .reserve_bytes(bytes, 64 * 1024 * 1024)
+            .map_err(|e| e.to_string())?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(maximum)
+            .map_err(|_| "Recovery discovery allocation refused")?;
+        if entries.capacity() > maximum.saturating_mul(2) {
+            return Err("Recovery discovery exceeds admitted capacity".into());
+        }
+        let state = self
+            .runtime
+            .inventory
+            .try_lock()
+            .map_err(|_| "Source inventory is busy")?;
+        let inventory = state.as_ref().ok_or("Source inventory unavailable")?;
+        for held in &inventory.files {
+            let Some(name) = held.path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(id) = name
+                .strip_prefix("recovery-v3-")
+                .and_then(|n| n.strip_suffix(".pbr"))
+            else {
+                continue;
+            };
+            let id = uuid::Uuid::parse_str(id)
+                .map_err(|_| "Invalid native recovery identity retained")?;
+            entries.push(*id.as_bytes());
+        }
+        drop(state);
+        entries.sort_unstable();
+        if entries.windows(2).any(|w| w[0] == w[1]) {
+            return Err("Ambiguous native recovery identities retained".into());
+        }
+        self.check()?;
+        Ok(NativeMarkerIds {
+            entries,
+            _charge: charge,
+        })
+    }
     /// The producer emits a completely framed recovery-domain record. Final
     /// ownership/revision checks occur after durable SHA readback and immediately
     /// before exclusive publication. No path is accepted from a serialized input.

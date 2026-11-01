@@ -1,5 +1,7 @@
 pub mod backed;
+pub mod native;
 pub mod scene;
+pub(crate) mod view;
 use crate::raster::{blend, check_size, Pixel, Raster};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1666,6 +1668,7 @@ impl Engine {
         // Reframe before taking native-original and soft-selection baselines. The
         // outer transaction still owns the complete pre-gesture undo snapshot.
         self.doc.ensure_depth();
+        crate::fill::prepare_visual_baseline(&mut self.doc, c)?;
         crate::edit_bounds::prepare(&mut self.doc, c)?;
         let before = crate::retained::has_originals(&self.doc).then(|| self.doc.clone());
         self.apply_retained(c, pixels)?;

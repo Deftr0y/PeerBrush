@@ -375,6 +375,20 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Recheck an ALREADY verified immutable prefix's held filesystem owner.
+    /// This is not prefix/hash verification, head selection or import authority.
+    /// Appends by this same owned Store do not invalidate a selected older prefix.
+    pub(crate) fn check_owner(&self, check: Check<'_>) -> Result<()> {
+        let _read = self.store.0.access.read()?;
+        let expected = self.store.state()?.expected;
+        if self.commit.end > expected.bytes {
+            return Err(Error::Changed);
+        }
+        check()?;
+        self.store.check_source(expected)?;
+        check()?;
+        self.store.check_source(expected)
+    }
     pub fn store(&self) -> Store {
         self.store.clone()
     }
@@ -590,6 +604,29 @@ impl Store {
         check()?;
         self.check_source(expected)?;
         Ok(snapshot)
+    }
+
+    /// The only selection is this held owner's already-validated in-memory head.
+    /// Re-read its complete CMIT and reference table; arbitrary selected transport
+    /// still goes through `snapshot` and its complete prefix validation.
+    pub(crate) fn checkpoint_snapshot(&self, check: Check<'_>) -> Result<Option<Snapshot>> {
+        let _read = self.0.access.read()?;
+        let state = self.state()?;
+        let Some(head) = state.head else {
+            return Ok(None);
+        };
+        let expected = state.expected;
+        drop(state);
+        check()?;
+        self.check_source(expected)?;
+        let record = read_record(&self.0.file, head.offset, head.end, self.0.limits, check)?;
+        let snapshot = self.manifest_contents(&record, check)?;
+        if snapshot.commit != head {
+            return Err(Error::Corrupt);
+        }
+        check()?;
+        self.check_source(expected)?;
+        Ok(Some(snapshot))
     }
 
     /// Create a fresh private directory below an already-owned profile/session parent.
@@ -1071,6 +1108,20 @@ impl Store {
         head: Option<CommitRef>,
         check: Check<'_>,
     ) -> Result<Snapshot> {
+        let snapshot = self.manifest_contents(record, check)?;
+        let parent: Digest = record.manifest.ok_or(Error::Corrupt)?[24..56]
+            .try_into()
+            .unwrap();
+        if head.map_or([0; 32], |p| p.digest) != parent
+            || head.is_some_and(|p| {
+                p.source != snapshot.commit.source || snapshot.commit.revision <= p.revision
+            })
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(snapshot)
+    }
+    fn manifest_contents(&self, record: &Record, check: Check<'_>) -> Result<Snapshot> {
         if &record.kind != b"CMIT" {
             return Err(Error::Corrupt);
         }
@@ -1080,7 +1131,6 @@ impl Store {
         let bytes = record.manifest.ok_or(Error::Corrupt)?;
         let source: [u8; 16] = bytes[..16].try_into().unwrap();
         let revision = u64_at(&bytes, 16);
-        let parent: Digest = bytes[24..56].try_into().unwrap();
         let metadata = u32_at(&bytes, 56) as usize;
         let count = u32_at(&bytes, 60) as usize;
         if source == [0; 16]
@@ -1090,11 +1140,6 @@ impl Store {
                 .and_then(|n| count.checked_mul(REF_BYTES).and_then(|b| n.checked_add(b)))
                 .map(|n| n as u64)
                 != Some(record.length)
-        {
-            return Err(Error::Corrupt);
-        }
-        if head.map_or([0; 32], |p| p.digest) != parent
-            || head.is_some_and(|p| p.source != source || revision <= p.revision)
         {
             return Err(Error::Corrupt);
         }

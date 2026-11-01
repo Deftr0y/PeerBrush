@@ -10,6 +10,18 @@ use std::{
 
 pub(crate) trait StageSession {
     fn check(&self) -> Result<()>;
+    /// Existing implementations remain conservative until the concrete service
+    /// supplies its retained-instance cleanup-only admission check.
+    fn cleanup_check(&self) -> Result<()> {
+        self.check()
+    }
+    fn abort_fragment(
+        &self,
+        _fragment: crate::large_document::FreshFragment,
+        _cleanup: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        Err("Source service retirement is unavailable; source bytes remain charged".into())
+    }
     fn store_for_lineage(&self, lineage: [u8; 16]) -> Result<Store>;
     fn seal_store(&self, store: &Store, blocks: &[BlockRef], metadata: &[u8]) -> Result<Snapshot>;
 }
@@ -205,7 +217,7 @@ fn seal_sources<S: StageSession>(
     for (_, (store, mut blocks)) in stores {
         session.check()?;
         check()?;
-        blocks.sort_unstable_by_key(|b| b.digest());
+        blocks.sort_unstable_by_key(|b| b.fingerprint());
         blocks.dedup();
         seals.push(session.seal_store(&store, &blocks, &key)?);
     }
@@ -660,6 +672,11 @@ mod tests {
         let second = capture(&doc).stage(&runtime, &cache, &|| Ok(())).unwrap();
         assert_eq!(first.scene.identity(), second.scene.identity());
         assert_ne!(key, second.scene.render_key().unwrap());
+        let first_metadata = first.scene.metadata();
+        let first_layer = first_metadata.layers().next().unwrap();
+        let first_slot = first_layer.pixels().slot();
+        assert!(first.scene.raster(first_slot).unwrap().is_known_zero());
+        assert!(second.scene.raster(first_slot).is_err());
         assert_eq!(runtime.0.disk.used().unwrap(), 0);
     }
     #[test]
@@ -749,11 +766,32 @@ mod tests {
         });
         let staged = capture(&doc).stage(&runtime, &cache, &|| Ok(())).unwrap();
         assert_eq!(staged.scene.rasters().len(), 3);
-        assert!(staged.scene.metadata().layers[0].pixels.retained.is_some());
-        let text = serde_json::to_string(staged.scene.metadata()).unwrap();
+        assert!(staged
+            .scene
+            .metadata()
+            .layers()
+            .next()
+            .unwrap()
+            .pixels()
+            .retained()
+            .is_some());
+        let text = serde_json::to_string(&staged.scene.metadata()).unwrap();
         assert!(!text.contains("\"tiles\""));
         assert!(!text.contains("samples16"));
-        assert_eq!(staged.scene.metadata().layers[0].effects[0].clips.len(), 1);
+        assert_eq!(
+            staged
+                .scene
+                .metadata()
+                .layers()
+                .next()
+                .unwrap()
+                .effects()
+                .next()
+                .unwrap()
+                .clips()
+                .len(),
+            1
+        );
     }
     #[test]
     fn refusal_and_cancellation_never_return_a_partial_scene() {
