@@ -19,7 +19,10 @@ impl<'a> Rows<'a> {
         Self::for_target(scene, None)
     }
     pub(crate) fn for_target(scene: &'a SceneSnapshot, target: Option<&str>) -> Result<Self> {
-        if scene.metadata().depth() != 8 && scene.metadata().depth() != 16 {
+        if ![8, 16].contains(&scene.metadata().depth())
+            || !(1..=16000).contains(&scene.metadata().width())
+            || !(1..=16000).contains(&scene.metadata().height())
+        {
             return Err("Composite rows require native RGB8 or RGB16".into());
         }
         if target.is_none()
@@ -71,14 +74,6 @@ impl<'a> Rows<'a> {
         let height = self.scene.metadata().height() as i32;
         while let Some(window) = grid.next()? {
             check()?;
-            let mut failed_check = None;
-            let prepared = RawLayers::for_topology(&self.topology, window.source, &mut || {
-                check().map_err(|reason| {
-                    failed_check = Some(reason);
-                    Error::Cancelled
-                })
-            })
-            .map_err(|reason| failed_check.unwrap_or(reason))?;
             let mut fill = |sample: &dyn Fn(i32, i32) -> Result<[u16; 4]>| -> Result<()> {
                 for y in window.output[1]..window.output[3] {
                     check()?;
@@ -108,19 +103,28 @@ impl<'a> Rows<'a> {
                 }
                 Ok(())
             };
+            let [l, t, r, b] = window.source;
+            let bounds = [l.max(0), t.max(0), r.min(width), b.min(height)];
+            if bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
+                fill(&|_, _| Ok([0; 4]))?;
+                continue;
+            }
+            let region = crate::raster::backed::Region::new(bounds).map_err(|e| e.to_string())?;
+            let mut failed_check = None;
+            let prepared = RawLayers::for_topology(&self.topology, region, &mut || {
+                check().map_err(|reason| {
+                    failed_check = Some(reason);
+                    Error::Cancelled
+                })
+            })
+            .map_err(|reason| failed_check.unwrap_or(reason))?;
             if depth == 8 {
-                let plan = Plan::<Native8, _>::with_topology(
-                    self.topology.clone(),
-                    &prepared,
-                    window.source,
-                )?;
+                let plan =
+                    Plan::<Native8, _>::with_topology(self.topology.clone(), &prepared, region)?;
                 fill(&|x, y| Ok(plan.pixel(x, y)?.map(u16::from)))?;
             } else {
-                let plan = Plan::<Native16, _>::with_topology(
-                    self.topology.clone(),
-                    &prepared,
-                    window.source,
-                )?;
+                let plan =
+                    Plan::<Native16, _>::with_topology(self.topology.clone(), &prepared, region)?;
                 fill(&|x, y| plan.pixel(x, y))?;
             }
         }
@@ -444,6 +448,43 @@ mod tests {
                     .is_err());
                 }
             }
+            drop(scene);
+            crate::compositor::native::tests::cleanup(&path);
+        }
+    }
+    #[test]
+    fn padded_exterior_beyond_legacy_preview_coordinates_never_becomes_a_source_read() {
+        for depth in [8, 16] {
+            let doc = crate::compositor::native::tests::doc(depth, true, "screen");
+            let (scene, path) = crate::compositor::native::tests::capture_kind(&doc, true);
+            let provider = Rows::new(&scene).unwrap();
+            for rect in [
+                [16000, 0, 24000, 8],
+                [-116000, -7, -110000, 8],
+                [110000, 0, 116000, 9],
+            ] {
+                let output = Output {
+                    target: None,
+                    target_name: String::new(),
+                    variant: String::new(),
+                    filename: "padded.png".into(),
+                    document_rect: rect,
+                    width: 17,
+                    height: 7,
+                    format: Format::Png,
+                    native_source_depth: depth,
+                    bit_depth: depth,
+                    scale_xy: [1., 1.],
+                };
+                for method in [Resampling::Nearest, Resampling::Bilinear] {
+                    let mut bytes = vec![0xff; 17 * 7 * usize::from(depth / 2)];
+                    provider
+                        .fill(&output, depth, method, 0, 7, &mut bytes, &|| Ok(()))
+                        .unwrap();
+                    assert!(bytes.iter().all(|v| *v == 0));
+                }
+            }
+            drop(provider);
             drop(scene);
             crate::compositor::native::tests::cleanup(&path);
         }

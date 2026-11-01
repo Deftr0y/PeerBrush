@@ -1,7 +1,6 @@
 //! Exact export sample coordinates, partitioned into bounded preparation windows.
 //! This owns no pixels and grants no source or destination authority.
 use super::{Output, Resampling};
-use crate::raster::backed::Region;
 
 type Result<T> = std::result::Result<T, String>;
 const EDGE: i32 = 256;
@@ -11,7 +10,7 @@ pub(crate) struct Window {
     /// Half-open coordinates in the final output, independent of stripe origin.
     pub output: [u32; 4],
     /// Includes the precise nearest/bilinear support, including padded exterior.
-    pub source: Region,
+    pub source: [i32; 4],
 }
 
 pub(crate) struct Grid {
@@ -40,7 +39,7 @@ impl Grid {
             || u64::from(output.width) * u64::from(rows) > 128 * 1024
             || rect[0] >= rect[2]
             || rect[1] >= rect[3]
-            || rect.iter().any(|v| v.unsigned_abs() > 16384)
+            || rect.iter().any(|v| v.unsigned_abs() > 116000)
         {
             return Err("Invalid bounded native export grid".into());
         }
@@ -95,7 +94,7 @@ impl Grid {
             if widths[0] <= EDGE && widths[1] <= EDGE {
                 return Ok(Some(Window {
                     output: bounds,
-                    source: Region::new(source).map_err(|e| e.to_string())?,
+                    source,
                 }));
             }
             let axis = if widths[0] > EDGE { 0 } else { 1 };
@@ -123,7 +122,7 @@ pub(crate) fn sample(
     mut pixel: impl FnMut(i32, i32) -> Result<[u16; 4]>,
 ) -> Result<[u16; 4]> {
     let [x, y] = position;
-    if !x.is_finite() || !y.is_finite() || x.abs() > 100000. || y.abs() > 100000. {
+    if !x.is_finite() || !y.is_finite() || x.abs() > 116000. || y.abs() > 116000. {
         return Err("Invalid native export sample position".into());
     }
     if method == Resampling::Nearest {
@@ -194,7 +193,7 @@ mod tests {
                     Grid::new(&output(width, height, rect), method, first, rows).unwrap();
                 let mut covered = vec![false; width as usize * rows as usize];
                 while let Some(window) = grid.next().unwrap() {
-                    let [l, t, r, b] = window.source.bounds();
+                    let [l, t, r, b] = window.source;
                     assert!(r - l <= EDGE && b - t <= EDGE);
                     for y in window.output[1]..window.output[3] {
                         for x in window.output[0]..window.output[2] {
