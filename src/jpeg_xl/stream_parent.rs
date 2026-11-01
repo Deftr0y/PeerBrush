@@ -32,6 +32,60 @@ const _: () = {
 };
 type Result<T> = std::result::Result<T, String>;
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum BrokerPhase {
+    Queue,
+    Source,
+    Launch,
+    Start,
+    Ready,
+    Rectangle,
+    Release,
+    Segment,
+    Done,
+    Exit,
+    Canonical,
+}
+#[cfg(test)]
+impl BrokerPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Source => "source",
+            Self::Launch => "launch",
+            Self::Start => "start",
+            Self::Ready => "ready",
+            Self::Rectangle => "rectangle",
+            Self::Release => "release",
+            Self::Segment => "segment",
+            Self::Done => "done",
+            Self::Exit => "exit",
+            Self::Canonical => "canonical",
+        }
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum BrokerCategory {
+    Begin,
+    Ok,
+}
+#[cfg(test)]
+fn broker_mark(depth: u16, phase: BrokerPhase, category: BrokerCategory) {
+    assert!(matches!(depth, 8 | 16));
+    let category = match category {
+        BrokerCategory::Begin => "begin",
+        BrokerCategory::Ok => "ok",
+    };
+    eprintln!(
+        "JXL_BROKER_STATUS phase={} depth={} category={}",
+        phase.label(),
+        depth,
+        category
+    );
+}
+
 pub(crate) struct Limits {
     pub output_bytes: u64,
     pub log_bytes: u64,
@@ -318,6 +372,12 @@ fn exchange<'scene, 'output, 'session>(
     };
     let result = (|| -> Result<()> {
         let mut state = State::new(configuration, nonce)?;
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Start,
+            BrokerCategory::Begin,
+        );
         state.send(
             Direction::Parent,
             Message::Start(configuration),
@@ -326,11 +386,42 @@ fn exchange<'scene, 'output, 'session>(
             &mut buffers.io,
             &active,
         )?;
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Start,
+            BrokerCategory::Ok,
+        );
+        #[cfg(test)]
+        let mut observed = [false; 11];
         loop {
             active()?;
             let frame = Frame::read(&mut stdout, &active)?;
             let sequence = frame.sequence();
             let message = frame.message();
+            #[cfg(test)]
+            let phase = match message {
+                Message::Ready => Some(BrokerPhase::Ready),
+                Message::NeedRectangle(_) => Some(BrokerPhase::Rectangle),
+                Message::Release { .. } => Some(BrokerPhase::Release),
+                Message::Segment { .. } => Some(BrokerPhase::Segment),
+                Message::Done { .. } => Some(BrokerPhase::Done),
+                _ => None,
+            };
+            #[cfg(test)]
+            let marked = phase.is_some_and(|phase| {
+                let old = observed[phase as usize];
+                observed[phase as usize] = true;
+                !old
+            });
+            #[cfg(test)]
+            if marked {
+                broker_mark(
+                    configuration.info.bit_depth,
+                    phase.unwrap(),
+                    BrokerCategory::Begin,
+                );
+            }
             state.preflight(Direction::Child, &frame)?;
             let mut copied = 0usize;
             state.complete(
@@ -393,6 +484,14 @@ fn exchange<'scene, 'output, 'session>(
                     }
                     drop(stdin);
                     wire::exact_eof(&mut stdout, &active)?;
+                    #[cfg(test)]
+                    if marked {
+                        broker_mark(
+                            configuration.info.bit_depth,
+                            BrokerPhase::Done,
+                            BrokerCategory::Ok,
+                        );
+                    }
                     return active();
                 }
                 _ => state.send(
@@ -403,6 +502,14 @@ fn exchange<'scene, 'output, 'session>(
                     &mut buffers.io,
                     &active,
                 )?,
+            }
+            #[cfg(test)]
+            if marked {
+                broker_mark(
+                    configuration.info.bit_depth,
+                    phase.unwrap(),
+                    BrokerCategory::Ok,
+                );
             }
         }
     })();
@@ -430,10 +537,22 @@ fn run_worker<'scene, 'output, 'session>(
 ) -> WorkerResult<'scene, 'output, 'session> {
     thread::scope(|scope| {
         let stop = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Launch,
+            BrokerCategory::Begin,
+        );
         let child = match command.spawn() {
             Ok(child) => child,
             Err(_) => return (Some(input), Some(log), Err(FAILED.into()), true),
         };
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Launch,
+            BrokerCategory::Ok,
+        );
         let mut guard = ChildGuard {
             child: Some(child),
             done: false,
@@ -535,6 +654,12 @@ fn run_worker<'scene, 'output, 'session>(
                         if let Some(error) = error {
                             return Err(error);
                         }
+                        #[cfg(test)]
+                        broker_mark(
+                            configuration.info.bit_depth,
+                            BrokerPhase::Exit,
+                            BrokerCategory::Begin,
+                        );
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) if packet.is_some() => {}
@@ -552,6 +677,12 @@ fn run_worker<'scene, 'output, 'session>(
                         return Err(FAILED.into());
                     }
                     if packet.is_some() {
+                        #[cfg(test)]
+                        broker_mark(
+                            configuration.info.bit_depth,
+                            BrokerPhase::Exit,
+                            BrokerCategory::Ok,
+                        );
                         return Ok(());
                     }
                 } else if let Err(error) =
@@ -623,6 +754,12 @@ pub(crate) fn encode<'scene, 'output, 'session>(
         if cleanup_failed() {
             return Err("JPEG XL cleanup is blocked; source work retained".into());
         }
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Queue,
+            BrokerCategory::Begin,
+        );
         let _active = loop {
             check()?;
             match ACTIVE.try_lock() {
@@ -638,7 +775,25 @@ pub(crate) fn encode<'scene, 'output, 'session>(
         if cleanup_failed() {
             return Err("JPEG XL cleanup is blocked; source work retained".into());
         }
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Queue,
+            BrokerCategory::Ok,
+        );
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Source,
+            BrokerCategory::Begin,
+        );
         input.recheck(check)?;
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Source,
+            BrokerCategory::Ok,
+        );
         let nonce = *uuid::Uuid::new_v4().as_bytes();
         let binding = configuration.binding(nonce)?;
         logging = Some(session.segment_log(
@@ -694,6 +849,12 @@ pub(crate) fn encode<'scene, 'output, 'session>(
         logging = log;
         may_retire = known;
         outcome?;
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Canonical,
+            BrokerCategory::Begin,
+        );
         let input = held.as_ref().ok_or("Streaming input owner disappeared")?;
         input.recheck(check)?;
         let segments = logging
@@ -726,6 +887,12 @@ pub(crate) fn encode<'scene, 'output, 'session>(
             return Err("Streaming output is not a JPEG XL signature".into());
         }
         check()?;
+        #[cfg(test)]
+        broker_mark(
+            configuration.info.bit_depth,
+            BrokerPhase::Canonical,
+            BrokerCategory::Ok,
+        );
         Ok((configuration, binding))
     })();
     match result {
