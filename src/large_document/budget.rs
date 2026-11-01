@@ -48,6 +48,10 @@ impl ResidentBudget {
         self.0.limit
     }
 
+    pub fn same_pool(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn reserve_bytes(&self, length: usize, maximum: usize) -> Result<Reservation> {
         if maximum > 64 * 1024 * 1024 || length > maximum {
             return Err(Error::Budget);
@@ -111,6 +115,8 @@ mod tests {
         let budget = ResidentBudget::new(1024).unwrap();
         let first = budget.reserve(512).unwrap();
         let clone = budget.clone();
+        assert!(budget.same_pool(&clone));
+        assert!(!budget.same_pool(&ResidentBudget::new(1024).unwrap()));
         assert_eq!(clone.used(), 512);
         assert!(matches!(clone.reserve(513), Err(Error::Budget)));
         assert!(matches!(clone.reserve(usize::MAX), Err(Error::Budget)));
