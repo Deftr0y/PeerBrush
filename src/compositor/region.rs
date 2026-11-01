@@ -1,7 +1,7 @@
 //! Explicit source footprints for a regional scene. Preparation does all I/O;
 //! sampling an undeclared footprint is an error, including for known sources.
 use crate::{
-    large_document::{Error, ResidentBudget, Result},
+    large_document::{Error, Reservation, ResidentBudget, Result},
     raster::{
         backed::Region,
         surface::{Surface, SurfaceKey, SurfaceRegion},
@@ -14,9 +14,19 @@ const MAX_FOOTPRINTS: usize = 4096;
 pub(crate) struct PreparedSceneRegion {
     footprints: Vec<SurfaceRegion>,
     budget: ResidentBudget,
+    _index: Reservation,
 }
 
 impl PreparedSceneRegion {
+    #[cfg(test)]
+    fn index_bytes(&self) -> usize {
+        self._index.bytes()
+            + self
+                .footprints
+                .iter()
+                .map(SurfaceRegion::index_bytes)
+                .sum::<usize>()
+    }
     /// Call outside engine, registry and UI locks. The caller's check retains
     /// the scene's source/revision/cancellation admission until final adoption.
     /// All source pins must share the caller's actual global payload ledger.
@@ -37,6 +47,12 @@ impl PreparedSceneRegion {
                 "Scene sources use a different payload ledger",
             ));
         }
+        let bytes = requests
+            .len()
+            .checked_mul(std::mem::size_of::<SurfaceRegion>())
+            .and_then(|n| n.checked_add(64))
+            .ok_or(Error::Budget)?;
+        let charge = budget.reserve_bytes(bytes, 4 * 1024 * 1024)?;
         let mut footprints = Vec::new();
         footprints
             .try_reserve_exact(requests.len())
@@ -54,6 +70,7 @@ impl PreparedSceneRegion {
         Ok(Self {
             footprints,
             budget: budget.clone(),
+            _index: charge,
         })
     }
 
@@ -161,6 +178,10 @@ mod tests {
             (&surface, Region::new([256, 0, 257, 1]).unwrap()),
             (&surface, Region::new([0, 0, 2, 1]).unwrap()),
         ];
+        // Warm only the retained weak-cache metadata. All payload pins and ROI
+        // containers drop before taking the persistent-owner baseline.
+        drop(PreparedSceneRegion::prepare(&requests, &budget, &mut || Ok(())).unwrap());
+        let baseline = budget.used();
         let scene = PreparedSceneRegion::prepare(&requests, &budget, &mut || Ok(())).unwrap();
         let source = scene.source(surface.key()).unwrap();
         assert_eq!(source.pixel16(0, 0).unwrap(), pixels.get16(0, 0));
@@ -182,9 +203,10 @@ mod tests {
         );
         drop(output);
         drop(scene);
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.used(), baseline);
         drop(surface);
         drop(store);
+        assert_eq!(budget.used(), 0);
         cleanup(&path);
     }
 
@@ -197,11 +219,14 @@ mod tests {
         pixels.set(0, 0, [17, 31, 53, 255]);
         let surface = Surface::stage_raster(&pixels, store.clone(), &mut || Ok(())).unwrap();
         let requests = [(&surface, Region::new([0, 0, 2, 1]).unwrap())];
+        let initial = budget.used();
         assert!(PreparedSceneRegion::prepare(&requests, &other, &mut || Ok(())).is_err());
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.used(), initial);
+        drop(PreparedSceneRegion::prepare(&requests, &budget, &mut || Ok(())).unwrap());
+        let baseline = budget.used();
         let mut saw_pin = false;
         let scene = PreparedSceneRegion::prepare(&requests, &budget, &mut || {
-            if budget.used() != 0 {
+            if budget.used() >= baseline + 256 * 256 * 4 {
                 saw_pin = true;
                 Err(Error::Cancelled)
             } else {
@@ -209,10 +234,11 @@ mod tests {
             }
         });
         assert!(saw_pin && matches!(scene, Err(Error::Cancelled)));
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.used(), baseline);
         assert_eq!(other.used(), 0);
         drop(surface);
         drop(store);
+        assert_eq!(budget.used(), 0);
         cleanup(&path);
     }
 
@@ -224,21 +250,24 @@ mod tests {
         pixels.set(0, 0, [17, 31, 53, 255]);
         let surface = Surface::stage_raster(&pixels, store.clone(), &mut || Ok(())).unwrap();
         let requests = [(&surface, Region::new([0, 0, 2, 1]).unwrap())];
+        drop(PreparedSceneRegion::prepare(&requests, &budget, &mut || Ok(())).unwrap());
+        let baseline = budget.used();
         let mut checks = 0;
         let complete = PreparedSceneRegion::prepare(&requests, &budget, &mut || {
             checks += 1;
             Ok(())
         })
         .unwrap();
-        assert_eq!(budget.used(), 256 * 256 * 4);
+        let descriptors = complete.index_bytes();
+        assert_eq!(budget.used(), baseline + descriptors + 256 * 256 * 4);
         drop(complete);
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.used(), baseline);
         let final_check = checks;
         checks = 0;
         let refused = PreparedSceneRegion::prepare(&requests, &budget, &mut || {
             checks += 1;
             if checks == final_check {
-                assert_eq!(budget.used(), 256 * 256 * 4);
+                assert_eq!(budget.used(), baseline + descriptors + 256 * 256 * 4);
                 Err(Error::Cancelled)
             } else {
                 Ok(())
@@ -246,15 +275,16 @@ mod tests {
         });
         assert!(matches!(refused, Err(Error::Cancelled)));
         assert_eq!(checks, final_check);
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.used(), baseline);
         drop(surface);
         drop(store);
+        assert_eq!(budget.used(), 0);
         cleanup(&path);
     }
 
     #[test]
     fn declared_zero_border_is_distinct_from_missing_source_or_footprint() {
-        let budget = ResidentBudget::new(128).unwrap();
+        let budget = ResidentBudget::new(1024).unwrap();
         let zero = Surface::zero(16000, 16000, 16).unwrap();
         let scene = PreparedSceneRegion::prepare(
             &[(&zero, Region::new([-1, -1, 1, 1]).unwrap())],
@@ -266,6 +296,25 @@ mod tests {
         assert_eq!(source.pixel(-1, -1).unwrap(), [0; 4]);
         assert_eq!(source.pixel16(0, 0).unwrap(), [0; 4]);
         assert!(source.pixel16(1, 0).is_err());
+        assert_eq!(budget.used(), scene.index_bytes());
+        drop(scene);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn index_admission_refuses_before_source_preparation() {
+        let budget = ResidentBudget::new(1).unwrap();
+        let zero = Surface::zero(8, 8, 8).unwrap();
+        let mut checks = 0;
+        let refused = PreparedSceneRegion::prepare(
+            &[(&zero, Region::new([0, 0, 1, 1]).unwrap())],
+            &budget,
+            &mut || {
+                checks += 1;
+                Ok(())
+            },
+        );
+        assert!(matches!(refused, Err(Error::Budget)));
+        assert_eq!(checks, 1);
         assert_eq!(budget.used(), 0);
     }
 }

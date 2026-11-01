@@ -285,8 +285,9 @@ mod tests {
             assert_eq!(budget.used(), baseline);
             drop(history);
             drop(base);
-            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.payload_used(), 0);
             drop(base_store);
+            assert_eq!(budget.used(), 0);
             std::fs::remove_dir_all(base_path).unwrap();
             std::fs::remove_dir_all(fragment_path).unwrap();
         }
