@@ -359,7 +359,7 @@ impl HistorySnapshot {
                 .admission
                 .as_ref()
                 .ok_or("Native editor capture admission is missing")?
-                .check(current, request.actor, &delta.intent)?;
+                .check_publication(current, request.actor, &delta.intent)?;
             let coalesce = request.gesture.is_some()
                 && self.undo.as_ref().is_some_and(|record| {
                     record.info.actor == request.actor

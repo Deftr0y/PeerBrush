@@ -210,13 +210,23 @@ impl NativeDocument {
             return Err(RefusedDelta { reason, prepared });
         }
         if let Some(admission) = &prepared.admission {
-            if let Err(reason) = admission.check(self, actor, &prepared.intent) {
+            if let Err(reason) = admission.check_publication(self, actor, &prepared.intent) {
                 return Err(RefusedDelta { reason, prepared });
             }
         }
         self.finish(prepared)
     }
     fn finish(&self, prepared: PreparedDelta) -> std::result::Result<NativeDocument, RefusedDelta> {
+        if prepared
+            .admission
+            .as_ref()
+            .is_some_and(|a| a.is_transaction_step())
+        {
+            return Err(RefusedDelta {
+                reason: "Native transaction steps cannot publish independently".into(),
+                prepared,
+            });
+        }
         if let Err(reason) = prepared.cancellation.check() {
             return Err(RefusedDelta { reason, prepared });
         }
