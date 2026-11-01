@@ -212,6 +212,31 @@ impl<T> Admitted<T> {
             owner,
         })
     }
+    /// Repartition unique metadata under freshly admitted headers and its actual
+    /// shared field owners. The previous broad parse admission stays alive until
+    /// the new payload and owner are inseparable, including every error exit.
+    /// The callback must admit new allocations before making them; retaining an
+    /// old broad ticket instead of accounting actual fields is not repartition.
+    pub(crate) fn rehome_unique<U>(
+        self,
+        map: impl FnOnce(T, &Arc<MetadataCharge>) -> Result<(U, Arc<MetadataCharge>), String>,
+    ) -> Result<Admitted<U>, String> {
+        let Self { value, owner } = self;
+        let value = Arc::try_unwrap(value)
+            .map_err(|_| "Source36 metadata owner is shared; cannot rehome its fields")?;
+        let (value, next) = map(value, &owner)?;
+        if !next.uses_budget(&owner.budget) {
+            // Returned payload storage must drop while both admissions remain.
+            drop(value);
+            return Err("Source36 rehomed metadata uses a different resident pool".into());
+        }
+        let admitted = Admitted {
+            value: Arc::new(value),
+            owner: next,
+        };
+        drop(owner);
+        Ok(admitted)
+    }
 }
 
 pub(crate) struct Admission {
@@ -405,6 +430,72 @@ mod tests {
         drop(b);
         assert_eq!(pool.used(), 98304);
         drop(payload);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn unique_rehome_releases_broad_parse_charge_only_after_new_owner_handoff() {
+        let pool = ResidentBudget::new(65536).unwrap();
+        let old = MetadataCharge::reserve(&pool, 4096, &|| Ok(())).unwrap();
+        let value = Admitted::from_parts(Arc::new(vec![7u8; 128]), old);
+        let pointer = value.as_ptr();
+        let next = value
+            .rehome_unique(|bytes, owner| {
+                assert_eq!(pool.used(), 4096);
+                assert!(owner.uses_budget(&pool));
+                let fresh = MetadataCharge::reserve(&pool, 512, &|| Ok(()))?;
+                assert_eq!(pool.used(), 4608);
+                Ok((bytes, fresh))
+            })
+            .unwrap();
+        assert_eq!(next.as_ptr(), pointer);
+        assert_eq!(pool.used(), 512);
+        let shared = next.clone();
+        drop(next);
+        assert_eq!(pool.used(), 512);
+        drop(shared);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn rehome_refuses_shared_and_foreign_owners_without_uncharged_payload_drop() {
+        let pool = ResidentBudget::new(65536).unwrap();
+        let foreign = ResidentBudget::new(65536).unwrap();
+        let old = MetadataCharge::reserve(&pool, 4096, &|| Ok(())).unwrap();
+        let value = Admitted::from_parts(Arc::new(7u8), old);
+        let shared = value.clone();
+        assert!(value
+            .rehome_unique::<u8>(|_, _| panic!("shared payload moved"))
+            .is_err());
+        assert_eq!(pool.used(), 4096);
+        struct Payload(ResidentBudget, ResidentBudget);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                assert_eq!(self.0.used(), 4096);
+                assert_eq!(self.1.used(), 512);
+            }
+        }
+        assert!(shared
+            .rehome_unique(|_, _| {
+                let next = MetadataCharge::reserve(&foreign, 512, &|| Ok(()))?;
+                Ok((Payload(pool.clone(), foreign.clone()), next))
+            })
+            .is_err());
+        assert_eq!(pool.used(), 0);
+        assert_eq!(foreign.used(), 0);
+    }
+    #[test]
+    fn rehome_callback_failure_drops_payload_before_releasing_previous_admission() {
+        let pool = ResidentBudget::new(65536).unwrap();
+        struct Payload(ResidentBudget);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                assert_eq!(self.0.used(), 4096);
+            }
+        }
+        let old = MetadataCharge::reserve(&pool, 4096, &|| Ok(())).unwrap();
+        let value = Admitted::from_parts(Arc::new(Payload(pool.clone())), old);
+        assert!(value
+            .rehome_unique::<()>(|_, _| Err("specific rehome refusal".into()))
+            .is_err_and(|error| error == "specific rehome refusal"));
         assert_eq!(pool.used(), 0);
     }
     #[test]
