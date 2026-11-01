@@ -50,6 +50,14 @@ impl Request {
     pub(crate) fn tag(&self) -> Tag {
         Tag(self.prepared.clone())
     }
+    pub(crate) fn is_thumbnail(&self) -> bool {
+        let key = self.key();
+        let doc = self.scene.metadata();
+        key.target.is_some()
+            && key.width <= 48
+            && key.height <= 48
+            && key.rect == [0, 0, doc.width() as i32, doc.height() as i32]
+    }
     pub(crate) fn render(&self, check: &mut dyn FnMut() -> Result<()>) -> Result<Frame> {
         let mut checked = || {
             self.session.check()?;

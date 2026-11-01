@@ -8,9 +8,41 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-struct Job {
+struct LegacyJob {
     render: Box<dyn FnOnce() + Send>,
     failed: Box<dyn FnOnce() + Send>,
+}
+enum Job {
+    Legacy(LegacyJob),
+    Native {
+        request: crate::render::native_preview::Request,
+        job: u64,
+        epoch: Arc<AtomicU64>,
+        replies: NativeReplies,
+        ready: Box<dyn FnOnce() + Send>,
+    },
+}
+
+pub(super) struct NativeReply {
+    pub job: u64,
+    pub tag: crate::render::native_preview::Tag,
+    pub result: Result<crate::render::native_preview::Frame, String>,
+}
+/// At most one completed pixel-only frame is retained while UI is busy.
+#[derive(Clone, Default)]
+pub(super) struct NativeReplies(Arc<Mutex<Option<NativeReply>>>);
+impl NativeReplies {
+    pub fn take(&self) -> Option<NativeReply> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+    pub(super) fn complete(&self, reply: NativeReply) {
+        let previous = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(reply);
+        drop(previous);
+    }
 }
 
 #[derive(Default)]
@@ -48,9 +80,33 @@ impl Worker {
         failed: impl FnOnce() + Send + 'static,
     ) -> io::Result<()> {
         self.enqueue(
-            Job {
+            Job::Legacy(LegacyJob {
                 render: Box::new(render),
                 failed: Box::new(failed),
+            }),
+            |queue| {
+                thread::Builder::new()
+                    .name("peerbrush-preview".into())
+                    .spawn(move || run(queue))
+            },
+        )
+    }
+
+    /// Request is already captured/admitted outside UI and Engine locks.
+    pub fn request_native(
+        &mut self,
+        request: crate::render::native_preview::Request,
+        job: u64,
+        replies: NativeReplies,
+        ready: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
+        self.enqueue(
+            Job::Native {
+                request,
+                job,
+                epoch: self.epoch.clone(),
+                replies,
+                ready: Box::new(ready),
             },
             |queue| {
                 thread::Builder::new()
@@ -121,10 +177,40 @@ fn run(queue: Arc<Queue>) {
             }
             state.next.take().unwrap()
         };
-        let Job { render, failed } = job;
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)).is_err() {
-            // A reply sink must not kill the actor and strand the newest job.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(failed));
+        match job {
+            Job::Legacy(LegacyJob { render, failed }) => {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)).is_err() {
+                    // A reply sink must not kill the actor and strand the newest job.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(failed));
+                }
+            }
+            Job::Native {
+                request,
+                job,
+                epoch,
+                replies,
+                ready,
+            } => {
+                let tag = request.tag();
+                let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    request.render(&mut || {
+                        if epoch.load(Ordering::Relaxed) == job {
+                            Ok(())
+                        } else {
+                            Err("Preview superseded".into())
+                        }
+                    })
+                }))
+                .unwrap_or_else(|_| Err("Native preview could not complete".into()));
+                // No scene, Surface, source session or profile operation escapes
+                // into the UI reply. Release all of them before notifying UI.
+                drop(request);
+                if epoch.load(Ordering::Relaxed) != job {
+                    result = Err("Preview superseded".into());
+                }
+                replies.complete(NativeReply { job, tag, result });
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ready));
+            }
         }
     }
 }
@@ -376,10 +462,10 @@ mod tests {
             dropped: drop_tx,
         };
         let failure = worker.enqueue(
-            Job {
+            Job::Legacy(LegacyJob {
                 render: Box::new(move || drop(owner)),
                 failed: Box::new(|| panic!("UI handles thread creation failure")),
-            },
+            }),
             |_| Err(io::Error::other("Synthetic thread creation failure")),
         );
         assert!(failure.is_err());

@@ -520,6 +520,7 @@
     "src/ui/layers.rs",
     "src/ui/lifecycle.rs",
     "src/ui/liquify.rs",
+    "src/ui/native_preview.rs",
     "src/ui/new_canvas.rs",
     "src/ui/parameter_preview_tests.rs",
     "src/ui/pattern_source.rs",
