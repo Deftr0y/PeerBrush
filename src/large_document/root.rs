@@ -28,6 +28,9 @@ impl Directory {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        self.identity
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
         validate_ancestors(&self.path).map_err(|e| e.to_string())?;
         let named = open_directory(&self.path).map_err(|e| e.to_string())?;
@@ -55,6 +58,65 @@ impl Directory {
         let child = Self::open(&path)?;
         self.check()?;
         Ok(child)
+    }
+    /// Only an independently verified, never-published, now-empty child may be
+    /// retired. This does not recursively clean or adopt any directory contents.
+    pub(crate) fn retire_empty(
+        self,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        check()?;
+        self.check()?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options
+                .access_mode(0x100A0)
+                .share_mode(7)
+                .custom_flags(0x02000000 | 0x00200000);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        }
+        let retiring = options
+            .open(&self.path)
+            .map_err(|_| "Cannot retain owned empty directory for retirement")?;
+        if crate::file_safety::identity(&retiring)? != self.identity {
+            return Err("Empty source directory ownership changed".into());
+        }
+        if fs::read_dir(&self.path)
+            .map_err(|_| "Cannot inspect owned empty source directory")?
+            .next()
+            .is_some()
+        {
+            return Err("Source directory contains retained entries; cleanup refused".into());
+        }
+        check()?;
+        self.check()?;
+        if fs::read_dir(&self.path)
+            .map_err(|_| "Cannot recheck owned empty source directory")?
+            .next()
+            .is_some()
+        {
+            return Err("Source directory changed before retirement; entries retained".into());
+        }
+        #[cfg(windows)]
+        super::linear::unlink_owned(&retiring, &self.path).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        fs::remove_dir(&self.path).map_err(|_| "Owned empty directory retirement failed")?;
+        server::sync_parent(&self.path)?;
+        let Self { path, file, .. } = self;
+        drop(retiring);
+        drop(file);
+        if !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err("Empty source retirement outcome uncertain; inventory retained".into());
+        }
+        Ok(())
     }
 }
 
