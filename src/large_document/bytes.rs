@@ -17,6 +17,8 @@ pub enum ByteRole {
     LayerData = 2,
     SourceBulk = 3,
     CompositeData = 4,
+    CompatibleJxlMode1 = 5,
+    StraightNativeRgba = 6,
 }
 
 pub struct LargeSourceTemporary {
@@ -52,6 +54,12 @@ impl LargeSourceTemporary {
         Ok(Self {
             inner: linear::Scratch::create(root, Self::layout(length, role)?, resident, disk)?,
         })
+    }
+    pub(crate) fn role(&self) -> ByteRole {
+        match self.inner.spec.kind {
+            linear::Kind::Bytes(role, _) => role,
+            _ => unreachable!("Byte temporary contains an image"),
+        }
     }
     pub fn payload_length(&self) -> u64 {
         self.inner.spec.payload_bytes()
@@ -103,6 +111,12 @@ pub struct CompletedBytes {
     inner: Arc<linear::Complete>,
 }
 impl CompletedBytes {
+    /// Observation after finish/readback; each actual range still verifies its
+    /// immutable chunk hash. This is not a fresh whole-file integrity proof.
+    pub(crate) fn check_owner(&self) -> Result<()> {
+        self.inner.owned.check()
+    }
+
     pub fn payload_length(&self) -> u64 {
         self.inner.spec.payload_bytes()
     }
@@ -120,6 +134,25 @@ impl CompletedBytes {
     }
     pub fn uses_budgets(&self, resident: &ResidentBudget, disk: &DiskBudget) -> bool {
         self.inner.uses_budgets(resident, disk)
+    }
+    /// Exact payload bytes read by ONE uncached read_range_into/read_bytes
+    /// invocation. Owner checks use metadata only, not header/index/seal reads.
+    /// Cursor callers must meter each actual Read separately: adjacent calls
+    /// can read the same complete chunk again. This grants no I/O authority.
+    pub(crate) fn authenticated_read_cost(&self, start: u64, length: u64) -> Result<u64> {
+        let end = start
+            .checked_add(length)
+            .filter(|end| *end <= self.payload_length())
+            .ok_or(Error::Invalid("Byte range exceeds its sealed payload"))?;
+        if length > 64 * 1024 * 1024 {
+            return Err(Error::Invalid("Byte range exceeds its sealed payload"));
+        }
+        if length == 0 {
+            return Ok(0);
+        }
+        let first = start / (CHUNK as u64) * (CHUNK as u64);
+        let last = (end.div_ceil(CHUNK as u64) * (CHUNK as u64)).min(self.payload_length());
+        Ok(last - first)
     }
     pub fn read_range_into(
         &self,
@@ -501,5 +534,47 @@ mod tests {
             assert_eq!(budget.used(), 0);
             assert!(disk.used().unwrap() > 0);
         }
+    }
+    #[test]
+    fn authenticated_range_cost_counts_full_chunks_and_separate_uncached_calls() {
+        let f = Fixture::new();
+        let budget = ResidentBudget::new(1024 * 1024).unwrap();
+        let length = 200123;
+        let disk =
+            DiskBudget::new(LargeSourceTemporary::encoded_bytes(length).unwrap(), 1).unwrap();
+        let done = filled(&f, length, &budget, &disk);
+        for (start, count, expected) in [
+            (0, 0, 0),
+            (1, 0, 0),
+            (length, 0, 0),
+            (0, 1, 65536),
+            (65535, 1, 65536),
+            (65535, 2, 131072),
+            (65536, 1, 65536),
+            (200000, 123, 3515),
+            (196607, 2, 69051),
+        ] {
+            assert_eq!(
+                done.authenticated_read_cost(start, count).unwrap(),
+                expected
+            );
+        }
+        let separate = done.authenticated_read_cost(65535, 2).unwrap()
+            + done.authenticated_read_cost(65537, 2).unwrap();
+        assert_eq!(separate, 196608);
+        assert_eq!(done.authenticated_read_cost(65535, 4).unwrap(), 131072);
+        assert!(done.authenticated_read_cost(length + 1, 0).is_err());
+        assert!(done.authenticated_read_cost(u64::MAX, 2).is_err());
+        assert!(done
+            .authenticated_read_cost(0, 64 * 1024 * 1024 + 1)
+            .is_err());
+        let mut empty = ScratchBytes::new(&budget, 0, CHUNK).unwrap();
+        let before = budget.used();
+        done.read_range_into(1, &mut empty, &mut okay).unwrap();
+        assert_eq!(budget.used(), before);
+        drop(empty);
+        done.retire(&mut okay).unwrap();
+        assert_eq!(budget.used(), 0);
+        assert_eq!(disk.used().unwrap(), 0);
     }
 }
