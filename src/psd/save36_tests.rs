@@ -558,7 +558,7 @@ impl crate::psd::import36::ImportSession for ImportOwner {
 #[test]
 fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_source_payloads() {
     use crate::psd::import36::{self, ProvisionalImport, QualifiedImport};
-    for depth in [8, 16] {
+    for (depth, revoke_during_handoff) in [(8, false), (16, false), (16, true)] {
         let f = Fixture::new();
         let doc = document(depth);
         let scene = capture(&f, &doc);
@@ -688,33 +688,51 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             .unwrap();
         drop(imported_rows);
         let qualified = ProvisionalImport::qualify(provisional, compared, &|| Ok(())).unwrap();
-        let pending =
-            QualifiedImport::map_pending(qualified, &|| Ok(()), |pending, _| Ok(pending)).unwrap();
-        let reference = &pending.metadata().layers[0].pixels;
-        let surface = pending.rasters().get(reference).unwrap();
-        assert_ne!(
-            surface.key(),
-            scene
-                .raster(&scene.metadata().layers[0].pixels)
-                .unwrap()
-                .key()
+        let invoked = Cell::new(false);
+        let result = QualifiedImport::map_pending(
+            qualified,
+            &|| {
+                if revoke_during_handoff {
+                    session.alive.set(false);
+                }
+                Ok(())
+            },
+            |pending, _| {
+                invoked.set(true);
+                Ok(pending)
+            },
         );
-        let tile = surface.prepare_tile((0, 0), &mut || Ok(())).unwrap();
-        let bytes = tile.bytes().unwrap();
-        let at = (255 * 256 + 255) * 4;
-        if depth == 16 {
-            assert_eq!(
-                &bytes[at * 2..at * 2 + 8],
-                &[44445u16, 55551, 12345, 56789]
-                    .into_iter()
-                    .flat_map(u16::to_be_bytes)
-                    .collect::<Vec<_>>()
-            );
+        assert_eq!(invoked.get(), !revoke_during_handoff);
+        if revoke_during_handoff {
+            assert!(result.is_err());
         } else {
-            assert_eq!(&bytes[at..at + 4], &[171, 219, 43, 231]);
+            let pending = result.unwrap();
+            let reference = &pending.metadata().layers[0].pixels;
+            let surface = pending.rasters().get(reference).unwrap();
+            assert_ne!(
+                surface.key(),
+                scene
+                    .raster(&scene.metadata().layers[0].pixels)
+                    .unwrap()
+                    .key()
+            );
+            let tile = surface.prepare_tile((0, 0), &mut || Ok(())).unwrap();
+            let bytes = tile.bytes().unwrap();
+            let at = (255 * 256 + 255) * 4;
+            if depth == 16 {
+                assert_eq!(
+                    &bytes[at * 2..at * 2 + 8],
+                    &[44445u16, 55551, 12345, 56789]
+                        .into_iter()
+                        .flat_map(u16::to_be_bytes)
+                        .collect::<Vec<_>>()
+                );
+            } else {
+                assert_eq!(&bytes[at..at + 4], &[171, 219, 43, 231]);
+            }
+            drop(tile);
+            drop(pending);
         }
-        drop(tile);
-        drop(pending);
         drop(source);
         drop(session);
         saved.retire(&|| Ok(())).unwrap();
