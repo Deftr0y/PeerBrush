@@ -25,6 +25,8 @@ mod patch;
 mod pixel_inverse;
 #[path = "native/publication.rs"]
 mod publication;
+#[path = "native/registration.rs"]
+mod registration;
 #[path = "native/scopes.rs"]
 mod scopes;
 #[path = "native/transaction.rs"]
