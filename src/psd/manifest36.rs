@@ -16,12 +16,10 @@ pub(crate) fn inflate<R: Read>(
     bulk: BulkLimits,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Manifest, String> {
-    Manifest::parse(
-        &inflate_bytes(input, encoded_bytes, metadata, check)?,
-        metadata,
-        bulk,
-        check,
-    )
+    let (bytes, origin) = inflate_bytes(input, encoded_bytes, metadata, check)?;
+    let mut manifest = Manifest::parse(&bytes, metadata, bulk, check)?;
+    manifest.origin = Some((encoded_bytes, origin));
+    Ok(manifest)
 }
 
 fn inflate_bytes<R: Read>(
@@ -29,7 +27,7 @@ fn inflate_bytes<R: Read>(
     encoded_bytes: u64,
     metadata: Limits,
     check: &dyn Fn() -> Result<(), String>,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Digest), String> {
     metadata.validate()?;
     check()?;
     if encoded_bytes < 6 || encoded_bytes > u64::from(u32::MAX) - 4 {
@@ -40,6 +38,7 @@ fn inflate_bytes<R: Read>(
     let mut decoded = [0; 65536];
     let (mut begin, mut end, mut remaining) = (0usize, 0usize, encoded_bytes);
     let mut bytes = Vec::new();
+    let mut encoded_hash = ring::digest::Context::new(&ring::digest::SHA256);
     loop {
         check()?;
         if begin == end && remaining != 0 {
@@ -47,6 +46,7 @@ fn inflate_bytes<R: Read>(
             input
                 .read_exact(&mut compressed[..end])
                 .map_err(|e| check().err().unwrap_or_else(|| e.to_string()))?;
+            encoded_hash.update(&compressed[..end]);
             remaining -= end as u64;
             begin = 0;
         }
@@ -95,7 +95,7 @@ fn inflate_bytes<R: Read>(
                 return Err("Source36 compressed range has extra bytes".into());
             }
             check()?;
-            return Ok(bytes);
+            return Ok((bytes, encoded_hash.finish().as_ref().try_into().unwrap()));
         }
         if consumed == 0 && produced == 0 && (remaining == 0 || begin != end) {
             return Err("Incomplete Source36 metadata zlib stream".into());
@@ -137,12 +137,16 @@ pub(crate) fn inflate_admitted<R: Read>(
         .and_then(|n| n.checked_add(2 * 1024 * 1024))
         .ok_or("Source36 preflight workspace overflow")?;
     let preflight_owner = MetadataCharge::reserve(budget, preflight_bytes, check)?;
-    let bytes = inflate_bytes(input, encoded_bytes, metadata, check)?;
+    let (bytes, origin) = inflate_bytes(input, encoded_bytes, metadata, check)?;
     let stats = Stats::scan(&bytes, metadata, check)?;
     drop(preflight_owner);
     let admission = Admission::reserve(stats, metadata, working, budget, &raw_owner, check)?;
     let canonical = admission.parse_owned(bytes, check)?;
-    canonical.map_unique(|canonical, _| Manifest::from_canonical(canonical, metadata, bulk, check))
+    canonical.map_unique(|canonical, _| {
+        let mut manifest = Manifest::from_canonical(canonical, metadata, bulk, check)?;
+        manifest.origin = Some((encoded_bytes, origin));
+        Ok(manifest)
+    })
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -310,6 +314,9 @@ pub(crate) struct Manifest<T = Value> {
     standard_layer_bytes: u64,
     standard_composite_bytes: u64,
     standard_sha256: Digest,
+    // Runtime byte observation from the exact bounded zlib range, never wire
+    // authority or a replacement for retained whole-source/lease validation.
+    origin: Option<(u64, Digest)>,
 }
 impl Manifest {
     pub(crate) fn bind(
@@ -333,6 +340,7 @@ impl Manifest {
             standard_layer_bytes: layer_bytes,
             standard_composite_bytes: composite_bytes,
             standard_sha256,
+            origin: None,
         };
         result.plan().admit(limits, check)?;
         Ok(result)
@@ -451,6 +459,7 @@ impl Manifest {
             standard_layer_bytes: self.standard_layer_bytes,
             standard_composite_bytes: self.standard_composite_bytes,
             standard_sha256: self.standard_sha256,
+            origin: self.origin,
         })
     }
 }
@@ -518,6 +527,9 @@ impl<T> Manifest<T> {
             self.standard_composite_bytes,
             self.standard_sha256,
         )
+    }
+    pub(crate) fn resource_origin(&self) -> Option<(u64, Digest)> {
+        self.origin
     }
     pub(crate) fn verify_standard<L: Read, C: Read>(
         &self,

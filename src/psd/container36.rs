@@ -770,6 +770,55 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(restored.core().sha256(), f.manifest.core().sha256());
+                let source = Source::new(Cursor::new(&output), output.len() as u64).unwrap();
+                let mut entries = [TileIndexEntry::vacant(); 2];
+                let mut counters = [0];
+                let mut scratch = vec![0; bulk36::MAX_TILE_BYTES];
+                let mut staged_tiles = 0;
+                let source_proof = crate::psd::read36::verify(
+                    &source,
+                    &parsed,
+                    digest(&output),
+                    &restored,
+                    crate::psd::read36::VerificationLimits {
+                        bulk: limits(),
+                        native_streams: 5,
+                    },
+                    &mut entries,
+                    &mut counters,
+                    &mut scratch,
+                    &check,
+                    |record| {
+                        if matches!(record, Record::Tile { .. }) {
+                            staged_tiles += 1;
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(staged_tiles, 2);
+                assert_eq!(source_proof.streams(), 5);
+                assert_eq!(source_proof.rows(), 257 * 8);
+                source_proof
+                    .recheck(
+                        &source,
+                        &parsed,
+                        &restored,
+                        digest(&output),
+                        &mut scratch,
+                        &check,
+                    )
+                    .unwrap();
+                assert!(source_proof
+                    .check(&source, &parsed.clone(), &restored, digest(&output), &check)
+                    .is_err());
+                let other = Source::new(Cursor::new(&output), output.len() as u64).unwrap();
+                assert!(source_proof
+                    .check(&other, &parsed, &restored, digest(&output), &check)
+                    .is_err());
+                assert!(source_proof
+                    .check(&source, &parsed, &f.manifest, digest(&output), &check)
+                    .is_err());
                 let old = structural::index(
                     &mut Cursor::new(&f.original),
                     structural::Limits::current(),
@@ -928,5 +977,140 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    #[test]
+    fn complete_source_requires_bound_inflation_and_rejects_changed_ranges_before_staging() {
+        use crate::psd::read36::{self, VerificationLimits};
+        let check = || Ok(());
+        let f = fixture(Format::Psb, 16);
+        let (bulk, standard) = proofs(&f);
+        let (encoded, compressed) = encoded(&f);
+        let mut output = vec![];
+        write(
+            &mut output,
+            f.header,
+            &f.manifest,
+            metadata(),
+            &compressed,
+            &mut encoded.as_slice(),
+            &standard,
+            &bulk,
+            &mut f.layer.as_slice(),
+            &mut f.composite.as_slice(),
+            None,
+            &mut [0; 65536],
+            &check,
+        )
+        .unwrap();
+        let index = structural::index(
+            &mut Cursor::new(&output),
+            structural::Limits::current(),
+            || Ok(()),
+        )
+        .unwrap();
+        let resource = index.resources.iter().find(|r| r.peerbrush_source).unwrap();
+        let resource_bytes = range(&output, resource.data);
+        let manifest = manifest36::inflate(
+            &mut &resource_bytes[4..],
+            (resource_bytes.len() - 4) as u64,
+            metadata(),
+            limits(),
+            &check,
+        )
+        .unwrap();
+        let mut entries = [TileIndexEntry::vacant(); 2];
+        let mut counts = [0];
+        let mut scratch = vec![0; bulk36::MAX_TILE_BYTES];
+        for variant in 0..4 {
+            let mut changed = output.clone();
+            match variant {
+                0 => changed[resource.data.offset as usize + 5] ^= 1,
+                1 => changed[index.composite.span.offset as usize + 4] ^= 1,
+                2 => changed[index.layer_and_mask.offset as usize + 20] ^= 1,
+                _ => (),
+            }
+            let source = Source::new(Cursor::new(&changed), changed.len() as u64).unwrap();
+            let mut staged = 0;
+            let supplied = if variant == 3 { &f.manifest } else { &manifest };
+            assert!(read36::verify(
+                &source,
+                &index,
+                digest(&changed),
+                supplied,
+                VerificationLimits {
+                    bulk: limits(),
+                    native_streams: 5
+                },
+                &mut entries,
+                &mut counts,
+                &mut scratch,
+                &check,
+                |_| {
+                    staged += 1;
+                    Ok(())
+                }
+            )
+            .is_err());
+            assert_eq!(staged, 0);
+        }
+        struct MutableInput {
+            bytes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+            position: usize,
+        }
+        impl Read for MutableInput {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let bytes = self.bytes.borrow();
+                let n = out.len().min(bytes.len().saturating_sub(self.position));
+                out[..n].copy_from_slice(&bytes[self.position..self.position + n]);
+                self.position += n;
+                Ok(n)
+            }
+        }
+        impl std::io::Seek for MutableInput {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                let length = self.bytes.borrow().len() as i128;
+                let position = match from {
+                    std::io::SeekFrom::Start(n) => i128::from(n),
+                    std::io::SeekFrom::Current(n) => self.position as i128 + i128::from(n),
+                    std::io::SeekFrom::End(n) => length + i128::from(n),
+                };
+                if !(0..=length).contains(&position) {
+                    return Err(std::io::Error::other("outside mutable fixture"));
+                }
+                self.position = position as usize;
+                Ok(position as u64)
+            }
+        }
+        let sha = digest(&output);
+        let bytes = std::rc::Rc::new(std::cell::RefCell::new(output));
+        let source = Source::new(
+            MutableInput {
+                bytes: bytes.clone(),
+                position: 0,
+            },
+            index.file_bytes,
+        )
+        .unwrap();
+        let proof = read36::verify(
+            &source,
+            &index,
+            sha,
+            &manifest,
+            VerificationLimits {
+                bulk: limits(),
+                native_streams: 5,
+            },
+            &mut entries,
+            &mut counts,
+            &mut scratch,
+            &check,
+            |_| Ok(()),
+        )
+        .unwrap();
+        bytes.borrow_mut()[index.composite.span.offset as usize + 4] ^= 1;
+        assert!(proof
+            .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
+            .is_err());
     }
 }
