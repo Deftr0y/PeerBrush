@@ -3,7 +3,7 @@ use std::{
     fs::File,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
     },
     thread::{self, JoinHandle},
 };
@@ -23,6 +23,12 @@ pub(super) struct Requests {
 pub(super) struct Request(Arc<Requests>);
 
 impl Requests {
+    fn stopping(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .stopping
+    }
     pub(super) fn begin(self: &Arc<Self>) -> Option<Request> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopping {
@@ -47,6 +53,49 @@ impl Requests {
     }
 }
 
+/// Source I/O lifetime admission, not authority over any filesystem path.
+#[derive(Clone)]
+pub(crate) struct SourceAdmission {
+    requests: Arc<Requests>,
+    workspace: Weak<Mutex<crate::workspace::Workspace>>,
+}
+
+pub(crate) struct SourceOperation {
+    // Release the workspace counter before allowing instance drain to finish.
+    _operation: super::FileOperation,
+    request: Request,
+}
+
+impl SourceAdmission {
+    pub(crate) fn begin(&self) -> Result<SourceOperation, String> {
+        let request = self
+            .requests
+            .begin()
+            .ok_or("PeerBrush source session is closing")?;
+        let workspace = self
+            .workspace
+            .upgrade()
+            .ok_or("PeerBrush source workspace is unavailable")?;
+        let operation = super::FileOperation::begin_workspace(&workspace)?;
+        let permit = SourceOperation {
+            _operation: operation,
+            request,
+        };
+        permit.check()?;
+        Ok(permit)
+    }
+}
+
+impl SourceOperation {
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if self.request.0.stopping() {
+            Err("PeerBrush source session is closing".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl Drop for Request {
     fn drop(&mut self) {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -62,6 +111,7 @@ impl Drop for Request {
 pub struct InstanceLock {
     requests: Arc<Requests>,
     availability: Arc<AtomicBool>,
+    workspace: Weak<Mutex<crate::workspace::Workspace>>,
     recovery: crate::recovery::Worker,
     listener: Option<JoinHandle<()>>,
     http: Arc<tiny_http::Server>,
@@ -70,6 +120,12 @@ pub struct InstanceLock {
 }
 
 impl InstanceLock {
+    pub(crate) fn source_admission(&self) -> SourceAdmission {
+        SourceAdmission {
+            requests: self.requests.clone(),
+            workspace: self.workspace.clone(),
+        }
+    }
     pub(super) fn start(
         file: File,
         http: tiny_http::Server,
@@ -80,6 +136,7 @@ impl InstanceLock {
         port: u16,
         availability: Arc<AtomicBool>,
     ) -> Result<Self, String> {
+        let source_workspace = Arc::downgrade(&workspace);
         let recovery = crate::recovery::Worker::start(workspace, dir).map_err(|e| e.to_string())?;
         let requests = Arc::new(Requests::default());
         let accepting = requests.clone();
@@ -102,6 +159,7 @@ impl InstanceLock {
         Ok(Self {
             requests,
             availability,
+            workspace: source_workspace,
             recovery,
             listener: Some(listener),
             http,
@@ -312,6 +370,78 @@ mod tests {
         assert_eq!(reply["ok"], false);
         assert!(!dir.join("brushes.json").exists());
         drop(connection);
+        let next_owner = lock(&dir);
+        next_owner.try_lock().unwrap();
+        drop(next_owner);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn source_operation_blocks_update_seal_and_cannot_begin_after_seal() {
+        let dir = directory();
+        let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+        let connection = super::super::start(shared.clone(), dir.clone()).unwrap();
+        let workspace = crate::workspace::attach(&shared);
+        let reviewed = crate::workspace::lifecycle::update_readiness(&workspace).unwrap();
+        let source = connection
+            .instance_lock
+            .as_ref()
+            .unwrap()
+            .source_admission();
+        let operation = source.begin().unwrap();
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(crate::workspace::lifecycle::finish_update_exit(&workspace, &reviewed).is_err());
+        assert!(!shared.lock().unwrap().closed);
+        drop(operation);
+        crate::workspace::lifecycle::finish_update_exit(&workspace, &reviewed).unwrap();
+        assert!(source.begin().is_err());
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!dir.join("sources").exists());
+        drop(connection);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn instance_drop_waits_for_source_operation_without_cloning_its_file() {
+        let dir = directory();
+        let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+        let connection = super::super::start(shared, dir.clone()).unwrap();
+        let source = connection
+            .instance_lock
+            .as_ref()
+            .unwrap()
+            .source_admission();
+        let operation = source.begin().unwrap();
+        let (finished, done) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        until(|| source.requests.stopping());
+        assert!(source.begin().is_err());
+        assert!(operation.check().is_err());
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(25)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(lock(&dir).try_lock().is_err());
+        drop(operation);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        dropper.join().unwrap();
         let next_owner = lock(&dir);
         next_owner.try_lock().unwrap();
         drop(next_owner);

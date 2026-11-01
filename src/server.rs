@@ -6,6 +6,7 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 pub use instance::InstanceLock;
+pub(crate) use instance::{SourceAdmission, SourceOperation};
 use serde_json::{json, Value};
 use std::{
     fs,
