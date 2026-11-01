@@ -1,4 +1,5 @@
 pub mod backed;
+pub mod native;
 pub mod scene;
 use crate::raster::{blend, check_size, Pixel, Raster};
 use serde::{Deserialize, Serialize};
