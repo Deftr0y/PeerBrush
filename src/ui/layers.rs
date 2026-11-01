@@ -1314,6 +1314,7 @@ mod native_metadata_tests {
                             &tree,
                         );
                     }
+                    app.layer_footer(ui, view.layer(1).unwrap());
                 });
             });
             assert_eq!(pool.used(), admitted);
