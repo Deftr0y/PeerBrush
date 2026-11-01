@@ -3,6 +3,7 @@ pub(crate) mod bulk36;
 pub(crate) mod canonical36;
 mod composite;
 pub(crate) mod container36;
+pub(crate) mod import36;
 mod indexed;
 pub(crate) mod manifest36;
 pub(crate) mod memory36;
