@@ -13,12 +13,21 @@ mod bounds;
 mod capture;
 #[path = "scene/icc.rs"]
 pub(crate) mod icc;
+#[path = "scene/payload.rs"]
+pub(crate) mod payload;
+pub use payload::MetadataPayload;
+#[path = "scene/metadata.rs"]
+mod metadata;
 #[path = "scene/runtime.rs"]
 mod runtime;
 pub use capture::{CapturedScene, LegacyTileCache};
 pub(crate) use capture::{StageRuntime, StageSession, StagedScene};
 
 pub type Result<T> = std::result::Result<T, String>;
+#[cfg(test)]
+pub(crate) fn wire_copy<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+    serde_json::from_slice(&serde_json::to_vec(value).unwrap()).unwrap()
+}
 pub const MAX_RASTER_LOCATIONS: usize = 65536;
 
 /// Portable IDs index this strong-owner roster; SurfaceKey is deliberately not
@@ -137,6 +146,22 @@ impl PendingScene {
             disk: _,
         } = self;
         metadata.map_unique(|document, owner| map(document, roster, owner))
+    }
+    pub(crate) fn rehome_unique<U>(
+        self,
+        map: impl FnOnce(
+            Document36,
+            RasterRoster,
+            &Arc<MetadataCharge>,
+        ) -> Result<(U, Arc<MetadataCharge>)>,
+    ) -> Result<Admitted<U>> {
+        let Self {
+            metadata,
+            roster,
+            resident: _,
+            disk: _,
+        } = self;
+        metadata.rehome_unique(|document, owner| map(document, roster, owner))
     }
 }
 
@@ -371,32 +396,32 @@ impl Warp36 {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Coverage36 {
     pub mask: RasterRef36,
     pub bounds: [i32; 4],
     pub origin: [i32; 2],
-    #[serde(deserialize_with = "bounds::contours")]
-    pub contours: Vec<Vec<[f32; 2]>>,
+    #[serde(deserialize_with = "payload::contours")]
+    pub contours: MetadataPayload<Vec<Vec<[f32; 2]>>>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Effect36 {
     pub id: String,
     pub kind: String,
     pub enabled: bool,
     pub weight: f32,
-    pub settings: Arc<Value>,
+    pub settings: MetadataPayload<Value>,
     pub clips: Vec<EffectClip36>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectClip36 {
     pub stroke: u32,
     pub coverage: Coverage36,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaskStep36 {
     pub id: String,
@@ -405,16 +430,16 @@ pub struct MaskStep36 {
     pub weight: f32,
     pub value: f32,
     pub pixels: RasterRef36,
-    pub settings: Value,
+    pub settings: MetadataPayload<Value>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mask36 {
     pub enabled: bool,
     pub linked: bool,
     pub steps: Vec<MaskStep36>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Layer36 {
     pub id: String,
@@ -432,20 +457,20 @@ pub struct Layer36 {
     pub color: [u8; 4],
     pub mask: Option<Mask36>,
     pub effects: Vec<Effect36>,
-    pub psd_metadata: Vec<crate::psd::LayerMetadata>,
+    pub psd_metadata: MetadataPayload<Vec<crate::psd::LayerMetadata>>,
     pub source: Option<Source36>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source36 {
     pub width: u32,
     pub height: u32,
     pub matrix: [f32; 6],
-    pub content: Content36,
+    pub content: MetadataPayload<Content36>,
 }
 /// Exhaustive mirror: a future native-source variant requires an explicit wire
 /// decision instead of inheriting serialization of new fields accidentally.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Content36 {
     Bezier {
@@ -478,7 +503,7 @@ pub enum Content36 {
         svg: String,
     },
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Document36 {
     pub id: String,
@@ -488,18 +513,18 @@ pub struct Document36 {
     pub revision: u64,
     pub bit_depth: u16,
     #[serde(with = "icc")]
-    pub icc_profile: Option<Arc<Vec<u8>>>,
+    pub icc_profile: Option<MetadataPayload<Vec<u8>>>,
     pub srgb_tagged: bool,
-    pub psd_global_mask: Option<crate::psd::GlobalMaskSettings>,
+    pub psd_global_mask: Option<MetadataPayload<crate::psd::GlobalMaskSettings>>,
     pub layers: Vec<Layer36>,
     pub filters: Vec<Effect36>,
     pub selection: Option<[i32; 4]>,
-    #[serde(default, deserialize_with = "bounds::polygon")]
-    pub selection_polygon: Option<Vec<[f32; 2]>>,
+    #[serde(default, deserialize_with = "payload::polygon")]
+    pub selection_polygon: Option<MetadataPayload<Vec<[f32; 2]>>>,
     pub selection_coverage: Option<Coverage36>,
     pub selection_previous: Option<Coverage36>,
     pub read_only: bool,
-    pub warnings: Vec<String>,
+    pub warnings: MetadataPayload<Vec<String>>,
 }
 
 /// Implementations capture handles/provenance only. They may not serialize a
@@ -605,9 +630,12 @@ impl Document36 {
             height: doc.height,
             revision: doc.revision,
             bit_depth: doc.bit_depth,
-            icc_profile: doc.icc_profile.clone(),
+            icc_profile: doc
+                .icc_profile
+                .as_ref()
+                .map(|value| MetadataPayload::from((**value).clone())),
             srgb_tagged: doc.srgb_tagged,
-            psd_global_mask: doc.psd_global_mask.clone(),
+            psd_global_mask: doc.psd_global_mask.clone().map(MetadataPayload::from),
             layers: doc
                 .layers
                 .iter()
@@ -619,7 +647,7 @@ impl Document36 {
                 .map(|e| Effect36::capture(e, collector))
                 .collect::<Result<_>>()?,
             selection: doc.selection,
-            selection_polygon: doc.selection_polygon.clone(),
+            selection_polygon: doc.selection_polygon.clone().map(MetadataPayload::from),
             selection_coverage: doc
                 .selection_coverage
                 .as_ref()
@@ -631,7 +659,7 @@ impl Document36 {
                 .map(|m| Coverage36::from_capture(m, collector))
                 .transpose()?,
             read_only: doc.read_only,
-            warnings: doc.warnings.clone(),
+            warnings: doc.warnings.clone().into(),
         })
     }
 
@@ -736,7 +764,7 @@ impl Layer36 {
                                     weight: s.weight,
                                     value: s.value,
                                     pixels: s.pixels.capture(c)?,
-                                    settings: s.settings.clone(),
+                                    settings: s.settings.clone().into(),
                                 })
                             })
                             .collect::<Result<_>>()?,
@@ -748,7 +776,7 @@ impl Layer36 {
                 .iter()
                 .map(|e| Effect36::capture(e, c))
                 .collect::<Result<_>>()?,
-            psd_metadata: layer.psd_metadata.clone(),
+            psd_metadata: layer.psd_metadata.clone().into(),
             source: layer.source.as_ref().map(|s| Source36::capture(s)),
         })
     }
@@ -777,7 +805,7 @@ impl Coverage36 {
             mask: mask.capture(c)?,
             bounds,
             origin,
-            contours: contours.to_vec(),
+            contours: contours.to_vec().into(),
         })
     }
 }
@@ -831,7 +859,7 @@ impl Effect36 {
             kind: effect.kind.clone(),
             enabled: effect.enabled,
             weight: effect.weight,
-            settings,
+            settings: (*settings).clone().into(),
             clips,
         })
     }
@@ -863,6 +891,9 @@ impl Effect36 {
     }
 }
 impl Source36 {
+    pub fn definition(&self) -> &Content36 {
+        &self.content
+    }
     fn capture(source: &crate::source::Source) -> Self {
         use crate::source::Content;
         let content = match &source.content {
@@ -921,7 +952,7 @@ impl Source36 {
             width: source.width,
             height: source.height,
             matrix: source.matrix,
-            content,
+            content: content.into(),
         }
     }
 }
@@ -1049,7 +1080,7 @@ mod tests {
     fn duplicate_nested_mismatched_and_unused_references_fail_closed() {
         let mut c = Capture::default();
         let metadata = Document36::capture(&doc(), &mut c).unwrap();
-        let mut duplicate = metadata.clone();
+        let mut duplicate = wire_copy(&metadata);
         duplicate.layers[0]
             .pixels
             .retained
@@ -1058,7 +1089,7 @@ mod tests {
             .pixels
             .id = 1;
         assert!(duplicate.visit_rasters(|_| Ok(())).is_err());
-        let mut mismatch = metadata.clone();
+        let mut mismatch = wire_copy(&metadata);
         mismatch.layers[0]
             .pixels
             .retained
@@ -1071,7 +1102,7 @@ mod tests {
         let disk = DiskBudget::new(1024 * 1024, 16).unwrap();
         let roster = RasterRoster::new(vec![Surface::zero(256, 256, 16).unwrap()]).unwrap();
         assert!(PendingScene::new(
-            admitted(metadata.clone(), &resident),
+            admitted(wire_copy(&metadata), &resident),
             roster,
             resident.clone(),
             disk.clone()
@@ -1085,7 +1116,7 @@ mod tests {
         ])
         .unwrap();
         assert!(PendingScene::new(
-            admitted(simple.clone(), &resident),
+            admitted(wire_copy(&simple), &resident),
             roster,
             resident.clone(),
             disk.clone()
@@ -1213,8 +1244,8 @@ mod tests {
         assert_eq!(c.planes[1].get(1, 1), [127; 4]);
         let bytes = serde_json::to_vec(&metadata).unwrap();
         assert!(bytes.len() < 8192);
-        let mut invalid = metadata.clone();
-        invalid.layers[0].effects[0].settings = doc.layers[0].effects[0].settings.clone();
+        let mut invalid = wire_copy(&metadata);
+        invalid.layers[0].effects[0].settings = (*doc.layers[0].effects[0].settings).clone().into();
         assert!(invalid.visit_rasters(|_| Ok(())).is_err());
     }
 }

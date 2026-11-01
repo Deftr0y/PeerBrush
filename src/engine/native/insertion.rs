@@ -127,7 +127,7 @@ impl CapturedEdit {
                 copy_metadata(metadata, self.base.budget(), check)?.retain_owner(&extra, check)?;
             let resident = self.base.budget().clone();
             let disk = self.base.disk_budget().clone();
-            let core = copied.map_unique(|mut metadata, _| {
+            let core = copied.rehome_unique(|mut metadata, _| {
                 metadata
                     .layers
                     .try_reserve_exact(1)
@@ -156,7 +156,7 @@ impl CapturedEdit {
                         color: [233, 84, 32, 255],
                         mask: None,
                         effects: vec![],
-                        psd_metadata: vec![],
+                        psd_metadata: vec![].into(),
                         source: None,
                     },
                 );
@@ -180,14 +180,7 @@ impl CapturedEdit {
                     .ok_or("Native revision overflow")?;
                 check()?;
                 self.cancellation.check()?;
-                Ok(Core {
-                    metadata,
-                    roster,
-                    resident,
-                    disk,
-                    key: key(),
-                    render_key: OnceLock::new(),
-                })
+                Core::prepare(metadata, roster, resident, disk, check)
             })?;
             // The output vector's allocation must survive with its admission
             // until final publication/abort, independently of the worker stack.

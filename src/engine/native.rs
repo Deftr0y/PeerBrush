@@ -27,6 +27,8 @@ mod publication;
 mod scopes;
 #[path = "native/transaction.rs"]
 mod transaction;
+#[cfg(test)]
+use super::scene::wire_copy;
 use super::scene::{Document36, Layer36, PendingScene, RasterRef36, RasterRoster, Result};
 use crate::{
     large_document::{DiskBudget, ResidentBudget, ScratchBytes},
@@ -81,6 +83,28 @@ struct OwnedRoster {
     roster: RasterRoster,
     _charge: crate::large_document::Reservation,
 }
+impl Core {
+    fn prepare(
+        metadata: Document36,
+        roster: Arc<OwnedRoster>,
+        resident: ResidentBudget,
+        disk: DiskBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Self, Arc<MetadataCharge>)> {
+        let (metadata, owner) = metadata.bind_runtime(&resident, check)?;
+        Ok((
+            Self {
+                metadata,
+                roster,
+                resident,
+                disk,
+                key: key(),
+                render_key: OnceLock::new(),
+            },
+            owner,
+        ))
+    }
+}
 /// Clones share the exact metadata allocation, source owners and admission.
 /// This type has neither serde nor Deref/DerefMut pixel/metadata access.
 pub struct NativeDocument {
@@ -110,18 +134,17 @@ impl NativeDocument {
         let roster_charge = resident
             .reserve_bytes(bytes, bytes)
             .map_err(|e| e.to_string())?;
-        let core = pending.map_unique(|metadata, roster, _| {
-            Ok(Core {
+        let core = pending.rehome_unique(|metadata, roster, _| {
+            Core::prepare(
                 metadata,
-                roster: Arc::new(OwnedRoster {
+                Arc::new(OwnedRoster {
                     roster,
                     _charge: roster_charge,
                 }),
                 resident,
                 disk,
-                key: key(),
-                render_key: OnceLock::new(),
-            })
+                &|| Ok(()),
+            )
         })?;
         Ok(Self { core })
     }
@@ -363,7 +386,7 @@ impl<'a> Metadata<'a> {
         self.0.srgb_tagged
     }
     pub fn global_mask(&self) -> Option<&'a crate::psd::GlobalMaskSettings> {
-        self.0.psd_global_mask.as_ref()
+        self.0.psd_global_mask.as_deref()
     }
     pub fn warnings(&self) -> &'a [String] {
         &self.0.warnings
@@ -372,7 +395,7 @@ impl<'a> Metadata<'a> {
         self.0.selection
     }
     pub fn selection_polygon(&self) -> Option<&'a [[f32; 2]]> {
-        self.0.selection_polygon.as_deref()
+        self.0.selection_polygon.as_deref().map(Vec::as_slice)
     }
     pub fn selection_coverage(&self) -> Option<CoverageMetadata<'a>> {
         self.0
@@ -740,7 +763,7 @@ impl CapturedEdit {
         let roster = self.base.core.roster.clone();
         let resident = self.base.core.resident.clone();
         let disk = self.base.core.disk.clone();
-        let core = copied.map_unique(|mut metadata, _| {
+        let core = copied.rehome_unique(|mut metadata, _| {
             check()?;
             metadata.layers[target].visible = visible;
             metadata.revision = metadata
@@ -748,14 +771,7 @@ impl CapturedEdit {
                 .checked_add(1)
                 .ok_or("Native revision overflow")?;
             check()?;
-            Ok(Core {
-                metadata,
-                roster,
-                resident,
-                disk,
-                key: key(),
-                render_key: OnceLock::new(),
-            })
+            Core::prepare(metadata, roster, resident, disk, check)
         })?;
         check()?;
         Ok(PreparedDelta {
@@ -802,7 +818,7 @@ impl CapturedEdit {
         let source = &self.base.core.roster.roster;
         let resident = self.base.core.resident.clone();
         let disk = self.base.core.disk.clone();
-        let core = copied.map_unique(|mut metadata, _| {
+        let core = copied.rehome_unique(|mut metadata, _| {
             for (index, id) in order.iter().enumerate() {
                 check()?;
                 let offset = metadata.layers[index..]
@@ -816,14 +832,7 @@ impl CapturedEdit {
                 .revision
                 .checked_add(1)
                 .ok_or("Native revision overflow")?;
-            Ok(Core {
-                metadata,
-                roster,
-                resident,
-                disk,
-                key: key(),
-                render_key: OnceLock::new(),
-            })
+            Core::prepare(metadata, roster, resident, disk, check)
         })?;
         check()?;
         Ok(PreparedDelta {
@@ -898,18 +907,21 @@ fn rebuild_from(
     }))
 }
 
-/// Fresh admitted deep copy, outside every engine/UI/registry lock. No prior
-/// header ticket or naked shared Arc payload is inherited into the new header.
+/// Fresh admitted header outside every engine/UI/registry lock. Shared assets
+/// carry their own physical charges; no ancestor header ticket is inherited.
 fn copy_metadata(
     source: &Document36,
     pool: &ResidentBudget,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<Admitted<Document36>> {
+    if source.runtime_bound(pool) {
+        return source.copy_runtime(pool, check);
+    }
     let metadata: Admitted<Document36> = copy_admitted(source, pool, true, check)?;
     metadata.visit_rasters(|_| Ok(()))?;
-    Ok(metadata)
+    metadata.rehome_unique(|value, _| value.bind_runtime(pool, check))
 }
-fn copy_admitted<T: Serialize, U: serde::de::DeserializeOwned + Serialize>(
+pub(super) fn copy_admitted<T: Serialize, U: serde::de::DeserializeOwned + Serialize>(
     source: &T,
     pool: &ResidentBudget,
     compare_wire: bool,
@@ -1111,10 +1123,14 @@ mod tests {
             .unwrap();
         assert!(current.metadata().layers().next().unwrap().visible());
         current = current.adopt(prepared).unwrap();
-        assert!(!Arc::ptr_eq(
-            current.core.metadata.icc_profile.as_ref().unwrap(),
-            old.core.metadata.icc_profile.as_ref().unwrap()
-        ));
+        assert!(current
+            .core
+            .metadata
+            .icc_profile
+            .as_ref()
+            .unwrap()
+            .same_allocation(old.core.metadata.icc_profile.as_ref().unwrap()));
+        assert!(!Arc::ptr_eq(current.core.owner(), old.core.owner()));
         assert!(!current.metadata().layers().next().unwrap().visible());
         assert!(current.adopt(stale).is_err());
         drop(old);
