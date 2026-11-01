@@ -11,10 +11,12 @@ use crate::{
     workspace::source_runtime::SourceSession,
 };
 
-struct Working<'a, 'd, 's> {
+struct Working<'a, 'd, 's, 'g, 'c> {
     input: &'a RasterInput<'d>,
     output: WorkingOutput<'d, 's>,
     last_step: Option<usize>,
+    guard: Option<&'g crate::edit_bounds::input::WriteGuard<'c>>,
+    frame: Option<&'a InputFrame>,
 }
 enum WorkingOutput<'d, 's> {
     Original(TileOutput<'d, 's>),
@@ -78,7 +80,7 @@ impl<'d, 's> WorkingOutput<'d, 's> {
         }
     }
 }
-impl Working<'_, '_, '_> {
+impl Working<'_, '_, '_, '_, '_> {
     fn step(&mut self, step: usize) -> Result<(), String> {
         if self.last_step.is_some_and(|old| step < old) {
             return Err("Native smudge attempted to read an obsolete working step".into());
@@ -87,7 +89,7 @@ impl Working<'_, '_, '_> {
         Ok(())
     }
 }
-impl WorkingSource for Working<'_, '_, '_> {
+impl WorkingSource for Working<'_, '_, '_, '_, '_> {
     fn frame(&self) -> [u32; 2] {
         match &self.output {
             WorkingOutput::Original(_) => self.input.shape(),
@@ -136,11 +138,16 @@ impl WorkingSource for Working<'_, '_, '_> {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
         self.step(step)?;
+        let before = self.output.prepare_tile(key, check)?;
+        crate::edit_bounds::input::check_proposal(
+            self.guard, self.input, self.frame, key, &before, &bytes, check,
+        )?;
         self.output.replace_tile(self.input, key, bytes, check)
     }
 }
 
 /// Original-frame entry point; reframed strokes use stage_in_frame explicitly.
+#[cfg(test)]
 pub(crate) fn stage<'d, 's>(
     input: &RasterInput<'d>,
     stroke: &LocalStroke,
@@ -151,12 +158,52 @@ pub(crate) fn stage<'d, 's>(
 ) -> Result<BuiltTiles<'d, 's>, String> {
     stage_in_frame(input, stroke, settings, color, None, session, check)
 }
+#[cfg(test)]
 pub(crate) fn stage_in_frame<'d, 's>(
     input: &RasterInput<'d>,
     stroke: &LocalStroke,
     settings: Settings,
     color: [u8; 4],
     frame: Option<&InputFrame>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<BuiltTiles<'d, 's>, String> {
+    stage_impl(input, stroke, settings, color, frame, None, session, check)
+}
+pub(crate) fn stage_guarded<'d, 's>(
+    input: &RasterInput<'d>,
+    stroke: &LocalStroke,
+    frame: Option<&InputFrame>,
+    guard: &crate::edit_bounds::input::WriteGuard<'_>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<BuiltTiles<'d, 's>, String> {
+    guard.validate(input, frame, &["smudge"])?;
+    stroke.validate_command(guard.token())?;
+    let parameters = guard.parameters();
+    let mut checked = || {
+        guard.check_active()?;
+        check()?;
+        guard.check_active()
+    };
+    stage_impl(
+        input,
+        stroke,
+        Settings::from_command(parameters)?,
+        crate::engine::color(parameters),
+        frame,
+        Some(guard),
+        session,
+        &mut checked,
+    )
+}
+fn stage_impl<'d, 's>(
+    input: &RasterInput<'d>,
+    stroke: &LocalStroke,
+    settings: Settings,
+    color: [u8; 4],
+    frame: Option<&InputFrame>,
+    guard: Option<&crate::edit_bounds::input::WriteGuard<'_>>,
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<BuiltTiles<'d, 's>, String> {
@@ -169,7 +216,8 @@ pub(crate) fn stage_in_frame<'d, 's>(
     if !input.is_mask() && input.layer_metadata().kind() != "paint" {
         return Err("Smudge a paint layer or paint mask step".into());
     }
-    if settings.opacity == 0. || settings.flow == 0. || settings.wetness == 0. {
+    if settings.opacity == 0. || settings.flow == 0. || (settings.wetness == 0. && frame.is_none())
+    {
         return Ok(BuiltTiles::Unchanged);
     }
     let mut guarded = || {
@@ -191,6 +239,8 @@ pub(crate) fn stage_in_frame<'d, 's>(
             WorkingOutput::Original(TileOutput::new(input, session)?)
         },
         last_step: None,
+        guard,
+        frame,
     };
     let result = (|| {
         plan.run_in_place(&mut working, &mut guarded)?;
@@ -240,9 +290,23 @@ pub(crate) fn stage_in_frame<'d, 's>(
                     } else {
                         restrict_tile(input, key, &before, &proposed, &coverage, &mut guarded)?
                     };
-                    working
-                        .output
-                        .replace_tile(input, key, after, &mut guarded)?;
+                    working.output.replace_tile(
+                        input,
+                        key,
+                        {
+                            crate::edit_bounds::input::check_proposal(
+                                guard,
+                                input,
+                                frame,
+                                key,
+                                &before,
+                                &after,
+                                &mut guarded,
+                            )?;
+                            after
+                        },
+                        &mut guarded,
+                    )?;
                 }
             }
         }

@@ -113,6 +113,16 @@ physical padding sample is refused. These boxes must pass the captured engine
 command's write guard before the same immutable proposal is staged; they grant
 no independent write permission and exclude read halos.
 
+Production worker entry points require `WriteGuard`, bound to an actual captured
+descriptor member, target/raw mask step, source generation and proposed frame.
+They consume that guard's immutable parameters; charged point owners and frame
+plans retain the same opaque command token. Each logical proposal passes the
+engine's actual write check before those immutable bytes append. Captured
+cancellation is checked throughout preparation/staging; cleanup still uses the
+registered session's independent retirement checks. Unguarded differential
+entry points exist only in test builds. Final atomic adoption/history, resolved
+folder insertion and shared composed-source providers remain separate gates.
+
 `edit_bounds::output::TileOutput` stages one plane through the actual
 `SourceSession` and the engine's `OutputDraft`. It compares full original padded
 tiles, keeps mutable proposal/index allocations charged, creates a fragment only

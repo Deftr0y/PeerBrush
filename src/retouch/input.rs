@@ -9,6 +9,7 @@ use crate::{
     workspace::source_runtime::SourceSession,
 };
 
+#[cfg(test)]
 pub(crate) fn stage_raster<'d, 's>(
     input: &RasterInput<'d>,
     source: &RasterInput<'d>,
@@ -17,6 +18,89 @@ pub(crate) fn stage_raster<'d, 's>(
     offset: [f32; 2],
     heal_radius: Option<u32>,
     frame: Option<&InputFrame>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<BuiltTiles<'d, 's>, String> {
+    stage_impl(
+        input,
+        source,
+        stroke,
+        settings,
+        offset,
+        heal_radius,
+        frame,
+        None,
+        session,
+        check,
+    )
+}
+pub(crate) fn stage_guarded<'d, 's>(
+    input: &RasterInput<'d>,
+    source: &RasterInput<'d>,
+    stroke: &LocalStroke,
+    frame: Option<&InputFrame>,
+    guard: &crate::edit_bounds::input::WriteGuard<'_>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<BuiltTiles<'d, 's>, String> {
+    guard.validate(input, frame, &["clone", "heal"])?;
+    stroke.validate_command(guard.token())?;
+    let parameters = guard.parameters();
+    match input.retouch_source(parameters)? {
+        crate::edit_bounds::input::RetouchInput::Raster(expected) if expected.binding()==source.binding()=>{},
+        _=>return Err("Retouch source requires its exact prepared raw plane, composed mask or merged artwork provider".into()),
+    }
+    let settings = Settings::from_command(parameters)?;
+    let anchor = parameters["source"]
+        .as_array()
+        .filter(|a| a.len() == 2)
+        .ok_or("Set a clone/heal source [x,y] in document pixels")?;
+    let coordinate = |i: usize| {
+        anchor[i]
+            .as_f64()
+            .filter(|n| n.is_finite() && n.abs() <= 100_000.)
+            .map(|n| n as f32)
+            .ok_or("Invalid retouch source coordinate")
+    };
+    let first = stroke.first_document();
+    let offset = [coordinate(0)? - first[0], coordinate(1)? - first[1]];
+    let radius = parameters
+        .get("heal_radius")
+        .map(|v| {
+            v.as_u64()
+                .filter(|n| (1..=64).contains(n))
+                .map(|n| n as u32)
+                .ok_or("Healing radius must be 1-64 pixels")
+        })
+        .transpose()?
+        .unwrap_or(settings.radius.round().clamp(1., 32.) as u32);
+    let mut checked = || {
+        guard.check_active()?;
+        check()?;
+        guard.check_active()
+    };
+    stage_impl(
+        input,
+        source,
+        stroke,
+        settings,
+        offset,
+        (parameters["op"] == "heal").then_some(radius),
+        frame,
+        Some(guard),
+        session,
+        &mut checked,
+    )
+}
+fn stage_impl<'d, 's>(
+    input: &RasterInput<'d>,
+    source: &RasterInput<'d>,
+    stroke: &LocalStroke,
+    settings: Settings,
+    offset: [f32; 2],
+    heal_radius: Option<u32>,
+    frame: Option<&InputFrame>,
+    guard: Option<&crate::edit_bounds::input::WriteGuard<'_>>,
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<BuiltTiles<'d, 's>, String> {
@@ -92,6 +176,7 @@ pub(crate) fn stage_raster<'d, 's>(
                 restrict_tile(input, key, before, &after, &coverage, check)?
             };
         }
+        crate::edit_bounds::input::check_proposal(guard, input, frame, key, before, &after, check)?;
         Ok(after)
     };
     if let Some(frame) = frame {

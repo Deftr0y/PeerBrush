@@ -2,7 +2,10 @@
 //! grants edit permission, source publication, or an Engine history operation.
 use super::native::FrameExpansion;
 use crate::{
-    engine::native::{DocumentKey, LayerMetadata, NativeDocument, RasterMetadata, RasterSlot},
+    engine::native::{
+        CapturedEdit, Command, CommandToken, DocumentKey, LayerMetadata, Method, NativeDocument,
+        RasterMetadata, RasterSlot,
+    },
     large_document::{Error, PinnedBytes, ResidentBudget, ScratchBytes},
     raster::{backed::Region, project16, Surface, SurfaceKey, SurfaceRegion, TILE},
 };
@@ -15,6 +18,174 @@ pub(crate) struct InputBinding {
     shape: [u32; 2],
     depth: u16,
     origin: [i32; 2],
+}
+/// Producer guard for one exact immutable command in the captured descriptor.
+/// It cannot replace scopes or authorize a different source/frame.
+pub(crate) struct WriteGuard<'c> {
+    _capture: &'c CapturedEdit,
+    cancellation: crate::engine::native::Cancellation,
+    command: Command<'c>,
+    binding: InputBinding,
+    shape: [u32; 2],
+    origin: [i32; 2],
+}
+impl<'c> WriteGuard<'c> {
+    pub(crate) fn new(
+        captured: &'c CapturedEdit,
+        command: Command<'c>,
+        input: &RasterInput<'_>,
+        frame: Option<&InputFrame>,
+    ) -> Result<Self, String> {
+        let cancellation = captured.cancellation();
+        cancellation.check()?;
+        if captured.base_key() != input.binding.generation
+            || !captured
+                .descriptor()
+                .is_some_and(|d| d.commands().any(|c| c.token() == command.token()))
+        {
+            return Err("Native paint command is not owned by its captured descriptor".into());
+        }
+        let parameters = command.parameters();
+        let operation = parameters["op"]
+            .as_str()
+            .ok_or("Native paint command has no operation")?;
+        let method = match operation {
+            "paint" => Method::Paint,
+            "paint.fill" => Method::Fill,
+            "paint.clear_selection" => Method::Clear,
+            "smudge" => Method::Smudge,
+            "clone" | "heal" => Method::Retouch,
+            _ => return Err("Native paint guard requires a paint operator".into()),
+        };
+        if command.method() != method {
+            return Err("Native paint method differs from its descriptor".into());
+        }
+        let target = parameters["layer"]
+            .as_str()
+            .ok_or("Native paint command has no target")?;
+        let mask = parameters
+            .get("mask")
+            .map_or(Ok(false), |v| v.as_bool().ok_or("mask must be boolean"))?;
+        if mask != input.is_mask() {
+            return Err("Native paint command targets a different color or mask plane".into());
+        }
+        if target != input.layer_metadata().id() {
+            if method != Method::Clear || mask {
+                return Err("Native paint command targets another layer".into());
+            }
+            let document = captured.document();
+            let parent = document
+                .metadata()
+                .layers()
+                .find(|layer| layer.id() == target)
+                .ok_or("Unknown native clear folder")?;
+            if parent.kind() != "group" {
+                return Err("Resolved native clear target is not a folder child".into());
+            }
+            let mut current = input.layer_metadata().parent();
+            let mut found = false;
+            for _ in 0..=16 {
+                let Some(id) = current else {
+                    break;
+                };
+                if id == target {
+                    found = true;
+                    break;
+                }
+                current = document
+                    .metadata()
+                    .layers()
+                    .find(|layer| layer.id() == id)
+                    .and_then(|layer| layer.parent());
+            }
+            if !found {
+                return Err("Resolved native clear target is not a folder child".into());
+            }
+        }
+        if mask
+            && RasterInput::from_parameters(captured.document(), parameters)?.binding()
+                != input.binding()
+        {
+            return Err("Native paint command targets another raw mask step".into());
+        }
+        let (shape, origin) = if let Some(frame) = frame {
+            input.validate(frame.binding())?;
+            if frame.command != Some(command.token()) {
+                return Err("Native frame was not planned from this immutable command".into());
+            }
+            (frame.geometry().new_shape(), frame.geometry().new_origin())
+        } else {
+            (input.shape(), input.origin())
+        };
+        Ok(Self {
+            _capture: captured,
+            cancellation,
+            command,
+            binding: input.binding,
+            shape,
+            origin,
+        })
+    }
+    pub(crate) fn parameters(&self) -> &'c serde_json::Value {
+        self.command.parameters()
+    }
+    pub(crate) fn check_active(&self) -> Result<(), String> {
+        self.cancellation.check()
+    }
+    pub(crate) fn token(&self) -> CommandToken {
+        self.command.token()
+    }
+    pub(crate) fn validate(
+        &self,
+        input: &RasterInput<'_>,
+        frame: Option<&InputFrame>,
+        operations: &[&str],
+    ) -> Result<(), String> {
+        self.check_active()?;
+        input.validate(self.binding)?;
+        let (shape, origin) = if let Some(frame) = frame {
+            input.validate(frame.binding())?;
+            (frame.geometry().new_shape(), frame.geometry().new_origin())
+        } else {
+            (input.shape(), input.origin())
+        };
+        if shape != self.shape
+            || origin != self.origin
+            || !self.parameters()["op"]
+                .as_str()
+                .is_some_and(|operation| operations.contains(&operation))
+        {
+            return Err("Native paint guard belongs to another operator or proposed frame".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn check_tile(
+        &self,
+        input: &RasterInput<'_>,
+        frame: Option<&InputFrame>,
+        key: (u32, u32),
+        before: &PinnedBytes,
+        after: &PinnedBytes,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.validate(
+            input,
+            frame,
+            &[
+                "paint",
+                "paint.fill",
+                "paint.clear_selection",
+                "smudge",
+                "clone",
+                "heal",
+            ],
+        )?;
+        if let Some(bounds) = changed_bounds(input, frame, key, before, after, check)? {
+            self.command
+                .check_write(input.document(), input.binding.slot, bounds)?;
+        }
+        self.check_active()
+    }
 }
 impl InputBinding {
     pub(crate) fn generation(self) -> DocumentKey {
@@ -432,8 +603,73 @@ impl<'a> RasterInput<'a> {
                 binding: self.binding,
                 layer: self.layer.pixels().slot(),
                 geometry,
+                command: None,
             })
         })
+    }
+    pub(crate) fn fill_frame(&self, command: Command<'_>) -> Result<Option<InputFrame>, String> {
+        if command.parameters()["op"] != "paint.fill" {
+            return Err("Native fill frame requires its foreground-fill command".into());
+        }
+        let metadata = self.document.metadata();
+        let requested = command
+            .parameters()
+            .get("rect")
+            .and_then(crate::engine::rect)
+            .or(metadata.selection())
+            .unwrap_or([0, 0, metadata.width() as i32, metadata.height() as i32]);
+        let mut frame = self.project_frame(requested)?;
+        if let Some(frame) = &mut frame {
+            frame.command = Some(command.token());
+        }
+        Ok(frame)
+    }
+    pub(crate) fn stroke_frame(
+        &self,
+        command: Command<'_>,
+        points: &crate::brush::input::StrokePoints,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Option<InputFrame>, String> {
+        check()?;
+        let parameters = command.parameters();
+        if !matches!(
+            parameters["op"].as_str(),
+            Some("paint" | "smudge" | "clone" | "heal")
+        ) || !points.matches_command(command.token())
+        {
+            return Err("Native stroke frame requires its same admitted command points".into());
+        }
+        let settings = crate::brush::Settings::from_command(parameters)?;
+        if settings.opacity == 0.
+            || settings.flow == 0.
+            || (parameters["op"] == "paint" && crate::engine::color(parameters)[3] == 0)
+        {
+            return Ok(None);
+        }
+        let radius = settings.radius + 1.;
+        let values = points.points();
+        let requested = [
+            (values.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min) - radius).floor() as i32,
+            (values.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min) - radius).floor() as i32,
+            (values
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::NEG_INFINITY, f32::max)
+                + radius)
+                .ceil() as i32,
+            (values
+                .iter()
+                .map(|p| p[1])
+                .fold(f32::NEG_INFINITY, f32::max)
+                + radius)
+                .ceil() as i32,
+        ];
+        let mut frame = self.project_frame(requested)?;
+        if let Some(frame) = &mut frame {
+            frame.command = Some(command.token());
+        }
+        check()?;
+        Ok(frame)
     }
     pub(crate) fn selection(&self) -> Result<SelectionInput<'a>, String> {
         SelectionInput::new(self.document)
@@ -443,6 +679,7 @@ pub(crate) struct InputFrame {
     binding: InputBinding,
     layer: RasterSlot,
     geometry: FrameExpansion,
+    command: Option<CommandToken>,
 }
 impl InputFrame {
     pub(crate) fn binding(&self) -> InputBinding {
@@ -471,6 +708,7 @@ impl InputFrame {
             geometry: self
                 .geometry
                 .for_plane(input.shape(), input.depth(), input.pool())?,
+            command: self.command,
         })
     }
 }
@@ -563,6 +801,27 @@ pub(crate) fn changed_bounds(
     }
     check()?;
     Ok(bounds)
+}
+pub(crate) fn check_proposal(
+    guard: Option<&WriteGuard<'_>>,
+    input: &RasterInput<'_>,
+    frame: Option<&InputFrame>,
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(guard) = guard {
+        return guard.check_tile(input, frame, key, before, after, check);
+    }
+    #[cfg(test)]
+    {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        Err("Native paint output requires its captured command write guard".into())
+    }
 }
 pub(crate) struct PreparedPixels<'a> {
     binding: InputBinding,
