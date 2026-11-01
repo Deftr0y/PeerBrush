@@ -1,5 +1,7 @@
 mod fonts;
 mod instance;
+mod cli;
+pub use cli::{run as cli, CliStatus};
 pub(crate) mod observation;
 mod reply;
 mod stream;

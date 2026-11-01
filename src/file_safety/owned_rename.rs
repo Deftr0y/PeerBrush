@@ -210,7 +210,7 @@ pub(crate) fn publish_new(
     Ok(())
 }
 
-fn open_directory(path: &Path) -> Result<File, String> {
+pub(crate) fn open_directory(path: &Path) -> Result<File, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]

@@ -132,29 +132,10 @@ fn run() -> Result<(), String> {
             } else {
                 serde_json::from_str::<Value>(raw.unwrap_or("{}")).map_err(|e| e.to_string())?
             };
-            let mut reply =
-                server::client(&state_dir, "rpc", &json!({"method":method,"params":params}))?;
-            if let Some(images) = reply["result"]["images"].as_array_mut() {
-                use base64::Engine as _;
-                std::fs::create_dir_all(state_dir.join("previews")).map_err(|e| e.to_string())?;
-                for img in images {
-                    let data = img["data"].as_str().ok_or("Missing image data")?;
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .map_err(|e| e.to_string())?;
-                    let path = state_dir
-                        .join("previews")
-                        .join(format!("{}.png", peerbrush::engine::id()));
-                    server::atomic_write(&path, &bytes)?;
-                    img.as_object_mut().unwrap().remove("data");
-                    img["path"] = json!(path);
-                }
-            }
-            println!("{}", serde_json::to_string_pretty(&reply).unwrap());
-            if reply["ok"] == false {
-                return Err(reply["error"].as_str().unwrap_or("Command failed").into());
-            }
-            return Ok(());
+            return match server::cli(&state_dir, method, &params)? {
+                server::CliStatus::Success => Ok(()),
+                server::CliStatus::Failed => std::process::exit(1),
+            };
         }
         Some("--help") => {
             println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush --build-info\npeerbrush --installation-info\npeerbrush discover\npeerbrush discover --status [--state-dir PATH]\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
