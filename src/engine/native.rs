@@ -226,11 +226,15 @@ impl<'a> Metadata<'a> {
             .as_ref()
             .map(|c| CoverageMetadata(c, self.1))
     }
-    pub fn layers(&self) -> impl ExactSizeIterator<Item = LayerMetadata<'a>> + 'a {
+    pub fn layers(
+        &self,
+    ) -> impl ExactSizeIterator<Item = LayerMetadata<'a>> + DoubleEndedIterator + 'a {
         let binding = self.1;
         self.0.layers.iter().map(move |l| LayerMetadata(l, binding))
     }
-    pub fn filters(&self) -> impl ExactSizeIterator<Item = EffectMetadata<'a>> + 'a {
+    pub fn filters(
+        &self,
+    ) -> impl ExactSizeIterator<Item = EffectMetadata<'a>> + DoubleEndedIterator + 'a {
         let binding = self.1;
         self.0
             .filters
@@ -280,7 +284,9 @@ impl<'a> LayerMetadata<'a> {
     pub fn mask(&self) -> Option<MaskMetadata<'a>> {
         self.0.mask.as_ref().map(|m| MaskMetadata(m, self.1))
     }
-    pub fn effects(&self) -> impl ExactSizeIterator<Item = EffectMetadata<'a>> + 'a {
+    pub fn effects(
+        &self,
+    ) -> impl ExactSizeIterator<Item = EffectMetadata<'a>> + DoubleEndedIterator + 'a {
         let binding = self.1;
         self.0
             .effects
@@ -328,7 +334,9 @@ impl<'a> EffectMetadata<'a> {
     pub fn settings(&self) -> &'a serde_json::Value {
         &self.0.settings
     }
-    pub fn clips(&self) -> impl ExactSizeIterator<Item = (u32, CoverageMetadata<'a>)> + 'a {
+    pub fn clips(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (u32, CoverageMetadata<'a>)> + DoubleEndedIterator + 'a {
         let binding = self.1;
         self.0
             .clips
@@ -345,7 +353,9 @@ impl<'a> MaskMetadata<'a> {
     pub fn linked(&self) -> bool {
         self.0.linked
     }
-    pub fn steps(&self) -> impl ExactSizeIterator<Item = MaskStepMetadata<'a>> + 'a {
+    pub fn steps(
+        &self,
+    ) -> impl ExactSizeIterator<Item = MaskStepMetadata<'a>> + DoubleEndedIterator + 'a {
         let binding = self.1;
         self.0
             .steps
@@ -507,6 +517,115 @@ impl CapturedEdit {
             cancellation: self.cancellation,
         })
     }
+    /// Bounded first structural operation. Hierarchical/clip policy stays with
+    /// the full edit dispatcher; this method accepts independent roots only.
+    pub fn reorder_independent_layers(
+        self,
+        order: &[String],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<PreparedDelta> {
+        let checked = || {
+            self.cancellation.check()?;
+            check()?;
+            self.cancellation.check()
+        };
+        let check = &checked;
+        check()?;
+        if order.len() != self.base.core.metadata.layers.len()
+            || self
+                .base
+                .core
+                .metadata
+                .layers
+                .iter()
+                .any(|l| l.parent.is_some() || l.clip_to.is_some())
+        {
+            return Err("Native reorder requires an exact independent-root permutation".into());
+        }
+        let copied = copy_metadata(&self.base.core.metadata, self.base.budget(), check)?;
+        let source = &self.base.core.roster.roster;
+        let resident = self.base.core.resident.clone();
+        let disk = self.base.core.disk.clone();
+        let core = copied.map_unique(|mut metadata, _| {
+            for (index, id) in order.iter().enumerate() {
+                check()?;
+                let offset = metadata.layers[index..]
+                    .iter()
+                    .position(|layer| layer.id == *id)
+                    .ok_or("Native layer order is not a permutation")?;
+                metadata.layers.swap(index, index + offset);
+            }
+            let roster = rebuild_roster(&mut metadata, source, &resident, &disk, check)?;
+            metadata.revision = metadata
+                .revision
+                .checked_add(1)
+                .ok_or("Native revision overflow")?;
+            Ok(Core {
+                metadata,
+                roster,
+                resident,
+                disk,
+                key: key(),
+                render_key: OnceLock::new(),
+            })
+        })?;
+        check()?;
+        Ok(PreparedDelta {
+            base: self.base.key(),
+            candidate: NativeDocument { core },
+            cancellation: self.cancellation,
+        })
+    }
+}
+
+fn rebuild_roster(
+    metadata: &mut Document36,
+    source: &RasterRoster,
+    resident: &ResidentBudget,
+    disk: &DiskBudget,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Arc<OwnedRoster>> {
+    let capacity = source.len();
+    let bytes = capacity
+        .checked_mul(std::mem::size_of::<Surface>())
+        .and_then(|n| n.checked_add(128))
+        .ok_or("Native roster footprint overflow")?;
+    let charge = resident
+        .reserve_bytes(bytes, bytes)
+        .map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(capacity)
+        .map_err(|_| "Native roster allocation refused")?;
+    if entries.capacity() > capacity {
+        return Err("Native roster allocation exceeds its admission".into());
+    }
+    metadata.remap_rasters(|reference| {
+        check()?;
+        if entries.len() >= capacity {
+            return Err("Native source roster exceeds its planned locations".into());
+        }
+        let surface = source.get(reference)?;
+        if !surface.uses_budget(resident) || !surface.uses_disk_budget(disk) {
+            return Err("Native source is outside shared admission".into());
+        }
+        entries.push(surface.clone());
+        reference.id = entries.len() as u32;
+        Ok(())
+    })?;
+    let roster = RasterRoster::new(entries)?;
+    let count = metadata.visit_rasters(|reference| {
+        roster.get(reference)?;
+        Ok(())
+    })?;
+    if count != roster.len() {
+        return Err("Native remapped source count differs".into());
+    }
+    check()?;
+    Ok(Arc::new(OwnedRoster {
+        roster,
+        _charge: charge,
+    }))
 }
 
 /// Fresh admitted deep copy, outside every engine/UI/registry lock. No prior
@@ -858,5 +977,225 @@ mod tests {
         assert!(settings(table[0]).is_empty());
         assert!(contours(snapshot.metadata()).is_none());
         assert!(warps(table[0].pixels()).is_none());
+    }
+    #[test]
+    fn reorder_renumbers_all_native_locations_and_retains_real_eight_and_sixteen_bit_sources() {
+        use crate::large_document::{Limits as StoreLimits, Store};
+        use crate::raster::{backed::Region, Raster};
+        struct Backed {
+            store: Store,
+            planes: Vec<Surface>,
+        }
+        impl RasterCollector for Backed {
+            fn resident(&mut self, raster: &Raster) -> Result<RasterRef36> {
+                let id = self.planes.len() as u32 + 1;
+                self.planes.push(
+                    Surface::stage_current_pixels(raster, self.store.clone(), &mut || Ok(()))
+                        .map_err(|e| e.to_string())?,
+                );
+                let retained = raster
+                    .retained
+                    .as_ref()
+                    .map(|original| -> Result<Box<super::super::scene::Retained36>> {
+                        Ok(Box::new(super::super::scene::Retained36 {
+                            pixels: self.resident(&original.pixels)?,
+                            matrix: original.matrix,
+                            projective: original.projective,
+                            warps: original
+                                .warps
+                                .iter()
+                                .map(super::super::scene::Warp36::capture)
+                                .collect(),
+                        }))
+                    })
+                    .transpose()?;
+                Ok(RasterRef36 {
+                    id,
+                    width: raster.width,
+                    height: raster.height,
+                    depth: raster.depth,
+                    retained,
+                })
+            }
+            fn surface(&mut self, _: &Surface) -> Result<RasterRef36> {
+                Err("Unexpected fixture surface".into())
+            }
+            fn embedded_coverage(
+                &mut self,
+                value: &serde_json::Value,
+            ) -> Result<super::super::scene::Coverage36> {
+                use serde::Deserialize;
+                let coverage =
+                    crate::selection::Coverage::deserialize(value).map_err(|e| e.to_string())?;
+                super::super::scene::Coverage36::from_capture(&coverage, self)
+            }
+        }
+        for depth in [8, 16] {
+            let pool = ResidentBudget::new(32 * 1024 * 1024).unwrap();
+            let disk = DiskBudget::new(16 * 1024 * 1024, 16).unwrap();
+            let path = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("peerbrush-native-roster-{}", crate::engine::id()));
+            let store = Store::create_with_disk_budget(
+                &path,
+                pool.clone(),
+                disk.clone(),
+                StoreLimits {
+                    disk_bytes: 8 * 1024 * 1024,
+                    max_blocks: 64,
+                    max_resident_blocks: 16,
+                    manifest_bytes: 1024 * 1024,
+                },
+            )
+            .unwrap();
+            let mut legacy = Document::new_depth(8, 8, depth).unwrap();
+            let mut second = legacy.layers[0].clone();
+            second.id = crate::engine::id();
+            second.name = "Second".into();
+            legacy.layers[0]
+                .pixels
+                .set16(0, 0, [12345, 23456, 34567, 65535]);
+            legacy.layers[0].pixels.retained = Some(Box::new(crate::retained::Original::from(
+                &legacy.layers[0].pixels,
+            )));
+            second.pixels.set16(0, 0, [42223, 45678, 17, 65535]);
+            legacy.layers.push(second);
+            let mut mask = Raster::new_depth(8, 8, depth);
+            mask.set16(0, 0, [10001; 4]);
+            legacy.layers[0].mask = Some(crate::engine::Mask {
+                enabled: true,
+                linked: true,
+                cache_key: crate::engine::id(),
+                steps: vec![crate::engine::MaskStep {
+                    id: crate::engine::id(),
+                    kind: "paint".into(),
+                    enabled: true,
+                    weight: 1.,
+                    value: 255.,
+                    pixels: mask,
+                    settings: serde_json::json!({}),
+                }],
+            });
+            let mut scalar = Raster::new(8, 8);
+            scalar.set(0, 0, [127, 127, 127, 255]);
+            let coverage = crate::selection::Coverage {
+                mask: scalar,
+                bounds: [0, 0, 8, 8],
+                origin: [0, 0],
+                contours: vec![vec![[0., 0.], [8., 0.], [8., 8.]]],
+            };
+            let effect = crate::effects::Effect {
+                id: crate::engine::id(),
+                kind: "liquify".into(),
+                enabled: true,
+                weight: 1.,
+                settings: Arc::new(
+                    serde_json::json!({"radius":3.,"strength":0.75,"strokes":[{"mode":"push","points":[[0,0],[1,1]],"coverage":coverage}]}),
+                ),
+            };
+            legacy.layers[0].effects.push(effect.clone());
+            legacy.filters.push(effect);
+            legacy.selection = Some(coverage.bounds);
+            legacy.selection_coverage = Some(coverage.clone());
+            legacy.selection_previous = Some(coverage);
+            let mut collector = Backed {
+                store: store.clone(),
+                planes: vec![],
+            };
+            let metadata = Document36::capture(&legacy, &mut collector).unwrap();
+            assert_eq!(collector.planes.len(), 8);
+            let refs: Vec<_> = collector
+                .planes
+                .iter()
+                .flat_map(Surface::physical_tiles)
+                .map(|p| p.reference())
+                .collect();
+            let sealed = store
+                .commit(
+                    store.identity(),
+                    1,
+                    None,
+                    b"native-roster-fixture",
+                    &refs,
+                    &mut || Ok(()),
+                )
+                .unwrap();
+            let owner = MetadataCharge::reserve(&pool, 64 * 1024, &|| Ok(())).unwrap();
+            let planes = collector.planes;
+            drop(collector.store);
+            let pending = PendingScene::new(
+                Admitted::from_parts(Arc::new(metadata), owner),
+                RasterRoster::new(planes).unwrap(),
+                pool.clone(),
+                disk.clone(),
+            )
+            .unwrap();
+            let original = NativeDocument::from_pending(pending).unwrap();
+            let order: Vec<_> = original
+                .metadata()
+                .layers()
+                .map(|l| l.id().to_string())
+                .rev()
+                .collect();
+            let before: Vec<_> = original
+                .metadata()
+                .layers()
+                .map(|l| {
+                    (
+                        l.id().to_string(),
+                        original.source(l.pixels().slot()).unwrap().key(),
+                    )
+                })
+                .collect();
+            let bytes = disk.used().unwrap();
+            let delta = original
+                .capture_edit()
+                .unwrap()
+                .reorder_independent_layers(&order, &|| Ok(()))
+                .unwrap();
+            let current = original.adopt(delta).unwrap();
+            assert_eq!(disk.used().unwrap(), bytes);
+            for layer in current.metadata().layers() {
+                assert_eq!(
+                    current.source(layer.pixels().slot()).unwrap().key(),
+                    before.iter().find(|(id, _)| id == layer.id()).unwrap().1
+                );
+            }
+            let layer = current.metadata().layers().next().unwrap();
+            assert_eq!(layer.name(), "Second");
+            let view = current
+                .source(layer.pixels().slot())
+                .unwrap()
+                .prepare_region(Region::new([0, 0, 1, 1]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            let expected = if depth == 16 {
+                [42223, 45678, 17, 65535]
+            } else {
+                [42223, 45678, 17, 65535]
+                    .map(crate::raster::project16)
+                    .map(|v| v as u16 * 257)
+            };
+            assert_eq!(view.pixel16(0, 0).unwrap(), expected);
+            drop(view);
+            let wire: Document36 =
+                serde_json::from_slice(&serde_json::to_vec(&current.metadata()).unwrap()).unwrap();
+            let mut ordinals = vec![];
+            wire.visit_rasters(|r| {
+                ordinals.push(r.id);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(ordinals, (1..=8).collect::<Vec<_>>());
+            assert_eq!(
+                current.metadata().selection_coverage().unwrap().contours()[0][2],
+                [8., 8.]
+            );
+            drop(current);
+            drop(original);
+            drop(sealed);
+            drop(store);
+            std::fs::remove_dir_all(path).unwrap();
+            assert_eq!(pool.used(), 0);
+        }
     }
 }
