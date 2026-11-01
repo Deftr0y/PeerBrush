@@ -29,6 +29,14 @@ pub(crate) struct ScenePlan<'a> {
     _index: Reservation,
 }
 impl<'a> ScenePlan<'a> {
+    /// Pure metadata inspection uses the PSB length envelope. A report does not
+    /// authorize either output format or supply pixel/publication authority.
+    pub(crate) fn for_report(
+        scene: &'a SceneSnapshot,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        Self::new(scene, Format::Psb, &[], check)
+    }
     pub(crate) fn new(
         scene: &'a SceneSnapshot,
         format: Format,
