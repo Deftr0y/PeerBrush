@@ -303,6 +303,7 @@
     "src/engine/native/scopes.rs",
     "src/engine/native/transaction.rs",
     "src/engine/native/worker.rs",
+    "src/engine/native/worker/paint.rs",
     "src/engine/native/worker_tests.rs",
     "src/engine/reframe_scope.rs",
     "src/engine/scene.rs",
