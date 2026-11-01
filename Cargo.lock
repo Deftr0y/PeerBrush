@@ -2325,6 +2325,7 @@ dependencies = [
  "serde_json",
  "svgtypes",
  "tiny_http",
+ "ttf-parser",
  "toml_edit",
  "unicode-bidi",
  "unicode-script",

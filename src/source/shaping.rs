@@ -87,7 +87,7 @@ fn coordinate(value: f64) -> Result<f32, String> {
     Ok(value as f32)
 }
 
-fn checked_glyph(font: &FontArc, value: u32) -> Result<GlyphId, String> {
+fn checked_glyph(font: &impl Font, value: u32) -> Result<GlyphId, String> {
     if value == 0 || value > u32::from(u16::MAX) || value as usize >= font.glyph_count() {
         return Err("The selected font needs an unsupported glyph".into());
     }
@@ -131,6 +131,31 @@ pub(super) fn layout(source: &Source, font: &FontArc) -> Result<Vec<Glyph>, Stri
     else {
         return Err("Shaped layout requires a text source".into());
     };
+    layout_parts(
+        source.width,
+        text,
+        reference,
+        *size,
+        *line_height,
+        *letter_spacing,
+        align,
+        font,
+        &mut |_| Ok(()),
+    )
+}
+
+pub(super) fn layout_parts(
+    width: u32,
+    text: &str,
+    reference: &crate::fonts::TextFont,
+    size: f32,
+    line_height: f32,
+    letter_spacing: f32,
+    align: &str,
+    font: &impl Font,
+    preflight: &mut dyn FnMut(GlyphId) -> Result<(), String>,
+) -> Result<Vec<Glyph>, String> {
+    let (size, line_height, letter_spacing) = (&size, &line_height, &letter_spacing);
     variation_sequences(text)?;
     let index = match reference {
         crate::fonts::TextFont::Bundled(_) => 0,
@@ -264,15 +289,16 @@ pub(super) fn layout(source: &Source, font: &FontArc) -> Result<Vec<Glyph>, Stri
                 previous = Some(info.cluster);
             }
         }
-        let start = match align.as_str() {
-            "center" => (f64::from(source.width) - advance) * 0.5,
-            "right" => f64::from(source.width) - advance,
+        let start = match align {
+            "center" => (f64::from(width) - advance) * 0.5,
+            "right" => f64::from(width) - advance,
             _ => 0.,
         };
         coordinate(start)?;
         for glyph in positioned {
             let glyph_position = point(coordinate(start + glyph.x)?, coordinate(glyph.y)?);
             let positioned = glyph.id.with_scale_and_position(*size, glyph_position);
+            preflight(positioned.id)?;
             match font.outline_glyph(positioned.clone()) {
                 Some(outline) => {
                     let bounds = outline.px_bounds();
