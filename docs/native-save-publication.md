@@ -43,3 +43,76 @@ integration and native interruption acceptance remain required. Existing source
 and canvas limits remain unchanged. Windows directory power-loss durability is
 not qualified by the current no-op parent-directory sync helper. Published
 source/history/recovery garbage collection remains closed.
+
+## New destinations
+
+A completed Source36 candidate already owns the exact scene and all qualified
+standard/source bytes. The destination writer requires that candidate, its exact
+source session, a held destination lease and frozen previous-version inventory.
+A durable publication intent fixes the destination, candidate SHA/length and
+same-directory temporary name before any external payload is created.
+
+The writer creates the temporary exclusively under a held parent directory. It
+syncs the empty file and parent, then registers the actual zero-byte FileId in the
+source journal. A planned name or matching file digest cannot substitute for that
+registration. Failure retains the file and the full admitted disk debt.
+
+Replay is append-only through a charged 64 KiB buffer. Every boundary checks the
+session, lease, actual named/held temporary, source candidate and registered
+creation. The entire temporary is synced and SHA-checked before the Engine fence.
+The fence consumes only an already prepared commit token; it performs no file I/O,
+large hashing or new admission. Publication uses a no-clobber operation. A foreign
+new destination is retained and reported as a conflict.
+
+After publication the held file is rehashed and its named identity reobserved.
+The private outcome receipt retains the plan, lease/inventory and physical file
+holds, but does not borrow the committed permit. The journal can therefore consume
+that permit after finishing its already admitted receipt. Normal new source
+operations still refuse workspace closing. Only the exact precommitted operation
+may finish. A renamed temporary remains a live destination FileId, never a retired
+file refund. Drop does not unlink external files or refund uncertain debt.
+
+The current abort receipt reports the retained temporary as live debt; it does
+not claim verified retirement. Only a complete retained candidate can settle
+that debt; partial, foreign or uncertain files keep the full pending reservation.
+A remaining temporary blocks the next write to that same target. Historical
+backups are never deleted by abort.
+
+## Ordinary access rules
+
+Existing-source backup copying uses held descriptors and refuses encrypted files
+before plaintext staging. Windows compares owner and primary group, DACL presence
+and null-versus-empty state, ordered active ACEs and source descriptor stability.
+A backup freezes the copied DACL against its new directory inheritance. Only the
+`INHERITED_ACE` origin marker may differ from the source; permission masks, SID,
+ACE type, order and every other flag remain exact. No token privilege is enabled.
+SACLs and a complete security-descriptor copy are not claimed. Unreadable or
+unpreservable ordinary access rules fail before payload copying.
+
+Linux checks held owner/group/mode and access ACL bytes. macOS checks held
+owner/group/mode and the external ACL representation. Platform execution evidence
+is required in addition to source review.
+
+## Existing destinations: unresolved replacement contract
+
+The component above accepts only an absent destination. It does not change the
+ordinary legacy Save path. Windows replacement APIs and POSIX `rename` do not
+compare an expected destination FileId atomically. A last check followed by a
+replace cannot guarantee that a raced foreign file is untouched.
+
+A separate, unadopted relocation proposal would journal a third quarantine name,
+move the old destination there with no-clobber semantics, verify the expected
+held ID and bytes, and publish the candidate with another no-clobber move. If a
+foreign file raced into the first move, restoration would also be no-clobber;
+occupied names and all uncertain files would remain retained. That proposal has
+an unbounded missing-destination window after a process crash or power loss.
+Filesystem watchers and cloud-sync clients can observe the move/create sequence.
+A durable phase record can support later exact-ID recovery but cannot bound that
+absence or undo external watcher effects. It is not activated or accepted as the
+ordinary Save contract.
+
+Atomic replacement with an exact backup capture preserves a no-gap filename but
+can move a raced foreign version to that backup. This is a different contract and
+must not be described as destination-ID compare-and-replace. Until a replacement
+contract is reviewed and qualified, existing-target native Save remains a gate;
+new-name no-clobber Save As is the available safe primitive, not full Save readiness.
