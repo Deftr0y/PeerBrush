@@ -55,7 +55,7 @@ impl<'a> From<&'a Layer> for LayerView<'a> {
 }
 /// The active engine still has resident authority until the coordinated switch.
 pub(crate) fn current(engine: &Engine) -> DocumentView<'_> {
-    DocumentView::Resident(&engine.doc)
+    engine.authority.view()
 }
 #[derive(Clone, Copy)]
 pub(crate) enum LayerView<'a> {

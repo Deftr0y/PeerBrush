@@ -129,6 +129,10 @@ impl Clone for NativeDocument {
     }
 }
 impl NativeDocument {
+    pub(super) fn command_scopes(&self, command: &serde_json::Value) -> Vec<crate::engine::Scope> {
+        scopes::scopes(&self.core.metadata, command)
+    }
+
     /// PendingScene's complete codec/recovery and semantic admission remains a
     /// registration requirement; this constructor grants no registry authority.
     pub(crate) fn from_pending(pending: PendingScene) -> Result<Self> {

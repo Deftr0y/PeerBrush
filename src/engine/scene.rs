@@ -277,6 +277,101 @@ impl SceneSnapshot {
     pub fn identity(&self) -> &SceneIdentity {
         &self.identity
     }
+    /// Capture borrowed live metadata only after reserving its complete copy.
+    /// The caller holds no source I/O permission and this performs no disk I/O.
+    pub(crate) fn capture_native(
+        project_id: &str,
+        document: super::native::NativeDocument,
+        leases: &[super::Lease],
+        file_version: Option<crate::file_safety::Version>,
+        file_ownership: Option<Arc<crate::file_ownership::Ownership>>,
+    ) -> Result<Self> {
+        fn text(value: &str) -> Result<String> {
+            let mut copy = String::new();
+            copy.try_reserve_exact(value.len())
+                .map_err(|_| "Scene text allocation refused")?;
+            if copy.capacity() > value.len() {
+                return Err("Scene text exceeds admission".into());
+            }
+            copy.push_str(value);
+            Ok(copy)
+        }
+        fn vector<T>(length: usize) -> Result<Vec<T>> {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(length)
+                .map_err(|_| "Scene vector allocation refused")?;
+            if copy.capacity() > length {
+                return Err("Scene vector exceeds admission".into());
+            }
+            Ok(copy)
+        }
+        let header_bytes = project_id
+            .len()
+            .checked_add(document.metadata().id().len())
+            .and_then(|n| n.checked_add(1024))
+            .ok_or("Scene header footprint overflow")?;
+        let mut lease_bytes = leases
+            .len()
+            .checked_mul(std::mem::size_of::<super::Lease>())
+            .and_then(|n| n.checked_add(512))
+            .ok_or("Scene lease footprint overflow")?;
+        for lease in leases {
+            for bytes in [
+                lease.id.len(),
+                lease.owner.len(),
+                lease.description.len(),
+                lease
+                    .scopes
+                    .len()
+                    .checked_mul(std::mem::size_of::<super::Scope>())
+                    .ok_or("Scene scope footprint overflow")?,
+            ] {
+                lease_bytes = lease_bytes
+                    .checked_add(bytes)
+                    .ok_or("Scene lease footprint overflow")?;
+            }
+            for scope in &lease.scopes {
+                lease_bytes = lease_bytes
+                    .checked_add(scope.target.as_ref().map_or(0, String::len))
+                    .ok_or("Scene scope text footprint overflow")?;
+            }
+        }
+        let header_charge = MetadataCharge::reserve(document.budget(), header_bytes, &|| Ok(()))?;
+        let lease_charge = MetadataCharge::reserve(document.budget(), lease_bytes, &|| Ok(()))?;
+        let identity = SceneIdentity {
+            project_id: text(project_id)?,
+            document_id: text(document.metadata().id())?,
+            revision: document.metadata().revision(),
+        };
+        let mut copied = vector(leases.len())?;
+        for lease in leases {
+            let mut scopes = vector(lease.scopes.len())?;
+            for scope in &lease.scopes {
+                scopes.push(super::Scope {
+                    target: scope.target.as_deref().map(text).transpose()?,
+                    rect: scope.rect,
+                });
+            }
+            copied.push(super::Lease {
+                id: text(&lease.id)?,
+                owner: text(&lease.owner)?,
+                description: text(&lease.description)?,
+                scopes,
+                expires: lease.expires,
+            });
+        }
+        Ok(Self {
+            identity,
+            binding: document.key(),
+            document: SnapshotDocument::Native(document),
+            leases: Arc::new(copied),
+            file_version,
+            _file_ownership: file_ownership,
+            runtime_views: RuntimeViews::default(),
+            _lease_charge: Some(lease_charge),
+            _header_charge: Some(header_charge),
+        })
+    }
     pub(crate) fn from_native(
         identity: SceneIdentity,
         document: super::native::NativeDocument,

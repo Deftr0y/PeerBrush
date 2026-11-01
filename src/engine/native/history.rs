@@ -271,6 +271,10 @@ impl RefusedMove {
     }
 }
 impl NativeHistory {
+    pub(crate) fn task_complete(&self, owner: &str, task: &str) -> bool {
+        !self.truncated.contains(owner, task)
+    }
+
     pub(crate) fn entries(&self) -> HistoryEntries<'_> {
         HistoryEntries {
             records: self.undo.iter(),
