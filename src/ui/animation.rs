@@ -7,8 +7,8 @@ const HIGHLIGHT: f64 = 3.0;
 
 struct Transition {
     change: AiChange,
-    before: Document,
-    after: Document,
+    before: DocumentSnapshot,
+    after: DocumentSnapshot,
     started: f64,
     interpolated_canvas: bool,
 }
@@ -22,11 +22,39 @@ struct Fade {
 }
 #[derive(Default)]
 pub(super) struct Animation {
-    observed: Option<Document>,
+    observed: Option<DocumentSnapshot>,
     serial: u64,
     transition: Option<Transition>,
     fade: Option<Fade>,
     fade_serial: u64,
+}
+pub(super) enum Observation<'a> {
+    Resident(&'a Document),
+    Snapshot(&'a DocumentSnapshot),
+}
+impl<'a> From<&'a Document> for Observation<'a> {
+    fn from(value: &'a Document) -> Self {
+        Self::Resident(value)
+    }
+}
+impl<'a> From<&'a DocumentSnapshot> for Observation<'a> {
+    fn from(value: &'a DocumentSnapshot) -> Self {
+        Self::Snapshot(value)
+    }
+}
+impl Observation<'_> {
+    fn view(&self) -> DocumentView<'_> {
+        match self {
+            Self::Resident(doc) => DocumentView::Resident(doc),
+            Self::Snapshot(doc) => doc.view(),
+        }
+    }
+    fn snapshot(&self) -> DocumentSnapshot {
+        match self {
+            Self::Resident(doc) => (*doc).clone().into(),
+            Self::Snapshot(doc) => (*doc).clone(),
+        }
+    }
 }
 fn ease(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -60,9 +88,20 @@ fn values(before: &Value, after: &mut Value, t: f32) {
     }
 }
 impl Animation {
-    pub(super) fn observe(&mut self, doc: &Document, change: Option<AiChange>, time: f64) -> bool {
+    pub(super) fn observe<'a>(
+        &mut self,
+        source: impl Into<Observation<'a>>,
+        change: Option<AiChange>,
+        time: f64,
+    ) -> bool {
+        let source = source.into();
+        let doc = source.view();
         let mut started = false;
-        if self.observed.as_ref().is_some_and(|d| d.id != doc.id) {
+        if self
+            .observed
+            .as_ref()
+            .is_some_and(|d| d.view().id() != doc.id())
+        {
             self.transition = None;
             self.fade = None;
             self.serial = change.as_ref().map_or(0, |c| c.serial);
@@ -72,22 +111,17 @@ impl Animation {
                 if let Some(before) = self.observed.clone() {
                     let interpolated_canvas = ["move", "opacity", "fill"]
                         .contains(&change.tool.as_str())
-                        && doc.layers.iter().any(|l| {
-                            before
-                                .layers
-                                .iter()
-                                .find(|old| old.id == l.id)
-                                .is_some_and(|old| {
-                                    old.opacity != l.opacity
-                                        || old.x != l.x
-                                        || old.y != l.y
-                                        || old.color != l.color
-                                })
+                        && doc.layers().any(|l| {
+                            before.view().find_layer(l.id()).is_some_and(|old| {
+                                old.opacity() != l.opacity()
+                                    || old.origin() != l.origin()
+                                    || old.color() != l.color()
+                            })
                         });
                     self.transition = Some(Transition {
                         change,
                         before,
-                        after: doc.clone(),
+                        after: source.snapshot(),
                         started: time,
                         interpolated_canvas,
                     });
@@ -97,13 +131,13 @@ impl Animation {
             } else if self
                 .transition
                 .as_ref()
-                .is_some_and(|t| t.after.revision != doc.revision)
+                .is_some_and(|t| t.after.view().revision() != doc.revision())
             {
                 // A later human edit takes precedence, including while a render is pending.
                 self.cancel();
             }
         }
-        self.observed = Some(doc.clone());
+        self.observed = Some(source.snapshot());
         if self
             .transition
             .as_ref()
@@ -117,6 +151,10 @@ impl Animation {
     pub(super) fn cancel(&mut self) {
         self.transition = None;
         self.fade = None;
+    }
+    pub(super) fn clear(&mut self) {
+        self.cancel();
+        self.observed = None;
     }
     pub(super) fn progress(&self, time: f64) -> f32 {
         self.transition
@@ -151,7 +189,7 @@ impl Animation {
     }
     pub(super) fn arrival(&self, id: &str, time: f64) -> f32 {
         if self.transition.as_ref().is_some_and(|t| {
-            !t.before.layers.iter().any(|l| l.id == id) && t.after.layers.iter().any(|l| l.id == id)
+            t.before.view().find_layer(id).is_none() && t.after.view().find_layer(id).is_some()
         }) {
             self.progress(time)
         } else {
@@ -188,7 +226,7 @@ impl Animation {
         } else {
             linear
         });
-        if t >= 1.0 || doc.revision != transition.after.revision {
+        if t >= 1.0 || doc.revision != transition.after.view().revision() {
             return doc.clone();
         }
         let cache_tag = if canvas {
@@ -197,9 +235,14 @@ impl Animation {
             format!("ui{}", (time * 1000.0).round() as u64)
         };
         let mut display = doc.clone();
+        // This compatibility renderer accepts an actual resident source only;
+        // native presentation uses its source-backed worker and metadata view.
+        let DocumentSnapshot::Resident(before) = &transition.before else {
+            return display;
+        };
         if !canvas {
             if let (Some(old), Some(source)) = (
-                crate::selection::wand_source(&transition.before),
+                crate::selection::wand_source(before),
                 display.wand_source.as_mut(),
             ) {
                 if old.id == source.id && source.revision == doc.revision {
@@ -212,8 +255,7 @@ impl Animation {
                 }
             }
             for filter in &mut display.filters {
-                if let Some(old) = transition
-                    .before
+                if let Some(old) = before
                     .filters
                     .iter()
                     .find(|f| f.id == filter.id && f.kind == filter.kind)
@@ -224,7 +266,7 @@ impl Animation {
             }
         }
         for l in &mut display.layers {
-            let Some(old) = transition.before.layers.iter().find(|old| old.id == l.id) else {
+            let Some(old) = before.layers.iter().find(|old| old.id == l.id) else {
                 continue;
             };
             // Effected ancestors are invalidated by the engine too. Keep every changed cache key
@@ -285,7 +327,7 @@ impl Animation {
             return false;
         };
         if t.interpolated_canvas
-            || preview.revision != t.after.revision
+            || preview.revision != t.after.view().revision()
             || self.fade_serial == t.change.serial
         {
             return false;
