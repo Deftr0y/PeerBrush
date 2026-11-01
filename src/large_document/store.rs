@@ -967,7 +967,7 @@ impl Store {
         regular(&self.0.path)?;
         let named_root = open_directory(&self.0.root)?;
         let named =
-            crate::file_safety::open_for_identity(&self.0.path).map_err(|_| Error::Changed)?;
+            crate::file_safety::open_native_identity(&self.0.path).map_err(|_| Error::Changed)?;
         if crate::file_safety::identity(&self.0.directory).map_err(|_| Error::Changed)?
             != self.0.directory_id
             || crate::file_safety::identity(&named_root).map_err(|_| Error::Changed)?
@@ -1545,7 +1545,7 @@ pub(super) fn source_options() -> OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     options
 }

@@ -120,6 +120,16 @@ same-directory rename relative to the retained directory descriptor; its source
 component is still path based. Caller-held private-directory/profile writer
 admission and before/after identity checks remain necessary. This does not claim
 an atomic POSIX source-file-descriptor rename against a hostile competing writer.
+The native filename packet includes an explicit zero WCHAR while its counted
+name length excludes that terminator. This avoids relying on padding after the
+last character for absolute-name conversion. Native alignment and nested-runtime
+marker cases exercise this separately from the existing long-path checks.
+
+Native backing identity/read observations use nonblocking, no-follow opens and
+verify the opened regular file. A FIFO or device replacing a checked name cannot
+stall source quiescence. Held profile admission also reads its bounded manifest
+through this path and repeats file/directory identity and stamp checks. Legacy
+preference readers and publication policy retain their existing behavior.
 
 The helper does not change legacy SaveTemporary/backup limits or establish
 Photoshop, editable-source or recovery authority. Windows directory metadata
@@ -134,3 +144,8 @@ bindings, every owning Store identity and selected 96-byte CommitRef, plus full
 metadata/payload hashes. This source-only recovery proof is not a standard PSD36
 layer/composite proof. Live dispatch remains gated until capture, admitted typed
 restore and the actual engine adopter retain every source and metadata owner.
+The approved distinct binary framing uses `recovery-v3-UUID.pbr`. Its runtime I/O
+factory publishes only through an exclusive held pending file, exact SHA readback
+and no-clobber rename. Opening requires the actual authenticated inventory and
+retains the source session; neither an arbitrary path nor marker presence grants
+editable authority. Unknown framing remains held without selection or cleanup.

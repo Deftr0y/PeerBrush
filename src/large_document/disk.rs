@@ -86,7 +86,8 @@ impl DiskBudget {
         for ((path, file), before) in files.iter().zip(observed) {
             super::store::validate_ancestors(path.parent().ok_or(Error::Changed)?)?;
             super::store::regular(path)?;
-            let named = crate::file_safety::open_for_identity(path).map_err(|_| Error::Changed)?;
+            let named =
+                crate::file_safety::open_native_identity(path).map_err(|_| Error::Changed)?;
             if super::store::stamp(file)? != before
                 || super::store::links(file)? != 1
                 || crate::file_safety::identity(&named).map_err(|_| Error::Changed)?
@@ -252,7 +253,7 @@ impl DiskBudget {
         super::store::validate_ancestors(path.parent().ok_or(Error::Changed)?)?;
         super::store::regular(path)?;
         let identity = crate::file_safety::identity(file).map_err(|_| Error::Changed)?;
-        let named = crate::file_safety::open_for_identity(path).map_err(|_| Error::Changed)?;
+        let named = crate::file_safety::open_native_identity(path).map_err(|_| Error::Changed)?;
         let before = super::store::stamp(file)?;
         if crate::file_safety::identity(&named).map_err(|_| Error::Changed)? != identity
             || super::store::links(file)? != 1
@@ -301,7 +302,7 @@ impl DiskBudget {
         };
         drop(state);
         // A failed final observation retains its conservative charge.
-        let after = crate::file_safety::open_for_identity(path).map_err(|_| Error::Changed)?;
+        let after = crate::file_safety::open_native_identity(path).map_err(|_| Error::Changed)?;
         if super::store::stamp(file)? != before
             || super::store::links(file)? != 1
             || crate::file_safety::identity(&after).map_err(|_| Error::Changed)? != identity

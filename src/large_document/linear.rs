@@ -118,7 +118,7 @@ impl Owned {
         regular(&self.path)?;
         let dir = open_directory(&self.root)?;
         let named =
-            crate::file_safety::open_for_identity(&self.path).map_err(|_| Error::Changed)?;
+            crate::file_safety::open_native_identity(&self.path).map_err(|_| Error::Changed)?;
         if crate::file_safety::identity(&dir).map_err(|_| Error::Changed)? != self.directory_id
             || crate::file_safety::identity(&self.directory).map_err(|_| Error::Changed)?
                 != self.directory_id
