@@ -48,7 +48,7 @@ impl RasterCollector for Collector {
 fn capture(source: &Document, pool: &ResidentBudget) -> NativeDocument {
     let mut collector = Collector(Vec::new());
     let metadata = Document36::capture(source, &mut collector).unwrap();
-    let owner = MetadataCharge::reserve(pool, 128 * 1024, &|| Ok(())).unwrap();
+    let owner = MetadataCharge::reserve(pool, 512 * 1024, &|| Ok(())).unwrap();
     NativeDocument::from_pending(
         PendingScene::new(
             Admitted::from_parts(Arc::new(metadata), owner),
