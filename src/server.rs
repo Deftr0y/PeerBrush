@@ -2034,7 +2034,8 @@ fn dispatch_project(
                     p.get("label").and_then(Value::as_str).unwrap_or("AI edit"),
                     None,
                     p["document_id"].as_str(),
-                )?.into_response(admission)?
+                )?
+                .into_response(admission)?
             } else if commands.len() == 1 && commands[0]["op"] == "layer.merge" {
                 let ids = crate::merge::requested(&commands[0])?;
                 crate::merge::edit_guarded(

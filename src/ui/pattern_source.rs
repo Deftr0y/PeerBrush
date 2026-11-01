@@ -80,7 +80,8 @@ pub(super) fn poll(app: &mut PeerBrush, ctx: &egui::Context) {
             app.animation.cancel();
             app.message = apply(&mut app.shared.lock().unwrap(), &pending, &source)
                 .map(|_| "Embedded bitmap pattern".into())
-                .unwrap_or_else(|e| e).into();
+                .unwrap_or_else(|e| e)
+                .into();
             app.last_preview = None;
         }
     }

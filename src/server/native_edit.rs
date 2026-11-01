@@ -194,7 +194,10 @@ pub(crate) fn edit_shared_controlled(
         Err(reason) => {
             return Err(combine(
                 reason.clone(),
-                pending.refused(&reason).abort(&session, &|| session.cleanup_check()).err(),
+                pending
+                    .refused(&reason)
+                    .abort(&session, &|| session.cleanup_check())
+                    .err(),
             ));
         }
     };
@@ -207,7 +210,10 @@ pub(crate) fn edit_shared_controlled(
         session.with_live_fence(|| {
             control.begin_commit()?;
             Ok(engine.commit_native_with_effects(
-                &seed, actor, pending.take().unwrap(), effects.take().unwrap(),
+                &seed,
+                actor,
+                pending.take().unwrap(),
+                effects.take().unwrap(),
             ))
         })
     };
