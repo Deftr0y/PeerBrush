@@ -10,6 +10,17 @@ pub(crate) struct NativeExternalFile {
     modified_nanos: u128,
 }
 impl NativeExternalFile {
+    pub(in crate::file_safety) fn observe_held(file: &fs::File) -> Result<Self, String> {
+        let (bytes, modified_nanos) = stamp(file)?;
+        if link_count(file)? != 1 {
+            return Err("Native outcome file link ownership changed".into());
+        }
+        Ok(Self {
+            identity: identity(file)?,
+            bytes,
+            modified_nanos,
+        })
+    }
     #[cfg(test)]
     pub(crate) fn for_accounting_tests(
         identity: (u64, u64),
