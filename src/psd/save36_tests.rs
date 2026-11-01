@@ -227,6 +227,7 @@ struct PreparedRows<'a> {
     stale: Option<&'a Cell<bool>>,
     fail_at: Option<usize>,
     replace: Option<(PathBuf, PathBuf)>,
+    replacement_denied: Option<std::io::ErrorKind>,
 }
 impl CapturedRows for PreparedRows<'_> {
     fn scene(&self) -> &SceneSnapshot {
@@ -246,7 +247,10 @@ impl NativeRows for PreparedRows<'_> {
         check()?;
         self.calls += 1;
         if let Some((named, original)) = self.replace.take() {
-            fs::rename(&named, &original).map_err(|e| e.to_string())?;
+            if let Err(error) = fs::rename(&named, &original) {
+                self.replacement_denied = Some(error.kind());
+                return Err(error.to_string());
+            }
             fs::write(&named, b"foreign stage replacement").map_err(|e| e.to_string())?;
         }
         let layer = self.scene.metadata().layers().next().unwrap();
@@ -332,6 +336,7 @@ fn provider(scene: &SceneSnapshot) -> PreparedRows<'_> {
         stale: None,
         fail_at: None,
         replace: None,
+        replacement_denied: None,
     }
 }
 
@@ -379,16 +384,33 @@ fn actual_owned_small_native8_native16_psd_psb_driver_reopens_and_retires_comple
             assert_eq!(done.sha256(), done.candidate().payload_sha256());
             done.recheck(&|| Ok(())).unwrap();
             let mut guarded = || Ok(());
-            let mut input = done
+            let input = done
                 .candidate()
                 .cursor(0, done.bytes(), &mut guarded)
                 .unwrap();
-            let index =
-                structural::index(&mut input, structural::Limits::current(), || Ok(())).unwrap();
+            let source = Source::with_buffer(
+                input,
+                done.bytes(),
+                ScratchBytes::new(&f.pool, 65536, 65536).unwrap(),
+            )
+            .unwrap();
+            let index = structural::index(
+                &mut source
+                    .range(
+                        Span {
+                            offset: 0,
+                            bytes: done.bytes(),
+                        },
+                        &|| Ok(()),
+                    )
+                    .unwrap(),
+                structural::Limits::current(),
+                || Ok(()),
+            )
+            .unwrap();
             assert_eq!(index.header.depth, depth);
             assert_eq!(index.header.height, 259);
             assert_eq!(index.layers[0].bounds, [-1, -2, 258, 3]);
-            let source = Source::new(input, done.bytes()).unwrap();
             let mask = index.layers[0]
                 .channels
                 .iter()
@@ -473,7 +495,16 @@ fn closed_driver_stale_cancel_and_foreign_scratch_fail_without_source_or_destina
                 .key(),
             source_key
         );
-        if fault == 2 {
+        if fault == 2 && rows.replacement_denied.is_some() {
+            assert!(cfg!(windows));
+            assert_eq!(
+                rows.replacement_denied,
+                Some(std::io::ErrorKind::PermissionDenied)
+            );
+            assert!(!layers.exists());
+            assert_eq!(f.disk.used().unwrap(), baseline);
+        } else if fault == 2 {
+            assert_eq!(rows.replacement_denied, None);
             assert_eq!(
                 fs::read(layers.join("bytes.pbb")).unwrap(),
                 b"foreign stage replacement"
@@ -513,12 +544,22 @@ fn completed_save_recheck_refuses_replacement_and_never_regains_authority_after_
     .unwrap();
     let named = container.join("bytes.pbb");
     let original = f.root.join("owned-container-original.pbb");
-    fs::rename(&named, &original).unwrap();
-    fs::write(&named, b"foreign completed candidate").unwrap();
-    assert!(done.recheck(&|| Ok(())).is_err());
-    assert_eq!(fs::read(&named).unwrap(), b"foreign completed candidate");
-    fs::remove_file(&named).unwrap();
-    fs::rename(&original, &named).unwrap();
+    let renamed = fs::rename(&named, &original);
+    if let Err(error) = renamed {
+        assert!(cfg!(windows));
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!original.exists());
+        done.recheck(&|| Ok(())).unwrap();
+        assert!(done
+            .recheck(&|| Err("Cancelled final source check".into()))
+            .is_err());
+    } else {
+        fs::write(&named, b"foreign completed candidate").unwrap();
+        assert!(done.recheck(&|| Ok(())).is_err());
+        assert_eq!(fs::read(&named).unwrap(), b"foreign completed candidate");
+        fs::remove_file(&named).unwrap();
+        fs::rename(&original, &named).unwrap();
+    }
     assert!(done.recheck(&|| Ok(())).is_err());
     done.retire(&|| Ok(())).unwrap();
     drop(rows);
@@ -627,7 +668,12 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             .candidate()
             .cursor(0, saved.bytes(), &mut guarded)
             .unwrap();
-        let source = Source::new(input, saved.bytes()).unwrap();
+        let source = Source::with_buffer(
+            input,
+            saved.bytes(),
+            ScratchBytes::new(&f.pool, 65536, 65536).unwrap(),
+        )
+        .unwrap();
         let index = Arc::new(
             structural::index(
                 &mut source
