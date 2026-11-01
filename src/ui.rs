@@ -5499,7 +5499,7 @@ impl PeerBrush {
             self.rename_edit = None;
         }
         let time = ctx.input(|i| i.time);
-        if self.animation.observe(&doc, ai_change, time) {
+        if self.animation.observe(&self.doc_snapshot, ai_change, time) {
             // Reveal the destination so an AI hierarchy move remains visible.
             for scope in self.animation.scopes(time) {
                 let mut parent = scope.target.and_then(|id| {
@@ -6290,6 +6290,7 @@ impl eframe::App for PeerBrush {
     }
     fn on_exit(&mut self) {
         self.preview_worker.stop();
+        self.animation.clear();
         self.native_preview.clear();
         self.native_canvas.clear();
         crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
