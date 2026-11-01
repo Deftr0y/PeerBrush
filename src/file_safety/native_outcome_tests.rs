@@ -470,3 +470,26 @@ fn actual_admitted_snapshot_binds_exact_source_operation_before_intent() {
         drop(lease);
     });
 }
+
+#[test]
+fn actual_admitted_prelease_closing_refuses_even_empty_versions_creation() {
+    crate::psd::save36::with_session_candidate_join(
+        8,
+        |session, _candidate, _runtime, root, connection| {
+            let path = root.join("new-source.psb");
+            let proof = session.admit_destination(&path, &|| Ok(())).unwrap();
+            assert!(!root.join(".peerbrush-versions").exists());
+            let connection = connection.take().unwrap();
+            let closer = std::thread::spawn(move || drop(connection));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while session.check().is_ok() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(session.check().is_err());
+            assert!(NativeLease::acquire_admitted(proof, || Ok(())).is_err());
+            assert!(!root.join(".peerbrush-versions").exists());
+            assert!(!path.exists());
+            ((), Some(closer))
+        },
+    );
+}
