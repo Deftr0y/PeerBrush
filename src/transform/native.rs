@@ -141,6 +141,7 @@ pub(crate) struct Tile {
     frame: [u32; 2],
     depth: u16,
     bytes: PinnedBytes,
+    preserve_empty: bool,
 }
 impl Tile {
     pub(crate) fn source(&self) -> SurfaceKey {
@@ -199,6 +200,7 @@ pub(crate) fn render_tile(
         let tile = source
             .prepare_tile(coordinate, &mut || check())
             .map_err(|e| e.to_string())?;
+        let preserve_empty = !tile.is_known_zero();
         let bytes = tile
             .copy_to_scratch(pool)
             .map_err(|e| e.to_string())?
@@ -210,6 +212,7 @@ pub(crate) fn render_tile(
             frame,
             depth: source.depth(),
             bytes,
+            preserve_empty,
         });
     }
     let mut output = ScratchBytes::new(pool, size, size).map_err(|e| e.to_string())?;
@@ -246,6 +249,7 @@ pub(crate) fn render_tile(
         frame,
         depth: source.depth(),
         bytes: output.freeze(),
+        preserve_empty: false,
     })
 }
 
@@ -535,6 +539,52 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn identity_plane_retains_explicit_empty_tile_presence_like_legacy_clone() {
+        for depth in [8, 16] {
+            let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+            let (store, _, path) = fixture(&pool);
+            let mut input = Raster::new_depth(3, 5, depth);
+            if depth == 16 {
+                input
+                    .samples16
+                    .insert((0, 0), Arc::new(vec![0; (TILE * TILE * 4) as usize]));
+            } else {
+                input
+                    .tiles
+                    .insert((0, 0), Arc::new(vec![0; (TILE * TILE * 4) as usize]));
+            }
+            let source = Surface::stage_raster(&input, store.clone(), &mut || Ok(())).unwrap();
+            let mapping =
+                Mapping::retained(3, 5, depth, crate::retained::IDENTITY, None, &[], &pool)
+                    .unwrap();
+            let output = write_plane(
+                &source,
+                &mapping,
+                [3, 5],
+                &store,
+                &mut Work::new(1_000_000).unwrap(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(source.physical_tiles().count(), 1);
+            assert_eq!(output.physical_tiles().count(), 1);
+            assert!(!output.is_known_zero());
+            assert!(output
+                .prepare_tile((0, 0), &mut || Ok(()))
+                .unwrap()
+                .bytes()
+                .unwrap()
+                .iter()
+                .all(|b| *b == 0));
+            drop(output);
+            drop(source);
+            drop(store);
+            assert_eq!(pool.used(), 0);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
     fn generated_fill_originals_match_native_set_and_physical_padding() {
         for depth in [8, 16] {
             let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
@@ -569,6 +619,7 @@ mod tests {
                             frame: [257, 3],
                             depth,
                             bytes,
+                            preserve_empty: false,
                         },
                         &expected,
                     );
@@ -649,6 +700,7 @@ mod tests {
                                 frame,
                                 depth,
                                 bytes,
+                                preserve_empty: false,
                             },
                             &expected,
                         );
