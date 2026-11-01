@@ -31,6 +31,14 @@ serialization remains the exact Source36 wire representation. The guarded codec
 handoff refuses native authority and any runtime leases, file guards or protected
 inspection owners.
 
+The independent-root reorder precursor rebuilds the admitted source roster in
+canonical document traversal order. Current pixels, originals, mask steps,
+historical Liquify clips and both selection coverage slots are remapped together.
+Their physical Surface keys stay unchanged; no pixel payload is rewritten. The
+result is revalidated against the strict 1..N reference rule before adoption.
+Hierarchical and clipping reorder policy remains part of the pending dispatcher
+migration.
+
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,
 recovery and coordinated live document replacement must be connected and tested
