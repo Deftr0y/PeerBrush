@@ -11,6 +11,7 @@ use super::{
 use ring::digest::{Context, SHA256};
 use std::cell::Cell;
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 pub(crate) struct VerificationLimits {
     pub bulk: BulkLimits,
@@ -20,9 +21,9 @@ pub(crate) struct VerificationLimits {
 /// Whole-source SHA must come from the caller's retained source admission and
 /// must bracket creation of this exact index. A directory scan is not admission.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn verify<'a, R: Read + Seek, T>(
-    source: &'a Source<R>,
-    index: &'a Index,
+pub(crate) fn verify<'source, 'index, R: Read + Seek, T>(
+    source: &'source Source<R>,
+    index: &'index Index,
     expected_source_sha256: Digest,
     manifest: &Manifest<T>,
     limits: VerificationLimits,
@@ -31,7 +32,7 @@ pub(crate) fn verify<'a, R: Read + Seek, T>(
     scratch: &mut [u8],
     check: &dyn Fn() -> Result<(), String>,
     mut provisional_sink: impl FnMut(Record<'_>) -> Result<(), String>,
-) -> Result<CompletedSource<'a, R>, String> {
+) -> Result<CompletedSource<'source, 'index, R>, String> {
     check()?;
     if scratch.len() != bulk36::MAX_TILE_BYTES
         || limits.native_streams == 0
@@ -246,9 +247,9 @@ fn hash_reader(
 /// cannot be reconstructed from requested row counts. Keeping exact source and
 /// index borrows prevents replacing either with a same-shaped caller object.
 #[must_use = "Source observations require typed/render/lease/publication validation"]
-pub(crate) struct CompletedSource<'a, R> {
-    source: &'a Source<R>,
-    index: &'a Index,
+pub(crate) struct CompletedSource<'source, 'index, R> {
+    source: &'source Source<R>,
+    index: &'index Index,
     whole: Digest,
     origin: (u64, Digest),
     bulk: CompletedBulk,
@@ -257,7 +258,7 @@ pub(crate) struct CompletedSource<'a, R> {
     rows: u64,
     failed: Cell<bool>,
 }
-impl<R: Read + Seek> CompletedSource<'_, R> {
+impl<R: Read + Seek> CompletedSource<'_, '_, R> {
     pub(crate) fn check<T>(
         &self,
         source: &Source<R>,
@@ -347,5 +348,84 @@ impl<R: Read + Seek> CompletedSource<'_, R> {
     ) -> Result<Admitted<T>, String> {
         self.recheck(source, index, &manifest, expected_whole, scratch, check)?;
         manifest.map_unique(|manifest, _| Ok(manifest.into_metadata()))
+    }
+}
+
+/// A movable exact index owner for provisional import. It borrows the caller's
+/// already admitted source handle and never grants file/path or edit authority.
+pub(crate) struct OwnedSource<'a, R> {
+    source: &'a Source<R>,
+    index: Arc<Index>,
+    whole: Digest,
+    origin: (u64, Digest),
+    bulk: CompletedBulk,
+    standard: CompletedStandard,
+    failed: Cell<bool>,
+}
+impl<'a, R: Read + Seek> CompletedSource<'a, '_, R> {
+    pub(crate) fn own_index(self, index: Arc<Index>) -> Result<OwnedSource<'a, R>, String> {
+        if self.failed.get() || !std::ptr::eq(self.index, index.as_ref()) {
+            return Err("Source36 owned completion requires its exact observed index".into());
+        }
+        Ok(OwnedSource {
+            source: self.source,
+            index,
+            whole: self.whole,
+            origin: self.origin,
+            bulk: self.bulk,
+            standard: self.standard,
+            failed: Cell::new(false),
+        })
+    }
+}
+impl<R: Read + Seek> OwnedSource<'_, R> {
+    pub(crate) fn source(&self) -> &Source<R> {
+        self.source
+    }
+    pub(crate) fn index(&self) -> &Index {
+        &self.index
+    }
+    pub(crate) fn sha256(&self) -> Digest {
+        self.whole
+    }
+    pub(crate) fn recheck(
+        &self,
+        binding: &super::manifest36::SourceBinding,
+        scratch: &mut [u8],
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.failed.replace(true) {
+            return Err("Source36 owned source completion is failed".into());
+        }
+        let result = (|| {
+            check()?;
+            if binding.origin() != Some(self.origin)
+                || scratch.is_empty()
+                || scratch.len() > bulk36::MAX_TILE_BYTES
+            {
+                return Err("Source36 retained source binding/scratch differs".into());
+            }
+            self.bulk.check(binding.plan(), check)?;
+            self.standard.check_binding(binding)?;
+            self.source.unchanged_length()?;
+            if hash_range(
+                self.source,
+                Span {
+                    offset: 0,
+                    bytes: self.index.file_bytes,
+                },
+                scratch,
+                check,
+            )? != self.whole
+            {
+                return Err("Source36 admitted source changed before provisional handoff".into());
+            }
+            self.source.unchanged_length()?;
+            check()
+        })();
+        if result.is_ok() {
+            self.failed.set(false);
+        }
+        result
     }
 }
