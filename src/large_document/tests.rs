@@ -305,6 +305,8 @@ fn mutable_scratch_freezes_without_copy_and_keeps_one_live_charge() {
     scratch[..2].copy_from_slice(&12347u16.to_be_bytes());
     let pointer = scratch.as_ptr();
     let pinned = scratch.freeze();
+    assert!(pinned.uses_budget(&budget));
+    assert!(!pinned.uses_budget(&ResidentBudget::new(1024).unwrap()));
     assert_eq!(pointer, pinned.as_ptr());
     assert_eq!(&pinned[..2], &12347u16.to_be_bytes());
     let clone = pinned.clone();
