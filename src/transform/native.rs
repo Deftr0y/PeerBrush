@@ -14,6 +14,8 @@ pub(crate) use bounds::{content_bounds, source_bounds};
 #[path = "native/output.rs"]
 mod output;
 pub(crate) use output::{write_fill, write_plane};
+#[path = "native/selected.rs"]
+pub(crate) mod selected;
 
 enum Kind {
     Affine { matrix: [f64; 6], determinant: f64 },

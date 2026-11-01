@@ -631,3 +631,195 @@ fn folder_move_does_not_scan_native_pixels_for_an_unused_pivot() {
     assert_eq!(fixture.pool.used(), baseline);
     fixture.finish();
 }
+
+#[test]
+fn virtual_selected_cut_remainder_and_blend_match_actual_legacy_native_pixels() {
+    use crate::transform::native::selected::{self, Placement, Selection};
+    let mut cases = 0;
+    for depth in [8, 16] {
+        for kind in ["paint", "fill"] {
+            for coverage in 0..3 {
+                for mut command in [
+                    json!({"op":"move","dx":-3,"dy":2}),
+                    json!({"op":"transform","angle":90}),
+                    json!({"op":"transform","angle":17.5,"scale_x":0.83,"scale_y":1.07,"skew_x":11.25,"dx":3.25,"dy":-2.75,"fractional_translation":true}),
+                    json!({"op":"transform","projective":{"rect":[-4,-3,13,15],"quad":[[-3,-4],[14,-1],[11,17],[-5,13]]}}),
+                    json!({"op":"transform","warp":{"rect":[-7,-6,20,22],"preset":"arc","amount":0.03}}),
+                    json!({"op":"transform","angle":0}),
+                ] {
+                    let mut doc = planning::tests::fixture(depth, kind, None);
+                    doc.layers[0].x = 2;
+                    doc.layers[0].y = 3;
+                    doc.layers[0].pixels.set(8, 1, [17, 83, 211, 0]);
+                    let area = [-4, -3, 13, 15];
+                    doc.selection = Some(area);
+                    if coverage == 1 {
+                        doc.selection_polygon = Some(vec![[-4., -3.], [13., -3.], [2., 15.]]);
+                    }
+                    if coverage == 2 {
+                        let mut mask = crate::raster::Raster::new(17, 19);
+                        for y in 0..19 {
+                            for x in 0..17 {
+                                let value =
+                                    [0, 1, 64, 127, 128, 254, 255][(x + y * 3) as usize % 7];
+                                mask.set(x, y, [value, 7, 11, 255]);
+                            }
+                        }
+                        doc.selection_coverage = Some(crate::selection::Coverage {
+                            mask,
+                            bounds: area,
+                            origin: [1, -2],
+                            contours: vec![],
+                        });
+                    }
+                    command["layer"] = json!(doc.layers[0].id);
+                    let expected = Engine::preview_edits(doc.clone(), &[command.clone()]).unwrap();
+                    let fixture = Fixture::from_legacy(doc);
+                    let session = fixture.session();
+                    let fragment = session.fresh().unwrap();
+                    let selection = Selection::new(&fixture.document).unwrap();
+                    let placement =
+                        Placement::for_selection(&selection, &command, &fixture.pool).unwrap();
+                    let layer = fixture.document.metadata().layers().next().unwrap();
+                    let source = fixture.document.source(layer.pixels().slot()).unwrap();
+                    let written = selected::write(
+                        source,
+                        &selection,
+                        &placement,
+                        layer.origin(),
+                        (kind == "fill").then_some(layer.color()),
+                        fragment.store(),
+                        &mut Work::new(20_000_000).unwrap(),
+                        &|| Ok(()),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        [written.surface.width(), written.surface.height()],
+                        [
+                            expected.layers[0].pixels.width,
+                            expected.layers[0].pixels.height
+                        ],
+                        "case{cases} depth{depth} kind{kind} coverage{coverage} command{command}"
+                    );
+                    planning::tests::assert_pixels(
+                        &written.surface,
+                        &expected.layers[0].pixels,
+                        &fixture.pool,
+                    );
+                    if coverage == 2 {
+                        let transformed = selected::write_coverage(
+                            &selection,
+                            &placement,
+                            fragment.store(),
+                            &mut Work::new(20_000_000).unwrap(),
+                            &|| Ok(()),
+                        )
+                        .unwrap();
+                        let old = expected.selection_coverage.as_ref().unwrap();
+                        assert_eq!(transformed.bounds(), old.bounds);
+                        assert_eq!(transformed.origin(), old.origin);
+                        planning::tests::assert_pixels(
+                            transformed.mask(),
+                            &old.mask,
+                            &fixture.pool,
+                        );
+                        assert_eq!(
+                            contour_edges(transformed.contours()),
+                            contour_edges(&old.contours)
+                        );
+                    }
+                    let b = placement.bounds;
+                    let expected_origin = if placement.noop {
+                        layer.origin()
+                    } else {
+                        [layer.origin()[0].min(b[0]), layer.origin()[1].min(b[1])]
+                    };
+                    assert_eq!(
+                        expected_origin,
+                        [expected.layers[0].x, expected.layers[0].y]
+                    );
+                    planning::tests::assert_pixels(
+                        source,
+                        &fixture.legacy.layers[0].pixels,
+                        &fixture.pool,
+                    );
+                    drop(written);
+                    drop(selection);
+                    drop(placement);
+                    session.abort_fragment(fragment, &|| Ok(())).unwrap();
+                    drop(session);
+                    fixture.finish();
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 72);
+}
+
+fn contour_edges(contours: &[Vec<[f32; 2]>]) -> Vec<([i32; 2], [i32; 2])> {
+    let mut edges = Vec::new();
+    for contour in contours {
+        for (i, point) in contour.iter().enumerate() {
+            let a = point.map(|v| v as i32);
+            let b = contour[(i + 1) % contour.len()].map(|v| v as i32);
+            let step = [(b[0] - a[0]).signum(), (b[1] - a[1]).signum()];
+            assert!(step[0] == 0 || step[1] == 0);
+            let mut p = a;
+            while p != b {
+                let q = [p[0] + step[0], p[1] + step[1]];
+                edges.push((p, q));
+                p = q;
+            }
+        }
+    }
+    edges.sort_unstable();
+    edges
+}
+
+#[test]
+fn selected_folder_geometry_scalar_preserves_canvas_clipping_and_contour_edges() {
+    use crate::transform::native::selected::{self, Placement, Selection};
+    for polygon in [false, true] {
+        for mut command in [
+            json!({"op":"move","dx":-3,"dy":2}),
+            json!({"op":"transform","angle":90}),
+            json!({"op":"transform","angle":17.5,"skew_x":11.25,"dx":3.25,"dy":-2.75,"fractional_translation":true}),
+        ] {
+            let mut doc = folder_document(16);
+            doc.selection = Some([-4, -3, 13, 15]);
+            if polygon {
+                doc.selection_polygon = Some(vec![[-4., -3.], [13., -3.], [2., 15.]]);
+            }
+            command["layer"] = json!(doc.layers[0].id);
+            let expected = Engine::preview_edits(doc.clone(), &[command.clone()]).unwrap();
+            let fixture = Fixture::from_legacy(doc);
+            let session = fixture.session();
+            let fragment = session.fresh().unwrap();
+            let selection = Selection::for_folder(&fixture.document).unwrap();
+            let placement = Placement::for_selection(&selection, &command, &fixture.pool).unwrap();
+            let output = selected::write_coverage(
+                &selection,
+                &placement,
+                fragment.store(),
+                &mut Work::new(20_000_000).unwrap(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let old = expected.selection_coverage.as_ref().unwrap();
+            assert_eq!(output.bounds(), old.bounds);
+            assert_eq!(output.origin(), old.origin);
+            planning::tests::assert_pixels(output.mask(), &old.mask, &fixture.pool);
+            assert_eq!(
+                contour_edges(output.contours()),
+                contour_edges(&old.contours)
+            );
+            drop(output);
+            drop(placement);
+            drop(selection);
+            session.abort_fragment(fragment, &|| Ok(())).unwrap();
+            drop(session);
+            fixture.finish();
+        }
+    }
+}

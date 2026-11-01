@@ -88,6 +88,23 @@ normalized command without allocating modified JSON per child. Selected-pixel
 commands remain closed until their complete policies and outputs use the same
 transaction.
 
+Selected-pixel sampling evaluates a virtual native cut and remainder directly
+from explicitly prepared current-source and coverage footprints. It keeps the
+old native8 alpha quantization, native16 channel bits, f32 selected inverse
+mapping, premultiplied interpolation and blend order. It splits mapped regions
+when pin/area admission is too large. No resident or temporary full-frame cut
+and remainder are produced. The writer preserves physical tile presence and
+padding where the resident clone path does, and reports retained-source
+invalidation independently of the final pixel comparison.
+
+The shared Engine has two geometric-selection routes: an ordinary layer
+transforms its matching polygon directly, while folder dispatch rasterizes
+geometry into a canvas-clipped scalar mask first. Matching raw coverage remains
+a separate source; its physical exterior, rather than its bounds hint, determines
+known zero during scalar resampling. The scalar writer retains the existing
+f32 expression, ordered-row completion proof and bounded contour extraction.
+These source producers do not yet constitute complete selected command adoption.
+
 Linked and unlinked mask/selection command integration,
 cancellation/history acceptance and
 full dense16K qualification are separate gates. Existing live limits remain

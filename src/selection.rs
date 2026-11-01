@@ -3,6 +3,7 @@ use crate::engine::Document;
 pub mod backed;
 mod contours;
 mod coverage_writer;
+pub(crate) use coverage_writer::stage_rows;
 pub mod display;
 mod flood;
 pub(crate) mod image_source;
