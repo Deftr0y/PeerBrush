@@ -243,6 +243,29 @@ fn fill_rectangle(
     }
     let mut hash = Context::new(&SHA256);
     let output_width = u64::from(input.output().width);
+    if rectangle.x == 0 && rectangle.width == input.output().width {
+        // Full-width native rows are one contiguous original-byte range.
+        // Authenticate once per covered chunk, rather than repeating the
+        // identical profile/inventory checks for every narrow image row.
+        let start = u64::from(rectangle.y) * output_width * pixel as u64;
+        let identity = input.cache_identity(buffers.binding, check)?;
+        buffers
+            .originals
+            .lock()
+            .map_err(|_| "Streaming original cache is poisoned")?
+            .copy_prefix(
+                identity,
+                start,
+                &mut buffers.window,
+                count,
+                &|| input.check(check),
+                |at, n, output| input.copy_complete_chunk(at, n, output, check),
+            )?;
+        hash.update(&buffers.window[..count]);
+        input.check(check)?;
+        return Ok((count, hash.finish().as_ref().try_into().unwrap()));
+    }
+
     for y in 0..rectangle.height {
         let at =
             (u64::from(rectangle.y + y) * output_width + u64::from(rectangle.x)) * pixel as u64;
