@@ -43,11 +43,19 @@ must cover actual surviving capacities. The payload and charge remain inseparabl
 through clones and history. Pins, byte scratch and disk reservations cannot use
 this external-owner hook or resize their accounted payloads.
 
-This budget excludes allocator overhead, indexing structures, document/history
-metadata and buffers not admitted through these pin/scratch APIs. The explicit
-record, resident-slot and manifest limits bound store structure counts; they are
-not a total process RAM bound. A full application admission policy must account
-for those other owners and scratch before enabling larger documents.
+Store block and weak-cache indexes now use fallible sorted buffers in the same
+budget. Every growth admits twice the requested new payload capacity before
+allocation, while the old buffer stays charged until its entries and storage
+drop. Failed growth preserves the old index and source bytes. Recovery preflights
+bounded record headers to admit the selected prefix's index, then still performs
+the complete SHA/reference/checkpoint validation pass. Header preflight alone
+grants no source authority.
+
+The index reservation is conservative capacity admission, not measured process
+RAM. Allocator/Arc bookkeeping, document/history metadata and buffers outside
+these admitted owners remain separate. Record, resident-slot and manifest limits
+also bound structure counts; larger-document activation still requires the
+complete application's admission and native qualification.
 
 Readers and writers use nonblocking operation admission. Cache/state mutexes are
 not held across I/O or caller checks. Reentrant or competing writes return `Busy`

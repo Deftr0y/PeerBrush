@@ -7,6 +7,7 @@ mod access;
 mod budget;
 mod bytes;
 mod disk;
+mod index;
 mod linear;
 mod planar;
 pub(crate) mod root;
