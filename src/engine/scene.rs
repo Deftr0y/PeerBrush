@@ -1218,3 +1218,4 @@ mod tests {
         assert!(invalid.visit_rasters(|_| Ok(())).is_err());
     }
 }
+
