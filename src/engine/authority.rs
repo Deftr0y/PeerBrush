@@ -94,6 +94,9 @@ impl DoubleEndedIterator for HistoryEntries<'_> {
 }
 impl ExactSizeIterator for HistoryEntries<'_> {}
 impl NativeCapture {
+    pub(crate) fn cancellation(&self) -> native::Cancellation {
+        self.edit.cancellation()
+    }
     pub(crate) fn document(&self) -> &native::NativeDocument {
         &self.document
     }
