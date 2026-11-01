@@ -7,6 +7,9 @@ use std::io::{self, Read, Write};
 
 pub(crate) type Digest = [u8; 32];
 pub(crate) const BUFFER_BYTES: usize = 64 * 1024;
+/// Leaves room inside the parent32MiB callback envelope for transport, completed
+/// segment, source-verification and short row buffers, with no raw-file cache.
+pub(crate) const WINDOW_ROWS: usize = 2032;
 pub(crate) const MAX_RECT_BYTES: u64 = 2048 * 2048 * 8;
 pub(crate) const MAX_HELD_BYTES: u32 = 128 * 1024 * 1024;
 pub(crate) const MAX_HELD_BUFFERS: u16 = 8;
@@ -14,9 +17,9 @@ pub(crate) const MAX_RECORDS: u32 = 131072;
 pub(crate) const MAX_CHILD_EVENTS: u32 = 1048576;
 pub(crate) const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub(crate) const MAX_ELAPSED_MS: u32 = 20 * 60 * 1000;
-const MAGIC: &[u8; 8] = b"PBJXLS02";
+const MAGIC: &[u8; 8] = b"PBJXLS03";
 const HEADER_BYTES: usize = 80;
-const CONFIG_BYTES: usize = 232;
+const CONFIG_BYTES: usize = 240;
 const ERROR: &str = "Invalid JPEG XL streaming transport";
 type Result<T> = std::result::Result<T, String>;
 
@@ -27,6 +30,7 @@ pub(crate) struct Configuration {
     pub profile_bytes: u32,
     pub raw_bytes: u64,
     pub max_input_bytes: u64,
+    pub max_source_read_bytes: u64,
     pub max_output_bytes: u64,
     pub max_log_bytes: u64,
     pub max_records: u32,
@@ -54,6 +58,8 @@ impl Configuration {
             || raw != Some(self.raw_bytes)
             || self.max_input_bytes == 0
             || self.max_input_bytes > source_work_ceiling(self.raw_bytes)?
+            || self.max_source_read_bytes == 0
+            || self.max_source_read_bytes > source_read_ceiling(self.raw_bytes)?
             || self.profile_bytes == 0
             || self.profile_bytes > 4 * 1024 * 1024
             || self.max_output_bytes == 0
@@ -102,6 +108,7 @@ impl Configuration {
             bytes[64 + i * 32..96 + i * 32].copy_from_slice(digest);
         }
         bytes[224..232].copy_from_slice(&self.max_input_bytes.to_le_bytes());
+        bytes[232..240].copy_from_slice(&self.max_source_read_bytes.to_le_bytes());
         bytes
     }
     fn decode(bytes: &[u8; CONFIG_BYTES]) -> Result<Self> {
@@ -122,6 +129,7 @@ impl Configuration {
             profile_bytes: u32le(&bytes[20..24]),
             raw_bytes: u64le(&bytes[24..32]),
             max_input_bytes: u64le(&bytes[224..232]),
+            max_source_read_bytes: u64le(&bytes[232..240]),
             max_output_bytes: u64le(&bytes[32..40]),
             max_log_bytes: u64le(&bytes[40..48]),
             max_records: u32le(&bytes[48..52]),
@@ -140,7 +148,7 @@ impl Configuration {
     pub(crate) fn binding(&self, nonce: [u8; 16]) -> Result<Digest> {
         self.validate()?;
         let mut hash = Context::new(&SHA256);
-        hash.update(b"PeerBrushJxlStreamingV2\0");
+        hash.update(b"PeerBrushJxlStreamingV3\0");
         hash.update(&nonce);
         hash.update(&self.encode());
         Ok(hash.finish().as_ref().try_into().unwrap())
@@ -159,6 +167,12 @@ pub(crate) fn source_work_ceiling(raw_bytes: u64) -> Result<u64> {
     raw_bytes
         .checked_mul(8)
         .and_then(|n| n.checked_add(MAX_RECT_BYTES))
+        .ok_or_else(|| ERROR.into())
+}
+pub(crate) fn source_read_ceiling(raw_bytes: u64) -> Result<u64> {
+    raw_bytes
+        .checked_mul(64)
+        .and_then(|n| n.checked_add(256 * 1024 * 1024))
         .ok_or_else(|| ERROR.into())
 }
 /// Admit control transcript/index ownership from this bound as well as DATA
@@ -915,6 +929,7 @@ mod tests {
             profile_bytes: 132,
             raw_bytes: 64 * 16 * 8,
             max_input_bytes: 8 * 64 * 16 * 8 + MAX_RECT_BYTES,
+            max_source_read_bytes: 64 * 64 * 16 * 8 + 256 * 1024 * 1024,
             max_output_bytes: 1024 * 1024,
             max_log_bytes: 2 * 1024 * 1024,
             max_records: 128,
@@ -1552,5 +1567,22 @@ mod tests {
         let mut old = [0u8; HEADER_BYTES];
         old[..8].copy_from_slice(b"PBJXLS01");
         assert!(Frame::read(&mut Cursor::new(old), &|| Ok(())).is_err());
+    }
+    #[test]
+    fn physical_source_read_policy_is_explicit_bound_and_domain_separated() {
+        let mut config = configuration();
+        let original = config.binding([7; 16]).unwrap();
+        config.max_source_read_bytes -= 1;
+        assert_ne!(original, config.binding([7; 16]).unwrap());
+        assert_eq!(Configuration::decode(&config.encode()).unwrap(), config);
+        config.max_source_read_bytes = 0;
+        assert!(config.validate().is_err());
+        config.max_source_read_bytes = source_read_ceiling(config.raw_bytes).unwrap() + 1;
+        assert!(config.validate().is_err());
+        assert!(source_read_ceiling(u64::MAX).is_err());
+        let mut old = [0u8; HEADER_BYTES];
+        old[..8].copy_from_slice(b"PBJXLS02");
+        assert!(Frame::read(&mut Cursor::new(old), &|| Ok(())).is_err());
+        assert!((2048 * WINDOW_ROWS * 8) as u64 <= MAX_RECT_BYTES - 4 * BUFFER_BYTES as u64);
     }
 }

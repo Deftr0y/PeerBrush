@@ -212,7 +212,7 @@ impl Inner<'_> {
         // all wire windows remain <=2048 with SAME8IDs/128MiB accounting.
         let parts = width
             .div_ceil(2048)
-            .checked_mul(height.div_ceil(2048))
+            .checked_mul(height.div_ceil(wire::WINDOW_ROWS))
             .ok_or(ERROR)?;
         let held_ids: usize = self.held.iter().flatten().map(|h| h.id_count).sum();
         if parts == 0
@@ -244,12 +244,12 @@ impl Inner<'_> {
         if held.allocated() != allocation {
             return Err(ERROR.into());
         }
-        for top in (0..height).step_by(2048) {
+        for top in (0..height).step_by(wire::WINDOW_ROWS) {
             for left in (0..width).step_by(2048) {
                 self.active()?;
                 let id = self.last_id.checked_add(1).ok_or(ERROR)?;
                 let w = (width - left).min(2048);
-                let h = (height - top).min(2048);
+                let h = (height - top).min(wire::WINDOW_ROWS);
                 let rectangle = Rectangle {
                     id,
                     x: (x + left).try_into().map_err(|_| ERROR)?,
@@ -751,6 +751,7 @@ mod tests {
             profile_bytes: 132,
             raw_bytes: 512,
             max_input_bytes: 8 * 512 + wire::MAX_RECT_BYTES,
+            max_source_read_bytes: 64 * 512 + 256 * 1024 * 1024,
             max_output_bytes: 65536,
             max_log_bytes: 65536,
             max_records: 16,
