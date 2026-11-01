@@ -336,6 +336,24 @@ impl TileIndex {
     pub(crate) fn blocks(&self) -> &BTreeMap<(u32, u32), BlockRef> {
         &self.blocks
     }
+    /// The session adapter seals the complete coordinate map before this
+    /// transfer. Provisional admission remains held until Surface has acquired
+    /// its permanent index charge; neither conversion publishes the fragment.
+    pub(super) fn into_surface(self) -> Result<(crate::raster::Surface, Complete), String> {
+        let Self {
+            blocks,
+            store,
+            complete,
+            _index_charge,
+        } = self;
+        let h = complete.header();
+        let plane =
+            crate::raster::backed::Plane::from_blocks(h.width, h.height, h.depth, store, blocks)
+                .map_err(|e| e.to_string())?;
+        let surface = crate::raster::Surface::from_plane(plane).map_err(|e| e.to_string())?;
+        drop(_index_charge);
+        Ok((surface, complete))
+    }
 }
 impl PassSet {
     pub(crate) fn is_plain(&self) -> bool {
