@@ -5,6 +5,7 @@ pub(crate) mod policy;
 pub(crate) mod pose;
 pub(crate) mod projection;
 pub(crate) mod stage;
+pub(crate) mod transaction;
 use crate::{
     engine::{Document, Layer},
     raster::{check_size, Raster},

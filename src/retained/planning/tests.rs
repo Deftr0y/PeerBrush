@@ -59,7 +59,7 @@ impl RasterCollector for Collector {
         Err("Unexpected fixture source".into())
     }
 }
-fn fixture(depth: u16, kind: &str, linked: Option<bool>) -> Document {
+pub(in crate::retained) fn fixture(depth: u16, kind: &str, linked: Option<bool>) -> Document {
     let mut doc = Document::new_depth(17, 19, depth).unwrap();
     let layer = &mut doc.layers[0];
     layer.x = -7;
@@ -107,7 +107,7 @@ fn fixture(depth: u16, kind: &str, linked: Option<bool>) -> Document {
     }
     doc
 }
-fn native_document(
+pub(in crate::retained) fn native_document(
     doc: &Document,
     pool: &ResidentBudget,
     disk: &DiskBudget,
@@ -131,7 +131,11 @@ fn native_document(
     )
     .unwrap()
 }
-fn assert_pixels(actual: &Surface, expected: &Raster, pool: &ResidentBudget) {
+pub(in crate::retained) fn assert_pixels(
+    actual: &Surface,
+    expected: &Raster,
+    pool: &ResidentBudget,
+) {
     assert_eq!(
         [actual.width(), actual.height()],
         [expected.width, expected.height]
