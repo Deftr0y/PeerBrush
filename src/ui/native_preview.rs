@@ -1,6 +1,6 @@
 //! Presentation accepts only complete tagged display pixels from the worker.
 //! Acquiring/capturing a source session belongs to the off-UI dispatcher.
-use super::preview_worker::{NativeReplies, Worker};
+use super::preview_worker::{NativeOutput, NativeReplies, Worker};
 use crate::engine::native::DocumentKey;
 use crate::render::native_preview::{Frame, Request, Tag};
 use eframe::egui;
@@ -11,6 +11,30 @@ pub(super) struct Presentation {
     replies: NativeReplies,
 }
 impl Presentation {
+    pub fn request_uploads(
+        &mut self,
+        worker: &mut Worker,
+        request: Request,
+        job: u64,
+        retirement: super::native_texture::Retirement,
+        side: usize,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let tag = request.tag();
+        let ctx = ctx.clone();
+        worker
+            .request_native_uploads(
+                request,
+                job,
+                self.replies.clone(),
+                retirement,
+                side,
+                move || ctx.request_repaint(),
+            )
+            .map_err(|_| "Native preview worker could not start".to_owned())?;
+        self.expected = Some((job, tag));
+        Ok(())
+    }
     pub fn request(
         &mut self,
         worker: &mut Worker,
@@ -52,6 +76,40 @@ impl Presentation {
         revision: u64,
         job: u64,
     ) -> Result<Option<Frame>, String> {
+        let Some(reply) = self.take_output(current, revision, job)? else {
+            return Ok(None);
+        };
+        let NativeOutput::Pixels(frame) = reply else {
+            return Err("Native preview returned uploads to a pixel-only consumer".into());
+        };
+        if !frame.matches(&self.expected.as_ref().unwrap().1) {
+            return Err("Native preview reply does not match its captured request".into());
+        }
+        Ok(Some(frame))
+    }
+    pub fn take_uploads(
+        &mut self,
+        current: DocumentKey,
+        revision: u64,
+        job: u64,
+    ) -> Result<Option<super::native_texture::Prepared>, String> {
+        let Some(reply) = self.take_output(current, revision, job)? else {
+            return Ok(None);
+        };
+        let NativeOutput::Uploads(prepared) = reply else {
+            return Err("Native preview returned raw pixels to an upload-only consumer".into());
+        };
+        if prepared.tag().key() != self.expected.as_ref().unwrap().1.key() {
+            return Err("Native upload reply does not match its captured request".into());
+        }
+        Ok(Some(prepared))
+    }
+    fn take_output(
+        &mut self,
+        current: DocumentKey,
+        revision: u64,
+        job: u64,
+    ) -> Result<Option<NativeOutput>, String> {
         let Some(reply) = self.replies.take() else {
             return Ok(None);
         };
@@ -66,11 +124,7 @@ impl Presentation {
         {
             return Ok(None);
         }
-        let frame = reply.result?;
-        if !frame.matches(expected_tag) {
-            return Err("Native preview reply does not match its captured request".into());
-        }
-        Ok(Some(frame))
+        Ok(Some(reply.result?))
     }
     pub fn clear(&mut self) {
         self.expected = None;
@@ -79,6 +133,63 @@ impl Presentation {
 }
 
 impl super::PeerBrush {
+    pub(crate) fn queue_native_uploads(
+        &mut self,
+        request: Request,
+        retirement: super::native_texture::Retirement,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let job = self
+            .preview_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        self.preview_job = job;
+        self.pending = true;
+        let side = ctx.input(|i| i.max_texture_side);
+        if let Err(error) = self.native_preview.request_uploads(
+            &mut self.preview_worker,
+            request,
+            job,
+            retirement,
+            side,
+            ctx,
+        ) {
+            self.pending = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+    pub(crate) fn present_native_uploads(
+        &mut self,
+        current: DocumentKey,
+        revision: u64,
+        ctx: &egui::Context,
+    ) -> Result<bool, String> {
+        let prepared = match self
+            .native_preview
+            .take_uploads(current, revision, self.preview_job)
+        {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                self.pending = false;
+                return Err(error);
+            }
+        };
+        self.pending = false;
+        let tag = prepared.tag().clone();
+        let epoch = self.preview_epoch.clone();
+        let job = self.preview_job;
+        self.native_canvas.present(prepared, &tag, ctx, &mut || {
+            if epoch.load(std::sync::atomic::Ordering::Relaxed) == job {
+                Ok(())
+            } else {
+                Err("Native display superseded".into())
+            }
+        })?;
+        self.canvas_generation = self.canvas_generation.wrapping_add(1);
+        Ok(true)
+    }
     /// The native dispatcher hands over an already-captured request. Live
     /// Engine document migration is separate from this nominal worker route.
     pub(crate) fn queue_native_preview(
@@ -349,7 +460,7 @@ mod tests {
             .complete(super::super::preview_worker::NativeReply {
                 job: 9,
                 tag: frame.tag(),
-                result: Ok(frame),
+                result: Ok(NativeOutput::Pixels(frame)),
             });
         assert!(presentation
             .take(other.key(), doc.revision, 9)

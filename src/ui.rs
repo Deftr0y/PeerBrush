@@ -27,6 +27,7 @@ mod layers;
 mod lifecycle;
 mod liquify;
 mod native_preview;
+mod native_texture;
 mod new_canvas;
 mod pattern_source;
 mod pen;
@@ -500,6 +501,7 @@ pub struct PeerBrush {
     preview_epoch: Arc<std::sync::atomic::AtomicU64>,
     preview_job: u64,
     native_preview: native_preview::Presentation,
+    native_canvas: native_texture::Presenter,
     #[cfg(test)]
     parameter_worker_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
     #[cfg(test)]
@@ -878,6 +880,7 @@ impl PeerBrush {
             preview_epoch,
             preview_job: 0,
             native_preview: native_preview::Presentation::default(),
+            native_canvas: native_texture::Presenter::default(),
             #[cfg(test)]
             parameter_worker_gate: None,
             #[cfg(test)]
@@ -3752,7 +3755,17 @@ impl PeerBrush {
         let painter = ui.painter().with_clip_rect(available);
         let visible = view.bounds(rect, scale).intersect(available);
         view.image(&painter, rect, scale, view::checker(ui.ctx()).id(), true);
-        if let Some(texture) = self.texture.as_ref().filter(|_| {
+        if let Some(canvas) = self
+            .native_canvas
+            .current()
+            .filter(|c| c.key().identity.document_id == doc.id)
+        {
+            canvas.paint_with(
+                &painter,
+                |point| view.point(point, rect, scale),
+                Color32::WHITE,
+            );
+        } else if let Some(texture) = self.texture.as_ref().filter(|_| {
             self.proposal_review.is_none()
                 || self.proposal_rendered.as_deref() == Some(self.live_key().as_str())
         }) {
@@ -6278,6 +6291,7 @@ impl eframe::App for PeerBrush {
     fn on_exit(&mut self) {
         self.preview_worker.stop();
         self.native_preview.clear();
+        self.native_canvas.clear();
         crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
         if self.update_exit_committed() {
             return;

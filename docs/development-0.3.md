@@ -6,6 +6,15 @@ preview sampling grid, target isolation and display projection; unsupported ICC,
 mask, effect and editable-source providers fail explicitly. Live native routing
 and complete provider qualification remain integration gates.
 
+Native presentation uses bounded stock-egui texture tiles with neighboring-pixel
+halos and cropped coordinates. Conversion and replacement owners share the native
+admission pool. A retirement owner keeps each upload image until all framework
+and renderer image owners release it, then destroys its pixels before refunding
+their charge. Complete candidate textures replace the preceding canvas together;
+resource, cancellation and stale-request refusals preserve the preceding frame.
+This accounts for owned CPU upload buffers, not opaque graphics-driver memory or
+total process RAM. Native graphics acceptance remains required.
+
 November 1 native-source foundations (unreleased): explicit captured scenes,
 fallible prepared regions, native tile edit kernels and complete bounded Source36
 container verification are being integrated. Source36 has its own strict metadata,
