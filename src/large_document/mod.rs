@@ -18,6 +18,7 @@ pub use budget::{Reservation, ResidentBudget};
 pub use bytes::{
     AppendWriter, ByteRole, BytesCursor, CompletedBytes, LargeSourceTemporary, MAX_SOURCE_PAYLOAD,
 };
+pub(crate) use disk::{CoexistenceSettlement, CoexistenceTicket};
 pub use disk::{DiskBudget, DiskReservation};
 pub use planar::{CompletedPlanar, PlanarRole, PlanarScratch, PlanarSpec};
 pub use scalar::{CompletedScalar, ScalarScratch, ScalarSpec};
