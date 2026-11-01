@@ -10,6 +10,18 @@ use std::{
 
 pub(crate) trait StageSession {
     fn check(&self) -> Result<()>;
+    /// Existing implementations remain conservative until the concrete service
+    /// supplies its retained-instance cleanup-only admission check.
+    fn cleanup_check(&self) -> Result<()> {
+        self.check()
+    }
+    fn abort_fragment(
+        &self,
+        _fragment: crate::large_document::FreshFragment,
+        _cleanup: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        Err("Source service retirement is unavailable; source bytes remain charged".into())
+    }
     fn store_for_lineage(&self, lineage: [u8; 16]) -> Result<Store>;
     fn seal_store(&self, store: &Store, blocks: &[BlockRef], metadata: &[u8]) -> Result<Snapshot>;
 }
