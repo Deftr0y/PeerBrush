@@ -94,8 +94,18 @@ source revision and do not publish blocks or enter history. The final candidate
 advances once, retains the original document generation guard and the union of
 initial and working command scopes, and enters one history record. Foreign,
 duplicate, out-of-order or cancelled steps cannot advance the working state.
+An intermediate step receipt cannot enter history or publish independently, even
+when its first working generation still equals the public document generation.
 Superseded intermediate fragments currently remain conservatively retained;
 reachability retirement/compaction remains required before full admission.
+
+The normalized metadata dispatcher handles layer creation, updates, deletion,
+ordering, clipping and parenting, plus mask removal, enable and link changes.
+Canonical roster rebuilding preserves the exact immutable sources and removes
+only unreachable locations. Folder foreground fill uses a separate typed
+insertion paired with its sealed complete canvas output; it never replaces the
+folder's dummy plane. Other structural/source/effect commands and selective task
+compensation remain required before live editor migration.
 
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,
