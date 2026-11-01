@@ -364,10 +364,28 @@ pub(super) mod tests {
                 })
                 .unwrap(),
         };
+        let diagnostic_disk = blank.disk_budget().clone();
+        // 1..4 initial source; 10..19 equal/expand/shrink; 20..24 hidden padding;
+        // 30 final resident release. ok=0 is the expected refused branch.
+        macro_rules! diagnostic {
+            ($step:expr, $width:expr, $ok:expr) => {
+                eprintln!(
+                    "PB_RETAINED_DIAG step={} width={} resident={} disk={} ok={}",
+                    $step,
+                    $width,
+                    pool.used(),
+                    diagnostic_disk.used().unwrap_or(u64::MAX),
+                    $ok
+                );
+            };
+        }
+        diagnostic!(1, 0, 1);
         let (first, path) = draft(&blank);
+        diagnostic!(2, 0, 1);
         let first = first
             .seal(&blank, &Session, &|| Ok(()))
             .unwrap_or_else(|e| panic!("{}", e.reason()));
+        diagnostic!(3, 0, 1);
         let stored = first.surface().clone();
         first.mark_published();
         let metadata_owner = MetadataCharge::reserve(&pool, 64 * 1024, &|| Ok(())).unwrap();
@@ -392,6 +410,7 @@ pub(super) mod tests {
         )
         .unwrap();
         let base = NativeDocument::from_pending(pending).unwrap();
+        diagnostic!(4, 0, 1);
         let target = base.metadata().layer(0).unwrap().pixels().slot();
         let original = base
             .metadata()
@@ -403,8 +422,14 @@ pub(super) mod tests {
             .pixels()
             .slot();
         let original_key = base.source(original).unwrap().key();
+        // Published files remain in the non-refunding ledger. Keep their names
+        // alive until all source creation finishes so Unix inode reuse cannot
+        // make a later fixture alias a deliberately retained identity.
+        let mut published_paths = Vec::with_capacity(2);
         for width in [8, 16, 4] {
+            diagnostic!(10, width, 1);
             let (mut next, next_path) = draft(&base);
+            diagnostic!(11, width, 1);
             let tile = next.surface.physical_tiles().next().unwrap();
             let owner = tile.owner().clone();
             let reference = tile.reference();
@@ -420,9 +445,11 @@ pub(super) mod tests {
                 .unwrap(),
             )
             .unwrap();
+            diagnostic!(12, width, 1);
             let output = next
                 .seal(&base, &Session, &|| Ok(()))
                 .unwrap_or_else(|e| panic!("{}", e.reason()));
+            diagnostic!(13, width, 1);
             assert_ne!(base.source(target).unwrap().key(), output.surface().key());
             let patch = RasterPatch {
                 target,
@@ -431,9 +458,11 @@ pub(super) mod tests {
                 layer_origin: None,
             };
             let prepared = base.capture_edit().unwrap().raster_patch(patch, &|| Ok(()));
+            diagnostic!(14, width, u8::from(prepared.is_ok()));
             if width >= 8 {
                 let prepared = prepared.unwrap_or_else(|e| panic!("{}", e.reason()));
                 let current = base.publish("human", &[], 1, false, prepared).unwrap();
+                diagnostic!(15, width, 1);
                 let raster = current.metadata().layer(0).unwrap().pixels();
                 assert_eq!(raster.width(), width);
                 assert_eq!(
@@ -444,20 +473,26 @@ pub(super) mod tests {
                     original_key
                 );
                 drop(current);
-                std::fs::remove_dir_all(next_path).unwrap();
+                diagnostic!(16, width, 1);
+                published_paths.push(next_path);
+                diagnostic!(17, width, 1);
             } else {
                 let refused = prepared.err().unwrap();
                 assert!(refused.reason().contains("source reconciliation"));
                 refused.abort(&Session, &|| Ok(())).unwrap();
+                diagnostic!(18, width, 0);
                 std::fs::remove_dir(next_path).unwrap();
+                diagnostic!(19, width, 0);
             }
         }
         // Hidden native RGB in physical padding is part of exact equivalence.
+        diagnostic!(20, 0, 1);
         let (changed, changed_path) =
             draft_with(&base, &mut |bytes| bytes[(200 * 256 + 200) * 8] = 1);
         let output = changed
             .seal(&base, &Session, &|| Ok(()))
             .unwrap_or_else(|e| panic!("{}", e.reason()));
+        diagnostic!(21, 0, 1);
         let refused = base
             .capture_edit()
             .unwrap()
@@ -473,11 +508,18 @@ pub(super) mod tests {
             .err()
             .unwrap();
         assert!(refused.reason().contains("source reconciliation"));
+        diagnostic!(22, 0, 0);
         refused.abort(&Session, &|| Ok(())).unwrap();
+        diagnostic!(23, 0, 0);
         std::fs::remove_dir(changed_path).unwrap();
+        diagnostic!(24, 0, 0);
         drop(base);
         drop(blank);
+        for published in published_paths {
+            std::fs::remove_dir_all(published).unwrap();
+        }
         std::fs::remove_dir_all(path).unwrap();
+        diagnostic!(30, 0, 1);
         assert_eq!(pool.used(), 0);
     }
 }
