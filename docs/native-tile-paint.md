@@ -41,3 +41,11 @@ result delivery are explicit callbacks; a source, sink or cancellation failure
 cannot complete the visit. Previously delivered results remain provisional and
 cannot authorize partial engine publication. Use the validated current polygon
 from `selection::polygon`, preserving the legacy stale-polygon rule.
+
+`PreparedClear` consumes already-prepared selection confidence in document
+coordinates. It preserves the existing f32-to-f64 alpha calculation, clears
+hidden RGB only when a selected pixel's resulting alpha is zero, and leaves
+physical padding untouched. Invalid confidence, an undeclared coverage sample,
+cancellation or a foreign pool returns no partial tile. The caller must bind
+the prepared coverage and original color/mask slot to the captured scene before
+the common engine transaction can adopt the result.
