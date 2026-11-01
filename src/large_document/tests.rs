@@ -1554,3 +1554,44 @@ fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
     assert_eq!(disk.used().unwrap(), physical);
     println!("dense backing component: {tile_count} full native16 tiles, {physical} encoded file bytes (all payload bytes written, allocated disk clusters not measured), canonical BE readback, resident pin payload <= {} bytes, persistent_reserved_bytes={}, retained after owner drop, elapsed_ms={}, file_sha256={file_sha256}, checkpoint_sha256={checkpoint_sha256}; no total RAM/editor/PSB/history qualification",spec.bytes(),disk.used().unwrap(),started.elapsed().as_millis());
 }
+
+#[test]
+fn in_place_fragment_publication_mark_retains_token_and_irreversibly_refuses_abort() {
+    let fixture = Fixture::new();
+    let resident = ResidentBudget::new(1024 * 1024).unwrap();
+    let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+    let fragment =
+        FreshFragment::create(&fixture.root(), resident.clone(), disk.clone(), limits()).unwrap();
+    assert!(!fragment.store().publication_marked());
+    let reference = fragment
+        .store()
+        .put(
+            TileSpec::new(1, 1, 16).unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            &mut okay,
+        )
+        .unwrap();
+    let sealed = fragment
+        .store()
+        .commit(
+            fragment.store().identity(),
+            1,
+            None,
+            b"candidate",
+            &[reference],
+            &mut okay,
+        )
+        .unwrap();
+    let retained = disk.used().unwrap();
+    let same_owner = fragment.store().clone();
+    fragment.mark_published();
+    fragment.mark_published();
+    assert!(fragment.store().publication_marked());
+    assert!(same_owner.publication_marked());
+    assert_eq!(disk.used().unwrap(), retained);
+    drop((sealed, same_owner));
+    assert!(matches!(fragment.abort(&mut okay), Err(Error::Invalid(_))));
+    assert_eq!(disk.used().unwrap(), retained);
+    assert!(fixture.root().join("blocks.pbt").is_file());
+    assert_eq!(resident.used(), 0);
+}
