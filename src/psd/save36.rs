@@ -296,11 +296,12 @@ pub(crate) fn prepare<'a>(
         drop(counts);
         let candidate = &staging[3];
         let mut guarded = || io_check(check);
-        let source = Source::new(
+        let source = Source::with_buffer(
             candidate
                 .cursor(0, candidate.payload_length(), &mut guarded)
                 .map_err(|e| e.to_string())?,
             candidate.payload_length(),
+            ScratchBytes::new(scene.budget(), 65536, 65536).map_err(|e| e.to_string())?,
         )?;
         let whole = Span {
             offset: 0,

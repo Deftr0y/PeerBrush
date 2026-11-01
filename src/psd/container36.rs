@@ -682,6 +682,192 @@ mod tests {
         (bytes, token)
     }
     #[test]
+    fn buffered_tiny_complete_source_proof_refuses_same_length_late_mutation_and_stays_failed() {
+        use crate::psd::read36::{self, VerificationLimits};
+        use std::{
+            cell::RefCell,
+            io::{Seek, SeekFrom},
+            rc::Rc,
+        };
+        struct Shared(Rc<RefCell<Cursor<Vec<u8>>>>);
+        impl Read for Shared {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().read(out)
+            }
+        }
+        impl Seek for Shared {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                self.0.borrow_mut().seek(from)
+            }
+        }
+        let check = || Ok(());
+        let layer = [0; 8];
+        let composite = [0, 0, 255, 255, 255, 0];
+        let core = StagedCore::new(
+            Core {
+                format: 36,
+                source_id: "61f53110-3789-4693-81d7-56136f750be2".into(),
+                revision: 1,
+                metadata: json!({"proof_only":true}),
+                rasters: vec![Raster {
+                    id: 1,
+                    width: 1,
+                    height: 1,
+                    depth: 8,
+                    references: 0,
+                }],
+                tiles: 0,
+                references: 0,
+                tile_root: root(b"PeerBrushSource36Tiles\0", &[]),
+                reference_root: root(b"PeerBrushSource36Refs\0", &[]),
+            },
+            metadata(),
+            limits(),
+            &check,
+        )
+        .unwrap();
+        let standard_sha = bulk36::standard_digest(
+            &mut layer.as_slice(),
+            layer.len() as u64,
+            &mut composite.as_slice(),
+            composite.len() as u64,
+            &check,
+        )
+        .unwrap();
+        let manifest = Manifest::bind(
+            core,
+            layer.len() as u64,
+            composite.len() as u64,
+            standard_sha,
+            vec![],
+            limits(),
+            &check,
+        )
+        .unwrap();
+        let mut counts = [0];
+        let bulk = BulkVerifier::new(manifest.plan(), limits(), &mut [], &mut counts, &check)
+            .unwrap()
+            .finish(&check)
+            .unwrap();
+        let standard = manifest
+            .verify_standard(
+                &mut layer.as_slice(),
+                layer.len() as u64,
+                &mut composite.as_slice(),
+                composite.len() as u64,
+                &check,
+            )
+            .unwrap();
+        let mut encoded = vec![];
+        let compressed = compress_manifest(&manifest, metadata(), &mut encoded, &check).unwrap();
+        let mut output = vec![];
+        write(
+            &mut output,
+            Header {
+                format: Format::Psd,
+                width: 1,
+                height: 1,
+                depth: 8,
+                channels: 4,
+            },
+            &manifest,
+            metadata(),
+            &compressed,
+            &mut encoded.as_slice(),
+            &standard,
+            &bulk,
+            &mut layer.as_slice(),
+            &mut composite.as_slice(),
+            None,
+            &mut [0; 65536],
+            &check,
+        )
+        .unwrap();
+        assert!(
+            output.len() < 65536,
+            "Whole byte-proof fixture fits in one read window"
+        );
+        let index = structural::index(
+            &mut Cursor::new(&output),
+            structural::Limits::current(),
+            || Ok(()),
+        )
+        .unwrap();
+        let sha = digest(&output);
+        let bytes = Rc::new(RefCell::new(Cursor::new(output)));
+        let pool = crate::large_document::ResidentBudget::new(65536 * 2).unwrap();
+        let source = Source::with_buffer(
+            Shared(bytes.clone()),
+            index.file_bytes,
+            crate::large_document::ScratchBytes::new(&pool, 65536, 65536).unwrap(),
+        )
+        .unwrap();
+        let resource = index.resources.iter().find(|r| r.peerbrush_source).unwrap();
+        let encoded = Span {
+            offset: resource.data.offset + 4,
+            bytes: resource.data.bytes - 4,
+        };
+        let manifest = crate::psd::manifest36::inflate(
+            &mut source.range(encoded, &check).unwrap(),
+            encoded.bytes,
+            metadata(),
+            limits(),
+            &check,
+        )
+        .unwrap();
+        let mut scratch = vec![0; bulk36::MAX_TILE_BYTES];
+        let proof = read36::verify(
+            &source,
+            &index,
+            sha,
+            &manifest,
+            VerificationLimits {
+                bulk: limits(),
+                native_streams: 1,
+            },
+            &mut [],
+            &mut [0],
+            &mut scratch,
+            &check,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let mut cached = vec![0; index.file_bytes as usize];
+        source
+            .range(
+                Span {
+                    offset: 0,
+                    bytes: index.file_bytes,
+                },
+                &check,
+            )
+            .unwrap()
+            .read_exact(&mut cached)
+            .unwrap();
+        let at = index.composite.span.offset as usize + 2;
+        bytes.borrow_mut().get_mut()[at] ^= 1;
+        let mut observed = vec![0; cached.len()];
+        source
+            .range(
+                Span {
+                    offset: 0,
+                    bytes: index.file_bytes,
+                },
+                &check,
+            )
+            .unwrap()
+            .read_exact(&mut observed)
+            .unwrap();
+        assert_eq!(observed, cached);
+        assert!(proof
+            .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
+            .is_err());
+        bytes.borrow_mut().get_mut()[at] ^= 1;
+        assert!(proof
+            .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
+            .is_err());
+    }
+    #[test]
     fn native_multistrip_psd_psb_container_replay_preserves_standard_rows_and_complete_bulk() {
         let check = || Ok(());
         for format in [Format::Psd, Format::Psb] {
@@ -1129,12 +1315,14 @@ mod tests {
         }
         let sha = digest(&output);
         let bytes = std::rc::Rc::new(std::cell::RefCell::new(output));
-        let source = Source::new(
+        let pool = crate::large_document::ResidentBudget::new(65536 * 2).unwrap();
+        let source = Source::with_buffer(
             MutableInput {
                 bytes: bytes.clone(),
                 position: 0,
             },
             index.file_bytes,
+            crate::large_document::ScratchBytes::new(&pool, 65536, 65536).unwrap(),
         )
         .unwrap();
         let proof = read36::verify(

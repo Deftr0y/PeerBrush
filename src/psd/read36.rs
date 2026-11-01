@@ -216,6 +216,7 @@ fn hash_range<R: Read + Seek>(
     scratch: &mut [u8],
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Digest, String> {
+    source.unchanged_length()?;
     hash_reader(&mut source.range(span, check)?, span.bytes, scratch, check)
 }
 fn hash_reader(

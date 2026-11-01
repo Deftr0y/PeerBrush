@@ -6,7 +6,7 @@
 //! interpretation remains the existing semantic codec's responsibility.
 use super::structural::{Compression, Encoding, Format, Span};
 use flate2::{Decompress, FlushDecompress, Status};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{self, Read, Seek, SeekFrom};
 
 const TRANSFER: usize = 64 * 1024;
@@ -15,6 +15,13 @@ const MAX_ROW_BYTES: u64 = 300_000 * 2; // Native16 at the Photoshop PSB format 
 pub(crate) struct Source<R> {
     input: RefCell<R>,
     bytes: u64,
+    window: RefCell<Option<ReadWindow>>,
+    window_valid: Cell<bool>,
+}
+struct ReadWindow {
+    bytes: crate::large_document::ScratchBytes,
+    offset: u64,
+    used: usize,
 }
 
 impl<R: Read + Seek> Source<R> {
@@ -29,7 +36,29 @@ impl<R: Read + Seek> Source<R> {
         Ok(Self {
             input: RefCell::new(input),
             bytes: expected_bytes,
+            window: RefCell::new(None),
+            window_valid: Cell::new(false),
         })
+    }
+
+    /// Owned Source36 readback only. The caller admits this exact transfer owner
+    /// from its scene pool; legacy sources remain unbuffered. Cached observations
+    /// never replace the fresh whole-source checks at unchanged_length boundaries.
+    pub(crate) fn with_buffer(
+        input: R,
+        expected_bytes: u64,
+        buffer: crate::large_document::ScratchBytes,
+    ) -> Result<Self, String> {
+        if buffer.len() != TRANSFER {
+            return Err("Photoshop source read window differs from its 64 KiB admission".into());
+        }
+        let source = Self::new(input, expected_bytes)?;
+        *source.window.borrow_mut() = Some(ReadWindow {
+            bytes: buffer,
+            offset: 0,
+            used: 0,
+        });
+        Ok(source)
     }
 
     /// A separate bounded cursor for existing semantic resource/tag consumers.
@@ -61,6 +90,42 @@ impl<R: Read + Seek> Source<R> {
                 "Photoshop read exceeds indexed source",
             ));
         }
+        let mut window = self
+            .window
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("Photoshop read window is already borrowed"))?;
+        if let Some(window) = window.as_mut() {
+            if self.window_valid.get()
+                && position >= window.offset
+                && position - window.offset < window.used as u64
+            {
+                let begin = (position - window.offset) as usize;
+                let count = out.len().min(window.used - begin);
+                out[..count].copy_from_slice(&window.bytes[begin..begin + count]);
+                return Ok(count);
+            }
+            self.window_valid.set(false);
+            window.used = 0;
+            let mut input = self
+                .input
+                .try_borrow_mut()
+                .map_err(|_| io::Error::other("Photoshop stream is already borrowed"))?;
+            if input.seek(SeekFrom::Start(position))? != position {
+                return Err(io::Error::other("Photoshop stream seek differs"));
+            }
+            let limit = (self.bytes - position).min(TRANSFER as u64) as usize;
+            let count = input.read(&mut window.bytes[..limit])?;
+            if count > limit {
+                return Err(io::Error::other("Invalid Photoshop read result"));
+            }
+            window.offset = position;
+            window.used = count;
+            self.window_valid.set(true);
+            let count = out.len().min(count);
+            out[..count].copy_from_slice(&window.bytes[..count]);
+            return Ok(count);
+        }
+        drop(window);
         let mut input = self
             .input
             .try_borrow_mut()
@@ -90,6 +155,9 @@ impl<R: Read + Seek> Source<R> {
     }
 
     pub(crate) fn unchanged_length(&self) -> Result<(), String> {
+        // Invalidate before even a failed borrow/seek. A later proof must never
+        // authenticate a stale window after any attempted source boundary.
+        self.window_valid.set(false);
         let mut input = self
             .input
             .try_borrow_mut()
@@ -578,6 +646,206 @@ mod tests {
     use flate2::{write::ZlibEncoder, Compression as Level};
     use std::cell::Cell;
     use std::io::{Cursor, Write};
+    use std::rc::Rc;
+
+    struct MutableInput {
+        bytes: Rc<RefCell<Vec<u8>>>,
+        reads: Rc<Cell<usize>>,
+        fail_seek: Rc<Cell<bool>>,
+        maximum: usize,
+        position: u64,
+    }
+    impl Read for MutableInput {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            let bytes = self.bytes.borrow();
+            let begin = usize::try_from(self.position)
+                .map_err(|_| io::Error::other("Invalid fixture position"))?;
+            if begin >= bytes.len() {
+                return Ok(0);
+            }
+            let count = out
+                .len()
+                .min(self.maximum)
+                .min(bytes.len().saturating_sub(begin));
+            out[..count].copy_from_slice(&bytes[begin..begin + count]);
+            self.position += count as u64;
+            Ok(count)
+        }
+    }
+    impl Seek for MutableInput {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            if self.fail_seek.get() {
+                return Err(io::Error::other("Injected source seek failure"));
+            }
+            let position = match from {
+                SeekFrom::Start(n) => i128::from(n),
+                SeekFrom::Current(n) => i128::from(self.position) + i128::from(n),
+                SeekFrom::End(n) => self.bytes.borrow().len() as i128 + i128::from(n),
+            };
+            self.position =
+                u64::try_from(position).map_err(|_| io::Error::other("Invalid fixture seek"))?;
+            Ok(self.position)
+        }
+    }
+    fn buffered_fixture(
+        bytes: Vec<u8>,
+        maximum: usize,
+    ) -> (
+        Source<MutableInput>,
+        Rc<RefCell<Vec<u8>>>,
+        Rc<Cell<usize>>,
+        Rc<Cell<bool>>,
+        crate::large_document::ResidentBudget,
+    ) {
+        let pool = crate::large_document::ResidentBudget::new(2 * TRANSFER).unwrap();
+        let length = bytes.len() as u64;
+        let bytes = Rc::new(RefCell::new(bytes));
+        let reads = Rc::new(Cell::new(0));
+        let fail_seek = Rc::new(Cell::new(false));
+        let input = MutableInput {
+            bytes: bytes.clone(),
+            reads: reads.clone(),
+            fail_seek: fail_seek.clone(),
+            maximum,
+            position: 0,
+        };
+        let window = crate::large_document::ScratchBytes::new(&pool, TRANSFER, TRANSFER).unwrap();
+        (
+            Source::with_buffer(input, length, window).unwrap(),
+            bytes,
+            reads,
+            fail_seek,
+            pool,
+        )
+    }
+    #[test]
+    fn admitted_source_window_batches_tiny_reads_and_releases_the_exact_charge() {
+        let (source, _, reads, _, pool) = buffered_fixture(vec![17; TRANSFER + 31], usize::MAX);
+        assert_eq!(pool.used(), TRANSFER);
+        let check = || Ok(());
+        let mut input = source
+            .range(
+                Span {
+                    offset: 0,
+                    bytes: (TRANSFER + 31) as u64,
+                },
+                &check,
+            )
+            .unwrap();
+        let mut byte = [0];
+        for _ in 0..TRANSFER + 31 {
+            input.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [17]);
+        }
+        assert_eq!(reads.get(), 2);
+        input.seek(SeekFrom::Start(TRANSFER as u64 + 1)).unwrap();
+        input.read_exact(&mut byte).unwrap();
+        assert_eq!(reads.get(), 2);
+        input.seek(SeekFrom::Start(0)).unwrap();
+        input.read_exact(&mut byte).unwrap();
+        assert_eq!(reads.get(), 3);
+        drop(input);
+        drop(source);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn same_length_cached_source_mutation_is_observed_after_every_boundary_even_failed_seek() {
+        for failing_boundary in [false, true] {
+            let (source, bytes, reads, fail_seek, _) = buffered_fixture(vec![23; 19], usize::MAX);
+            let check = || Ok(());
+            let span = Span {
+                offset: 0,
+                bytes: 19,
+            };
+            let mut before = [0; 19];
+            source
+                .range(span, &check)
+                .unwrap()
+                .read_exact(&mut before)
+                .unwrap();
+            bytes.borrow_mut()[0] = 199;
+            let mut cached = [0; 19];
+            source
+                .range(span, &check)
+                .unwrap()
+                .read_exact(&mut cached)
+                .unwrap();
+            assert_eq!(cached, before);
+            assert_eq!(reads.get(), 1);
+            fail_seek.set(failing_boundary);
+            assert_eq!(source.unchanged_length().is_err(), failing_boundary);
+            fail_seek.set(false);
+            let mut fresh = [0; 19];
+            source
+                .range(span, &check)
+                .unwrap()
+                .read_exact(&mut fresh)
+                .unwrap();
+            assert_ne!(fresh, before);
+            assert_eq!(fresh[0], 199);
+            assert_eq!(reads.get(), 2);
+            assert_ne!(
+                ring::digest::digest(&ring::digest::SHA256, &before).as_ref(),
+                ring::digest::digest(&ring::digest::SHA256, &fresh).as_ref()
+            );
+        }
+    }
+    #[test]
+    fn source_window_preserves_short_reads_cancellation_and_truncation_refusal() {
+        let (source, bytes, reads, _, _) = buffered_fixture((0..23).collect(), 3);
+        let canceled = Cell::new(false);
+        let check = || {
+            if canceled.get() {
+                Err("Cancelled cached source".into())
+            } else {
+                Ok(())
+            }
+        };
+        let span = Span {
+            offset: 0,
+            bytes: 23,
+        };
+        let mut actual = [0; 23];
+        source
+            .range(span, &check)
+            .unwrap()
+            .read_exact(&mut actual)
+            .unwrap();
+        assert_eq!(actual, std::array::from_fn(|i| i as u8));
+        assert_eq!(reads.get(), 8);
+        canceled.set(true);
+        assert!(source
+            .range(
+                Span {
+                    offset: 21,
+                    bytes: 1
+                },
+                &check
+            )
+            .is_err());
+        canceled.set(false);
+        let mut input = source
+            .range(
+                Span {
+                    offset: 21,
+                    bytes: 1,
+                },
+                &check,
+            )
+            .unwrap();
+        canceled.set(true);
+        assert!(input.read(&mut [0]).is_err());
+        drop(input);
+        canceled.set(false);
+        bytes.borrow_mut().truncate(7);
+        assert!(source.unchanged_length().is_err());
+        assert!(source
+            .range(span, &check)
+            .unwrap()
+            .read_exact(&mut actual)
+            .is_err());
+    }
 
     #[test]
     fn native_layer_raw_rows_accept_explicit_odd_padding_while_composite_has_none() {
