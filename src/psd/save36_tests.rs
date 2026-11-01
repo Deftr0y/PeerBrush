@@ -1,4 +1,4 @@
-//! Small owned codec fixtures, not installed-profile/runtime qualification.
+//! Small source codec fixtures; installed desktop and full editor qualification are separate.
 use super::*;
 use crate::{
     engine::{
@@ -11,7 +11,7 @@ use crate::{
     psd::standard36::{NativeRows, RowRequest, RowSource},
     raster::{backed::Region, Raster, Surface},
 };
-use std::{cell::Cell, fs, path::PathBuf};
+use std::{cell::Cell, fs, io::Seek, path::PathBuf};
 
 struct Fixture {
     root: PathBuf,
@@ -359,7 +359,7 @@ fn actual_owned_small_native8_native16_psd_psb_driver_reopens_and_retires_comple
             let baseline = f.disk.used().unwrap();
             let (layers, composite, manifest, container) = f.roots();
             let mut rows = provider(&scene);
-            let done = prepare(
+            let done = prepare_fixture(
                 &scene,
                 format,
                 OwnedRoots {
@@ -472,7 +472,7 @@ fn closed_driver_stale_cancel_and_foreign_scratch_fail_without_source_or_destina
             }
         };
         let baseline = f.disk.used().unwrap();
-        let result = prepare(
+        let result = prepare_fixture(
             &scene,
             Format::Psb,
             OwnedRoots {
@@ -527,7 +527,7 @@ fn completed_save_recheck_refuses_replacement_and_never_regains_authority_after_
     let scene = capture(&f, &doc);
     let (layers, composite, manifest, container) = f.roots();
     let mut rows = provider(&scene);
-    let done = prepare(
+    let done = prepare_fixture(
         &scene,
         Format::Psb,
         OwnedRoots {
@@ -579,7 +579,7 @@ fn closed_driver_resident_admission_refusal_preserves_source_before_any_staging_
     let disk = f.disk.used().unwrap();
     let remaining = f.pool.limit() - baseline - 128;
     let pressure = ScratchBytes::new(&f.pool, remaining, 64 * 1024 * 1024).unwrap();
-    assert!(prepare(
+    assert!(prepare_fixture(
         &scene,
         Format::Psb,
         OwnedRoots {
@@ -602,6 +602,119 @@ fn closed_driver_resident_admission_refusal_preserves_source_before_any_staging_
     drop(rows);
     drop(scene);
     drop(doc);
+    f.finish();
+}
+
+#[test]
+fn actual_profile_session_save_keeps_cursor_guard_and_retires_only_owned_spools_after_closing() {
+    use crate::{
+        large_document::root::PersistentRootContext,
+        workspace::source_runtime::{Limits as RuntimeLimits, SourceRuntime},
+    };
+    use std::{
+        sync::{atomic::Ordering, Mutex},
+        time::{Duration, Instant},
+    };
+    let mut f = Fixture::new();
+    fs::create_dir(f.root.join("legacy")).unwrap();
+    let locations = crate::settings::Locations {
+        config: f.root.join("config"),
+        data: f.root.join("data"),
+        cache: f.root.join("cache"),
+    };
+    let profile =
+        crate::settings::Profile::open(locations.clone(), &f.root.join("legacy")).unwrap();
+    let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+    let connection = crate::server::start(shared.clone(), f.root.join("runtime")).unwrap();
+    let context =
+        PersistentRootContext::from_profile(&connection, profile.source_profile().unwrap())
+            .unwrap();
+    let runtime = SourceRuntime::new(
+        context.clone(),
+        RuntimeLimits {
+            resident_bytes: 64 * 1024 * 1024,
+            disk_bytes: 64 * 1024 * 1024,
+            max_files: 64,
+            store: StoreLimits {
+                disk_bytes: 16 * 1024 * 1024,
+                max_blocks: 64,
+                max_resident_blocks: 8,
+                manifest_bytes: 1024 * 1024,
+            },
+        },
+    )
+    .unwrap();
+    let session = runtime.begin().unwrap();
+    f.store = session.store_for_lineage([61; 16]).unwrap();
+    f.pool = runtime.resident();
+    f.disk = runtime.disk();
+    let doc = document(16);
+    let scene = native_capture(&f, &doc);
+    let baseline = f.disk.used().unwrap();
+    let mut rows = provider(&scene);
+    let saved = prepare(
+        &scene,
+        Format::Psb,
+        &session,
+        &mut rows,
+        limits(),
+        &|| Ok(()),
+        &|| Ok(()),
+    )
+    .unwrap();
+    saved.recheck(&|| Ok(())).unwrap();
+    let mut transfer = ScratchBytes::new(&f.pool, 65536, 65536).unwrap();
+    let mut check = || Ok(());
+    let mut input = saved.cursor(0, saved.bytes(), &mut check).unwrap();
+    let mut hash = Context::new(&SHA256);
+    let mut left = saved.bytes();
+    while left != 0 {
+        let count = left.min(65536) as usize;
+        input.read_exact(&mut transfer[..count]).unwrap();
+        hash.update(&transfer[..count]);
+        left -= count as u64;
+    }
+    assert_eq!(hash.finish().as_ref(), &saved.sha256()[..]);
+    assert_eq!(input.read(&mut [0]).unwrap(), 0);
+    input.seek(std::io::SeekFrom::Start(0)).unwrap();
+    let workspace = crate::workspace::attach(&shared);
+    assert!(
+        workspace
+            .lock()
+            .unwrap()
+            .file_operations
+            .load(Ordering::Acquire)
+            > 0
+    );
+    let (ended, finished) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(connection);
+        ended.send(()).unwrap();
+    });
+    let until = Instant::now() + Duration::from_secs(5);
+    while session.check().is_ok() {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(finished.try_recv().is_err());
+    assert!(input.read(&mut [0]).is_err());
+    assert!(input.seek(std::io::SeekFrom::Start(0)).is_err());
+    drop(input);
+    drop(transfer);
+    assert!(saved.recheck(&|| Ok(())).is_err());
+    saved.retire(&|| Ok(())).unwrap();
+    assert_eq!(f.disk.used().unwrap(), baseline);
+    drop(rows);
+    drop(scene);
+    drop(doc);
+    drop(session);
+    finished.recv_timeout(Duration::from_secs(5)).unwrap();
+    dropper.join().unwrap();
+    drop(runtime);
+    drop(context);
+    drop(profile);
+    drop(workspace);
+    drop(shared);
     f.finish();
 }
 
@@ -630,7 +743,7 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
         let scene = capture(&f, &doc);
         let (layers, composite, manifest, container) = f.roots();
         let mut rows = provider(&scene);
-        let saved = prepare(
+        let saved = prepare_fixture(
             &scene,
             Format::Psb,
             OwnedRoots {
