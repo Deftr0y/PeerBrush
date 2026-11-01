@@ -335,8 +335,8 @@ impl PeerBrush {
             command["document_id"] = json!(self
                 .straight
                 .document
-                .as_ref()
-                .unwrap_or(&self.doc_snapshot.id));
+                .as_deref()
+                .unwrap_or(self.doc_snapshot.view().id()));
         }
         self.retouch_command(&mut command, &sampled_points);
         command

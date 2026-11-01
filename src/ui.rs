@@ -63,7 +63,7 @@ mod workspace_tests;
 use crate::{controls, thumbnails};
 use crate::{
     engine::{
-        view::{DocumentView, LayerView},
+        view::{DocumentSnapshot, DocumentView, LayerView},
         Document,
     },
     raster::Pixel,
@@ -383,7 +383,7 @@ pub struct PeerBrush {
     tab_active: String,
     tab_drag: Option<tabs::TabDrag>,
     project_picker_rect: Option<Rect>,
-    doc_snapshot: Document,
+    doc_snapshot: DocumentSnapshot,
     canvas_press_document: Option<String>,
     canvas_input_region: Option<(Rect, egui::LayerId)>,
     jobs: HashSet<String>,
@@ -543,7 +543,7 @@ pub struct PeerBrush {
     selection_commit_failed: bool,
     selection_pointer_cancelled: bool,
     selection_gesture_source: Option<selection::GestureSource>,
-    save_report: Option<crate::compatibility::SaveReport>,
+    save_report: Option<crate::compatibility::PreparedReport>,
     save_loss_review: Option<compatibility::SaveReview>,
     export_editor: Option<exports::Editor>,
     new_width: u32,
@@ -743,7 +743,7 @@ impl PeerBrush {
         let workspace = crate::workspace::attach(&shared);
         let (project_id, doc_snapshot) = {
             let e = shared.lock().unwrap();
-            (e.project_id.clone(), e.doc.clone())
+            (e.project_id.clone(), e.doc_snapshot())
         };
         Self {
             preview_worker: preview_worker::Worker::new(preview_epoch.clone()),
@@ -1831,23 +1831,23 @@ impl PeerBrush {
         if self.save_loss_review.is_some() {
             return;
         }
-        let report = match crate::compatibility::report(&self.doc_snapshot) {
+        let report = match crate::compatibility::report_snapshot(&self.doc_snapshot) {
             Ok(report) => report,
             Err(error) => {
                 self.message = error;
                 return;
             }
         };
-        if !report.save_allowed {
+        if !report.data().save_allowed {
             self.open_save_report();
             self.message =
                 "Protected source · create an explicit compatible copy before saving".into();
             return;
         }
-        if report.has_editability_losses {
+        if report.data().has_editability_losses {
             self.save_loss_review = Some(compatibility::SaveReview::new(
                 self.project_id.clone(),
-                self.doc_snapshot.name.clone(),
+                self.doc_snapshot.view().name().to_owned(),
                 report,
                 compatibility::SaveIntent::Save { save_as },
             ));
@@ -1856,8 +1856,8 @@ impl PeerBrush {
         }
         self.save_frozen(
             save_as,
-            self.doc_snapshot.id.clone(),
-            self.doc_snapshot.revision,
+            self.doc_snapshot.view().id().to_owned(),
+            self.doc_snapshot.view().revision(),
             false,
         );
     }
@@ -1891,9 +1891,9 @@ impl PeerBrush {
     fn export(&mut self, format: crate::production_export::Format) {
         use crate::production_export::Format;
         let s = self.shared.clone();
-        let document = self.doc_snapshot.id.clone();
-        let revision = self.doc_snapshot.revision;
-        let depth = self.doc_snapshot.bit_depth;
+        let document = self.doc_snapshot.view().id().to_owned();
+        let revision = self.doc_snapshot.view().revision();
+        let depth = self.doc_snapshot.view().depth();
         self.job(move || {
             let (label, title) = match format {
                 Format::Png => ("PNG", format!("Export native {depth}-bit PNG")),
@@ -5486,7 +5486,7 @@ impl PeerBrush {
             e.expire();
             (e.doc.clone(), e.ai_change.clone())
         };
-        self.doc_snapshot = doc.clone();
+        self.doc_snapshot = doc.clone().into();
         self.sync_free_transform(ctx, &doc);
         if self.lifecycle.is_none() && !self.lifecycle_frame {
             self.import_dialog(ctx);
@@ -6038,7 +6038,7 @@ impl PeerBrush {
             let current = self.shared.lock().unwrap().doc.clone();
             if current.id == doc.id && self.tab_transfer.is_none() && !self.selection_commit_failed
             {
-                self.doc_snapshot = current.clone();
+                self.doc_snapshot = current.clone().into();
                 self.document_shortcuts(ctx, &current);
                 ctx.request_repaint();
             }
