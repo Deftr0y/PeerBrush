@@ -6,7 +6,11 @@ use crate::{
 use ab_glyph::{point, Font, FontArc, FontRef, PxScale, ScaleFont};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[path = "source/prepared.rs"]
+pub(crate) mod prepared;
 mod shaping;
+#[path = "source/stage.rs"]
+pub(crate) mod stage;
 
 fn identity() -> [f32; 6] {
     [1., 0., 0., 1., 0., 0.]
