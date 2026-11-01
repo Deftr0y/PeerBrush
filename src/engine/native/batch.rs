@@ -5,6 +5,7 @@ use crate::engine::scene::{Coverage36, Retained36, Source36};
 pub(crate) struct RasterBatch {
     pub rasters: Vec<RasterPatch>,
     pub layers: Vec<LayerPatch>,
+    pub effects: Vec<EffectPatch>,
     /// None preserves selection. Some replaces all four selection fields.
     pub selection: Option<SelectionPatch>,
 }
@@ -64,11 +65,19 @@ impl RasterBatch {
         session: &impl super::super::scene::StageSession,
         cleanup: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        let effect_count = self
+            .effects
+            .iter()
+            .try_fold(0usize, |n, patch| {
+                n.checked_add(patch.clips.as_ref().map_or(0, Vec::len))
+            })
+            .ok_or("Native clip count overflow")?;
         let count = self
             .rasters
             .len()
             .checked_mul(2)
             .and_then(|n| n.checked_add(2))
+            .and_then(|n| n.checked_add(effect_count))
             .ok_or("Native retirement footprint overflow")?;
         let mut outputs = Vec::new();
         outputs.try_reserve_exact(count).map_err(|_| {
@@ -87,6 +96,15 @@ impl RasterBatch {
             {
                 if let CoveragePixels::Output(output) = coverage.pixels {
                     outputs.push(output);
+                }
+            }
+        }
+        for patch in self.effects {
+            if let Some(clips) = patch.clips {
+                for clip in clips {
+                    if let CoveragePixels::Output(output) = clip.coverage.pixels {
+                        outputs.push(output);
+                    }
                 }
             }
         }
@@ -110,21 +128,36 @@ impl CapturedEdit {
             &batch.rasters,
             &batch.layers,
             batch.selection.as_ref(),
+            &batch.effects,
             &checked,
         ) {
             Err(reason) => Err(RefusedBatch { reason, batch }),
             Ok(mut prepared) => {
                 let outputs = batch
-                    .rasters
+                    .effects
                     .iter()
-                    .map(|raster| {
-                        if matches!(raster.retained, RetainedUpdate::ReplaceOutput { .. }) {
-                            2
-                        } else {
-                            1
-                        }
+                    .map(|patch| {
+                        patch.clips.as_ref().map_or(0, |clips| {
+                            clips
+                                .iter()
+                                .filter(|clip| {
+                                    matches!(clip.coverage.pixels, CoveragePixels::Output(_))
+                                })
+                                .count()
+                        })
                     })
                     .sum::<usize>()
+                    + batch
+                        .rasters
+                        .iter()
+                        .map(|raster| {
+                            if matches!(raster.retained, RetainedUpdate::ReplaceOutput { .. }) {
+                                2
+                            } else {
+                                1
+                            }
+                        })
+                        .sum::<usize>()
                     + batch.selection.as_ref().map_or(0, |selection| {
                         [&selection.current, &selection.previous]
                             .into_iter()
@@ -154,28 +187,40 @@ impl CapturedEdit {
                         }
                     }
                 }
+                for patch in batch.effects {
+                    if let Some(clips) = patch.clips {
+                        for clip in clips {
+                            if let CoveragePixels::Output(output) = clip.coverage.pixels {
+                                prepared.outputs.push(output);
+                            }
+                        }
+                    }
+                }
                 Ok(prepared)
             }
         }
     }
-    pub(super) fn prepare_batch(
-        &self,
-        rasters: &[RasterPatch],
-        layers: &[LayerPatch],
-        selection: Option<&SelectionPatch>,
+    pub(super) fn prepare_batch<'a>(
+        &'a self,
+        rasters: &'a [RasterPatch],
+        layers: &'a [LayerPatch],
+        selection: Option<&'a SelectionPatch>,
+        effects: &'a [EffectPatch],
         check: &dyn Fn() -> Result<()>,
     ) -> Result<PreparedDelta> {
         check()?;
-        if rasters.is_empty() && layers.is_empty() && selection.is_none() {
+        if rasters.is_empty() && layers.is_empty() && selection.is_none() && effects.is_empty() {
             return Err("Native edit batch is empty".into());
         }
         let base = &self.base.core.metadata;
         let pool = self.base.budget();
         let locations = self.base.roster().len();
+        let (effect_bytes, effect_locations) = super::effect_patch::admission(&self.base, effects)?;
         let added = rasters
             .len()
             .checked_mul(2)
             .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(effect_locations))
             .ok_or("Native batch footprint overflow")?;
         if locations
             .checked_add(added)
@@ -185,6 +230,7 @@ impl CapturedEdit {
         }
         let mut bytes = (rasters.len() + layers.len() + 4)
             .checked_mul(32 * 1024)
+            .and_then(|n| n.checked_add(effect_bytes))
             .ok_or("Native batch footprint overflow")?;
         for layer in layers {
             if let SourceUpdate::Replace(source) = &layer.source {
@@ -239,11 +285,11 @@ impl CapturedEdit {
             .map_err(|_| "Native patch allocation refused")?;
         let mut outputs: Vec<&Surface> = Vec::new();
         outputs
-            .try_reserve_exact(rasters.len() * 2 + 2)
+            .try_reserve_exact(rasters.len() * 2 + 2 + effect_locations)
             .map_err(|_| "Native output index allocation refused")?;
         let mut scopes = Vec::new();
         scopes
-            .try_reserve_exact(rasters.len() + layers.len() + 1)
+            .try_reserve_exact(rasters.len() + layers.len() + effects.len() + 1)
             .map_err(|_| "Native scope allocation refused")?;
         for (index, patch) in rasters.iter().enumerate() {
             check()?;
@@ -385,20 +431,32 @@ impl CapturedEdit {
             }
             scopes.push(layer.id.clone());
         }
+        let global = super::effect_patch::scopes(&self.base, effects, &mut scopes)?;
         if selection.is_some() {
             scopes.push("@selection".into());
         }
         scopes.sort_unstable();
         scopes.dedup();
-        let intent = Intent::layers(
-            if selection.is_some() {
-                IntentKind::Selection
-            } else {
-                IntentKind::Placement
-            },
-            &scopes,
-            pool,
-        )?;
+        let intent = if global {
+            Intent::from_scopes(
+                IntentKind::Placement,
+                &[crate::engine::Scope {
+                    target: None,
+                    rect: None,
+                }],
+                pool,
+            )?
+        } else {
+            Intent::layers(
+                if selection.is_some() {
+                    IntentKind::Selection
+                } else {
+                    IntentKind::Placement
+                },
+                &scopes,
+                pool,
+            )?
+        };
         let copied = copy_metadata(base, pool, check)?;
         let mut prepared_core = None;
         copied.map_unique(|mut metadata, _| {
@@ -444,6 +502,7 @@ impl CapturedEdit {
             // changed elsewhere in this batch. Freeze that original unchanged;
             // do not recursively apply another replacement to its old ordinal.
             replace_slots(&mut metadata, &replacements);
+            super::effect_patch::apply(&self.base, &mut metadata, effects, &mut outputs)?;
             if let Some(selection) = selection {
                 valid_selection(selection)?;
                 metadata.selection = selection.bounds;
@@ -464,7 +523,7 @@ impl CapturedEdit {
             }
             let roster = rebuild_from(
                 &mut metadata,
-                locations + outputs.len() + 4,
+                locations + added,
                 pool,
                 self.base.disk_budget(),
                 check,
@@ -683,7 +742,7 @@ fn valid_selection(selection: &SelectionPatch) -> Result<()> {
     }
     Ok(())
 }
-fn coverage_ref<'a>(
+pub(super) fn coverage_ref<'a>(
     base: &NativeDocument,
     coverage: &'a CoveragePatch,
     outputs: &mut Vec<&'a Surface>,
@@ -849,6 +908,7 @@ mod tests {
             .seal(&base, &Session, &|| Ok(()))
             .unwrap_or_else(|e| panic!("{}", e.reason()));
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![color_patch, mask_patch],
             layers: vec![LayerPatch {
                 target: color,
@@ -942,6 +1002,7 @@ mod tests {
         let (first, p1) = patch(&base, color);
         let (second, p2) = patch(&base, mask);
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![first, second],
             layers: vec![LayerPatch {
                 target: color,
@@ -980,6 +1041,7 @@ mod tests {
         let (first, p1) = patch(&base, target);
         let (second, p2) = patch(&base, target);
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![first, second],
             layers: vec![LayerPatch {
                 target,
@@ -1001,6 +1063,7 @@ mod tests {
         std::fs::remove_dir(p1).unwrap();
         std::fs::remove_dir(p2).unwrap();
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![],
             layers: vec![LayerPatch {
                 target,
@@ -1040,6 +1103,7 @@ mod tests {
         };
         let (output, path) = patch(&base, target);
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![output],
             layers: vec![LayerPatch {
                 target,
@@ -1070,6 +1134,7 @@ mod tests {
             }
         ));
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![],
             layers: vec![LayerPatch {
                 target,
@@ -1105,6 +1170,7 @@ mod tests {
             warps: vec![],
         };
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![current],
             layers: vec![LayerPatch {
                 target,
@@ -1148,6 +1214,7 @@ mod tests {
         let (patch, path) = patch(&base, target);
         let foreign = ResidentBudget::new(1024 * 1024).unwrap();
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![patch],
             layers: vec![],
             selection: Some(SelectionPatch {
@@ -1170,6 +1237,7 @@ mod tests {
         let captured = base.capture_edit().unwrap();
         captured.cancellation().cancel();
         let batch = RasterBatch {
+            effects: vec![],
             rasters: vec![],
             layers: vec![],
             selection: Some(SelectionPatch {
