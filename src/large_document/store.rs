@@ -427,6 +427,19 @@ impl Snapshot {
 }
 
 impl Store {
+    /// Tests with a dedicated pool distinguish retained index capacity from
+    /// leaked payload/pin/scratch owners without relaxing production admission.
+    #[cfg(test)]
+    pub(crate) fn retained_index_bytes(&self) -> Result<usize> {
+        let blocks = self.state()?.blocks.admitted_bytes();
+        let cache = self
+            .0
+            .cache
+            .lock()
+            .map_err(|_| Error::Interrupted)?
+            .admitted_bytes();
+        blocks.checked_add(cache).ok_or(Error::Budget)
+    }
     pub(crate) fn downgrade(&self) -> WeakStore {
         WeakStore(Arc::downgrade(&self.0))
     }
