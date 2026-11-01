@@ -296,6 +296,9 @@ pub(crate) struct RootOperation {
     _operation: server::SourceOperation,
 }
 impl RootOperation {
+    pub(crate) fn with_live_fence<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
+        self._operation.with_live_fence(commit)
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
         self._operation.check()?;
         self.check_retirement()
