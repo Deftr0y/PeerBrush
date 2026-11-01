@@ -14,9 +14,9 @@ unchanged. The input source, metadata/profile, callback allocations, output log,
 canonical replay and destination temporary must coexist under explicit shared
 resident/disk admissions. These admissions are not a total process RAM claim.
 
-`PBJXLS01` uses fixed binary framing: an 80-byte header contains message kind,
+`PBJXLS02` uses fixed binary framing: an 80-byte header contains message kind,
 nonce, per-direction sequence, a SHA-256 configuration binding and payload length.
-Reserved bytes must be zero. The 224-byte start configuration binds build digest,
+Reserved bytes must be zero. The 232-byte start configuration binds build digest,
 source/output bindings, exact raw/profile lengths and SHA-256, native dimensions,
 options and operation ceilings. No filesystem path or credential is transported.
 Control prefixes have fixed sizes; large bodies pass through an already charged
@@ -95,3 +95,10 @@ ceiling `4*max_records + 4*ceil(raw_bytes/65536) + 64`, at most 1048576 events.
 Storage must admit its control transcript and interval metadata from this bound
 in addition to DATA bytes/record overhead. The absolute deadline alone does not
 bound hostile control-record growth.
+
+Protocol V2 additionally binds `max_input_bytes`. It must be nonzero and no more
+than checked `8*raw_bytes +32 MiB`. Every authenticated rectangle response counts
+against this declared budget; NeedRectangle preflight refuses excess before the
+parent reads/stages that window. This bounds repeated source work as well as
+resident/output metadata. Legitimate effort/halo demand must be qualified before
+choosing a production policy. Earlier unpublished V1 peers fail the new magic.

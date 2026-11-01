@@ -750,6 +750,7 @@ mod tests {
             options: super::super::Options::default(),
             profile_bytes: 132,
             raw_bytes: 512,
+            max_input_bytes: 8 * 512 + wire::MAX_RECT_BYTES,
             max_output_bytes: 65536,
             max_log_bytes: 65536,
             max_records: 16,

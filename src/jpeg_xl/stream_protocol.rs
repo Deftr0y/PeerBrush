@@ -14,9 +14,9 @@ pub(crate) const MAX_RECORDS: u32 = 131072;
 pub(crate) const MAX_CHILD_EVENTS: u32 = 1048576;
 pub(crate) const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub(crate) const MAX_ELAPSED_MS: u32 = 20 * 60 * 1000;
-const MAGIC: &[u8; 8] = b"PBJXLS01";
+const MAGIC: &[u8; 8] = b"PBJXLS02";
 const HEADER_BYTES: usize = 80;
-const CONFIG_BYTES: usize = 224;
+const CONFIG_BYTES: usize = 232;
 const ERROR: &str = "Invalid JPEG XL streaming transport";
 type Result<T> = std::result::Result<T, String>;
 
@@ -26,6 +26,7 @@ pub(crate) struct Configuration {
     pub options: Options,
     pub profile_bytes: u32,
     pub raw_bytes: u64,
+    pub max_input_bytes: u64,
     pub max_output_bytes: u64,
     pub max_log_bytes: u64,
     pub max_records: u32,
@@ -51,6 +52,8 @@ impl Configuration {
             || info.height > 16000
             || ![8, 16].contains(&info.bit_depth)
             || raw != Some(self.raw_bytes)
+            || self.max_input_bytes == 0
+            || self.max_input_bytes > source_work_ceiling(self.raw_bytes)?
             || self.profile_bytes == 0
             || self.profile_bytes > 4 * 1024 * 1024
             || self.max_output_bytes == 0
@@ -98,6 +101,7 @@ impl Configuration {
         {
             bytes[64 + i * 32..96 + i * 32].copy_from_slice(digest);
         }
+        bytes[224..232].copy_from_slice(&self.max_input_bytes.to_le_bytes());
         bytes
     }
     fn decode(bytes: &[u8; CONFIG_BYTES]) -> Result<Self> {
@@ -117,6 +121,7 @@ impl Configuration {
             },
             profile_bytes: u32le(&bytes[20..24]),
             raw_bytes: u64le(&bytes[24..32]),
+            max_input_bytes: u64le(&bytes[224..232]),
             max_output_bytes: u64le(&bytes[32..40]),
             max_log_bytes: u64le(&bytes[40..48]),
             max_records: u32le(&bytes[48..52]),
@@ -135,7 +140,7 @@ impl Configuration {
     pub(crate) fn binding(&self, nonce: [u8; 16]) -> Result<Digest> {
         self.validate()?;
         let mut hash = Context::new(&SHA256);
-        hash.update(b"PeerBrushJxlStreamingV1\0");
+        hash.update(b"PeerBrushJxlStreamingV2\0");
         hash.update(&nonce);
         hash.update(&self.encode());
         Ok(hash.finish().as_ref().try_into().unwrap())
@@ -149,6 +154,12 @@ fn u32le(bytes: &[u8]) -> u32 {
 }
 fn u64le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().unwrap())
+}
+pub(crate) fn source_work_ceiling(raw_bytes: u64) -> Result<u64> {
+    raw_bytes
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(MAX_RECT_BYTES))
+        .ok_or_else(|| ERROR.into())
 }
 /// Admit control transcript/index ownership from this bound as well as DATA
 /// bytes. A deadline alone does not bound hostile zero-payload message growth.
@@ -599,6 +610,7 @@ pub(crate) struct State {
     records: u32,
     log_bytes: u64,
     child_events: u32,
+    served_bytes: u64,
     failed: bool,
     success: bool,
 }
@@ -620,6 +632,7 @@ impl State {
             records: 0,
             log_bytes: 0,
             child_events: 0,
+            served_bytes: 0,
             failed: false,
             success: false,
         })
@@ -784,6 +797,10 @@ impl State {
             (Turn::Child, Direction::Child, Message::NeedRectangle(rectangle)) => {
                 let bytes = rectangle.bytes(&self.configuration)?;
                 if rectangle.id != self.last_id.checked_add(1).ok_or(ERROR)?
+                    || self
+                        .served_bytes
+                        .checked_add(bytes)
+                        .is_none_or(|n| n > self.configuration.max_input_bytes)
                     || self.held.iter().filter(|n| n.is_some()).count()
                         >= usize::from(self.configuration.max_held_buffers)
                     || self
@@ -803,6 +820,11 @@ impl State {
                 let slot = self.held.iter_mut().find(|n| n.is_none()).ok_or(ERROR)?;
                 *slot = Some((id, bytes));
                 self.held_bytes = self.held_bytes.checked_add(bytes).ok_or(ERROR)?;
+                self.served_bytes = self
+                    .served_bytes
+                    .checked_add(bytes)
+                    .filter(|n| *n <= self.configuration.max_input_bytes)
+                    .ok_or(ERROR)?;
                 self.last_id = id;
                 Turn::Child
             }
@@ -892,6 +914,7 @@ mod tests {
             options: Options::default(),
             profile_bytes: 132,
             raw_bytes: 64 * 16 * 8,
+            max_input_bytes: 8 * 64 * 16 * 8 + MAX_RECT_BYTES,
             max_output_bytes: 1024 * 1024,
             max_log_bytes: 2 * 1024 * 1024,
             max_records: 128,
@@ -950,8 +973,7 @@ mod tests {
         assert_eq!(received, payload);
         exact_eof(&mut input, &|| Ok(())).unwrap();
     }
-    fn handshake() -> (State, State) {
-        let config = configuration();
+    fn handshake_configuration(config: Configuration) -> (State, State) {
         let mut a = State::new(config, [7; 16]).unwrap();
         let mut b = a.clone();
         deliver(
@@ -970,6 +992,9 @@ mod tests {
             &[],
         );
         (a, b)
+    }
+    fn handshake() -> (State, State) {
+        handshake_configuration(configuration())
     }
     fn ack(a: &mut State, b: &mut State) {
         let request = a.next_sequence(Direction::Child) - 1;
@@ -1464,5 +1489,68 @@ mod tests {
         config.raw_bytes = 2_048_000_000;
         config.max_records = MAX_RECORDS;
         assert!(child_event_limit(&config).unwrap() <= MAX_CHILD_EVENTS);
+    }
+    #[test]
+    fn explicit_source_work_budget_binds_config_and_refuses_before_the_next_window() {
+        let mut config = configuration();
+        config.max_input_bytes = 1024;
+        let (mut a, mut b) = handshake_configuration(config);
+        for id in 1..=2 {
+            let r = Rectangle {
+                id,
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            };
+            deliver(
+                &mut a,
+                &mut b,
+                Direction::Child,
+                Message::NeedRectangle(r),
+                &[],
+            );
+            deliver(
+                &mut a,
+                &mut b,
+                Direction::Parent,
+                Message::RectangleData {
+                    id,
+                    bytes: 512,
+                    sha256: digest(&[0; 512]),
+                },
+                &[0; 512],
+            );
+            deliver(
+                &mut a,
+                &mut b,
+                Direction::Child,
+                Message::Release { id },
+                &[],
+            );
+            ack(&mut a, &mut b);
+        }
+        let next = frame(
+            &a,
+            Direction::Child,
+            Message::NeedRectangle(Rectangle {
+                id: 3,
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            }),
+        );
+        assert!(a.preflight(Direction::Child, &next).is_err());
+        assert_eq!(a.served_bytes, 1024);
+        let original = config.binding([7; 16]).unwrap();
+        config.max_input_bytes += 1;
+        assert_ne!(original, config.binding([7; 16]).unwrap());
+        config.max_input_bytes = source_work_ceiling(config.raw_bytes).unwrap() + 1;
+        assert!(config.validate().is_err());
+        assert!(source_work_ceiling(u64::MAX).is_err());
+        let mut old = [0u8; HEADER_BYTES];
+        old[..8].copy_from_slice(b"PBJXLS01");
+        assert!(Frame::read(&mut Cursor::new(old), &|| Ok(())).is_err());
     }
 }
