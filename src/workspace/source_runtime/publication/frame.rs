@@ -16,8 +16,8 @@ pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const MAX_FACTS: usize = 4100;
 const PATH_BYTES: usize = 64 * 1024;
 const NAME_BYTES: usize = 4096;
-const MAGIC: &[u8; 16] = b"PBEXTERNAL01\0\0\0\0";
-const DOMAIN: &[u8] = b"PeerBrushExternalIntentFrame1\0";
+const MAGIC: &[u8; 16] = b"PBEXTERNAL02\0\0\0\0";
+const DOMAIN: &[u8] = b"PeerBrushExternalIntentFrame2\0";
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +46,7 @@ pub(super) struct IntentFrame {
     pub operation: [u8; 16],
     pub target: PathBuf,
     pub target_key: [u8; 32],
+    pub previous: Option<[u8; 32]>,
     pub parent: (u64, u64),
     pub backups: PathBuf,
     pub backups_identity: (u64, u64),
@@ -66,6 +67,7 @@ impl IntentFrame {
             || self.owner == [0; 16]
             || self.operation == [0; 16]
             || self.target_key == [0; 32]
+            || self.previous == Some([0; 32])
             || self.candidate_bytes == 0
             || self.candidate_bytes > 64 * 1024 * 1024 * 1024
             || self.facts.len() > MAX_FACTS
@@ -159,6 +161,10 @@ impl IntentFrame {
         put(out, &self.owner)?;
         put(out, &self.operation)?;
         put(out, &self.target_key)?;
+        put(out, &[u8::from(self.previous.is_some())])?;
+        if let Some(previous) = self.previous {
+            put(out, &previous)?;
+        }
         identity(out, self.parent)?;
         identity(out, self.backups_identity)?;
         os(out, self.target.as_os_str(), PATH_BYTES)?;
@@ -236,6 +242,11 @@ impl IntentFrame {
         let root = input.array()?;
         let operation = input.array()?;
         let target_key = input.array()?;
+        let previous = match input.u8()? {
+            0 => None,
+            1 => Some(input.array()?),
+            _ => return Err("Invalid previous settlement flag".into()),
+        };
         let parent = input.identity()?;
         let backups_identity = input.identity()?;
         let target = PathBuf::from(input.os(PATH_BYTES)?);
@@ -297,6 +308,7 @@ impl IntentFrame {
             operation,
             target,
             target_key,
+            previous,
             parent,
             backups,
             backups_identity,
@@ -471,6 +483,7 @@ mod tests {
             operation: [3; 16],
             target: parent.join("native-\u{05d0}.psb"),
             target_key: [4; 32],
+            previous: None,
             parent: (1, 2),
             backups: parent.join(".peerbrush-versions"),
             backups_identity: (1, 3),

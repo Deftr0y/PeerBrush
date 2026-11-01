@@ -10,7 +10,7 @@ use std::{
 type Identity = (u64, u64);
 #[path = "disk/external.rs"]
 mod external;
-pub(crate) use external::{ExternalFact, PublicationTicket};
+pub(crate) use external::{ExternalFact, PreparedSettlement, PublicationTicket};
 
 #[derive(Clone)]
 pub struct DiskBudget(Arc<Inner>);
