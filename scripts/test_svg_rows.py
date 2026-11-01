@@ -16,6 +16,8 @@ import tomllib
 
 def verify_packages(manifest: Path, kind: str, root: Path, offline: bool) -> None:
     command = ["cargo", "metadata", "--locked", "--format-version", "1", "--manifest-path", str(manifest)]
+    if kind == "rows":
+        command += ["--no-default-features", "--features", "peerbrush-svg-resvg-tests/text"]
     if offline:
         command.append("--offline")
     metadata = json.loads(subprocess.check_output(command, cwd=root))
@@ -34,6 +36,28 @@ def verify_packages(manifest: Path, kind: str, root: Path, offline: bool) -> Non
                 raise ValueError("The independent oracle registry checksum differs")
         elif package["source"] is not None or Path(package["manifest_path"]).resolve() != (root / "vendor" / expected["name"] / "Cargo.toml").resolve():
             raise ValueError("The candidate must use only the reviewed pinned local forks")
+    if kind == "rows":
+        members = [package for package in metadata["packages"] if package["name"] == "peerbrush-svg-resvg-tests"]
+        if len(members) != 1 or members[0]["id"] not in metadata["workspace_members"]:
+            raise ValueError("The actual resvg unit-test target must be a workspace member")
+        member = members[0]
+        libraries = [target for target in member["targets"] if "lib" in target["kind"]]
+        if len(libraries) != 1 or Path(libraries[0]["src_path"]).resolve() != (root / "vendor/resvg/src/lib.rs").resolve() or not libraries[0]["test"]:
+            raise ValueError("Resvg unit tests must compile the unchanged actual vendor library source")
+        renderer = next(package for package in metadata["packages"] if package["name"] == "resvg")
+        nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+        candidate, tests = nodes[renderer["id"]], nodes[member["id"]]
+        if set(candidate["features"]) != {"text"} or set(tests["features"]) != {"text"}:
+            raise ValueError("Resvg library tests must retain the candidate's exact text-only features")
+        dependencies = {dependency["name"]: dependency["pkg"] for dependency in candidate["deps"]}
+        tested = {dependency["name"]: dependency["pkg"] for dependency in tests["deps"]}
+        dev = {dependency["name"].replace("-", "_") for dependency in renderer["dependencies"] if dependency["kind"] == "dev"}
+        if set(tested) != set(dependencies) | dev or any(tested[name] != package for name, package in dependencies.items()):
+            raise ValueError("Resvg unit tests must use the candidate's exact dependency packages plus its dev dependencies")
+        required = {dependency["name"]: dependency["req"] for dependency in renderer["dependencies"] if dependency["kind"] == "dev"}
+        declared = {dependency["name"]: dependency["req"] for dependency in member["dependencies"] if dependency["kind"] == "dev"}
+        if declared != required:
+            raise ValueError("Resvg unit tests must retain the actual upstream dev-dependency requirements")
 
 
 def main() -> None:
@@ -71,7 +95,13 @@ def main() -> None:
         print(f"Exact registry/row primitive parity: {len(expected)} bytes, SHA256 {hashlib.sha256(expected).hexdigest()}")
         manifest = root / "tests" / "svg-origin-rows" / "Cargo.toml"
         for package in ("tiny-skia-path", "tiny-skia", "resvg"):
-            command = ["cargo", "test", "--release", "--locked", "--lib", "--package", package, "--manifest-path", str(manifest), "--target-dir", str(work / "target-rows")]
+            # The workspace member's lib.path is the actual vendor/resvg source;
+            # this retains every real dev-dependency unit test. Merely selecting
+            # resvg as a nonmember dependency makes Cargo refuse those tests.
+            selected = "peerbrush-svg-resvg-tests" if package == "resvg" else package
+            command = ["cargo", "test", "--release", "--locked", "--lib", "--package", selected, "--manifest-path", str(manifest), "--target-dir", str(work / "target-rows")]
+            if package == "resvg":
+                command += ["--no-default-features", "--features", "peerbrush-svg-resvg-tests/text"]
             if args.offline:
                 command.append("--offline")
             subprocess.run(command, cwd=root, check=True)

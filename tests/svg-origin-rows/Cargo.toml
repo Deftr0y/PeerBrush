@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [workspace]
+members = ["resvg-tests"]
 
 [dependencies]
 resvg = { path = "../../vendor/resvg", default-features = false, features = ["text"] }

@@ -1,0 +1,29 @@
+[package]
+name = "peerbrush-svg-resvg-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Cargo requires a workspace member to run its dev-dependency unit tests. This
+# library target compiles the exact vendored source, without copying or wrapping
+# any renderer logic. Keep its selected features/dependencies equal to the
+# candidate's text-only resvg library; do not activate CLI/system-font features.
+[lib]
+path = "../../../vendor/resvg/src/lib.rs"
+
+[features]
+default = ["text"]
+text = ["usvg/text"]
+
+[dependencies]
+bytemuck = "1.16"
+log = "0.4"
+pico-args = { version = "0.5", features = ["eq-separator"] }
+rgb = "0.8"
+svgtypes = "0.16.1"
+tiny-skia = { path = "../../../vendor/tiny-skia" }
+usvg = { version = "=0.48.1", default-features = false }
+
+[dev-dependencies]
+once_cell = "1.21"
+png = "0.18.0"

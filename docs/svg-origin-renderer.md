@@ -114,6 +114,14 @@ cancellation-control reset and nested ledgers. Qualification receipts must bind
 the exact tested sources and platform; earlier primitive receipts never qualify
 later edits.
 
+The standalone candidate workspace has an explicit resvg library-test member
+whose library target is the actual `vendor/resvg/src/lib.rs`. This runs every
+unchanged library unit test with its real dev dependencies; Cargo cannot test
+those dev dependencies by selecting a nonmember path dependency. Metadata checks
+bind the target path, workspace membership, exact text-only feature set and
+dependency package identities to the candidate. The registry oracle remains in
+its separate workspace and lockfile.
+
 Hairlines retain the original subdivision, clipped fixed-point kernels, cap
 coverage and draw order. AA and aliased kernels emit only provably contributing
 integer steps for a band. Integer jumps preserve the original repeated clamp
