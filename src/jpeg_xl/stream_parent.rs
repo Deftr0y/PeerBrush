@@ -871,4 +871,135 @@ mod tests {
                 .unwrap();
         });
     }
+    fn actual_legacy_runtime() -> Runtime {
+        let executable = executable().unwrap();
+        let mut command = Command::new(&executable);
+        command
+            .arg("--jxl-worker")
+            .current_dir(executable.parent().unwrap());
+        Runtime {
+            timeout: Duration::from_secs(15),
+            command: Some(command),
+            test_prefix: false,
+            response_started: None,
+            publication_started: None,
+            primary_kill_failed: false,
+            input_written: None,
+            stall_writer: false,
+        }
+    }
+    #[test]
+    fn lossy_rgb_with_lossless_alpha_keeps_native_output_contract_against_isolated_legacy_encoder()
+    {
+        let _serial = super::super::tests::PROCESS_FIXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for depth in [8, 16] {
+            let options = Options {
+                lossless: false,
+                distance: 1.,
+                effort: 3,
+            };
+            crate::production_export::staged_rows::tests::with_staged_options(
+                depth,
+                33,
+                2050,
+                options,
+                |input| {
+                    let session = input.session();
+                    let raw = input.raw_bytes();
+                    let profile = input.profile().to_vec();
+                    let mut samples =
+                        ScratchBytes::new(&session.resident(), raw as usize, 1024 * 1024).unwrap();
+                    input.copy_range(0, &mut samples, &|| Ok(())).unwrap();
+                    let output = encode(
+                        input,
+                        Limits {
+                            output_bytes: 1024 * 1024,
+                            log_bytes: 2 * 1024 * 1024,
+                            records: 4096,
+                            input_bytes: wire::source_work_ceiling(raw).unwrap(),
+                            deadline_ms: 15000,
+                        },
+                        &|| Ok(()),
+                    )
+                    .unwrap();
+                    let mut encoded = ScratchBytes::new(
+                        &session.resident(),
+                        output.bytes() as usize,
+                        1024 * 1024,
+                    )
+                    .unwrap();
+                    output.copy_range(0, &mut encoded, &|| Ok(())).unwrap();
+                    let decoded = invoke(
+                        request(Operation::Decode, None, None, 0, encoded.len()).unwrap(),
+                        Input::Encoded(&encoded),
+                        &|| Ok(()),
+                        actual_legacy_runtime(),
+                    )
+                    .unwrap();
+                    let words: Vec<u16> = if depth == 16 {
+                        samples
+                            .chunks_exact(2)
+                            .map(|v| u16::from_be_bytes([v[0], v[1]]))
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    let pixels = if depth == 8 {
+                        PixelsRef::Eight(&samples)
+                    } else {
+                        PixelsRef::Sixteen(&words)
+                    };
+                    let reference = invoke(
+                        request(
+                            Operation::Encode,
+                            Some(Info {
+                                width: 33,
+                                height: 2050,
+                                bit_depth: depth,
+                            }),
+                            Some(options),
+                            profile.len(),
+                            raw as usize,
+                        )
+                        .unwrap(),
+                        Input::Pixels(pixels, &profile),
+                        &|| Ok(()),
+                        actual_legacy_runtime(),
+                    )
+                    .unwrap();
+                    let reference = invoke(
+                        request(Operation::Decode, None, None, 0, reference.encoded.len()).unwrap(),
+                        Input::Encoded(&reference.encoded),
+                        &|| Ok(()),
+                        actual_legacy_runtime(),
+                    )
+                    .unwrap();
+                    assert_eq!(decoded.info, reference.info);
+                    assert_eq!(decoded.info.bit_depth, depth);
+                    // XYB decode can return a canonical sRGB ICC encoding. Compare
+                    // actual unchanged decoder output, never relabel native samples.
+                    assert_eq!(decoded.profile, reference.profile);
+                    assert_eq!(decoded.pixels, reference.pixels);
+                    match decoded.pixels {
+                        Pixels::Eight(values) => {
+                            for (a, b) in samples.chunks_exact(4).zip(values.chunks_exact(4)) {
+                                assert_eq!(a[3], b[3]);
+                            }
+                        }
+                        Pixels::Sixteen(values) => {
+                            for (a, b) in samples.chunks_exact(8).zip(values.chunks_exact(4)) {
+                                assert_eq!(&a[6..], b[3].to_be_bytes());
+                            }
+                        }
+                    }
+                    output.recheck(&|| Ok(())).unwrap();
+                    drop(samples);
+                    drop(encoded);
+                    output.retire(&mut || session.cleanup_check()).unwrap();
+                },
+            );
+        }
+    }
 }

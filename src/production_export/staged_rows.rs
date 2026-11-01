@@ -545,7 +545,15 @@ pub(crate) mod tests {
         }
     }
     fn scene(session: &SourceSession, depth: u16) -> SceneSnapshot {
-        let mut doc = Document::new_depth(17, 513, depth).unwrap();
+        scene_dimensions(session, depth, 17, 513)
+    }
+    fn scene_dimensions(
+        session: &SourceSession,
+        depth: u16,
+        width: u32,
+        height: u32,
+    ) -> SceneSnapshot {
+        let mut doc = Document::new_depth(width, height, depth).unwrap();
         doc.srgb_tagged = true;
         let mut collect = Collect(vec![]);
         let metadata = Document36::capture(&doc, &mut collect).unwrap();
@@ -639,10 +647,19 @@ pub(crate) mod tests {
         }
     }
     pub(crate) fn with_staged(depth: u16, call: impl FnOnce(StagedNativeRows<'_, '_, '_>)) {
+        with_staged_options(depth, 17, 513, crate::jpeg_xl::Options::default(), call)
+    }
+    pub(crate) fn with_staged_options(
+        depth: u16,
+        width: u32,
+        height: u32,
+        options: crate::jpeg_xl::Options,
+        call: impl FnOnce(StagedNativeRows<'_, '_, '_>),
+    ) {
         let f = Fixture::new();
         let (_profile, _shared, _connection, runtime) = f.runtime();
         let session = runtime.begin().unwrap();
-        let scene = scene(&session, depth);
+        let scene = scene_dimensions(&session, depth, width, height);
         let output = output(&scene);
         let mut provider = Rows {
             scene: &scene,
@@ -650,11 +667,13 @@ pub(crate) mod tests {
             fail_at: None,
         };
         let raw = u64::from(output.width) * u64::from(output.height) * 4 * u64::from(depth / 8);
+        let mut settings = settings();
+        settings.jxl = options;
         let input = StagedNativeRows::stage(
             &session,
             &scene,
             &output,
-            &settings(),
+            &settings,
             &mut provider,
             crate::jpeg_xl::stream_protocol::source_read_ceiling(raw).unwrap(),
             &|| Ok(()),
