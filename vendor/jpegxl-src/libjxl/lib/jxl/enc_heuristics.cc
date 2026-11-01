@@ -5,6 +5,7 @@
 
 #include "lib/jxl/enc_heuristics.h"
 #include "lib/jxl/enc_sharper_rows.h"
+#include "lib/jxl/enc_iterative_rows.h"
 
 #include <jxl/cms_interface.h>
 #include <jxl/memory_manager.h>
@@ -232,45 +233,6 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
   return true;
 }
 
-void StoreMin2(const float v, float& min1, float& min2) {
-  if (v < min2) {
-    if (v < min1) {
-      min2 = min1;
-      min1 = v;
-    } else {
-      min2 = v;
-    }
-  }
-}
-
-void CreateMask(const ImageF& image, ImageF& mask) {
-  for (size_t y = 0; y < image.ysize(); y++) {
-    const auto* row_n = y > 0 ? image.Row(y - 1) : image.Row(y);
-    const auto* row_in = image.Row(y);
-    const auto* row_s = y + 1 < image.ysize() ? image.Row(y + 1) : image.Row(y);
-    auto* row_out = mask.Row(y);
-    for (size_t x = 0; x < image.xsize(); x++) {
-      // Center, west, east, north, south values and their absolute difference
-      float c = row_in[x];
-      float w = x > 0 ? row_in[x - 1] : row_in[x];
-      float e = x + 1 < image.xsize() ? row_in[x + 1] : row_in[x];
-      float n = row_n[x];
-      float s = row_s[x];
-      float dw = std::abs(c - w);
-      float de = std::abs(c - e);
-      float dn = std::abs(c - n);
-      float ds = std::abs(c - s);
-      float min = std::numeric_limits<float>::max();
-      float min2 = std::numeric_limits<float>::max();
-      StoreMin2(dw, min, min2);
-      StoreMin2(de, min, min2);
-      StoreMin2(dn, min, min2);
-      StoreMin2(ds, min, min2);
-      row_out[x] = min2;
-    }
-  }
-}
-
 // Downsamples the image by a factor of 2 with a kernel that's sharper than
 // the standard 2x2 box kernel used by DownsampleImage.
 // The kernel is optimized against the result of the 2x2 upsampling kernel used
@@ -324,311 +286,38 @@ Status DownsampleImage2_Sharper(Image3F* opsin) {
 
 namespace {
 
-// The default upsampling kernels used by Upsampler in the decoder.
-const constexpr int64_t kSize = 5;
-
-const float kernel00[25] = {
-    -0.01716200f, -0.03452303f, -0.04022174f, -0.02921014f, -0.00624645f,
-    -0.03452303f, 0.14111091f,  0.28896755f,  0.00278718f,  -0.01610267f,
-    -0.04022174f, 0.28896755f,  0.56661550f,  0.03777607f,  -0.01986694f,
-    -0.02921014f, 0.00278718f,  0.03777607f,  -0.03144731f, -0.01185068f,
-    -0.00624645f, -0.01610267f, -0.01986694f, -0.01185068f, -0.00213539f,
-};
-const float kernel01[25] = {
-    -0.00624645f, -0.01610267f, -0.01986694f, -0.01185068f, -0.00213539f,
-    -0.02921014f, 0.00278718f,  0.03777607f,  -0.03144731f, -0.01185068f,
-    -0.04022174f, 0.28896755f,  0.56661550f,  0.03777607f,  -0.01986694f,
-    -0.03452303f, 0.14111091f,  0.28896755f,  0.00278718f,  -0.01610267f,
-    -0.01716200f, -0.03452303f, -0.04022174f, -0.02921014f, -0.00624645f,
-};
-const float kernel10[25] = {
-    -0.00624645f, -0.02921014f, -0.04022174f, -0.03452303f, -0.01716200f,
-    -0.01610267f, 0.00278718f,  0.28896755f,  0.14111091f,  -0.03452303f,
-    -0.01986694f, 0.03777607f,  0.56661550f,  0.28896755f,  -0.04022174f,
-    -0.01185068f, -0.03144731f, 0.03777607f,  0.00278718f,  -0.02921014f,
-    -0.00213539f, -0.01185068f, -0.01986694f, -0.01610267f, -0.00624645f,
-};
-const float kernel11[25] = {
-    -0.00213539f, -0.01185068f, -0.01986694f, -0.01610267f, -0.00624645f,
-    -0.01185068f, -0.03144731f, 0.03777607f,  0.00278718f,  -0.02921014f,
-    -0.01986694f, 0.03777607f,  0.56661550f,  0.28896755f,  -0.04022174f,
-    -0.01610267f, 0.00278718f,  0.28896755f,  0.14111091f,  -0.03452303f,
-    -0.00624645f, -0.02921014f, -0.04022174f, -0.03452303f, -0.01716200f,
-};
-
-// Does exactly the same as the Upsampler in dec_upsampler for 2x2 pixels, with
-// default CustomTransformData.
-// TODO(lode): use Upsampler instead. However, it requires pre-initialization
-// and padding on the left side of the image which requires refactoring the
-// other code using this.
-void UpsampleImage(const ImageF& input, ImageF* output) {
-  int64_t xsize = input.xsize();
-  int64_t ysize = input.ysize();
-  int64_t xsize2 = output->xsize();
-  int64_t ysize2 = output->ysize();
-  for (int64_t y = 0; y < ysize2; y++) {
-    for (int64_t x = 0; x < xsize2; x++) {
-      const auto* kernel = kernel00;
-      if ((x & 1) && (y & 1)) {
-        kernel = kernel11;
-      } else if (x & 1) {
-        kernel = kernel10;
-      } else if (y & 1) {
-        kernel = kernel01;
-      }
-      float sum = 0;
-      int64_t x2 = x / 2;
-      int64_t y2 = y / 2;
-
-      // get min and max values of the original image in the support
-      float min = std::numeric_limits<float>::max();
-      float max = std::numeric_limits<float>::min();
-
-      for (int64_t ky = 0; ky < kSize; ky++) {
-        for (int64_t kx = 0; kx < kSize; kx++) {
-          int64_t xi = x2 - kSize / 2 + kx;
-          int64_t yi = y2 - kSize / 2 + ky;
-          if (xi < 0) xi = 0;
-          if (xi >= xsize) xi = input.xsize() - 1;
-          if (yi < 0) yi = 0;
-          if (yi >= ysize) yi = input.ysize() - 1;
-          min = std::min<float>(min, input.Row(yi)[xi]);
-          max = std::max<float>(max, input.Row(yi)[xi]);
-        }
-      }
-
-      for (int64_t ky = 0; ky < kSize; ky++) {
-        for (int64_t kx = 0; kx < kSize; kx++) {
-          int64_t xi = x2 - kSize / 2 + kx;
-          int64_t yi = y2 - kSize / 2 + ky;
-          if (xi < 0) xi = 0;
-          if (xi >= xsize) xi = input.xsize() - 1;
-          if (yi < 0) yi = 0;
-          if (yi >= ysize) yi = input.ysize() - 1;
-          sum += input.Row(yi)[xi] * kernel[ky * kSize + kx];
-        }
-      }
-      output->Row(y)[x] = sum;
-      if (output->Row(y)[x] < min) output->Row(y)[x] = min;
-      if (output->Row(y)[x] > max) output->Row(y)[x] = max;
-    }
-  }
-}
-
-// Returns the derivative of Upsampler, with respect to input pixel x2, y2, to
-// output pixel x, y (ignoring the clamping).
-float UpsamplerDeriv(int64_t x2, int64_t y2, int64_t x, int64_t y) {
-  const auto* kernel = kernel00;
-  if ((x & 1) && (y & 1)) {
-    kernel = kernel11;
-  } else if (x & 1) {
-    kernel = kernel10;
-  } else if (y & 1) {
-    kernel = kernel01;
-  }
-
-  int64_t ix = x / 2;
-  int64_t iy = y / 2;
-  int64_t kx = x2 - ix + kSize / 2;
-  int64_t ky = y2 - iy + kSize / 2;
-
-  // This should not happen.
-  if (kx < 0 || kx >= kSize || ky < 0 || ky >= kSize) return 0;
-
-  return kernel[ky * kSize + kx];
-}
-
-// Apply the derivative of the Upsampler to the input, reversing the effect of
-// its coefficients. The output image is 2x2 times smaller than the input.
-void AntiUpsample(const ImageF& input, ImageF* d) {
-  int64_t xsize = input.xsize();
-  int64_t ysize = input.ysize();
-  int64_t xsize2 = d->xsize();
-  int64_t ysize2 = d->ysize();
-  int64_t k0 = kSize - 1;
-  int64_t k1 = kSize;
-  for (int64_t y2 = 0; y2 < ysize2; ++y2) {
-    auto* row = d->Row(y2);
-    for (int64_t x2 = 0; x2 < xsize2; ++x2) {
-      int64_t x0 = x2 * 2 - k0;
-      if (x0 < 0) x0 = 0;
-      int64_t x1 = x2 * 2 + k1 + 1;
-      if (x1 > xsize) x1 = xsize;
-      int64_t y0 = y2 * 2 - k0;
-      if (y0 < 0) y0 = 0;
-      int64_t y1 = y2 * 2 + k1 + 1;
-      if (y1 > ysize) y1 = ysize;
-
-      float sum = 0;
-      for (int64_t y = y0; y < y1; ++y) {
-        const auto* row_in = input.Row(y);
-        for (int64_t x = x0; x < x1; ++x) {
-          double deriv = UpsamplerDeriv(x2, y2, x, y);
-          sum += deriv * row_in[x];
-        }
-      }
-      row[x2] = sum;
-    }
-  }
-}
-
-// Element-wise multiplies two images.
-template <typename T>
-Status ElwiseMul(const Plane<T>& image1, const Plane<T>& image2,
-                 Plane<T>* out) {
-  const size_t xsize = image1.xsize();
-  const size_t ysize = image1.ysize();
-  JXL_ENSURE(xsize == image2.xsize());
-  JXL_ENSURE(ysize == image2.ysize());
-  JXL_ENSURE(xsize == out->xsize());
-  JXL_ENSURE(ysize == out->ysize());
-  for (size_t y = 0; y < ysize; ++y) {
-    const T* const JXL_RESTRICT row1 = image1.Row(y);
-    const T* const JXL_RESTRICT row2 = image2.Row(y);
-    T* const JXL_RESTRICT row_out = out->Row(y);
-    for (size_t x = 0; x < xsize; ++x) {
-      row_out[x] = row1[x] * row2[x];
-    }
-  }
-  return true;
-}
-
-// Element-wise divides two images.
-template <typename T>
-Status ElwiseDiv(const Plane<T>& image1, const Plane<T>& image2,
-                 Plane<T>* out) {
-  const size_t xsize = image1.xsize();
-  const size_t ysize = image1.ysize();
-  JXL_ENSURE(xsize == image2.xsize());
-  JXL_ENSURE(ysize == image2.ysize());
-  JXL_ENSURE(xsize == out->xsize());
-  JXL_ENSURE(ysize == out->ysize());
-  for (size_t y = 0; y < ysize; ++y) {
-    const T* const JXL_RESTRICT row1 = image1.Row(y);
-    const T* const JXL_RESTRICT row2 = image2.Row(y);
-    T* const JXL_RESTRICT row_out = out->Row(y);
-    for (size_t x = 0; x < xsize; ++x) {
-      row_out[x] = row1[x] / row2[x];
-    }
-  }
-  return true;
-}
-
-void ReduceRinging(const ImageF& initial, const ImageF& mask, ImageF& down) {
-  int64_t xsize2 = down.xsize();
-  int64_t ysize2 = down.ysize();
-
-  for (size_t y = 0; y < down.ysize(); y++) {
-    const float* row_mask = mask.Row(y);
-    float* row_out = down.Row(y);
-    for (size_t x = 0; x < down.xsize(); x++) {
-      float v = down.Row(y)[x];
-      float min = initial.Row(y)[x];
-      float max = initial.Row(y)[x];
-      for (int64_t yi = -1; yi < 2; yi++) {
-        for (int64_t xi = -1; xi < 2; xi++) {
-          int64_t x2 = static_cast<int64_t>(x) + xi;
-          int64_t y2 = static_cast<int64_t>(y) + yi;
-          if (x2 < 0 || y2 < 0 || x2 >= xsize2 || y2 >= ysize2) continue;
-          min = std::min<float>(min, initial.Row(y2)[x2]);
-          max = std::max<float>(max, initial.Row(y2)[x2]);
-        }
-      }
-
-      row_out[x] = v;
-
-      // Clamp the pixel within the value  of a small area to prevent ringning.
-      // The mask determines how much to clamp, clamp more to reduce more
-      // ringing in smooth areas, clamp less in noisy areas to get more
-      // sharpness. Higher mask_multiplier gives less clamping, so less
-      // ringing reduction.
-      const constexpr float mask_multiplier = 2;
-      float a = row_mask[x] * mask_multiplier;
-      float clip_min = min - a;
-      float clip_max = max + a;
-      if (row_out[x] < clip_min) row_out[x] = clip_min;
-      if (row_out[x] > clip_max) row_out[x] = clip_max;
-    }
-  }
-}
-
-// TODO(lode): move this to a separate file enc_downsample.cc
 Status DownsampleImage2_Iterative(const ImageF& orig, ImageF* output) {
-  int64_t xsize = orig.xsize();
-  int64_t ysize = orig.ysize();
-  int64_t xsize2 = DivCeil(orig.xsize(), 2);
-  int64_t ysize2 = DivCeil(orig.ysize(), 2);
   JxlMemoryManager* memory_manager = orig.memory_manager();
-
-  JXL_ASSIGN_OR_RETURN(ImageF box_downsample,
-                       ImageF::Create(memory_manager, xsize, ysize));
-  JXL_RETURN_IF_ERROR(CopyImageTo(orig, &box_downsample));
-  JXL_ASSIGN_OR_RETURN(box_downsample, DownsampleImage(box_downsample, 2));
-  JXL_ASSIGN_OR_RETURN(ImageF mask,
-                       ImageF::Create(memory_manager, box_downsample.xsize(),
-                                      box_downsample.ysize()));
-  CreateMask(box_downsample, mask);
-
-  JXL_RETURN_IF_ERROR(output->ShrinkTo(xsize2, ysize2));
-
-  // Initial result image using the sharper downsampling.
-  // Allocate extra space to avoid a reallocation when padding.
-  JXL_ASSIGN_OR_RETURN(
-      ImageF initial,
-      ImageF::Create(memory_manager, DivCeil(orig.xsize(), 2) + kBlockDim,
-                     DivCeil(orig.ysize(), 2) + kBlockDim));
-  JXL_RETURN_IF_ERROR(initial.ShrinkTo(initial.xsize() - kBlockDim,
-                                       initial.ysize() - kBlockDim));
-  JXL_RETURN_IF_ERROR(DownsampleImage2_Sharper(orig, &initial));
-
-  JXL_ASSIGN_OR_RETURN(
-      ImageF down,
-      ImageF::Create(memory_manager, initial.xsize(), initial.ysize()));
-  JXL_RETURN_IF_ERROR(CopyImageTo(initial, &down));
-  JXL_ASSIGN_OR_RETURN(ImageF up, ImageF::Create(memory_manager, xsize, ysize));
-  JXL_ASSIGN_OR_RETURN(ImageF corr,
-                       ImageF::Create(memory_manager, xsize, ysize));
-  JXL_ASSIGN_OR_RETURN(ImageF corr2,
-                       ImageF::Create(memory_manager, xsize2, ysize2));
-
-  // In the weights map, relatively higher values will allow less ringing but
-  // also less sharpness. With all constant values, it optimizes equally
-  // everywhere. Even in this case, the weights2 computed from
-  // this is still used and differs at the borders of the image.
-  // TODO(lode): Make use of the weights field for anti-ringing and clamping,
-  // the values are all set to 1 for now, but it is intended to be used for
-  // reducing ringing based on the mask, and taking clamping into account.
-  JXL_ASSIGN_OR_RETURN(ImageF weights,
-                       ImageF::Create(memory_manager, xsize, ysize));
-  for (size_t y = 0; y < weights.ysize(); y++) {
-    auto* row = weights.Row(y);
-    for (size_t x = 0; x < weights.xsize(); x++) {
-      row[x] = 1;
-    }
-  }
-  JXL_ASSIGN_OR_RETURN(ImageF weights2,
-                       ImageF::Create(memory_manager, xsize2, ysize2));
-  AntiUpsample(weights, &weights2);
-
-  const size_t num_it = 3;
-  for (size_t it = 0; it < num_it; ++it) {
-    UpsampleImage(down, &up);
-    JXL_ASSIGN_OR_RETURN(corr, LinComb<float>(1, orig, -1, up));
-    JXL_RETURN_IF_ERROR(ElwiseMul(corr, weights, &corr));
-    AntiUpsample(corr, &corr2);
-    JXL_RETURN_IF_ERROR(ElwiseDiv(corr2, weights2, &corr2));
-
-    JXL_ASSIGN_OR_RETURN(down, LinComb<float>(1, down, 1, corr2));
-  }
-
-  ReduceRinging(initial, mask, down);
-
-  // can't just use CopyImage, because the output image was prepared with
-  // padding.
-  for (size_t y = 0; y < down.ysize(); y++) {
-    for (size_t x = 0; x < down.xsize(); x++) {
-      float v = down.Row(y)[x];
-      output->Row(y)[x] = v;
+  const size_t width = DivCeil(orig.xsize(), 2);
+  const size_t height = DivCeil(orig.ysize(), 2);
+  JXL_RETURN_IF_ERROR(output->ShrinkTo(width, height));
+  const size_t field_width = std::min(iterative_rows::kSide, width);
+  const size_t field_height = std::min(iterative_rows::kSide, height);
+  JXL_ASSIGN_OR_RETURN(ImageF initial, ImageF::Create(memory_manager, field_width, field_height));
+  JXL_ASSIGN_OR_RETURN(ImageF ping, ImageF::Create(memory_manager, field_width, field_height));
+  JXL_ASSIGN_OR_RETURN(ImageF pong, ImageF::Create(memory_manager, field_width, field_height));
+  JXL_ASSIGN_OR_RETURN(ImageF scratch, ImageF::Create(memory_manager, iterative_rows::kScratchFloats, 1));
+  const size_t stride = static_cast<size_t>(initial.PixelsPerRow());
+  JXL_ENSURE(stride == static_cast<size_t>(ping.PixelsPerRow()));
+  JXL_ENSURE(stride == static_cast<size_t>(pong.PixelsPerRow()));
+  const iterative_rows::Workspace workspace {
+    initial.Row(0), ping.Row(0), pong.Row(0), stride, field_height,
+    stride * field_height, scratch.Row(0), static_cast<size_t>(scratch.PixelsPerRow())
+  };
+  for (size_t y = 0; y < height; y += iterative_rows::kTarget) {
+    for (size_t x = 0; x < width; x += iterative_rows::kTarget) {
+      JXL_ENSURE(iterative_rows::Region(
+          orig.xsize(), orig.ysize(), x, y,
+          std::min(iterative_rows::kTarget, width - x),
+          std::min(iterative_rows::kTarget, height - y), workspace,
+          [&](size_t row, size_t first, size_t count, float* target) {
+            std::copy(orig.Row(row) + first, orig.Row(row) + first + count, target);
+            return true;
+          },
+          [&](size_t row, size_t first, size_t count, const float* source) {
+            std::copy(source, source + count, output->Row(row) + first);
+            return true;
+          }));
     }
   }
   return true;

@@ -155,7 +155,7 @@ and signed-zero samples, wide/tall one-dimensional offsets and explicit failures
 The full native high-distance group-coordinate and iterative-filter integration
 remains open; this refactor does not qualify high-distance 16000 exports.
 
-An iterative regional kernel is available as a prototype, with the exact pinned
+An iterative regional kernel supplies the existing scalar ImageF helper, with the exact pinned
 three passes and an independent whole-image reference oracle. AntiUpsample needs
 raw support `[2x-4,2x+5]`; its upsample reads `floor(raw/2)±2`, giving a coarse
 radius 4 per pass, hence 12 for three passes. Final ringing's initial±1 is inside
@@ -168,5 +168,6 @@ plus bounded correction/source/sharper scratch stay below 53 MiB. No replacement
 allocation occurs during a pass. Allocator overhead and all other native state
 still count under the unchanged 512 MiB allocator admission; this is not total app
 RAM. Buffers must remain admitted and disjoint. Source and sink failures refuse
-completion. The prototype is not yet called by the iterative encoder path and
+completion. The existing helper still receives its resident input plane; its three-channel
+caller and actual resampling2 group/XYB-row bridge remain separate work. This
 introduces no new spool, wire format, option override or publication authority.
