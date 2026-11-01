@@ -11,6 +11,9 @@ use crate::{
 #[path = "native/bounds.rs"]
 mod bounds;
 pub(crate) use bounds::source_bounds;
+#[path = "native/output.rs"]
+mod output;
+pub(crate) use output::write_plane;
 
 enum Kind {
     Affine { matrix: [f64; 6], determinant: f64 },
@@ -190,6 +193,9 @@ pub(crate) fn render_tile(
     }
     let size = (TILE * TILE * 4) as usize * usize::from(source.depth() / 8);
     if fill.is_none() && mapping.identity() && frame == mapping.input {
+        // This path copies complete physical padding too. It must consume the
+        // same operation allowance even though no coordinate map is evaluated.
+        work.claim(u64::from(TILE) * u64::from(TILE))?;
         let tile = source
             .prepare_tile(coordinate, &mut || check())
             .map_err(|e| e.to_string())?;
@@ -527,6 +533,135 @@ mod tests {
         raster::Raster,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn whole_plane_output_preserves_native_tiles_and_retires_zero_and_refused_candidates() {
+        use crate::large_document::FreshFragment;
+        for depth in [8, 16] {
+            let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+            let (store, disk, path) = fixture(&pool);
+            let input = pixels(257, 3, depth);
+            let source = Surface::stage_raster(&input, store.clone(), &mut || Ok(())).unwrap();
+            let original_key = source.key();
+            for (matrix, frame) in [
+                (crate::retained::IDENTITY, [257, 3]),
+                ([1., 0., 0., 1., 0.25, 0.5], [263, 5]),
+            ] {
+                let output_path =
+                    std::fs::canonicalize(std::env::temp_dir())
+                        .unwrap()
+                        .join(format!(
+                            "peerbrush-transform-output-{}",
+                            crate::engine::id()
+                        ));
+                let fragment = FreshFragment::create(
+                    &output_path,
+                    pool.clone(),
+                    disk.clone(),
+                    Limits {
+                        disk_bytes: 8 * 1024 * 1024,
+                        max_blocks: 16,
+                        max_resident_blocks: 4,
+                        manifest_bytes: 65536,
+                    },
+                )
+                .unwrap();
+                let mapping = Mapping::retained(257, 3, depth, matrix, None, &[], &pool).unwrap();
+                let output = write_plane(
+                    &source,
+                    &mapping,
+                    frame,
+                    fragment.store(),
+                    &mut Work::new(1_000_000).unwrap(),
+                    &|| Ok(()),
+                )
+                .unwrap();
+                let mut old = crate::retained::Original::from(&input);
+                old.matrix = matrix;
+                let expected = old.render(frame[0], frame[1]).unwrap();
+                for y in 0..frame[1].div_ceil(TILE) {
+                    for x in 0..frame[0].div_ceil(TILE) {
+                        let bytes = output
+                            .prepare_tile((x, y), &mut || Ok(()))
+                            .unwrap()
+                            .copy_to_scratch(&pool)
+                            .unwrap()
+                            .freeze();
+                        assert_tile(
+                            &Tile {
+                                source: source.key(),
+                                coordinate: (x, y),
+                                frame,
+                                depth,
+                                bytes,
+                            },
+                            &expected,
+                        );
+                    }
+                }
+                assert_eq!(source.key(), original_key);
+                assert_eq!(
+                    source
+                        .prepare_region(Region::new([256, 2, 257, 3]).unwrap(), &mut || Ok(()))
+                        .unwrap()
+                        .pixel16(256, 2)
+                        .unwrap(),
+                    input.get16(256, 2)
+                );
+                drop(output);
+                fragment.abort(&mut || Ok(())).unwrap();
+                std::fs::remove_dir(output_path).unwrap();
+            }
+            let output_path = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("peerbrush-transform-zero-{}", crate::engine::id()));
+            let fragment = FreshFragment::create(
+                &output_path,
+                pool.clone(),
+                disk.clone(),
+                Limits {
+                    disk_bytes: 8 * 1024 * 1024,
+                    max_blocks: 16,
+                    max_resident_blocks: 4,
+                    manifest_bytes: 65536,
+                },
+            )
+            .unwrap();
+            let mapping =
+                Mapping::retained(257, 3, depth, crate::retained::IDENTITY, None, &[], &pool)
+                    .unwrap();
+            let baseline = pool.used();
+            assert!(write_plane(
+                &source,
+                &mapping,
+                [257, 3],
+                fragment.store(),
+                &mut Work::new(1).unwrap(),
+                &|| Ok(())
+            )
+            .is_err());
+            assert_eq!(pool.used(), baseline);
+            let zero = Surface::zero(257, 3, depth).unwrap();
+            let output = write_plane(
+                &zero,
+                &mapping,
+                [257, 3],
+                fragment.store(),
+                &mut Work::new(1_000_000).unwrap(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert!(output.is_known_zero());
+            assert_eq!(output.physical_tiles().count(), 0);
+            drop(output);
+            fragment.abort(&mut || Ok(())).unwrap();
+            std::fs::remove_dir(output_path).unwrap();
+            drop(source);
+            drop(store);
+            assert_eq!(pool.used(), 0);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
 
     fn fixture(pool: &ResidentBudget) -> (Store, DiskBudget, std::path::PathBuf) {
         let path = std::fs::canonicalize(std::env::temp_dir())
