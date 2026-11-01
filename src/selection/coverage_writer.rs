@@ -2,7 +2,9 @@
 //! resulting selection remains a candidate until common engine publication.
 use super::{backed::CoverageSource, contours::Contours, rows::CompleteRows};
 use crate::{
-    large_document::{BlockRef, Error, ResidentBudget, Result, ScratchBytes, Store, TileSpec},
+    large_document::{
+        BlockRef, Error, Reservation, ResidentBudget, Result, ScratchBytes, Store, TileSpec,
+    },
     raster::{backed::Plane, surface::Surface, TILE},
 };
 use std::collections::BTreeMap;
@@ -17,6 +19,7 @@ pub(super) struct Writer {
     contours: Contours,
     blocks: BTreeMap<(u32, u32), BlockRef>,
     store: Store,
+    _index: Reservation,
     failed: bool,
 }
 
@@ -43,6 +46,10 @@ impl Writer {
             contours: Contours::new(width, height, pool)?,
             blocks: BTreeMap::new(),
             store,
+            _index: pool.reserve_bytes(
+                columns as usize * height.div_ceil(TILE) as usize * 2048,
+                8 * 1024 * 1024,
+            )?,
             failed: false,
         })
     }

@@ -51,7 +51,8 @@ receive a borrowed slice. Surviving Vec capacities remain charged across source
 and prepared-region clones. A growth reservation is reduced only after old
 allocations have been freed; this does not resize pin, scratch or disk charges.
 Its prepared region retains both source ownership and payload pins. Sampling
-outside the declared footprint fails; metadata-proven exterior pixels are zero.
+outside the declared footprint fails; the physical mask exterior is known zero.
+The bounds hint does not authorize dropping nonzero raw pixels inside the mask.
 The scalar red channel remains authoritative even when independent RGBA alpha
 is zero. Staging currently refuses retained legacy mask originals until their
 explicit scene collector can preserve them. No source is discarded to stage a
@@ -85,3 +86,34 @@ holes, tile edges, several seed colors, Quick radius, generation rollover and
 failure after provisional output. The opt-in 256MP traversal uses computed
 native samples and proves traversal/workspace behavior only. It does not qualify
 an actual dense document, styled composition, Save/recovery or native latency.
+
+`regional_refine` prepares native scalar surfaces through explicit source
+regions. Shift uses separable bounded monotone queues; smooth, feather, contrast
+and guided edge preserve the existing arithmetic and tile/halo boundaries.
+The largest local block is 512 square. Local vectors share a 16 MiB scratch
+reservation; native source pins, output buffers, source indices and staging disk
+remain separately charged. Source reads use declared windows of at most 128 Ki
+pixels. An unchanged selection returns no candidate and keeps its history.
+
+`regional_import` samples an already validated image source. It retains the
+existing channel, pixel-center bilinear and float-combination order before
+rounding final coverage. Luma conversion uses bounded rows through the same
+image-library operation as the resident importer. Original grayscale, alpha
+presence and color-space facts come from image admission. The existing PNG
+loader uses the image library's default sRGB color space; applying a raw PNG
+cICP chunk is a separate behavior change. Native image pixels remain intact.
+Container decoding, checksums and final source completion belong to the image
+decoder, rather than this sampler.
+
+`regional_masks` consumes a fallible prepared evaluator bound to one captured
+scene, layer frame, origin, native depth and shared budgets. Raw fractional
+factors are rounded at 65535 before native selection combination, target-depth
+projection and opaque output alpha, matching the current mask command. The
+adapter supplies no alternative mask-stack evaluator and no history authority.
+
+The native tile and decoded-row writers reject incomplete sequences and
+nonnative 8-bit samples. Provisional indices retain a separate reservation through
+surface construction. Live adoption also requires the permanently charged
+surface descriptor owner, concrete captured-source sampler bindings and the
+common engine publication checks. These components do not raise resident
+selection/import/refinement limits or establish full 16K application acceptance.
