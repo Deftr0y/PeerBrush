@@ -207,7 +207,7 @@ pub fn run_with(shared: &Shared, actor: &str, p: &Value, config: &Config) -> Res
                 return Err("Task reservation expired or was released".into());
             }
         }
-        e.doc.clone()
+        e.resident()?.clone()
     };
     let expected = p
         .get("expected_revision")
@@ -223,7 +223,7 @@ pub fn run_with(shared: &Shared, actor: &str, p: &Value, config: &Config) -> Res
     let request = request(&doc, p)?;
     let response = invoke(config, &request, || {
         let e = shared.lock().unwrap();
-        e.doc.id == doc.id && e.doc.revision == doc.revision
+        e.authority.view().id() == doc.id && e.authority.view().revision() == doc.revision
     })?;
     if response["version"] != 1
         || response["document_id"] != doc.id
@@ -234,7 +234,7 @@ pub fn run_with(shared: &Shared, actor: &str, p: &Value, config: &Config) -> Res
         return Err("Segmentation response does not match the requested project, revision, coordinates or luma confidence format".into());
     }
     let mut e = shared.lock().unwrap();
-    if e.doc.id != doc.id || e.doc.revision != doc.revision {
+    if e.authority.view().id() != doc.id || e.authority.view().revision() != doc.revision {
         return Err(
             "Project changed before automatic selection completed; no result applied".into(),
         );

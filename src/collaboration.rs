@@ -126,7 +126,9 @@ impl Engine {
             if p.draft.is_none() {
                 continue;
             }
-            if p.document != self.doc.id || p.revision != self.doc.revision {
+            if p.document != self.authority.view().id()
+                || p.revision != self.authority.view().revision()
+            {
                 p.stop(
                     "stale",
                     "The project changed. Request a fresh proposal; your edits are preserved.",
@@ -193,7 +195,7 @@ impl Engine {
             return Err("Proposals need explicit human acceptance".into());
         }
         self.expire();
-        if self.doc.id != document || self.doc.revision != revision {
+        if self.authority.view().id() != document || self.authority.view().revision() != revision {
             return Err("The project changed; review a fresh proposal before accepting".into());
         }
         let p = self
@@ -218,7 +220,9 @@ impl Engine {
     }
     fn queue_proposal(&mut self, p: Proposal) -> Result<Value, String> {
         self.expire();
-        if p.document != self.doc.id || p.revision != self.doc.revision {
+        if p.document != self.authority.view().id()
+            || p.revision != self.authority.view().revision()
+        {
             return Err(
                 "The project changed while preparing the proposal; current work preserved".into(),
             );
@@ -234,7 +238,7 @@ impl Engine {
             return Err("Four proposals are already pending. Review or reject one first".into());
         }
         let mut base = HashMap::new();
-        doc_tiles(&self.doc, &mut base);
+        doc_tiles(self.resident()?, &mut base);
         let mut pending = HashMap::new();
         for old in self.proposals.iter().chain(std::iter::once(&p)) {
             if let Some(d) = &old.draft {
@@ -295,10 +299,10 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
     {
         let mut e = shared.lock().unwrap();
         e.expire();
-        if e.doc.id != document || e.doc.revision != revision {
+        if e.authority.view().id() != document || e.authority.view().revision() != revision {
             return Err("The proposal source changed. Observe the current project again".into());
         }
-        draft.doc = e.doc.clone();
+        *draft.resident_mut()? = e.resident()?.clone();
         draft.leases = e.leases.clone();
         draft.brush_library = e.brush_library.clone();
         draft.filter_library = e.filter_library.clone();
@@ -314,15 +318,15 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         .unwrap()
         .resolve_commands(&commands)?;
     let result = draft.edit(actor, &commands, Some(revision), task, label)?;
-    if draft.doc.id != document {
+    if draft.authority.view().id() != document {
         return Err("Proposals edit the current project; new/open are document actions".into());
     }
     let scopes = draft
-        .undo
+        .history_entries()
         .last()
         .ok_or("Missing proposal scope")?
-        .scopes
-        .clone();
+        .scopes()
+        .to_vec();
     let proposal = Proposal {
         id: engine::id(),
         actor: actor.into(),
@@ -332,7 +336,7 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         revision,
         commands: commands.clone(),
         scopes,
-        draft: Some(draft.doc),
+        draft: Some(draft.authority.into_resident_document()?),
         expires: engine::now() + 900,
         status: "pending".into(),
         reason: String::new(),
