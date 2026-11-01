@@ -7,7 +7,7 @@ use serde::{
 use serde_json::{Number, Value};
 use std::{cell::Cell, fmt, io::Write};
 
-pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
@@ -16,7 +16,7 @@ pub(crate) struct Limits {
     pub depth: usize,
 }
 impl Limits {
-    fn validate(self) -> Result<(), String> {
+    pub(crate) fn validate(self) -> Result<(), String> {
         if self.bytes == 0
             || self.bytes > MAX_BYTES
             || self.nodes == 0
@@ -210,6 +210,14 @@ impl Canonical {
         limits: Limits,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
+        Self::decode(bytes, limits, true, check)
+    }
+    fn decode(
+        bytes: &[u8],
+        limits: Limits,
+        require_canonical: bool,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
         limits.validate()?;
         check()?;
         if bytes.len() > limits.bytes {
@@ -234,7 +242,7 @@ impl Canonical {
             check,
         };
         serde_json::to_writer(&mut output, &Ordered(&value)).map_err(|e| e.to_string())?;
-        if output.bytes != bytes {
+        if require_canonical && output.bytes != bytes {
             return Err("Source36 metadata is not canonical JSON".into());
         }
         check()?;
@@ -266,11 +274,28 @@ impl Canonical {
         // Enforce the exact same parser/depth/numeric contract on emitted data.
         Self::parse(&output.bytes, limits, check)
     }
+    pub(crate) fn from_serializable<T: Serialize>(
+        value: &T,
+        limits: Limits,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        limits.validate()?;
+        let mut output = Output {
+            bytes: Vec::new(),
+            maximum: limits.bytes,
+            check,
+        };
+        serde_json::to_writer(&mut output, value).map_err(|e| e.to_string())?;
+        Self::decode(&output.bytes, limits, false, check)
+    }
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
     pub(crate) fn value(&self) -> &Value {
         &self.value
+    }
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Value) {
+        (self.bytes, self.value)
     }
     pub(crate) fn core_digest(&self) -> [u8; 32] {
         let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
