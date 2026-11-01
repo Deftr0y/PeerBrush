@@ -22,6 +22,15 @@ unchanged source roster remains shared. Final adoption checks the exact base
 generation, revision, document identity, read-only state and cancellation without
 I/O or callbacks.
 
+SceneSnapshot can retain either a provisional PendingScene or a NativeDocument.
+Both return the same borrowed metadata projection. Raster, mask, coverage and
+retained-original projections produce opaque generation-bound slots, resolved
+against the snapshot's strong roster. Native frames share their header and roster
+without a metadata copy; their immutable render key is computed once. Metadata
+serialization remains the exact Source36 wire representation. The guarded codec
+handoff refuses native authority and any runtime leases, file guards or protected
+inspection owners.
+
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,
 recovery and coordinated live document replacement must be connected and tested
