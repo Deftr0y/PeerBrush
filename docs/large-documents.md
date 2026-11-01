@@ -1,5 +1,11 @@
 # Large-document loading and derived caches
 
+## Native display color preparation (unreleased)
+
+The source-backed preview worker prepares uncached ICC transforms under the same resident admission as its captured scene. It converts rendered native8 rows directly, or native16 rows before their display projection, preserving the existing CMS arithmetic and original profile bytes. Mask feedback bypasses color conversion. Unsupported profiles retain raw feedback with a warning; admission, cancellation and source failures return an error instead of a fallback image.
+
+Only the active render owns CMS executors. Queued requests and completed frames retain small source/profile tags and independently admitted display pixels. This preparation does not activate the native document path, raise canvas limits or supply the still-required protected-document, derived-effect and mask providers. Full native presentation and cross-platform acceptance remain separate gates.
+
 File → Open, dropping a PSD and recovering an autosave use the same cancellable loader as MCP and CLI. The progress window reports reading, saved-image decoding, layer decoding and editable-source restoration. Its saved-image preview is display-only; the current document stays editable until a complete replacement is ready. Cancel, a changed current document, a changed file or decoding failure preserves the existing project and history. Reservations are checked before replacement.
 
 The codec streams raw, PackBits RLE, ZIP and ZIP-predicted 8/16-bit composites and color-layer channels into 256-pixel native tiles. It uses row-sized decompression buffers instead of complete channel and interleaved-image buffers. Encoded resources/layer sections are read in cancellable 1 MiB chunks; the complete encoded file is not buffered. A bounded saved-image projection is available before source restoration finishes. Valid PeerBrush definitions are restored directly after verifying the standard data checksum, avoiding a duplicate standard-layer allocation. Unsupported or invalid definitions retain the existing protected Photoshop fallback.

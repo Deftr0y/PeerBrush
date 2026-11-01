@@ -87,6 +87,12 @@ fn classic_lut(data: &[u8]) -> Result<bool, String> {
 }
 
 fn parse(bytes: &[u8]) -> Result<ColorProfile, String> {
+    parse_observing(bytes, &mut |_| {})
+}
+fn parse_observing(
+    bytes: &[u8],
+    native_error: &mut dyn FnMut(&moxcms::CmsError),
+) -> Result<ColorProfile, String> {
     if bytes.len() > MAX_PROFILE_BYTES || bytes.len() < 132 {
         return Err("ICC profile exceeds the supported size or is truncated".into());
     }
@@ -195,7 +201,10 @@ fn parse(bytes: &[u8]) -> Result<ColorProfile, String> {
             max_allowed_trc_size: 65536,
         },
     )
-    .map_err(|e| format!("Invalid ICC profile: {e}"))?;
+    .map_err(|e| {
+        native_error(&e);
+        format!("Invalid ICC profile: {e}")
+    })?;
     if profile.color_space != DataColorSpace::Rgb
         || !matches!(profile.pcs, DataColorSpace::Xyz | DataColorSpace::Lab)
         || !matches!(

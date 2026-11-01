@@ -1,9 +1,12 @@
 //! Uncached CMS ownership for workers using the shared resident admission pool.
 use super::{
-    parse, ColorProfile, Layout, RenderingIntent, TransformOptions, Transforms, MAX_PROFILE_BYTES,
+    ColorProfile, Layout, RenderingIntent, TransformOptions, Transforms, MAX_PROFILE_BYTES,
 };
 use crate::large_document::{Reservation, ResidentBudget, ScratchBytes};
 use std::ops::{Deref, DerefMut};
+#[path = "prepared/display.rs"]
+mod display;
+pub(crate) use display::{profile_binding, DisplayPlan, DisplayStatus};
 
 /// Conservative pinned moxcms0.8.1 envelope:4MiB input/derived profile,
 /// <=8MiB cumulative decoded text, six classic LUTs plus bounded auxiliary
@@ -18,21 +21,60 @@ pub(crate) struct UncachedTransforms {
     pool: ResidentBudget,
     _charges: [Reservation; 7],
 }
+enum PreparationFailure {
+    Unsupported(String),
+    Failed(String),
+}
+impl PreparationFailure {
+    fn operational(error: &moxcms::CmsError) -> bool {
+        use moxcms::CmsError;
+        matches!(
+            error,
+            CmsError::OutOfMemory(_)
+                | CmsError::LaneSizeMismatch
+                | CmsError::LaneMultipleOfChannels
+                | CmsError::InvalidLayout
+                | CmsError::InvalidRenderingIntent
+                | CmsError::OverflowingError
+        )
+    }
+    fn native(error: moxcms::CmsError) -> Self {
+        if Self::operational(&error) {
+            Self::Failed(error.to_string())
+        } else {
+            Self::Unsupported(error.to_string())
+        }
+    }
+    fn reason(self) -> String {
+        match self {
+            Self::Unsupported(reason) | Self::Failed(reason) => reason,
+        }
+    }
+}
 impl UncachedTransforms {
     pub(crate) fn new(
         profile: &[u8],
         pool: &ResidentBudget,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, String> {
-        check()?;
+        Self::classified(profile, pool, check, true).map_err(PreparationFailure::reason)
+    }
+    fn classified(
+        profile: &[u8],
+        pool: &ResidentBudget,
+        check: &mut dyn FnMut() -> Result<(), String>,
+        bypass_srgb: bool,
+    ) -> Result<Self, PreparationFailure> {
+        use PreparationFailure::{Failed, Unsupported};
+        check().map_err(Failed)?;
         if profile.len() > MAX_PROFILE_BYTES {
-            return Err("ICC profile exceeds the4MiB limit".into());
+            return Err(Unsupported("ICC profile exceeds the4MiB limit".into()));
         }
         // Separate allocation groups, not one >64MiB buffer. Keep every group
         // until all executor objects are destroyed; partial admission unwinds.
         let reserve = |mib: usize| {
             pool.reserve_bytes(mib * 1024 * 1024, mib * 1024 * 1024)
-                .map_err(|e| e.to_string())
+                .map_err(|e| Failed(e.to_string()))
         };
         let charges = [
             reserve(8)?,
@@ -43,19 +85,30 @@ impl UncachedTransforms {
             reserve(8)?,
             reserve(24)?,
         ];
-        metadata_bound(profile)?;
-        let source = parse(profile)?;
-        check()?;
+        metadata_bound(profile).map_err(Unsupported)?;
+        let mut operational = false;
+        let source = super::parse_observing(profile, &mut |error| {
+            operational = PreparationFailure::operational(error);
+        })
+        .map_err(|reason| {
+            if operational {
+                Failed(reason)
+            } else {
+                Unsupported(reason)
+            }
+        })?;
+        check().map_err(Failed)?;
         let mut target = ColorProfile::new_srgb();
         target.cicp = None;
-        let canonical = target.encode().map_err(|e| e.to_string())?;
+        let canonical = target.encode().map_err(|e| Failed(e.to_string()))?;
         // Same immutable tag comparison as the legacy sRGB bypass, without
         // initializing or retaining a process-global profile/transform cache.
-        if profile.len() == canonical.len()
+        if bypass_srgb
+            && profile.len() == canonical.len()
             && profile[..24] == canonical[..24]
             && profile[36..] == canonical[36..]
         {
-            check()?;
+            check().map_err(Failed)?;
             return Ok(Self {
                 transforms: None,
                 pool: pool.clone(),
@@ -76,12 +129,12 @@ impl UncachedTransforms {
         };
         let bytes = source
             .create_transform_8bit(Layout::Rgba, &target, Layout::Rgba, options)
-            .map_err(|e| e.to_string())?;
-        check()?;
+            .map_err(PreparationFailure::native)?;
+        check().map_err(Failed)?;
         let words = source
             .create_transform_16bit(Layout::Rgba, &target, Layout::Rgba, options)
-            .map_err(|e| e.to_string())?;
-        check()?;
+            .map_err(PreparationFailure::native)?;
+        check().map_err(Failed)?;
         Ok(Self {
             transforms: Some(Transforms { bytes, words }),
             pool: pool.clone(),
