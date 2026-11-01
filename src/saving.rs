@@ -56,6 +56,11 @@ impl Control {
     pub fn status(&self) -> Status {
         self.0.lock().unwrap().status.clone()
     }
+    /// Inspect metadata for admission before copying it. The callback must not
+    /// perform I/O or recursively access this control.
+    pub(crate) fn read_status<T>(&self, read: impl FnOnce(&Status) -> T) -> T {
+        read(&self.0.lock().unwrap().status)
+    }
     fn check_status(status: &Status) -> Result<(), String> {
         if status.cancel_requested {
             Err("Save canceled; current work and destination preserved".into())

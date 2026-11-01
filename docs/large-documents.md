@@ -1,5 +1,11 @@
 # Large-document loading and derived caches
 
+## Owned native response transport (unreleased preparation)
+
+The native response owner keeps metadata admission and encoded image bytes inseparable from their wire representation. Its sealed image slots stream base64 from bounded segments; MCP text metadata is serialized directly without constructing a second complete string. Serialized segments retain their own charges through the final reader, including cancellation, failed serialization and early connection closure.
+
+This component does not activate a native MCP path by itself. Captured scene provenance, complete metadata projection, bounded selection feedback, PNG preparation and actual HTTP/stdio routing still require integration and acceptance. Resident response behavior and document/preview limits remain unchanged.
+
 ## Source-backed internal clipboard preparation (unreleased)
 
 The native clipboard producer prepares bounded tiles from an immutable source scene and seals a private output before any clipboard assignment. Native16 words remain native16. Selection coverage, target opacity, cropping, hidden channels and cancellation retain the legacy copy order. Color-graph promotion preserves physical tiles and retained originals while leaving scalar coverage at its original depth. Layer-tree copy and placement keep charged source owners instead of rebuilding a resident document.
