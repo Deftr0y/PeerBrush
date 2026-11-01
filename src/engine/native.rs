@@ -1,4 +1,10 @@
 //! Immutable native document owners. No live Engine field is switched here.
+#[path = "native/intent.rs"]
+mod intent;
+#[path = "native/output.rs"]
+mod output;
+#[path = "native/patch.rs"]
+mod patch;
 use super::scene::{Document36, Layer36, PendingScene, RasterRef36, RasterRoster, Result};
 use crate::{
     large_document::{DiskBudget, ResidentBudget, ScratchBytes},
@@ -8,6 +14,9 @@ use crate::{
     },
     raster::Surface,
 };
+pub use intent::{Intent, IntentKind};
+pub use output::{OutputDraft, RefusedOutput, StagedOutput};
+pub use patch::{RasterPatch, RefusedPatch, RetainedUpdate};
 use serde::{Serialize, Serializer};
 use std::{
     io::Write,
@@ -41,6 +50,13 @@ struct OwnedRoster {
 /// This type has neither serde nor Deref/DerefMut pixel/metadata access.
 pub struct NativeDocument {
     core: Admitted<Core>,
+}
+impl std::fmt::Debug for NativeDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeDocument")
+            .field("generation", &self.key())
+            .finish_non_exhaustive()
+    }
 }
 impl Clone for NativeDocument {
     fn clone(&self) -> Self {
@@ -134,16 +150,55 @@ impl NativeDocument {
             cancellation: Cancellation::default(),
         })
     }
-    /// No callbacks, allocation, file access or history duplication occurs here.
-    pub fn adopt(&self, prepared: PreparedDelta) -> Result<NativeDocument> {
-        prepared.cancellation.check()?;
+    /// No callbacks, file access or history duplication occurs here.
+    pub fn adopt(
+        &self,
+        prepared: PreparedDelta,
+    ) -> std::result::Result<NativeDocument, RefusedDelta> {
+        if !prepared.outputs.is_empty() {
+            return Err(RefusedDelta {
+                reason: "Source edits require guarded Engine publication".into(),
+                prepared,
+            });
+        }
+        self.finish(prepared)
+    }
+    pub(crate) fn publish(
+        &self,
+        actor: &str,
+        leases: &[super::Lease],
+        now: u64,
+        closed: bool,
+        prepared: PreparedDelta,
+    ) -> std::result::Result<NativeDocument, RefusedDelta> {
+        if closed {
+            return Err(RefusedDelta {
+                reason: "Project is closed".into(),
+                prepared,
+            });
+        }
+        if let Err(reason) = prepared.intent.check(self, actor, leases, now) {
+            return Err(RefusedDelta { reason, prepared });
+        }
+        self.finish(prepared)
+    }
+    fn finish(&self, prepared: PreparedDelta) -> std::result::Result<NativeDocument, RefusedDelta> {
+        if let Err(reason) = prepared.cancellation.check() {
+            return Err(RefusedDelta { reason, prepared });
+        }
         if prepared.base != self.key()
             || self.core.metadata.id != prepared.candidate.core.metadata.id
             || self.core.metadata.revision.checked_add(1)
                 != Some(prepared.candidate.core.metadata.revision)
             || self.core.metadata.read_only
         {
-            return Err("Prepared native edit is stale or refused".into());
+            return Err(RefusedDelta {
+                reason: "Prepared native edit is stale or refused".into(),
+                prepared,
+            });
+        }
+        for output in prepared.outputs {
+            output.mark_published();
         }
         Ok(prepared.candidate)
     }
@@ -439,7 +494,7 @@ impl Cancellation {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.0.load(Ordering::Acquire) {
             Err("Native edit cancelled".into())
         } else {
@@ -455,13 +510,59 @@ pub struct PreparedDelta {
     base: DocumentKey,
     candidate: NativeDocument,
     cancellation: Cancellation,
+    intent: Intent,
+    outputs: Vec<StagedOutput>,
+}
+#[must_use]
+pub struct RefusedDelta {
+    reason: String,
+    prepared: PreparedDelta,
+}
+impl std::fmt::Debug for RefusedDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RefusedDelta").field(&self.reason).finish()
+    }
+}
+impl RefusedDelta {
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+    pub fn into_prepared(self) -> PreparedDelta {
+        self.prepared
+    }
+    pub(crate) fn abort(
+        self,
+        session: &impl super::scene::StageSession,
+        cleanup: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let PreparedDelta {
+            candidate, outputs, ..
+        } = self.prepared;
+        drop(candidate);
+        for output in outputs {
+            output.into_draft().abort(session, cleanup)?;
+        }
+        Ok(())
+    }
 }
 impl PreparedDelta {
+    pub fn base_key(&self) -> DocumentKey {
+        self.base
+    }
+    pub fn intent(&self) -> &Intent {
+        &self.intent
+    }
     pub fn preview(&self) -> &NativeDocument {
         &self.candidate
     }
 }
 impl CapturedEdit {
+    pub fn base_key(&self) -> DocumentKey {
+        self.base.key()
+    }
+    pub fn document(&self) -> &NativeDocument {
+        &self.base
+    }
     pub fn cancellation(&self) -> Cancellation {
         self.cancellation.clone()
     }
@@ -488,6 +589,7 @@ impl CapturedEdit {
             .iter()
             .position(|l| l.id == layer)
             .ok_or("Unknown native layer")?;
+        let intent = Intent::visibility(layer, visible, self.base.budget())?;
         // The shared engine permits visibility-only changes on locked layers.
         let copied = copy_metadata(&self.base.core.metadata, self.base.budget(), check)?;
         let roster = self.base.core.roster.clone();
@@ -515,6 +617,8 @@ impl CapturedEdit {
             base: self.base.key(),
             candidate: NativeDocument { core },
             cancellation: self.cancellation,
+            intent,
+            outputs: vec![],
         })
     }
     /// Bounded first structural operation. Hierarchical/clip policy stays with
@@ -543,6 +647,7 @@ impl CapturedEdit {
             return Err("Native reorder requires an exact independent-root permutation".into());
         }
         let copied = copy_metadata(&self.base.core.metadata, self.base.budget(), check)?;
+        let intent = Intent::layers(IntentKind::Reorder, order, self.base.budget())?;
         let source = &self.base.core.roster.roster;
         let resident = self.base.core.resident.clone();
         let disk = self.base.core.disk.clone();
@@ -574,6 +679,8 @@ impl CapturedEdit {
             base: self.base.key(),
             candidate: NativeDocument { core },
             cancellation: self.cancellation,
+            intent,
+            outputs: vec![],
         })
     }
 }
@@ -585,7 +692,18 @@ fn rebuild_roster(
     disk: &DiskBudget,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<Arc<OwnedRoster>> {
-    let capacity = source.len();
+    rebuild_from(metadata, source.len(), resident, disk, check, |reference| {
+        source.get(reference).cloned()
+    })
+}
+fn rebuild_from(
+    metadata: &mut Document36,
+    capacity: usize,
+    resident: &ResidentBudget,
+    disk: &DiskBudget,
+    check: &dyn Fn() -> Result<()>,
+    mut resolve: impl FnMut(&RasterRef36) -> Result<Surface>,
+) -> Result<Arc<OwnedRoster>> {
     let bytes = capacity
         .checked_mul(std::mem::size_of::<Surface>())
         .and_then(|n| n.checked_add(128))
@@ -605,11 +723,11 @@ fn rebuild_roster(
         if entries.len() >= capacity {
             return Err("Native source roster exceeds its planned locations".into());
         }
-        let surface = source.get(reference)?;
+        let surface = resolve(reference)?;
         if !surface.uses_budget(resident) || !surface.uses_disk_budget(disk) {
             return Err("Native source is outside shared admission".into());
         }
-        entries.push(surface.clone());
+        entries.push(surface);
         reference.id = entries.len() as u32;
         Ok(())
     })?;
@@ -733,7 +851,7 @@ mod tests {
             Err("Unexpected fixture surface".into())
         }
     }
-    fn document(pool: &ResidentBudget) -> NativeDocument {
+    pub(super) fn document(pool: &ResidentBudget) -> NativeDocument {
         let mut source = Document::new_depth(8, 8, 16).unwrap();
         source.icc_profile = Some(Arc::new(vec![0, 127, 128, 255]));
         let mut collector = Collector { rasters: vec![] };
@@ -977,6 +1095,40 @@ mod tests {
         assert!(settings(table[0]).is_empty());
         assert!(contours(snapshot.metadata()).is_none());
         assert!(warps(table[0].pixels()).is_none());
+    }
+    #[test]
+    fn final_lease_and_closed_guards_return_the_prepared_edit_for_recovery() {
+        use crate::engine::{Lease, Scope};
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let current = document(&pool);
+        let layer = current.metadata().layers().next().unwrap().id().to_string();
+        let prepared = current
+            .capture_edit()
+            .unwrap()
+            .visibility(&layer, false, &|| Ok(()))
+            .unwrap();
+        let lease = Lease {
+            id: "new-lease".into(),
+            owner: "human".into(),
+            description: "visible review".into(),
+            scopes: vec![Scope::layer(&format!("@visibility:{layer}"))],
+            expires: 100,
+        };
+        let refused = current
+            .publish("worker", &[lease], 10, false, prepared)
+            .unwrap_err();
+        assert!(refused.reason().contains("Reserved by human"));
+        assert!(current.metadata().layers().next().unwrap().visible());
+        let recovered = refused.into_prepared();
+        let refused = current
+            .publish("worker", &[], 10, true, recovered)
+            .unwrap_err();
+        assert!(refused.reason().contains("closed"));
+        let committed = current
+            .publish("worker", &[], 10, false, refused.into_prepared())
+            .unwrap();
+        assert!(!committed.metadata().layers().next().unwrap().visible());
+        assert_eq!(committed.metadata().revision(), 1);
     }
     #[test]
     fn reorder_renumbers_all_native_locations_and_retains_real_eight_and_sixteen_bit_sources() {
