@@ -9,6 +9,8 @@ use std::{
 };
 
 mod png_rows;
+#[path = "image_import/png_surface.rs"]
+pub(crate) mod png_surface;
 #[path = "image_import/prepared_png.rs"]
 pub(crate) mod prepared_png;
 
