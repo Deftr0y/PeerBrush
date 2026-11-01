@@ -11,6 +11,7 @@ pub(crate) struct NativeSeed {
     document: native::NativeDocument,
     project_id: String,
     ai_serial: u64,
+    saved_revision: u64,
     path: Option<std::path::PathBuf>,
     file_version: Option<crate::file_safety::Version>,
     ownership: Option<Arc<crate::file_ownership::Ownership>>,
@@ -19,6 +20,21 @@ pub(crate) struct NativeSeed {
 impl NativeSeed {
     pub(crate) fn document(&self) -> &native::NativeDocument {
         &self.document
+    }
+    pub(crate) fn source_path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+    pub(crate) fn file_version(&self) -> Option<crate::file_safety::Version> {
+        self.file_version
+    }
+    pub(crate) fn file_ownership(&self) -> Option<&Arc<crate::file_ownership::Ownership>> {
+        self.ownership.as_ref()
+    }
+    pub(crate) fn saved_revision(&self) -> u64 {
+        self.saved_revision
+    }
+    pub(crate) fn validate_current(&self, engine: &Engine) -> Result<()> {
+        self.validate(engine)
     }
     pub(super) fn runtime_serial(&self) -> u64 {
         self.ai_serial
@@ -55,6 +71,7 @@ impl NativeSeed {
             document: document.clone(),
             project_id,
             ai_serial: engine.ai_serial,
+            saved_revision: engine.saved_revision,
             path,
             file_version: engine.file_version,
             ownership: engine.file_ownership.clone(),
@@ -87,7 +104,68 @@ impl NativeSeed {
         Ok(())
     }
 }
+/// A pure in-memory edit fence. SourceSession/Workspace operations independently
+/// retain actual filesystem authority across the external publication.
+pub(crate) struct NativePublicationFence {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Drop for NativePublicationFence {
+    fn drop(&mut self) {
+        let previous = self
+            .counter
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert_eq!(previous, 1);
+    }
+}
 impl Engine {
+    pub(crate) fn validate_native_save(
+        &self,
+        seed: &NativeSeed,
+        control: &crate::saving::Control,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        seed.validate(self)?;
+        control.check()?;
+        if self.saved_revision != seed.saved_revision
+            || self
+                .saving
+                .as_ref()
+                .is_none_or(|active| !active.same(control))
+        {
+            return Err("Native save source or control changed".into());
+        }
+        Ok(())
+    }
+    /// Call under Engine plus the actual SourceSession live fence after all disk
+    /// preparation/checks. This never performs filesystem I/O or allocates.
+    pub(crate) fn native_publication_fence(
+        &self,
+        seed: &NativeSeed,
+        control: &crate::saving::Control,
+    ) -> Result<NativePublicationFence> {
+        self.ensure_open()?;
+        seed.validate(self)?;
+        control.check()?;
+        if self
+            .saving
+            .as_ref()
+            .is_some_and(|active| !active.same(control))
+        {
+            return Err("Another file operation owns this project".into());
+        }
+        self.external_publication
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| "Another file publication owns this project")?;
+        Ok(NativePublicationFence {
+            counter: self.external_publication.clone(),
+        })
+    }
+
     // The sole authority field binds capture, snapshots, history and final
     // publication. A native route never derives pixels from resident state.
     fn native_authority(&self) -> Option<&DocumentAuthority> {
@@ -337,7 +415,7 @@ impl DocumentAuthority {
             Self::Native(_) => Err("This operation requires its prepared native route".into()),
         }
     }
-    pub(super) fn into_resident_document(self) -> Result<Document> {
+    pub(crate) fn into_resident_document(self) -> Result<Document> {
         match self {
             Self::Resident(state) => Ok(state.document),
             Self::Native(_) => Err("Native authority cannot become a resident document".into()),

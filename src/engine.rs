@@ -460,6 +460,7 @@ pub struct Engine {
     pub leases: Vec<Lease>,
     pub changes: Vec<(u64, Vec<Scope>)>,
     pub saved_revision: u64,
+    pub(crate) external_publication: Arc<std::sync::atomic::AtomicUsize>,
     /// Retained runtime I/O admission; never serialized into project sources.
     pub(crate) file_operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub feedback: BTreeMap<String, String>,
@@ -490,11 +491,57 @@ pub struct Engine {
 impl Engine {
     /// An explicit resident-only route. Native callers must use a captured
     /// source/metadata view and a prepared worker instead of materializing pixels.
-    pub(crate) fn resident(&self) -> Result<&Document, String> {
+    pub fn resident(&self) -> Result<&Document, String> {
         self.authority.resident()
     }
-    pub(crate) fn resident_mut(&mut self) -> Result<&mut Document, String> {
+    pub fn resident_mut(&mut self) -> Result<&mut Document, String> {
         Ok(&mut self.authority.resident_state_mut()?.document)
+    }
+    /// Explicit legacy checkpoint for resident-only transaction preview/rollback.
+    /// Native authority is refused before any document or runtime state is copied.
+    pub(crate) fn resident_runtime_copy(&self) -> Result<Self, String> {
+        let resident = self.authority.resident_state()?;
+        self.ensure_open()?;
+        let authority = authority::DocumentAuthority::Resident(authority::ResidentAuthority {
+            document: resident.document.clone(),
+            undo: resident.undo.clone(),
+            redo: resident.redo.clone(),
+            truncated_tasks: resident.truncated_tasks.clone(),
+        });
+        Ok(Self {
+            authority,
+            project_id: self.project_id.clone(),
+            closed: self.closed.clone(),
+            workspace: self.workspace.clone(),
+            workspace_owner: self.workspace_owner.clone(),
+            leases: self.leases.clone(),
+            changes: self.changes.clone(),
+            saved_revision: self.saved_revision.clone(),
+            external_publication: self.external_publication.clone(),
+            file_operations: self.file_operations.clone(),
+            feedback: self.feedback.clone(),
+            path: self.path.clone(),
+            status: self.status.clone(),
+            file_version: self.file_version.clone(),
+            file_ownership: self.file_ownership.clone(),
+            capture_ui: self.capture_ui.clone(),
+            native_close_review: self.native_close_review.clone(),
+            capture_panel: self.capture_panel.clone(),
+            mcp_clients: self.mcp_clients.clone(),
+            activity: self.activity.clone(),
+            ai_change: self.ai_change.clone(),
+            ai_serial: self.ai_serial.clone(),
+            focus_requested: self.focus_requested.clone(),
+            loading: self.loading.clone(),
+            saving: self.saving.clone(),
+            brush_library: self.brush_library.clone(),
+            tool_settings: self.tool_settings.clone(),
+            filter_library: self.filter_library.clone(),
+            export_library: self.export_library.clone(),
+            proposals: self.proposals.clone(),
+            recent_tasks: self.recent_tasks.clone(),
+            code_jobs: self.code_jobs.clone(),
+        })
     }
     pub(crate) fn doc_snapshot(&self) -> view::DocumentSnapshot {
         self.authority.snapshot()
@@ -703,6 +750,7 @@ impl Engine {
             leases: vec![],
             changes: vec![],
             saved_revision: 0,
+            external_publication: Default::default(),
             file_operations: Default::default(),
             feedback: BTreeMap::new(),
             path: None,
@@ -754,6 +802,13 @@ impl Engine {
     }
     pub(crate) fn ensure_write_available(&self) -> Result<(), String> {
         self.ensure_open()?;
+        if self
+            .external_publication
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return Err("Finish the current file publication before editing".into());
+        }
         if let Some(save) = &self.saving {
             save.ensure_editable()?;
         }

@@ -42,7 +42,7 @@ impl Source {
     /// The initial bridge deliberately covers exactly one complete aligned tile.
     /// Shifted/partial tiles would need separately admitted reframe/COW ownership.
     pub fn capture(engine: &Engine, target: &str, rect: [i32; 4]) -> Result<Self, String> {
-        let doc = &engine.doc;
+        let doc = engine.resident()?;
         if doc.read_only {
             return Err("Backing preparation requires an editable document".into());
         }
