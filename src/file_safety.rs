@@ -10,6 +10,8 @@ mod permissions;
 pub(crate) use permissions::preserve as preserve_permissions;
 #[cfg(windows)]
 pub(crate) use permissions::wide_absolute_file_path;
+#[path = "file_safety/owned_rename.rs"]
+pub(crate) mod owned_rename;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Version {
