@@ -82,7 +82,7 @@ pub(crate) fn prepare<'a>(
     staging
         .try_reserve_exact(4)
         .map_err(|_| "Source36 staging receipt allocation refused")?;
-    let result:Result<ComparedStandard,String> = (|| {
+    let result: Result<ComparedStandard, String> = (|| {
         let (layers, layer_written) = stage_file(
             roots.layers,
             plan.standard().layer_bytes(),
