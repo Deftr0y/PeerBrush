@@ -43,6 +43,19 @@ The runtime does not retain a duplicate file handle which could keep an aborted
 file allocated after its verified quota release. Published/history/clipboard/
 task/recovery owners require a complete retirement inventory.
 
+`SourceSession::abort_fragment` combines the fragment's proven file retirement
+with its exact registered empty-directory identity. Only successful empty owned
+directory retirement releases the directory/location slot. Busy, foreign or
+uncertain cleanup keeps conservative inventory; it never recursively deletes.
+The session permit remains held through cleanup. Its caller's cleanup check may
+ignore an obsolete gesture revision, while actual profile/session checks remain.
+
+Live inventory entries retain filesystem file and directory identities even when
+their weak Store owner expires. Resolving a selected checkpoint checks those IDs
+before and after reopening, including a final named-file observation. A copied
+same-byte/header replacement does not inherit the old live owner's authority.
+Ownership uncertainty closes further source admission until a fresh inventory.
+
 ## Exclusive marker publication
 
 `file_safety::owned_rename` verifies the expected complete SHA256 through a held
