@@ -5,7 +5,7 @@ use serde::{Serialize, Serializer};
 use std::{ops::Deref, sync::Arc};
 type Result<T> = std::result::Result<T, String>;
 
-pub(crate) struct RuntimeValue<T>(Arc<Owned<T>>);
+pub struct RuntimeValue<T>(Arc<Owned<T>>);
 struct Owned<T> {
     value: T,
     charge: Option<Arc<MetadataCharge>>,
