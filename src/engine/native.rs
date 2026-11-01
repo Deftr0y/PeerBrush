@@ -17,6 +17,8 @@ mod intent;
 mod output;
 #[path = "native/patch.rs"]
 mod patch;
+#[path = "native/publication.rs"]
+mod publication;
 #[path = "native/scopes.rs"]
 mod scopes;
 #[path = "native/transaction.rs"]
@@ -180,6 +182,7 @@ impl NativeDocument {
         })
     }
     /// No callbacks, file access or history duplication occurs here.
+    #[cfg(test)]
     pub fn adopt(
         &self,
         prepared: PreparedDelta,
@@ -192,6 +195,7 @@ impl NativeDocument {
         }
         self.finish(prepared)
     }
+    #[cfg(test)]
     pub(crate) fn publish(
         &self,
         actor: &str,
@@ -200,6 +204,20 @@ impl NativeDocument {
         closed: bool,
         prepared: PreparedDelta,
     ) -> std::result::Result<NativeDocument, RefusedDelta> {
+        let (candidate, outputs) = self.publish_deferred(actor, leases, now, closed, prepared)?;
+        for output in outputs {
+            output.mark_published();
+        }
+        Ok(candidate)
+    }
+    fn publish_deferred(
+        &self,
+        actor: &str,
+        leases: &[super::Lease],
+        now: u64,
+        closed: bool,
+        prepared: PreparedDelta,
+    ) -> std::result::Result<(NativeDocument, Vec<StagedOutput>), RefusedDelta> {
         if closed {
             return Err(RefusedDelta {
                 reason: "Project is closed".into(),
@@ -214,9 +232,20 @@ impl NativeDocument {
                 return Err(RefusedDelta { reason, prepared });
             }
         }
-        self.finish(prepared)
+        self.finish_deferred(prepared)
     }
+    #[cfg(test)]
     fn finish(&self, prepared: PreparedDelta) -> std::result::Result<NativeDocument, RefusedDelta> {
+        let (candidate, outputs) = self.finish_deferred(prepared)?;
+        for output in outputs {
+            output.mark_published();
+        }
+        Ok(candidate)
+    }
+    fn finish_deferred(
+        &self,
+        prepared: PreparedDelta,
+    ) -> std::result::Result<(NativeDocument, Vec<StagedOutput>), RefusedDelta> {
         if prepared
             .admission
             .as_ref()
@@ -241,10 +270,7 @@ impl NativeDocument {
                 prepared,
             });
         }
-        for output in prepared.outputs {
-            output.mark_published();
-        }
-        Ok(prepared.candidate)
+        Ok((prepared.candidate, prepared.outputs))
     }
 }
 pub(super) fn key() -> DocumentKey {
