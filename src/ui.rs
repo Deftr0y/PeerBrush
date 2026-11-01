@@ -4678,11 +4678,12 @@ impl PeerBrush {
     }
     // Commands before selection completion must not act on old coverage. Require
     // an explicit retry; never retain delayed destructive/clipboard work.
-    fn hold_canvas_selection_shortcuts(
+    fn hold_canvas_selection_shortcuts<'a>(
         &mut self,
         ctx: &egui::Context,
-        doc: &Document,
+        doc: impl Into<DocumentView<'a>>,
     ) -> Option<Vec<egui::Event>> {
+        let doc = doc.into();
         if !matches!(self.tool, Tool::Selection | Tool::MagicWand)
             || self.lifecycle.is_some()
             || self.lifecycle_frame
@@ -4738,7 +4739,7 @@ impl PeerBrush {
                 rect.contains(*pos) && ctx.layer_id_at(*pos) == Some(layer)
             })
         });
-        let owner = self.canvas_press_document.as_deref() == Some(doc.id.as_str());
+        let owner = self.canvas_press_document.as_deref() == Some(doc.id());
         let start = if owner || path_tool && !self.selection_path.is_empty() {
             0
         } else {
@@ -4787,11 +4788,12 @@ impl PeerBrush {
     }
     // Canvas gestures commit in the central panel. Shortcuts delivered after
     // their mouse release must see that commit, rather than the frame's snapshot.
-    fn defer_canvas_shortcuts(
+    fn defer_canvas_shortcuts<'a>(
         &mut self,
         ctx: &egui::Context,
-        doc: &Document,
+        doc: impl Into<DocumentView<'a>>,
     ) -> Option<(Vec<egui::Event>, Vec<egui::Event>, egui::Modifiers)> {
+        let doc = doc.into();
         // A quick click may deliver both buttons in one frame. Use the prior
         // canvas hit region and layer to exclude floating windows and panels.
         let press = ctx.input(|i| {
@@ -4845,7 +4847,7 @@ impl PeerBrush {
                     .iter()
                     .any(|event| matches!(event, egui::Event::WindowFocused(false)))
                 || self.selection_gesture_stale(doc)
-                || (owner.as_deref() != Some(doc.id.as_str()) && !pressed_canvas)
+                || (owner.as_deref() != Some(doc.id()) && !pressed_canvas)
             {
                 return None;
             }
