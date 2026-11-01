@@ -44,7 +44,8 @@ class SdkContent(unittest.TestCase):
         self.assertNotIn('/nv', args)
         self.assertEqual(kwargs, {'_windows_host': True})
         output = Path(args[args.index('/d') + 1])
-        output.mkdir()
+        # Simulated Windows extraction still obeys the real host's private-work guard.
+        output.mkdir(mode=0o700)
         expected = dict(self.seed.fixture.payload)
         with zipfile.ZipFile(Path(args[args.index('/p') + 1])) as archive:
             expected['AppxBlockMap.xml'] = archive.read('AppxBlockMap.xml')
