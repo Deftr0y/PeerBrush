@@ -1147,3 +1147,183 @@ fn framed_healing_uses_original_document_source_and_translated_destination_halo(
         output.abort(&session, &|| Ok(())).unwrap();
     }
 }
+
+#[test]
+fn owned_frame_seed_reads_prior_updates_and_retires_unreferenced_blocks_before_seal() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(12, 10, depth).unwrap();
+        source.layers[0].pixels = Raster::new_depth(5, 4, depth);
+        source.layers[0]
+            .pixels
+            .set16(2, 2, [12347, 23521, 43217, 49153]);
+        source.layers[0].x = 4;
+        source.layers[0].y = 3;
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let frame = input.project_frame([0, 0, 9, 7]).unwrap().unwrap();
+        let before = runtime.disk().used().unwrap();
+        let mut seed = crate::edit_bounds::output::stage_frame_seed(
+            &input,
+            &frame,
+            &session,
+            &mut || Ok(()),
+            |_, bytes, _| Ok(bytes.clone()),
+        )
+        .unwrap();
+        let tile = seed.prepare_tile((0, 0), &mut || Ok(())).unwrap();
+        let bpp = if depth == 16 { 8 } else { 4 };
+        let mut changed =
+            crate::large_document::ScratchBytes::new(input.pool(), tile.len(), tile.len()).unwrap();
+        changed.copy_from_slice(&tile);
+        if depth == 16 {
+            changed[..8].copy_from_slice(&[0x30, 0x3b, 0x5b, 0xe1, 0xa8, 0xd1, 0xc0, 0x01]);
+        } else {
+            changed[..4].copy_from_slice(&[37, 83, 127, 193]);
+        }
+        let expected = changed[..bpp].to_vec();
+        seed.replace_tile((0, 0), changed.freeze(), &mut || Ok(()))
+            .unwrap();
+        let strip = seed.prepare_strip([0, 0, 1, 1], &mut || Ok(())).unwrap();
+        assert_eq!(&*strip, expected.as_slice());
+        drop((strip, tile));
+        let zero = crate::large_document::ScratchBytes::new(
+            input.pool(),
+            256 * 256 * bpp,
+            256 * 256 * bpp,
+        )
+        .unwrap()
+        .freeze();
+        seed.replace_tile((0, 0), zero, &mut || Ok(())).unwrap();
+        let draft = seed.finish(&mut || Ok(())).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), before);
+        let output = draft.seal(&|| Ok(())).ok().unwrap();
+        assert!(output.surface().is_known_zero());
+        output.abort(&session, &|| Ok(())).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), before);
+
+        let seed = crate::edit_bounds::output::stage_frame_seed(
+            &input,
+            &frame,
+            &session,
+            &mut || Ok(()),
+            |_, bytes, _| Ok(bytes.clone()),
+        )
+        .unwrap();
+        assert!(seed
+            .finish(&mut || Err("Cancelled after complete frame writes".into()))
+            .is_err());
+        assert_eq!(runtime.disk().used().unwrap(), before);
+    }
+}
+
+#[test]
+fn reframed_session_smudge_matches_resident_after_all_dabs_and_once_only_soft_coverage() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(12, 10, depth).unwrap();
+        source.layers[0].pixels = Raster::new_depth(5, 4, depth);
+        source.layers[0].x = 4;
+        source.layers[0].y = 3;
+        for y in 0..4 {
+            for x in 0..5 {
+                source.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [12347 + x as u16 * 911, 23521 + y as u16 * 617, 43217, 49153],
+                );
+            }
+        }
+        source.selection = Some([0, 0, 12, 10]);
+        let mut coverage = Raster::new_depth(12, 10, 16);
+        for y in 0..10 {
+            for x in 0..12 {
+                coverage.set16(x, y, [if x < 6 { 32769 } else { 49153 }, 0, 0, 0]);
+            }
+        }
+        source.selection_coverage = Some(crate::selection::Coverage {
+            mask: coverage,
+            bounds: source.selection.unwrap(),
+            origin: [0, 0],
+            contours: vec![],
+        });
+        let command = serde_json::json!({"op":"smudge","layer":source.layers[0].id,
+            "points":[[5.25,4.5,0.7],[3.25,3.25,0.9],[1.,1.,0.6]],"color":[37,83,127,193],
+            "radius":1.8,"spacing":0.8,"hardness":0.4,"flow":0.6,"opacity":0.7,
+            "load":0.3,"pickup":0.4,"wetness":0.8});
+        let (points, pressures) = crate::brush::points_from_command(&command).unwrap();
+        let settings = crate::brush::Settings::from_command(&command).unwrap();
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[command], None, None, "Smudge")
+            .unwrap();
+        assert_eq!(legacy.undo.len(), 1);
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let frame = input.project_frame([0, 0, 9, 7]).unwrap().unwrap();
+        let stroke = LocalStroke::for_frame(
+            &input,
+            &frame,
+            &points,
+            pressures.as_deref(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let before = runtime.disk().used().unwrap();
+        assert!(crate::smudge::input::stage(
+            &input,
+            &stroke,
+            settings,
+            [37, 83, 127, 193],
+            &session,
+            &mut || Ok(())
+        )
+        .is_err());
+        assert_eq!(runtime.disk().used().unwrap(), before);
+        let BuiltTiles::Draft(draft) = crate::smudge::input::stage_in_frame(
+            &input,
+            &stroke,
+            settings,
+            [37, 83, 127, 193],
+            Some(&frame),
+            &session,
+            &mut || Ok(()),
+        )
+        .unwrap() else {
+            panic!("No framed smudge output")
+        };
+        let output = draft.seal(&|| Ok(())).ok().unwrap();
+        let shape = frame.geometry().new_shape();
+        assert_eq!(
+            shape,
+            [
+                legacy.doc.layers[0].pixels.width,
+                legacy.doc.layers[0].pixels.height
+            ]
+        );
+        let region = output
+            .surface()
+            .prepare_region(
+                Region::new([0, 0, shape[0] as i32, shape[1] as i32]).unwrap(),
+                &mut || Ok(()),
+            )
+            .unwrap();
+        for y in 0..shape[1] as i32 {
+            for x in 0..shape[0] as i32 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    legacy.doc.layers[0].pixels.get16(x, y),
+                    "depth{depth} at{x},{y}"
+                );
+            }
+        }
+        drop(region);
+        output.abort(&session, &|| Ok(())).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), before);
+    }
+}

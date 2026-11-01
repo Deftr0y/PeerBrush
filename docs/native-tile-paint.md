@@ -146,9 +146,15 @@ The original-frame smudge adapter retains one session-owned provisional tile
 map across all dabs. Explicit strip/tile preparation sees completed prior dabs;
 memory-only reservoir sampling never opens storage. A borrowing run entry point
 preserves the owner on error for registered fragment retirement. Soft coverage
-is applied once against the captured original after the full stroke. Reframed
-strokes are refused by their binding until a complete working-frame adapter is
-provided; this is an integration gate, not permission to clip requested work.
+is applied once against the captured original after the full stroke.
+
+Reframed smudge retains an owned `FrameSeed` before constructing an output draft.
+The seed holds its complete provisional surface, registered fragments, index
+admission and actual source session across every dab. Working strip/tile reads
+see completed prior writes. Replaced append-only blocks remain charged on disk;
+unused fragments are retired only after all candidate views drop. Explicit zero
+is canonicalized before the single final draft/seal. No intermediate document
+or history state is published, and another frame cannot reuse the stroke token.
 
 The clone/heal adapter prepares a generation-matched paint source or raw paint
 mask step, including exact floating bilinear support and the complete healing
