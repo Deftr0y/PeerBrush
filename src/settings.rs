@@ -82,6 +82,54 @@ pub struct Profile {
     pub locations: Locations,
     _lock: std::sync::Arc<Lock>,
 }
+/// Actual default-profile lease for persistent native source I/O on all platforms.
+/// No caller can mint this from inferred locations or clone its lock descriptor.
+#[derive(Clone)]
+pub(crate) struct SourceProfile {
+    locations: Locations,
+    lock: std::sync::Arc<Lock>,
+}
+impl Profile {
+    pub(crate) fn source_profile(&self) -> Result<SourceProfile, String> {
+        let profile = SourceProfile {
+            locations: self.locations.clone(),
+            lock: self._lock.clone(),
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+}
+impl SourceProfile {
+    pub(crate) fn locations(&self) -> &Locations {
+        &self.locations
+    }
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let path = self.locations.config.join("settings.lock");
+        let named_metadata =
+            fs::symlink_metadata(&path).map_err(|_| "Source profile lock is unavailable")?;
+        let named = crate::file_safety::open_for_identity(&path)
+            .map_err(|_| "Source profile lock is unavailable")?;
+        let held = self
+            .lock
+            .0
+            .metadata()
+            .map_err(|_| "Source profile lock is unavailable")?;
+        if !held.is_file()
+            || !named_metadata.is_file()
+            || alias(&named_metadata)
+            || crate::file_safety::identity(&named)? != crate::file_safety::identity(&self.lock.0)?
+            || crate::file_safety::link_count(&named)? != 1
+            || crate::file_safety::link_count(&self.lock.0)? != 1
+        {
+            return Err("Source profile no longer matches its actual held lock".into());
+        }
+        Profile {
+            locations: self.locations.clone(),
+            _lock: self.lock.clone(),
+        }
+        .validate_manifest()
+    }
+}
 /// A default-profile lease can only come from the session holding settings.lock.
 /// Explicit --state-dir sessions cannot request installed-app native staging or checkpoints.
 #[cfg(any(windows, target_os = "macos", test, feature = "windows-setup"))]

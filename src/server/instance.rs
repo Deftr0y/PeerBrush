@@ -67,15 +67,20 @@ pub(crate) struct SourceOperation {
 }
 
 impl SourceAdmission {
+    pub(crate) fn workspace(&self) -> Result<crate::workspace::Registry, String> {
+        if self.requests.stopping() {
+            return Err("PeerBrush source session is closing".into());
+        }
+        self.workspace
+            .upgrade()
+            .ok_or_else(|| "PeerBrush source workspace is unavailable".into())
+    }
     pub(crate) fn begin(&self) -> Result<SourceOperation, String> {
         let request = self
             .requests
             .begin()
             .ok_or("PeerBrush source session is closing")?;
-        let workspace = self
-            .workspace
-            .upgrade()
-            .ok_or("PeerBrush source workspace is unavailable")?;
+        let workspace = self.workspace()?;
         let operation = super::FileOperation::begin_workspace(&workspace)?;
         let permit = SourceOperation {
             _operation: operation,
@@ -120,6 +125,23 @@ pub struct InstanceLock {
 }
 
 impl InstanceLock {
+    pub(crate) fn source_admission_for(
+        &self,
+        dir: &std::path::Path,
+    ) -> Result<(SourceAdmission, (u64, u64)), String> {
+        let named = crate::file_safety::open_for_identity(&dir.join("instance.lock"))
+            .map_err(|_| "Source connection lock is unavailable")?;
+        if crate::file_safety::identity(&named)? != crate::file_safety::identity(&self._file)?
+            || crate::file_safety::link_count(&named)? != 1
+            || crate::file_safety::link_count(&self._file)? != 1
+        {
+            return Err("Source connection differs from its actual instance lock".into());
+        }
+        Ok((
+            self.source_admission(),
+            crate::file_safety::identity(&self._file)?,
+        ))
+    }
     pub(crate) fn source_admission(&self) -> SourceAdmission {
         SourceAdmission {
             requests: self.requests.clone(),
