@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from functools import cache
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -9,6 +10,9 @@ import stat
 import subprocess
 import tempfile
 import time
+
+from package_macos_dmg import bounded_file
+from production_readiness import unique_fields
 
 from submit_store_release import (BASELINE, FAMILY, IDENTITY, PUBLISHER, STORE_ID,
                                  RemoteError, SafeError, published_version, release_version, version)
@@ -70,8 +74,10 @@ def private_path(path):
 
 def regular(path):
     metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or getattr(metadata, 'st_file_attributes', 0) & 0x400:
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+            or getattr(metadata, 'st_file_attributes', 0) & 0x400):
         raise SafeError('Store state and lock must be regular files without links or reparse points.')
+    return metadata
 
 
 @contextmanager
@@ -83,7 +89,10 @@ def locked(path):
         regular(lock)
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     with os.fdopen(fd, 'r+b') as stream:
-        regular(lock)
+        metadata, opened = regular(lock), os.fstat(stream.fileno())
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)):
+            raise SafeError('Store lock identity changed before acquisition.')
         try:
             if os.name == 'nt':
                 import msvcrt
@@ -113,34 +122,17 @@ class Journal:
         self.state = None
         if self.path.exists() or self.path.is_symlink():
             regular(self.path)
-            if self.path.stat().st_size > 8192:
-                raise SafeError('Store state exceeds its size limit.')
-            self.state = json.loads(self.path.read_text(encoding='utf-8'))
-            self.validate()
+            checksum, size = bounded_file(self.path, 8192)
+            with self.path.open('rb') as stream:
+                raw = stream.read(8193)
+            if (len(raw) != size or hashlib.sha256(raw).hexdigest() != checksum
+                    or bounded_file(self.path, 8192) != (checksum, size)):
+                raise SafeError('Store state changed during its bounded read.')
+            private_path(self.path)
+            self.state = receipt(raw)
 
     def validate(self):
-        fields = {'schema', 'tag', 'commit', 'package', 'sha256', 'version',
-                  'phase', 'submission_id', 'service_status'}
-        s = self.state
-        matches = lambda key, pattern: type(s[key]) is str and re.fullmatch(pattern, s[key]) is not None
-        if (not isinstance(s, dict) or set(s) != fields or type(s['schema']) is not int or s['schema'] != 1
-                or not matches('tag', r'v?(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})(?:\.(0|[1-9][0-9]{0,4}))?')
-                or not matches('commit', '[0-9a-f]{40}') or not matches('sha256', '[0-9a-f]{64}')
-                or not matches('package', r'PeerBrush-[0-9.]{7,23}-Windows-x64\.msix')
-                or not matches('version', r'[0-9.]{7,23}')
-                or type(s['phase']) is not str or s['phase'] not in {'new', 'create-requested', 'created', 'commit-requested', 'committed'}
-                or (s['submission_id'] is not None and not matches('submission_id', '[1-9][0-9]{0,31}'))
-                or (s['service_status'] is not None and (type(s['service_status']) is not str or s['service_status'] not in STATUSES))):
-            raise SafeError('Unsupported Store state; preserve it for manual recovery.')
-        version(s['version'])
-        if release_version(s['tag'])[1] != s['version'] or s['package'] != f"PeerBrush-{s['version']}-Windows-x64.msix":
-            raise SafeError('Store receipt tag, package and deployment version disagree.')
-        if s['phase'] in {'created', 'commit-requested', 'committed'} and s['submission_id'] is None:
-            raise SafeError('Incomplete Store state; preserve it for manual recovery.')
-        if s['phase'] in {'new', 'create-requested'} and s['submission_id'] is not None:
-            raise SafeError('Inconsistent Store creation state; preserve it for manual recovery.')
-        if s['service_status'] is not None and s['submission_id'] is None:
-            raise SafeError('Store service observation needs a recorded submission identity.')
+        validate_receipt(self.state)
 
     def bind(self, tag, name, report):
         expected = dict(schema=1, tag=tag, commit=report['commit'], package=name,
@@ -153,6 +145,8 @@ class Journal:
 
     def write(self):
         private_path(self.path)
+        if self.path.exists() or self.path.is_symlink():
+            regular(self.path)
         self.validate()
         name = None
         try:
@@ -163,6 +157,9 @@ class Journal:
                 stream.write('\n')
                 stream.flush()
                 os.fsync(stream.fileno())
+            private_path(self.path)
+            if self.path.exists() or self.path.is_symlink():
+                regular(self.path)
             if os.name == 'nt':
                 import ctypes
                 from ctypes import wintypes
@@ -196,6 +193,41 @@ class Journal:
             raise SafeError('Unknown Store service status; availability remains unverified.')
         self.state['service_status'] = status
         self.write()
+
+
+def receipt(raw):
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= 8192:
+        raise SafeError('Store receipt exceeds its bounded schema.')
+    try:
+        value = json.loads(raw, object_pairs_hook=unique_fields)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise SafeError('Unsupported Store receipt JSON; preserve it for manual recovery.') from None
+    validate_receipt(value)
+    return value
+
+
+def validate_receipt(s):
+    fields = {'schema', 'tag', 'commit', 'package', 'sha256', 'version',
+              'phase', 'submission_id', 'service_status'}
+    matches = lambda key, pattern: type(s[key]) is str and re.fullmatch(pattern, s[key]) is not None
+    if (not isinstance(s, dict) or set(s) != fields or type(s['schema']) is not int or s['schema'] != 1
+            or not matches('tag', r'v?(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})(?:\.(0|[1-9][0-9]{0,4}))?')
+            or not matches('commit', '[0-9a-f]{40}') or not matches('sha256', '[0-9a-f]{64}')
+            or not matches('package', r'PeerBrush-[0-9.]{7,23}-Windows-x64\.msix')
+            or not matches('version', r'[0-9.]{7,23}')
+            or type(s['phase']) is not str or s['phase'] not in {'new', 'create-requested', 'created', 'commit-requested', 'committed'}
+            or (s['submission_id'] is not None and not matches('submission_id', '[1-9][0-9]{0,31}'))
+            or (s['service_status'] is not None and (type(s['service_status']) is not str or s['service_status'] not in STATUSES))):
+        raise SafeError('Unsupported Store state; preserve it for manual recovery.')
+    version(s['version'])
+    if release_version(s['tag'])[1] != s['version'] or s['package'] != f"PeerBrush-{s['version']}-Windows-x64.msix":
+        raise SafeError('Store receipt tag, package and deployment version disagree.')
+    if s['phase'] in {'created', 'commit-requested', 'committed'} and s['submission_id'] is None:
+        raise SafeError('Incomplete Store state; preserve it for manual recovery.')
+    if s['phase'] in {'new', 'create-requested'} and s['submission_id'] is not None:
+        raise SafeError('Inconsistent Store creation state; preserve it for manual recovery.')
+    if s['service_status'] is not None and s['submission_id'] is None:
+        raise SafeError('Store service observation needs a recorded submission identity.')
 
 
 def get(store, path='', attempts=3, sleep=time.sleep):

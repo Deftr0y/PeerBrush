@@ -78,7 +78,7 @@ class StoreWorkflow(unittest.TestCase):
             environment['STORE_EXECUTE'] = value
             with self.subTest(value=value), self.assertRaises(SystemExit) as error:
                 run_guard(environment)
-            self.assertEqual(str(error.exception), 'Hosted Store submission remains blocked until an approved durable private host/state integration is implemented.')
+            self.assertEqual(str(error.exception), 'Hosted Store submission remains blocked on this read-only preflight route; use the separately qualified protected publisher.')
         environment = invocation()
         environment['RELEASE_COMMIT'] = 'private-input\r\n::error::unexpected'
         with self.assertRaises(SystemExit) as error:

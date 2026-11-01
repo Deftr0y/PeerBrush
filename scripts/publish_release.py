@@ -4,6 +4,7 @@ No ready-report input, replacement/delete API or automatic mutation retry.
 Store handoff is limited to the same fresh protected publication invocation.
 """
 import hashlib
+from contextlib import contextmanager
 import http.client
 import json
 import os
@@ -56,9 +57,11 @@ class GitHub:
         self._token = token
 
     def request(self, method, route, payload=None, *, upload=None):
+        action_read = (method == 'GET' and payload is None and upload is None and isinstance(route, str)
+            and re.fullmatch(re.escape(PREFIX) + r'/actions/(?:workflows/production\.yml/runs\?per_page=100&page=(?:[1-9]|10)|runs/[1-9][0-9]{0,19}/(?:attempts/1/jobs|artifacts)\?per_page=100&page=1|artifacts/[1-9][0-9]{0,19})', route))
         if (method not in {'GET', 'POST', 'PATCH'} or type(route) is not str or not route.startswith(PREFIX + '/')
                 or not route.isascii() or any(ord(c) < 33 for c in route)
-                or not re.fullmatch(re.escape(PREFIX) + r'/(?:releases(?:\?per_page=100&page=[1-9][0-9]?)?|releases/tags/v[0-9.]+|releases/[1-9][0-9]{0,19}(?:/assets(?:\?name=[A-Za-z0-9._-]+)?)?|releases/assets/[1-9][0-9]{0,19}|commits/(?:main|v[0-9.]+))', route)):
+                or (not action_read and not re.fullmatch(re.escape(PREFIX) + r'/(?:releases(?:\?per_page=100&page=[1-9][0-9]?)?|releases/tags/v[0-9.]+|releases/[1-9][0-9]{0,19}(?:/assets(?:\?name=[A-Za-z0-9._-]+)?)?|releases/assets/[1-9][0-9]{0,19}|commits/(?:main|v[0-9.]+))', route))):
             raise ValueError('Unsupported protected release route.')
         host = 'uploads.github.com' if upload is not None else 'api.github.com'
         headers = {'User-Agent': 'PeerBrush-immutable-release', 'Authorization': 'Bearer ' + self._token,
@@ -113,6 +116,16 @@ class GitHub:
 
     def release(self, tag):
         return self.request('GET', PREFIX + '/releases/tags/' + tag)
+
+    def receipt_bytes(self, identifier, size):
+        import acquire_macos_qualification_inputs as transport
+        from store_handoff_history import MAX_ZIP
+        if type(identifier) is not int or not 0 < identifier < 10 ** 20 or type(size) is not int or not 22 <= size <= MAX_ZIP:
+            raise ValueError('Store history requires an exact bounded artifact ID and size.')
+        location = transport.request('api.github.com', transport.API + 'artifacts/' + str(identifier) + '/zip',
+                                     8192, token=self._token, redirect=True)
+        parsed = urlsplit(location)
+        return transport.request(parsed.hostname, parsed.path + ('?' + parsed.query if parsed.query else ''), size)
 
     def commit(self, ref):
         return self.request('GET', PREFIX + '/commits/' + ref)
@@ -365,7 +378,28 @@ def _prepare_store_handoff(candidate):
     return provider
 
 
-def _store_handoff(candidate, environment, provider):
+@contextmanager
+def _store_journal(candidate, environment):
+    """Record no-attempt state before publication; a crash without upload still holds."""
+    from store_release_state import locked
+    from package_macos_dmg import private_inspection_directory
+    candidate.verify()
+    manifest = candidate.manifest
+    directory = private_inspection_directory(Path(environment['RUNNER_TEMP']) / 'peerbrush-store-handoff', candidate.root, fresh=True)
+    directory.mkdir(mode=0o700)
+    records = validate_manifest(manifest)
+    package = manifest['channels']['microsoft-store']['file']
+    report = json.loads(read(candidate.directory / (package + '.json'), 64 * 1024,
+        records[package + '.json']['sha256']), object_pairs_hook=unique_fields)
+    if (report['commit'] != manifest['commit'] or report['package'] != package
+            or report['sha256'] != records[package]['sha256']):
+        raise ValueError('Store receipt differs from exact candidate source and package.')
+    with locked(directory / 'submission.json') as journal:
+        journal.bind('v' + manifest['version'], package, report)
+        yield journal
+
+
+def _store_handoff(candidate, provider, journal):
     """One fresh protected publication, one submission attempt; never replay receipts.
 
     Local write-ahead records aid diagnosis. Artifact retention is not write
@@ -373,15 +407,10 @@ def _store_handoff(candidate, environment, provider):
     response or competing draft needs service reconciliation, not a retry.
     """
     import submit_store_release as store
-    from store_release_state import locked
-    from package_macos_dmg import private_inspection_directory
     candidate.verify()
     manifest = candidate.manifest
     if manifest['format'] != STORE_FORMAT:
         raise ValueError('Automatic Store handoff requires the exact Store-only final composition.')
-    directory = private_inspection_directory(Path(environment['RUNNER_TEMP']) / 'peerbrush-store-handoff',
-                                             candidate.root, fresh=True)
-    directory.mkdir(mode=0o700)
     records = validate_manifest(manifest)
     package = manifest['channels']['microsoft-store']['file']
     portable = next(r['file'] for r in manifest['base_inventory']['assets'] if r.get('platform') == 'Windows')
@@ -391,11 +420,10 @@ def _store_handoff(candidate, environment, provider):
     if name != package:
         raise ValueError('Published Store package differs from final composition.')
     candidate.verify()
-    with locked(directory / 'submission.json') as journal:
-        journal.bind('v' + manifest['version'], name, report)
-        store.submit(provider, name, data, report, execute=True, journal=journal)
-        return dict(submission_attempted=True, service_status=journal.state['service_status'],
-                    public_availability='unverified')
+    journal.bind('v' + manifest['version'], name, report)
+    store.submit(provider, name, data, report, execute=True, journal=journal)
+    return dict(submission_attempted=True, service_status=journal.state['service_status'],
+                public_availability='unverified')
 
 
 class _StoreWrites:
@@ -403,6 +431,7 @@ class _StoreWrites:
     def __init__(self, provider):
         self.provider, self.submission_id, self.baseline = provider, None, None
         self.phase, self.draft = 'new', None
+        self.history = None
 
     @staticmethod
     def snapshot(value):
@@ -411,6 +440,8 @@ class _StoreWrites:
 
     def check(self):
         import submit_store_release as store
+        if self.history is not None:
+            self.history.check(pending_id=self.submission_id)
         app = self.provider.call()
         if (app.get('id') != store.STORE_ID or app.get('packageIdentityName') != store.IDENTITY
                 or app.get('publisherName') != store.PUBLISHER or app.get('packageFamilyName') != store.FAMILY
@@ -490,9 +521,13 @@ def publish(candidate, client, notes, *, execute=False, environment=None):
         raise ValueError('Current production distribution requires Store-only Windows composition; historical direct layouts are readback only.')
     if env.get('PEERBRUSH_STORE_HANDOFF_ENABLED') != 'true':
         raise ValueError('Store-only publication requires its explicitly approved Store handoff before any GitHub write.')
-    provider = _prepare_store_handoff(candidate)
-    handoff = lambda: _store_handoff(candidate, env, provider)
-    return _transfer(client, candidate.directory, candidate.manifest, notes, after_publish=handoff)
+    from store_handoff_history import History
+    with _store_journal(candidate, env) as journal:
+        provider = _prepare_store_handoff(candidate)
+        provider.history = History(client, provider.provider, env)
+        provider.history.check()
+        handoff = lambda: _store_handoff(candidate, provider, journal)
+        return _transfer(client, candidate.directory, candidate.manifest, notes, after_publish=handoff)
 
 
 def main(argv=None):

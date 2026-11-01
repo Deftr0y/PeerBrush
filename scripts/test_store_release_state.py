@@ -252,6 +252,31 @@ class Tests(unittest.TestCase):
             self.assertEqual(submit.main(), 1)
             remote.assert_not_called()
 
+    def test_hardlinked_receipts_and_locks_cannot_alias_foreign_files(self):
+        original = self.path.read_bytes()
+        alias = self.path.parent / 'foreign-receipt'
+        os.link(self.path, alias)
+        try:
+            with self.assertRaises(submit.SafeError): state.Journal(self.path)
+            with self.assertRaises(submit.SafeError): self.journal.phase('create-requested')
+            self.assertEqual(self.path.read_bytes(), original)
+            self.assertEqual(alias.read_bytes(), original)
+        finally:
+            alias.unlink()
+        foreign = self.path.parent / 'foreign-empty-file'
+        foreign.write_bytes(b'')
+        lock = self.path.with_name(self.path.name + '.lock')
+        os.link(foreign, lock)
+        with self.assertRaises(submit.SafeError):
+            with state.locked(self.path): self.fail('Hardlinked lock must not open')
+        self.assertEqual(foreign.read_bytes(), b'')
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_duplicate_and_oversized_receipts_are_never_reinterpreted(self):
+        raw = self.path.read_bytes()
+        for altered in [raw.replace(b'{', b'{"schema":1,', 1), b'x' * 8193]:
+            with self.assertRaises(submit.SafeError): state.receipt(altered)
+
 
 if __name__ == '__main__':
     unittest.main()
