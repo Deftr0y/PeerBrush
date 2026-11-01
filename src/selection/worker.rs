@@ -265,6 +265,190 @@ mod tests {
         raster::{project16, surface::Surface, Raster},
     };
     use std::cell::RefCell;
+    fn warm_dense_rows(source: &Surface, observe: &dyn Fn() -> Result<()>) {
+        use crate::raster::TILE;
+        let first = source
+            .prepare_region(
+                Region::new([0, 0, source.width() as i32, source.height().min(8) as i32]).unwrap(),
+                &mut || observe(),
+            )
+            .unwrap();
+        let second = (source.height() > TILE).then(|| {
+            source
+                .prepare_region(
+                    Region::new([
+                        0,
+                        TILE as i32,
+                        source.width() as i32,
+                        (TILE + 8).min(source.height()) as i32,
+                    ])
+                    .unwrap(),
+                    &mut || observe(),
+                )
+                .unwrap()
+        });
+        drop(second);
+        drop(first);
+    }
+    fn dense_pass(
+        source: &Surface,
+        request: &Request<'_>,
+        output: Store,
+        cancel_after: Option<u64>,
+        observe: &dyn Fn() -> Result<()>,
+        expected: impl Fn(u32, u32) -> [u16; 4],
+    ) -> (std::result::Result<CoverageSource, String>, u64) {
+        use crate::raster::{surface::SurfaceRegion, TILE};
+        let cache = RefCell::new(Vec::<(u32, SurfaceRegion)>::new());
+        let samples = std::cell::Cell::new(0u64);
+        let check = || {
+            observe()?;
+            if cancel_after.is_some_and(|limit| samples.get() >= limit) {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        let result = prepare(
+            request,
+            output,
+            None,
+            &check,
+            |y| {
+                let tile_row = y / TILE;
+                let mut cache = cache.borrow_mut();
+                let found = cache.iter().position(|(key, _)| *key == tile_row);
+                if found.is_some_and(|index| {
+                    let b = cache[index].1.region().bounds();
+                    y as i32 >= b[1] && (y as i32) < b[3]
+                }) {
+                    return Ok(());
+                }
+                if found.is_none() && cache.len() == 2 {
+                    cache.remove(0);
+                }
+                let top = y / 8 * 8;
+                let view = source.prepare_region(
+                    Region::new([
+                        0,
+                        top as i32,
+                        source.width() as i32,
+                        (top + 8).min(source.height()) as i32,
+                    ])?,
+                    &mut || check(),
+                )?;
+                if let Some(index) = found {
+                    cache[index] = (tile_row, view);
+                } else {
+                    cache.push((tile_row, view));
+                }
+                Ok(())
+            },
+            |_, x, y| {
+                let cache = cache.borrow();
+                let view = &cache
+                    .iter()
+                    .find(|(_, view)| {
+                        let b = view.region().bounds();
+                        y as i32 >= b[1] && (y as i32) < b[3]
+                    })
+                    .ok_or(Error::Invalid("Dense native row was not prepared"))?
+                    .1;
+                if view.pixel16(x as i32, y as i32)? != expected(x, y) {
+                    return Err(Error::Corrupt);
+                }
+                samples.set(samples.get() + 1);
+                Ok(true)
+            },
+        );
+        drop(cache);
+        (result, samples.get())
+    }
+    #[test]
+    fn dense_fixture_owner_baseline_survives_cancel_and_releases_candidate_then_stores() {
+        use crate::large_document::DiskBudget;
+        let (w, h) = (257, 259);
+        let pool = ResidentBudget::new(128 * 1024 * 1024).unwrap();
+        let disk = DiskBudget::new(32 * 1024 * 1024, 8).unwrap();
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "peerbrush-selection-lifetime-{}",
+                crate::engine::id()
+            ));
+        std::fs::create_dir(&base).unwrap();
+        let limits = Limits {
+            disk_bytes: 16 * 1024 * 1024,
+            max_blocks: 64,
+            max_resident_blocks: 16,
+            manifest_bytes: 65536,
+        };
+        let input =
+            Store::create_with_disk_budget(&base.join("input"), pool.clone(), disk.clone(), limits)
+                .unwrap();
+        let output =
+            Store::create_with_disk_budget(&base.join("output"), pool.clone(), disk, limits)
+                .unwrap();
+        let expected = |x: u32, y: u32| [(x * 149) as u16, (y * 241) as u16, (x ^ y) as u16, 65535];
+        let mut raster = Raster::new_depth(w, h, 16);
+        for y in 0..h {
+            for x in 0..w {
+                raster.set16(x as i32, y as i32, expected(x, y));
+            }
+        }
+        let proposal = pool.reserve_bytes(8192, 8192).unwrap();
+        let source = Surface::stage_raster(&raster, input.clone(), &mut || Ok(())).unwrap();
+        drop(proposal);
+        drop(raster);
+        warm_dense_rows(&source, &|| Ok(()));
+        let source_descriptors = source.physical_tiles().count() * 512 + 128;
+        assert_eq!(pool.payload_used(), source_descriptors);
+        let baseline = pool.used();
+        let request = Request {
+            width: w,
+            height: h,
+            seeds: &[[0, 0]],
+            quick_radius: None,
+            feather: 0,
+            mode: Combine::Replace,
+            maximum_work: u64::from(w) * u64::from(h),
+        };
+        let (result, samples) = dense_pass(
+            &source,
+            &request,
+            output.clone(),
+            Some(1000),
+            &|| Ok(()),
+            expected,
+        );
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(samples >= 1000);
+        assert_eq!(pool.used(), baseline);
+        let (result, samples) = dense_pass(
+            &source,
+            &request,
+            output.clone(),
+            None,
+            &|| Ok(()),
+            expected,
+        );
+        let candidate = result.unwrap();
+        assert_eq!(samples, u64::from(w) * u64::from(h));
+        assert_eq!(candidate.bounds(), [0, 0, w as i32, h as i32]);
+        assert_eq!(candidate.contours().len(), 1);
+        assert_eq!(candidate.contours()[0].len(), 4);
+        let owned =
+            candidate.metadata_bytes() + candidate.mask().physical_tiles().count() * 512 + 128;
+        assert_eq!(pool.payload_used(), source_descriptors + owned);
+        drop(candidate);
+        assert_eq!(pool.payload_used(), source_descriptors);
+        drop(source);
+        assert_eq!(pool.payload_used(), 0);
+        drop(input);
+        drop(output);
+        assert_eq!(pool.used(), 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
     fn store(pool: ResidentBudget) -> (Store, std::path::PathBuf) {
         let path = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -695,7 +879,7 @@ mod tests {
     fn dense_16000_native16_owned_source_selection_preserves_full_file_and_native_hashes() {
         use crate::{
             large_document::{DiskBudget, TileSpec},
-            raster::{backed::Plane, surface::SurfaceRegion, TILE},
+            raster::{backed::Plane, TILE},
         };
         use ring::digest::{Context, SHA256};
         use std::{cell::Cell, collections::BTreeMap, io::Read, time::Instant};
@@ -766,6 +950,10 @@ mod tests {
         let input = Store::create_with_disk_budget(&input_path, pool.clone(), disk.clone(), limits)
             .unwrap();
         let spec = TileSpec::new(256, 256, 16).unwrap();
+        let source_blocks = (W.div_ceil(TILE) * H.div_ceil(TILE)) as usize;
+        let proposal_bytes =
+            source_blocks * (512 + std::mem::size_of::<crate::large_document::BlockRef>()) + 4096;
+        let proposal = pool.reserve_bytes(proposal_bytes, proposal_bytes).unwrap();
         let mut blocks = BTreeMap::new();
         let mut generated = Context::new(&SHA256);
         generated.update(b"PeerBrush-dense-selection-native-tiles-v1\0");
@@ -796,7 +984,9 @@ mod tests {
             }
         }
         let generated = finish(generated);
-        let refs: Vec<_> = blocks.values().copied().collect();
+        let mut refs = Vec::new();
+        refs.try_reserve_exact(blocks.len()).unwrap();
+        refs.extend(blocks.values().copied());
         let snapshot = input
             .commit(
                 [37; 16],
@@ -808,6 +998,7 @@ mod tests {
             )
             .unwrap();
         let selected = snapshot.reference();
+        drop(refs);
         drop(snapshot);
         drop(input);
         let input_file = input_path.join("blocks.pbt");
@@ -840,6 +1031,7 @@ mod tests {
         let source =
             Surface::from_plane(Plane::from_blocks(W, H, 16, input.clone(), blocks).unwrap())
                 .unwrap();
+        drop(proposal);
         assert!(source.uses_disk_budget(&disk));
         assert!(source.uses_budget(&pool));
         let native_before = native_hash(&source);
@@ -848,6 +1040,10 @@ mod tests {
         let output =
             Store::create_with_disk_budget(&output_path, pool.clone(), disk.clone(), limits)
                 .unwrap();
+        warm_dense_rows(&source, &observe);
+        let source_baseline = pool.used();
+        let source_descriptors = source_blocks * 512 + 128;
+        assert_eq!(pool.payload_used(), source_descriptors);
         let request = Request {
             width: W,
             height: H,
@@ -862,75 +1058,22 @@ mod tests {
         let mut selected_samples = 0u64;
         let selection_started = Instant::now();
         for cancel in [true, false] {
-            let cache = RefCell::new(Vec::<(u32, SurfaceRegion)>::new());
-            let samples = Cell::new(0u64);
-            let check = || {
-                observe()?;
-                if cancel && samples.get() >= 100_000 {
-                    Err(Error::Cancelled)
-                } else {
-                    Ok(())
-                }
-            };
-            let result = prepare(
+            let (result, samples) = dense_pass(
+                &source,
                 &request,
                 output.clone(),
-                None,
-                &check,
-                |y| {
-                    let tile_row = y / TILE;
-                    let mut cache = cache.borrow_mut();
-                    let found = cache.iter().position(|(key, _)| *key == tile_row);
-                    if found.is_some_and(|index| {
-                        let b = cache[index].1.region().bounds();
-                        y as i32 >= b[1] && (y as i32) < b[3]
-                    }) {
-                        return Ok(());
-                    }
-                    if found.is_none() && cache.len() == 2 {
-                        cache.remove(0);
-                    }
-                    let top = y / 8 * 8;
-                    let view = source.prepare_region(
-                        Region::new([0, top as i32, W as i32, (top + 8).min(H) as i32])?,
-                        &mut || check(),
-                    )?;
-                    if let Some(index) = found {
-                        cache[index] = (tile_row, view);
-                    } else {
-                        cache.push((tile_row, view));
-                    }
-                    Ok(())
-                },
-                |_, x, y| {
-                    let cache = cache.borrow();
-                    let view = &cache
-                        .iter()
-                        .find(|(_, view)| {
-                            let b = view.region().bounds();
-                            (y as i32) >= b[1] && (y as i32) < b[3]
-                        })
-                        .ok_or(Error::Invalid("Dense native row was not prepared"))?
-                        .1;
-                    let pixel = view.pixel16(x as i32, y as i32)?;
-                    if pixel != native(x, y) {
-                        return Err(Error::Corrupt);
-                    }
-                    samples.set(samples.get() + 1);
-                    Ok(true)
-                },
+                cancel.then_some(100_000),
+                &observe,
+                native,
             );
             if cancel {
                 assert!(result.is_err());
-                cancel_samples = samples.get();
+                cancel_samples = samples;
                 assert!(cancel_samples >= 100_000);
+                assert_eq!(pool.used(), source_baseline);
             } else {
                 candidate = Some(result.unwrap());
-                selected_samples = samples.get();
-            }
-            drop(cache);
-            if cancel {
-                assert_eq!(pool.used(), 0);
+                selected_samples = samples;
             }
         }
         let selection_seconds = selection_started.elapsed().as_secs_f64();
@@ -982,14 +1125,20 @@ mod tests {
         let disk_bytes = disk.used().unwrap();
         assert_eq!(disk_bytes, input_bytes + output_bytes);
         assert!(peak.get() <= pool.limit());
+        let candidate_owned =
+            candidate.metadata_bytes() + candidate.mask().physical_tiles().count() * 512 + 128;
+        assert_eq!(pool.payload_used(), source_descriptors + candidate_owned);
         drop(candidate);
+        assert_eq!(pool.payload_used(), source_descriptors);
+        let stores_after_candidate = pool.used();
         drop(source);
+        assert_eq!(pool.payload_used(), 0);
         drop(input);
         drop(output);
         assert_eq!(pool.used(), 0);
         let file_after = file_hash(&input_file);
         assert_eq!(file_before, file_after);
-        let receipt = serde_json::json!({"scope":"Actual dense native16 Surface selection candidate component only; no editor, styled composite, Save/history, installed or performance qualification", "width":W,"height":H,"native_depth":16,"source_file_bytes":input_bytes,"source_blocks":refs.len(),"source_file_sha256_before":hex(file_before),"source_file_sha256_after":hex(file_after),"full_native_tile_sha256_before":hex(native_before),"full_native_tile_sha256_after":hex(native_after),"mask_native_sha256":hex(finish(mask_hash)),"mask_bounds":mask_bounds,"mask_contours":mask_contours,"selected_samples":selected_samples,"cancelled_after_samples":cancel_samples,"resident_ledger_peak_bytes":peak.get(),"resident_ledger_limit_bytes":pool.limit(),"resident_after_close":pool.used(),"disk_ledger_bytes":disk_bytes,"disk_limit_bytes":disk.limit(),"output_file_bytes":output_bytes,"staging_seconds":staged_seconds,"selection_including_cancel_seconds":selection_seconds,"total_seconds":started.elapsed().as_secs_f64(),"exclusions":"Fixture/index/allocator metadata and OS caches are not total process RAM; shared ledger peak is admitted payload accounting. Private owned files retained for independent review."});
+        let receipt = serde_json::json!({"scope":"Actual dense native16 Surface selection candidate component only; no editor, styled composite, Save/history, installed or performance qualification", "width":W,"height":H,"native_depth":16,"source_file_bytes":input_bytes,"source_blocks":source_blocks,"source_file_sha256_before":hex(file_before),"source_file_sha256_after":hex(file_after),"full_native_tile_sha256_before":hex(native_before),"full_native_tile_sha256_after":hex(native_after),"mask_native_sha256":hex(finish(mask_hash)),"mask_bounds":mask_bounds,"mask_contours":mask_contours,"selected_samples":selected_samples,"cancelled_after_samples":cancel_samples,"source_owner_baseline_bytes":source_baseline,"candidate_owned_payload_bytes":candidate_owned,"stores_after_candidate_drop_bytes":stores_after_candidate,"resident_ledger_peak_bytes":peak.get(),"resident_ledger_limit_bytes":pool.limit(),"resident_after_close":pool.used(),"disk_ledger_bytes":disk_bytes,"disk_limit_bytes":disk.limit(),"output_file_bytes":output_bytes,"staging_seconds":staged_seconds,"selection_including_cancel_seconds":selection_seconds,"total_seconds":started.elapsed().as_secs_f64(),"exclusions":"Tracked ledger includes source descriptors and native buffers; fixture bookkeeping, allocator overhead and OS caches are not a process RAM measurement. Private owned files retained for independent review."});
         std::fs::write(
             base.join("receipt.json"),
             serde_json::to_vec_pretty(&receipt).unwrap(),
