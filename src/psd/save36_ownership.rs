@@ -129,6 +129,15 @@ pub(super) enum StagedBytes<'a> {
     Fixture(CompletedBytes),
 }
 impl StagedBytes<'_> {
+    pub(super) fn check_session(&self, session: &SourceSession) -> Result<(), String> {
+        match self {
+            Self::Session(value) => value.check_session(session),
+            #[cfg(test)]
+            Self::Fixture(_) => {
+                Err("Private codec fixture is not a source-session candidate".into())
+            }
+        }
+    }
     pub(super) fn check(&self) -> Result<(), String> {
         match self {
             Self::Session(value) => value.check(),
