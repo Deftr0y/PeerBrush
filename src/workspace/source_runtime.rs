@@ -27,6 +27,11 @@ mod checkpoints;
 mod recovery_marker;
 pub(crate) use checkpoints::CheckpointCensus;
 pub(crate) use recovery_marker::{NativeMarker, NativeMarkerIds};
+#[path = "source_runtime/publication.rs"]
+mod publication;
+pub(crate) use publication::{
+    ArmedPublication, CommittedPublication, PublicationIntent, PublicationPlan,
+};
 
 pub(crate) struct Limits {
     pub resident_bytes: usize,
@@ -100,12 +105,14 @@ struct Location {
 }
 struct Inventory {
     directory: Directory,
+    owner: [u8; 16],
     // The namespace owner's exact file holds the exclusive session inventory lock.
     files: Vec<HeldFile>,
     locations: BTreeMap<[u8; 16], Location>,
     lineages: BTreeMap<[u8; 16], [u8; 16]>,
     staging: BTreeMap<[u8; 16], staging::Location>,
     checkpoints: checkpoints::Registry,
+    publications: publication::Registry,
     directories: usize,
     // Payload/index/path allocations above must drop before their accounting.
     _charges: Vec<Reservation>,
@@ -158,6 +165,7 @@ impl SourceRuntime {
             runtime: self.clone(),
             operation: Arc::new(operation),
             directory,
+            id: *uuid::Uuid::new_v4().as_bytes(),
         };
         session.check()?;
         Ok(session)
@@ -267,11 +275,13 @@ impl SourceRuntime {
         files.push(HeldFile::new(owner_path, owner)?);
         let mut inventory = Inventory {
             directory,
+            owner: bytes[8..24].try_into().unwrap(),
             files,
             locations: BTreeMap::new(),
             lineages: BTreeMap::new(),
             staging: BTreeMap::new(),
             checkpoints,
+            publications: publication::Registry::new(self.limits.max_files)?,
             directories: 0,
             _charges: charges,
         };
@@ -353,7 +363,10 @@ impl SourceRuntime {
                     push_file(&mut inventory, item.path(), file, self.limits.max_files)?;
                 }
                 child.check()?;
-            } else if valid_marker_name(&name) || valid_pending_name(&name) {
+            } else if valid_marker_name(&name)
+                || valid_pending_name(&name)
+                || publication::recognized_name(&name)
+            {
                 push_file(
                     &mut inventory,
                     path.clone(),
@@ -372,6 +385,7 @@ impl SourceRuntime {
                 .retain_file(&held.path, &held.file)
                 .map_err(|e| e.to_string())?;
         }
+        publication::restore(self, operation, &mut inventory)?;
         operation.check()?;
         inventory.directory.check()?;
         // No callback after this final inventory-wide observation pass.
@@ -386,6 +400,7 @@ pub(crate) struct SourceSession {
     runtime: Arc<SourceRuntime>,
     operation: Arc<RootOperation>,
     directory: PathBuf,
+    id: [u8; 16],
 }
 /// Nominal lifetime only. The worker owner parks this with an uncertain child
 /// until known exit; it grants no source I/O or publication capability.
