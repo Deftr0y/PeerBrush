@@ -704,7 +704,11 @@ impl<'source> CompletedSave36<'source> {
         }
         let mut transfer =
             ScratchBytes::new(self.scene.budget(), 65536, 65536).map_err(|e| e.to_string())?;
-        let mut guarded = || check().map_err(|e| Error::Io(std::io::Error::other(e)));
+        let active = || {
+            check()?;
+            self.candidate.check()
+        };
+        let mut guarded = || io_check(&active);
         let mut input = self
             .candidate
             .cursor(0, self.bytes, &mut guarded)
@@ -712,7 +716,7 @@ impl<'source> CompletedSave36<'source> {
         let mut left = self.bytes;
         let mut hash = Context::new(&SHA256);
         while left != 0 {
-            check()?;
+            active()?;
             let n = left.min(65536) as usize;
             input
                 .read_exact(&mut transfer[..n])
