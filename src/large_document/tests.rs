@@ -1020,6 +1020,23 @@ fn explicit_disk_inventory_rechecks_every_file_after_the_last_callback() {
 }
 
 #[test]
+fn quota_refusal_creates_no_uninventoried_source_directory() {
+    let fixture = Fixture::new();
+    let disk = DiskBudget::new(FILE_HEADER - 1, 1).unwrap();
+    assert!(matches!(
+        Store::create_with_disk_budget(
+            &fixture.root(),
+            ResidentBudget::new(1024).unwrap(),
+            disk.clone(),
+            limits()
+        ),
+        Err(Error::Budget)
+    ));
+    assert!(!fixture.root().exists());
+    assert_eq!(disk.used().unwrap(), 0);
+}
+
+#[test]
 fn held_checkpoint_selection_rechecks_late_source_changes() {
     let fixture = Fixture::new();
     let store = fixture.store(&ResidentBudget::new(1024).unwrap());
