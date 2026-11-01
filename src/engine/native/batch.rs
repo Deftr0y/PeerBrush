@@ -457,6 +457,7 @@ impl CapturedEdit {
                 pool,
             )?
         };
+        let intent = self.planned_intent(intent)?;
         let copied = copy_metadata(base, pool, check)?;
         let mut prepared_core = None;
         copied.map_unique(|mut metadata, _| {

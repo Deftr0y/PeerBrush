@@ -75,9 +75,18 @@ The editor capture factory binds the observed generation, revision, actor and
 targets after checking the current write fence and reservations. It performs no
 source I/O. Workers retain that admission with their candidate; native history
 refuses a data-only capture without editor admission. Final publication rechecks
-the actor, targets and current leases. Generated raster batches currently use
-conservative whole-layer publication scopes; exact command footprint binding
-must preserve the legacy rectangle reservation behavior before live adoption.
+the actor, targets and current leases. The production factory accepts an immutable
+normalized command descriptor; generic caller-supplied scope capture exists only
+in tests. Descriptor construction and typed parameter normalization run outside
+the engine mutex. Capture shares its admitted scope owner and binds generation,
+revision, method classes and command tokens without copying the parameter tree.
+
+Prepared publication inherits the engine-derived command scopes after checking
+its actual targets. A command view exposes those exact scopes and checks a typed
+producer's baseline-to-proposed logical write box. Read halos remain independent.
+Producers must retain their actual changed-tile/write proof; semantic fill
+materialization is a distinct baseline proof. Sequential working-metadata scope
+planning for state-dependent multi-command batches remains a transaction gate.
 
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,
