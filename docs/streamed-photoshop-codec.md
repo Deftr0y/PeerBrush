@@ -1,8 +1,20 @@
 # Streamed Photoshop codec foundation (unreleased)
 
-The structural index and row readers are preparation for bounded source loading.
-They do not enable larger documents, change saved source formats, replace the
-active decoder or establish release qualification.
+The seekable `decode_reader` path uses the structural index and row readers to
+avoid buffering complete encoded resource/layer sections. The slice decoder
+retains its borrowed parsing path. This does not enable larger documents, change
+saved source formats or establish release qualification. Current decoded Raster
+residency, the 512 MiB tile admission and the bounded private JSON restore remain.
+
+Seekable imports retain compact layer-record/global metadata for the existing
+semantic parser. Original layer/mask and composite bytes are hashed separately;
+the compact view can never establish a private source's standard hash. PBR1
+resources are decompressed from their original bounded source ranges. Native
+standard layer/mask channels and the merged composite are decoded directly from
+indexed rows into current tiles. Whole-source SHA-256 and length observations
+bracket indexing/decoding, with cancellation checks; the caller must still retain
+its source lease and final identity/publication guard. The extra bounded reads are
+not a demonstrated performance or total-RAM improvement.
 
 `psd::structural::index` accepts a seekable, already leased source, explicit
 limits and a cancellation check. It records checked 64-bit spans instead of

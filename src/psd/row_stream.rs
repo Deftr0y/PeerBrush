@@ -89,7 +89,7 @@ impl<R: Read + Seek> Source<R> {
         Ok(())
     }
 
-    fn unchanged_length(&self) -> Result<(), String> {
+    pub(crate) fn unchanged_length(&self) -> Result<(), String> {
         let mut input = self
             .input
             .try_borrow_mut()

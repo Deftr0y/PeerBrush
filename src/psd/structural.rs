@@ -72,6 +72,9 @@ pub(crate) struct Limits {
     pub resources: usize,
     pub tags: usize,
     pub row_bytes: u64,
+    pub mask_edge: u32,
+    pub mask_pixels8: u64,
+    pub mask_pixels16: u64,
 }
 
 impl Limits {
@@ -86,6 +89,9 @@ impl Limits {
             resources: 4096,
             tags: 4096,
             row_bytes: 8192 * 2,
+            mask_edge: 200_000,
+            mask_pixels8: 32 * 1024 * 1024,
+            mask_pixels16: 128 * 1024 * 1024,
         }
     }
 }
@@ -321,6 +327,28 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
         })
     }
 
+    fn mask_dimensions(&self, bounds: [i32; 4], depth: u16) -> Result<[u32; 2], String> {
+        let width = i64::from(bounds[3]) - i64::from(bounds[1]);
+        let height = i64::from(bounds[2]) - i64::from(bounds[0]);
+        let pixels = if depth == 16 {
+            self.limits.mask_pixels16
+        } else {
+            self.limits.mask_pixels8
+        };
+        if bounds.iter().any(|v| v.unsigned_abs() > 100_000)
+            || width < 0
+            || height < 0
+            || width > i64::from(self.limits.mask_edge)
+            || height > i64::from(self.limits.mask_edge)
+            || (width as u64)
+                .checked_mul(height as u64)
+                .is_none_or(|n| n > pixels)
+        {
+            return Err("Photoshop mask exceeds native decode limits".into());
+        }
+        Ok([width as u32, height as u32])
+    }
+
     fn encoding(
         &mut self,
         span: Span,
@@ -329,6 +357,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
         channels: u16,
         depth: u16,
         format: Format,
+        mask: bool,
     ) -> Result<Encoding, String> {
         let end = span.end()?;
         let rows = u64::from(height)
@@ -337,7 +366,12 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
         let row_bytes = u64::from(width)
             .checked_mul(u64::from(depth / 8))
             .ok_or("Photoshop row size overflow")?;
-        if row_bytes > self.limits.row_bytes {
+        let row_limit = if mask {
+            u64::from(self.limits.mask_edge) * u64::from(depth / 8)
+        } else {
+            self.limits.row_bytes
+        };
+        if row_bytes > row_limit {
             return Err("Photoshop row exceeds index limits".into());
         }
         self.seek(span.offset)?;
@@ -481,9 +515,19 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                 let next = self.position()?;
                 self.seek(mask.offset)?;
                 let bounds = self.bounds(mask.end()?)?;
-                let result = self.dimensions(bounds)?;
+                if bounds.iter().any(|v| v.unsigned_abs() > 100_000) {
+                    return Err("PSD mask coordinates exceed initial limits".into());
+                }
+                let [_default, flags] = self.read::<2>(mask.end()?)?;
+                let ordinary =
+                    mask.bytes == 20 && flags & !2 == 0 && self.read::<2>(mask.end()?)? == [0; 2];
+                let result = if ordinary {
+                    Some(self.mask_dimensions(bounds, header.depth)?)
+                } else {
+                    None
+                };
                 self.seek(next)?;
-                Some(result)
+                result
             } else {
                 None
             };
@@ -500,7 +544,17 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
             let mut keys = HashSet::new();
             while self.position()? < extra_end {
                 if extra_end - self.position()? < 12 {
-                    self.zeros(extra_end)?;
+                    // The semantic parser protects nonzero unframed layer
+                    // metadata using the saved composite. Preserve those raw
+                    // record bytes; indexing must not turn that case editable.
+                    self.seek(extra_end)?;
+                    break;
+                }
+                let start = self.position()?;
+                let signature = self.read::<4>(extra_end)?;
+                self.seek(start)?;
+                if !matches!(&signature, b"8BIM" | b"8B64") {
+                    self.seek(extra_end)?;
                     break;
                 }
                 let tag = self.tag(extra_end, header.format, 2)?;
@@ -540,6 +594,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                         1,
                         header.depth,
                         header.format,
+                        channel.id == -2,
                     )?);
                 } else if channel.span.bytes != 0 {
                     let next = self.position()?;
@@ -728,6 +783,7 @@ pub(crate) fn index<R: Read + Seek>(
         channels,
         depth,
         format,
+        false,
     )?;
     (scan.check)()?;
     if scan
