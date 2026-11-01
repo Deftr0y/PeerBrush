@@ -20,8 +20,68 @@ outer ZIP and exact MSIX/report/checksum member digests. Direct Windows signing,
 runtime, descriptor and native-direct artifacts are excluded from this variant.
 Existing bounded extraction, source/content reinspection, Mac/Linux native
 authentication and late original/metadata checks still run. Schema 1 remains
-the historical direct-Windows input contract. Downloading a successful SDK
-artifact does not itself grant installed acceptance or Store public readiness.
+the historical direct-Windows input contract. Schema 2 deliberately carries no
+native Store authority and rejects a sixth role or a nested `store.native`.
+
+Schema 3 explicitly adds the sixth `store_native` role. It requires
+`store.native` with independently selected qualification, MakeAppx executable
+SHA-256/version and complete native trust pins. The role contains exactly
+`store-sdk-qualification.json` and `store-sdk-qualification.sigstore.json`
+from a distinct successful first main `store-qualification.yml` run. Public
+offline roots and the exact pinned Linux x64 GitHub CLI must already exist in
+the consumer's separately provisioned `peerbrush-final-trust/store` directory.
+The original five-role and historical direct-Windows selectors remain strict.
+
+## Native Store SDK evidence (inactive)
+
+Both jobs in `store-qualification.yml` remain literally disabled. Their fixed
+pre-checkout guard requires the official repository and owner IDs, reviewed
+exact main source/workflow SHA, first manual attempt and hosted Windows x64.
+The qualifier declares the `store-native-qualification` environment; its actual
+reviewers, branch restrictions and protection configuration still need separate
+owner verification before any enablement. The workflow declaration and an OIDC
+attestation do not prove that those protections were configured.
+
+`acquire_store_qualification_inputs.py` selects the Windows portable and
+corresponding source from the exact first main `release.yml` run, plus the
+distinct unsigned Store artifact from that same run. Its public selection has
+exact `commit`, `transport` and `qualification` fields. Transport selects the
+run/artifact IDs and independent outer/source/checksum digests; qualification
+selects the canonical portable/MSIX/report names, their digests, stable app
+version, previous package version and MakeAppx executable hash/version. Those
+tool pins are independent inputs, never taken from the package report. The
+previous version remains operator-selected until Partner Center reconciliation.
+Acquisition checks actual bytes/source/identity but grants no SDK authority.
+
+`qualify_store_sdk.py` runs only on Windows x64. It reuses the existing SDK
+selection policy and checks the selected MakeAppx executable's architecture,
+SHA-256 and native fixed version resource. It freezes the exact portable,
+package and report in exclusive owned files and runs `MakeAppx unpack` with
+validation enabled, without `/nv`. Every extracted byte and directory must
+match the complete source-derived inventory, including the selected block map.
+Tool, original and owned inputs, source, content and extracted inventory are
+rechecked before and after retaining the bounded report. Child output and time
+are bounded; its environment contains no GitHub or Store credentials. No
+installation, certificate provisioning, signing or Store authentication occurs.
+Microsoft describes MakeAppx semantic validation as limited; this result is
+neither WACK nor proof that the app installs or upgrades successfully.
+
+The next adjacent step attests only the generated report. Only that report and
+its bundle enter the retained native artifact. `verify_store_qualification.py`
+is a fixed adapter to the shared offline verifier: the aggregate consumer must
+verify the independently pinned CLI/root/bundle, exact report subject/hash,
+official repository/owner, exact source/workflow/OIDC identity, first run and
+successful hosted native job with the fixed acquisition/qualification/attestation
+step ordering. It repeats original and owned evidence checks. Preparing or
+relocating a final-input bundle reruns this consumer; artifact metadata and JSON
+booleans cannot substitute for the cryptographic and service-origin checks.
+
+Authenticated evidence removes only the missing-SDK-producer blocker. It never
+grants installed upgrade acceptance, Store submission automation qualification,
+certification, public availability, `ready` or `production_ready`. Native local
+SDK tests use isolated synthetic source/packages; service and crypto fixtures
+are explicitly fake. Genuine hosted attestation, Store installation/upgrade,
+provider access and public readback remain separate qualification gates.
 
 The protected publisher has an explicit same-invocation Store handoff. It can
 run only after that invocation freshly publishes the exact final release and
@@ -155,6 +215,9 @@ Run offline tests:
 python scripts/test_submit_store_release.py
 python scripts/test_store_release_state.py
 python -B scripts/test_store_workflow.py
+python -B scripts/test_store_sdk_qualification.py
+python -B scripts/test_store_sdk_inputs.py
+python -B scripts/test_store_sdk_final_inputs.py
 ```
 
 ## Official references
@@ -165,3 +228,5 @@ python -B scripts/test_store_workflow.py
 - [Manage app submissions and upload sequence](https://learn.microsoft.com/en-us/windows/uwp/monetize/manage-app-submissions)
 - [Microsoft's CLI/GitHub Actions setup](https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/github-actions)
 - [GitHub workflow trigger restrictions](https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-when-your-workflow-runs/triggering-a-workflow)
+- [MakeAppx commands and limited semantic validation](https://learn.microsoft.com/en-us/windows/msix/package/create-app-package-with-makeappx-tool)
+- [GitHub deployment environment protections](https://docs.github.com/en/actions/concepts/workflows-and-actions/deployment-environments)

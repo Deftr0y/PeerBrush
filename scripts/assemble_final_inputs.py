@@ -31,19 +31,22 @@ POLICIES = {
 }
 STORE_POLICIES = {key: value for key, value in POLICIES.items() if not key.startswith('windows_')}
 STORE_POLICIES['store_package'] = ('release.yml', 'unsigned-store-msix-candidate')
+STORE_NATIVE_POLICIES = dict(STORE_POLICIES, store_native=('store-qualification.yml', 'store-native-qualification-'))
 
 
 def selections(value):
-    store = isinstance(value, dict) and type(value.get('schema')) is int and value['schema'] == 2
-    policies = STORE_POLICIES if store else POLICIES
+    store = isinstance(value, dict) and type(value.get('schema')) is int and value['schema'] in (2, 3)
+    store_native = store and value['schema'] == 3
+    policies = STORE_NATIVE_POLICIES if store_native else STORE_POLICIES if store else POLICIES
     if (not isinstance(value, dict) or set(value) != {'schema', 'final', 'artifacts'}
-            or type(value['schema']) is not int or value['schema'] not in (1, 2)
+            or type(value['schema']) is not int or value['schema'] not in (1, 2, 3)
             or not isinstance(value['artifacts'], dict) or set(value['artifacts']) != set(policies)):
         raise ValueError('Exact fixed upstream artifact selections required.')
     selected, artifacts = value['final'], value['artifacts']
     roles, trusts = inputs.paths(selected)
     if ('linux_native' not in selected or ('store' in selected) != store
-            or (not store and 'native' not in selected['windows'])):
+            or (not store and 'native' not in selected['windows'])
+            or (store and ('native' in selected['store']) != store_native)):
         raise ValueError('The upstream producer requires the selected Windows channel and current Linux native contract.')
     for keys, name, _, _ in roles:
         if inputs.get(selected, keys) != name:
@@ -104,6 +107,8 @@ def selections(value):
             **({'installed-gui.json': selected['linux_native']['gui_sha256']} if 'gui' in selected['linux_native'] else {})})
     if store:
         package = selected['store']
+        if store_native:
+            native('store_native', 'store-sdk-qualification', package['native'])
         name = Path(package['package']).name
         if (name != f'PeerBrush-{final.msix.package_version(version)}-Windows-x64.msix'
                 or Path(package['report']).name != name + '.json'):
@@ -123,7 +128,7 @@ def selections(value):
 
 
 def metadata(run, artifact, role, record, commit):
-    workflow, name = (STORE_POLICIES if role == 'store_package' else POLICIES)[role]
+    workflow, name = (STORE_NATIVE_POLICIES if role in {'store_package', 'store_native'} else POLICIES)[role]
     workflow = '.github/workflows/' + workflow
     for field in ['repository', 'head_repository']:
         repository = run.get(field) if isinstance(run, dict) else None
@@ -260,9 +265,9 @@ def produce(root, output, work, artifact_output, value, *, authority_directory, 
             sources[('windows', key)] = raw['windows_signed'] / Path(selected['windows'][key]).name
         sources[('windows', 'descriptor')] = raw['windows_native'] / Path(selected['windows']['descriptor']).name
     for keys, platform in trusts:
-        report = {'macos': 'dmg-qualification', 'windows': 'windows-installer-qualification', 'linux': 'linux-deb-qualification'}[platform]
+        report = {'macos': 'dmg-qualification', 'windows': 'windows-installer-qualification', 'linux': 'linux-deb-qualification', 'store': 'store-sdk-qualification'}[platform]
         sources[(*keys, 'bundle')] = raw[platform + '_native'] / (report + '.sigstore.json')
-        qualification_keys = ('macos', 'qualification') if platform == 'macos' else ('windows', 'native', 'qualification') if platform == 'windows' else ('linux_native', 'qualification')
+        qualification_keys = ('macos', 'qualification') if platform == 'macos' else (platform, 'native', 'qualification') if platform in {'windows', 'store'} else ('linux_native', 'qualification')
         sources[qualification_keys] = raw[platform + '_native'] / (report + '.json')
     sources[('linux_receipt',)] = raw['linux_native'] / 'installation.json'
     sources[('linux_native', 'upgrade')] = raw['linux_native'] / 'portable-to-deb.json'

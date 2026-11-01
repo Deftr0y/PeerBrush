@@ -16,13 +16,13 @@ FIELDS = {'qualification', 'qualification_sha256', 'certificate_sha256', 'timest
 
 
 def authenticate(qualification, **inputs):
-    if any(key in inputs for key in ['_windows', '_linux', '_setup_host']):
+    if any(key in inputs for key in ['_windows', '_linux', '_store', '_setup_host']):
         raise ValueError('Windows native origin uses its fixed reviewed workflow policy.')
     return native.authenticate(qualification, **inputs, _windows=True)
 
 
 def authenticate_setup(qualification, **inputs):
-    if any(key in inputs for key in ['_windows', '_linux', '_setup_host']):
+    if any(key in inputs for key in ['_windows', '_linux', '_store', '_setup_host']):
         raise ValueError('Setup native origin uses its fixed reviewed workflow and host policy.')
     return native.authenticate(qualification, **inputs, _windows=True, _setup_host=True)
 

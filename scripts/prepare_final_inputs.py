@@ -47,7 +47,7 @@ def safe_name(name):
 
 
 def paths(selected):
-    """The two concrete native trust callers and existing Windows/Linux roles only."""
+    """Concrete native trust callers and the selected Windows distribution only."""
     if not isinstance(selected, dict) or set(selected) not in [SELECTION, SELECTION | {'linux_native'},
                                                               STORE_SELECTION, STORE_SELECTION | {'linux_native'}]:
         raise ValueError('Exact existing final selection required; no readiness or credential fields.')
@@ -59,7 +59,8 @@ def paths(selected):
     required = {'unsigned', 'unsigned_sha256', 'package', 'package_sha256', 'runtime', 'runtime_sha256',
                 'identity', 'identity_sha256', 'package_family', 'descriptor', 'descriptor_sha256',
                 'descriptor_uri', 'package_uri', 'runtime_uri'}
-    allowed = [{'package', 'package_sha256', 'report', 'report_sha256', 'previous_version'}] if store_only else [required, required | {'native'}]
+    store_fields = {'package', 'package_sha256', 'report', 'report_sha256', 'previous_version'}
+    allowed = [store_fields, store_fields | {'native'}] if store_only else [required, required | {'native'}]
     if not isinstance(windows, dict) or set(windows) not in allowed:
         raise ValueError('Exact existing Windows selection required.')
     records = [(('linux_receipt',), 'linux/installation.json', readiness.MAX_INSTALLATION_RECEIPT_BYTES,
@@ -75,6 +76,14 @@ def paths(selected):
             raise ValueError('Selected Windows role requires a bounded canonical filename.')
         records.append(((('store' if store_only else 'windows'), key), 'windows/' + name, limit, windows[key + '_sha256']))
     trusts = [(('macos', 'trust'), 'macos')]
+    if store_only and 'native' in windows:
+        from verify_store_qualification import FIELDS
+        native = windows['native']
+        if not isinstance(native, dict) or set(native) != FIELDS:
+            raise ValueError('Exact Store SDK native fields required.')
+        records.append((('store', 'native', 'qualification'), 'native/store/store-sdk-qualification.json',
+                        16 * 1024, native['qualification_sha256']))
+        trusts.append((('store', 'native', 'trust'), 'store'))
     if not store_only and 'native' in windows:
         from verify_windows_qualification import FIELDS
         native = windows['native']

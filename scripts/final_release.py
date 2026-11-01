@@ -296,7 +296,7 @@ def windows_binding(root, base, directory, selection, *, for_setup=False):
 def store_binding(root, inventory, directory, selection):
     import qualify_store_msix as preflight
     required = {'package', 'package_sha256', 'report', 'report_sha256', 'previous_version'}
-    if not isinstance(selection, dict) or set(selection) != required:
+    if not isinstance(selection, dict) or set(selection) not in [required, required | {'native'}]:
         raise ValueError('Exact Store package, report, hashes and previous version selection required.')
     portable = next(r for r in inventory['assets'] if r.get('platform') == 'Windows')
     checked = preflight.qualify(root, directory / portable['file'], selection['package'], selection['report'],
@@ -307,8 +307,18 @@ def store_binding(root, inventory, directory, selection):
     raw = read(selection['report'], 64 * 1024, selection['report_sha256'])
     originals = [(package, LIMIT, selection['package_sha256']),
                  (Path(selection['report']), 64 * 1024, selection['report_sha256'])]
+    if 'native' in selection:
+        import verify_store_qualification as native
+        origin, retained = native.bind(root, selection['native'], checked)
+        originals += retained
+        checked = dict(checked, native_sdk_validation='authenticated-selected-sdk-limited-validation',
+                       native_producer_authentication='verified-pinned-workflow-oidc-attestation-and-successful-job',
+                       native_origin=origin)
     sidecars = {package.name + '.json': raw,
                 package.name + '.sha256': (selection['package_sha256'] + '  ' + package.name + '\n').encode('ascii')}
+    signed._source(root, inventory['commit'])
+    if any(bounded_file(path, limit)[0] != checksum for path, limit, checksum in originals):
+        raise ValueError('Store original or owned qualification changed before final binding.')
     return [package], store_package_channel(package.name), originals, checked, sidecars
 
 
@@ -438,6 +448,8 @@ def compose(root, directory, output, *, commit, version, macos, maintainer,
         report['blockers'].remove('windows-installed-distribution-and-signing-not-verified')
         report['blockers'] += ['store-native-sdk-producer-not-authenticated',
             'store-installed-upgrade-acceptance-not-established', 'store-submission-automation-not-qualified']
+        if store_checked.get('native_producer_authentication') == 'verified-pinned-workflow-oidc-attestation-and-successful-job':
+            report['blockers'].remove('store-native-sdk-producer-not-authenticated')
         report['store_package'] = store_checked
     elif windows_origin is None:
         report['blockers'] += ['windows-native-final-producer-not-authenticated',
