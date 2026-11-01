@@ -212,6 +212,10 @@ impl NativeLease {
         &self,
         budget: &crate::large_document::ResidentBudget,
     ) -> Result<(), String> {
+        #[cfg(not(test))]
+        if self.1.is_none() {
+            return Err("Native inventory lacks actual source admission".into());
+        }
         if self
             .1
             .as_ref()
@@ -236,6 +240,10 @@ impl NativeLease {
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String> {
         check()?;
+        #[cfg(not(test))]
+        if self.1.is_none() {
+            return Err("Native mutation lacks actual source admission".into());
+        }
         if let Some(admission) = &self.1 {
             admission.check(check)?;
         }
@@ -249,9 +257,16 @@ impl NativeLease {
                 .try_clone()
                 .map_err(|_| "Cannot retain admitted native parent".into())
         } else {
-            super::owned_rename::open_directory(
-                self.path().parent().ok_or("Native parent missing")?,
-            )
+            #[cfg(test)]
+            {
+                super::owned_rename::open_directory(
+                    self.path().parent().ok_or("Native parent missing")?,
+                )
+            }
+            #[cfg(not(test))]
+            {
+                Err("Native parent lacks actual source admission".into())
+            }
         }
     }
     pub(in crate::file_safety) fn native_versions_handle(&self) -> Result<fs::File, String> {
@@ -261,13 +276,20 @@ impl NativeLease {
                 .try_clone()
                 .map_err(|_| "Cannot retain native versions owner".into())
         } else {
-            super::owned_rename::open_directory(
-                &self
-                    .path()
-                    .parent()
-                    .ok_or("Native parent missing")?
-                    .join(VERSIONS),
-            )
+            #[cfg(test)]
+            {
+                super::owned_rename::open_directory(
+                    &self
+                        .path()
+                        .parent()
+                        .ok_or("Native parent missing")?
+                        .join(VERSIONS),
+                )
+            }
+            #[cfg(not(test))]
+            {
+                Err("Native versions lack actual source admission".into())
+            }
         }
     }
     pub(in crate::file_safety) fn open_native_quota(
