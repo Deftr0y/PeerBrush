@@ -60,7 +60,10 @@ mod view;
 mod workspace_tests;
 use crate::{controls, thumbnails};
 use crate::{
-    engine::{view::DocumentView, Document},
+    engine::{
+        view::{DocumentView, LayerView},
+        Document,
+    },
     raster::Pixel,
     server::{self, Connection, Shared},
 };
@@ -2932,22 +2935,23 @@ impl PeerBrush {
             ui.close_menu();
         }
     }
-    fn layer_footer(&mut self, ui: &mut egui::Ui, l: &crate::engine::Layer) {
-        let mut blend = l.blend.clone();
+    fn layer_footer<'a>(&mut self, ui: &mut egui::Ui, l: impl Into<LayerView<'a>>) {
+        let l = l.into();
+        let mut blend = l.blend().to_owned();
         self.blend_hover = None;
         let combo = egui::ComboBox::from_id_salt("blend")
             .selected_text(
-                crate::raster::layer_blends(&l.kind)
+                crate::raster::layer_blends(l.kind())
                     .find(|(mode, _)| *mode == blend)
                     .map(|(_, label)| label)
                     .unwrap_or("Normal"),
             )
             .width(ui.available_width() - 10.0)
             .show_ui(ui, |ui| {
-                for (name, label) in crate::raster::layer_blends(&l.kind) {
+                for (name, label) in crate::raster::layer_blends(l.kind()) {
                     let response = ui.selectable_value(&mut blend, name.into(), label);
                     if response.hovered() {
-                        self.blend_hover = Some((l.id.clone(), name.into()));
+                        self.blend_hover = Some((l.id().to_owned(), name.into()));
                     }
                     if response.clicked() {
                         self.blend_hover = None;
@@ -2958,11 +2962,11 @@ impl PeerBrush {
         self.blend_rect = Some(combo.response.rect);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Opacity").size(12.0).color(MUTED));
-            let mut percent = l.opacity * 100.0;
+            let mut percent = l.opacity() * 100.0;
             let width = (ui.available_width() - 3.0).max(60.0);
             let response = controls::range(
                 ui,
-                ("opacity", &l.id),
+                ("opacity", l.id()),
                 &mut percent,
                 0.0..=100.0,
                 width,
@@ -3085,7 +3089,7 @@ impl PeerBrush {
                 .on_hover_text(caption);
         }
         ui.add_space(12.0);
-        let selected = doc.layers.iter().find(|l| l.id == self.selected).cloned();
+        let selected = doc.layers.iter().find(|l| l.id == self.selected);
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
@@ -3125,7 +3129,7 @@ impl PeerBrush {
                     ui.horizontal(|ui| {
                         self.channel_tabs(ui, doc, l.mask.is_some());
                         if l.mask.is_some() {
-                            self.mask_link_button(ui, doc, &l);
+                            self.mask_link_button(ui, doc, l);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
@@ -3162,9 +3166,9 @@ impl PeerBrush {
                         });
                     }
                     if !self.mask {
-                        self.color_stack(ui, &l, doc.revision);
+                        self.color_stack(ui, l, doc.revision);
                     } else if l.mask.is_some() {
-                        self.mask_stack(ui, doc, &l);
+                        self.mask_stack(ui, doc, l);
                     } else {
                         ui.label(
                             RichText::new("Reveal. Hide. Refine.")
@@ -3176,7 +3180,7 @@ impl PeerBrush {
             ui.advance_cursor_after_rect(stack_rect);
             ui.add_space(5.0);
             ui.separator();
-            self.layer_footer(ui, &l);
+            self.layer_footer(ui, l);
         }
     }
     fn gizmo(
