@@ -2,7 +2,9 @@
 //! engine/UI locks; publication is a separate final engine decision.
 use super::{
     png_surface::{PassWriter, TileIndex},
-    prepared_png::{self, ColorPolicy, Complete, EncodedPng, Limits},
+    prepared_png::{
+        self, ColorPolicy, Complete, EncodedPng, FilePng, Header, Limits, PassRow, SourceBinding,
+    },
 };
 use crate::{
     large_document::{BlockRef, FreshFragment, Reservation, ScratchBytes, Snapshot},
@@ -67,9 +69,38 @@ pub(crate) fn stage(
     color: ColorPolicy,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<StagedPng, String> {
+    let binding = encoded.binding(&session.resident())?;
+    stage_with(session, binding, color, check, |guard, row| {
+        prepared_png::decode_pass_rows(encoded, limits, color, &session.resident(), guard, row)
+    })
+}
+
+pub(crate) fn stage_file(
+    session: &SourceSession,
+    file: &mut FilePng<'_>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<StagedPng, String> {
+    let binding = file.binding(session)?;
+    let color = file.color_policy();
+    stage_with(session, binding, color, check, |guard, row| {
+        file.decode_pass_rows(guard, row)
+    })
+}
+
+type RowSink<'a> = dyn FnMut(Header, PassRow, &[u8]) -> Result<(), String> + 'a;
+fn stage_with(
+    session: &SourceSession,
+    binding: SourceBinding,
+    color: ColorPolicy,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    decode: impl FnOnce(
+        &mut dyn FnMut() -> Result<(), String>,
+        &mut RowSink<'_>,
+    ) -> Result<Complete, String>,
+) -> Result<StagedPng, String> {
     session.check()?;
     check()?;
-    if !encoded.uses_budget(&session.resident()) || color == ColorPolicy::ToSrgb {
+    if !binding.uses_budget(&session.resident()) || color == ColorPolicy::ToSrgb {
         return Err("Native PNG staging requires its actual pool and raw color policy".into());
     }
     let mut partial = None;
@@ -81,31 +112,23 @@ pub(crate) fn stage(
             (caller.borrow_mut())()
         };
         let mut writer = None;
-        let complete = prepared_png::decode_pass_rows(
-            encoded,
-            limits,
-            color,
-            &session.resident(),
-            &mut guarded,
-            |header, row, bytes| {
-                if writer.is_none() {
-                    let fragment = session.fresh_fragment()?;
-                    // Register the owner before any later fallible operation.
-                    partial = Some(fragment);
-                    writer = Some(PassWriter::new(
-                        header,
-                        row,
-                        partial.as_ref().unwrap().store(),
-                        encoded,
-                        color,
-                    )?);
-                }
-                writer.as_mut().unwrap().push(header, row, bytes, &mut || {
-                    session.check()?;
-                    (caller.borrow_mut())()
-                })
-            },
-        )?;
+        let complete = decode(&mut guarded, &mut |header, row, bytes| {
+            if writer.is_none() {
+                let fragment = session.fresh_fragment()?;
+                partial = Some(fragment);
+                writer = Some(PassWriter::new_binding(
+                    header,
+                    row,
+                    partial.as_ref().unwrap().store(),
+                    &binding,
+                    color,
+                )?);
+            }
+            writer.as_mut().unwrap().push(header, row, bytes, &mut || {
+                session.check()?;
+                (caller.borrow_mut())()
+            })
+        })?;
         let passes = writer
             .ok_or("PNG source completed without native rows")?
             .finish(complete)?;
@@ -488,5 +511,182 @@ mod tests {
         )
         .is_err());
         assert_eq!(small.disk().used().unwrap(), before);
+    }
+
+    #[test]
+    fn held_file_streams_to_the_identical_native_sink_and_preserves_original_limits() {
+        use crate::image_import::prepared_png::{FileLimits, FilePng};
+        let f = Fixture::new();
+        let (runtime, _connection) = f.runtime(16 * 1024 * 1024);
+        let session = runtime.begin().unwrap();
+        let baseline = runtime.disk().used().unwrap();
+        for depth in [8, 16] {
+            for adam in [false, true] {
+                let path = f.path.join("source.png");
+                let bytes = png(adam, depth);
+                fs::write(&path, &bytes).unwrap();
+                let source = encoded(&bytes, &runtime);
+                let resident = stage(
+                    &session,
+                    &source,
+                    Limits::SELECTION,
+                    ColorPolicy::Raw,
+                    &mut || Ok(()),
+                )
+                .unwrap();
+                let mut held = FilePng::open(
+                    &session,
+                    &path,
+                    FileLimits::SELECTION,
+                    ColorPolicy::Raw,
+                    &mut || Ok(()),
+                )
+                .unwrap();
+                let streamed = stage_file(&session, &mut held, &mut || Ok(())).unwrap();
+                assert_eq!(streamed.complete().source_sha256(), source.source_sha256());
+                let a = resident
+                    .surface()
+                    .prepare_tile((0, 0), &mut || Ok(()))
+                    .unwrap();
+                let b = streamed
+                    .surface()
+                    .prepare_tile((0, 0), &mut || Ok(()))
+                    .unwrap();
+                assert_eq!(a.bytes(), b.bytes());
+                drop((a, b));
+                streamed.abort(&session).unwrap();
+                resident.abort(&session).unwrap();
+                assert_eq!(runtime.disk().used().unwrap(), baseline);
+                drop(held);
+                assert!(FilePng::open(
+                    &session,
+                    &path,
+                    FileLimits {
+                        encoded_bytes: 8,
+                        ..FileLimits::SELECTION
+                    },
+                    ColorPolicy::Raw,
+                    &mut || Ok(())
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn held_file_crc_and_resident_footprint_do_not_depend_on_ignored_chunk_length() {
+        use crate::image_import::prepared_png::{FileLimits, FilePng};
+        let f = Fixture::new();
+        let (runtime, _connection) = f.runtime(16 * 1024 * 1024);
+        let session = runtime.begin().unwrap();
+        let path = f.path.join("unused.png");
+        let ordinary = png(false, 16);
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&ordinary[..33]).unwrap();
+        let length = 2u32 * 1024 * 1024;
+        file.write_all(&length.to_be_bytes()).unwrap();
+        file.write_all(b"vpAg").unwrap();
+        let block = [7u8; 64 * 1024];
+        let mut crc = !0u32;
+        for byte in b"vpAg"
+            .iter()
+            .chain(block.iter().cycle().take(length as usize))
+        {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0u32.wrapping_sub(crc & 1) & 0xedb88320);
+            }
+        }
+        for _ in 0..length as usize / block.len() {
+            file.write_all(&block).unwrap();
+        }
+        file.write_all(&(!crc).to_be_bytes()).unwrap();
+        file.write_all(&ordinary[33..]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let baseline = runtime.resident().used();
+        let mut held = FilePng::open(
+            &session,
+            &path,
+            FileLimits::SELECTION,
+            ColorPolicy::Raw,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        // Includes a conservative worst-case long-path owner, not encoded bytes.
+        assert!(runtime.resident().used() - baseline < 2 * 1024 * 1024);
+        let source = stage_file(&session, &mut held, &mut || Ok(())).unwrap();
+        source.abort(&session).unwrap();
+        drop(held);
+        assert_eq!(runtime.resident().used(), baseline);
+        let mut writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        use std::io::{Seek, SeekFrom};
+        writer.seek(SeekFrom::Start(41)).unwrap();
+        writer.write_all(&[8]).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        assert!(FilePng::open(
+            &session,
+            &path,
+            FileLimits::SELECTION,
+            ColorPolicy::Raw,
+            &mut || Ok(())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn held_file_rejects_changed_decoder_bytes_even_with_a_restored_stamp() {
+        use crate::image_import::prepared_png::{FileLimits, FilePng};
+        let f = Fixture::new();
+        let (runtime, _connection) = f.runtime(16 * 1024 * 1024);
+        let session = runtime.begin().unwrap();
+        let baseline = runtime.disk().used().unwrap();
+        let path = f.path.join("changed.png");
+        let plain = png(true, 16);
+        let mut before = plain[..33].to_vec();
+        chunk(&mut before, b"vpAg", b"first");
+        before.extend_from_slice(&plain[33..]);
+        let mut after = plain[..33].to_vec();
+        chunk(&mut after, b"vpAg", b"other");
+        after.extend_from_slice(&plain[33..]);
+        assert_eq!(before.len(), after.len());
+        fs::write(&path, &before).unwrap();
+        let stamp = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut held = FilePng::open(
+            &session,
+            &path,
+            FileLimits::SELECTION,
+            ColorPolicy::Raw,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        match fs::OpenOptions::new().write(true).open(&path) {
+            Ok(mut writer) => {
+                writer.write_all(&after).unwrap();
+                writer
+                    .set_times(fs::FileTimes::new().set_modified(stamp))
+                    .unwrap();
+                writer.sync_all().unwrap();
+                drop(writer);
+                held.recheck().unwrap();
+                let error = stage_file(&session, &mut held, &mut || Ok(()))
+                    .err()
+                    .unwrap();
+                assert!(error.contains("Bytes consumed"), "{error}");
+            }
+            Err(error) => {
+                // Windows retains a read owner denying write/delete access;
+                // no bypass of the actual OS protection is needed or attempted.
+                assert!(
+                    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32)),
+                    "{error}"
+                );
+                held.recheck().unwrap();
+                let source = stage_file(&session, &mut held, &mut || Ok(())).unwrap();
+                source.abort(&session).unwrap();
+            }
+        }
+        assert_eq!(runtime.disk().used().unwrap(), baseline);
     }
 }

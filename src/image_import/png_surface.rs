@@ -1,6 +1,6 @@
 //! Append-only native PNG pass staging. These private indices are provisional;
 //! session admission, final seal and engine publication remain mandatory.
-use super::prepared_png::{ColorPolicy, Complete, EncodedPng, Header, PassRow};
+use super::prepared_png::{ColorPolicy, Complete, EncodedPng, Header, PassRow, SourceBinding};
 use crate::{
     large_document::{BlockRef, Error, Reservation, ResidentBudget, ScratchBytes, Store, TileSpec},
     raster::TILE,
@@ -139,8 +139,23 @@ impl PassWriter {
         encoded: &EncodedPng,
         policy: ColorPolicy,
     ) -> Result<Self, String> {
+        Self::new_binding(
+            header,
+            first,
+            store,
+            &encoded.binding(&store.resident_budget())?,
+            policy,
+        )
+    }
+    pub(super) fn new_binding(
+        header: Header,
+        first: PassRow,
+        store: &Store,
+        source: &SourceBinding,
+        policy: ColorPolicy,
+    ) -> Result<Self, String> {
         checked(header)?;
-        if matches!(policy, ColorPolicy::ToSrgb) || !encoded.uses_budget(&store.resident_budget()) {
+        if matches!(policy, ColorPolicy::ToSrgb) || !source.uses_budget(&store.resident_budget()) {
             return Err(
                 "PNG pass writer requires its captured native source and actual pool".into(),
             );
@@ -172,8 +187,8 @@ impl PassWriter {
             store: store.clone(),
             pool,
             poisoned: false,
-            expected_source: encoded.source_sha256(),
-            expected_transport: encoded.base64_sha256(),
+            expected_source: source.source_sha256(),
+            expected_transport: source.base64_sha256(),
             expected_policy: policy,
             _index_charge: charge,
         })
