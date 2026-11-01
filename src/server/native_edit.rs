@@ -187,19 +187,35 @@ pub(crate) fn edit_shared_controlled(
                 .err(),
         ));
     }
+    let effects = match crate::engine::runtime_value::PreparedEngineEffects::prepare(
+        &seed, &pending, &active,
+    ) {
+        Ok(effects) => effects,
+        Err(reason) => {
+            return Err(combine(
+                reason.clone(),
+                pending.refused(&reason).abort(&session, &|| session.cleanup_check()).err(),
+            ));
+        }
+    };
     let mut pending = Some(pending);
+    let mut effects = Some(effects);
     let result = {
         let mut engine = shared.lock().unwrap();
         // Only pure atomic/memory operations may run under both fences. In
         // particular no request/session owner is dropped until after unlocking.
         session.with_live_fence(|| {
             control.begin_commit()?;
-            Ok(engine.commit_native(&seed, actor, pending.take().unwrap()))
+            Ok(engine.commit_native_with_effects(
+                &seed, actor, pending.take().unwrap(), effects.take().unwrap(),
+            ))
         })
     };
     let result = match result {
         Ok(Ok(result)) => result,
         Ok(Err(reason)) | Err(reason) => {
+            // Runtime owners and refused source cleanup retire outside both locks.
+            drop(effects.take());
             let refused = pending.take().unwrap().refused(&reason);
             return Err(combine(
                 reason,
