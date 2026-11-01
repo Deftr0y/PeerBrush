@@ -1667,6 +1667,7 @@ impl Engine {
         // Reframe before taking native-original and soft-selection baselines. The
         // outer transaction still owns the complete pre-gesture undo snapshot.
         self.doc.ensure_depth();
+        crate::fill::prepare_visual_baseline(&mut self.doc, c)?;
         crate::edit_bounds::prepare(&mut self.doc, c)?;
         let before = crate::retained::has_originals(&self.doc).then(|| self.doc.clone());
         self.apply_retained(c, pixels)?;

@@ -32,6 +32,9 @@ impl InputBinding {
     pub(crate) fn depth(self) -> u16 {
         self.depth
     }
+    pub(crate) fn origin(self) -> [i32; 2] {
+        self.origin
+    }
 }
 
 pub(crate) struct RasterInput<'a> {

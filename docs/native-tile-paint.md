@@ -124,3 +124,20 @@ soft coverage against the correctly reframed baseline. All source reads remain
 explicit before memory-only kernels, and a failed tile retires the unpublished
 fragment through the held session. Complete frame, mask, retained placement and
 source/effect metadata changes still belong to one coordinator batch.
+
+Resolved native fill and selected clear consume the same borrowed plane and
+session-owned output path. An opaque fill-baseline proof binds the literal
+procedural color to the original generation, slot and logical frame. It does
+not expand draw permissions: the coordinator must pair its complete output
+with the kind transition and retained-source retirement in one atomic batch.
+New frame space and padding remain zero, including when the original fill has
+partial alpha or hidden RGB. Selected clear consumes coverage once.
+
+The resident engine now materializes that literal visual baseline before frame
+expansion and soft-selection snapshots. Previously those snapshots could see
+the fill's unused raw plane, losing unselected visible color or blending at the
+wrong document coordinates. The outer transaction retains the original kind
+and pixels for one undo/redo record. Prepared native8/16 fixtures reproduce the
+former loss and compare the corrected engine with the staged native result;
+their runtime qualification remains required. Neither these adapters nor a
+metadata-only compile establish large-document or desktop acceptance.
