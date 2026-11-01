@@ -175,8 +175,31 @@ fn validate(
 }
 
 /// Does not expand bounds. Coverage is consumed once by this clear kernel.
+#[cfg(test)]
 pub(crate) fn stage_clear<'d, 's>(
     input: &RasterInput<'d>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<FillStage<'d, 's>, String> {
+    stage_clear_impl(input, None, session, check)
+}
+pub(crate) fn stage_clear_guarded<'d, 's>(
+    input: &RasterInput<'d>,
+    guard: &crate::edit_bounds::input::WriteGuard<'_>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<FillStage<'d, 's>, String> {
+    guard.validate(input, None, &["paint.clear_selection"])?;
+    let mut checked = || {
+        guard.check_active()?;
+        check()?;
+        guard.check_active()
+    };
+    stage_clear_impl(input, Some(guard), session, &mut checked)
+}
+fn stage_clear_impl<'d, 's>(
+    input: &RasterInput<'d>,
+    guard: Option<&crate::edit_bounds::input::WriteGuard<'_>>,
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<FillStage<'d, 's>, String> {
@@ -222,15 +245,25 @@ pub(crate) fn stage_clear<'d, 's>(
                 }
                 check()?;
                 let before = input.prepare_tile(key, check)?;
-                let mut after = if let Some(baseline) = &baseline {
+                let semantic_before = if let Some(baseline) = &baseline {
                     baseline.tile(input, None, key, check)?
                 } else {
                     before.bytes().clone()
                 };
+                let mut after = semantic_before.clone();
                 if touches(local, key) {
                     let coverage = selection.prepare(input.tile_document_rect(key)?, check)?;
                     after = clear.render_tile(key, &after, check, |x, y| coverage.value(x, y))?;
                 }
+                crate::edit_bounds::input::check_proposal(
+                    guard,
+                    input,
+                    None,
+                    key,
+                    &semantic_before,
+                    &after,
+                    check,
+                )?;
                 output.replace_tile(&before, after, check)?;
             }
         }
@@ -247,11 +280,53 @@ pub(crate) fn stage_clear<'d, 's>(
 
 /// Resolved raster foreground fill. The common coordinator owns folder child
 /// insertion and the atomic kind/plane transition for a nominal fill baseline.
+#[cfg(test)]
 pub(crate) fn stage_fill<'d, 's>(
     input: &RasterInput<'d>,
     color: [u8; 4],
     requested: Option<[i32; 4]>,
     frame: Option<&InputFrame>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<FillStage<'d, 's>, String> {
+    stage_fill_impl(input, color, requested, frame, None, session, check)
+}
+pub(crate) fn stage_fill_guarded<'d, 's>(
+    input: &RasterInput<'d>,
+    frame: Option<&InputFrame>,
+    guard: &crate::edit_bounds::input::WriteGuard<'_>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<FillStage<'d, 's>, String> {
+    guard.validate(input, frame, &["paint.fill"])?;
+    let parameters = guard.parameters();
+    let values = parameters["color"]
+        .as_array()
+        .filter(|v| v.len() == 4 && v.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255)))
+        .ok_or("Fill color must contain four byte values")?;
+    let color = std::array::from_fn(|i| values[i].as_u64().unwrap() as u8);
+    let requested = parameters.get("rect").and_then(crate::engine::rect);
+    let mut checked = || {
+        guard.check_active()?;
+        check()?;
+        guard.check_active()
+    };
+    stage_fill_impl(
+        input,
+        color,
+        requested,
+        frame,
+        Some(guard),
+        session,
+        &mut checked,
+    )
+}
+fn stage_fill_impl<'d, 's>(
+    input: &RasterInput<'d>,
+    color: [u8; 4],
+    requested: Option<[i32; 4]>,
+    frame: Option<&InputFrame>,
+    guard: Option<&crate::edit_bounds::input::WriteGuard<'_>>,
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<FillStage<'d, 's>, String> {
@@ -323,12 +398,22 @@ pub(crate) fn stage_fill<'d, 's>(
             } else {
                 before.clone()
             };
-            if selection.has_coverage() {
+            let after = if selection.has_coverage() {
                 let coverage = selection.prepare(frame.tile_document_rect(key)?, check)?;
                 restrict_frame_tile(input, frame, key, &before, &after, &coverage, check)
             } else {
                 Ok(after)
-            }
+            }?;
+            crate::edit_bounds::input::check_proposal(
+                guard,
+                input,
+                Some(frame),
+                key,
+                &before,
+                &after,
+                check,
+            )?;
+            Ok(after)
         })?;
         return Ok(FillStage {
             output: BuiltTiles::Draft(draft),
@@ -358,6 +443,9 @@ pub(crate) fn stage_fill<'d, 's>(
                     let coverage = selection.prepare(input.tile_document_rect(key)?, check)?;
                     after = restrict_tile(input, key, &before, &after, &coverage, check)?;
                 }
+                crate::edit_bounds::input::check_proposal(
+                    guard, input, None, key, &before, &after, check,
+                )?;
                 output.replace_tile(&raw, after, check)?;
             }
         }
