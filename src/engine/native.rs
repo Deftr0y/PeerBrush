@@ -17,6 +17,8 @@ mod output;
 mod patch;
 #[path = "native/scopes.rs"]
 mod scopes;
+#[path = "native/transaction.rs"]
+mod transaction;
 use super::scene::{Document36, Layer36, PendingScene, RasterRef36, RasterRoster, Result};
 use crate::{
     large_document::{DiskBudget, ResidentBudget, ScratchBytes},
@@ -47,6 +49,7 @@ use std::{
         Arc, OnceLock,
     },
 };
+pub(crate) use transaction::{NativeTransaction, RefusedTransaction};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DocumentKey([u8; 16]);
@@ -572,10 +575,15 @@ impl RefusedDelta {
         cleanup: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         let PreparedDelta {
-            candidate, outputs, ..
+            candidate,
+            outputs,
+            admission,
+            ..
         } = self.prepared;
         drop(candidate);
-        output::abort_outputs(outputs, session, cleanup)
+        let result = output::abort_outputs(outputs, session, cleanup);
+        drop(admission);
+        result
     }
 }
 impl PreparedDelta {
