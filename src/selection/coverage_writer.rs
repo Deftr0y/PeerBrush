@@ -10,6 +10,46 @@ use crate::{
 use std::collections::BTreeMap;
 
 const TILE_BYTES: usize = (TILE * TILE * 4) as usize;
+
+/// Ordered scalar sources share the same completion/contour/native-tile path
+/// as flood output. Completion grants no source or document publication.
+pub(crate) fn stage_rows(
+    width: u32,
+    height: u32,
+    store: Store,
+    pool: &ResidentBudget,
+    check: &dyn Fn() -> Result<()>,
+    mut read: impl FnMut(u32, &mut [u8]) -> std::result::Result<(), String>,
+) -> std::result::Result<CoverageSource, String> {
+    let mut writer = Writer::new(width, height, store, pool).map_err(|e| e.to_string())?;
+    let w = width as usize;
+    let mut ring = ScratchBytes::new(pool, w, w).map_err(|e| e.to_string())?;
+    let mut sums = ScratchBytes::new(pool, w * 4, w * 4).map_err(|e| e.to_string())?;
+    let mut input = ScratchBytes::new(pool, w, w).map_err(|e| e.to_string())?;
+    let mut output = ScratchBytes::new(pool, w, w).map_err(|e| e.to_string())?;
+    let mut ordered = super::rows::Feather::new(
+        width,
+        height,
+        0,
+        &mut ring,
+        &mut sums,
+        &mut input,
+        &mut output,
+    )
+    .map_err(str::to_owned)?;
+    let complete = ordered.run(
+        || check().map_err(|e| e.to_string()),
+        |y, row| read(y, row),
+        |y, row| {
+            writer
+                .row(y, row, &mut || check())
+                .map_err(|e| e.to_string())
+        },
+    )?;
+    writer
+        .finish(&complete, &mut || check())
+        .map_err(|e| e.to_string())
+}
 pub(super) struct Writer {
     width: u32,
     height: u32,
