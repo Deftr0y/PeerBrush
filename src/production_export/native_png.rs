@@ -16,6 +16,8 @@ const CHUNK_BYTES: usize = 64 * 1024;
 
 pub(crate) struct RowRequest<'a> {
     pub output: &'a Output,
+    /// Precision of the requested samples, independently of destination format.
+    pub sample_depth: u16,
     pub resampling: Resampling,
     pub first_row: u32,
     pub rows: u32,
@@ -117,7 +119,7 @@ fn backend_bytes(row: usize, profile: usize) -> Result<usize, String> {
         .and_then(|n| n.checked_add(4 * 1024 * 1024))
         .ok_or_else(|| "Native PNG backend footprint overflow".into())
 }
-fn profile(scene: &SceneSnapshot) -> Option<&[u8]> {
+pub(super) fn profile(scene: &SceneSnapshot) -> Option<&[u8]> {
     let metadata = scene.metadata();
     metadata.profile().or_else(|| {
         metadata
@@ -125,7 +127,7 @@ fn profile(scene: &SceneSnapshot) -> Option<&[u8]> {
             .then(crate::color_profile::srgb_profile)
     })
 }
-fn binding(
+pub(super) fn binding(
     scene: &SceneSnapshot,
     output: &Output,
     resampling: Resampling,
@@ -286,6 +288,7 @@ pub(crate) fn write_to<'scene, 'output>(
                     .fill(
                         RowRequest {
                             output,
+                            sample_depth: output.native_source_depth,
                             resampling: settings.resampling,
                             first_row: first,
                             rows: count,
@@ -505,6 +508,7 @@ mod tests {
             check()?;
             self.calls += 1;
             assert!(r.rows > 0 && r.rows <= 256);
+            assert_eq!(r.sample_depth, r.output.native_source_depth);
             assert_eq!(r.resampling, Resampling::Bilinear);
             assert_eq!(
                 r.provenance,
