@@ -35,6 +35,27 @@ including files with a separate default image. It does not compose animation
 frames. The completion still requires validation through IEND. Pattern decoding
 continues to require one static image.
 
+`decode_pass_rows` is the separate native-source event interface. It retains
+only one charged canonical RGBA16 row (at most128KiB), including for Adam7.
+Each event states pass, y, first-x, x-step and sample count; pass0 is an ordinary
+full row. Decoder-native rows are checked against the exact expected Adam7 pass
+descriptor before delivery. RawSelection retains its intentional ICC policy;
+Raw retains original native samples and profile metadata. This interface does
+not normalize to sRGB or reconstruct a whole image in memory.
+
+A caller must stage pass events into a private durable source, preserving prior
+pass pixels and complete physical tile padding, and publish only after the
+completion receipt and independent engine guards. That durable tile-band sink,
+disk quotas/abort/compaction, live large-document admission and native16K
+qualification remain separate work. A small row-charge/once-only coverage test
+does not close those gates.
+
+`decode_rows` remains a resident compatibility adapter for interlaced input and
+color-normalized bitmap preparation. It reconstructs native RGBA bands and runs
+CMS on completed rows rather than sparse pass samples. Combined orientation,
+interlace and whole-image CMS fidelity still requires independent exact-oracle
+tests; it must not be inferred solely from pointwise transform semantics.
+
 ## Pinned dependency audit
 
 These envelopes depend on the versions pinned in Cargo.lock: png 0.18.1,

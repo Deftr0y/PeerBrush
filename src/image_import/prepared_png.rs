@@ -198,6 +198,19 @@ impl std::io::BufRead for Checked<'_, '_, '_> {
     }
 }
 
+/// Coordinates for one decoded native pass row. Pass0 is a complete ordinary
+/// row; passes1..7 are sparse Adam7 samples. These are provisional source facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PassRow {
+    pub pass: u8,
+    pub y: u32,
+    pub first_x: u32,
+    pub step_x: u32,
+    pub samples: u32,
+}
+
+/// Existing small-image compatibility adapter. Interlaced rows are explicitly
+/// reconstructed in resident native bands; this API does not become out of core.
 pub(crate) fn decode_rows(
     encoded: &EncodedPng,
     limits: Limits,
@@ -205,6 +218,145 @@ pub(crate) fn decode_rows(
     pool: &ResidentBudget,
     check: &mut dyn FnMut() -> Result<(), String>,
     mut row: impl FnMut(Header, u32, &[u8]) -> Result<(), String>,
+) -> Result<Complete, String> {
+    let mut bands = None;
+    let complete = decode_native_pass_rows(
+        encoded,
+        limits,
+        color,
+        pool,
+        check,
+        |header, event, data| {
+            if event.pass == 0 && !matches!(color, ColorPolicy::ToSrgb) {
+                return row(header, event.y, data);
+            }
+            if bands.is_none() {
+                let native_bytes = if header.depth == 16 { 8 } else { 4 };
+                bands = Some(BandedFrame::new(
+                    header.width as usize * native_bytes,
+                    header.height,
+                    pool,
+                )?);
+            }
+            let target = bands.as_mut().unwrap().row_mut(event.y)?;
+            for (sample, value) in data.chunks_exact(8).enumerate() {
+                let x = (event.first_x + sample as u32 * event.step_x) as usize;
+                if header.depth == 16 {
+                    target[x * 8..x * 8 + 8].copy_from_slice(value);
+                } else {
+                    for c in 0..4 {
+                        if value[c * 2] != value[c * 2 + 1] {
+                            return Err(
+                                "Prepared native8 Adam7 sample contains16-bit residuals".into()
+                            );
+                        }
+                        target[x * 4 + c] = value[c * 2];
+                    }
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if let Some(mut bands) = bands {
+        let header = complete.header;
+        // Preserve legacy full-row CMS grouping, including SIMD tail arithmetic.
+        let conversion = if matches!(color, ColorPolicy::ToSrgb) {
+            complete
+                .profile()
+                .map(|p| UncachedTransforms::new(p, pool, check))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut rgba = if header.depth == 8 || conversion.is_some() {
+            Some(
+                ScratchBytes::new(pool, header.width as usize * 8, header.width as usize * 8)
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let mut output8 = if header.depth == 8 && conversion.is_some() {
+            Some(
+                ScratchBytes::new(pool, header.width as usize * 4, header.width as usize * 4)
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let mut input16 = if header.depth == 16 && conversion.is_some() {
+            Some(ChargedWords::new(header.width as usize * 4, pool)?)
+        } else {
+            None
+        };
+        let mut output16 = if header.depth == 16 && conversion.is_some() {
+            Some(ChargedWords::new(header.width as usize * 4, pool)?)
+        } else {
+            None
+        };
+        for y in 0..header.height {
+            check()?;
+            let native = bands.row_mut(y)?;
+            if header.depth == 8 {
+                let values = if let Some(conversion) = &conversion {
+                    let output = output8.as_mut().unwrap();
+                    conversion.convert8(native, output)?;
+                    &**output
+                } else {
+                    &*native
+                };
+                let rgba = rgba.as_mut().unwrap();
+                for (&value, target) in values.iter().zip(rgba.chunks_exact_mut(2)) {
+                    target.copy_from_slice(&(value as u16 * 257).to_be_bytes());
+                }
+                row(header, y, rgba)?;
+            } else if let Some(conversion) = &conversion {
+                let input = input16.as_mut().unwrap();
+                let output = output16.as_mut().unwrap();
+                for (target, value) in input.iter_mut().zip(native.chunks_exact(2)) {
+                    *target = u16::from_be_bytes(value.try_into().unwrap());
+                }
+                conversion.convert16(input, output)?;
+                let rgba = rgba.as_mut().unwrap();
+                for (&value, target) in output.iter().zip(rgba.chunks_exact_mut(2)) {
+                    target.copy_from_slice(&value.to_be_bytes());
+                }
+                row(header, y, rgba)?;
+            } else {
+                row(header, y, native)?;
+            }
+        }
+    }
+    check()?;
+    Ok(complete)
+}
+
+/// Worker event source: no full-frame allocation, including for Adam7. A durable
+/// sink must preserve previous pass pixels and remain unpublished through the
+/// final completion, source checks and its independent guarded engine adoption.
+pub(crate) fn decode_pass_rows(
+    encoded: &EncodedPng,
+    limits: Limits,
+    color: ColorPolicy,
+    pool: &ResidentBudget,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    mut row: impl FnMut(Header, PassRow, &[u8]) -> Result<(), String>,
+) -> Result<Complete, String> {
+    if matches!(color, ColorPolicy::ToSrgb) {
+        return Err(
+            "Pass rows preserve native source color; convert completed full rows explicitly".into(),
+        );
+    }
+    decode_native_pass_rows(encoded, limits, color, pool, check, row)
+}
+
+fn decode_native_pass_rows(
+    encoded: &EncodedPng,
+    limits: Limits,
+    color: ColorPolicy,
+    pool: &ResidentBudget,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    mut row: impl FnMut(Header, PassRow, &[u8]) -> Result<(), String>,
 ) -> Result<Complete, String> {
     check()?;
     limits.validate()?;
@@ -270,14 +422,6 @@ pub(crate) fn decode_rows(
             Ok(bytes.freeze())
         })
         .transpose()?;
-    let conversion = if matches!(color, ColorPolicy::ToSrgb) {
-        profile
-            .as_deref()
-            .map(|p| UncachedTransforms::new(p, pool, &mut || (cancellation.borrow_mut())()))
-            .transpose()?
-    } else {
-        None
-    };
     let (output_color, bits) = reader.output_color_type();
     let depth = match bits {
         png::BitDepth::Eight => 8,
@@ -311,94 +455,39 @@ pub(crate) fn decode_rows(
         orientation,
         animated: reader.info().animation_control.is_some(),
     };
-    let row_length = width as usize * channels * usize::from(depth / 8);
+    let pixel_bytes = channels * usize::from(depth / 8);
     let mut rgba = ScratchBytes::new(pool, width as usize * 8, width as usize * 8)
         .map_err(|e| e.to_string())?;
-    let mut input8 = if depth == 8 {
-        Some(
-            ScratchBytes::new(pool, width as usize * 4, width as usize * 4)
-                .map_err(|e| e.to_string())?,
-        )
-    } else {
-        None
-    };
-    let mut output8 = if depth == 8 && conversion.is_some() {
-        Some(
-            ScratchBytes::new(pool, width as usize * 4, width as usize * 4)
-                .map_err(|e| e.to_string())?,
-        )
-    } else {
-        None
-    };
-    let mut input16 = if depth == 16 {
-        Some(ChargedWords::new(width as usize * 4, pool)?)
-    } else {
-        None
-    };
-    let mut output16 = if depth == 16 && conversion.is_some() {
-        Some(ChargedWords::new(width as usize * 4, pool)?)
-    } else {
-        None
-    };
-    let mut emit = |y: u32, data: &[u8]| -> Result<(), String> {
+    let mut emit = |event: PassRow, data: &[u8]| -> Result<(), String> {
         (cancellation.borrow_mut())()?;
-        if data.len() != row_length {
+        if data.len() != event.samples as usize * pixel_bytes {
             return Err("Prepared PNG row length differs".into());
         }
-        if depth == 8 {
-            let input = input8.as_mut().unwrap();
-            for (source, target) in data.chunks_exact(channels).zip(input.chunks_exact_mut(4)) {
-                target[0] = source[0];
-                target[1] = if channels <= 2 { source[0] } else { source[1] };
-                target[2] = if channels <= 2 { source[0] } else { source[2] };
-                target[3] = match channels {
-                    2 => source[1],
-                    4 => source[3],
-                    _ => 255,
-                };
-            }
-            let values = if let Some(conversion) = &conversion {
-                let output = output8.as_mut().unwrap();
-                conversion.convert8(input, output)?;
-                &**output
-            } else {
-                &**input
+        for (source, target) in data.chunks_exact(pixel_bytes).zip(rgba.chunks_exact_mut(8)) {
+            let get = |c: usize| {
+                if depth == 16 {
+                    u16::from_be_bytes([source[c * 2], source[c * 2 + 1]])
+                } else {
+                    u16::from(source[c]) * 257
+                }
             };
-            for (&value, target) in values.iter().zip(rgba.chunks_exact_mut(2)) {
-                target.copy_from_slice(&(value as u16 * 257).to_be_bytes());
-            }
-        } else {
-            let input = input16.as_mut().unwrap();
-            for (source, target) in data
-                .chunks_exact(channels * 2)
-                .zip(input.chunks_exact_mut(4))
-            {
-                let get = |c: usize| u16::from_be_bytes([source[c * 2], source[c * 2 + 1]]);
-                target[0] = get(0);
-                target[1] = if channels <= 2 { get(0) } else { get(1) };
-                target[2] = if channels <= 2 { get(0) } else { get(2) };
-                target[3] = match channels {
+            let value = [
+                get(0),
+                if channels <= 2 { get(0) } else { get(1) },
+                if channels <= 2 { get(0) } else { get(2) },
+                match channels {
                     2 => get(1),
                     4 => get(3),
                     _ => 65535,
-                };
-            }
-            let values = if let Some(conversion) = &conversion {
-                let output = output16.as_mut().unwrap();
-                conversion.convert16(input, output)?;
-                &**output
-            } else {
-                &**input
-            };
-            for (&value, target) in values.iter().zip(rgba.chunks_exact_mut(2)) {
+                },
+            ];
+            for (value, target) in value.into_iter().zip(target.chunks_exact_mut(2)) {
                 target.copy_from_slice(&value.to_be_bytes());
             }
         }
-        row(header, y, &rgba)
+        row(header, event, &rgba[..event.samples as usize * 8])
     };
     if reader.info().interlaced {
-        let mut decoded = BandedFrame::new(row_length, height, pool)?;
-        let pixel_bytes = channels * usize::from(depth / 8);
         for (pass, (sx, sy, dx, dy)) in [
             (0u32, 0u32, 8u32, 8u32),
             (4, 0, 8, 8),
@@ -427,11 +516,16 @@ pub(crate) fn decode_rows(
                 {
                     return Err("Prepared PNG Adam7 row differs from its declared pass".into());
                 }
-                let target = decoded.row_mut(sy + line * dy)?;
-                for (sample, value) in part.data().chunks_exact(pixel_bytes).enumerate() {
-                    let at = (sx + sample as u32 * dx) as usize * pixel_bytes;
-                    target[at..at + pixel_bytes].copy_from_slice(value);
-                }
+                emit(
+                    PassRow {
+                        pass: (pass + 1) as u8,
+                        y: sy + line * dy,
+                        first_x: sx,
+                        step_x: dx,
+                        samples,
+                    },
+                    part.data(),
+                )?;
             }
         }
         if reader
@@ -441,16 +535,22 @@ pub(crate) fn decode_rows(
         {
             return Err("Prepared PNG has excess Adam7 rows".into());
         }
-        for y in 0..height {
-            emit(y, decoded.row_mut(y)?)?;
-        }
     } else {
         for y in 0..height {
             let data = reader
                 .next_row()
                 .map_err(|e| e.to_string())?
                 .ok_or("Prepared PNG ended before all rows")?;
-            emit(y, data.data())?;
+            emit(
+                PassRow {
+                    pass: 0,
+                    y,
+                    first_x: 0,
+                    step_x: 1,
+                    samples: width,
+                },
+                data.data(),
+            )?;
         }
         if reader.next_row().map_err(|e| e.to_string())?.is_some() {
             return Err("Prepared PNG has excess rows".into());
@@ -952,8 +1052,7 @@ mod tests {
         }
         bytes.extend_from_slice(&(!crc).to_be_bytes());
     }
-    #[test]
-    fn charged_interlace_rows_match_existing_decoder_at_original_precision() {
+    fn adam7_fixture(depth: u16) -> Vec<u8> {
         let (width, height) = (9u32, 7u32);
         let mut scan = Vec::new();
         for (sx, sy, dx, dy) in [
@@ -977,7 +1076,11 @@ mod tests {
                         51237,
                         if (x + y) % 3 == 0 { 0 } else { 45679 },
                     ] {
-                        scan.extend_from_slice(&value.to_be_bytes());
+                        if depth == 16 {
+                            scan.extend_from_slice(&value.to_be_bytes());
+                        } else {
+                            scan.push(crate::raster::project16(value));
+                        }
                     }
                 }
             }
@@ -989,12 +1092,17 @@ mod tests {
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(&width.to_be_bytes());
         ihdr.extend_from_slice(&height.to_be_bytes());
-        ihdr.extend_from_slice(&[16, 6, 0, 0, 1]);
+        ihdr.extend_from_slice(&[depth as u8, 6, 0, 0, 1]);
         chunk(&mut bytes, b"IHDR", &ihdr);
         chunk(&mut bytes, b"IDAT", &compressed.finish().unwrap());
         chunk(&mut bytes, b"IEND", &[]);
-        compare_pattern(bytes);
+        bytes
     }
+    #[test]
+    fn charged_interlace_rows_match_existing_decoder_at_original_precision() {
+        compare_pattern(adam7_fixture(16));
+    }
+
     #[test]
     fn incomplete_corrupt_animated_cancelled_or_refused_png_never_completes() {
         let bytes = fixture(png::ColorType::Rgba, png::BitDepth::Sixteen, None, 1);
@@ -1351,6 +1459,128 @@ mod tests {
         assert_eq!(pool.used(), 0);
     }
     #[test]
+    fn adam7_pass_events_are_native_exact_once_and_keep_only_one_charged_row() {
+        for depth in [8, 16] {
+            let bytes = adam7_fixture(depth);
+            let pool = ResidentBudget::new(64 * 1024 * 1024).unwrap();
+            let encoded = EncodedPng::base64(
+                &STANDARD.encode(bytes),
+                Limits::SELECTION,
+                &pool,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            let held = pool.used();
+            let mut visited = std::collections::BTreeSet::new();
+            let mut pass = 0;
+            let complete = decode_pass_rows(
+                &encoded,
+                Limits::SELECTION,
+                ColorPolicy::RawSelection,
+                &pool,
+                &mut || Ok(()),
+                |header, event, row| {
+                    assert_eq!(header.depth, depth);
+                    assert_eq!((header.width, header.height), (9, 7));
+                    assert_eq!(
+                        pool.used(),
+                        held + DECODER_BYTES + header.width as usize * 8
+                    );
+                    assert!(event.pass >= pass && event.pass <= 7);
+                    pass = event.pass;
+                    assert_eq!(row.len(), event.samples as usize * 8);
+                    for (sample, value) in row.chunks_exact(8).enumerate() {
+                        let x = event.first_x + sample as u32 * event.step_x;
+                        let y = event.y;
+                        assert!(x < 9 && y < 7);
+                        assert!(visited.insert((x, y)));
+                        let original = [
+                            12347 + x as u16 * 173,
+                            33559 + y as u16 * 97,
+                            51237,
+                            if (x + y) % 3 == 0 { 0 } else { 45679 },
+                        ];
+                        for (expected, actual) in original.into_iter().zip(value.chunks_exact(2)) {
+                            let expected = if depth == 16 {
+                                expected
+                            } else {
+                                u16::from(crate::raster::project16(expected)) * 257
+                            };
+                            assert_eq!(u16::from_be_bytes(actual.try_into().unwrap()), expected);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(pass, 7);
+            assert_eq!(visited.len(), 9 * 7);
+            assert_eq!(pool.used(), held);
+            drop(complete);
+            drop(encoded);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+    #[test]
+    fn pass_source_failure_has_no_completion_and_does_not_normalize_color_implicitly() {
+        let pool = ResidentBudget::new(64 * 1024 * 1024).unwrap();
+        let encoded = EncodedPng::base64(
+            &STANDARD.encode(adam7_fixture(16)),
+            Limits::SELECTION,
+            &pool,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let held = pool.used();
+        let mut delivered = 0;
+        assert!(decode_pass_rows(
+            &encoded,
+            Limits::SELECTION,
+            ColorPolicy::RawSelection,
+            &pool,
+            &mut || Ok(()),
+            |_, _, _| {
+                delivered += 1;
+                if delivered > 1 {
+                    Err("Provisional pass sink refused".into())
+                } else {
+                    Ok(())
+                }
+            }
+        )
+        .is_err());
+        assert_eq!(delivered, 2);
+        assert_eq!(pool.used(), held);
+        assert!(decode_pass_rows(
+            &encoded,
+            Limits::SELECTION,
+            ColorPolicy::ToSrgb,
+            &pool,
+            &mut || Ok(()),
+            |_, _, _| Ok(())
+        )
+        .is_err());
+        assert_eq!(pool.used(), held);
+        drop(encoded);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn interlace_profile_conversion_keeps_legacy_completed_row_grouping() {
+        for depth in [8, 16] {
+            let original = adam7_fixture(depth);
+            let profile = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+            let mut compressor =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            compressor.write_all(&profile).unwrap();
+            let mut tag = b"Profile\0\0".to_vec();
+            tag.extend_from_slice(&compressor.finish().unwrap());
+            let mut bytes = original[..33].to_vec();
+            chunk(&mut bytes, b"iCCP", &tag);
+            bytes.extend_from_slice(&original[33..]);
+            compare_pattern(bytes);
+        }
+    }
+    #[test]
     fn declared_icc_parse_failures_cannot_become_untagged_srgb_even_with_managed_gamma() {
         let original = fixture(png::ColorType::Rgb, png::BitDepth::Eight, None, 1);
         for profile in [
@@ -1444,5 +1674,58 @@ mod tests {
         assert_eq!(pool.used(), held);
         drop(encoded);
         assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn odd_width_icc_and_exif_match_existing_native_conversion_together() {
+        let profile = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+        for bits in [png::BitDepth::Eight, png::BitDepth::Sixteen] {
+            for color in [
+                png::ColorType::Rgb,
+                png::ColorType::Rgba,
+                png::ColorType::Grayscale,
+                png::ColorType::GrayscaleAlpha,
+            ] {
+                for orientation in 1..=8 {
+                    let mut info = png::Info::with_size(9, 7);
+                    info.color_type = color;
+                    info.bit_depth = bits;
+                    info.icc_profile = Some(Cow::Owned(profile.clone()));
+                    let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+                    exif.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0, 0]);
+                    info.exif_metadata = Some(Cow::Owned(exif));
+                    let channels = match color {
+                        png::ColorType::Rgb => 3,
+                        png::ColorType::Rgba => 4,
+                        png::ColorType::Grayscale => 1,
+                        _ => 2,
+                    };
+                    let edges = [
+                        0u16, 1, 127, 128, 255, 256, 257, 258, 4095, 12347, 32767, 32768, 51237,
+                        65534, 65535,
+                    ];
+                    let mut data = Vec::new();
+                    for pixel in 0..9 * 7 {
+                        for channel in 0..channels {
+                            let value = edges[(pixel * 3 + channel) % edges.len()];
+                            if bits == png::BitDepth::Sixteen {
+                                data.extend_from_slice(&value.to_be_bytes());
+                            } else {
+                                data.push(crate::raster::project16(value));
+                            }
+                        }
+                    }
+                    let mut bytes = Vec::new();
+                    {
+                        let mut writer = png::Encoder::with_info(&mut bytes, info)
+                            .unwrap()
+                            .write_header()
+                            .unwrap();
+                        writer.write_image_data(&data).unwrap();
+                        writer.finish().unwrap();
+                    }
+                    compare_pattern(bytes);
+                }
+            }
+        }
     }
 }
