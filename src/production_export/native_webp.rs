@@ -106,10 +106,7 @@ fn visit_rows(
 ) -> io::Result<Digest> {
     let native = usize::from(output.native_source_depth / 8);
     let row_bytes = output.width as usize * 4 * native;
-    let stripe = STRIP_PIXELS
-        .div_ceil(output.width)
-        .min(256)
-        .min(output.height);
+    let stripe = super::native_png::stripe_rows(output.width, output.height);
     let mut raw = Context::new(&SHA256);
     let mut first = 0;
     while first < output.height {
@@ -267,10 +264,7 @@ pub(crate) fn write_to<'scene, 'output>(
         return Err("Native WebP rectangle, target or scale differs".into());
     }
     let provenance = binding(scene, output, settings.resampling, check)?;
-    let stripe = STRIP_PIXELS
-        .div_ceil(output.width)
-        .min(256)
-        .min(output.height);
+    let stripe = super::native_png::stripe_rows(output.width, output.height);
     let row_bytes = output.width as usize * 4 * usize::from(output.native_source_depth / 8);
     let mut rows = ScratchBytes::new(
         scene.budget(),
