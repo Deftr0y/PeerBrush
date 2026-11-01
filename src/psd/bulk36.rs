@@ -3,6 +3,11 @@
 //! are separate requirements; a completed chunk never grants editable authority.
 use ring::digest::{Context, SHA256};
 use std::io::{Read, Write};
+#[path = "bulk36_verify.rs"]
+mod verify;
+pub(crate) use verify::{
+    BulkLimits, BulkPlan, BulkVerifier, CompletedBulk, RasterSpec, TileIndexEntry,
+};
 
 pub(crate) type Digest = [u8; 32];
 const MAGIC: &[u8; 8] = b"PBRBULK1";
