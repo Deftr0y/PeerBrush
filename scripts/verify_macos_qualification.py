@@ -42,9 +42,14 @@ REQUIRED_JOB_STEPS = (
 )
 
 
-def _policy(windows, linux=False):
-    if type(windows) is not bool or type(linux) is not bool or (windows and linux):
+def _policy(windows, linux=False, store=False):
+    if any(type(value) is not bool for value in [windows, linux, store]) or sum([windows, linux, store]) > 1:
         raise ValueError('Native platform policy must be selected by its fixed adapter.')
+    if store:
+        workflow = '.github/workflows/store-qualification.yml'
+        return (workflow, REPOSITORY_URI + '/' + workflow + '@refs/heads/main',
+                'store-sdk-qualification.json', 'PeerBrushStoreSdkQualificationV1',
+                'PeerBrushStoreSdkNativeOriginV1', 'windows-2025', 'Qualify selected Store SDK package', 16 * 1024)
     if linux:
         workflow = '.github/workflows/linux-qualification.yml'
         return (workflow, REPOSITORY_URI + '/' + workflow + '@refs/heads/main',
@@ -102,9 +107,9 @@ def _command(executable, arguments, work, label, *, _windows_host=False):
     return output.read_bytes()
 
 
-def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt, _windows=False, _linux=False):
+def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt, _windows=False, _linux=False, _store=False):
     """Only inspect output from the successful, pinned cryptographic verifier process."""
-    workflow, identity, filename, *_ = _policy(_windows, _linux)
+    workflow, identity, filename, *_ = _policy(_windows, _linux, _store)
     if not isinstance(data, bytes) or not 0 < len(data) <= OUTPUT_LIMIT:
         raise ValueError('Native attestation verifier returned unsupported output.')
     try:
@@ -170,11 +175,12 @@ def _verified_claims(data, *, commit, qualification_sha256, run_id, run_attempt,
                 trigger=certificate['buildTrigger'], run_id=run_id, run_attempt=run_attempt,
                 certificate_and_observer_time='cryptographically-verified')
 
-def _reconcile_job(claims, *, _windows=False, _linux=False):
+def _reconcile_job(claims, *, _windows=False, _linux=False, _store=False):
     """Only called with this invocation's cryptographically verified claims."""
     from prepare_site_release import public_get
-    workflow, _, _, _, _, runner, qualify_step, _ = _policy(_windows, _linux)
+    workflow, _, _, _, _, runner, qualify_step, _ = _policy(_windows, _linux, _store)
     required_steps = tuple('Acquire selected Linux assets' if _linux and name == 'Acquire selected signed assets'
+                           else 'Acquire selected Store assets' if _store and name == 'Acquire selected signed assets'
                            else qualify_step if name == 'Qualify selected final DMG' else name for name in REQUIRED_JOB_STEPS)
 
     try:
@@ -266,9 +272,9 @@ def _reconcile_job(claims, *, _windows=False, _linux=False):
 
 def authenticate(qualification, *, qualification_sha256, commit, version, bundle, bundle_sha256,
                  trusted_root, trusted_root_sha256, cli, cli_sha256, cli_version,
-                 workflow_commit, run_id, run_attempt, work, source_root, readback_job=False, _windows=False, _linux=False, _setup_host=False):
+                 workflow_commit, run_id, run_attempt, work, source_root, readback_job=False, _windows=False, _linux=False, _setup_host=False, _store=False):
     """Explicit reviewed public trust inputs only; never fetch roots/bundles or use auth."""
-    _, identity, filename, report_format, origin_format, _, _, qualification_limit = _policy(_windows, _linux)
+    _, identity, filename, report_format, origin_format, _, _, qualification_limit = _policy(_windows, _linux, _store)
     selected = [qualification_sha256, bundle_sha256, trusted_root_sha256, cli_sha256]
     if (not isinstance(qualification, bytes) or not 0 < len(qualification) <= qualification_limit
             or any(type(value) is not str or not re.fullmatch('[0-9a-f]{64}', value) for value in selected)
@@ -281,7 +287,7 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
             or type(run_attempt) is not str or not re.fullmatch('[1-9][0-9]{0,2}', run_attempt)
             or type(readback_job) is not bool):
         raise ValueError('Native attestation requires independently reviewed exact source, verifier, trust and run selections.')
-    if type(_setup_host) is not bool or (_setup_host and (not _windows or _linux)):
+    if type(_setup_host) is not bool or (_setup_host and (not _windows or _linux or _store)):
         raise ValueError('Setup host is available only through the fixed Windows adapter.')
     windows_host = _setup_host and sys.platform == 'win32' and platform.machine().lower() in {'x86_64', 'amd64'}
     if not windows_host and (sys.platform != 'linux' or platform.machine().lower() not in {'x86_64', 'amd64'}):
@@ -341,8 +347,8 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
                  '--format', 'json']
     verified = _command(executable, arguments, work, 'verification', **command_options)
     claims = _verified_claims(verified, commit=commit, qualification_sha256=qualification_sha256,
-                              run_id=run_id, run_attempt=run_attempt, _windows=_windows, _linux=_linux)
-    service = _reconcile_job(claims, _windows=_windows, _linux=_linux) if readback_job else None
+                              run_id=run_id, run_attempt=run_attempt, _windows=_windows, _linux=_linux, _store=_store)
+    service = _reconcile_job(claims, _windows=_windows, _linux=_linux, _store=_store) if readback_job else None
     private_inspection_directory(work, source_root, fresh=False)
     for source, destination, expected, limit in copies:
         is_cli = windows_host and source == cli

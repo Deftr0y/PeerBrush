@@ -13,7 +13,7 @@ GUI_FIELDS = FIELDS | {'gui', 'gui_sha256'}
 
 
 def authenticate(qualification, **inputs):
-    if '_windows' in inputs or '_linux' in inputs:
+    if any(key in inputs for key in ['_windows', '_linux', '_store', '_setup_host']):
         raise ValueError('Linux native origin uses its fixed reviewed workflow policy.')
     return native.authenticate(qualification, **inputs, _linux=True)
 
