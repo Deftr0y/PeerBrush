@@ -174,3 +174,12 @@ chunk, and use the same shared resident pool. Field files remain fully charged i
 the operation's shared disk quota until verified retirement; the disposable
 512 MiB image-cache limit cannot account for a 2.048 GB field. The opt-in scalar
 test qualifies storage and readback, not the effects producer, editor or total RAM.
+
+Never-published planar/scalar writers have an explicit `abort` operation. It
+rehashes the complete known successful prefix, verifies the exact header and held
+identities, and repeats stamps before owned retirement. A cancellation between
+successful chunks can therefore release its reservation without adopting a seal.
+Unknown partial writes, extra bytes, changed hashes or foreign replacements keep
+their bytes and charge. Drop still performs no cleanup. The caller retains its
+actual session I/O permit through abort; cleanup checks may ignore the obsolete
+gesture revision, but cannot invent filesystem or profile authority.

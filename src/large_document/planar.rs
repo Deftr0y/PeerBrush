@@ -72,6 +72,9 @@ pub struct PlanarScratch {
     inner: linear::Scratch,
 }
 impl PlanarScratch {
+    pub fn abort(self, check: Check<'_>) -> Result<()> {
+        self.inner.abort(check)
+    }
     pub fn create(
         root: &Path,
         spec: PlanarSpec,
