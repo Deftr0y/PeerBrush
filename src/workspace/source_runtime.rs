@@ -18,6 +18,9 @@ use std::{
 #[path = "source_runtime/staging.rs"]
 mod staging;
 pub(crate) use staging::{SessionBytes, SessionTemporary};
+#[path = "source_runtime/recovery_marker.rs"]
+mod recovery_marker;
+pub(crate) use recovery_marker::NativeMarker;
 
 pub(crate) struct Limits {
     pub resident_bytes: usize,
@@ -52,7 +55,10 @@ impl HeldFile {
     fn check(&self) -> Result<(), String> {
         let metadata =
             fs::symlink_metadata(&self.path).map_err(|_| "Source inventory file disappeared")?;
-        let named = crate::file_safety::open_for_identity(&self.path)
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("Source inventory requires a regular owned file".into());
+        }
+        let named = crate::file_safety::open_native_identity(&self.path)
             .map_err(|_| "Source inventory name unavailable")?;
         let actual = self
             .file
@@ -675,7 +681,7 @@ impl SourceSession {
             error
         })?;
         let named =
-            crate::file_safety::open_for_identity(&path.join("blocks.pbt")).map_err(|_| {
+            crate::file_safety::open_native_identity(&path.join("blocks.pbt")).map_err(|_| {
                 self.runtime.tainted.store(true, Ordering::Release);
                 "Owned recovery source is unavailable"
             })?;
@@ -710,8 +716,8 @@ impl SourceSession {
             self.runtime.tainted.store(true, Ordering::Release);
             error
         })?;
-        let final_named =
-            crate::file_safety::open_for_identity(&path.join("blocks.pbt")).map_err(|_| {
+        let final_named = crate::file_safety::open_native_identity(&path.join("blocks.pbt"))
+            .map_err(|_| {
                 self.runtime.tainted.store(true, Ordering::Release);
                 "Owned recovery source disappeared during admission"
             })?;
@@ -748,20 +754,7 @@ impl SourceSession {
 }
 
 fn open_read(path: &Path) -> Result<File, String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(7).custom_flags(0x00200000);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    options
-        .open(path)
+    crate::file_safety::open_native_read(path)
         .map_err(|_| "Cannot open owned source inventory file".into())
 }
 fn push_file(
@@ -780,7 +773,7 @@ fn push_file(
 }
 fn valid_marker_name(name: &str) -> bool {
     name.strip_prefix("recovery-v3-")
-        .and_then(|n| n.strip_suffix(".json"))
+        .and_then(|n| n.strip_suffix(".pbr").or_else(|| n.strip_suffix(".json")))
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 fn valid_pending_name(name: &str) -> bool {
@@ -1137,6 +1130,140 @@ mod tests {
         drop(runtime);
         drop(context);
         drop(connection);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn native_inventory_fifo_replacement_refuses_without_stalling_retirement() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt, sync::mpsc, time::Duration};
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let owner = session.directory.join("owner.pbr");
+        fs::rename(&owner, owner.with_file_name("retained-owner.pbr")).unwrap();
+        let name = CString::new(owner.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, done) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(session.check().is_err());
+            assert!(session.cleanup_check().is_err());
+            assert!(open_read(&owner).is_err());
+            sender.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("Native inventory FIFO stalled its existing admission");
+        worker.join().unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56);
+    }
+    #[test]
+    fn native_marker_publication_is_exclusive_held_and_startup_inventory_only() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let snapshot = *uuid::Uuid::new_v4().as_bytes();
+        let bytes = b"small opaque framing fixture";
+        let hash = ring::digest::digest(&SHA256, bytes)
+            .as_ref()
+            .try_into()
+            .unwrap();
+        session
+            .publish_recovery_marker(
+                snapshot,
+                bytes.len() as u64,
+                hash,
+                &mut |out| out.write_all(bytes).map_err(|e| e.to_string()),
+                &|| Ok(()),
+            )
+            .unwrap();
+        let mut marker = session.open_recovery_marker(snapshot).unwrap();
+        assert_eq!(marker.snapshot(), snapshot);
+        assert_eq!(marker.len(), bytes.len() as u64);
+        let mut read = Vec::new();
+        marker.read_to_end(&mut read).unwrap();
+        assert_eq!(read, bytes);
+        assert!(session
+            .publish_recovery_marker(
+                snapshot,
+                bytes.len() as u64,
+                hash,
+                &mut |out| out.write_all(bytes).map_err(|e| e.to_string()),
+                &|| Ok(())
+            )
+            .is_err());
+        marker.check().unwrap();
+        drop(marker);
+        drop(session);
+        drop(runtime);
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let mut marker = session.open_recovery_marker(snapshot).unwrap();
+        read.clear();
+        marker.read_to_end(&mut read).unwrap();
+        assert_eq!(read, bytes);
+        assert!(runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .locations
+            .is_empty());
+    }
+    #[test]
+    fn native_marker_stale_or_short_producers_never_select_a_partial_marker() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let snapshot = *uuid::Uuid::new_v4().as_bytes();
+        assert!(session
+            .publish_recovery_marker(
+                snapshot,
+                32,
+                [1; 32],
+                &mut |out| out.write_all(b"short").map_err(|e| e.to_string()),
+                &|| Ok(())
+            )
+            .is_err());
+        assert!(session.open_recovery_marker(snapshot).is_err());
+        assert_eq!(runtime.disk().used().unwrap(), 56 + 32);
+        let stale = std::cell::Cell::new(false);
+        let other = *uuid::Uuid::new_v4().as_bytes();
+        let bytes = b"stale";
+        let hash = ring::digest::digest(&SHA256, bytes)
+            .as_ref()
+            .try_into()
+            .unwrap();
+        assert!(session
+            .publish_recovery_marker(
+                other,
+                bytes.len() as u64,
+                hash,
+                &mut |out| {
+                    out.write_all(bytes).map_err(|e| e.to_string())?;
+                    stale.set(true);
+                    Ok(())
+                },
+                &|| if stale.get() {
+                    Err("Source changed before durable publication".into())
+                } else {
+                    Ok(())
+                }
+            )
+            .is_err());
+        assert!(session.open_recovery_marker(other).is_err());
+        assert!(session
+            .directory
+            .join(format!("pending-{}", uuid::Uuid::from_bytes(other)))
+            .is_file());
+        assert!(!session
+            .directory
+            .join(format!("recovery-v3-{}.pbr", uuid::Uuid::from_bytes(other)))
+            .exists());
     }
     #[test]
     fn admitted_provisional_retirement_finishes_during_connection_drop_before_instance_unlock() {

@@ -117,11 +117,21 @@ fn component(path: &Path) -> Result<&std::ffi::OsStr, String> {
     }
 }
 fn named(file: &File, path: &Path, identity: (u64, u64)) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| "Owned staging name unavailable")?;
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        format!(
+            "Owned staging metadata unavailable ({:?})",
+            e.raw_os_error()
+        )
+    })?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err("Owned staging name changed".into());
     }
-    let opened = super::open_for_identity(path).map_err(|_| "Owned staging name unavailable")?;
+    let opened = super::open_native_identity(path).map_err(|e| {
+        format!(
+            "Owned staging identity unavailable ({:?})",
+            e.raw_os_error()
+        )
+    })?;
     if super::identity(&opened)? != identity
         || super::identity(file)? != identity
         || super::link_count(&opened)? != 1
@@ -330,7 +340,10 @@ fn rename_new(
     if count == 0 || count > 32767 {
         return Err("Owned destination exceeds its native path bound".into());
     }
-    let mut storage = NativeBuffer::new(budget, name_at + count * 2)?;
+    // FileName's documented representation is NUL-terminated even though its
+    // counted length excludes that terminator. Do not rely on allocator padding.
+    let packet_bytes = name_at + (count + 1) * 2;
+    let mut storage = NativeBuffer::new(budget, packet_bytes)?;
     // Documented absolute extended path + NULL RootDirectory. Directory and ALL
     // ancestors remain pinned without FILE_SHARE_DELETE through final postchecks,
     // preventing namespace replacement during the Win32 path resolution.
@@ -370,7 +383,7 @@ fn rename_new(
             file.as_raw_handle(),
             3,
             storage.words.as_ptr().cast(),
-            (name_at + count * 2) as u32,
+            packet_bytes as u32,
         )
     } == 0
     {
@@ -498,6 +511,30 @@ mod tests {
                 drop(self.held.take());
                 let _ = fs::remove_dir_all(&self.path);
             }
+        }
+    }
+    #[test]
+    fn absolute_native_rename_covers_every_utf16_packet_alignment() {
+        for length in 1..=8 {
+            let f = Fixture::new();
+            let (file, sealed, pool) = f.staged();
+            let name = "x".repeat(length);
+            publish_new(
+                &f.path,
+                f.held.as_ref().unwrap(),
+                Path::new("candidate.tmp"),
+                Path::new(&name),
+                &file,
+                &sealed,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(pool.used(), 0);
+            file.unlock().unwrap();
+            assert_eq!(
+                fs::read(f.path.join(name)).unwrap(),
+                b"exact owned candidate bytes"
+            );
         }
     }
     #[test]

@@ -38,7 +38,7 @@ impl Namespace<'_> {
         }
         self.directory.check()?;
         let path = self.directory.path().join("bytes.pbb");
-        let named = crate::file_safety::open_for_identity(&path)
+        let named = crate::file_safety::open_native_identity(&path)
             .map_err(|_| "Operation spool name unavailable; inventory retained")?;
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|_| "Operation spool disappeared; inventory retained")?;
@@ -137,7 +137,7 @@ impl SourceSession {
             LargeSourceTemporary::create(&path, length, role, self.resident(), self.disk())
                 .map_err(|e| e.to_string())?;
         let directory = Directory::open(&path)?;
-        let file = crate::file_safety::open_for_identity(&path.join("bytes.pbb"))
+        let file = crate::file_safety::open_native_identity(&path.join("bytes.pbb"))
             .map_err(|_| "New operation spool unavailable; inventory retained")?;
         let file_id = crate::file_safety::identity(&file)?;
         if temporary.filesystem_identity() != (directory.identity(), file_id)
