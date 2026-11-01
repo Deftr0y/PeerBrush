@@ -154,3 +154,19 @@ bitwise old-reference tests cover odd edges, interior ROI boundaries, negative
 and signed-zero samples, wide/tall one-dimensional offsets and explicit failures.
 The full native high-distance group-coordinate and iterative-filter integration
 remains open; this refactor does not qualify high-distance 16000 exports.
+
+An iterative regional kernel is available as a prototype, with the exact pinned
+three passes and an independent whole-image reference oracle. AntiUpsample needs
+raw support `[2x-4,2x+5]`; its upsample reads `floor(raw/2)±2`, giving a coarse
+radius 4 per pass, hence 12 for three passes. Final ringing's initial±1 is inside
+that extent; sharper initialization separately fetches its raw±5/+6 support.
+
+Its workspace processes one channel sequentially: immutable initial plus two
+alternating scalar fields. Logical 2072² fields require 16.38 MiB each/49.13 MiB total.
+Actual stride is validated at most 2200 floats and 2072 rows, so all three capacities
+plus bounded correction/source/sharper scratch stay below 53 MiB. No replacement
+allocation occurs during a pass. Allocator overhead and all other native state
+still count under the unchanged 512 MiB allocator admission; this is not total app
+RAM. Buffers must remain admitted and disjoint. Source and sink failures refuse
+completion. The prototype is not yet called by the iterative encoder path and
+introduces no new spool, wire format, option override or publication authority.

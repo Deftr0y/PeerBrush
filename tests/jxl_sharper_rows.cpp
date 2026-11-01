@@ -236,4 +236,5 @@ int main() {
   assert(sinks == 1);
   std::cout << "10 bitwise pinned-reference cases and bounded failure checks "
                "passed\n";
+  return 0;
 }
