@@ -1,21 +1,11 @@
 //! Bounded soft-edge refinement. Source channels remain untouched.
-use super::{current, system};
+use super::{current, regional_refine::parameter, system};
 use crate::{
     engine::Document,
     raster::{Raster, TILE},
 };
 use serde_json::Value;
 
-fn parameter(c: &Value, key: &str, min: f32, max: f32, default: f32) -> Result<f32, String> {
-    let Some(v) = c.get(key) else {
-        return Ok(default);
-    };
-    let v = v.as_f64().ok_or_else(|| format!("Invalid {key}"))?;
-    if !v.is_finite() || v < min as f64 || v > max as f64 {
-        return Err(format!("{key} must be between {min} and {max}"));
-    }
-    Ok(v as f32)
-}
 /// Separable clamped box means, linear work independent of radius.
 fn mean(input: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     if r == 0 {
