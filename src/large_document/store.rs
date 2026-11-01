@@ -361,6 +361,7 @@ impl Snapshot {
             self.blocks.0,
             self.blocks.1,
             self.refs_digest,
+            self.commit.offset,
             check,
             &mut visit,
         )?;
@@ -370,8 +371,57 @@ impl Snapshot {
 }
 
 impl Store {
+    /// Stable backing lineage identity; this grants no filesystem or pin authority.
+    pub fn identity(&self) -> [u8; 16] {
+        self.0.id
+    }
+
     pub fn resident_budget(&self) -> ResidentBudget {
         self.0.budget.clone()
+    }
+
+    /// Select an independently retained checkpoint using an already-held owner.
+    /// Prefix validation never advances this owner's publication head.
+    pub fn snapshot(&self, selected: CommitRef, check: Check<'_>) -> Result<Snapshot> {
+        let _read = self.0.access.read()?;
+        let state = self.state()?;
+        let head = state.head.ok_or(Error::Corrupt)?;
+        if selected.store != self.0.id
+            || selected.source != head.source
+            || selected.end > head.end
+            || selected.revision > head.revision
+        {
+            return Err(Error::Corrupt);
+        }
+        let expected = state.expected;
+        drop(state);
+        self.check_source(expected)?;
+        let mut at = FILE_HEADER;
+        let mut last = None;
+        while at < selected.end {
+            check()?;
+            let record = read_record(&self.0.file, at, selected.end, self.0.limits, check)?;
+            if &record.kind == b"TILE" {
+                let block = self.block_record(&record)?;
+                if self.state()?.blocks.get(&block.digest) != Some(&block) {
+                    return Err(Error::Corrupt);
+                }
+            } else {
+                last = Some(self.parse_manifest(
+                    &record,
+                    last.as_ref().map(|s: &Snapshot| s.commit),
+                    check,
+                )?);
+            }
+            at = record.end;
+        }
+        let snapshot = last.ok_or(Error::Corrupt)?;
+        if snapshot.commit != selected || at != selected.end {
+            return Err(Error::Corrupt);
+        }
+        check()?;
+        self.check_source(expected)?;
+        Ok(snapshot)
     }
 
     /// Create a fresh private directory below an already-owned profile/session parent.
@@ -777,6 +827,21 @@ impl Store {
     }
 
     fn manifest_record(&self, record: &Record, check: Check<'_>) -> Result<Snapshot> {
+        let head = self.state()?.head;
+        let snapshot = self.parse_manifest(record, head, check)?;
+        self.state()?.head = Some(snapshot.commit);
+        Ok(snapshot)
+    }
+
+    fn parse_manifest(
+        &self,
+        record: &Record,
+        head: Option<CommitRef>,
+        check: Check<'_>,
+    ) -> Result<Snapshot> {
+        if &record.kind != b"CMIT" {
+            return Err(Error::Corrupt);
+        }
         if record.length < MANIFEST_HEADER as u64 {
             return Err(Error::Corrupt);
         }
@@ -796,16 +861,21 @@ impl Store {
         {
             return Err(Error::Corrupt);
         }
-        let head = self.state()?.head;
         if head.map_or([0; 32], |p| p.digest) != parent
             || head.is_some_and(|p| p.source != source || revision <= p.revision)
         {
             return Err(Error::Corrupt);
         }
         let start = record.body + MANIFEST_HEADER as u64 + metadata as u64;
-        visit_refs(self, start, count, record.refs_digest, check, &mut |_| {
-            Ok(())
-        })?;
+        visit_refs(
+            self,
+            start,
+            count,
+            record.refs_digest,
+            record.offset,
+            check,
+            &mut |_| Ok(()),
+        )?;
         let commit = CommitRef {
             store: self.0.id,
             digest: record.digest,
@@ -814,7 +884,6 @@ impl Store {
             source,
             revision,
         };
-        self.state()?.head = Some(commit);
         Ok(Snapshot {
             store: self.clone(),
             commit,
@@ -1063,6 +1132,7 @@ fn visit_refs(
     start: u64,
     count: usize,
     expected: Digest,
+    boundary: u64,
     check: Check<'_>,
     visit: &mut impl FnMut(BlockRef) -> Result<()>,
 ) -> Result<()> {
@@ -1081,7 +1151,12 @@ fn visit_refs(
         context.update(&buffer[..batch * REF_BYTES]);
         for bytes in buffer[..batch * REF_BYTES].chunks_exact(REF_BYTES) {
             let reference = decode_ref(store.0.id, bytes.try_into().unwrap())?;
-            if store.state()?.blocks.get(&reference.digest) != Some(&reference) {
+            if reference
+                .offset
+                .checked_add(RECORD_HEADER + 8 + reference.bytes() as u64 + SEAL.len() as u64)
+                .is_none_or(|end| end > boundary)
+                || store.state()?.blocks.get(&reference.digest) != Some(&reference)
+            {
                 return Err(Error::Corrupt);
             }
             visit(reference)?;
