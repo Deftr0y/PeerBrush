@@ -1,5 +1,8 @@
 use super::*;
-use crate::{effects, engine::Layer};
+use crate::{
+    effects,
+    engine::{view::LayerView, Layer},
+};
 // Bitmap bytes are displayed/imported through the original Effect, never these controls.
 fn inspector_values(kind: &str, source: &Value) -> Value {
     match source
@@ -531,26 +534,28 @@ impl PeerBrush {
             "{name} · Expand or collapse settings · Other effects can stay open · right-click for actions"
         ))
     }
-    pub(super) fn effect_bake_menu(
+    pub(super) fn effect_bake_menu<'a>(
         &mut self,
         response: &egui::Response,
-        l: &Layer,
+        l: impl Into<LayerView<'a>>,
         mask: bool,
         effect: &str,
         index: usize,
         revision: u64,
     ) {
+        let l = l.into();
         response.context_menu(|ui| self.effect_options(ui, l, mask, effect, index, revision));
     }
-    pub(super) fn effect_actions(
+    pub(super) fn effect_actions<'a>(
         &mut self,
         ui: &mut egui::Ui,
-        l: &Layer,
+        l: impl Into<LayerView<'a>>,
         mask: bool,
         effect: &str,
         index: usize,
         revision: u64,
     ) -> egui::Response {
+        let l = l.into();
         let menu =
             egui::menu::menu_custom_button(ui, egui::Button::new("...").frame(false), |ui| {
                 self.effect_options(ui, l, mask, effect, index, revision);
@@ -563,37 +568,33 @@ impl PeerBrush {
         menu
     }
     fn effect_present(&self, layer: &str, mask: bool, effect: &str) -> bool {
-        self.shared
-            .lock()
-            .unwrap()
-            .doc
-            .layers
-            .iter()
-            .find(|entry| entry.id == layer)
+        let engine = self.shared.lock().unwrap();
+        crate::engine::view::current(&engine)
+            .find_layer(layer)
             .is_some_and(|entry| {
                 if mask {
-                    entry
-                        .mask
-                        .as_ref()
-                        .is_some_and(|m| m.steps.iter().any(|step| step.id == effect))
+                    entry.mask().is_some_and(|mask| {
+                        (0..mask.step_count()).any(|i| mask.step(i).unwrap().id() == effect)
+                    })
                 } else {
-                    entry.effects.iter().any(|entry| entry.id == effect)
+                    (0..entry.effect_count()).any(|i| entry.effect(i).unwrap().id() == effect)
                 }
             })
     }
-    fn effect_options(
+    fn effect_options<'a>(
         &mut self,
         ui: &mut egui::Ui,
-        l: &Layer,
+        l: impl Into<LayerView<'a>>,
         mask: bool,
         effect: &str,
         index: usize,
         revision: u64,
     ) {
+        let l = l.into();
         let count = if mask {
-            l.mask.as_ref().map_or(0, |m| m.steps.len())
+            l.mask().map_or(0, |m| m.step_count())
         } else {
-            l.effects.len()
+            l.effect_count()
         };
         ui.label(RichText::new("Top effects run last").size(11.).color(MUTED));
         for (label, available, destination) in [
@@ -645,11 +646,11 @@ impl PeerBrush {
                 },
                 "Remove effect",
             );
-            let removed = !self.effect_present(&l.id, mask, effect);
+            let removed = !self.effect_present(l.id(), mask, effect);
             if removed {
                 self.effect_expanded
-                    .remove(&(l.id.clone(), mask, effect.to_string()));
-                if self.effect_is_selected(&l.id, mask, effect) {
+                    .remove(&(l.id().to_owned(), mask, effect.to_string()));
+                if self.effect_is_selected(l.id(), mask, effect) {
                     self.effect_selected = None;
                 }
                 if mask && self.mask_step.as_deref() == Some(effect) {
@@ -661,9 +662,9 @@ impl PeerBrush {
         ui.separator();
         let scope = if mask {
             "mask pixels"
-        } else if l.kind == "group" {
+        } else if l.kind() == "group" {
             "folder pixels (flattens children)"
-        } else if l.source.is_some() {
+        } else if l.source_kind().is_some() {
             "pixels (rasterizes text/vector)"
         } else {
             "layer pixels"
@@ -673,15 +674,15 @@ impl PeerBrush {
             "Includes this effect and {index} preceding {}",
             if index == 1 { "effect" } else { "effects" }
         ));
-        let enabled = l.kind != "adjustment" || mask;
+        let enabled = l.kind() != "adjustment" || mask;
         if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
             let command = if mask {
-                json!({"op":"mask.step.bake","layer":l.id,"step":effect,"source_revision":revision})
+                json!({"op":"mask.step.bake","layer":l.id(),"step":effect,"source_revision":revision})
             } else {
-                json!({"op":"effect.bake","layer":l.id,"effect":effect,"source_revision":revision})
+                json!({"op":"effect.bake","layer":l.id(),"effect":effect,"source_revision":revision})
             };
             self.edit(vec![command], "Bake effect and preceding effects");
-            if !self.effect_present(&l.id, mask, effect) {
+            if !self.effect_present(l.id(), mask, effect) {
                 self.effect_selected = None;
                 self.mask_step = None;
             }
@@ -1976,6 +1977,92 @@ mod bitmap_inspector_tests {
                 assert_eq!(workspace::source(&app), retained, "{depth}/{interruption}");
                 assert_eq!(json!(app.shared.lock().unwrap().leases), reservations);
                 assert_eq!(app.shared.lock().unwrap().doc.bit_depth, depth);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_metadata_tests {
+    use super::*;
+    #[test]
+    fn native_effect_action_menus_read_only_the_shared_metadata_snapshot() {
+        for depth in [8, 16] {
+            let ctx = egui::Context::default();
+            let mut document = Document::new_depth(9, 7, depth).unwrap();
+            let effect = crate::engine::id();
+            let step = crate::engine::id();
+            document.layers[0].effects.push(crate::effects::Effect {
+                id: effect.clone(),
+                kind: "invert".into(),
+                enabled: true,
+                weight: 0.5,
+                settings: Arc::new(json!({})),
+            });
+            document.layers[0].mask = Some(crate::engine::Mask {
+                enabled: true,
+                linked: true,
+                cache_key: crate::engine::id(),
+                steps: vec![crate::engine::MaskStep {
+                    id: step.clone(),
+                    kind: "fill".into(),
+                    enabled: true,
+                    weight: 1.,
+                    value: 183.,
+                    pixels: crate::raster::Raster::new_depth(9, 7, depth),
+                    settings: json!({}),
+                }],
+            });
+            let mut engine = crate::engine::Engine::new();
+            engine.doc = document.clone();
+            let mut app = PeerBrush::init(
+                &ctx,
+                Arc::new(std::sync::Mutex::new(engine)),
+                Connection {
+                    port: 0,
+                    token: String::new(),
+                    state_dir: Default::default(),
+                    instance_lock: None,
+                    availability: Default::default(),
+                },
+            );
+            let pool = crate::large_document::ResidentBudget::new(8 * 1024 * 1024).unwrap();
+            let owner = crate::engine::view::DocumentSnapshot::from(
+                crate::tree::presentation_tests::native(&document, &pool),
+            );
+            let admitted = pool.used();
+            for mask in [false, true] {
+                let id = if mask { &step } else { &effect };
+                assert!(app.effect_present(&document.layers[0].id, mask, id));
+                let output = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.effect_options(
+                            ui,
+                            owner.view().layer(0).unwrap(),
+                            mask,
+                            id,
+                            0,
+                            owner.view().revision(),
+                        );
+                    });
+                });
+                let text = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(text.contains("Top effects run last"));
+                assert!(text.contains(if mask {
+                    "Bake into mask pixels"
+                } else {
+                    "Bake into layer pixels"
+                }));
+                assert_eq!(pool.used(), admitted);
+                assert_eq!(app.shared.lock().unwrap().doc.revision, 0);
             }
         }
     }
