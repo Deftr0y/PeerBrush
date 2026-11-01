@@ -863,6 +863,9 @@ impl Effect36 {
     }
 }
 impl Source36 {
+    pub fn definition(&self) -> &Content36 {
+        &self.content
+    }
     fn capture(source: &crate::source::Source) -> Self {
         use crate::source::Content;
         let content = match &source.content {
