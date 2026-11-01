@@ -603,9 +603,11 @@ impl Lease {
 /// Explicit Source36 save guard. Legacy callers retain their existing file and
 /// backup limits. This lease grants no scene/codec/publication authority; the
 /// native save driver must retain its SourceOperation and completed scene proof.
-pub(crate) struct NativeLease(Lease);
+pub(crate) struct NativeLease(Lease, Option<native_lease::Admission>);
 #[path = "file_safety/native_inventory.rs"]
 mod native_inventory;
+#[path = "file_safety/native_lease.rs"]
+mod native_lease;
 pub(crate) use native_inventory::NativeInventory;
 pub(crate) use native_inventory::{NativeExternalFile, NativeExternalSnapshot};
 #[path = "file_safety/native_access.rs"]
@@ -619,11 +621,12 @@ pub(crate) use native_outcome::{
     NativeNewDestination, NativePublicationReceipt,
 };
 impl NativeLease {
+    #[cfg(test)]
     pub(crate) fn acquire(
         path: &Path,
         check: impl Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
-        Lease::acquire_bounded(path, FilePolicy::Source36, check).map(Self)
+        Lease::acquire_bounded(path, FilePolicy::Source36, check).map(|lease| Self(lease, None))
     }
     pub(crate) fn path(&self) -> &Path {
         &self.0.path
@@ -650,6 +653,7 @@ impl NativeLease {
         )
     }
     pub(crate) fn validate(&self, check: impl Fn() -> Result<(), String>) -> Result<(), String> {
+        self.check_before_native_mutation(&check)?;
         self.0.validate_checked(check)
     }
     #[cfg(test)]

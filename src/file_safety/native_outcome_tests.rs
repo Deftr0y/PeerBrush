@@ -8,7 +8,11 @@ fn actual_native_new_destination_requires_durable_creation_and_keeps_all_debt_on
     for depth in [8, 16] {
         with_session_candidate(depth, |session, candidate, runtime, root, _| {
             let path = root.join("new-source.psb");
-            let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+            let lease = NativeLease::acquire_admitted(
+                session.admit_destination(&path, &|| Ok(())).unwrap(),
+                || Ok(()),
+            )
+            .unwrap();
             let inventory = lease
                 .freeze_inventory(&runtime.resident(), &|| Ok(()))
                 .unwrap();
@@ -63,7 +67,11 @@ fn actual_native_new_destination_no_clobber_publication_returns_exact_live_ident
     for depth in [8, 16] {
         with_session_candidate(depth, |session, candidate, runtime, root, _| {
             let path = root.join("new-source.psb");
-            let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+            let lease = NativeLease::acquire_admitted(
+                session.admit_destination(&path, &|| Ok(())).unwrap(),
+                || Ok(()),
+            )
+            .unwrap();
             let inventory = lease
                 .freeze_inventory(&runtime.resident(), &|| Ok(()))
                 .unwrap();
@@ -121,7 +129,11 @@ fn actual_native_foreign_target_and_temporary_replacements_are_never_overwritten
     for replace_temporary in [false, true] {
         with_session_candidate(16, |session, candidate, runtime, root, _| {
             let path = root.join("new-source.psb");
-            let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+            let lease = NativeLease::acquire_admitted(
+                session.admit_destination(&path, &|| Ok(())).unwrap(),
+                || Ok(()),
+            )
+            .unwrap();
             let inventory = lease
                 .freeze_inventory(&runtime.resident(), &|| Ok(()))
                 .unwrap();
@@ -162,7 +174,11 @@ fn actual_native_foreign_target_and_temporary_replacements_are_never_overwritten
 fn actual_native_replay_cancellation_is_latched_and_keeps_prefix_as_charged_debt() {
     with_session_candidate(16, |session, candidate, runtime, root, _| {
         let path = root.join("new-source.psb");
-        let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+        let lease = NativeLease::acquire_admitted(
+            session.admit_destination(&path, &|| Ok(())).unwrap(),
+            || Ok(()),
+        )
+        .unwrap();
         let inventory = lease
             .freeze_inventory(&runtime.resident(), &|| Ok(()))
             .unwrap();
@@ -206,7 +222,11 @@ fn actual_native_committed_new_target_finishes_after_closing_without_new_source_
         16,
         |session, candidate, runtime, root, connection| {
             let path = root.join("new-source.psb");
-            let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+            let lease = NativeLease::acquire_admitted(
+                session.admit_destination(&path, &|| Ok(())).unwrap(),
+                || Ok(()),
+            )
+            .unwrap();
             let inventory = lease
                 .freeze_inventory(&runtime.resident(), &|| Ok(()))
                 .unwrap();
@@ -266,7 +286,11 @@ fn actual_native_committed_new_target_finishes_after_closing_without_new_source_
 fn actual_native_late_foreign_replacement_prevents_receipt_settlement_without_cleanup() {
     with_session_candidate(8, |session, candidate, runtime, root, _| {
         let path = root.join("new-source.psb");
-        let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+        let lease = NativeLease::acquire_admitted(
+            session.admit_destination(&path, &|| Ok(())).unwrap(),
+            || Ok(()),
+        )
+        .unwrap();
         let inventory = lease
             .freeze_inventory(&runtime.resident(), &|| Ok(()))
             .unwrap();
@@ -317,7 +341,11 @@ fn actual_native_existing_target_refuses_new_target_driver_before_external_stagi
     with_session_candidate(16, |session, candidate, runtime, root, _| {
         let path = root.join("existing-source.psb");
         fs::write(&path, b"original version stays exactly").unwrap();
-        let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+        let lease = NativeLease::acquire_admitted(
+            session.admit_destination(&path, &|| Ok(())).unwrap(),
+            || Ok(()),
+        )
+        .unwrap();
         let inventory = lease
             .freeze_inventory(&runtime.resident(), &|| Ok(()))
             .unwrap();
@@ -339,6 +367,105 @@ fn actual_native_existing_target_refuses_new_target_driver_before_external_stagi
         assert!(!backup.exists());
         inventory.validate(&|| Ok(())).unwrap();
         drop(intent);
+        drop(inventory);
+        drop(lease);
+    });
+}
+
+#[test]
+fn actual_admitted_parent_and_versions_names_cannot_redirect_native_lock_creation() {
+    with_session_candidate(8, |session, _candidate, _runtime, root, _| {
+        let selected = root.join("selected-parent");
+        fs::create_dir(&selected).unwrap();
+        let path = selected.join("new-source.psb");
+        let proof = session.admit_destination(&path, &|| Ok(())).unwrap();
+        let displaced = root.join("retained-selected-parent");
+        #[cfg(windows)]
+        {
+            assert!(fs::rename(&selected, &displaced).is_err());
+            assert!(!selected.join(".peerbrush-versions").exists());
+            let lease = NativeLease::acquire_admitted(proof, || Ok(())).unwrap();
+            drop(lease);
+        }
+        #[cfg(unix)]
+        {
+            fs::rename(&selected, &displaced).unwrap();
+            fs::create_dir(&selected).unwrap();
+            assert!(NativeLease::acquire_admitted(proof, || Ok(())).is_err());
+            assert!(!selected.join(".peerbrush-versions").exists());
+            assert!(!displaced.join(".peerbrush-versions").exists());
+        }
+        let path = root.join("second-source.psb");
+        let lease = NativeLease::acquire_admitted(
+            session.admit_destination(&path, &|| Ok(())).unwrap(),
+            || Ok(()),
+        )
+        .unwrap();
+        let versions = root.join(".peerbrush-versions");
+        let moved = root.join("retained-versions");
+        #[cfg(windows)]
+        assert!(fs::rename(&versions, &moved).is_err());
+        #[cfg(unix)]
+        {
+            fs::rename(&versions, &moved).unwrap();
+            fs::create_dir(&versions).unwrap();
+            assert!(lease
+                .freeze_inventory(&session.resident(), &|| Ok(()))
+                .is_err());
+            assert!(!versions.join("quota.lock").exists());
+            assert!(!moved.join("quota.lock").exists());
+        }
+        drop(lease);
+    });
+}
+
+#[test]
+fn actual_admitted_quota_alias_and_other_pool_refuse_before_locking_or_payload() {
+    with_session_candidate(8, |session, _candidate, _runtime, root, _| {
+        let path = root.join("new-source.psb");
+        let lease = NativeLease::acquire_admitted(
+            session.admit_destination(&path, &|| Ok(())).unwrap(),
+            || Ok(()),
+        )
+        .unwrap();
+        let quota = root.join(".peerbrush-versions/quota.lock");
+        let other = crate::large_document::ResidentBudget::new(32 * 1024 * 1024).unwrap();
+        assert!(lease.freeze_inventory(&other, &|| Ok(())).is_err());
+        assert_eq!(other.used(), 0);
+        assert!(!quota.exists());
+        let foreign = root.join("foreign-preserved");
+        fs::write(&foreign, b"foreign source bytes remain").unwrap();
+        fs::hard_link(&foreign, &quota).unwrap();
+        assert!(lease
+            .freeze_inventory(&session.resident(), &|| Ok(()))
+            .is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign source bytes remain");
+        assert_eq!(fs::read(&quota).unwrap(), b"foreign source bytes remain");
+        drop(lease);
+    });
+}
+
+#[test]
+fn actual_admitted_snapshot_binds_exact_source_operation_before_intent() {
+    with_session_candidate(8, |session, _candidate, runtime, root, _| {
+        let path = root.join("new-source.psb");
+        let lease = NativeLease::acquire_admitted(
+            session.admit_destination(&path, &|| Ok(())).unwrap(),
+            || Ok(()),
+        )
+        .unwrap();
+        let inventory = lease
+            .freeze_inventory(&session.resident(), &|| Ok(()))
+            .unwrap();
+        let observed = inventory.observe_external(&|| Ok(())).unwrap();
+        observed.check_session(session).unwrap();
+        let second = runtime.begin().unwrap();
+        assert!(observed.check_session(&second).is_err());
+        assert!(inventory
+            .observe_external(&|| Err("exact destination cancel".into()))
+            .is_err_and(|e| e == "exact destination cancel"));
+        drop(second);
+        drop(observed);
         drop(inventory);
         drop(lease);
     });
