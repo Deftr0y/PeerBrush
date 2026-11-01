@@ -211,7 +211,13 @@ impl PeerBrush {
         })
         .to_owned()
     }
-    pub(super) fn select_command(&self, doc: &Document, points: &[[f32; 2]], mode: &str) -> Value {
+    pub(super) fn select_command<'a>(
+        &self,
+        doc: impl Into<DocumentView<'a>>,
+        points: &[[f32; 2]],
+        mode: &str,
+    ) -> Value {
+        let doc = doc.into();
         let a = points.first().copied().unwrap_or([0., 0.]);
         let b = points.last().copied().unwrap_or(a);
         let mut area = [
@@ -224,7 +230,7 @@ impl PeerBrush {
             area = [
                 0,
                 a[1].floor() as i32,
-                doc.width as i32,
+                doc.width() as i32,
                 a[1].floor() as i32 + 1,
             ];
         }
@@ -233,14 +239,14 @@ impl PeerBrush {
                 a[0].floor() as i32,
                 0,
                 a[0].floor() as i32 + 1,
-                doc.height as i32,
+                doc.height() as i32,
             ];
         }
         let polygon = ["lasso", "polygon", "magnetic"]
             .contains(&self.selection_kind.as_str())
             .then_some(points);
         let source = self.selection_gesture_source.as_ref();
-        json!({"op":"selection","document_id":source.map_or(doc.id.as_str(), |s| s.document.as_str()),"source_revision":source.map_or(doc.revision, |s| s.revision),"kind":self.selection_kind,"mode":mode,"rect":area,"polygon":polygon,"point":a,"points":points,"radius":self.selection_width,"feather":self.selection_feather,"tolerance":self.selection_tolerance,"contiguous":self.selection_contiguous,"sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity,"layer":source.map_or(self.selected.as_str(), |s| s.layer.as_str())})
+        json!({"op":"selection","document_id":source.map_or(doc.id(), |s| s.document.as_str()),"source_revision":source.map_or(doc.revision(), |s| s.revision),"kind":self.selection_kind,"mode":mode,"rect":area,"polygon":polygon,"point":a,"points":points,"radius":self.selection_width,"feather":self.selection_feather,"tolerance":self.selection_tolerance,"contiguous":self.selection_contiguous,"sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity,"layer":source.map_or(self.selected.as_str(), |s| s.layer.as_str())})
     }
     pub(super) fn selection_canvas(
         &mut self,
