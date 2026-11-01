@@ -1,7 +1,7 @@
 //! Explicit immutable pixel authority for the coordinated document migration.
 //! No live Layer field uses this type until its metadata/source DTO is migrated.
 use super::{
-    backed::{PinnedRegion, Plane, Region},
+    backed::{PinnedRegion, Plane, Region, RegionPins},
     Pixel, Pixel16, Raster,
 };
 use crate::large_document::{
@@ -162,7 +162,7 @@ impl Surface {
         let pixels = match &*self.storage {
             SurfaceStorage::Zero => RegionPixels::Zero,
             SurfaceStorage::Stored(plane, _) => RegionPixels::Pinned(plane.pin(region, check)?),
-            SurfaceStorage::Resolved(_) => {
+            SurfaceStorage::Resolved(index) => {
                 let [left, top, right, bottom] = region.bounds();
                 let x0 = left.max(0).min(self.width as i32) as u32 / super::TILE;
                 let y0 = top.max(0).min(self.height as i32) as u32 / super::TILE;
@@ -171,12 +171,13 @@ impl Surface {
                 if u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0)) > 128 {
                     return Err(Error::Budget);
                 }
-                let mut tiles = std::collections::BTreeMap::new();
+                let count = (x1.saturating_sub(x0) as usize) * (y1.saturating_sub(y0) as usize);
+                let mut tiles = RegionPins::new(&index.budget, count)?;
                 for y in y0..y1 {
                     for x in x0..x1 {
                         let tile = self.prepare_tile((x, y), check)?;
                         if let Some(pixels) = tile.pixels {
-                            tiles.insert((x, y), pixels);
+                            tiles.push((x, y), pixels)?;
                         }
                     }
                 }
@@ -326,6 +327,13 @@ enum RegionPixels {
 }
 
 impl SurfaceRegion {
+    #[cfg(test)]
+    pub(crate) fn index_bytes(&self) -> usize {
+        match &self.pixels {
+            RegionPixels::Zero => 0,
+            RegionPixels::Pinned(view) => view.index_bytes(),
+        }
+    }
     pub fn key(&self) -> SurfaceKey {
         self.key
     }
@@ -424,6 +432,7 @@ mod tests {
                 Arc::make_mut(raster.tiles.get_mut(&(1, 1)).unwrap())[4] = 211;
             }
             let surface = Surface::stage_raster(&raster, store.clone(), &mut || Ok(())).unwrap();
+            drop(surface.prepare_tile((1, 1), &mut || Ok(())).unwrap());
             let descriptors = budget.used();
             let tile = surface.prepare_tile((1, 1), &mut || Ok(())).unwrap();
             assert_eq!(tile.coordinate(), (1, 1));
@@ -444,8 +453,9 @@ mod tests {
             drop(tile);
             assert_eq!(budget.used(), descriptors);
             drop(surface);
-            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.payload_used(), 0);
             drop(store);
+            assert_eq!(budget.used(), 0);
             std::fs::remove_dir_all(path).unwrap();
         }
         let zero = Surface::zero(257, 257, 16).unwrap();
@@ -497,25 +507,38 @@ mod tests {
         assert_eq!(surface.key(), copy.key());
         assert!(copy.uses_budget(&budget));
         assert!(!copy.uses_budget(&ResidentBudget::new(budget.limit()).unwrap()));
-        let descriptors = budget.used();
-        assert!(descriptors > 0);
+        let source_descriptors = match &*surface.storage {
+            SurfaceStorage::Stored(_, charge) => charge.bytes(),
+            _ => panic!("The fixture must retain the actual stored source index"),
+        };
+        drop(
+            surface
+                .prepare_region(Region::new([2, 3, 3, 4]).unwrap(), &mut || Ok(()))
+                .unwrap(),
+        );
+        let baseline = budget.used();
+        assert!(baseline >= source_descriptors);
         let a = surface
             .prepare_region(Region::new([2, 3, 3, 4]).unwrap(), &mut || Ok(()))
             .unwrap();
         let charge = budget.used();
-        assert_eq!(charge, descriptors + 256 * 256 * 8);
+        assert_eq!(charge, baseline + a.index_bytes() + 256 * 256 * 8);
         let b = copy
             .prepare_region(Region::new([2, 3, 3, 4]).unwrap(), &mut || Ok(()))
             .unwrap();
-        assert_eq!(budget.used(), charge);
+        assert_eq!(budget.used(), charge + b.index_bytes());
         assert_eq!(b.pixel16(2, 3).unwrap(), [1, 12345, 54321, 65535]);
         drop(a);
         drop(surface);
         drop(copy);
-        assert_eq!(budget.used(), charge - descriptors);
+        assert_eq!(
+            budget.used(),
+            baseline - source_descriptors + b.index_bytes() + 256 * 256 * 8
+        );
         drop(b);
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.used(), baseline - source_descriptors);
         drop(store);
+        assert_eq!(budget.used(), 0);
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]

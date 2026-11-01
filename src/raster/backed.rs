@@ -1,7 +1,9 @@
 //! Explicit native pixel-plane backing. This is not a serialized document or
 //! permission to evict the resident raster used by existing infallible getters.
 use super::{check_size, project16, Pixel, Pixel16, Raster, TILE};
-use crate::large_document::{BlockRef, Error, PinnedTile, Result, ScratchBytes, Store, TileSpec};
+use crate::large_document::{
+    BlockRef, Error, PinnedTile, Reservation, ResidentBudget, Result, ScratchBytes, Store, TileSpec,
+};
 use std::collections::BTreeMap;
 
 pub const MAX_REGION_PIXELS: usize = 128 * 1024;
@@ -160,13 +162,14 @@ impl Plane {
         {
             return Err(Error::Budget);
         }
-        let mut tiles = BTreeMap::new();
+        let count = (x1.saturating_sub(x0) as usize) * (y1.saturating_sub(y0) as usize);
+        let mut tiles = RegionPins::new(&self.store.resident_budget(), count)?;
         for y in y0..y1 {
             for x in x0..x1 {
                 check()?;
                 if let Some(reference) = self.blocks.get(&(x, y)) {
                     let tile = self.store.pin(*reference, check)?;
-                    tiles.insert((x, y), tile);
+                    tiles.push((x, y), tile)?;
                 }
             }
         }
@@ -188,24 +191,78 @@ pub struct PinnedRegion {
     height: u32,
     depth: u16,
     region: Region,
-    tiles: BTreeMap<(u32, u32), PinnedTile>,
+    tiles: RegionPins,
+}
+
+/// The ROI index is admitted before any pins or container allocation. Entries
+/// arrive in row order and are sampled with a memory-only binary search.
+pub(crate) struct RegionPins {
+    entries: Vec<((u32, u32), PinnedTile)>,
+    _charge: Reservation,
+}
+impl RegionPins {
+    pub(crate) fn new(budget: &ResidentBudget, capacity: usize) -> Result<Self> {
+        if capacity > MAX_REGION_TILES {
+            return Err(Error::Budget);
+        }
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<((u32, u32), PinnedTile)>())
+            .and_then(|n| n.checked_add(64))
+            .ok_or(Error::Budget)?;
+        let charge = budget.reserve_bytes(bytes, bytes)?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::Budget)?;
+        if entries.capacity() != capacity {
+            return Err(Error::Budget);
+        }
+        Ok(Self {
+            entries,
+            _charge: charge,
+        })
+    }
+    pub(crate) fn push(&mut self, coordinate: (u32, u32), tile: PinnedTile) -> Result<()> {
+        if self.entries.len() == self.entries.capacity()
+            || self
+                .entries
+                .last()
+                .is_some_and(|(last, _)| (last.1, last.0) >= (coordinate.1, coordinate.0))
+        {
+            return Err(Error::Invalid(
+                "Regional pin order or admitted capacity changed",
+            ));
+        }
+        self.entries.push((coordinate, tile));
+        Ok(())
+    }
+    fn get(&self, coordinate: (u32, u32)) -> Option<&PinnedTile> {
+        self.entries
+            .binary_search_by_key(&(coordinate.1, coordinate.0), |(at, _)| (at.1, at.0))
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
 }
 
 impl PinnedRegion {
+    #[cfg(test)]
+    pub(crate) fn index_bytes(&self) -> usize {
+        self.tiles._charge.bytes()
+    }
     pub(crate) fn from_pins(
         width: u32,
         height: u32,
         depth: u16,
         region: Region,
-        tiles: BTreeMap<(u32, u32), PinnedTile>,
+        tiles: RegionPins,
     ) -> Result<Self> {
         if width == 0
             || height == 0
             || width > 16000
             || height > 16000
             || ![8, 16].contains(&depth)
-            || tiles.len() > 128
-            || tiles.iter().any(|(&(x, y), tile)| {
+            || tiles.entries.len() > 128
+            || tiles.entries.iter().any(|&((x, y), ref tile)| {
                 x >= width.div_ceil(TILE)
                     || y >= height.div_ceil(TILE)
                     || tile.spec().width() != TILE as u16
@@ -233,7 +290,7 @@ impl PinnedRegion {
             return Ok([0; 4]);
         }
         let (x, y) = (x as u32, y as u32);
-        let Some(tile) = self.tiles.get(&(x / TILE, y / TILE)) else {
+        let Some(tile) = self.tiles.get((x / TILE, y / TILE)) else {
             return Ok([0; 4]);
         };
         let index = (((y % TILE) * TILE + x % TILE) * 4) as usize;
@@ -325,9 +382,11 @@ mod tests {
                 assert_eq!(&row[8..16], &[0, 1, 48, 57, 212, 49, 255, 255]);
             }
             drop(view);
-            assert_eq!(store.resident_budget().used(), 0);
+            assert_eq!(store.resident_budget().payload_used(), 0);
+            let budget = store.resident_budget();
             drop(plane);
             drop(store);
+            assert_eq!(budget.used(), 0);
             std::fs::remove_dir_all(path).unwrap();
         }
     }
@@ -363,23 +422,55 @@ mod tests {
     }
     #[test]
     fn pin_budget_and_cancellation_return_no_partial_view_or_charge() {
-        let (store, path) = make_store(256 * 256 * 4);
+        let (store, path) = make_store(256 * 256 * 4 + 16 * 1024);
         let mut raster = Raster::new(512, 256);
         raster.set(0, 0, [1; 4]);
         raster.set(256, 0, [2; 4]);
         let plane = Plane::from_resident(&raster, store.clone(), &mut || Ok(())).unwrap();
+        let mut saw_first_pin = false;
         assert!(plane
-            .pin(Region::new([0, 0, 512, 256]).unwrap(), &mut || Ok(()))
+            .pin(Region::new([0, 0, 512, 256]).unwrap(), &mut || {
+                saw_first_pin |= store.resident_budget().payload_used() >= 256 * 256 * 4;
+                Ok(())
+            })
             .is_err());
-        assert_eq!(store.resident_budget().used(), 0);
+        assert!(
+            saw_first_pin,
+            "The first complete payload must have been pinned before the second refuses"
+        );
+        assert_eq!(store.resident_budget().payload_used(), 0);
         assert!(plane
             .pin(Region::new([0, 0, 1, 1]).unwrap(), &mut || Err(
                 Error::Cancelled
             ))
             .is_err());
-        assert_eq!(store.resident_budget().used(), 0);
+        assert_eq!(store.resident_budget().payload_used(), 0);
+        let budget = store.resident_budget();
         drop(plane);
         drop(store);
+        assert_eq!(budget.used(), 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn regional_index_refusal_precedes_even_known_absent_tile_preparation() {
+        let (store, path) = make_store(16 * 1024);
+        let plane = Plane::from_blocks(8, 8, 8, store.clone(), BTreeMap::new()).unwrap();
+        let budget = store.resident_budget();
+        let baseline = budget.used();
+        let remaining = budget.limit() - baseline - 32;
+        let held = budget.reserve_bytes(remaining, remaining).unwrap();
+        let mut checks = 0;
+        let refused = plane.pin(Region::new([0, 0, 1, 1]).unwrap(), &mut || {
+            checks += 1;
+            Ok(())
+        });
+        assert!(matches!(refused, Err(Error::Budget)));
+        assert_eq!(checks, 1);
+        drop(held);
+        assert_eq!(budget.used(), baseline);
+        drop(plane);
+        drop(store);
+        assert_eq!(budget.used(), 0);
         std::fs::remove_dir_all(path).unwrap();
     }
 }
