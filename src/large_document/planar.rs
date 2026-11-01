@@ -1,17 +1,15 @@
 //! Owned linear canonical channel planes. Completion is storage integrity only.
-use super::store::{
-    links, open_directory, read_exact_at, regular, source_options, stamp, validate_ancestors,
-    write_all_at, Stamp,
-};
-use super::{
-    DiskBudget, DiskReservation, Error, PinnedBytes, ResidentBudget, Result, ScratchBytes,
-};
+#[cfg(test)]
+use super::store::{open_directory, read_exact_at, stamp, validate_ancestors, write_all_at};
+use super::{DiskBudget, Error, ResidentBudget, Result, ScratchBytes};
+#[cfg(test)]
 use ring::digest::{Context, SHA256};
+#[cfg(test)]
 use std::{
     fs::{self, File},
-    path::{Path, PathBuf},
-    sync::Arc,
+    path::PathBuf,
 };
+use std::{path::Path, sync::Arc};
 
 const CHUNK: usize = 64 * 1024;
 const HEADER: u64 = 64;
@@ -69,59 +67,11 @@ pub enum PlanarRole {
     SaveCurrentMatte = 2,
 }
 
-struct Owned {
-    root: PathBuf,
-    directory: File,
-    directory_id: (u64, u64),
-    path: PathBuf,
-    file: File,
-    identity: (u64, u64),
-    expected: Stamp,
-    disk: DiskReservation,
-}
-impl Owned {
-    fn check(&self) -> Result<()> {
-        validate_ancestors(&self.root)?;
-        regular(&self.path)?;
-        let dir = open_directory(&self.root)?;
-        let named =
-            crate::file_safety::open_for_identity(&self.path).map_err(|_| Error::Changed)?;
-        if crate::file_safety::identity(&dir).map_err(|_| Error::Changed)? != self.directory_id
-            || crate::file_safety::identity(&self.directory).map_err(|_| Error::Changed)?
-                != self.directory_id
-            || crate::file_safety::identity(&named).map_err(|_| Error::Changed)? != self.identity
-            || crate::file_safety::identity(&self.file).map_err(|_| Error::Changed)?
-                != self.identity
-            || links(&self.file)? != 1
-            || stamp(&self.file)? != self.expected
-        {
-            return Err(Error::Changed);
-        }
-        Ok(())
-    }
-}
-
+use super::linear;
 pub struct PlanarScratch {
-    owned: Owned,
-    spec: PlanarSpec,
-    role: PlanarRole,
-    budget: ResidentBudget,
-    header: [u8; 64],
-    index: ScratchBytes,
-    rows: u64,
-    content: Context,
-    chunk: Context,
-    chunk_bytes: usize,
-    chunk_count: usize,
-    poisoned: bool,
+    inner: linear::Scratch,
 }
-
 impl PlanarScratch {
-    pub fn uses_budgets(&self, resident: &ResidentBudget, disk: &DiskBudget) -> bool {
-        self.budget.same_pool(resident) && self.owned.disk.uses_budget(disk)
-    }
-    /// The caller retains the actual instance/profile admission for this fresh,
-    /// private namespace. Quota and seals never grant that authority.
     pub fn create(
         root: &Path,
         spec: PlanarSpec,
@@ -129,449 +79,82 @@ impl PlanarScratch {
         budget: ResidentBudget,
         disk: DiskBudget,
     ) -> Result<Self> {
-        if !root.is_absolute() || root.file_name().is_none() {
-            return Err(Error::Invalid(
-                "Planar scratch requires an absolute fresh owned directory",
-            ));
-        }
-        validate_ancestors(root.parent().ok_or(Error::Changed)?)?;
-        let index = ScratchBytes::new(&budget, spec.chunks() * 32, 64 * 1024 * 1024)?;
-        let charge = disk.reserve(spec.encoded_bytes())?;
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(root)?;
-        let directory = open_directory(root)?;
-        let directory_id = crate::file_safety::identity(&directory).map_err(|_| Error::Changed)?;
-        let path = root.join("planes.pbp");
-        let mut options = source_options();
-        options.create_new(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            // DELETE is needed to retire this owned handle without unlinking a
-            // foreign replacement at the original name.
-            options.access_mode(0xC0010000);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
-        file.try_lock().map_err(|_| Error::Busy)?;
-        charge.bind(&file)?;
-        let identity = crate::file_safety::identity(&file).map_err(|_| Error::Changed)?;
-        let mut header = [0; 64];
-        header[..8].copy_from_slice(b"PBPLAN01");
-        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut header[8..24])
-            .map_err(|_| Error::Invalid("Planar identity creation failed"))?;
-        if header[8..24] == [0; 16] {
-            return Err(Error::Invalid("Planar identity creation failed"));
-        }
-        header[24..28].copy_from_slice(&spec.width.to_be_bytes());
-        header[28..32].copy_from_slice(&spec.height.to_be_bytes());
-        header[32..34].copy_from_slice(&spec.depth.to_be_bytes());
-        header[34..36].copy_from_slice(&4u16.to_be_bytes());
-        header[36] = role as u8;
-        header[40..48].copy_from_slice(&spec.payload_bytes().to_be_bytes());
-        header[48..56].copy_from_slice(&(spec.chunks() as u64).to_be_bytes());
-        header[56..64].copy_from_slice(&(CHUNK as u64).to_be_bytes());
-        write_all_at(&file, 0, &header)?;
-        file.sync_all()?;
-        crate::server::sync_parent(&path).map_err(|_| Error::Changed)?;
-        let owned = Owned {
-            root: root.into(),
-            directory,
-            directory_id,
-            path,
-            identity,
-            expected: stamp(&file)?,
-            file,
-            disk: charge,
+        let layout = linear::Spec {
+            width: spec.width,
+            height: spec.height,
+            depth: spec.depth,
+            channels: 4,
+            kind: linear::Kind::Native(role),
         };
-        owned.check()?;
-        let content = hash_start(b"PBPLANAR-CONTENT1", &header);
-        let chunk = chunk_start(&header, 0);
         Ok(Self {
-            owned,
-            spec,
-            role,
-            budget,
-            header,
-            index,
-            rows: 0,
-            content,
-            chunk,
-            chunk_bytes: 0,
-            chunk_count: 0,
-            poisoned: false,
+            inner: linear::Scratch::create(root, layout, budget, disk)?,
         })
     }
-
-    /// Append the exact next channel/row in canonical native BE, without seeks.
+    pub fn spec(&self) -> PlanarSpec {
+        PlanarSpec {
+            width: self.inner.spec.width,
+            height: self.inner.spec.height,
+            depth: self.inner.spec.depth,
+        }
+    }
+    pub fn uses_budgets(&self, ram: &ResidentBudget, disk: &DiskBudget) -> bool {
+        self.inner.uses_budgets(ram, disk)
+    }
     pub fn append_rows(
         &mut self,
         channel: u16,
-        first_y: u32,
+        y: u32,
         bytes: &[u8],
         check: Check<'_>,
     ) -> Result<()> {
-        if self.poisoned {
-            return Err(Error::Interrupted);
-        }
-        let count = bytes.len() / self.spec.row_bytes();
-        if channel >= 4
-            || first_y >= self.spec.height
-            || bytes.is_empty()
-            || bytes.len() % self.spec.row_bytes() != 0
-            || count > 256
-            || first_y as u64 + count as u64 > self.spec.height as u64
-            || self.rows != channel as u64 * self.spec.height as u64 + first_y as u64
-        {
-            return Err(Error::Invalid(
-                "Planar rows must be complete, sequential, and bounded",
-            ));
-        }
-        check()?;
-        self.owned.check()?;
-        let result = (|| {
-            let mut at = HEADER + self.rows * self.spec.row_bytes() as u64;
-            let mut input = bytes;
-            while !input.is_empty() {
-                check()?;
-                let count = input.len().min(CHUNK - self.chunk_bytes);
-                let part = &input[..count];
-                write_all_at(&self.owned.file, at, part)?;
-                self.content.update(part);
-                self.chunk.update(part);
-                self.chunk_bytes += count;
-                at += count as u64;
-                input = &input[count..];
-                if self.chunk_bytes == CHUNK || at == HEADER + self.spec.payload_bytes() {
-                    let next = chunk_start(&self.header, self.chunk_count + 1);
-                    let digest = std::mem::replace(&mut self.chunk, next).finish();
-                    self.index[self.chunk_count * 32..self.chunk_count * 32 + 32]
-                        .copy_from_slice(digest.as_ref());
-                    self.chunk_count += 1;
-                    self.chunk_bytes = 0;
-                }
-            }
-            let expected = stamp(&self.owned.file)?;
-            if expected.bytes != at {
-                return Err(Error::Changed);
-            }
-            self.owned.expected = expected;
-            self.owned.check()?;
-            check()?;
-            self.owned.check()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.poisoned = true;
-        } else {
-            self.rows += count as u64;
-        }
-        result
+        self.inner.append_rows(channel, y, bytes, check)
     }
-
-    /// The codec supplies `binding` after its independent source/completion checks.
-    /// Sealing proves storage bytes, never permission to edit or recover them.
-    pub fn finish(mut self, binding: Digest, check: Check<'_>) -> Result<CompletedPlanar> {
-        if self.poisoned {
-            return Err(Error::Interrupted);
-        }
-        if self.rows != 4 * self.spec.height as u64
-            || self.chunk_count != self.spec.chunks()
-            || binding == [0; 32]
-        {
-            return Err(Error::Invalid(
-                "Planar scratch is incomplete or lacks its source binding",
-            ));
-        }
-        check()?;
-        self.owned.check()?;
-        let content = finish(self.content);
-        let mut index_hash = hash_start(b"PBPLANAR-INDEX1", &self.header);
-        index_hash.update(&self.index);
-        let index_hash = finish(index_hash);
-        let mut seal = [0; SEAL];
-        seal[..8].copy_from_slice(b"PBPLSE01");
-        seal[8..40].copy_from_slice(&binding);
-        seal[40..72].copy_from_slice(&content);
-        seal[72..104].copy_from_slice(&index_hash);
-        let mut sealed = hash_start(b"PBPLANAR-SEAL1", &self.header);
-        sealed.update(&seal[..104]);
-        seal[104..136].copy_from_slice(&finish(sealed));
-        seal[136..].copy_from_slice(b"PBPLEND1");
-        let index_at = HEADER + self.spec.payload_bytes();
-        for (n, part) in self.index.chunks(CHUNK).enumerate() {
-            check()?;
-            write_all_at(&self.owned.file, index_at + (n * CHUNK) as u64, part)?;
-        }
-        check()?;
-        write_all_at(&self.owned.file, index_at + self.index.len() as u64, &seal)?;
-        self.owned.file.sync_all()?;
-        self.owned.expected = stamp(&self.owned.file)?;
-        if self.owned.expected.bytes != self.spec.encoded_bytes() {
-            return Err(Error::Changed);
-        }
-        self.owned.check()?;
-        verify(
-            &self.owned.file,
-            self.spec,
-            &self.header,
-            &self.index,
-            &seal,
-            &self.budget,
-            check,
-        )?;
-        check()?;
-        self.owned.check()?;
-        Ok(CompletedPlanar(Arc::new(Complete {
-            owned: self.owned,
-            spec: self.spec,
-            role: self.role,
-            binding,
-            header: self.header,
-            index: self.index.freeze(),
-            budget: self.budget,
-        })))
+    pub fn finish(self, binding: Digest, check: Check<'_>) -> Result<CompletedPlanar> {
+        Ok(CompletedPlanar {
+            inner: self.inner.finish(binding, check)?,
+        })
     }
-}
-
-struct Complete {
-    owned: Owned,
-    spec: PlanarSpec,
-    role: PlanarRole,
-    binding: Digest,
-    header: [u8; 64],
-    index: PinnedBytes,
-    budget: ResidentBudget,
 }
 #[derive(Clone)]
-pub struct CompletedPlanar(Arc<Complete>);
+pub struct CompletedPlanar {
+    inner: Arc<linear::Complete>,
+}
 impl CompletedPlanar {
-    pub fn uses_budgets(&self, resident: &ResidentBudget, disk: &DiskBudget) -> bool {
-        self.0.budget.same_pool(resident) && self.0.owned.disk.uses_budget(disk)
-    }
-    /// Explicit retirement only after the codec has released every reader and
-    /// needs no staged bytes. Failure preserves the quota charge and foreign names.
-    pub fn retire(self, check: Check<'_>) -> Result<()> {
-        let complete = Arc::try_unwrap(self.0).map_err(|_| Error::Busy)?;
-        check()?;
-        complete.owned.check()?;
-        check()?;
-        complete.owned.check()?;
-        unlink_owned(&complete.owned.file, &complete.owned.path)?;
-        crate::server::sync_parent(&complete.owned.path).map_err(|_| Error::Changed)?;
-        let Owned {
-            root,
-            directory,
-            directory_id,
-            path,
-            file,
-            identity,
-            disk,
-            ..
-        } = complete.owned;
-        drop(file);
-        let named_dir = open_directory(&root)?;
-        if crate::file_safety::identity(&directory).map_err(|_| Error::Changed)? != directory_id
-            || crate::file_safety::identity(&named_dir).map_err(|_| Error::Changed)? != directory_id
-            || !matches!(fs::symlink_metadata(path),Err(error) if error.kind()==std::io::ErrorKind::NotFound)
-        {
-            return Err(Error::Changed);
-        }
-        disk.release_retired(identity)
-    }
     pub fn spec(&self) -> PlanarSpec {
-        self.0.spec
+        PlanarSpec {
+            width: self.inner.spec.width,
+            height: self.inner.spec.height,
+            depth: self.inner.spec.depth,
+        }
     }
     pub fn role(&self) -> PlanarRole {
-        self.0.role
+        match self.inner.spec.kind {
+            linear::Kind::Native(role) => role,
+            linear::Kind::Scalar => unreachable!("Native wrapper contains a scalar field"),
+        }
     }
     pub fn binding(&self) -> Digest {
-        self.0.binding
+        self.inner.binding
     }
-    pub fn read_stripe(
-        &self,
-        channel: u16,
-        y: u32,
-        rows: u32,
-        check: Check<'_>,
-    ) -> Result<ScratchBytes> {
-        let bytes = self.stripe_bytes(channel, y, rows)?;
-        let mut output = ScratchBytes::new(&self.0.budget, bytes, 64 * 1024 * 1024)?;
-        self.read_into(channel, y, rows, &mut output, check)?;
-        Ok(output)
+    pub fn uses_budgets(&self, ram: &ResidentBudget, disk: &DiskBudget) -> bool {
+        self.inner.uses_budgets(ram, disk)
     }
-    fn stripe_bytes(&self, channel: u16, y: u32, rows: u32) -> Result<usize> {
-        if channel >= 4
-            || rows == 0
-            || rows > 256
-            || y.checked_add(rows)
-                .is_none_or(|end| end > self.0.spec.height)
-        {
-            return Err(Error::Invalid(
-                "Planar stripe is outside its admitted shape",
-            ));
-        }
-        let bytes = rows as usize * self.0.spec.row_bytes();
-        if bytes > 64 * 1024 * 1024 {
-            return Err(Error::Budget);
-        }
-        Ok(bytes)
-    }
-    /// Output remains provisional until the whole call succeeds, including its
-    /// final cancellation and ownership checks. Failed reads return no stripe.
     pub fn read_into(
         &self,
-        channel: u16,
+        c: u16,
         y: u32,
         rows: u32,
-        output: &mut ScratchBytes,
+        out: &mut ScratchBytes,
         check: Check<'_>,
     ) -> Result<()> {
-        let bytes = self.stripe_bytes(channel, y, rows)?;
-        if output.len() != bytes || !output.uses_budget(&self.0.budget) {
-            return Err(Error::Budget);
-        }
-        check()?;
-        self.0.owned.check()?;
-        let start = (channel as u64 * self.0.spec.height as u64 + y as u64)
-            * self.0.spec.row_bytes() as u64;
-        let end = start + bytes as u64;
-        let mut buffer = ScratchBytes::new(&self.0.budget, CHUNK, CHUNK)?;
-        for number in start / CHUNK as u64..end.div_ceil(CHUNK as u64) {
-            check()?;
-            let at = number * CHUNK as u64;
-            let count = (self.0.spec.payload_bytes() - at).min(CHUNK as u64) as usize;
-            read_exact_at(&self.0.owned.file, HEADER + at, &mut buffer[..count])?;
-            let mut hash = chunk_start(&self.0.header, number as usize);
-            hash.update(&buffer[..count]);
-            if hash.finish().as_ref()
-                != &self.0.index[number as usize * 32..number as usize * 32 + 32]
-            {
-                return Err(Error::Corrupt);
-            }
-            let left = start.max(at);
-            let right = end.min(at + count as u64);
-            output[(left - start) as usize..(right - start) as usize]
-                .copy_from_slice(&buffer[(left - at) as usize..(right - at) as usize]);
-        }
-        check()?;
-        self.0.owned.check()
+        self.inner.read_into(c, y, rows, out, check)
     }
-}
-
-#[cfg(unix)]
-fn unlink_owned(_file: &File, path: &Path) -> Result<()> {
-    // The retained private directory and actual profile writer admission are
-    // required; no arbitrary path or disposable-cache deletion is admitted.
-    fs::remove_file(path)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn unlink_owned(file: &File, _path: &Path) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn SetFileInformationByHandle(
-            handle: *mut std::ffi::c_void,
-            class: u32,
-            info: *const std::ffi::c_void,
-            bytes: u32,
-        ) -> i32;
+    pub fn read_stripe(&self, c: u16, y: u32, rows: u32, check: Check<'_>) -> Result<ScratchBytes> {
+        self.inner.read_stripe(c, y, rows, check)
     }
-    // FILE_DISPOSITION_INFO_EX: DELETE | POSIX_SEMANTICS; available since Win10
-    // RS1, below the app's 19041 floor. Do not ignore readonly/security failures.
-    let flags = 3u32;
-    // SAFETY: File owns the live DELETE-capable handle. The one-DWORD structure
-    // matches FileDispositionInfoEx and remains initialized for this call.
-    if unsafe {
-        SetFileInformationByHandle(file.as_raw_handle(), 21, (&flags as *const u32).cast(), 4)
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error().into());
+    pub fn retire(self, check: Check<'_>) -> Result<()> {
+        linear::retire(self.inner, check)
     }
-    Ok(())
-}
-
-fn hash_start(domain: &[u8], header: &[u8; 64]) -> Context {
-    let mut hash = Context::new(&SHA256);
-    hash.update(domain);
-    hash.update(header);
-    hash
-}
-fn chunk_start(header: &[u8; 64], number: usize) -> Context {
-    let mut hash = hash_start(b"PBPLANAR-CHUNK1", header);
-    hash.update(&(number as u64).to_be_bytes());
-    hash
-}
-fn finish(hash: Context) -> Digest {
-    hash.finish().as_ref().try_into().unwrap()
-}
-
-fn verify(
-    file: &File,
-    spec: PlanarSpec,
-    header: &[u8; 64],
-    index: &[u8],
-    seal: &[u8; SEAL],
-    budget: &ResidentBudget,
-    check: Check<'_>,
-) -> Result<()> {
-    let mut buffer = ScratchBytes::new(budget, CHUNK, CHUNK)?;
-    read_exact_at(file, 0, &mut buffer[..64])?;
-    if &buffer[..64] != header {
-        return Err(Error::Corrupt);
-    }
-    let mut content = hash_start(b"PBPLANAR-CONTENT1", header);
-    for n in 0..spec.chunks() {
-        check()?;
-        let at = n as u64 * CHUNK as u64;
-        let count = (spec.payload_bytes() - at).min(CHUNK as u64) as usize;
-        read_exact_at(file, HEADER + at, &mut buffer[..count])?;
-        content.update(&buffer[..count]);
-        let mut chunk = chunk_start(header, n);
-        chunk.update(&buffer[..count]);
-        if chunk.finish().as_ref() != &index[n * 32..n * 32 + 32] {
-            return Err(Error::Corrupt);
-        }
-    }
-    if content.finish().as_ref() != &seal[40..72] {
-        return Err(Error::Corrupt);
-    }
-    let mut hash = hash_start(b"PBPLANAR-INDEX1", header);
-    for (n, expected) in index.chunks(CHUNK).enumerate() {
-        check()?;
-        read_exact_at(
-            file,
-            HEADER + spec.payload_bytes() + (n * CHUNK) as u64,
-            &mut buffer[..expected.len()],
-        )?;
-        if &buffer[..expected.len()] != expected {
-            return Err(Error::Corrupt);
-        }
-        hash.update(expected);
-    }
-    if hash.finish().as_ref() != &seal[72..104] {
-        return Err(Error::Corrupt);
-    }
-    read_exact_at(
-        file,
-        HEADER + spec.payload_bytes() + index.len() as u64,
-        &mut buffer[..SEAL],
-    )?;
-    if &buffer[..SEAL] != seal {
-        return Err(Error::Corrupt);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -645,9 +228,9 @@ mod tests {
     fn fill(scratch: &mut PlanarScratch) {
         for channel in 0..4 {
             let mut y = 0;
-            while y < scratch.spec.height {
-                let count = (scratch.spec.height - y).min(256);
-                let data = rows(scratch.spec, channel, y, count, &scratch.budget);
+            while y < scratch.spec().height {
+                let count = (scratch.spec().height - y).min(256);
+                let data = rows(scratch.spec(), channel, y, count, &scratch.inner.budget);
                 scratch.append_rows(channel, y, &data, &mut okay).unwrap();
                 y += count;
             }
@@ -740,7 +323,7 @@ mod tests {
             (0, 0, &one[..one.len() - 1]),
         ] {
             assert!(scratch.append_rows(channel, y, bytes, &mut okay).is_err());
-            assert_eq!(scratch.owned.file.metadata().unwrap().len(), HEADER);
+            assert_eq!(scratch.inner.owned.file.metadata().unwrap().len(), HEADER);
         }
         scratch.append_rows(0, 0, &one, &mut okay).unwrap();
         drop(one);
@@ -764,7 +347,7 @@ mod tests {
         )
         .unwrap();
         let data = rows(spec, 0, 0, 256, &budget);
-        let probe = scratch.owned.file.try_clone().unwrap();
+        let probe = scratch.inner.owned.file.try_clone().unwrap();
         assert!(matches!(
             scratch.append_rows(0, 0, &data, &mut || {
                 if probe.metadata()?.len() > HEADER {
@@ -804,7 +387,7 @@ mod tests {
         .unwrap();
         fill(&mut scratch);
         let mut completed = scratch.finish([7; 32], &mut okay).unwrap();
-        let owned = &mut Arc::get_mut(&mut completed.0).unwrap().owned;
+        let owned = &mut Arc::get_mut(&mut completed.inner).unwrap().owned;
         write_all_at(&owned.file, HEADER + 17, b"corrupt").unwrap();
         owned.expected = stamp(&owned.file).unwrap();
         let before = budget.used();
@@ -835,10 +418,10 @@ mod tests {
             .unwrap();
             fill(&mut scratch);
             if damage_index {
-                scratch.index[0] ^= 1;
+                scratch.inner.index[0] ^= 1;
             } else {
-                write_all_at(&scratch.owned.file, HEADER + 17, b"bad").unwrap();
-                scratch.owned.expected = stamp(&scratch.owned.file).unwrap();
+                write_all_at(&scratch.inner.owned.file, HEADER + 17, b"bad").unwrap();
+                scratch.inner.owned.expected = stamp(&scratch.inner.owned.file).unwrap();
             }
             assert!(matches!(
                 scratch.finish([7; 32], &mut okay),
@@ -892,7 +475,7 @@ mod tests {
         )
         .unwrap();
         fill(&mut scratch);
-        let file = scratch.owned.file.try_clone().unwrap();
+        let file = scratch.inner.owned.file.try_clone().unwrap();
         assert!(matches!(
             scratch.finish([7; 32], &mut || {
                 if file.metadata()?.len() == spec.encoded_bytes() {
@@ -956,7 +539,7 @@ mod tests {
                         .unwrap();
                     y += count;
                 }
-                println!("16K planar component depth={depth} channel={channel} payload_written={} resident_bytes={}",scratch.owned.file.metadata().unwrap().len()-HEADER,budget.used());
+                println!("16K planar component depth={depth} channel={channel} payload_written={} resident_bytes={}",scratch.inner.owned.file.metadata().unwrap().len()-HEADER,budget.used());
             }
             let completed = scratch.finish([55; 32], &mut okay).unwrap();
             for channel in 0..4 {
@@ -981,7 +564,7 @@ mod tests {
             let mut at = 0;
             while at < spec.encoded_bytes() {
                 let count = (spec.encoded_bytes() - at).min(CHUNK as u64) as usize;
-                read_exact_at(&completed.0.owned.file, at, &mut io[..count]).unwrap();
+                read_exact_at(&completed.inner.owned.file, at, &mut io[..count]).unwrap();
                 hash.update(&io[..count]);
                 at += count as u64;
             }
