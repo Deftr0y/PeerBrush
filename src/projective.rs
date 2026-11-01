@@ -202,8 +202,9 @@ pub(crate) fn parse(command: &Value) -> Result<Option<Specification>, String> {
         .as_object()
         .filter(|v| v.len() == 2 && v.contains_key("rect") && v.contains_key("quad"))
         .ok_or("Projective placement requires only rect and quad")?;
-    let rect: [f64; 4] = serde_json::from_value(fields["rect"].clone()).map_err(|_| ERROR)?;
-    let quad: [[f64; 2]; 4] = serde_json::from_value(fields["quad"].clone()).map_err(|_| ERROR)?;
+    let rect: [f64; 4] = serde::Deserialize::deserialize(&fields["rect"]).map_err(|_| ERROR)?;
+    let quad: [[f64; 2]; 4] =
+        serde::Deserialize::deserialize(&fields["quad"]).map_err(|_| ERROR)?;
     let source = corners(rect)?;
     if quad
         .iter()
@@ -278,7 +279,7 @@ pub(crate) fn affine(command: &Value, default_pivot: [f64; 2]) -> Result<Map, St
         v.as_f64().ok_or("Transform angle must be a number")
     })?;
     let pivot: [f64; 2] = command.get("pivot").map_or(Ok(default_pivot), |v| {
-        serde_json::from_value(v.clone()).map_err(|_| "Transform pivot requires two numbers")
+        serde::Deserialize::deserialize(v).map_err(|_| "Transform pivot requires two numbers")
     })?;
     if !angle.is_finite()
         || angle.abs() > LIMIT

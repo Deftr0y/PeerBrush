@@ -264,6 +264,7 @@ fn whole_layer_and_mask_policy_match_actual_legacy_operators_at_native_depth() {
             let doc = fixture(depth, kind, linked);
             let native = native_document(&doc, &pool, &disk, &input);
             let id = doc.layers[0].id.clone();
+            let mut successful = 0;
             for mut command in [
                 json!({"op":"move","dx":3,"dy":-2}),
                 json!({"op":"transform","angle":17.5,"scale_x":0.83,"scale_y":1.07,"dx":3.25,"dy":-2.75,"fractional_translation":true}),
@@ -289,6 +290,7 @@ fn whole_layer_and_mask_policy_match_actual_legacy_operators_at_native_depth() {
                 let expected = expected.unwrap();
                 let expected = expected.layers.iter().find(|l| l.id == id).unwrap();
                 let plan = planned.unwrap().unwrap();
+                successful += 1;
                 assert_eq!(plan.origin, [expected.x, expected.y], "{command}");
                 assert_eq!(
                     plan.frame,
@@ -338,10 +340,142 @@ fn whole_layer_and_mask_policy_match_actual_legacy_operators_at_native_depth() {
                 drop(output);
                 std::fs::remove_dir_all(output_path).unwrap();
             }
+            assert_eq!(successful, if linked.is_none() { 5 } else { 6 });
             drop(native);
             drop(input);
             assert_eq!(pool.used(), 0);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+}
+
+#[test]
+fn off_frame_mask_original_survives_native_planning_and_can_resume_inside_frame() {
+    for depth in [8, 16] {
+        let pool = ResidentBudget::new(32 * 1024 * 1024).unwrap();
+        let disk = DiskBudget::new(32 * 1024 * 1024, 8).unwrap();
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "peerbrush-native-hidden-mask-{}",
+                crate::engine::id()
+            ));
+        let limits = Limits {
+            disk_bytes: 16 * 1024 * 1024,
+            max_blocks: 128,
+            max_resident_blocks: 16,
+            manifest_bytes: 65536,
+        };
+        let store =
+            Store::create_with_disk_budget(&root, pool.clone(), disk.clone(), limits).unwrap();
+        let mut doc = fixture(depth, "paint", Some(false));
+        let mut hidden = Raster::new_depth(31, 29, depth);
+        hidden.set16(30, 28, [20001, 30003, 40007, 50009]);
+        doc.layers[0].mask.as_mut().unwrap().steps[1].pixels =
+            crate::retained::Original::from(&hidden)
+                .render(17, 19)
+                .unwrap();
+        let native = native_document(&doc, &pool, &disk, &store);
+        let id = doc.layers[0].id.clone();
+        let command = json!({"op":"move","layer":id,"mask":true,"step":"paint","dx":-20,"dy":-20});
+        let expected = Engine::preview_edits(doc.clone(), &[command.clone()]).unwrap();
+        let mut work = Work::new(1_000_000).unwrap();
+        let plan = layer(&native, &id, &command, &mut work, &|| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.masks.len(), 1);
+        let expected = &expected.layers[0].mask.as_ref().unwrap().steps[1].pixels;
+        assert_plane(&plan.masks[0], plan.frame, expected, &store, &mut work);
+        assert_eq!(expected.get16(10, 8), hidden.get16(30, 28));
+        drop(plan);
+        drop(native);
+        drop(store);
+        assert_eq!(pool.used(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn editable_source_policy_preserves_definition_matrix_and_refuses_implicit_rasterization() {
+    for depth in [8, 16] {
+        let pool = ResidentBudget::new(32 * 1024 * 1024).unwrap();
+        let disk = DiskBudget::new(32 * 1024 * 1024, 8).unwrap();
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "peerbrush-native-source-policy-{}",
+                crate::engine::id()
+            ));
+        let limits = Limits {
+            disk_bytes: 16 * 1024 * 1024,
+            max_blocks: 64,
+            max_resident_blocks: 8,
+            manifest_bytes: 65536,
+        };
+        let store =
+            Store::create_with_disk_budget(&root, pool.clone(), disk.clone(), limits).unwrap();
+        let mut doc = fixture(depth, "paint", Some(false));
+        let definition = crate::source::Source {
+            width: 9,
+            height: 11,
+            matrix: [0.87, 0.13, -0.07, 1.11, 2.25, -1.5],
+            content: crate::source::Content::Shape {
+                shape: "rectangle".into(),
+                bounds: [1., 2., 7., 9.],
+                points: Vec::new(),
+                closed: true,
+                fill: [10001, 20003, 30007, 65535],
+                stroke: [0; 4],
+                stroke_width: 0.,
+            },
+        };
+        doc.layers[0].pixels = definition.render(17, 19, depth).unwrap();
+        doc.layers[0].source = Some(definition.into());
+        doc.selection = Some([0, 0, 4, 4]);
+        let native = native_document(&doc, &pool, &disk, &store);
+        let id = doc.layers[0].id.clone();
+        for mut command in [
+            json!({"op":"transform","angle":17.5,"scale_x":0.83,"scale_y":1.07,"selection_only":false}),
+            json!({"op":"transform","mask":true,"step":"paint","angle":17.5,"selection_only":false}),
+            json!({"op":"move","dx":3,"dy":-2}),
+            json!({"op":"transform","selection_only":false,"projective":{"rect":[-7,13,10,32],"quad":[[-6,11],[11,14],[9,34],[-8,31]]}}),
+        ] {
+            command["layer"] = json!(id);
+            let expected = Engine::preview_edits(doc.clone(), &[command.clone()]);
+            let plan = layer(
+                &native,
+                &id,
+                &command,
+                &mut Work::new(1_000_000).unwrap(),
+                &|| Ok(()),
+            );
+            match expected {
+                Err(_) => assert!(plan.is_err()),
+                Ok(expected) => {
+                    let plan = plan.unwrap().unwrap();
+                    let expected = &expected.layers[0];
+                    assert_eq!(plan.origin, [expected.x, expected.y]);
+                    assert_eq!(plan.frame, [expected.pixels.width, expected.pixels.height]);
+                    let Pixels::Editable {
+                        source,
+                        matrix,
+                        depth: actual_depth,
+                    } = &plan.color.as_ref().unwrap().pixels
+                    else {
+                        panic!("Editable definition was flattened");
+                    };
+                    assert_eq!(*actual_depth, depth);
+                    assert_eq!(
+                        matrix.map(f32::to_bits),
+                        expected.source.as_ref().unwrap().matrix.map(f32::to_bits)
+                    );
+                    assert_eq!([source.width, source.height], [9, 11]);
+                }
+            }
+        }
+        drop(native);
+        drop(store);
+        assert_eq!(pool.used(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

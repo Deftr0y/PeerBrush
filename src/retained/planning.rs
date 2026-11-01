@@ -147,6 +147,21 @@ pub(crate) fn layer<'a>(
 ) -> Result<Option<LayerPlan<'a>>, String> {
     check().map_err(|e| e.to_string())?;
     let layer = lookup(document, id)?;
+    if layer.source().is_some() {
+        if command["op"] == "transform"
+            && (crate::projective::parse(command)?.is_some()
+                || crate::warp::parse(command)?.is_some())
+        {
+            return Err("Rasterize the editable text/vector source at its native precision before Distort, Perspective or Warp".into());
+        }
+        let independent_mask =
+            command["mask"] == true && layer.mask().is_none_or(|mask| !mask.linked());
+        if independent_mask
+            || (document.metadata().selection().is_some() && command["selection_only"] != false)
+        {
+            return Err("Transform the complete editable text/vector layer with selection_only:false, or rasterize it for a pixel/mask transform".into());
+        }
+    }
     if command["mask"] == true && layer.mask().is_none_or(|mask| !mask.linked()) {
         return mask(document, layer, command).map(Some);
     }
