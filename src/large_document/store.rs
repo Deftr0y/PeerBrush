@@ -481,6 +481,7 @@ impl Store {
             .parent()
             .ok_or(Error::Invalid("Native backing parent is missing"))?;
         validate_ancestors(parent)?;
+        let disk = disk.map(|budget| budget.reserve(FILE_HEADER)).transpose()?;
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -491,7 +492,6 @@ impl Store {
         let directory = open_directory(root)?;
         let directory_id = crate::file_safety::identity(&directory).map_err(|_| Error::Changed)?;
         let path = root.join("blocks.pbt");
-        let disk = disk.map(|budget| budget.reserve(FILE_HEADER)).transpose()?;
         let mut options = source_options();
         options.create_new(true);
         #[cfg(unix)]
