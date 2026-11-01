@@ -10,7 +10,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 pub(crate) struct Limits {
@@ -75,6 +78,8 @@ impl HeldFile {
 }
 struct Location {
     path: PathBuf,
+    directory_identity: (u64, u64),
+    file_identity: (u64, u64),
     weak: Option<WeakStore>,
     selected: Option<CommitRef>,
 }
@@ -93,6 +98,7 @@ pub(crate) struct SourceRuntime {
     disk: DiskBudget,
     limits: Limits,
     inventory: Mutex<Option<Inventory>>,
+    tainted: AtomicBool,
     // Close inventory handles before releasing the actual default profile lease.
     context: Arc<PersistentRootContext>,
 }
@@ -111,6 +117,7 @@ impl SourceRuntime {
             disk,
             limits,
             inventory: Mutex::new(None),
+            tainted: AtomicBool::new(false),
         }))
     }
     pub(crate) fn resident(&self) -> ResidentBudget {
@@ -311,6 +318,8 @@ impl SourceRuntime {
                                 id,
                                 Location {
                                     path: path.clone(),
+                                    directory_identity: child.identity(),
+                                    file_identity: crate::file_safety::identity(&file)?,
                                     weak: None,
                                     selected: None,
                                 },
@@ -359,6 +368,12 @@ pub(crate) struct SourceSession {
 }
 impl SourceSession {
     pub(crate) fn check(&self) -> Result<(), String> {
+        if self.runtime.tainted.load(Ordering::Acquire) {
+            return Err(
+                "Source inventory ownership changed; fresh admission required and bytes retained"
+                    .into(),
+            );
+        }
         self.operation.check()?;
         let state = self
             .runtime
@@ -395,6 +410,77 @@ impl SourceSession {
         self.check()?;
         Ok(fragment)
     }
+    pub(crate) fn abort_fragment(
+        &self,
+        fragment: FreshFragment,
+        cleanup: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.check()?;
+        cleanup()?;
+        let identity = fragment.store().identity();
+        let path = {
+            let state = self
+                .runtime
+                .inventory
+                .try_lock()
+                .map_err(|_| "Source inventory is busy")?;
+            let location = state
+                .as_ref()
+                .and_then(|inventory| inventory.locations.get(&identity))
+                .ok_or("Fragment is outside the owned inventory")?;
+            if !location
+                .weak
+                .as_ref()
+                .and_then(WeakStore::upgrade)
+                .is_some_and(|store| store.same_owner(fragment.store()))
+            {
+                return Err("Fragment differs from its registered owner".into());
+            }
+            location.path.clone()
+        };
+        let directory = Directory::open(&path)?;
+        fragment
+            .abort(&mut || {
+                cleanup().map_err(|_| crate::large_document::Error::Cancelled)?;
+                self.check()
+                    .map_err(|_| crate::large_document::Error::Changed)
+            })
+            .map_err(|e| e.to_string())?;
+        if let Err(error) = directory.retire_empty(&mut || {
+            cleanup()?;
+            self.check()
+        }) {
+            self.runtime.tainted.store(true, Ordering::Release);
+            return Err(error);
+        }
+        self.check()?;
+        let mut state = self
+            .runtime
+            .inventory
+            .try_lock()
+            .map_err(|_| "Source inventory is busy")?;
+        let inventory = state.as_mut().ok_or("Source inventory is unavailable")?;
+        let location = inventory
+            .locations
+            .get(&identity)
+            .ok_or("Retired fragment inventory changed")?;
+        if location.path != path
+            || location
+                .weak
+                .as_ref()
+                .and_then(WeakStore::upgrade)
+                .is_some()
+        {
+            return Err("Retired fragment gained an unexpected owner".into());
+        }
+        inventory.locations.remove(&identity);
+        inventory.lineages.retain(|_, store| *store != identity);
+        inventory.directories = inventory
+            .directories
+            .checked_sub(1)
+            .ok_or("Retired fragment directory count differs")?;
+        Ok(())
+    }
     fn reserve_directory(&self) -> Result<(), String> {
         let mut state = self
             .runtime
@@ -413,6 +499,10 @@ impl SourceSession {
         let file = open_read(&held_path)?;
         let held = HeldFile::new(held_path, file)?;
         held.check()?;
+        let directory_identity = Directory::open(path)?.identity();
+        if store.filesystem_identity() != (directory_identity, held.identity) {
+            return Err("New source differs from its inventoried filesystem owner".into());
+        }
         let mut state = self
             .runtime
             .inventory
@@ -431,6 +521,8 @@ impl SourceSession {
             store.identity(),
             Location {
                 path: path.to_owned(),
+                directory_identity,
+                file_identity: held.identity,
                 weak: Some(store.downgrade()),
                 selected: None,
             },
@@ -547,7 +639,7 @@ impl SourceSession {
         selected: CommitRef,
     ) -> Result<Snapshot, String> {
         self.check()?;
-        let (held, path) = {
+        let (held, path, directory_identity, file_identity) = {
             let state = self
                 .runtime
                 .inventory
@@ -560,8 +652,27 @@ impl SourceSession {
             (
                 location.weak.as_ref().and_then(WeakStore::upgrade),
                 location.path.clone(),
+                location.directory_identity,
+                location.file_identity,
             )
         };
+        let directory = Directory::open(&path).map_err(|error| {
+            self.runtime.tainted.store(true, Ordering::Release);
+            error
+        })?;
+        let named =
+            crate::file_safety::open_for_identity(&path.join("blocks.pbt")).map_err(|_| {
+                self.runtime.tainted.store(true, Ordering::Release);
+                "Owned recovery source is unavailable"
+            })?;
+        if directory.identity() != directory_identity
+            || crate::file_safety::identity(&named)? != file_identity
+        {
+            self.runtime.tainted.store(true, Ordering::Release);
+            return Err(
+                "Recovery source filesystem ownership changed; replacement retained".into(),
+            );
+        }
         let mut check = || {
             self.check()
                 .map_err(|_| crate::large_document::Error::Cancelled)
@@ -580,6 +691,22 @@ impl SourceSession {
         .map_err(|e| e.to_string())?;
         if snapshot.store().identity() != identity {
             return Err("Recovery source identity differs".into());
+        }
+        directory.check().map_err(|error| {
+            self.runtime.tainted.store(true, Ordering::Release);
+            error
+        })?;
+        let final_named =
+            crate::file_safety::open_for_identity(&path.join("blocks.pbt")).map_err(|_| {
+                self.runtime.tainted.store(true, Ordering::Release);
+                "Owned recovery source disappeared during admission"
+            })?;
+        if snapshot.store().filesystem_identity() != (directory_identity, file_identity)
+            || crate::file_safety::identity(&named)? != file_identity
+            || crate::file_safety::identity(&final_named)? != file_identity
+        {
+            self.runtime.tainted.store(true, Ordering::Release);
+            return Err("Recovery source filesystem identity changed during admission".into());
         }
         self.check()?;
         let mut state = self
@@ -890,6 +1017,150 @@ mod tests {
             b"foreign instance"
         );
         assert!(!other.join("native-sources-v1").exists());
+        drop(connection);
+    }
+    #[test]
+    fn clean_registered_fragment_abort_reclaims_directory_slots_beyond_the_inventory_limit() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        for _ in 0..32 {
+            let fragment = session.fresh_fragment().unwrap();
+            session.abort_fragment(fragment, &mut || Ok(())).unwrap();
+            assert_eq!(runtime.disk().used().unwrap(), 56);
+        }
+        assert_eq!(
+            fs::read_dir(connection.state_dir.join("native-sources-v1"))
+                .unwrap()
+                .count(),
+            1
+        );
+        drop(session);
+        drop(runtime);
+        drop(context);
+        drop(connection);
+    }
+    #[test]
+    fn refused_fragment_abort_keeps_its_inventory_and_source_bytes() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let fragment = session.fresh_fragment().unwrap();
+        let identity = fragment.store().identity();
+        let held = fragment.store().clone();
+        assert!(session.abort_fragment(fragment, &mut || Ok(())).is_err());
+        assert_eq!(runtime.disk().used().unwrap(), 80);
+        assert!(runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .locations
+            .contains_key(&identity));
+        assert_eq!(held.checkpoint_reference().unwrap(), None);
+        drop(held);
+        drop(session);
+        drop(runtime);
+        drop(context);
+        drop(connection);
+    }
+    #[test]
+    fn foreign_directory_after_file_abort_is_preserved_and_slot_remains_conservative() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let fragment = session.fresh_fragment().unwrap();
+        let identity = fragment.store().identity();
+        let path = runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .locations[&identity]
+            .path
+            .clone();
+        let mut changed = false;
+        let result = session.abort_fragment(fragment, &mut || {
+            if !changed && !path.join("blocks.pbt").exists() {
+                let renamed = fs::rename(
+                    &path,
+                    path.with_file_name(format!("retained-{}", uuid::Uuid::new_v4())),
+                );
+                #[cfg(windows)]
+                if let Err(error) = &renamed {
+                    assert!(matches!(error.raw_os_error(), Some(5 | 32)));
+                    return Err("Native directory replacement prevented".into());
+                }
+                renamed.unwrap();
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("foreign"), b"preserve").unwrap();
+                changed = true;
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(runtime.disk().used().unwrap(), 56);
+        if changed {
+            assert_eq!(fs::read(path.join("foreign")).unwrap(), b"preserve");
+        }
+        assert!(runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .locations
+            .contains_key(&identity));
+        drop(session);
+        drop(runtime);
+        drop(context);
+        drop(connection);
+    }
+    #[test]
+    fn warm_runtime_refuses_a_same_bytes_foreign_source_after_the_last_store_drops() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let store = session.store_for_lineage([8; 16]).unwrap();
+        let snapshot = session.seal_store(&store, &[], b"selected source").unwrap();
+        let selected = snapshot.reference();
+        let identity = store.identity();
+        let path = runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .locations[&identity]
+            .path
+            .join("blocks.pbt");
+        drop(snapshot);
+        drop(store);
+        let original = fs::read(&path).unwrap();
+        let charged = runtime.disk().used().unwrap();
+        fs::rename(&path, path.with_file_name("retained.pbt")).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(session.resolve_store(identity, selected).is_err());
+        assert!(session.fresh_fragment().is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::read(path.with_file_name("retained.pbt")).unwrap(),
+            original
+        );
+        assert_eq!(runtime.disk().used().unwrap(), charged);
+        drop(session);
+        drop(runtime);
+        drop(context);
         drop(connection);
     }
 }
