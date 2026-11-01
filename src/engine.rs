@@ -682,6 +682,13 @@ impl Engine {
             Ok(())
         }
     }
+    pub(crate) fn ensure_write_available(&self) -> Result<(), String> {
+        self.ensure_open()?;
+        if let Some(save) = &self.saving {
+            save.ensure_editable()?;
+        }
+        Ok(())
+    }
     pub(crate) fn mark_ai(&mut self, actor: &str, label: &str, tool: &str, scopes: Vec<Scope>) {
         if actor == "human" {
             return;
@@ -776,7 +783,7 @@ impl Engine {
         Ok(lease)
     }
     pub fn check(&mut self, actor: &str, scopes: &[Scope]) -> Result<(), String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         self.expire();
         for l in &self.leases {
             if l.owner != actor
@@ -1365,7 +1372,7 @@ impl Engine {
         mut imports: Option<std::collections::VecDeque<crate::image_import::Prepared>>,
         pixels: Option<backed::PreparedPixels>,
     ) -> Result<Value, String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         if self.doc.read_only {
             return Err("This PSD is read-only. Create a compatible copy first.".into());
         }
@@ -2748,7 +2755,7 @@ impl Engine {
         Err(format!("Unsupported operation: {op}"))
     }
     pub fn undo(&mut self, actor: &str) -> Result<(), String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         let h = self.undo.last().ok_or("Nothing to undo")?.clone();
         if actor != "human" && h.actor != actor {
             return Err("Latest change belongs to another participant. Observe again or inspect selective task undo.".into());
@@ -2764,7 +2771,7 @@ impl Engine {
         Ok(())
     }
     pub fn redo(&mut self, actor: &str) -> Result<(), String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         let h = self.redo.last().ok_or("Nothing to redo")?.clone();
         if actor != "human" && h.actor != actor {
             return Err("Redo belongs to another participant".into());
@@ -2789,7 +2796,7 @@ impl Engine {
         mut doc: Document,
         path: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         if ![8, 16].contains(&doc.bit_depth) {
             return Err("Color depth must be 8 or 16 bits".into());
         }
