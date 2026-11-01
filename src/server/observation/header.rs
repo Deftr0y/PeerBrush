@@ -3,7 +3,7 @@
 //! from this header because the legacy observation does not serialize them.
 use crate::{
     collaboration::{Proposal, TaskRecord},
-    engine::{AiChange, Engine, Lease, Scope},
+    engine::{Engine, Lease, Scope},
 };
 use serde::{ser::SerializeSeq, Serialize, Serializer};
 use serde_json::Value;
@@ -12,7 +12,7 @@ use serde_json::Value;
 pub(super) struct Header<'a> {
     pub file_status: &'a str,
     pub reservations: &'a [Lease],
-    pub ai_change: &'a Option<AiChange>,
+    pub ai_change: Option<Ai<'a>>,
     pub dirty: bool,
     pub project_id: &'a str,
     pub closed: bool,
@@ -24,7 +24,14 @@ impl<'a> Header<'a> {
         Self {
             file_status: &engine.status,
             reservations: &engine.leases,
-            ai_change: &engine.ai_change,
+            ai_change: engine.ai_change.as_ref().map(|value| Ai {
+                serial: value.serial,
+                actor: &value.actor,
+                label: &value.label,
+                tool: &value.tool,
+                scopes: &value.scopes,
+                at: value.at,
+            }),
             dirty: revision != engine.saved_revision,
             project_id: &engine.project_id,
             closed: engine.closed,
@@ -35,6 +42,15 @@ impl<'a> Header<'a> {
             },
         }
     }
+}
+#[derive(Serialize)]
+pub(super) struct Ai<'a> {
+    serial: u64,
+    actor: &'a str,
+    label: &'a str,
+    tool: &'a str,
+    scopes: &'a [Scope],
+    at: u64,
 }
 #[derive(Serialize)]
 struct ProposalWire<'a> {
