@@ -1309,24 +1309,31 @@ mod tests {
         let capture =
             Capture::new(&staged.scene, &staged.seals, &session, limits(), &|| Ok(())).unwrap();
         let id = *uuid::Uuid::new_v4().as_bytes();
-        let calls = std::cell::Cell::new(0);
+        let pending = f.base.join(format!(
+            "state/native-sources-v1/pending-{}",
+            uuid::Uuid::from_bytes(id)
+        ));
+        let reached_write = std::cell::Cell::new(false);
         assert!(capture
             .publish(id, &session, &|| {
-                calls.set(calls.get() + 1);
-                if calls.get() == 6 {
+                // Admission/source proof may add checks before the writer is
+                // created. Fail only after this actual writer has emitted bytes.
+                if fs::symlink_metadata(&pending)
+                    .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() != 0)
+                {
+                    reached_write.set(true);
                     Err("Captured source changed during publication".into())
                 } else {
                     Ok(())
                 }
             })
             .is_err());
-        assert!(f
-            .base
-            .join(format!(
-                "state/native-sources-v1/pending-{}",
-                uuid::Uuid::from_bytes(id)
-            ))
-            .is_file());
+        assert!(
+            reached_write.get(),
+            "Failure must occur after actual pending bytes"
+        );
+        assert!(pending.is_file());
+        assert!(fs::metadata(&pending).unwrap().len() != 0);
         assert!(session.open_recovery_marker(id).is_err());
         assert!(capture
             .publish(*uuid::Uuid::new_v4().as_bytes(), &session, &|| Ok(()))
