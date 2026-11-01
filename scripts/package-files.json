@@ -163,6 +163,7 @@
     "scripts/qualify_store_sdk.py",
     "scripts/qualify_windows_installer.py",
     "scripts/readback_site_release.py",
+    "scripts/release_essentials.py",
     "scripts/release_gate.py",
     "scripts/select_native_python.py",
     "scripts/sign_macos.py",

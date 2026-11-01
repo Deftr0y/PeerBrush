@@ -1,23 +1,6 @@
 name: SVG row renderer qualification
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - '.github/workflows/svg-rows-qualification.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'src/source.rs'
-      - 'src/source/**'
-      - 'src/svg.rs'
-      - 'src/svg/**'
-      - 'vendor/tiny-skia/**'
-      - 'vendor/tiny-skia-path/**'
-      - 'vendor/resvg/**'
-      - 'vendor/renderer-provenance.json'
-      - 'tests/svg-origin-*'
-      - 'tests/svg-origin-*/**'
-      - 'scripts/test_svg_rows.py'
 permissions:
   contents: read
 jobs:

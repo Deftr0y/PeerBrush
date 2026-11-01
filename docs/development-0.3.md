@@ -1,5 +1,10 @@
 # PeerBrush v0.3 — development
 
+Development now proceeds directly on `version/0.3`. Routine push and feature-PR
+CI are disabled; a small essential gate runs for version-to-production `main`
+candidates. Existing WIP branches preserve unfinished work and remain unqualified.
+See the [development guide](development-guide.md).
+
 Native preview rows (unreleased) now retain admitted display stripes independently
 of their captured source session. The raw provider preserves the existing 8/16-bit
 preview sampling grid, target isolation and display projection; unsupported ICC,

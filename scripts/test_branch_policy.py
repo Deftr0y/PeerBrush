@@ -20,9 +20,8 @@ class BranchPolicyTests(unittest.TestCase):
                 validate_name(name)
 
     def test_promotion_destinations(self):
-        for head, base in (("feature/0.26/selection", "version/0.26"),
-                           ("fix/0.26/save-locks", "version/0.26"),
-                           ("version/0.26", "dev"), ("dev", "main"),
+        for head, base in (("version/0.26", "main"),
+                           ("version/0.3", "main"),
                            ("maintenance/site-development-guide", "site-content")):
             with self.subTest(head=head, base=base):
                 validate_pull_request(head, base)
@@ -31,14 +30,16 @@ class BranchPolicyTests(unittest.TestCase):
         for head, base in (("feature/0.26/selection", "main"),
                            ("feature/0.26/selection", "dev"),
                            ("feature/0.27/selection", "version/0.26"),
-                           ("version/0.26", "main"), ("main", "dev"),
+                           ("feature/0.26/selection", "version/0.26"),
+                           ("fix/0.26/save-locks", "version/0.26"),
+                           ("version/0.26", "dev"), ("dev", "main"), ("main", "dev"),
                            ("maintenance/archive-v0.1.2", "site-content")):
             with self.subTest(head=head, base=base), self.assertRaises(ValueError):
                 validate_pull_request(head, base)
 
     def test_event_uses_pr_head_not_merge_ref(self):
-        validate_event({"pull_request": {"head": {"ref": "feature/0.26/selection"},
-                                         "base": {"ref": "version/0.26"}}}, "refs/pull/5/merge")
+        validate_event({"pull_request": {"head": {"ref": "version/0.3"},
+                                         "base": {"ref": "main"}}}, "refs/pull/5/merge")
         with self.assertRaises(ValueError):
             validate_event({"pull_request": {"head": {"ref": "codex/0.26"},
                                              "base": {"ref": "version/0.26"}}}, "refs/pull/5/merge")

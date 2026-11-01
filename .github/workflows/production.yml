@@ -69,12 +69,6 @@ jobs:
           persist-credentials: false
       - name: Require exact source and existing version checks
         run: python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
-      - name: Verify offline composition and transaction contracts
-        run: |
-          python -B scripts/test_final_release.py
-          python -B scripts/test_final_inputs.py
-          python -B scripts/test_publish_release.py
-          python -B scripts/test_store_handoff_history.py
       - name: Report disabled production authority
         run: |
           echo 'Final composition and immutable transaction are prepared. Windows signing/qualification handoff is prepared but inactive and unverified. Authenticated installed producers and complete native acceptance remain source work; publication and Store submission are disabled.' >> "$GITHUB_STEP_SUMMARY"

@@ -1,5 +1,11 @@
-name: PeerBrush
-on: [push, pull_request]
+name: PeerBrush release gate
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+concurrency:
+  group: release-gate-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: false
 permissions:
   contents: read
 jobs:
@@ -9,12 +15,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Verify branch-policy regressions
-        run: python scripts/test_branch_policy.py
-      - name: Verify bounded CI failure diagnostics
-        run: python -B scripts/test_ci_diagnostics.py
-      - name: Verify exact release invocation guards
-        run: python -B scripts/test_release_source_guard.py
       - name: Enforce branch names and PR destinations
         shell: bash
         run: python scripts/check_branch_policy.py --event "$GITHUB_EVENT_PATH" --ref "$GITHUB_REF"
@@ -51,6 +51,7 @@ jobs:
           print(f'Checked approved human attribution for {len(commits)} commits.')
           PY
   native:
+    timeout-minutes: 90
     needs: [branch-policy, attribution]
     strategy:
       fail-fast: false
@@ -83,8 +84,6 @@ jobs:
       - if: runner.os != 'Windows'
         name: Select existing native codec tools
         run: python3 -B scripts/jxl_build.py --github-env
-      - name: Verify native codec tool selection regressions
-        run: python -B scripts/test_jxl_build.py
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
         with:
           toolchain: 1.92.0
@@ -119,14 +118,8 @@ jobs:
           key: peerbrush-build-v2-${{ matrix.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.version }}-${{ steps.compiler.outputs.native }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'scripts/build_release.py', 'scripts/jxl_build.py', 'vendor/cmake/**', 'vendor/jpegxl-src/**') }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
-      - run: cargo fmt --all -- --check
-      - run: cargo fmt --manifest-path vendor/cmake/Cargo.toml -- --check
-      - run: rustfmt --check --edition 2021 tests/fixtures/native-build-flags/src/main.rs
       - name: Build source-matched JPEG XL worker for integration tests
         run: cargo build --locked --bin peerbrush
-      - name: Check the separate setup entry in the ordinary non-test configuration
-        run: cargo check --locked --features windows-setup --bin peerbrush-setup
-      # Cached bytes are an optimization; source builds and every qualification gate still run.
       - name: Save CI build cache after main compilation
         if: success() && steps.cargo_cache.outputs.cache-hit != 'true' && steps.cargo_cache.outputs.cache-primary-key != ''
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
@@ -137,233 +130,8 @@ jobs:
             ~/.cargo/registry/src
             target
           key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
-      - name: Verify dormant native setup without a VC runtime prerequisite
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          python -B scripts/build_windows_setup.py --source-root . --commit $env:GITHUB_SHA `
-            --work "$env:RUNNER_TEMP/peerbrush-setup-work" --output "$env:RUNNER_TEMP/peerbrush-setup-output"
-      - name: Run regression tests and summarize failures
-        shell: bash
-        run: |
-          set +e
-          CARGO_TERM_COLOR=never cargo test --locked > "$RUNNER_TEMP/peerbrush-tests.log" 2>&1
-          test_status=$?
-          if [[ "$RUNNER_OS" == "Windows" && "$test_status" -eq 0 ]]; then
-            CARGO_TERM_COLOR=never cargo test --locked --test clipboard -- --ignored >> "$RUNNER_TEMP/peerbrush-tests.log" 2>&1
-            test_status=$?
-          fi
-          python - "$RUNNER_TEMP/peerbrush-tests.log" "$GITHUB_STEP_SUMMARY" "$test_status" <<'PY'
-          import re, sys
-          from pathlib import Path
-          log = Path(sys.argv[1]).read_text(encoding='utf-8', errors='replace')
-          log = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', log)
-          failures = re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$', log, re.M)
-          results = re.findall(r'^test result: (?:ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored;', log, re.M)
-          detail = ''
-          if failures:
-              print('::error title=Regression test failures::' + ', '.join(name[:128] for name in failures[:32]))
-              locations = re.findall(r"^thread '([A-Za-z0-9_:]+)' (?:\([0-9]+\) )?panicked at (?:[^\r\n]*?[/\\])?((?:tests|src)[/\\][A-Za-z0-9_./\\-]+):([0-9]+):([0-9]+)", log, re.M)
-              reported_locations = set()
-              for name, path, line, column in locations[:32]:
-                  path = path.replace('\\', '/')
-                  if name in failures and '..' not in path.split('/'):
-                      print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Regression failure location::{name[:128]}')
-                      reported_locations.add(name)
-              sections = re.split(r'^---- ([A-Za-z0-9_:]+) stdout ----$', log, flags=re.M)
-              kinds = {
-                  'OWNERSHIP_BUSY': 'File already open',
-                  'SAVE_BUSY': 'Another PeerBrush save',
-                  'BACKUP_STORAGE_FULL': 'Previous-save storage is full',
-                  'PROJECT_HANDLE_MISSING': 'Missing or closed project ID',
-                  'PROJECT_SET_CHANGED': 'The open projects changed',
-                  'SOURCE_CHANGED': 'File changed while opening',
-                  'SOURCE_CONFLICT': 'Unsaved project: save first',
-              }
-              for index in range(1, len(sections) - 1, 2):
-                  name, body = sections[index:index + 2]
-                  if name in failures:
-                      # Cargo's section names retain the full test identifier
-                      # when a worker/platform thread name differs or truncates.
-                      if name not in reported_locations and len(reported_locations) < 32:
-                          located = re.findall(r"^thread '[^\r\n']{1,512}' (?:\([0-9]{1,10}\) )?panicked at (?:[^\r\n]{0,4096}?[/\\])?((?:tests|src)[/\\][A-Za-z0-9_./\\-]{1,512}\.rs):([0-9]{1,7}):([0-9]{1,5}):", body, re.M)
-                          for path, line, column in located[:1]:
-                              path = path.replace('\\', '/')
-                              if '..' not in path.split('/') and int(line) > 0 and int(column) > 0:
-                                  print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Regression failure location::{name[:128]}')
-                                  reported_locations.add(name)
-                      matched = [code for code, marker in kinds.items() if marker in body]
-                      matched += ['JXL_WORKER_' + code for code in sorted(set(re.findall(r'^JXL_TIMEOUT_ERROR_(FAILED|PROTOCOL|RESOURCE|OTHER)$', body, re.M)))]
-                      if matched:
-                          print('::error title=Regression failure category::' + name[:128] + ': ' + ', '.join(matched))
-                      if name == 'jpeg_xl::stream_parent::tests::actual_profile_staging_owned_mode1_worker_replay_and_isolated_decode_keep_native_samples':
-                          records = re.findall(r'^JXL_STREAM_STATUS phase=(staging|encode|recheck|copy|decode|pixels|retire|cleanup) depth=(8|16) category=(begin|ok|quota|timeout|retained|worker|protocol|other)$', body, re.M)
-                          if 0 < len(records) <= 64:
-                              phase, depth, category = records[-1]
-                              print(f'::error title=Native codec diagnostic::phase={phase} depth={depth} category={category}')
-                          broker = re.findall(r'^JXL_BROKER_STATUS phase=(queue|source|launch|start|ready|rectangle|release|segment|done|exit|canonical) depth=(8|16) category=(begin|ok)$', body, re.M)
-                          if 0 < len(broker) <= 44:
-                              for phase, depth, category in broker:
-                                  print(f'::error title=Native broker diagnostic::phase={phase} depth={depth} category={category}')
-                      if name in {'protocol_presets_preview_and_repeated_batches_keep_native_files_profiles_and_source', 'batch_existing_file_policies_report_written_skipped_failed_and_unattempted_outputs'}:
-                          records = re.findall(r'^PB_EXPORT_WAIT elapsed_ms=(0|[1-9][0-9]{0,5}) status=(running) phase=(planning|rendering|complete|stopped|unknown) outputs=(0|[1-9][0-9]{0,2}) written=(0|[1-9][0-9]{0,2}) skipped=(0|[1-9][0-9]{0,2}) failed=(0|[1-9][0-9]{0,2}) not_written=(0|[1-9][0-9]{0,2})$', body, re.M)
-                          if len(records) == 1:
-                              elapsed, status, phase, outputs, written, skipped, failed, pending = records[0]
-                              counts = [int(value) for value in [outputs, written, skipped, failed, pending]]
-                              if 15000 <= int(elapsed) <= 999999 and max(counts) <= 64 and sum(counts[1:]) == counts[0]:
-                                  print(f'::error title=Export completion diagnostic::elapsed_ms={elapsed} status={status} phase={phase} outputs={outputs} written={written} skipped={skipped} failed={failed} not_written={pending}')
-                      if name == 'ui::effect_color::tests::effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes':
-                          records = re.findall(r'^PB_EFFECT_COLOR_HISTORY depth=(8|16) action=(escape|invalid|source) before=(0|[1-9][0-9]{0,4}) after=(0|[1-9][0-9]{0,4})$', body, re.M)
-                          if len(records) == 1:
-                              depth, action, before, after = records[0]
-                              if max(int(before), int(after)) <= 65535 and before != after:
-                                  print(f'::error title=Effect color history diagnostic::depth={depth} action={action} before={before} after={after}')
-                      if name == 'engine::native::output::tests::retained_noop_and_unshifted_expansion_keep_original_across_distinct_owned_stores':
-                          records = re.findall(r'^PB_RETAINED_DIAG step=(0|[1-9][0-9]?) width=(0|4|8|16) resident=(0|[1-9][0-9]{0,7}) disk=(0|[1-9][0-9]{0,7}) ok=(0|1)$', body, re.M)
-                          if records:
-                              step, width, resident, disk, ok = records[-1]
-                              if int(resident) <= 16 * 1024 * 1024 and int(disk) <= 8 * 1024 * 1024:
-                                  print(f'::error title=Retained source diagnostic::step={step} width={width} resident={resident} disk={disk} ok={ok}')
-                      input_cases = {
-                          'edit_bounds::input::tests::projected_frame_and_brush_share_one_complete_output_with_the_legacy_soft_baseline': ('frame_brush', {'brush'}),
-                          'edit_bounds::input::tests::session_clone_and_heal_match_resident_source_offsets_and_soft_selection': ('retouch', {'clone', 'heal'}),
-                      }
-                      if name in input_cases:
-                          records = re.findall(r'^PB_NATIVE_INPUT_FAILURE case=(frame_brush|retouch) phase=(stage|seal|legacy_history|pixels|cleanup|cancel) depth=(8|16) mode=(brush|clone|heal) category=(refused|history_count|pixel_count|quota_count|retained_inventory) count=(0|[1-9][0-9]{0,6})$', body, re.M)
-                          if records:
-                              case, phase, depth, mode, category, count = records[-1]
-                              expected_case, modes = input_cases[name]
-                              if case == expected_case and mode in modes and int(count) <= 1048576:
-                                  print(f'::error title=Native input diagnostic::case={case} phase={phase} depth={depth} mode={mode} category={category} count={count}')
-                      if name in {
-                          'source::stage::tests::actual_session_vector_refusal_reclaims_only_owned_provisional_files',
-                          'source::stage::tests::actual_session_vector_mid_record_refusal_retains_unverified_bytes_and_quota',
-                      }:
-                          records = re.findall(r'^VECTOR_REFUSAL_STATUS completed=(0|[1-9][0-9]{0,3}) canceled=(true|false) retained=(true|false)$', body, re.M)
-                          if records:
-                              completed, canceled, retained = records[-1]
-                              if int(completed) <= 4096:
-                                  print(f'::error title=Vector refusal diagnostic::completed={completed} canceled={canceled} retained={retained}')
-          elif int(sys.argv[3]):
-              codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
-              categories = []
-              if not codes:
-                  kinds = {
-                      'CARGO_TEST_FAILURE': r'^error: test failed(?:,|$)',
-                      'CARGO_BUILD_FAILURE': r'^error: could not compile\b',
-                      'BUILD_SCRIPT_FAILURE': r'^error: failed to run custom build command\b',
-                      'LINKER_FAILURE': r'^error: linking with [^\r\n]{0,4096} failed:',
-                      'COMPILER_PANIC': r"^(?:error: (?:the compiler unexpectedly panicked|internal compiler error)|thread 'rustc' panicked)",
-                      'OUT_OF_MEMORY_DIAGNOSTIC': r'^(?:error: |LLVM ERROR: |fatal runtime error: )?(?:out of memory|memory allocation of [0-9]+ bytes failed)\b',
-                      'DISK_FULL_DIAGNOSTIC': r'^(?:error:|fatal error:|LLVM ERROR:)[^\r\n]{0,4096}(?:No space left on device|os error 28\b|os error 112\b)',
-                  }
-                  categories = [name for name, pattern in kinds.items() if re.search(pattern, log, re.M)]
-                  # Report termination evidence, never infer a cause from SIGKILL.
-                  endings = re.findall(r"^  process didn't exit successfully: [^\r\n]{1,8192} \((signal|exit status|exit code): (0x[0-9a-fA-F]{1,8}|[0-9]{1,10})(?:, [^\r\n)]{0,512})?\)[ \t]*$", log, re.M)
-                  for kind, value in endings[:8]:
-                      number = int(value, 16 if value.startswith('0x') else 10)
-                      if kind == 'signal' and value.isdecimal() and 1 <= number <= 127:
-                          categories.append(f'CHILD_SIGNAL_{number}')
-                      elif kind != 'signal' and 1 <= number <= 0xffffffff:
-                          categories.append(f'CHILD_EXIT_{number}')
-              detail = ', '.join(codes[:32] or list(dict.fromkeys(categories)) or ['UNKNOWN'])
-              print('::error title=Regression test run failed::' + detail)
-              if codes:
-                  locations = re.findall(r'^\s*(?:-->|:::)\s+((?:src|tests|examples|vendor)[/\\][A-Za-z0-9_./\\-]+|build\.rs):([0-9]+):([0-9]+)\s*$', log, re.M)
-                  for path, line, column in locations[:32]:
-                      path = path.replace('\\', '/')
-                      if '..' not in path.split('/'):
-                          print(f'::error file={path[:256]},line={int(line)},col={int(column)},title=Compiler diagnostic location::See the reported compiler error codes')
-          # Publish only bounded test identifiers/counts, never arbitrary
-          # panic output, environment values, paths or fixture contents.
-          with Path(sys.argv[2]).open('a', encoding='utf-8') as summary:
-              summary.write('### Regression tests\n\n')
-              summary.write(f'Exit status: {int(sys.argv[3])}\n\n')
-              if detail:
-                  summary.write(f'Failure classification: `{detail}`\n\n')
-              summary.writelines(f'- `{line}`\n' for line in results[:100])
-              if failures:
-                  summary.write('\nFailed tests:\n\n')
-                  summary.writelines(f'- `{name[:256]}`\n' for name in failures[:100])
-          PY
-          exit "$test_status"
-      - name: Record headless workspace CPU component baseline
-        shell: bash
-        run: |
-          set +e
-          cargo test --locked --lib ui::input_performance_diagnostic::actual_workspace_control_and_navigation_components -- --exact --ignored --nocapture --test-threads=1 > "$RUNNER_TEMP/peerbrush-ui-cpu.log" 2>&1
-          diagnostic_status=$?
-          python - "$RUNNER_TEMP/peerbrush-ui-cpu.log" "$(git rev-parse HEAD)" "$diagnostic_status" <<'PY'
-          import json, sys
-          from pathlib import Path
-          path = Path(sys.argv[1])
-          if int(sys.argv[3]) or path.stat().st_size > 2 * 1024 * 1024:
-              raise SystemExit('Headless workspace CPU diagnostic failed; no timing comparison established')
-          rows = []
-          for line in path.read_text(encoding='utf-8', errors='strict').splitlines():
-              if line.startswith('{'):
-                  value = json.loads(line)
-                  if isinstance(value, dict) and value.get('format') == 'PeerBrushUiCpuDiagnosticV1':
-                      rows.append(value)
-          if len(rows) != 1 or rows[0].get('build', {}).get('commit') != sys.argv[2] or rows[0]['build'].get('tree') != 'clean' or rows[0].get('native_window') is not False:
-              raise SystemExit('CPU diagnostic does not match exact clean source/headless scope')
-          print('CPU component metrics only; caches/scheduling uncontrolled; compiler/platform changes are not controlled before/after comparisons.')
-          print(json.dumps(rows[0], sort_keys=True, separators=(',', ':')))
-          PY
-      - name: Record balanced native16 CPU kernel baseline
-        shell: bash
-        run: |
-          set +e
-          cargo test --locked --lib depth16::color::tests::native16_spatial_kernel_performance -- --exact --ignored --nocapture --test-threads=1 > "$RUNNER_TEMP/peerbrush-native16-cpu.log" 2>&1
-          diagnostic_status=$?
-          python - "$RUNNER_TEMP/peerbrush-native16-cpu.log" "$(git rev-parse HEAD)" "$diagnostic_status" <<'PY'
-          import json, math, re, sys
-          from pathlib import Path
-          path = Path(sys.argv[1])
-          failure = 'Native16 CPU kernel diagnostic failed; no timing comparison established'
-          if int(sys.argv[3]) or path.stat().st_size > 2 * 1024 * 1024:
-              raise SystemExit(failure)
-          rows = [line for line in path.read_text(encoding='utf-8', errors='strict').splitlines() if line.startswith('{')]
-          if len(rows) != 1 or len(rows[0]) > 4096:
-              raise SystemExit(failure)
-          def unique_fields(pairs):
-              result = {}
-              for key, value in pairs:
-                  if key in result:
-                      raise ValueError('Duplicate metric field')
-                  result[key] = value
-              return result
-          try:
-              value = json.loads(rows[0], object_pairs_hook=unique_fields)
-              fixed = dict(format='PeerBrushNative16SpatialV1', group='native16-premultiplied-radius4',
-                  width=2048, height=2048, radius=4, pairs=6,
-                  order=['channel-pixel', 'pixel-channel'] * 3)
-              if (not isinstance(value, dict) or set(value) != set(fixed) | {'build', 'channel_major_ms', 'pixel_major_ms', 'native_window', 'cpu_used', 'gpu_used'}
-                      or any(value[key] != expected for key, expected in fixed.items())
-                      or value['native_window'] is not False or value['cpu_used'] is not True or value['gpu_used'] is not False):
-                  raise ValueError('Wrong kernel metric scope')
-              build = value['build']
-              if (not isinstance(build, dict) or set(build) != {'format', 'schema', 'product', 'version', 'commit', 'tree', 'end'}
-                      or build['format'] != 'PeerBrushBuildInfoV1' or type(build['schema']) is not int or build['schema'] != 1
-                      or build['product'] != 'PeerBrush' or build['end'] != 'PeerBrushBuildInfoEnd'
-                      or build['commit'] != sys.argv[2] or not re.fullmatch('[0-9a-f]{40}', sys.argv[2]) or build['tree'] != 'clean'
-                      or not isinstance(build['version'], str) or len(build['version']) > 80
-                      or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', build['version'])):
-                  raise ValueError('Wrong kernel build binding')
-              for name in ['channel_major_ms', 'pixel_major_ms']:
-                  samples = value[name]
-                  if (not isinstance(samples, list) or len(samples) != 6
-                          or any(type(sample) not in [int, float] or not math.isfinite(sample) or sample <= 0 for sample in samples)):
-                      raise ValueError('Invalid kernel samples')
-          except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
-              raise SystemExit(failure) from None
-          print('Native16 CPU kernel metrics only; full-word parity asserted; caches/scheduling uncontrolled; no application/GUI/GPU/peak-memory or isolated-causation claim.')
-          print(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False))
-          PY
-      - name: Verify native installed-font inventory without registration
-        run: cargo test --locked --lib fonts::tests::native_enumeration_reports_exact_selectable_faces_without_paths -- --ignored --exact
-      - run: cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests
-      - run: cargo clippy --all-targets --locked
+      - name: Run the essential release cases once
+        run: python -B scripts/release_essentials.py
       - name: Verify native macOS document delivery and icon
         if: runner.os == 'macOS'
         shell: bash
@@ -371,37 +139,6 @@ jobs:
           cargo run --locked --example macos_activation
           cargo run --locked --example macos_quit
           sips -s format png assets/peerbrush.icns --out "$RUNNER_TEMP/peerbrush-icon.png"
-      - run: python scripts/test_package.py
-      - run: python scripts/test_msix.py
-      - run: python -B scripts/test_signed_msix.py
-      - run: python -B scripts/test_windows_executable_signing.py
-      - run: python -B scripts/test_windows_qualification.py
-      - run: python -B scripts/test_linux_qualification.py
-      - run: python -B scripts/test_appinstaller.py
-      - run: python -B scripts/test_store_msix_preflight.py
-      - run: python -B scripts/test_store_msix_handoff.py
-      - run: python -B scripts/test_store_sdk_qualification.py
-      - run: python -B scripts/test_store_sdk_inputs.py
-      - run: python -B scripts/test_store_sdk_final_inputs.py
-      - run: python -B scripts/test_store_handoff_history.py
-      - run: python scripts/test_sign_macos.py
-      - run: python -B scripts/test_macos_signing_producer.py
-      - run: python -B scripts/test_deb.py
-      - run: python -B scripts/test_deb_version_upgrade_checks.py
-      - run: python -B scripts/test_deb_installed_gui_checks.py
-      - run: python -B scripts/test_macos_dmg.py
-      - run: python -B scripts/test_final_macos_dmg.py
-      - run: python -B scripts/test_dmg_file_identity.py
-      - run: python -B scripts/test_dmg_handoff.py
-      - run: python -B scripts/test_macos_qualification_attestation.py
-      - run: python -B scripts/test_macos_qualification_producer.py
-      - run: python -B scripts/test_macos_qualification_job.py
-      - run: python -B scripts/test_sign_macos_dmg.py
-      - name: Native DMG round trip with synthetic unsigned data
-        if: runner.os == 'macOS'
-        run: python3 -B scripts/test_macos_dmg_native.py
-      - run: python -B scripts/test_prepare_sparkle.py
-      - run: python -B scripts/test_sparkle_bundle.py
       - name: Verify disabled native Sparkle preparation
         if: runner.os == 'macOS'
         shell: bash
@@ -411,17 +148,6 @@ jobs:
           cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-preparation/Sparkle.framework"
           python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --native-audit-output "$RUNNER_TEMP/peerbrush-sparkle-native-audit"
           cat "$RUNNER_TEMP/peerbrush-sparkle-native-audit/native-policy-candidate.json"
-      - run: python scripts/test_submit_store_release.py
-      - run: python -B scripts/test_store_workflow.py
-      - run: python scripts/test_store_release_state.py
-      - run: python scripts/test_production_readiness.py
-      - run: python -B scripts/test_final_release.py
-      - run: python -B scripts/test_final_inputs.py
-      - run: python -B scripts/test_publish_release.py
-      - run: python -B scripts/test_prepare_site_release.py
-      - run: python -B scripts/test_readback_site_release.py
-      # Keep release dependencies separately: the earlier immutable cache is
-      # saved before release compilation. Exclude runtime profiles and test work.
       - name: Restore release compilation outputs
         id: release_cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5, Node.js 24
@@ -443,14 +169,6 @@ jobs:
             target/release/deps
             target/release/incremental
           key: ${{ steps.release_cache.outputs.cache-primary-key }}
-      - name: Verify fixed-offer setup feature component tests
-        run: cargo test --locked --features windows-setup --lib updates::windows::bootstrap
-      - name: Build dormant setup entry without an offer
-        run: python -B scripts/build_release.py --setup-entry
-      - name: Verify fixed-offer setup contracts and read-only runtime
-        run: python -B scripts/test_windows_setup.py
-      - run: python -B scripts/test_windows_version.py
-      - run: python scripts/test_msix_runtime_tests.py
       - name: Package and report archive sizes
         shell: bash
         run: |

@@ -2,64 +2,63 @@
 
 PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store 0.26 remains pending. The active [v0.3 milestone](development-0.3.md) proposes the remaining backlog and installation/release foundations, with PB-108 first. Its approved application version is 0.30.0; development packages are unreleased.
 
-## Branches and pull requests
+## Direct version development and release promotion
 
-| Branch | Role | Pull request destination |
-| --- | --- | --- |
-| `main` | Production source | Receives `dev` |
-| `dev` | Final integration and release acceptance | `main` |
-| `version/0.3` | Active v0.3 milestone; application version 0.30.0 | `dev` |
-| `feature/0.3/<topic>` | One focused v0.3 feature or foundation | `version/0.3` |
-| `fix/0.3/<topic>` | One focused v0.3 bug fix | `version/0.3` |
-| `version/0.26` | Changes and acceptance work intended for 0.26 | `dev` |
-| `feature/0.26/<topic>` | One focused feature or documentation change | `version/0.26` |
-| `fix/0.26/<topic>` | One focused bug fix | `version/0.26` |
-| `site-content` | Reviewed public website output | Website deployment workflow |
-| `maintenance/archive-<checkpoint>` | Retained historical packaging corrections | No normal development promotion |
-| `maintenance/site-<topic>` | A reviewed website content change | `site-content` |
+Develop directly on the appropriate version branch. The active milestone is
+`version/0.3`, with application version 0.30.0; development builds remain
+unreleased. Production source is `main`. `dev` and existing feature/fix branches
+retain historical and explicitly unqualified WIP checkpoints. Do not delete,
+rewrite or automatically integrate those checkpoints.
 
-The active `version/0.3` integration branch starts from synchronized `dev`/`main`. Use `feature/0.3/<topic>` or `fix/0.3/<topic>` targeting it; do not mix new development into published 0.26 artifacts. The installation/release foundations are explicitly proposed for v0.3 in its development queue, with PB-108 still first.
-
-The normal promotion order is **feature or fix → matching version → dev → main**. Use lowercase names and a descriptive topic, for example `fix/0.26/selection-coverage`. Never create a `codex/` branch, regardless of capitalization. `origin/` is the remote-tracking prefix, not part of a branch name. Git cannot hold both `version/0.26` and `version/0.26/selection-coverage`; feature and fix names use their own namespace.
-
-Create each version branch from the current `dev` after synchronizing required production fixes. Keep a version's scope explicit so another version's unfinished work cannot enter its production promotion. Create focused branches from their matching version branch:
+The development path is **version branch → main**. Do not create routine feature
+PRs or run push/feature-to-version CI. A version-to-`main` promotion is a release
+candidate, not authorization to publish. Never force-push shared history. Website
+maintenance remains separate: `maintenance/site-*` → `site-content`.
 
 ```sh
-git fetch origin --prune
-git switch -c feature/0.26/selection-coverage origin/version/0.26
-# Implement and review the focused change.
-git push -u origin feature/0.26/selection-coverage
+git fetch origin
+git switch version/0.3
+git pull --ff-only origin version/0.3
+# Make the requested change and commit it directly on this version branch.
+git push origin version/0.3
 ```
 
-Open a PR against `version/0.26`, describe the resulting behavior, and include verification evidence and remaining limits. Prefer one backlog item or coherent slice per PR. A source implementation alone does not close native or receiving-application acceptance work.
+## Essential release verification
 
-Feature and fix PRs may be squash merged. Use merge commits for version → dev and dev → main, retaining shared ancestry for subsequent promotions. Do not rebase or force-push shared promotion branches. After production fixes, merge the production history back into `dev` and each affected active version before new work. Delete a focused branch only after its work is merged or explicitly superseded and unique work is preserved. Preserve published tags, release provenance and unique historical corrections during cleanup.
+Ordinary development commits do not automatically execute tests. Preserve useful
+test source, but do not add broad suites or repeatedly run exhaustive checks by
+default. Build or investigate a specific failure only when the work requires it.
 
-The CI branch-policy check rejects forbidden names and incorrect PR destinations. Configure required checks on `main`, `dev` and `version/*`: branch policy, contributor attribution, all native platform jobs and package inspection. Disable force pushes and deletion on these active promotion branches. A CI check is not a server-side branch creation restriction; repository protection settings must enforce required checks.
+Open a version-to-`main` release candidate after its intended features are complete.
+The release gate runs once for that candidate: approved attribution and branch
+policy, ten existing critical editing/selection/undo/save-reopen/conflict/export
+cases, native builds, and real package/source integrity on Windows, macOS and
+Linux. The selected code cases are defined in `scripts/release_essentials.py`.
+Large resource experiments, broad unit suites, benchmarks and SVG oracles are
+not automatic development or release gates. The separate SVG oracle is manual.
 
-## Build and verification
+If a release check fails, stop promotion. Repair the actual failure on the version
+branch, use the relevant targeted recheck when requested, and identify the repaired
+candidate precisely. An old pass or a failed run cannot qualify a later source.
+The selector accepts `--case TARGET:NAME` for that targeted diagnosis; `--check`
+validates the selection without executing application tests.
 
-Use the committed Rust 1.92.0 toolchain and [native JPEG XL build prerequisites](jpeg-xl-build.md). Linux CI installs `libxkbcommon-dev`, `libwayland-dev`, `libxcb-shape0-dev` and `libxcb-xfixes0-dev`. On Windows, start in an existing MSVC/SDK developer shell with the reviewed Clang/CMake/Ninja on PATH. The command wrapper selects these tools only for its child; the older ignored GNU bootstrap is no longer selected.
+Actual artifact identity, signatures, Store/notarization requirements, package
+installation, native feature acceptance and publication protections still apply.
+Release/signing producers build and validate their exact artifacts without
+repeating the broad code suite. Unfinished 16K integration and known failed checks
+remain release blockers; reducing test volume does not resolve those defects.
 
-```sh
-python scripts/jxl_build.py -- run --locked -- --state-dir .runtime
-cargo fmt --all -- --check
-python scripts/jxl_build.py -- build --locked --bin peerbrush
-python scripts/jxl_build.py -- test --locked
-python scripts/jxl_build.py -- clippy --all-targets --locked
-python scripts/test_package.py
-python -B scripts/test_windows_executable_signing.py
-```
+Use Rust 1.92.0 and the [native JPEG XL prerequisites](jpeg-xl-build.md). For an
+explicit build use `python scripts/jxl_build.py -- build --locked --bin peerbrush`.
+Do not automatically invoke `cargo test`, Clippy, benchmark suites or Python test
+discovery during routine work.
 
-```powershell
-.\scripts\dev.ps1 run
-.\scripts\dev.ps1 test
-.\scripts\dev.ps1 build
-```
-
-GitHub Actions runs the engine, codec, protocol, UI and packaging checks on Windows, macOS and Linux. Push focused work while those checks run; inspect failures and fix them before merging. Passing a previous commit does not validate a later revision. Package inspection checks the matching version, source commit, source archive and platform packages. Actions artifacts are development or candidate downloads until an actual release is published.
-
-Behavior changes also require native visual verification: inspect actual rendered strokes, transforms, masks, effects and layer movement, plus gesture completion/cancellation and undo. Preserve human work and use an isolated workspace for synthetic checks. Verify native16 edits and saved PSD/PNG channels at their original precision. Record real Photoshop/application versions for receiving-application checks; protected unsupported documents must remain read-only. Windows native evidence does not establish macOS/Linux desktop acceptance.
+Repository administrators must reconcile branch rules with this policy: permit
+authorized direct development on `version/*`; retain protected production `main`
+with its release gate, attribution and package inspection. Changing protection,
+required-check or credential settings requires separate authorization. Existing
+branches and PRs must not be deleted or forcibly closed to enforce this workflow.
 
 ## Architecture and contribution rules
 
@@ -75,9 +74,13 @@ Default launches use the versioned [per-user preferences profile](settings.md). 
 
 ## Release promotion and website
 
-Before version → dev, complete the intended scope and report unresolved acceptance work. Before dev → main, confirm the release version and notes, all required checks, native acceptance evidence and a clean reviewed release source. Production publication must use Windows, macOS and Linux packages built and verified from the exact same production commit and version; never relabel an older platform binary.
-
-The intended automated production sequence is **main → exact-source tests/builds → verified packages → versioned GitHub release → matching website release information and deployment**. The existing CI builds and inspects all three platforms. Currently `release.yml` prepares candidates through manual dispatch, and `pages.yml` deploys a specifically reviewed `site-content` commit through manual dispatch from `main`. The `github-pages` environment restricts eligible deployment branches; preserve that protection. Merging application source into `main` does not currently publish a release or synchronize website release data. Do not describe the complete production sequence as active until it is configured and verified. The unreleased [final composition and immutable publication controller](production-publishing.md) adds source/version checks on main and a protected preparation path; publication remains unconditionally disabled while native producers and installed acceptance are incomplete.
+Before version → `main`, complete the intended scope and report all unresolved
+acceptance work. Confirm the release version, notes, essential gate and actual
+native/package evidence for the exact candidate. Publication requires packages
+from the same reviewed production commit and version; never relabel an older
+binary. Production build/signing/publication workflows keep their separate
+authority and artifact checks. A version push or release-gate pass does not grant
+release, deployment, signing-credential or Store-submission authority.
 
 Follow the [release-maintenance playbook](release-maintenance.md) for actual publication, checksums, version history and read-back verification. Keep the site's development-guide link pointed at a published branch or a verified source commit containing this guide. Keep unreleased version queues separate from published downloads. Website content changes use `maintenance/site-<topic>` based on `site-content`; review the public diff before promoting the result to `site-content`, then dispatch the website workflow from an eligible branch with its exact site commit. Confirm the deployed content, not just workflow completion. Do not merge the website output branch into application source or delete it while the deployment workflow uses it.
 

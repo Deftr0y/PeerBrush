@@ -1,6 +1,6 @@
 # PeerBrush development
 
-- Follow the [development guide](docs/development-guide.md) for branch names, pull request targets, verification and promotion. Never create branches under `codex/` (in any capitalization). Use `feature/<version>/<topic>` or `fix/<version>/<topic>`, based on the matching `version/<version>` branch. Promote through `version/<version>` → `dev` → `main`; preserve shared history with merge commits between promotion branches. Historical maintenance and website content have separate documented roles.
+- Develop directly on the appropriate `version/<version>` branch; the active milestone is `version/0.3` (application version 0.30.0). Do not create routine feature/fix PRs or run development CI. Production is `main`; a version-to-`main` release candidate receives the essential gate once before promotion. `dev` and existing feature branches retain historical/WIP work. Never force-push or delete that history. Historical maintenance and website content have separate roles in the [development guide](docs/development-guide.md).
 
 - Git attribution belongs to the human contributor. Never register an LLM or AI tool as a commit author, committer, co-author or contributor, or add automated contributor badges. Use an approved human identity from `.github/human-contributors.json`; adding another identity requires the maintainer to verify that it belongs to a human. GitHub's signing service is allowed only as a committer. Keep the README's AI-development disclosure.
 
@@ -13,7 +13,7 @@
 - Every save must contain a current merged composite. PeerBrush-only source data must not replace standard PSD raster/mask data.
 - Preserve human work when resolving conflicts or undoing agent tasks.
 - Keep model choice outside the application; return actual image content and explicit document coordinates to clients.
-- Run engine/codec/protocol tests and visually verify the native workspace after behavior changes.
+- Do not automatically run tests during ordinary development. Keep focused tests as source, then run the small essential release gate once for a version-to-production candidate. A failed check blocks release and requires repair plus the relevant targeted recheck; do not rerun broad suites by default. Actual package, signing, provenance and required native acceptance checks remain mandatory for release artifacts.
 - Do not commit generated QA artifacts, credentials, connection tokens, development tools, recovery files, or build outputs. Requested bundled app artwork, fonts and curated documentation screenshots are source assets and must accompany the application.
 
 - Layer controls use a connected Color/Mask selector, with blend and opacity beneath the effects. Top effects run last. Rename inline, without a dialog. Create regular layers, folders and explicitly requested adjustment layers; new folders collect selected roots.
@@ -52,7 +52,7 @@ Take the first option that fully works:
 - Prefer the shortest readable working diff, after understanding its full scope. Comment only reasons the code cannot express.
 - For a bug fix, search every caller before editing and fix the root cause in shared code. Preserve existing validation and error handling when moving or merging code.
 - Between equally small options, choose the one that handles edge cases correctly.
-- New non-trivial logic needs a focused test or assert-based self-check. Trivial changes need none. Follow PeerBrush's required suites and native verification for behavior changes.
+- Add a focused test or assertion only for concrete critical behavior; trivial changes need none. Execute the essential selection at the release gate, or a specifically requested targeted diagnosis, rather than repeatedly testing development commits.
 - Mark a deliberate bounded shortcut with `shortcut: <the limit>, <when to upgrade>`; do not use shortcuts to bypass project requirements.
 
 Never cut trust-boundary validation, protection against data loss, security, accessibility, hardware calibration or anything the user requested.
