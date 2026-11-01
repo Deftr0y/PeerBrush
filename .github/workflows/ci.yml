@@ -209,6 +209,32 @@ jobs:
                               depth, action, before, after = records[0]
                               if max(int(before), int(after)) <= 65535 and before != after:
                                   print(f'::error title=Effect color history diagnostic::depth={depth} action={action} before={before} after={after}')
+                      if name == 'engine::native::output::tests::retained_noop_and_unshifted_expansion_keep_original_across_distinct_owned_stores':
+                          records = re.findall(r'^PB_RETAINED_DIAG step=(0|[1-9][0-9]?) width=(0|4|8|16) resident=(0|[1-9][0-9]{0,7}) disk=(0|[1-9][0-9]{0,7}) ok=(0|1)$', body, re.M)
+                          if records:
+                              step, width, resident, disk, ok = records[-1]
+                              if int(resident) <= 16 * 1024 * 1024 and int(disk) <= 8 * 1024 * 1024:
+                                  print(f'::error title=Retained source diagnostic::step={step} width={width} resident={resident} disk={disk} ok={ok}')
+                      input_cases = {
+                          'edit_bounds::input::tests::projected_frame_and_brush_share_one_complete_output_with_the_legacy_soft_baseline': ('frame_brush', {'brush'}),
+                          'edit_bounds::input::tests::session_clone_and_heal_match_resident_source_offsets_and_soft_selection': ('retouch', {'clone', 'heal'}),
+                      }
+                      if name in input_cases:
+                          records = re.findall(r'^PB_NATIVE_INPUT_FAILURE case=(frame_brush|retouch) phase=(stage|seal|legacy_history|pixels|cleanup|cancel) depth=(8|16) mode=(brush|clone|heal) category=(refused|history_count|pixel_count|quota_count|retained_inventory) count=(0|[1-9][0-9]{0,6})$', body, re.M)
+                          if records:
+                              case, phase, depth, mode, category, count = records[-1]
+                              expected_case, modes = input_cases[name]
+                              if case == expected_case and mode in modes and int(count) <= 1048576:
+                                  print(f'::error title=Native input diagnostic::case={case} phase={phase} depth={depth} mode={mode} category={category} count={count}')
+                      if name in {
+                          'source::stage::tests::actual_session_vector_refusal_reclaims_only_owned_provisional_files',
+                          'source::stage::tests::actual_session_vector_mid_record_refusal_retains_unverified_bytes_and_quota',
+                      }:
+                          records = re.findall(r'^VECTOR_REFUSAL_STATUS completed=(0|[1-9][0-9]{0,3}) canceled=(true|false) retained=(true|false)$', body, re.M)
+                          if records:
+                              completed, canceled, retained = records[-1]
+                              if int(completed) <= 4096:
+                                  print(f'::error title=Vector refusal diagnostic::completed={completed} canceled={canceled} retained={retained}')
           elif int(sys.argv[3]):
               codes = sorted(set(re.findall(r'^error\[(E[0-9]{4})\]', log, re.M)))
               categories = []

@@ -137,6 +137,10 @@ fn source(depth: u16) -> Document {
     source.layers[0].pixels.set16(8, 6, [7, 11, 13, 0]);
     source
 }
+fn input_failure(case: &str, phase: &str, depth: u16, mode: &str, category: &str, count: usize) {
+    assert!(count <= 1_048_576);
+    eprintln!("PB_NATIVE_INPUT_FAILURE case={case} phase={phase} depth={depth} mode={mode} category={category} count={count}");
+}
 #[test]
 fn projected_tiles_are_generation_bound_native_and_preserve_physical_padding() {
     let f = Fixture::new();
@@ -447,10 +451,17 @@ fn projected_frame_and_brush_share_one_complete_output_with_the_legacy_soft_base
             &session,
             &mut || Ok(()),
         )
-        .unwrap() else {
+        .unwrap_or_else(|_| {
+            input_failure("frame_brush", "stage", depth, "brush", "refused", 1);
+            panic!("Native frame brush staging refused")
+        }) else {
+            input_failure("frame_brush", "stage", depth, "brush", "refused", 0);
             panic!("Frame was not staged")
         };
-        let staged = draft.seal(&|| Ok(())).ok().unwrap();
+        let staged = draft.seal(&|| Ok(())).unwrap_or_else(|_| {
+            input_failure("frame_brush", "seal", depth, "brush", "refused", 1);
+            panic!("Native frame brush sealing refused")
+        });
         let mut expected = source.clone();
         crate::edit_bounds::prepare(
             &mut expected,
@@ -494,6 +505,9 @@ fn projected_frame_and_brush_share_one_complete_output_with_the_legacy_soft_base
             .unwrap();
         for y in 0..14 {
             for x in 0..23 {
+                if region.pixel16(x, y).unwrap() != expected.layers[0].pixels.get16(x, y) {
+                    input_failure("frame_brush", "pixels", depth, "brush", "pixel_count", 1);
+                }
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
                     expected.layers[0].pixels.get16(x, y)
@@ -501,20 +515,71 @@ fn projected_frame_and_brush_share_one_complete_output_with_the_legacy_soft_base
             }
         }
         drop(region);
-        staged.abort(&session, &|| Ok(())).unwrap();
+        staged.abort(&session, &|| Ok(())).unwrap_or_else(|_| {
+            input_failure("frame_brush", "cleanup", depth, "brush", "refused", 1);
+            panic!("Native frame brush cleanup refused")
+        });
+        if runtime.disk().used().unwrap() != baseline {
+            input_failure("frame_brush", "cleanup", depth, "brush", "quota_count", 1);
+        }
         assert_eq!(runtime.disk().used().unwrap(), baseline);
-        assert!(
-            crate::edit_bounds::output::stage_frame(&input, &frame, &session, &mut || {
-                if runtime.disk().used().unwrap() > baseline + 4096 {
-                    Err("cancelled after native frame staging".into())
-                } else {
-                    Ok(())
-                }
-            })
-            .is_err()
-        );
+        // Disk quota grows BEFORE append completes. Cancel only after a full
+        // owned frame exists; an interrupted append has a separate retention
+        // oracle below and must never be mistaken for confirmed retirement.
+        let seed = crate::edit_bounds::output::stage_frame_seed(
+            &input,
+            &frame,
+            &session,
+            &mut || Ok(()),
+            |_, bytes, _| Ok(bytes.clone()),
+        )
+        .unwrap_or_else(|_| {
+            input_failure("frame_brush", "cancel", depth, "brush", "refused", 1);
+            panic!("Complete frame preparation refused")
+        });
+        assert!(runtime.disk().used().unwrap() > baseline);
+        let error = match seed
+            .finish(&mut || Err("Cancelled after completed native frame staging".into()))
+        {
+            Err(error) => error,
+            Ok(draft) => {
+                draft.abort().unwrap();
+                input_failure("frame_brush", "cancel", depth, "brush", "refused", 0);
+                panic!("Cancelled frame finished")
+            }
+        };
+        assert!(error.contains("Cancelled after completed native frame staging"));
+        if runtime.disk().used().unwrap() != baseline {
+            input_failure("frame_brush", "cancel", depth, "brush", "quota_count", 1);
+        }
         assert_eq!(runtime.disk().used().unwrap(), baseline);
     }
+}
+
+#[test]
+fn projected_frame_mid_append_cancel_keeps_unconfirmed_inventory() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = source(16);
+    source.width = 20;
+    source.height = 14;
+    let document = native(&source, &session);
+    let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+    let frame = input.project_frame([15, 7, 20, 13]).unwrap().unwrap();
+    let before = runtime.disk().used().unwrap();
+    let result = crate::edit_bounds::output::stage_frame(&input, &frame, &session, &mut || {
+        if runtime.disk().used().unwrap() > before + 4096 {
+            Err("Cancelled during native frame append".into())
+        } else {
+            Ok(())
+        }
+    });
+    let error = result
+        .err()
+        .expect("Interrupted append returned no completed frame authority");
+    assert!(error.contains("native frame cleanup retained inventory"));
+    assert!(runtime.disk().used().unwrap() > before);
 }
 
 #[test]
@@ -949,6 +1014,7 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
     let session = runtime.begin().unwrap();
     for depth in [8, 16] {
         for heal in [false, true] {
+            let mode = if heal { "heal" } else { "clone" };
             let mut source = Document::new_depth(9, 7, depth).unwrap();
             let mut sample = crate::engine::Layer::new("Sample", "paint", 9, 7);
             sample.pixels = Raster::new_depth(9, 7, depth);
@@ -999,6 +1065,16 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
             legacy
                 .edit("human", &[command], None, None, "Retouch")
                 .unwrap();
+            if legacy.undo.len() != 1 {
+                input_failure(
+                    "retouch",
+                    "legacy_history",
+                    depth,
+                    mode,
+                    "history_count",
+                    legacy.undo.len(),
+                );
+            }
             assert_eq!(legacy.undo.len(), 1);
             let document = native(&source, &session);
             let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
@@ -1017,16 +1093,26 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
                 &session,
                 &mut || Ok(()),
             )
-            .unwrap() else {
+            .unwrap_or_else(|_| {
+                input_failure("retouch", "stage", depth, mode, "refused", 1);
+                panic!("Native retouch staging refused")
+            }) else {
+                input_failure("retouch", "stage", depth, mode, "refused", 0);
                 panic!("No retouch output")
             };
-            let output = draft.seal(&|| Ok(())).ok().unwrap();
+            let output = draft.seal(&|| Ok(())).unwrap_or_else(|_| {
+                input_failure("retouch", "seal", depth, mode, "refused", 1);
+                panic!("Native retouch sealing refused")
+            });
             let region = output
                 .surface()
                 .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
                 .unwrap();
             for y in 0..7 {
                 for x in 0..9 {
+                    if region.pixel16(x, y).unwrap() != legacy.doc.layers[0].pixels.get16(x, y) {
+                        input_failure("retouch", "pixels", depth, mode, "pixel_count", 1);
+                    }
                     assert_eq!(
                         region.pixel16(x, y).unwrap(),
                         legacy.doc.layers[0].pixels.get16(x, y),
@@ -1035,7 +1121,13 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
                 }
             }
             drop(region);
-            output.abort(&session, &|| Ok(())).unwrap();
+            output.abort(&session, &|| Ok(())).unwrap_or_else(|_| {
+                input_failure("retouch", "cleanup", depth, mode, "refused", 1);
+                panic!("Native retouch cleanup refused")
+            });
+            if runtime.disk().used().unwrap() != before {
+                input_failure("retouch", "cleanup", depth, mode, "quota_count", 1);
+            }
             assert_eq!(runtime.disk().used().unwrap(), before);
         }
     }
