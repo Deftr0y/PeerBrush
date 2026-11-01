@@ -79,10 +79,6 @@ impl Retirement {
             .checked_mul(std::mem::size_of::<egui::Color32>())
             .and_then(|n| n.checked_add(128))
             .ok_or("Native upload footprint overflow")?;
-        let charge = self
-            .pool
-            .reserve_bytes(bytes, MAX_PIXELS * 4 + 128)
-            .map_err(|e| e.to_string())?;
         {
             let mut state = self.queue.state.lock().unwrap_or_else(|e| e.into_inner());
             reap(&mut state);
@@ -91,11 +87,17 @@ impl Retirement {
             }
             state.reserved += 1;
         }
-        Ok(Ticket {
-            charge: Some(charge),
+        let mut ticket = Ticket {
+            charge: None,
             queue: self.queue.clone(),
             reserved: true,
-        })
+        };
+        ticket.charge = Some(
+            self.pool
+                .reserve_bytes(bytes, MAX_PIXELS * 4 + 128)
+                .map_err(|e| e.to_string())?,
+        );
+        Ok(ticket)
     }
     #[cfg(test)]
     pub(super) fn collect(&self) {
@@ -190,4 +192,18 @@ pub(super) fn small(pool: &ResidentBudget, limit: usize) -> Result<Retirement> {
             .spawn(move || run(queue))
             .map(|_| ())
     })
+}
+#[cfg(test)]
+pub(super) fn paused(pool: &ResidentBudget) -> Result<(Retirement, std::sync::mpsc::Sender<()>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owner = Retirement::start(pool, 8, move |queue| {
+        thread::Builder::new()
+            .name("peerbrush-test-image-retirement-gate".into())
+            .spawn(move || {
+                let _ = rx.recv();
+                run(queue)
+            })
+            .map(|_| ())
+    })?;
+    Ok((owner, tx))
 }
