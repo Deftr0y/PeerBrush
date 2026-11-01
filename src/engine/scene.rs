@@ -2,10 +2,13 @@
 //! grants neither file admission nor edit publication authority.
 use super::{Document, Layer};
 use crate::large_document::{DiskBudget, ResidentBudget};
+use crate::psd::memory36::{Admitted, MetadataCharge};
 use crate::raster::{Raster, Surface};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+#[path = "scene/bounds.rs"]
+mod bounds;
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_RASTER_LOCATIONS: usize = 65536;
@@ -53,18 +56,22 @@ impl RasterRoster {
 /// Shared output for the codec/recovery paths after their complete source proofs.
 /// This validates metadata/roster shape only; engine adoption remains separate.
 pub struct PendingScene {
-    metadata: Document36,
     roster: RasterRoster,
+    // The roster/index payload drops before its final shared metadata charge.
+    metadata: Admitted<Document36>,
     resident: ResidentBudget,
     disk: DiskBudget,
 }
 impl PendingScene {
-    pub fn new(
-        metadata: Document36,
+    pub(crate) fn new(
+        metadata: Admitted<Document36>,
         roster: RasterRoster,
         resident: ResidentBudget,
         disk: DiskBudget,
     ) -> Result<Self> {
+        if !metadata.owner().uses_budget(&resident) {
+            return Err("Native metadata uses a different resident admission pool".into());
+        }
         let count = metadata.visit_rasters(|reference| {
             let source = roster.get(reference)?;
             if !source.uses_budget(&resident) || !source.uses_disk_budget(&disk) {
@@ -96,8 +103,19 @@ impl PendingScene {
     pub fn disk_budget(&self) -> &DiskBudget {
         &self.disk
     }
-    pub fn into_parts(self) -> (Document36, RasterRoster, ResidentBudget, DiskBudget) {
-        (self.metadata, self.roster, self.resident, self.disk)
+    /// The consuming adopter moves fields while the charge remains inseparable
+    /// from the resulting document/candidate. No bare metadata extraction.
+    pub(crate) fn map_unique<U>(
+        self,
+        map: impl FnOnce(Document36, RasterRoster, &Arc<MetadataCharge>) -> Result<U>,
+    ) -> Result<Admitted<U>> {
+        let Self {
+            metadata,
+            roster,
+            resident: _,
+            disk: _,
+        } = self;
+        metadata.map_unique(|document, owner| map(document, roster, owner))
     }
 }
 
@@ -212,6 +230,7 @@ pub struct Coverage36 {
     pub mask: RasterRef36,
     pub bounds: [i32; 4],
     pub origin: [i32; 2],
+    #[serde(deserialize_with = "bounds::contours")]
     pub contours: Vec<Vec<[f32; 2]>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -327,6 +346,7 @@ pub struct Document36 {
     pub layers: Vec<Layer36>,
     pub filters: Vec<Effect36>,
     pub selection: Option<[i32; 4]>,
+    #[serde(default, deserialize_with = "bounds::polygon")]
     pub selection_polygon: Option<Vec<[f32; 2]>>,
     pub selection_coverage: Option<Coverage36>,
     pub selection_previous: Option<Coverage36>,
@@ -723,6 +743,10 @@ mod tests {
     struct Capture {
         planes: Vec<Raster>,
     }
+    fn admitted(metadata: Document36, budget: &ResidentBudget) -> Admitted<Document36> {
+        let owner = MetadataCharge::reserve(budget, 64 * 1024, &|| Ok(())).unwrap();
+        Admitted::from_parts(Arc::new(metadata), owner)
+    }
     impl RasterCollector for Capture {
         fn resident(&mut self, r: &Raster) -> Result<RasterRef36> {
             r.validate_layout()?;
@@ -854,9 +878,13 @@ mod tests {
         let resident = ResidentBudget::new(1024 * 1024).unwrap();
         let disk = DiskBudget::new(1024 * 1024, 16).unwrap();
         let roster = RasterRoster::new(vec![Surface::zero(256, 256, 16).unwrap()]).unwrap();
-        assert!(
-            PendingScene::new(metadata.clone(), roster, resident.clone(), disk.clone()).is_err()
-        );
+        assert!(PendingScene::new(
+            admitted(metadata.clone(), &resident),
+            roster,
+            resident.clone(),
+            disk.clone()
+        )
+        .is_err());
         let mut simple =
             Document36::capture(&Document::new(4, 4).unwrap(), &mut Capture::default()).unwrap();
         let roster = RasterRoster::new(vec![
@@ -864,10 +892,16 @@ mod tests {
             Surface::zero(4, 4, 8).unwrap(),
         ])
         .unwrap();
-        assert!(PendingScene::new(simple.clone(), roster, resident.clone(), disk.clone()).is_err());
+        assert!(PendingScene::new(
+            admitted(simple.clone(), &resident),
+            roster,
+            resident.clone(),
+            disk.clone()
+        )
+        .is_err());
         simple.layers[0].pixels.width = 5;
         let roster = RasterRoster::new(vec![Surface::zero(4, 4, 8).unwrap()]).unwrap();
-        assert!(PendingScene::new(simple, roster, resident, disk).is_err());
+        assert!(PendingScene::new(admitted(simple, &resident), roster, resident, disk).is_err());
     }
     #[test]
     fn zero_scene_admission_and_snapshot_do_not_create_source_files() {
@@ -882,12 +916,20 @@ mod tests {
         let resident = ResidentBudget::new(1024 * 1024).unwrap();
         let disk = DiskBudget::new(1024 * 1024, 16).unwrap();
         let roster = RasterRoster::new(vec![Surface::zero(4, 4, 8).unwrap()]).unwrap();
-        let pending = PendingScene::new(metadata, roster, resident.clone(), disk.clone()).unwrap();
+        let pending = PendingScene::new(
+            admitted(metadata, &resident),
+            roster,
+            resident.clone(),
+            disk.clone(),
+        )
+        .unwrap();
         let snapshot = SceneSnapshot::new(identity.clone(), pending, vec![], None, None).unwrap();
         assert_eq!(snapshot.identity(), &identity);
         assert_eq!(snapshot.metadata().layers.len(), 1);
-        assert_eq!(resident.used(), 0);
+        assert_eq!(resident.used(), 64 * 1024);
         assert_eq!(disk.used().unwrap(), 0);
+        drop(snapshot);
+        assert_eq!(resident.used(), 0);
     }
     #[test]
     fn typed_metadata_rejects_unknown_fields() {
