@@ -275,10 +275,25 @@ impl<'d, 's> TileOutput<'d, 's> {
         Ok(result)
     }
     pub(crate) fn finish(
-        mut self,
+        self,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<BuiltTiles<'d, 's>, RefusedTiles<'d, 's>> {
-        let surface = match self.candidate(check) {
+        self.finish_inner(false, check)
+    }
+    /// A semantic fill→paint transition needs a paired complete output even
+    /// when its rendered bytes are unchanged. Ordinary edits use finish().
+    pub(crate) fn finish_for_metadata(
+        self,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<BuiltTiles<'d, 's>, RefusedTiles<'d, 's>> {
+        self.finish_inner(true, check)
+    }
+    fn finish_inner(
+        mut self,
+        required_output: bool,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<BuiltTiles<'d, 's>, RefusedTiles<'d, 's>> {
+        let mut surface = match self.candidate(check) {
             Ok(surface) => surface,
             Err(reason) => {
                 return Err(RefusedTiles {
@@ -298,9 +313,24 @@ impl<'d, 's> TileOutput<'d, 's> {
                     });
                 }
             }
-            if self.replacements.is_empty() {
+            if self.replacements.is_empty() && !required_output {
                 return Ok(BuiltTiles::Unchanged);
             }
+        }
+        if required_output && surface.physical_tiles().next().is_none() {
+            surface = match Surface::zero(
+                self.binding.shape()[0],
+                self.binding.shape()[1],
+                self.binding.depth(),
+            ) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    return Err(RefusedTiles {
+                        reason: error.to_string(),
+                        builder: self,
+                    })
+                }
+            };
         }
         let mut fragments = Vec::new();
         if self.fragment.is_some() {

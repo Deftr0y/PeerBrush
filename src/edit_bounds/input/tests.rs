@@ -574,3 +574,242 @@ fn projected_mask_frames_keep_the_color_translation_with_their_own_native_shape(
     staged.abort(&session, &|| Ok(())).unwrap();
     assert_eq!(runtime.disk().used().unwrap(), baseline);
 }
+
+#[test]
+fn fill_visual_baseline_fixes_unselected_loss_and_keeps_one_real_undo_redo() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = source(depth);
+        source.layers[0].x = 0;
+        source.layers[0].y = 0;
+        source.layers[0].kind = "fill".into();
+        source.layers[0].color = [32, 96, 160, 128];
+        source.selection = Some([1, 1, 4, 4]);
+        let mut mask = Raster::new_depth(9, 7, 16);
+        mask.set16(2, 2, [32769, 0, 0, 0]);
+        let coverage = crate::selection::Coverage {
+            mask,
+            bounds: source.selection.unwrap(),
+            origin: [0, 0],
+            contours: vec![],
+        };
+        source.selection_coverage = Some(coverage.clone());
+        let command = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,"color":[240,16,48,255]});
+        // Reproducer of the former ordering: its before-snapshot sees the raw
+        // zero fill raster rather than the procedural visible color.
+        let mut unsafe_order = source.clone();
+        let raw_before = unsafe_order.clone();
+        crate::fill::apply(&mut unsafe_order, &command).unwrap();
+        crate::selection::restrict_document(&mut unsafe_order, &raw_before, &coverage);
+        assert_eq!(unsafe_order.layers[0].pixels.get16(7, 5), [0; 4]);
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[command], None, None, "Fill")
+            .unwrap();
+        let literal = source.layers[0].color.map(|v| u16::from(v) * 257);
+        assert_eq!(legacy.doc.layers[0].pixels.get16(7, 5), literal);
+        assert_eq!(legacy.doc.layers[0].kind, "paint");
+        assert_eq!(legacy.undo.len(), 1);
+        let after = legacy.doc.layers[0].pixels.clone();
+        legacy.undo("human").unwrap();
+        assert_eq!(legacy.doc.layers[0].kind, "fill");
+        assert_eq!(
+            legacy.doc.layers[0].pixels.get16(0, 0),
+            source.layers[0].pixels.get16(0, 0)
+        );
+        legacy.redo("human").unwrap();
+        assert_eq!(legacy.doc.layers[0].pixels.get16(7, 5), literal);
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let generated = crate::fill::input::stage_fill(
+            &input,
+            [240, 16, 48, 255],
+            None,
+            None,
+            &session,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert!(generated.materializes_fill());
+        assert_eq!(generated.baseline().unwrap().binding(), input.binding());
+        let (BuiltTiles::Draft(draft), proof) = generated.into_parts() else {
+            panic!("Materialized fill requires paired output")
+        };
+        assert_eq!(proof.unwrap().color(), source.layers[0].color);
+        let staged = draft.seal(&|| Ok(())).ok().unwrap();
+        let region = staged
+            .surface()
+            .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                assert_eq!(region.pixel16(x, y).unwrap(), after.get16(x, y));
+            }
+        }
+        drop(region);
+        staged.abort(&session, &|| Ok(())).unwrap();
+    }
+}
+
+#[test]
+fn corrected_fill_frame_keeps_visible_pixels_at_original_document_coordinates() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(12, 10, depth).unwrap();
+        source.layers[0].pixels = Raster::new_depth(4, 3, depth);
+        source.layers[0]
+            .pixels
+            .set16(0, 0, [12347, 23521, 43217, 49153]);
+        source.layers[0].x = 5;
+        source.layers[0].y = 4;
+        source.layers[0].kind = "fill".into();
+        source.layers[0].color = [32, 96, 160, 128];
+        source.selection = Some([0, 0, 12, 10]);
+        let mut mask = Raster::new_depth(12, 10, 16);
+        mask.set16(1, 1, [32769, 0, 0, 0]);
+        source.selection_coverage = Some(crate::selection::Coverage {
+            mask,
+            bounds: source.selection.unwrap(),
+            origin: [0, 0],
+            contours: vec![],
+        });
+        let command = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,"rect":[0,0,2,2],"color":[240,16,48,255]});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[command], None, None, "Fill")
+            .unwrap();
+        assert_eq!([legacy.doc.layers[0].x, legacy.doc.layers[0].y], [0, 0]);
+        assert_eq!(
+            legacy.doc.layers[0].pixels.get16(6, 5),
+            [32, 96, 160, 128].map(|v| v * 257)
+        );
+        assert_eq!(legacy.doc.layers[0].pixels.get16(0, 5), [0; 4]);
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let frame = input.project_frame([0, 0, 2, 2]).unwrap().unwrap();
+        let before = runtime.disk().used().unwrap();
+        assert!(crate::fill::input::stage_fill(
+            &input,
+            [240, 16, 48, 255],
+            Some([0, 0, 2, 2]),
+            None,
+            &session,
+            &mut || Ok(()),
+        )
+        .is_err());
+        assert_eq!(runtime.disk().used().unwrap(), before);
+        let generated = crate::fill::input::stage_fill(
+            &input,
+            [240, 16, 48, 255],
+            Some([0, 0, 2, 2]),
+            Some(&frame),
+            &session,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert!(generated.materializes_fill());
+        let (BuiltTiles::Draft(draft), _) = generated.into_parts() else {
+            panic!("Frame fill missing")
+        };
+        let staged = draft.seal(&|| Ok(())).ok().unwrap();
+        let region = staged
+            .surface()
+            .prepare_region(Region::new([0, 0, 12, 10]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..10 {
+            for x in 0..12 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    legacy.doc.layers[0].pixels.get16(x, y)
+                );
+            }
+        }
+        drop(region);
+        staged.abort(&session, &|| Ok(())).unwrap();
+    }
+}
+
+#[test]
+fn fill_clear_consumes_soft_coverage_once_and_keeps_transparent_baseline_rgb() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        for color in [[37, 83, 127, 113], [7, 11, 13, 0], [0, 0, 0, 0]] {
+            let mut source = Document::new_depth(9, 7, depth).unwrap();
+            source.layers[0].kind = "fill".into();
+            source.layers[0].color = color;
+            source.selection = Some([1, 1, 4, 4]);
+            let mut mask = Raster::new_depth(9, 7, 16);
+            mask.set16(2, 2, [32769, 0, 0, 0]);
+            source.selection_coverage = Some(crate::selection::Coverage {
+                mask,
+                bounds: source.selection.unwrap(),
+                origin: [0, 0],
+                contours: vec![],
+            });
+            let mut legacy = crate::engine::Engine::new();
+            legacy.doc = source.clone();
+            legacy.edit("human",&[serde_json::json!({"op":"paint.clear_selection","layer":source.layers[0].id})],None,None,"Clear").unwrap();
+            assert_eq!(legacy.undo.len(), 1);
+            assert_eq!(legacy.doc.layers[0].kind, "paint");
+            assert_eq!(
+                legacy.doc.layers[0].pixels.get16(7, 5),
+                color.map(|v| u16::from(v) * 257)
+            );
+            let document = native(&source, &session);
+            let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+            let generated =
+                crate::fill::input::stage_clear(&input, &session, &mut || Ok(())).unwrap();
+            assert!(generated.materializes_fill());
+            let (BuiltTiles::Draft(draft), _) = generated.into_parts() else {
+                panic!("Fill transition missing")
+            };
+            let staged = draft.seal(&|| Ok(())).ok().unwrap();
+            let region = staged
+                .surface()
+                .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            for y in 0..7 {
+                for x in 0..9 {
+                    assert_eq!(
+                        region.pixel16(x, y).unwrap(),
+                        legacy.doc.layers[0].pixels.get16(x, y)
+                    );
+                }
+            }
+            drop(region);
+            staged.abort(&session, &|| Ok(())).unwrap();
+        }
+    }
+}
+
+#[test]
+fn native_fill_refuses_unresolved_folder_and_editable_source_kinds() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for kind in ["group", "adjustment", "text", "vector"] {
+        let mut source = Document::new_depth(9, 7, 16).unwrap();
+        source.layers[0].kind = kind.into();
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let before = runtime.disk().used().unwrap();
+        assert!(crate::fill::input::stage_fill(
+            &input,
+            [240, 16, 48, 255],
+            None,
+            None,
+            &session,
+            &mut || Ok(()),
+        )
+        .is_err());
+        assert_eq!(runtime.disk().used().unwrap(), before);
+    }
+}
