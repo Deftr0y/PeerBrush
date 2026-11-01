@@ -9,6 +9,10 @@ use serde_json::Value;
 use std::sync::Arc;
 #[path = "scene/bounds.rs"]
 mod bounds;
+#[path = "scene/capture.rs"]
+mod capture;
+pub use capture::{CapturedScene, LegacyTileCache};
+pub(crate) use capture::{StageRuntime, StageSession, StagedScene};
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const MAX_RASTER_LOCATIONS: usize = 65536;
@@ -130,10 +134,18 @@ pub struct SceneIdentity {
 /// no native Surface or filesystem path participates in metadata serialization.
 pub struct SceneSnapshot {
     identity: SceneIdentity,
-    pending: PendingScene,
     leases: Arc<Vec<super::Lease>>,
     file_version: Option<crate::file_safety::Version>,
     _file_ownership: Option<Arc<crate::file_ownership::Ownership>>,
+    // Protected runtime inspection is retained, never promoted to editable sources.
+    runtime_views: RuntimeViews,
+    // Metadata admission outlives the other captured metadata allocations.
+    pending: PendingScene,
+}
+#[derive(Default)]
+struct RuntimeViews {
+    structure: Vec<crate::psd::SourceLayerInfo>,
+    patterns: Vec<crate::psd::patterns::Source>,
 }
 impl SceneSnapshot {
     pub(crate) fn new(
@@ -154,6 +166,7 @@ impl SceneSnapshot {
             leases: Arc::new(leases),
             file_version,
             _file_ownership: file_ownership,
+            runtime_views: RuntimeViews::default(),
         })
     }
     pub fn identity(&self) -> &SceneIdentity {
@@ -179,6 +192,48 @@ impl SceneSnapshot {
     }
     pub fn file_version(&self) -> Option<crate::file_safety::Version> {
         self.file_version
+    }
+    pub fn source_structure(&self) -> &[crate::psd::SourceLayerInfo] {
+        &self.runtime_views.structure
+    }
+    pub fn source_patterns(&self) -> &[crate::psd::patterns::Source] {
+        &self.runtime_views.patterns
+    }
+
+    /// Actual captured metadata and physical source identities, including gesture
+    /// pixels whose owner changed without a committed document revision.
+    pub fn render_key(&self) -> Result<[u8; 32]> {
+        use std::io::Write;
+        struct KeyWriter {
+            hash: ring::digest::Context,
+            remaining: usize,
+        }
+        impl Write for KeyWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.remaining {
+                    return Err(std::io::Error::other(
+                        "Captured scene metadata exceeds its bounded identity",
+                    ));
+                }
+                self.remaining -= bytes.len();
+                self.hash.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = KeyWriter {
+            hash: ring::digest::Context::new(&ring::digest::SHA256),
+            remaining: 64 * 1024 * 1024,
+        };
+        writer.hash.update(b"PeerBrush captured scene v1\0");
+        serde_json::to_writer(&mut writer, self.metadata()).map_err(|e| e.to_string())?;
+        for (id, surface) in self.rasters().iter() {
+            writer.hash.update(&id.to_be_bytes());
+            writer.hash.update(&surface.key().bytes());
+        }
+        Ok(writer.hash.finish().as_ref().try_into().unwrap())
     }
 }
 

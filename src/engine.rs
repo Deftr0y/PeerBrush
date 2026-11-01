@@ -486,6 +486,29 @@ pub struct Engine {
     pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
     pub(crate) code_jobs: Vec<crate::code::Job>,
 }
+impl Engine {
+    /// Capture strong immutable owners under the engine lock; staging and source
+    /// I/O must happen only after releasing that lock and the root/registry locks.
+    pub fn capture_scene(
+        &self,
+        preview: Option<&Document>,
+    ) -> Result<scene::CapturedScene, String> {
+        if self.closed {
+            return Err("Cannot capture a closed project".into());
+        }
+        let document = preview.unwrap_or(&self.doc);
+        if document.id != self.doc.id || document.revision != self.doc.revision {
+            return Err("Preview does not belong to the captured project revision".into());
+        }
+        Ok(scene::CapturedScene::from_parts(
+            document.clone(),
+            self.project_id.clone(),
+            self.leases.clone(),
+            self.file_version,
+            self.file_ownership.clone(),
+        ))
+    }
+}
 fn num(v: &Value, key: &str, default: f64) -> f64 {
     v.get(key).and_then(Value::as_f64).unwrap_or(default)
 }
