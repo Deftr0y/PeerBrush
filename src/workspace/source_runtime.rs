@@ -152,7 +152,7 @@ impl SourceRuntime {
         drop(state);
         let session = SourceSession {
             runtime: self.clone(),
-            operation,
+            operation: Arc::new(operation),
             directory,
         };
         session.check()?;
@@ -378,10 +378,26 @@ impl SourceRuntime {
 
 pub(crate) struct SourceSession {
     runtime: Arc<SourceRuntime>,
-    operation: RootOperation,
+    operation: Arc<RootOperation>,
     directory: PathBuf,
 }
+/// Nominal lifetime only. The worker owner parks this with an uncertain child
+/// until known exit; it grants no source I/O or publication capability.
+#[must_use]
+pub(crate) struct SessionRetention {
+    // Close retained inventory handles before the final operation/profile owner.
+    _runtime: Arc<SourceRuntime>,
+    _operation: Arc<RootOperation>,
+}
 impl SourceSession {
+    pub(crate) fn retain_for_child(&self) -> Result<SessionRetention, String> {
+        self.check()?;
+        Ok(SessionRetention {
+            _runtime: self.runtime.clone(),
+            _operation: self.operation.clone(),
+        })
+    }
+
     pub(crate) fn check(&self) -> Result<(), String> {
         self.operation.check()?;
         self.check_inventory()
@@ -1804,5 +1820,91 @@ mod tests {
         done.recv_timeout(Duration::from_secs(2)).unwrap();
         closer.join().unwrap();
         drop(runtime);
+    }
+    #[test]
+    fn nominal_child_retention_is_owned_send_static_without_granting_io() {
+        fn owned_send<T: Send + 'static>() {}
+        owned_send::<SessionRetention>();
+    }
+    #[test]
+    fn uncertain_child_retention_preserves_profile_instance_and_file_operation_until_drop() {
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let f = Fixture::new();
+        let profile =
+            crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).unwrap();
+        let (shared, connection) = f.connection();
+        let state_dir = connection.state_dir.clone();
+        let context =
+            PersistentRootContext::from_profile(&connection, profile.source_profile().unwrap())
+                .unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let workspace = crate::workspace::attach(&shared);
+        let before = workspace
+            .lock()
+            .unwrap()
+            .file_operations
+            .load(Ordering::Acquire);
+        assert_eq!(before, 1);
+        let retained = session.retain_for_child().unwrap();
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            before
+        );
+        drop(profile);
+        drop(context);
+        let (finished, done) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.check().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.check().is_err());
+        assert!(session.retain_for_child().is_err());
+        drop(session);
+        drop(runtime);
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            before
+        );
+        assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_err());
+        let instance = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_dir.join("instance.lock"))
+            .unwrap();
+        assert!(instance.try_lock().is_err());
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(retained);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        closer.join().unwrap();
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            0
+        );
+        instance.try_lock().unwrap();
+        assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_ok());
     }
 }
