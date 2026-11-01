@@ -8,6 +8,9 @@ use std::{
 };
 
 type Identity = (u64, u64);
+#[path = "disk/external.rs"]
+mod external;
+pub(crate) use external::{ExternalFact, PublicationTicket};
 
 #[derive(Clone)]
 pub struct DiskBudget(Arc<Inner>);
@@ -24,6 +27,8 @@ struct State {
     next: u64,
     files: BTreeMap<u64, Entry>,
     coexistence: Index<[u8; 32], ExternalEntry>,
+    known_external: Index<Identity, ExternalFact>,
+    publication_targets: Index<[u8; 32], external::Target>,
 }
 #[derive(Clone)]
 struct ExternalEntry {
@@ -129,6 +134,8 @@ impl DiskBudget {
                 next: 0,
                 files: BTreeMap::new(),
                 coexistence: Index::new(),
+                known_external: Index::new(),
+                publication_targets: Index::new(),
             }),
         })))
     }
@@ -180,7 +187,8 @@ impl DiskBudget {
                 bytes,
             });
         }
-        if state.files.len() + state.active_external >= self.0.maximum {
+        if state.files.len() + state.known_external.len() + state.active_external >= self.0.maximum
+        {
             return Err(Error::Budget);
         }
         let external = state.external.checked_add(bytes).ok_or(Error::Budget)?;
@@ -228,7 +236,8 @@ impl DiskBudget {
                     .is_some_and(|n| n <= self.0.limit)
             })
             .ok_or(Error::Budget)?;
-        if state.files.len() + state.active_external >= self.0.maximum {
+        if state.files.len() + state.known_external.len() + state.active_external >= self.0.maximum
+        {
             return Err(Error::Budget);
         }
         let key = state.next;
@@ -261,6 +270,9 @@ impl DiskBudget {
             return Err(Error::Changed);
         }
         let mut state = self.0.state.lock().map_err(|_| Error::Interrupted)?;
+        if state.known_external.get(&identity).is_some() {
+            return Err(Error::Changed);
+        }
         let existing = state
             .files
             .iter()
@@ -332,10 +344,11 @@ impl DiskReservation {
         }
         let length = file.metadata()?.len();
         let mut state = self.budget.0.state.lock().map_err(|_| Error::Interrupted)?;
-        if state
-            .files
-            .iter()
-            .any(|(key, entry)| *key != self.key && entry.identity == Some(identity))
+        if state.known_external.get(&identity).is_some()
+            || state
+                .files
+                .iter()
+                .any(|(key, entry)| *key != self.key && entry.identity == Some(identity))
         {
             return Err(Error::Changed);
         }
