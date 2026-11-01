@@ -4,8 +4,42 @@ use std::fs;
 use std::path::Path;
 
 #[cfg(windows)]
+pub(crate) fn wide_absolute_file_path(path: &Path) -> Result<Vec<u16>, String> {
+    use std::{
+        os::windows::ffi::OsStrExt,
+        path::{Component, Prefix},
+    };
+    // Match Rust's file operations without depending on the host's long-path
+    // opt-in. Lexical absolute paths do not resolve or follow a source symlink.
+    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let units: Vec<_> = absolute.as_os_str().encode_wide().collect();
+    let mut extended = match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => {
+                let mut result: Vec<_> = r"\\?\".encode_utf16().collect();
+                result.extend_from_slice(&units);
+                result
+            }
+            Prefix::UNC(_, _) => {
+                let mut result: Vec<_> = r"\\?\UNC\".encode_utf16().collect();
+                result.extend_from_slice(&units[2..]);
+                result
+            }
+            Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) => units,
+            _ => return Err("Expected a Windows disk or UNC file path".into()),
+        },
+        _ => return Err("Expected an absolute Windows file path".into()),
+    };
+    if extended.contains(&0) || extended.len() >= 32767 {
+        return Err("Invalid or overlong Windows file path".into());
+    }
+    extended.push(0);
+    Ok(extended)
+}
+
+#[cfg(windows)]
 pub(crate) fn preserve(source: &Path, destination: &Path) -> Result<(), String> {
-    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr::null_mut};
+    use std::{ffi::c_void, ptr::null_mut};
     #[link(name = "advapi32")]
     extern "system" {
         fn GetNamedSecurityInfoW(
@@ -32,12 +66,8 @@ pub(crate) fn preserve(source: &Path, destination: &Path) -> Result<(), String> 
     extern "system" {
         fn LocalFree(memory: *mut c_void) -> *mut c_void;
     }
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let source = wide_absolute_file_path(source)?;
+    let mut destination = wide_absolute_file_path(destination)?;
     let mut dacl = null_mut();
     let mut descriptor = null_mut();
     let error = unsafe {

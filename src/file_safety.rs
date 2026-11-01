@@ -8,6 +8,8 @@ use std::{
 #[path = "file_permissions.rs"]
 mod permissions;
 pub(crate) use permissions::preserve as preserve_permissions;
+#[cfg(windows)]
+pub(crate) use permissions::wide_absolute_file_path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Version {

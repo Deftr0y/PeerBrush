@@ -314,6 +314,7 @@
     "src/selection/system.rs",
     "src/selection/visited.rs",
     "src/server.rs",
+    "src/server/atomic_file_tests.rs",
     "src/server/fonts.rs",
     "src/settings.rs",
     "src/settings_tests.rs",

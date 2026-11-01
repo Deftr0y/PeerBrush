@@ -103,19 +103,20 @@ fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
 }
 #[cfg(windows)]
 fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     extern "system" {
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     }
-    let from: Vec<_> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<_> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let from = crate::file_safety::wide_absolute_file_path(from)?;
+    let to = crate::file_safety::wide_absolute_file_path(to)?;
     // Same-directory replacement, with Windows write-through durability.
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) } == 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
 }
+#[cfg(all(test, windows))]
+mod atomic_file_tests;
 pub(crate) fn sync_parent(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
