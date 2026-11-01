@@ -1,5 +1,6 @@
 pub mod backed;
 pub mod native;
+pub(crate) mod reframe_scope;
 pub mod scene;
 pub(crate) mod view;
 use crate::raster::{blend, check_size, Pixel, Raster};
@@ -803,6 +804,31 @@ impl Engine {
     }
     pub fn scopes(&self, c: &Value) -> Vec<Scope> {
         let mut scopes = self.command_scopes(c);
+        if self.doc.selection.is_some()
+            && matches!(c["op"].as_str(), Some("move" | "transform"))
+            && c["selection_only"] != false
+        {
+            if let Some(layer) = c["layer"]
+                .as_str()
+                .and_then(|id| self.doc.layers.iter().find(|layer| layer.id == id))
+            {
+                if let Some(mask) = &layer.mask {
+                    for scope in &mut scopes {
+                        if let Some(area) = &mut scope.rect {
+                            *area = reframe_scope::widen(
+                                *area,
+                                [layer.x, layer.y],
+                                [layer.pixels.width, layer.pixels.height],
+                                mask.linked,
+                                mask.steps
+                                    .iter()
+                                    .map(|step| [step.pixels.width, step.pixels.height]),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if self.doc.selection.is_some()
             && (c["op"] == "paint.clear_selection"
                 || (matches!(c["op"].as_str(), Some("move" | "transform"))
