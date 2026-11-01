@@ -574,6 +574,7 @@ impl CapturedEdit {
             cancellation: self.cancellation.clone(),
             intent,
             outputs: vec![],
+            admission: self.admission.clone(),
         })
     }
 }

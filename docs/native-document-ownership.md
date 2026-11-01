@@ -71,6 +71,14 @@ owners are returned for release after leaving the engine mutex. Undo and redo
 advance revision monotonically while sharing the exact native sources. Selective
 task compensation and runtime selection replay ownership still require migration.
 
+The editor capture factory binds the observed generation, revision, actor and
+targets after checking the current write fence and reservations. It performs no
+source I/O. Workers retain that admission with their candidate; native history
+refuses a data-only capture without editor admission. Final publication rechecks
+the actor, targets and current leases. Generated raster batches currently use
+conservative whole-layer publication scopes; exact command footprint binding
+must preserve the legacy rectangle reservation behavior before live adoption.
+
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,
 recovery and coordinated live document replacement must be connected and tested
