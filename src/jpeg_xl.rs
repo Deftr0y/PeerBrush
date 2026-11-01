@@ -4,6 +4,9 @@
 mod native;
 mod pipe;
 mod process_limits;
+mod stream_native;
+pub(crate) mod stream_parent;
+pub(crate) mod stream_protocol;
 pub use native::{Decoded, Info, Options, Pixels, PixelsRef, ENCODED_LIMIT};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,7 +16,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        mpsc, Arc, Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -28,7 +31,82 @@ const PROTOCOL: &str = "JPEG XL worker response was invalid; current work was pr
 static ACTIVE: Mutex<()> = Mutex::new(());
 static MAIN_EXE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 static FAILED_STOP: AtomicBool = AtomicBool::new(false);
-static RETAINED: Mutex<Option<Child>> = Mutex::new(None);
+struct RetainedWorker {
+    child: Child,
+    _limits: Option<process_limits::Parent>,
+    _source: Option<crate::workspace::source_runtime::SessionRetention>,
+    _resources: Option<ChildResources>,
+    #[cfg(test)]
+    reaped: Option<Arc<AtomicBool>>,
+}
+struct ChildResources {
+    charges: Vec<crate::large_document::Reservation>,
+    _headers: crate::large_document::Reservation,
+}
+static RETAINED: Mutex<Option<RetainedWorker>> = Mutex::new(None);
+static RETAINED_WAKE: Condvar = Condvar::new();
+static REAPER: OnceLock<Result<(), String>> = OnceLock::new();
+static REAPER_LIVE: AtomicBool = AtomicBool::new(false);
+fn release_retained(worker: Option<RetainedWorker>) {
+    #[cfg(test)]
+    let reaped = worker.as_ref().and_then(|w| w.reaped.clone());
+    drop(worker);
+    #[cfg(test)]
+    if let Some(reaped) = reaped {
+        reaped.store(true, Ordering::SeqCst);
+    }
+}
+fn ensure_reaper() -> Result<(), String> {
+    REAPER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::sync_channel(1);
+            thread::Builder::new()
+                .name("peerbrush-jxl-reaper".into())
+                .spawn(move || {
+                    struct Live;
+                    impl Drop for Live {
+                        fn drop(&mut self) {
+                            REAPER_LIVE.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    let _live = Live;
+                    REAPER_LIVE.store(true, Ordering::SeqCst);
+                    let _ = tx.send(());
+                    loop {
+                        let reaped = {
+                            let mut held = RETAINED.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if held.as_mut().is_some_and(|worker| {
+                                    matches!(worker.child.try_wait(), Ok(Some(_)))
+                                }) {
+                                    break held.take();
+                                }
+                                held = if held.is_some() {
+                                    RETAINED_WAKE
+                                        .wait_timeout(held, Duration::from_millis(50))
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .0
+                                } else {
+                                    RETAINED_WAKE.wait(held).unwrap_or_else(|e| e.into_inner())
+                                };
+                            }
+                        };
+                        // Condvar waits release the mutex; source/profile/resource
+                        // owners also drop outside it, and only after known exit.
+                        release_retained(reaped);
+                    }
+                })
+                .map_err(|_| "JPEG XL retained-owner reaper could not start".to_string())?;
+            rx.recv_timeout(Duration::from_secs(1))
+                .map_err(|_| "JPEG XL retained-owner reaper startup timed out".to_string())?;
+            Ok(())
+        })
+        .clone()?;
+    if !REAPER_LIVE.load(Ordering::SeqCst) {
+        return Err("JPEG XL retained-owner reaper is unavailable".into());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -323,6 +401,32 @@ pub fn main_entry() -> Option<i32> {
             2
         });
     }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--jxl-stream-worker")
+    {
+        return Some(
+            if arguments.len() == 1
+                && (|| -> Result<(), String> {
+                    let expected = ring::digest::digest(&ring::digest::SHA256, build()?.as_bytes())
+                        .as_ref()
+                        .try_into()
+                        .unwrap();
+                    stream_native::run(
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout().lock(),
+                        expected,
+                        &|| Ok(()),
+                    )
+                })()
+                .is_ok()
+            {
+                0
+            } else {
+                2
+            },
+        );
+    }
     let path = std::env::current_exe()
         .and_then(|path| path.canonicalize())
         .map_err(|_| FAILED.into());
@@ -406,6 +510,8 @@ struct ChildGuard {
     done: bool,
     stop: Arc<AtomicBool>,
     _limits: Option<process_limits::Parent>,
+    _source: Option<crate::workspace::source_runtime::SessionRetention>,
+    _resources: Option<ChildResources>,
     #[cfg(test)]
     primary_kill_failed: bool,
     #[cfg(test)]
@@ -416,7 +522,17 @@ impl ChildGuard {
         FAILED_STOP.store(true, Ordering::SeqCst);
         // ACTIVE serializes this sole slot. Future calls reject before
         // spawning and may only try to reap this retained owner.
-        *RETAINED.lock().unwrap_or_else(|error| error.into_inner()) = self.child.take();
+        if let Some(child) = self.child.take() {
+            *RETAINED.lock().unwrap_or_else(|error| error.into_inner()) = Some(RetainedWorker {
+                child,
+                _limits: self._limits.take(),
+                _source: self._source.take(),
+                _resources: self._resources.take(),
+                #[cfg(test)]
+                reaped: None,
+            });
+            RETAINED_WAKE.notify_one();
+        }
         Err("JPEG XL worker could not be stopped; further codec work is disabled".into())
     }
     fn stop(&mut self) -> Result<(), String> {
@@ -447,9 +563,8 @@ impl ChildGuard {
             let killed = child.kill().is_ok();
             if !killed {
                 #[cfg(windows)]
-                if let Some(limits) = self._limits.take() {
+                if let Some(limits) = self._limits.as_ref() {
                     limits.terminate();
-                    drop(limits);
                 }
                 #[cfg(unix)]
                 {
@@ -534,13 +649,20 @@ fn cleanup_failed() -> bool {
     if !FAILED_STOP.load(Ordering::SeqCst) {
         return false;
     }
-    let mut retained = RETAINED.lock().unwrap_or_else(|error| error.into_inner());
-    if retained
-        .as_mut()
-        .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
-    {
-        retained.take();
-    }
+    let reaped = {
+        let mut retained = RETAINED.lock().unwrap_or_else(|error| error.into_inner());
+        if retained
+            .as_mut()
+            .is_some_and(|worker| matches!(worker.child.try_wait(), Ok(Some(_))))
+        {
+            retained.take()
+        } else {
+            None
+        }
+    };
+    // Profile/operation drops can acquire their own locks. Never perform them
+    // under the codec retained-owner mutex, and never before known child exit.
+    release_retained(reaped);
     true
 }
 fn invoke(
@@ -550,6 +672,7 @@ fn invoke(
     mut runtime: Runtime,
 ) -> Result<Output, String> {
     check()?;
+    ensure_reaper()?;
     request.validate()?;
     if cleanup_failed() {
         return Err("JPEG XL worker cleanup failed; further codec work is disabled".into());
@@ -612,6 +735,8 @@ fn invoke(
             done: false,
             stop: stop.clone(),
             _limits: None,
+            _source: None,
+            _resources: None,
             #[cfg(test)]
             primary_kill_failed: runtime.primary_kill_failed,
             #[cfg(test)]
@@ -956,3 +1081,117 @@ fn worker() -> Result<(), String> {
 mod tests;
 #[cfg(test)]
 use tests::{read_test_ready, test_fault};
+
+/// Actual retained-child lifecycle hook for SourceRuntime's isolated-profile
+/// tests. No production path or arbitrary publication/session API is exposed.
+#[cfg(test)]
+pub(crate) struct RetainedTestGate {
+    input: Option<std::process::ChildStdin>,
+    reaped: Arc<AtomicBool>,
+    _active: std::sync::MutexGuard<'static, ()>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+#[cfg(test)]
+impl RetainedTestGate {
+    pub(crate) fn close_child(&mut self) {
+        drop(self.input.take());
+    }
+    pub(crate) fn reaped(&self) -> bool {
+        self.reaped.load(Ordering::SeqCst)
+    }
+}
+#[cfg(test)]
+impl Drop for RetainedTestGate {
+    fn drop(&mut self) {
+        self.close_child();
+        let until = Instant::now() + Duration::from_secs(3);
+        while !self.reaped() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Tests may restore their serialized fixture state only after the real
+        // reaper observed exit and dropped every operation/profile owner.
+        if self.reaped() {
+            FAILED_STOP.store(false, Ordering::SeqCst);
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) fn prepare_retained_test_reaper() -> Result<(), String> {
+    ensure_reaper()
+}
+#[cfg(test)]
+pub(crate) fn park_retained_test_child(
+    mut command: Command,
+    source: crate::workspace::source_runtime::SessionRetention,
+) -> Result<RetainedTestGate, String> {
+    let serial = tests::PROCESS_FIXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_reaper()?;
+    if FAILED_STOP.load(Ordering::SeqCst)
+        || RETAINED.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    {
+        return Err("Retained fixture codec state unavailable".into());
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let child = command
+        .spawn()
+        .map_err(|_| "Retained fixture failed to launch")?;
+    let mut guard = ChildGuard {
+        child: Some(child),
+        done: false,
+        stop: Arc::new(AtomicBool::new(false)),
+        _limits: None,
+        _source: Some(source),
+        _resources: None,
+        primary_kill_failed: false,
+        kill_calls: 0,
+    };
+    guard._limits = Some(process_limits::Parent::new(
+        guard.child.as_ref().ok_or(FAILED)?,
+    )?);
+    let input = guard
+        .child
+        .as_mut()
+        .ok_or(FAILED)?
+        .stdin
+        .take()
+        .ok_or("Retained fixture lacks owned input pipe")?;
+    if guard
+        .child
+        .as_mut()
+        .ok_or(FAILED)?
+        .try_wait()
+        .map_err(|_| FAILED)?
+        .is_some()
+    {
+        guard.done = true;
+        return Err("Retained fixture exited before parking".into());
+    }
+    let reaped = Arc::new(AtomicBool::new(false));
+    let worker = RetainedWorker {
+        child: guard.child.take().ok_or(FAILED)?,
+        _limits: guard._limits.take(),
+        _source: guard._source.take(),
+        _resources: None,
+        reaped: Some(reaped.clone()),
+    };
+    *RETAINED.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
+    FAILED_STOP.store(true, Ordering::SeqCst);
+    RETAINED_WAKE.notify_one();
+    Ok(RetainedTestGate {
+        input: Some(input),
+        reaped,
+        _active: active,
+        _serial: serial,
+    })
+}

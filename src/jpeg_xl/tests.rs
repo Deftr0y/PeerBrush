@@ -6,7 +6,7 @@ use std::{
         Arc,
     },
 };
-static PROCESS_FIXTURES: Mutex<()> = Mutex::new(());
+pub(super) static PROCESS_FIXTURES: Mutex<()> = Mutex::new(());
 
 // Rust's test harness emits a short banner before invoking this known entry.
 // Only cfg(test) launchers may strip it. Real application protocol accepts
@@ -386,6 +386,8 @@ fn known_reaped_child_never_reaches_primary_or_fallback_kill() {
         done: false,
         stop: stop.clone(),
         _limits: None,
+        _source: None,
+        _resources: None,
         primary_kill_failed: true,
         kill_calls: 0,
     };

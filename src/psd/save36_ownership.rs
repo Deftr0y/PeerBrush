@@ -64,6 +64,9 @@ impl<'a> StagingFactory<'a> for OwnedRoots<'_> {
             ByteRole::CompositeData => self.composite,
             ByteRole::SourceBulk => self.manifest,
             ByteRole::PhotoshopContainer => self.container,
+            ByteRole::CompatibleJxlMode1 | ByteRole::StraightNativeRgba => {
+                return Err("Photoshop fixture cannot stage another codec role".into());
+            }
         };
         Ok(Temporary::Fixture(
             LargeSourceTemporary::create(
