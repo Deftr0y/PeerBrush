@@ -71,12 +71,12 @@ pub(crate) fn publish_update_checkpoint(
 }
 
 fn update_project_ready(e: &Engine) -> Result<(), String> {
-    if e.doc.revision != e.saved_revision
+    if e.authority.view().revision() != e.saved_revision
         || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version)
     {
         return Err(format!(
             "Save {} before restarting for an update",
-            e.doc.name
+            e.authority.view().name()
         ));
     }
     if e.file_operations.load(std::sync::atomic::Ordering::Acquire) != 0
@@ -104,8 +104,8 @@ pub fn update_readiness(workspace: &Registry) -> Result<Vec<Reviewed>, String> {
         update_project_ready(&e)?;
         reviewed.push(Reviewed {
             project,
-            document: e.doc.id.clone(),
-            revision: e.doc.revision,
+            document: e.authority.view().id().to_owned(),
+            revision: e.authority.view().revision(),
             discard: false,
         });
     }
@@ -143,23 +143,24 @@ fn windows_blank_workspace<'a>(engines: impl Iterator<Item = &'a Engine>) -> Res
     }
     let e = engines[0];
     if e.path.is_some()
-        || !e.undo.is_empty()
-        || !e.redo.is_empty()
+        || e.history_lengths()[0] != 0
+        || e.history_lengths()[1] != 0
         || !e.changes.is_empty()
         || !e.leases.is_empty()
         || e.saved_revision != 0
     {
         return Err(refused());
     }
+    let document = e.resident().map_err(|_| refused())?;
     let mut blank = Document::new(1024, 768)?;
-    blank.id = e.doc.id.clone();
-    if e.doc.layers.len() != 1 {
+    blank.id = e.authority.view().id().to_owned();
+    if document.layers.len() != 1 {
         return Err(refused());
     }
-    blank.layers[0].id = e.doc.layers[0].id.clone();
-    blank.layers[0].effect_key = e.doc.layers[0].effect_key.clone();
+    blank.layers[0].id = document.layers[0].id.clone();
+    blank.layers[0].effect_key = document.layers[0].effect_key.clone();
     if serde_json::to_value(&blank).map_err(|e| e.to_string())?
-        != serde_json::to_value(&e.doc).map_err(|e| e.to_string())?
+        != serde_json::to_value(document).map_err(|e| e.to_string())?
     {
         return Err(refused());
     }
@@ -237,12 +238,12 @@ fn finish(
             file_operations_idle(&e.file_operations)?;
         }
         if !r.discard
-            && (e.doc.revision != e.saved_revision
+            && (e.authority.view().revision() != e.saved_revision
                 || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version))
         {
             return Err(format!(
                 "{} still has unsaved changes. Save, Don't Save or Cancel before exiting.",
-                e.doc.name
+                e.authority.view().name()
             ));
         }
         e.check(

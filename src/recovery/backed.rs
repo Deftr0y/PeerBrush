@@ -446,6 +446,15 @@ impl Capture {
         session: &SourceSession,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        self.publish_info(snapshot, session, check).map(|_| ())
+    }
+    /// Display/checkpoint bookkeeping only; this data is not filesystem authority.
+    pub(super) fn publish_info(
+        &self,
+        snapshot: [u8; 16],
+        session: &SourceSession,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(u64, [u8; 32], u64)> {
         if snapshot == [0; 16] {
             return Err("Recovery marker identity is empty".into());
         }
@@ -531,7 +540,7 @@ impl Capture {
         if result.is_err() {
             self.failed.store(true, Ordering::Release);
         }
-        result
+        result.map(|_| (full.bytes, sha256, self.timestamp))
     }
 }
 struct Buffered<'a> {
@@ -574,6 +583,7 @@ pub(crate) struct DecodedNativeRecovery<'a> {
     pub marker: NativeMarker<'a>,
     pub project: [u8; 16],
     pub timestamp: u64,
+    pub(super) sha256: [u8; 32],
     _owner: Arc<MetadataCharge>,
 }
 struct Input<'a> {
@@ -979,6 +989,7 @@ pub(crate) fn load<'a>(
         marker,
         project,
         timestamp,
+        sha256: marker_sha256,
         _owner: owner,
     })
 }

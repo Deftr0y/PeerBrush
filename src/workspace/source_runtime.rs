@@ -162,7 +162,7 @@ impl SourceRuntime {
             .try_lock()
             .map_err(|_| "Source inventory is busy")?;
         if state.is_none() {
-            *state = Some(self.inventory_owned(&operation)?);
+            *state = Some(self.inventory_owned(&operation, true)?);
         }
         let directory = state.as_ref().unwrap().directory.path().to_owned();
         drop(state);
@@ -175,7 +175,39 @@ impl SourceRuntime {
         session.check()?;
         Ok(session)
     }
-    fn inventory_owned(&self, operation: &RootOperation) -> Result<Inventory, String> {
+    /// Existing-source recovery inspection has no absent-root initialization.
+    pub(crate) fn begin_existing(self: &Arc<Self>) -> Result<Option<SourceSession>, String> {
+        let Some(operation) = self.context.begin_existing()? else {
+            return Ok(None);
+        };
+        let mut state = self
+            .inventory
+            .try_lock()
+            .map_err(|_| "Source inventory is busy")?;
+        if state.is_none() {
+            *state = Some(self.inventory_owned(&operation, false)?);
+        }
+        let directory = state
+            .as_ref()
+            .ok_or("Existing source inventory unavailable")?
+            .directory
+            .path()
+            .to_owned();
+        drop(state);
+        let session = SourceSession {
+            runtime: self.clone(),
+            operation: Arc::new(operation),
+            directory,
+            id: *uuid::Uuid::new_v4().as_bytes(),
+        };
+        session.check()?;
+        Ok(Some(session))
+    }
+    fn inventory_owned(
+        &self,
+        operation: &RootOperation,
+        allow_create: bool,
+    ) -> Result<Inventory, String> {
         let directory = operation.source_directory()?;
         let per_entry = directory
             .path()
@@ -207,6 +239,9 @@ impl SourceRuntime {
         let owner_path = directory.path().join("owner.pbr");
         let mut owner = match fs::symlink_metadata(&owner_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !allow_create {
+                    return Err("Existing source namespace has no owner; files retained".into());
+                }
                 if fs::read_dir(directory.path())
                     .map_err(|_| "Cannot inspect fresh source namespace")?
                     .next()

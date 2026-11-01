@@ -1,5 +1,6 @@
 //! Complete immutable recovery versions. No source file is used as a destination.
 pub(crate) mod backed;
+mod native;
 mod worker;
 use crate::{engine, psd, server, workspace};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,9 @@ pub struct Snapshot {
     pub document_id: String,
     pub revision: u64,
     pub name: String,
+    /// Native entries use a bounded display label; sealed metadata keeps its full name.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub name_is_excerpt: bool,
     pub original_path: Option<PathBuf>,
     pub bit_depth: u16,
     pub timestamp_ms: u64,
@@ -42,9 +46,13 @@ pub struct Snapshot {
     pub checksum: String,
     pub file: String,
 }
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 impl Snapshot {
     fn valid(&self) -> bool {
         self.version == 2
+            && !self.name_is_excerpt
             && [self.snapshot.as_str(), &self.project_id, &self.document_id]
                 .iter()
                 .all(|id| uuid::Uuid::parse_str(id).is_ok())
@@ -122,6 +130,25 @@ pub fn catalog(dir: &Path) -> Vec<Snapshot> {
             .then(a.snapshot.cmp(&b.snapshot))
     });
     entries
+}
+/// Source-backed entries retain their listing admission. Legacy catalog and
+/// cleanup remain v2-only; these entries never authorize path-based deletion.
+pub struct RecoveryCatalog {
+    entries: Vec<Snapshot>,
+    _native_admission: Option<Arc<crate::psd::memory36::MetadataCharge>>,
+}
+impl RecoveryCatalog {
+    pub fn entries(&self) -> &[Snapshot] {
+        &self.entries
+    }
+}
+impl Serialize for RecoveryCatalog {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.entries.serialize(serializer)
+    }
+}
+pub fn catalog_in(workspace: &workspace::Registry, dir: &Path) -> Result<RecoveryCatalog, String> {
+    native::catalog(workspace, catalog(dir))
 }
 fn remove(dir: &Path, entry: &Snapshot) -> Result<(), String> {
     // Remove the marker first. A crash can leave an unlisted data file, never a
@@ -263,6 +290,7 @@ fn persist(
         document_id: doc.id.clone(),
         revision: doc.revision,
         name: doc.name.clone(),
+        name_is_excerpt: false,
         original_path: path,
         bit_depth: doc.bit_depth,
         timestamp_ms: SystemTime::now()
@@ -333,10 +361,15 @@ pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Ve
     let live: HashSet<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
     previous.retain(|id, _| live.contains(id));
     for (project, _, shared) in entries {
-        let (doc, path) = match shared.try_lock() {
-            Ok(e) if e.closed || e.doc.read_only || e.doc.revision == e.saved_revision => {
+        let (doc, native_scene, path) = match shared.try_lock() {
+            Ok(e)
+                if e.closed
+                    || e.authority.view().read_only()
+                    || e.authority.view().revision() == e.saved_revision =>
+            {
                 drop(e);
                 previous.remove(&project);
+                // Legacy cleanup never touches owned native marker/source files.
                 if let Err(error) = discard_project(dir, &project) {
                     failures.insert(project, error);
                 } else {
@@ -345,38 +378,64 @@ pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Ve
                 continue;
             }
             Ok(e) => {
+                let view = e.authority.view();
                 if previous
                     .get(&project)
-                    .is_some_and(|(id, rev, _)| id == &e.doc.id && *rev == e.doc.revision)
+                    .is_some_and(|(id, rev, _)| id == view.id() && *rev == view.revision())
                 {
                     continue;
                 }
-                (e.doc.clone(), e.path.clone())
+                let native_scene = if e.native_document().is_some() {
+                    match e
+                        .capture_scene(None)
+                        .and_then(|capture| capture.into_native())
+                    {
+                        Ok(scene) => Some(scene),
+                        Err(error) => {
+                            failures.insert(project, error);
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                (e.doc_snapshot(), native_scene, e.path.clone())
             }
             Err(_) => continue,
         };
-        let result = psd::encode(&doc).and_then(|bytes| {
-            // Replacement/closing during encoding must not create a new recovery.
-            if shared.try_lock().is_ok_and(|e| {
-                e.closed
-                    || e.doc.id != doc.id
-                    || e.doc.revision != doc.revision
-                    || e.saved_revision == e.doc.revision
-            }) {
-                return Ok(None);
-            }
-            persist(dir, &project, &doc, path, &bytes).map(Some)
-        });
+        let result = if let Some(scene) = native_scene {
+            native::checkpoint(workspace, &shared, scene, path).map(Some)
+        } else {
+            let engine::view::DocumentSnapshot::Resident(resident) = &doc else {
+                failures.insert(project, "Recovery authority changed before capture".into());
+                continue;
+            };
+            psd::encode(resident).and_then(|bytes| {
+                // Source replacement/closing cannot publish another legacy checkpoint.
+                if shared.try_lock().is_ok_and(|e| {
+                    e.closed
+                        || e.authority.view().id() != doc.view().id()
+                        || e.authority.view().revision() != doc.view().revision()
+                        || e.saved_revision == e.authority.view().revision()
+                }) {
+                    return Ok(None);
+                }
+                persist(dir, &project, resident, path, &bytes).map(Some)
+            })
+        };
         match result {
             Ok(Some(entry)) => {
                 failures.remove(&project);
-                previous.insert(project, (doc.id, doc.revision, json!(entry)));
+                previous.insert(
+                    project,
+                    (entry.document_id.clone(), entry.revision, json!(entry)),
+                );
             }
             Ok(None) => {
                 failures.remove(&project);
             }
             Err(error) => {
-                failures.insert(project, format!("{}: {error}", doc.name));
+                failures.insert(project, format!("{}: {error}", doc.view().name()));
             }
         }
     }
@@ -397,11 +456,14 @@ pub fn restore(
     control: &crate::loading::Control,
     initiating: Option<&str>,
 ) -> Result<server::Shared, String> {
-    let entry = catalog(dir)
-        .into_iter()
-        .find(|e| e.snapshot == snapshot)
-        .ok_or("Recovery version no longer exists; refresh the list")?;
+    let entry = catalog(dir).into_iter().find(|e| e.snapshot == snapshot);
     control.begin()?;
+    let Some(entry) = entry else {
+        let id = *uuid::Uuid::parse_str(snapshot)
+            .map_err(|_| "Recovery identity is invalid")?
+            .as_bytes();
+        return native::restore(workspace, id, control, initiating);
+    };
     let bytes = bounded_read(&dir.join(&entry.file), MAX_FILE)?;
     if bytes.len() as u64 != entry.bytes || checksum(&bytes) != entry.checksum {
         return Err("Recovery version is incomplete or damaged; choose an earlier version".into());
@@ -416,7 +478,7 @@ pub fn restore(
     }
     doc.name = entry.name;
     let mut e = engine::Engine::new();
-    e.doc = doc;
+    *e.resident_mut()? = doc;
     e.saved_revision = u64::MAX;
     e.status = "Recovered into an unsaved tab · choose Save As · recovery retained".into();
     // Engine::new has no destination or external file version. Register assigns a

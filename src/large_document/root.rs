@@ -260,10 +260,57 @@ impl PersistentRootContext {
         let held = RootOperation {
             context: self.clone(),
             base,
+            existing_source: None,
             _operation: operation,
         };
         held.check()?;
         Ok(held)
+    }
+
+    /// Recovery discovery must never create an absent profile data/source root.
+    pub(crate) fn begin_existing(self: &Arc<Self>) -> Result<Option<RootOperation>, String> {
+        let operation = self.admission.begin()?;
+        operation.check()?;
+        self.validate()?;
+        match fs::symlink_metadata(&self.base) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Cannot inspect existing persistent source root".into()),
+            Ok(_) => {}
+        }
+        let mut initialized = self
+            .initialized
+            .try_lock()
+            .map_err(|_| "Persistent source initialization is busy")?;
+        let base = match &*initialized {
+            Some(base) => {
+                base.check()?;
+                base.clone()
+            }
+            None => Arc::new(Directory::open(&self.base)?),
+        };
+        let path = base.path().join("native-sources-v1");
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Cannot inspect existing native source namespace".into()),
+            Ok(_) => {}
+        }
+        let source = Directory::open(&path)?;
+        base.check()?;
+        source.check()?;
+        self.validate()?;
+        operation.check()?;
+        if initialized.is_none() {
+            *initialized = Some(base.clone());
+        }
+        drop(initialized);
+        let held = RootOperation {
+            context: self.clone(),
+            base,
+            existing_source: Some(source),
+            _operation: operation,
+        };
+        held.check()?;
+        Ok(Some(held))
     }
 
     /// Observation of known in-memory pixels must not initialize the data root.
@@ -293,6 +340,7 @@ impl RootReadOperation {
 pub(crate) struct RootOperation {
     context: Arc<PersistentRootContext>,
     base: Arc<Directory>,
+    existing_source: Option<Directory>,
     _operation: server::SourceOperation,
 }
 impl RootOperation {
@@ -333,7 +381,16 @@ impl RootOperation {
     }
     pub(crate) fn source_directory(&self) -> Result<Directory, String> {
         self.check()?;
-        let directory = self.base.child("native-sources-v1")?;
+        let directory = if let Some(existing) = &self.existing_source {
+            existing.check()?;
+            let named = Directory::open(existing.path())?;
+            if named.identity() != existing.identity() {
+                return Err("Existing native source namespace changed".into());
+            }
+            named
+        } else {
+            self.base.child("native-sources-v1")?
+        };
         self.check()?;
         Ok(directory)
     }

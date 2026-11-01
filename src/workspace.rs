@@ -126,7 +126,7 @@ pub fn attach(root: &Shared) -> Registry {
         activation: Default::default(),
         entries: vec![Entry {
             id: e.project_id.clone(),
-            name: e.doc.name.clone(),
+            name: e.authority.view().name().to_owned(),
             handle: Handle::Root(Arc::downgrade(root)),
         }],
         active: e.project_id.clone(),
@@ -220,14 +220,14 @@ pub fn mutating(method: &str, p: &Value) -> bool {
 pub fn validate_target(e: &Engine, p: &Value) -> Result<(), String> {
     e.ensure_open()?;
     if let Some(document) = p.get("document_id") {
-        if document.as_str() != Some(&e.doc.id) {
+        if document.as_str() != Some(e.authority.view().id()) {
             return Err("Project document changed; observe this project again".into());
         }
     }
     if p.get("project_id").is_some()
         && p["expected_revision"]
             .as_u64()
-            .is_some_and(|r| r != e.doc.revision)
+            .is_some_and(|r| r != e.authority.view().revision())
     {
         return Err("Targeted project revision changed; observe this project again".into());
     }
@@ -310,7 +310,7 @@ pub fn state(root: &Shared) -> Value {
     let projects=handles(root).into_iter().filter_map(|shared| {
         let mut e=shared.lock().unwrap();e.expire();
         if e.closed {return None;}
-        Some(json!({"project_id":e.project_id,"document_id":e.doc.id,"name":e.doc.name,"revision":e.doc.revision,"dirty":e.doc.revision!=e.saved_revision,"path":e.path,"bit_depth":e.doc.bit_depth,"read_only":e.doc.read_only,"loading":e.loading.as_ref().map(|c|c.status().stage),"ai_change":e.ai_change}))
+        Some(json!({"project_id":e.project_id,"document_id":e.authority.view().id(),"name":e.authority.view().name(),"revision":e.authority.view().revision(),"dirty":e.authority.view().revision()!=e.saved_revision,"path":e.path,"bit_depth":e.authority.view().depth(),"read_only":e.authority.view().read_only(),"loading":e.loading.as_ref().map(|c|c.status().stage),"ai_change":e.ai_change}))
     }).collect::<Vec<_>>();
     let error = attach(root).lock().unwrap().recovery_error.clone();
     json!({"active_project_id":active,"projects":projects,"max_projects":MAX_PROJECTS,"autosave_error":error})
@@ -326,39 +326,101 @@ pub fn register(
 }
 pub fn register_in(
     workspace: &Registry,
-    mut engine: Engine,
+    engine: Engine,
     activate_if: Option<&str>,
 ) -> Result<Shared, String> {
+    register_shared_in(workspace, Arc::new(Mutex::new(engine)), activate_if)
+}
+/// Register the actual prepared engine, preserving its ownership and worker
+/// identity. No detached Engine clone or reconstructed document participates.
+pub fn register_shared_in(
+    workspace: &Registry,
+    shared: Shared,
+    activate_if: Option<&str>,
+) -> Result<Shared, String> {
+    let native = {
+        let engine = shared.lock().unwrap();
+        engine.ensure_open()?;
+        if engine.native_document().is_some() && engine.history_lengths() != [0, 0] {
+            return Err(
+                "A registered project must retain its existing native identity and history".into(),
+            );
+        }
+        engine.native_document().cloned()
+    };
+    // Native metadata/header admission is prepared off both engine and registry locks.
+    let registered = native
+        .as_ref()
+        .map(|document| {
+            let fresh = document.for_runtime_registration(&|| Ok(()))?;
+            engine::authority::DocumentAuthority::from_native(fresh, 40)
+        })
+        .transpose()?;
+    let libraries = {
+        let state = workspace.lock().unwrap();
+        if state.exiting || state.entries.len() >= MAX_PROJECTS {
+            return Err("Workspace is exiting or has reached its 16-project limit".into());
+        }
+        if state.entries.iter().any(|entry| {
+            entry
+                .handle
+                .get()
+                .is_some_and(|existing| Arc::ptr_eq(&existing, &shared))
+        }) {
+            return Err("Project engine is already registered".into());
+        }
+        (
+            state.brush_library.clone(),
+            state.tool_settings.clone(),
+            state.filter_library.clone(),
+            state.export_library.clone(),
+        )
+    };
+    let mut engine = shared.lock().unwrap();
     engine.ensure_open()?;
-    engine.brush_library = workspace.lock().unwrap().brush_library.clone();
-    engine.tool_settings = workspace.lock().unwrap().tool_settings.clone();
-    engine.filter_library = workspace.lock().unwrap().filter_library.clone();
-    engine.export_library = workspace.lock().unwrap().export_library.clone();
+    if let Some(original) = &native {
+        if !engine
+            .native_document()
+            .is_some_and(|current| current.key() == original.key())
+            || engine.history_lengths() != [0, 0]
+        {
+            return Err("Native project changed during runtime registration".into());
+        }
+        engine.authority = registered.ok_or("Native registration authority unavailable")?;
+    } else {
+        engine.resident_mut()?.id = engine::id();
+    }
+    engine.brush_library = libraries.0;
+    engine.tool_settings = libraries.1;
+    engine.filter_library = libraries.2;
+    engine.export_library = libraries.3;
     engine.workspace = Some(Arc::downgrade(workspace));
     engine.workspace_owner = None;
-    // A runtime source identity distinguishes multiple opens of the same serialized PSD.
-    engine.doc.id = engine::id();
     let id = engine.project_id.clone();
-    let name = engine.doc.name.clone();
-    let shared = Arc::new(Mutex::new(engine));
-    let mut workspace = workspace.lock().unwrap();
-    if workspace.exiting {
-        return Err("The workspace is exiting; project was not opened".into());
+    let name = engine.authority.view().name().to_owned();
+    let mut state = workspace.lock().unwrap();
+    if state.exiting || state.entries.len() >= MAX_PROJECTS {
+        return Err("Workspace changed before project registration".into());
     }
-    if workspace.entries.len() >= MAX_PROJECTS {
-        return Err("Close a project before opening another (16-project limit)".into());
+    if state.entries.iter().any(|entry| {
+        entry.id == id
+            || entry
+                .handle
+                .get()
+                .is_some_and(|existing| Arc::ptr_eq(&existing, &shared))
+    }) {
+        return Err("Project ID or engine is already registered".into());
     }
-    if workspace.entries.iter().any(|p| p.id == id) {
-        return Err("Project ID already exists".into());
-    }
-    workspace.entries.push(Entry {
+    state.entries.push(Entry {
         id: id.clone(),
         name,
         handle: Handle::Owned(shared.clone()),
     });
-    if activate_if.is_some_and(|source| source == workspace.active) {
-        workspace.active = id;
+    if activate_if.is_some_and(|source| source == state.active) {
+        state.active = id;
     }
+    drop(state);
+    drop(engine);
     Ok(shared)
 }
 pub fn new_project(
@@ -369,12 +431,12 @@ pub fn new_project(
     activate_if: Option<&str>,
 ) -> Result<Shared, String> {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(width, height, depth)?;
+    *e.resident_mut()? = Document::new_depth(width, height, depth)?;
     register(root, e, activate_if)
 }
 pub fn guard(e: &Engine, document: &str, revision: u64) -> Result<(), String> {
     e.ensure_open()?;
-    if e.doc.id != document || e.doc.revision != revision {
+    if e.authority.view().id() != document || e.authority.view().revision() != revision {
         return Err("Project source changed; observe its document ID and revision again".into());
     }
     Ok(())
@@ -414,7 +476,7 @@ pub fn close_in(
         .map_err(|_| "The project is still working. Try closing again when it finishes.")?;
     guard(&e, document, revision)?;
     file_operations_idle(&e.file_operations)?;
-    if (e.doc.revision != e.saved_revision
+    if (e.authority.view().revision() != e.saved_revision
         || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version))
         && !discard
     {
@@ -440,10 +502,7 @@ pub fn close_in(
     }
     e.closed = true;
     e.release_file_ownership();
-    e.doc = Document::new(1, 1).unwrap();
     e.saved_revision = 0;
-    e.undo.clear();
-    e.redo.clear();
     e.changes.clear();
     e.leases.clear();
     e.proposals.clear();
@@ -463,13 +522,15 @@ pub fn close_in(
         let id = blank.project_id.clone();
         workspace_guard.entries.push(Entry {
             id: id.clone(),
-            name: blank.doc.name.clone(),
+            name: blank.authority.view().name().to_owned(),
             handle: Handle::Owned(Arc::new(Mutex::new(blank))),
         });
         workspace_guard.active = id;
     } else if workspace_guard.active == id {
         workspace_guard.active = workspace_guard.entries[0].id.clone();
     }
+    drop(workspace_guard);
+    drop(e);
     Ok(())
 }
 
@@ -510,7 +571,7 @@ pub fn transfer_in(workspace: &Registry, request: &Transfer<'_>) -> Result<Value
 fn transfer_locked(from: &mut Engine, to: &mut Engine, r: &Transfer<'_>) -> Result<Value, String> {
     guard(from, r.source_document, r.source_revision)?;
     guard(to, r.destination_document, r.destination_revision)?;
-    if from.doc.read_only {
+    if from.authority.view().read_only() {
         return Err("Protected Photoshop sources need an explicit compatible copy before transferring editable layers".into());
     }
     let snapshot = crate::layer_clipboard::copy(&from.doc, r.layers)?;
@@ -539,7 +600,7 @@ fn transfer_locked(from: &mut Engine, to: &mut Engine, r: &Transfer<'_>) -> Resu
             )?;
         }
         Ok(
-            json!({"source_project_id":from.project_id,"destination_project_id":to.project_id,"source_revision":from.doc.revision,"destination_revision":to.doc.revision,"moved":r.move_layers,"created_roots":pasted["created_roots"],"created":pasted["created"]}),
+            json!({"source_project_id":from.project_id,"destination_project_id":to.project_id,"source_revision":from.authority.view().revision(),"destination_revision":to.authority.view().revision(),"moved":r.move_layers,"created_roots":pasted["created_roots"],"created":pasted["created"]}),
         )
     })();
     if result.is_err() {
@@ -560,7 +621,7 @@ pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Doc
     let destination = get_in(workspace, r.destination)?;
     let from = source.lock().unwrap();
     guard(&from, r.source_document, r.source_revision)?;
-    if from.doc.read_only {
+    if from.authority.view().read_only() {
         return Err("Protected Photoshop sources need an explicit compatible copy before transferring editable layers".into());
     }
     let snapshot = crate::layer_clipboard::copy(&from.doc, r.layers)?;
