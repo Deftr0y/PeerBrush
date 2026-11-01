@@ -1,5 +1,6 @@
 //! Stable project engines. Registry locks never acquire existing engine locks.
 pub mod lifecycle;
+pub(crate) mod native_dispatch;
 pub(crate) mod source_runtime;
 use crate::{
     engine::{self, Document, Engine, Scope},
