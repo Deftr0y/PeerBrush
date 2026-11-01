@@ -192,6 +192,37 @@ pub struct PinnedRegion {
 }
 
 impl PinnedRegion {
+    pub(crate) fn from_pins(
+        width: u32,
+        height: u32,
+        depth: u16,
+        region: Region,
+        tiles: BTreeMap<(u32, u32), PinnedTile>,
+    ) -> Result<Self> {
+        if width == 0
+            || height == 0
+            || width > 16000
+            || height > 16000
+            || ![8, 16].contains(&depth)
+            || tiles.len() > 128
+            || tiles.iter().any(|(&(x, y), tile)| {
+                x >= width.div_ceil(TILE)
+                    || y >= height.div_ceil(TILE)
+                    || tile.spec().width() != TILE as u16
+                    || tile.spec().height() != TILE as u16
+                    || tile.spec().depth() != depth
+            })
+        {
+            return Err(Error::Invalid("Invalid resolved native region pins"));
+        }
+        Ok(Self {
+            width,
+            height,
+            depth,
+            region,
+            tiles,
+        })
+    }
     pub fn pixel16(&self, x: i32, y: i32) -> Result<Pixel16> {
         if !self.region.contains(x, y) {
             return Err(Error::Invalid(

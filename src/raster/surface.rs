@@ -5,10 +5,14 @@ use super::{
     Pixel, Pixel16, Raster,
 };
 use crate::large_document::{
-    DiskBudget, Error, PinnedTile, ResidentBudget, Result, ScratchBytes, Store, TileSpec,
+    DiskBudget, Error, PinnedTile, Reservation, ResidentBudget, Result, ScratchBytes, Store,
+    TileSpec,
 };
 use ring::digest::{Context, SHA256};
 use std::sync::Arc;
+#[path = "surface/fragments.rs"]
+mod fragments;
+pub use fragments::{PhysicalTile, TilePatch};
 
 /// Native pixel-footprint identity, including the owned backing-store identity.
 /// Retained placement, layer style and document revisions are separate scene keys.
@@ -33,7 +37,8 @@ pub struct Surface {
 enum SurfaceStorage {
     /// Complete known absence, never a replacement for failed backing reads.
     Zero,
-    Stored(Plane),
+    Stored(Plane, Reservation),
+    Resolved(fragments::Index),
 }
 
 impl std::fmt::Debug for Surface {
@@ -67,22 +72,26 @@ impl Surface {
     pub(crate) fn from_plane(plane: Plane) -> Result<Self> {
         let (width, height, depth) = (plane.width(), plane.height(), plane.depth());
         shape(width, height, depth)?;
-        let mut hash = key_prefix(b"owned-store", width, height, depth);
-        hash.update(&plane.store().identity());
-        for (&(x, y), block) in plane.blocks() {
-            hash.update(&x.to_be_bytes());
-            hash.update(&y.to_be_bytes());
-            hash.update(&block.spec().width().to_be_bytes());
-            hash.update(&block.spec().height().to_be_bytes());
-            hash.update(&block.spec().depth().to_be_bytes());
-            hash.update(&block.fingerprint());
+        let budget = plane.store().resident_budget();
+        // Conservative B-tree node admission. Provisional input construction is
+        // separately admitted by the importer/worker before ownership arrives here.
+        let bytes = plane
+            .blocks()
+            .len()
+            .checked_mul(512)
+            .and_then(|n| n.checked_add(128))
+            .ok_or(Error::Budget)?;
+        let charge = budget.reserve_bytes(bytes, bytes)?;
+        let mut hash = key_prefix(b"physical-tiles", width, height, depth);
+        for (&coordinate, &reference) in plane.blocks() {
+            fragments::hash_tile(&mut hash, coordinate, plane.store(), reference);
         }
         Ok(Self {
             key: finish(hash),
             width,
             height,
             depth,
-            storage: Arc::new(SurfaceStorage::Stored(plane)),
+            storage: Arc::new(SurfaceStorage::Stored(plane, charge)),
         })
     }
 
@@ -129,13 +138,18 @@ impl Surface {
     pub fn uses_budget(&self, budget: &ResidentBudget) -> bool {
         match &*self.storage {
             SurfaceStorage::Zero => true,
-            SurfaceStorage::Stored(plane) => plane.store().resident_budget().same_pool(budget),
+            SurfaceStorage::Stored(plane, _) => plane.store().resident_budget().same_pool(budget),
+            SurfaceStorage::Resolved(index) => index.budget.same_pool(budget),
         }
     }
     pub fn uses_disk_budget(&self, budget: &DiskBudget) -> bool {
         match &*self.storage {
             SurfaceStorage::Zero => true,
-            SurfaceStorage::Stored(plane) => plane.store().uses_disk_budget(budget),
+            SurfaceStorage::Stored(plane, _) => plane.store().uses_disk_budget(budget),
+            SurfaceStorage::Resolved(index) => index
+                .entries
+                .iter()
+                .all(|tile| tile.owner().uses_disk_budget(budget)),
         }
     }
 
@@ -147,7 +161,33 @@ impl Surface {
         check()?;
         let pixels = match &*self.storage {
             SurfaceStorage::Zero => RegionPixels::Zero,
-            SurfaceStorage::Stored(plane) => RegionPixels::Pinned(plane.pin(region, check)?),
+            SurfaceStorage::Stored(plane, _) => RegionPixels::Pinned(plane.pin(region, check)?),
+            SurfaceStorage::Resolved(_) => {
+                let [left, top, right, bottom] = region.bounds();
+                let x0 = left.max(0).min(self.width as i32) as u32 / super::TILE;
+                let y0 = top.max(0).min(self.height as i32) as u32 / super::TILE;
+                let x1 = (right.max(0).min(self.width as i32) as u32).div_ceil(super::TILE);
+                let y1 = (bottom.max(0).min(self.height as i32) as u32).div_ceil(super::TILE);
+                if u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0)) > 128 {
+                    return Err(Error::Budget);
+                }
+                let mut tiles = std::collections::BTreeMap::new();
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let tile = self.prepare_tile((x, y), check)?;
+                        if let Some(pixels) = tile.pixels {
+                            tiles.insert((x, y), pixels);
+                        }
+                    }
+                }
+                RegionPixels::Pinned(PinnedRegion::from_pins(
+                    self.width,
+                    self.height,
+                    self.depth,
+                    region,
+                    tiles,
+                )?)
+            }
         };
         check()?;
         Ok(SurfaceRegion {
@@ -176,13 +216,25 @@ impl Surface {
         let spec = TileSpec::new(super::TILE as u16, super::TILE as u16, self.depth)?;
         let (pixels, budget) = match &*self.storage {
             SurfaceStorage::Zero => (None, None),
-            SurfaceStorage::Stored(plane) => {
+            SurfaceStorage::Stored(plane, _) => {
                 let pixels = plane
                     .blocks()
                     .get(&coordinate)
                     .map(|reference| plane.store().pin(*reference, check))
                     .transpose()?;
                 (pixels, Some(plane.store().resident_budget()))
+            }
+            SurfaceStorage::Resolved(index) => {
+                let pixels = index
+                    .entries
+                    .binary_search_by_key(&coordinate, PhysicalTile::coordinate)
+                    .ok()
+                    .map(|at| {
+                        let tile = &index.entries[at];
+                        tile.owner().pin(tile.reference(), check)
+                    })
+                    .transpose()?;
+                (pixels, Some(index.budget.clone()))
             }
         };
         check()?;
@@ -372,6 +424,7 @@ mod tests {
                 Arc::make_mut(raster.tiles.get_mut(&(1, 1)).unwrap())[4] = 211;
             }
             let surface = Surface::stage_raster(&raster, store.clone(), &mut || Ok(())).unwrap();
+            let descriptors = budget.used();
             let tile = surface.prepare_tile((1, 1), &mut || Ok(())).unwrap();
             assert_eq!(tile.coordinate(), (1, 1));
             assert_eq!(tile.key(), surface.key());
@@ -382,15 +435,16 @@ mod tests {
             } else {
                 assert_eq!(bytes[4], 211);
             }
-            assert_eq!(budget.used(), 2 * tile.spec().bytes());
+            assert_eq!(budget.used(), descriptors + 2 * tile.spec().bytes());
             assert!(tile
                 .copy_to_scratch(&ResidentBudget::new(4 * 1024 * 1024).unwrap())
                 .is_err());
             assert!(surface.prepare_tile((2, 1), &mut || Ok(())).is_err());
             drop(bytes);
             drop(tile);
-            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.used(), descriptors);
             drop(surface);
+            assert_eq!(budget.used(), 0);
             drop(store);
             std::fs::remove_dir_all(path).unwrap();
         }
@@ -443,12 +497,13 @@ mod tests {
         assert_eq!(surface.key(), copy.key());
         assert!(copy.uses_budget(&budget));
         assert!(!copy.uses_budget(&ResidentBudget::new(budget.limit()).unwrap()));
-        assert_eq!(budget.used(), 0);
+        let descriptors = budget.used();
+        assert!(descriptors > 0);
         let a = surface
             .prepare_region(Region::new([2, 3, 3, 4]).unwrap(), &mut || Ok(()))
             .unwrap();
         let charge = budget.used();
-        assert_eq!(charge, 256 * 256 * 8);
+        assert_eq!(charge, descriptors + 256 * 256 * 8);
         let b = copy
             .prepare_region(Region::new([2, 3, 3, 4]).unwrap(), &mut || Ok(()))
             .unwrap();
@@ -457,7 +512,7 @@ mod tests {
         drop(a);
         drop(surface);
         drop(copy);
-        assert_eq!(budget.used(), charge);
+        assert_eq!(budget.used(), charge - descriptors);
         drop(b);
         assert_eq!(budget.used(), 0);
         drop(store);
