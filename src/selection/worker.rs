@@ -34,6 +34,101 @@ pub struct Request<'a> {
     pub maximum_work: u64,
 }
 
+/// Bind candidate preparation to one captured scene and its actual shared
+/// pools. This still grants no engine/history publication authority.
+pub fn prepare_for_scene(
+    scene: &crate::engine::scene::SceneSnapshot,
+    expected: &crate::engine::scene::SceneIdentity,
+    request: &Request<'_>,
+    store: Store,
+    check: &dyn Fn() -> Result<()>,
+    prepare_row: impl FnMut(u32) -> Result<()>,
+    matches: impl FnMut(usize, u32, u32) -> Result<bool>,
+) -> std::result::Result<CoverageSource, String> {
+    let metadata = scene.metadata();
+    if scene.identity() != expected
+        || request.width != metadata.width
+        || request.height != metadata.height
+        || !store.resident_budget().same_pool(scene.budget())
+        || !store.uses_disk_budget(scene.disk_budget())
+    {
+        return Err(
+            "Selection candidate differs from its captured scene or shared admission pools".into(),
+        );
+    }
+    check().map_err(|e| e.to_string())?;
+    // This scope owns the only polygon copy; it drops before its reservation.
+    let mut polygon_charge = None;
+    let prior = if request.mode == Combine::Replace {
+        None
+    } else {
+        let coverage = metadata
+            .selection_coverage
+            .as_ref()
+            .filter(|coverage| metadata.selection == Some(coverage.bounds))
+            .map(|coverage| {
+                if coverage.mask.retained.is_some() {
+                    return Err(
+                        "Retained coverage needs its complete native scene source".to_owned()
+                    );
+                }
+                CoverageSource::new(
+                    scene.raster(&coverage.mask)?.clone(),
+                    coverage.bounds,
+                    coverage.origin,
+                    &coverage.contours,
+                    scene.budget(),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .transpose()?;
+        let polygon = if coverage.is_none() {
+            metadata
+                .selection_polygon
+                .as_ref()
+                .filter(|points| super::bounds(points).ok() == metadata.selection)
+                .map(|points| {
+                    let bytes = points
+                        .len()
+                        .checked_mul(std::mem::size_of::<[f32; 2]>())
+                        .ok_or(Error::Budget)?;
+                    let charge = scene.budget().reserve_bytes(bytes, 4 * 1024 * 1024)?;
+                    let mut copy = Vec::new();
+                    copy.try_reserve_exact(points.len())
+                        .map_err(|_| Error::Budget)?;
+                    if copy
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<[f32; 2]>())
+                        .is_none_or(|capacity| capacity > charge.bytes())
+                    {
+                        return Err(Error::Budget);
+                    }
+                    copy.extend_from_slice(points);
+                    polygon_charge = Some(charge);
+                    Ok(std::sync::Arc::new(copy))
+                })
+                .transpose()
+                .map_err(|e: Error| e.to_string())?
+        } else {
+            None
+        };
+        Some(
+            SelectionSource::from_metadata(metadata.selection, polygon, coverage)
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let candidate = prepare(request, store, prior.as_ref(), check, prepare_row, matches)?;
+    check().map_err(|e| e.to_string())?;
+    if !candidate.uses_budget(scene.budget())
+        || !candidate.mask().uses_disk_budget(scene.disk_budget())
+    {
+        return Err("Prepared selection escaped its captured scene admission pools".into());
+    }
+    drop(prior);
+    drop(polygon_charge);
+    Ok(candidate)
+}
+
 /// This produces no document mutation or publication permission. `matches`
 /// only reads the immutable source view established by `prepare_row`.
 /// Source/revision/lease/cancellation must still pass common engine admission.
@@ -400,6 +495,186 @@ mod tests {
         assert_eq!(calls.get(), 0);
         assert_eq!(pool.used(), 0);
         drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn scene_bound_worker_refuses_foreign_identity_dimensions_or_pools_before_source_callbacks() {
+        use crate::engine::scene::{
+            Document36, PendingScene, RasterCollector, RasterRef36, RasterRoster, SceneIdentity,
+            SceneSnapshot,
+        };
+        use crate::large_document::DiskBudget;
+        struct Collector(Vec<Surface>);
+        impl RasterCollector for Collector {
+            fn resident(&mut self, raster: &Raster) -> std::result::Result<RasterRef36, String> {
+                self.surface(
+                    &Surface::zero(raster.width, raster.height, raster.depth)
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+            fn surface(&mut self, source: &Surface) -> std::result::Result<RasterRef36, String> {
+                self.0.push(source.clone());
+                Ok(RasterRef36 {
+                    id: self.0.len() as u32,
+                    width: source.width(),
+                    height: source.height(),
+                    depth: source.depth(),
+                    retained: None,
+                })
+            }
+        }
+        let pool = ResidentBudget::new(128 * 1024 * 1024).unwrap();
+        let disk = DiskBudget::new(32 * 1024 * 1024, 8).unwrap();
+        let mut doc = crate::engine::Document::new(16, 12).unwrap();
+        doc.selection = Some([0, 0, 16, 12]);
+        doc.selection_polygon = Some(vec![[0., 0.], [16., 0.], [0., 12.]]);
+        let mut collector = Collector(Vec::new());
+        let metadata = Document36::capture(&doc, &mut collector).unwrap();
+        let identity = SceneIdentity {
+            project_id: crate::engine::id(),
+            document_id: doc.id.clone(),
+            revision: doc.revision,
+        };
+        let scene = SceneSnapshot::new(
+            identity.clone(),
+            PendingScene::new(
+                metadata,
+                RasterRoster::new(collector.0).unwrap(),
+                pool.clone(),
+                disk.clone(),
+            )
+            .unwrap(),
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        let path = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-selection-scene-{}", crate::engine::id()));
+        let limits = Limits {
+            disk_bytes: 16 * 1024 * 1024,
+            max_blocks: 32,
+            max_resident_blocks: 16,
+            manifest_bytes: 1024 * 1024,
+        };
+        let output =
+            Store::create_with_disk_budget(&path, pool.clone(), disk.clone(), limits).unwrap();
+        let calls = std::cell::Cell::new(0);
+        for wrong in [0, 1, 2, 3] {
+            let mut expected = identity.clone();
+            if wrong == 0 {
+                expected.revision += 1;
+            }
+            let request = Request {
+                width: if wrong == 1 { 17 } else { 16 },
+                height: 12,
+                seeds: &[[0, 0]],
+                quick_radius: None,
+                feather: 0,
+                mode: Combine::Replace,
+                maximum_work: 1000,
+            };
+            let foreign_path = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "peerbrush-selection-foreign-{}",
+                    crate::engine::id()
+                ));
+            let store = if wrong >= 2 {
+                Store::create_with_disk_budget(
+                    &foreign_path,
+                    if wrong == 3 {
+                        ResidentBudget::new(pool.limit()).unwrap()
+                    } else {
+                        pool.clone()
+                    },
+                    if wrong == 2 {
+                        DiskBudget::new(32 * 1024 * 1024, 8).unwrap()
+                    } else {
+                        disk.clone()
+                    },
+                    limits,
+                )
+                .unwrap()
+            } else {
+                output.clone()
+            };
+            let result = prepare_for_scene(
+                &scene,
+                &expected,
+                &request,
+                store,
+                &|| Ok(()),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_, _, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(true)
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 0);
+            if wrong >= 2 {
+                std::fs::remove_dir_all(foreign_path).unwrap();
+            }
+        }
+        let request = Request {
+            width: 16,
+            height: 12,
+            seeds: &[[0, 0]],
+            quick_radius: None,
+            feather: 0,
+            mode: Combine::Replace,
+            maximum_work: 1000,
+        };
+        let candidate = prepare_for_scene(
+            &scene,
+            &identity,
+            &request,
+            output.clone(),
+            &|| Ok(()),
+            |_| Ok(()),
+            |_, _, _| Ok(true),
+        )
+        .unwrap();
+        assert!(candidate.uses_budget(&pool));
+        assert!(candidate.mask().uses_disk_budget(&disk));
+        drop(candidate);
+        let candidate = prepare_for_scene(
+            &scene,
+            &identity,
+            &Request {
+                mode: Combine::Add,
+                ..request
+            },
+            output.clone(),
+            &|| Ok(()),
+            |_| Ok(()),
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+        let view = candidate
+            .prepare_region(Region::new([0, 0, 16, 12]).unwrap(), &pool, &mut || Ok(()))
+            .unwrap();
+        for y in 0..12 {
+            for x in 0..16 {
+                let inside = crate::selection::contains(
+                    doc.selection_polygon.as_ref().unwrap(),
+                    x as f32 + 0.5,
+                    y as f32 + 0.5,
+                );
+                assert_eq!(view.value(x, y).unwrap(), f32::from(u8::from(inside)));
+            }
+        }
+        drop(view);
+        drop(candidate);
+        drop(scene);
+        drop(output);
+        assert_eq!(pool.used(), 0);
         std::fs::remove_dir_all(path).unwrap();
     }
 
