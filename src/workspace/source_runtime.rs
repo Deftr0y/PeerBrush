@@ -2052,4 +2052,106 @@ mod tests {
         instance.try_lock().unwrap();
         assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_ok());
     }
+    #[test]
+    #[ignore = "Internal bounded pipe-wait child, launched only by the retained-worker lifecycle test"]
+    fn retained_codec_pipe_child_waits_for_owned_stdin_close() {
+        use std::io::Read;
+        let mut byte = [0];
+        let result = std::io::stdin().read_exact(&mut byte);
+        assert!(matches!(result,Err(error) if error.kind()==std::io::ErrorKind::UnexpectedEof));
+    }
+    #[test]
+    fn autonomous_retained_codec_reaper_releases_actual_profile_and_instance_without_future_request(
+    ) {
+        use std::{
+            process::Command,
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        crate::jpeg_xl::prepare_retained_test_reaper().unwrap();
+        let f = Fixture::new();
+        let profile =
+            crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).unwrap();
+        let (shared, connection) = f.connection();
+        let state_dir = connection.state_dir.clone();
+        let context =
+            PersistentRootContext::from_profile(&connection, profile.source_profile().unwrap())
+                .unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let workspace = crate::workspace::attach(&shared);
+        let baseline = workspace
+            .lock()
+            .unwrap()
+            .file_operations
+            .load(Ordering::Acquire);
+        assert_eq!(baseline, 1);
+        let retained = session.retain_for_child().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            "workspace::source_runtime::tests::retained_codec_pipe_child_waits_for_owned_stdin_close",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        let mut child = crate::jpeg_xl::park_retained_test_child(command, retained).unwrap();
+        assert!(!child.reaped());
+        drop(profile);
+        drop(context);
+        let (finished, done) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.check().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.check().is_err());
+        assert!(session.retain_for_child().is_err());
+        drop(session);
+        drop(runtime);
+        assert!(!child.reaped());
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            baseline
+        );
+        assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_err());
+        let instance = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_dir.join("instance.lock"))
+            .unwrap();
+        assert!(instance.try_lock().is_err());
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        // No codec request follows this close. The autonomous reaper must perform
+        // actual child/job/source-owner drops and wake the waiting Connection.
+        child.close_child();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !child.reaped() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(child.reaped());
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        closer.join().unwrap();
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            0
+        );
+        instance.try_lock().unwrap();
+        assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_ok());
+    }
 }
