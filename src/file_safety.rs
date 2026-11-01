@@ -492,6 +492,9 @@ impl Lease {
 /// backup limits. This lease grants no scene/codec/publication authority; the
 /// native save driver must retain its SourceOperation and completed scene proof.
 pub(crate) struct NativeLease(Lease);
+#[path = "file_safety/native_inventory.rs"]
+mod native_inventory;
+pub(crate) use native_inventory::NativeInventory;
 impl NativeLease {
     pub(crate) fn acquire(
         path: &Path,
@@ -531,9 +534,6 @@ impl NativeLease {
         check: impl Fn() -> Result<(), String>,
     ) -> Result<Option<PathBuf>, String> {
         self.0.preserve_checked(check)
-    }
-    pub(crate) fn prune(&self, newest: &Path) {
-        self.0.prune(newest)
     }
     pub(crate) fn verified_version(
         &self,

@@ -679,6 +679,7 @@ mod tests {
         let doc = doc(16, false, "normal");
         let (scene, path) = capture(&doc);
         let region = Region::new([0, 0, 9, 7]).unwrap();
+        drop(RawLayers::prepare(&scene, region, &mut || Ok(())).unwrap());
         let baseline = scene.budget().used();
         let mut checks = 0;
         let complete = RawLayers::prepare(&scene, region, &mut || {
