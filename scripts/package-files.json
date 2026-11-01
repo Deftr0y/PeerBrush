@@ -568,6 +568,7 @@
     "src/ui/lifecycle.rs",
     "src/ui/liquify.rs",
     "src/ui/native_preview.rs",
+    "src/ui/native_canvas_queue.rs",
     "src/ui/native_texture.rs",
     "src/ui/native_texture/retirement.rs",
     "src/ui/native_texture/tests.rs",

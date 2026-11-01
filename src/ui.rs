@@ -27,6 +27,7 @@ mod image_open;
 mod layers;
 mod lifecycle;
 mod liquify;
+mod native_canvas_queue;
 mod native_preview;
 mod native_texture;
 mod new_canvas;
@@ -507,6 +508,8 @@ pub struct PeerBrush {
     preview_job: u64,
     native_preview: native_preview::Presentation,
     native_canvas: native_texture::Presenter,
+    native_canvas_queue: Option<native_canvas_queue::Queue>,
+    native_gesture_source: Option<crate::render::native_preview::SourceSupplement>,
     #[cfg(test)]
     parameter_worker_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
     #[cfg(test)]
