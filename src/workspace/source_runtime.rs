@@ -398,6 +398,9 @@ pub(crate) struct SessionRetention {
     _operation: Arc<RootOperation>,
 }
 impl SourceSession {
+    pub(crate) fn with_live_fence<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
+        self.operation.with_live_fence(commit)
+    }
     pub(crate) fn retain_for_child(&self) -> Result<SessionRetention, String> {
         self.check()?;
         Ok(SessionRetention {

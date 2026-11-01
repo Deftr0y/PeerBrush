@@ -92,6 +92,21 @@ impl SourceAdmission {
 }
 
 impl SourceOperation {
+    /// Final memory-only publication while this exact request is still live.
+    /// The closure must not perform I/O, call admission/check methods, or drop a
+    /// final Request/SourceOperation owner (which reenters this state mutex).
+    pub(crate) fn with_live_fence<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
+        let state = self
+            .request
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.stopping {
+            return Err("PeerBrush source session is closing".into());
+        }
+        Ok(commit())
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
         if self.request.0.stopping() {
             Err("PeerBrush source session is closing".into())
