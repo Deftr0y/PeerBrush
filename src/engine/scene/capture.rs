@@ -660,6 +660,11 @@ mod tests {
         let second = capture(&doc).stage(&runtime, &cache, &|| Ok(())).unwrap();
         assert_eq!(first.scene.identity(), second.scene.identity());
         assert_ne!(key, second.scene.render_key().unwrap());
+        let first_metadata = first.scene.metadata();
+        let first_layer = first_metadata.layers().next().unwrap();
+        let first_slot = first_layer.pixels().slot();
+        assert!(first.scene.raster(first_slot).unwrap().is_known_zero());
+        assert!(second.scene.raster(first_slot).is_err());
         assert_eq!(runtime.0.disk.used().unwrap(), 0);
     }
     #[test]
@@ -749,11 +754,32 @@ mod tests {
         });
         let staged = capture(&doc).stage(&runtime, &cache, &|| Ok(())).unwrap();
         assert_eq!(staged.scene.rasters().len(), 3);
-        assert!(staged.scene.metadata().layers[0].pixels.retained.is_some());
-        let text = serde_json::to_string(staged.scene.metadata()).unwrap();
+        assert!(staged
+            .scene
+            .metadata()
+            .layers()
+            .next()
+            .unwrap()
+            .pixels()
+            .retained()
+            .is_some());
+        let text = serde_json::to_string(&staged.scene.metadata()).unwrap();
         assert!(!text.contains("\"tiles\""));
         assert!(!text.contains("samples16"));
-        assert_eq!(staged.scene.metadata().layers[0].effects[0].clips.len(), 1);
+        assert_eq!(
+            staged
+                .scene
+                .metadata()
+                .layers()
+                .next()
+                .unwrap()
+                .effects()
+                .next()
+                .unwrap()
+                .clips()
+                .len(),
+            1
+        );
     }
     #[test]
     fn refusal_and_cancellation_never_return_a_partial_scene() {
