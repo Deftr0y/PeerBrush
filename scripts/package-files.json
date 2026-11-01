@@ -313,6 +313,7 @@
     "src/production_export.rs",
     "src/production_export/jobs.rs",
     "src/production_export/library.rs",
+    "src/production_export/native_grid.rs",
     "src/production_export/png.rs",
     "src/projective.rs",
     "src/psd.rs",
