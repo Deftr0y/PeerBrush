@@ -431,10 +431,14 @@ pub(super) struct Feather<'a> {
 
 pub(super) struct CompleteRows {
     rows: u32,
+    width: u32,
 }
 impl CompleteRows {
     pub fn rows(&self) -> u32 {
         self.rows
+    }
+    pub fn shape(&self) -> (u32, u32) {
+        (self.width, self.rows)
     }
 }
 
@@ -539,6 +543,7 @@ impl<'a> Feather<'a> {
         check()?;
         Ok(CompleteRows {
             rows: self.height as u32,
+            width: self.width as u32,
         })
     }
 }
