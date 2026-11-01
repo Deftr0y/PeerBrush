@@ -100,6 +100,21 @@ standard PSD/PSB saves are not provided by this primitive. The opt-in multi-laye
 dense tile test verifies backing I/O and bounded pins only; it cannot qualify
 large-document editing, styled rendering, history or receiving-app fidelity.
 
+`FreshFragment` separately owns a never-published candidate store. Preparation
+may retain provisional Surface/Snapshot clones through its borrowed store. Before
+engine, history, clipboard or marker visibility, consuming `publish` marks that
+same shared owner permanently. All fallible candidate checks and history
+admission precede this mark; a late refused publication cannot erase it.
+
+Explicit `abort` first requires the last Store/Snapshot owner, no publication
+mark, and no unknown or failed append. It verifies the exact header, every known
+record, reference table and checkpoint chain, then repeats held identity/stamp
+checks before owned-handle retirement. Failed checks preserve bytes and quota.
+Generic created or recovered stores are conservatively considered published;
+they cannot acquire this candidate-only cleanup authority. Ordinary Drop still
+retains all files and charges. Published source retirement and compaction require
+the complete live/history/clipboard/task/backup/recovery owner inventory.
+
 ## Persistent disk admission and planar staging
 
 `DiskBudget` counts shared logical-file reservations. A reservation remains

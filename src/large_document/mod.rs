@@ -20,7 +20,8 @@ pub use disk::{DiskBudget, DiskReservation};
 pub use planar::{CompletedPlanar, PlanarRole, PlanarScratch, PlanarSpec};
 pub use scalar::{CompletedScalar, ScalarScratch, ScalarSpec};
 pub use store::{
-    BlockRef, CommitRef, Limits, PinnedBytes, PinnedTile, ScratchBytes, Snapshot, Store, TileSpec,
+    BlockRef, CommitRef, FreshFragment, Limits, PinnedBytes, PinnedTile, ScratchBytes, Snapshot,
+    Store, TileSpec,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

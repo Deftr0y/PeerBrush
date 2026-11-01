@@ -3,7 +3,10 @@ use std::{
     fs::{self, File, OpenOptions},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, Weak,
+    },
     time::SystemTime,
 };
 
@@ -314,17 +317,46 @@ struct Inner {
     access: Access,
     state: Mutex<State>,
     cache: Mutex<BTreeMap<(u8, Digest), Weak<Resident>>>,
+    may_be_published: AtomicBool,
 }
 
-impl Drop for Inner {
-    fn drop(&mut self) {
-        // Source backing survives its handles. No file is unlinked on failure/drop.
-        let _ = self.file.unlock();
-    }
-}
+// File's final close releases its exclusive lock. Source backing survives Drop;
+// disk reservations are released only by explicit proven retirement.
 
 #[derive(Clone)]
 pub struct Store(Arc<Inner>);
+
+/// A source fragment which has never been exposed as document/history/recovery
+/// authority. The actual session and workspace I/O admission belongs to its caller.
+pub struct FreshFragment {
+    store: Store,
+}
+impl FreshFragment {
+    pub fn create(
+        root: &Path,
+        resident: ResidentBudget,
+        disk: DiskBudget,
+        limits: Limits,
+    ) -> Result<Self> {
+        Ok(Self {
+            store: Store::create_inner(root, resident, limits, Some(disk), false)?,
+        })
+    }
+    /// Borrow for provisional writes. Retained Store/Snapshot owners must be
+    /// dropped before abort. Do not expose them as authority before publish.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+    /// Mark before any engine, history, clipboard or marker visibility. A late
+    /// refused publication deliberately cannot undo this conservative mark.
+    pub fn publish(self) -> Store {
+        self.store.0.may_be_published.store(true, Ordering::Release);
+        self.store
+    }
+    pub fn abort(self, check: Check<'_>) -> Result<()> {
+        self.store.retire_unpublished(check)
+    }
+}
 
 #[derive(Clone)]
 pub struct Snapshot {
@@ -389,6 +421,83 @@ impl Snapshot {
 }
 
 impl Store {
+    fn retire_unpublished(self, check: Check<'_>) -> Result<()> {
+        if self.0.may_be_published.load(Ordering::Acquire) {
+            return Err(Error::Invalid(
+                "Published source retirement requires a retained-owner inventory",
+            ));
+        }
+        if Arc::strong_count(&self.0) != 1 {
+            return Err(Error::Busy);
+        }
+        let write = self.0.access.write()?;
+        let state = self.state()?;
+        if state.poisoned || state.readonly {
+            return Err(Error::Interrupted);
+        }
+        let expected = state.expected;
+        let head = state.head;
+        let blocks = state.blocks.len();
+        drop(state);
+        check()?;
+        self.check_source(expected)?;
+        let mut header = [0; FILE_HEADER as usize];
+        read_exact_at(&self.0.file, 0, &mut header)?;
+        if &header[..8] != FILE_MAGIC || header[8..] != self.0.id {
+            return Err(Error::Corrupt);
+        }
+        let mut at = FILE_HEADER;
+        let mut last = None;
+        let mut seen = 0usize;
+        while at < expected.bytes {
+            check()?;
+            let record = read_record(&self.0.file, at, expected.bytes, self.0.limits, check)?;
+            if &record.kind == b"TILE" {
+                let block = self.block_record(&record)?;
+                if self.state()?.blocks.get(&block.digest) != Some(&block) {
+                    return Err(Error::Corrupt);
+                }
+                seen = seen.checked_add(1).ok_or(Error::Corrupt)?;
+            } else {
+                last = Some(self.parse_manifest(&record, last, check)?.commit);
+            }
+            at = record.end;
+        }
+        if at != expected.bytes || seen != blocks || last != head {
+            return Err(Error::Corrupt);
+        }
+        check()?;
+        self.check_source(expected)?;
+        drop(write);
+        let inner = Arc::try_unwrap(self.0).map_err(|_| Error::Busy)?;
+        // No Store owner can be created after unique ownership is established.
+        // The caller still holds its session/workspace I/O admission here.
+        if inner.may_be_published.load(Ordering::Acquire) {
+            return Err(Error::Changed);
+        }
+        super::linear::unlink_owned(&inner.file, &inner.path)?;
+        crate::server::sync_parent(&inner.path).map_err(|_| Error::Changed)?;
+        let Inner {
+            root,
+            directory,
+            directory_id,
+            path,
+            file,
+            identity,
+            disk,
+            ..
+        } = inner;
+        drop(file);
+        let named = open_directory(&root)?;
+        if crate::file_safety::identity(&directory).map_err(|_| Error::Changed)? != directory_id
+            || crate::file_safety::identity(&named).map_err(|_| Error::Changed)? != directory_id
+            || !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(Error::Changed);
+        }
+        disk.ok_or(Error::Changed)?.release_retired(identity)
+    }
+
     pub fn disk_budget(&self) -> Option<DiskBudget> {
         self.0.disk.as_ref().map(DiskReservation::budget)
     }
@@ -453,7 +562,7 @@ impl Store {
 
     /// Create a fresh private directory below an already-owned profile/session parent.
     pub fn create(root: &Path, budget: ResidentBudget, limits: Limits) -> Result<Self> {
-        Self::create_inner(root, budget, limits, None)
+        Self::create_inner(root, budget, limits, None, true)
     }
 
     pub fn create_with_disk_budget(
@@ -462,7 +571,7 @@ impl Store {
         disk: DiskBudget,
         limits: Limits,
     ) -> Result<Self> {
-        Self::create_inner(root, budget, limits, Some(disk))
+        Self::create_inner(root, budget, limits, Some(disk), true)
     }
 
     fn create_inner(
@@ -470,6 +579,7 @@ impl Store {
         budget: ResidentBudget,
         limits: Limits,
         disk: Option<DiskBudget>,
+        may_be_published: bool,
     ) -> Result<Self> {
         let limits = limits.validate()?;
         if !root.is_absolute() || root.file_name().is_none() {
@@ -494,6 +604,11 @@ impl Store {
         let path = root.join("blocks.pbt");
         let mut options = source_options();
         options.create_new(true);
+        #[cfg(windows)]
+        if !may_be_published {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.access_mode(0xC0010000);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -537,6 +652,7 @@ impl Store {
             }),
             file,
             cache: Mutex::new(BTreeMap::new()),
+            may_be_published: AtomicBool::new(may_be_published),
         }));
         let expected = store.state()?.expected;
         store.check_source(expected)?;
@@ -618,6 +734,7 @@ impl Store {
                 poisoned: false,
             }),
             cache: Mutex::new(BTreeMap::new()),
+            may_be_published: AtomicBool::new(true),
         }));
         store.check_source(expected)?;
         let mut offset = FILE_HEADER;
