@@ -34,7 +34,7 @@ impl Spec {
     pub(crate) fn bytes(self) -> usize {
         256 * 256 * 4 * usize::from(self.depth / 8)
     }
-    fn wire(self) -> [u8; 8] {
+    pub(super) fn wire(self) -> [u8; 8] {
         let mut out = [1, 0, 1, 0, 0, 0, 0, 4];
         out[4..6].copy_from_slice(&self.depth.to_be_bytes());
         out
