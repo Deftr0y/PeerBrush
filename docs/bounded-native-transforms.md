@@ -47,7 +47,13 @@ native document until that adoption succeeds. The read-only retained input
 projection binds both current and original slots to that exact generation and
 borrows the complete original placement. It also accepts mask/coverage raster
 projections without converting them into resident pixels. A foreign generation
-refuses before source preparation. Runtime registration, linked and
-unlinked mask/selection command integration, cancellation/history acceptance and
+refuses before source preparation. The single-plane precursor uses the actual
+registered source session, seals its complete output through `OutputDraft`, and
+prepares a generation-bound raster patch with the original source and placement.
+Cancelled or refused output uses registered fragment retirement after every
+candidate owner drops. The caller retains the session through final adoption.
+Closing-safe retirement additionally requires the concrete runtime's cleanup-only
+admission binding. Linked and unlinked mask/selection command integration,
+cancellation/history acceptance and
 full dense16K qualification are separate gates. Existing live limits remain
 unchanged.
