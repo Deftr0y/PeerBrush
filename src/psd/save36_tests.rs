@@ -501,3 +501,40 @@ fn completed_save_recheck_refuses_replacement_and_never_regains_authority_after_
     drop(doc);
     f.finish();
 }
+
+#[test]
+fn closed_driver_resident_admission_refusal_preserves_source_before_any_staging_creation() {
+    let f = Fixture::new();
+    let doc = document(16);
+    let scene = capture(&f, &doc);
+    let (layers, composite, manifest, container) = f.roots();
+    let mut rows = provider(&scene);
+    let baseline = f.pool.used();
+    let disk = f.disk.used().unwrap();
+    let remaining = f.pool.limit() - baseline - 128;
+    let pressure = ScratchBytes::new(&f.pool, remaining, 64 * 1024 * 1024).unwrap();
+    assert!(prepare(
+        &scene,
+        Format::Psb,
+        OwnedRoots {
+            layers: &layers,
+            composite: &composite,
+            manifest: &manifest,
+            container: &container
+        },
+        &mut rows,
+        limits(),
+        &|| Ok(()),
+        &|| Ok(())
+    )
+    .is_err());
+    assert_eq!(rows.calls, 0);
+    assert!(!layers.exists() && !composite.exists() && !manifest.exists() && !container.exists());
+    assert_eq!(f.disk.used().unwrap(), disk);
+    drop(pressure);
+    assert_eq!(f.pool.used(), baseline);
+    drop(rows);
+    drop(scene);
+    drop(doc);
+    f.finish();
+}
