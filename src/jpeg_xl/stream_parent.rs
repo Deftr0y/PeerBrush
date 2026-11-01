@@ -16,8 +16,20 @@ use ring::digest::{Context, SHA256};
 use std::sync::atomic::AtomicBool;
 const CHILD_BYTES: usize = 96 * 1024 * 1024;
 const PARENT_BYTES: usize = 32 * 1024 * 1024;
-const WINDOW_BYTES: usize = 32 * 1024 * 1024 - 4 * wire::BUFFER_BYTES;
+const WINDOW_BYTES: usize = PARENT_BYTES - 12 * wire::BUFFER_BYTES;
 const NATIVE_BYTES: usize = 512 * 1024 * 1024;
+const _: () = {
+    assert!(2048 * wire::WINDOW_ROWS * 8 <= WINDOW_BYTES);
+    assert!(
+        WINDOW_BYTES
+            + 3 * wire::BUFFER_BYTES
+            + 2048 * 8
+            + stream_chunks::CACHE_BYTES
+            + stream_chunks::HEADERS
+            + 65536
+            <= PARENT_BYTES
+    );
+};
 type Result<T> = std::result::Result<T, String>;
 
 pub(crate) struct Limits {
@@ -111,9 +123,11 @@ struct Buffers {
     io: ScratchBytes,
     segment: ScratchBytes,
     row: Option<ScratchBytes>,
+    originals: Arc<Mutex<stream_chunks::OriginalChunks>>,
+    binding: [u8; 32],
 }
 impl Buffers {
-    fn new(input: &StagedNativeRows<'_, '_, '_>) -> Result<Self> {
+    fn new(input: &StagedNativeRows<'_, '_, '_>, binding: [u8; 32]) -> Result<Self> {
         let pool = input.session().resident();
         Ok(Self {
             window: ScratchBytes::new(&pool, WINDOW_BYTES, WINDOW_BYTES)
@@ -123,6 +137,12 @@ impl Buffers {
             segment: ScratchBytes::new(&pool, wire::BUFFER_BYTES, wire::BUFFER_BYTES)
                 .map_err(|e| e.to_string())?,
             row: None,
+            originals: Arc::new(Mutex::new(stream_chunks::OriginalChunks::new(
+                &pool,
+                input.cache_identity(binding, &|| Ok(()))?,
+                input.raw_bytes(),
+            )?)),
+            binding,
         })
     }
 }
@@ -148,6 +168,7 @@ fn resources(input: &StagedNativeRows<'_, '_, '_>) -> Result<ChildResources> {
     Ok(ChildResources {
         charges,
         _headers: headers,
+        _original_chunks: None,
     })
 }
 fn configuration(input: &StagedNativeRows<'_, '_, '_>, limits: &Limits) -> Result<Configuration> {
@@ -208,9 +229,16 @@ fn fill_rectangle(
                 .map_err(|e| e.to_string())?,
         );
     }
-    // Three64KiB owners include the temporary verifier allocated inside each
-    // uncached range read. The short native row and full window stay admitted.
-    if buffers.window.len() + 3 * wire::BUFFER_BYTES + row > PARENT_BYTES {
+    // The original cache, its headers and the one-chunk verifier all remain
+    // inside the same parent admission as the row, wire and segment buffers.
+    if buffers.window.len()
+        + 3 * wire::BUFFER_BYTES
+        + row
+        + stream_chunks::CACHE_BYTES
+        + stream_chunks::HEADERS
+        + 65536
+        > PARENT_BYTES
+    {
         return Err("Streaming parent callback envelope exceeded".into());
     }
     let mut hash = Context::new(&SHA256);
@@ -219,7 +247,18 @@ fn fill_rectangle(
         let at =
             (u64::from(rectangle.y + y) * output_width + u64::from(rectangle.x)) * pixel as u64;
         let scratch = buffers.row.as_mut().ok_or("Streaming row buffer missing")?;
-        input.copy_range(at, scratch, check)?;
+        let identity = input.cache_identity(buffers.binding, check)?;
+        buffers
+            .originals
+            .lock()
+            .map_err(|_| "Streaming original cache is poisoned")?
+            .copy(
+                identity,
+                at,
+                scratch,
+                &|| input.check(check),
+                |start, count, output| input.copy_complete_chunk(start, count, output, check),
+            )?;
         let start = y as usize * row;
         buffers.window[start..start + row].copy_from_slice(scratch);
         hash.update(scratch);
@@ -589,8 +628,9 @@ pub(crate) fn encode<'scene, 'output, 'session>(
             nonce,
             binding,
         )?);
-        let resources = resources(input)?;
-        let buffers = Buffers::new(input)?;
+        let mut resources = resources(input)?;
+        let buffers = Buffers::new(input, binding)?;
+        resources._original_chunks = Some(buffers.originals.clone());
         let source = session.retain_for_child()?;
         let executable = executable()?;
         let mut command = Command::new(&executable);
@@ -705,6 +745,116 @@ pub(crate) fn encode<'scene, 'output, 'session>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn one_row(y: u32) -> wire::Rectangle {
+        wire::Rectangle {
+            id: 1,
+            x: 0,
+            y,
+            width: 1,
+            height: 1,
+        }
+    }
+    #[test]
+    fn actual_session_original_cache_meters_only_misses_and_checks_cancellation_on_hits() {
+        crate::production_export::staged_rows::tests::with_staged(16, |input| {
+            let session = input.session();
+            assert!(input.test_corrupt_payload(0, &[], false).is_err());
+            assert!(input.test_corrupt_payload(0, &[1; 4097], false).is_err());
+            assert!(input
+                .test_corrupt_payload(input.raw_bytes(), &[1], false)
+                .is_err());
+            input.check(&|| Ok(())).unwrap();
+            let mut buffers = Buffers::new(&input, [77; 32]).unwrap();
+            let before = input.read_used();
+            fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).unwrap();
+            let first = input.read_used();
+            assert_eq!(first - before, 65536);
+            fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).unwrap();
+            assert_eq!(input.read_used(), first);
+            let error = fill_rectangle(&input, one_row(0), &mut buffers, &|| {
+                Err("specific cached source cancellation".into())
+            })
+            .unwrap_err();
+            assert_eq!(error, "specific cached source cancellation");
+            assert_eq!(input.read_used(), first);
+            drop(buffers);
+            input.retire(&mut || session.cleanup_check()).unwrap();
+        });
+    }
+    #[test]
+    fn actual_session_original_cache_refuses_configuration_and_other_stage_bindings() {
+        crate::production_export::staged_rows::tests::with_staged(16, |input| {
+            let session = input.session();
+            let mut buffers = Buffers::new(&input, [77; 32]).unwrap();
+            fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).unwrap();
+            let before = input.read_used();
+            buffers.binding = [78; 32];
+            assert!(fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).is_err());
+            assert_eq!(input.read_used(), before);
+            drop(buffers);
+            let mut buffers = Buffers::new(&input, [77; 32]).unwrap();
+            fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).unwrap();
+            crate::production_export::staged_rows::tests::with_staged(16, |other| {
+                let other_session = other.session();
+                let before = other.read_used();
+                assert!(fill_rectangle(&other, one_row(0), &mut buffers, &|| Ok(())).is_err());
+                assert_eq!(other.read_used(), before);
+                other.retire(&mut || other_session.cleanup_check()).unwrap();
+            });
+            drop(buffers);
+            input.retire(&mut || session.cleanup_check()).unwrap();
+        });
+    }
+    #[test]
+    fn actual_session_cached_original_bytes_never_replace_the_final_fresh_hash() {
+        crate::production_export::staged_rows::tests::with_staged(16, |input| {
+            let session = input.session();
+            let mut buffers = Buffers::new(&input, [77; 32]).unwrap();
+            fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).unwrap();
+            let original = buffers.window[0];
+            let before = input.read_used();
+            input
+                .test_corrupt_payload(0, &[original ^ 255], true)
+                .unwrap();
+            // A timestamp-restored change cannot alter the already verified
+            // original bytes served by a hit, but final fresh proof must fail.
+            fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).unwrap();
+            assert_eq!(buffers.window[0], original);
+            assert_eq!(input.read_used(), before);
+            assert!(input.recheck(&|| Ok(())).is_err());
+            drop(buffers);
+            input.retire(&mut || session.cleanup_check()).unwrap();
+        });
+    }
+    #[test]
+    fn actual_session_evicted_original_chunk_reload_refuses_late_corruption() {
+        crate::production_export::staged_rows::tests::with_staged_options(
+            16,
+            33,
+            2050,
+            Options::default(),
+            |input| {
+                let session = input.session();
+                let mut buffers = Buffers::new(&input, [77; 32]).unwrap();
+                fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).unwrap();
+                let original = buffers.window[0];
+                input
+                    .test_corrupt_payload(0, &[original ^ 255], true)
+                    .unwrap();
+                let row_bytes = u64::from(input.output().width) * 8;
+                for chunk in 1..=4u64 {
+                    let y = (chunk * 65536).div_ceil(row_bytes) as u32;
+                    fill_rectangle(&input, one_row(y), &mut buffers, &|| Ok(())).unwrap();
+                }
+                let before = input.read_used();
+                assert!(fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).is_err());
+                assert_eq!(input.read_used() - before, 65536);
+                assert!(input.check(&|| Ok(())).is_err());
+                drop(buffers);
+                input.retire(&mut || session.cleanup_check()).unwrap();
+            },
+        );
+    }
     #[derive(Clone, Copy)]
     enum FixturePhase {
         Staging,
@@ -919,8 +1069,9 @@ mod tests {
                     config.binding(nonce).unwrap(),
                 )
                 .unwrap();
-            let resources = resources(&input).unwrap();
-            let buffers = Buffers::new(&input).unwrap();
+            let mut resources = resources(&input).unwrap();
+            let buffers = Buffers::new(&input, config.binding(nonce).unwrap()).unwrap();
+            resources._original_chunks = Some(buffers.originals.clone());
             let source = session.retain_for_child().unwrap();
             // Ordinary Cargo test listing is deliberately not our strict wire.
             // The real child must be stopped/reaped before cleanup is admitted.

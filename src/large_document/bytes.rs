@@ -111,6 +111,16 @@ pub struct CompletedBytes {
     inner: Arc<linear::Complete>,
 }
 impl CompletedBytes {
+    #[cfg(test)]
+    pub(crate) fn test_corrupt_payload(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+        restore_modified: bool,
+    ) -> Result<()> {
+        self.inner
+            .test_corrupt_payload(offset, bytes, restore_modified)
+    }
     /// Observation after finish/readback; each actual range still verifies its
     /// immutable chunk hash. This is not a fresh whole-file integrity proof.
     pub(crate) fn check_owner(&self) -> Result<()> {

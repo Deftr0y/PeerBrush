@@ -30,6 +30,7 @@ pub(crate) struct StagedNativeRows<'scene, 'output, 'session> {
     read_limit: u64,
     read_used: AtomicU64,
     failed: AtomicBool,
+    read_nonce: [u8; 16],
 }
 fn profile(scene: &SceneSnapshot) -> &[u8] {
     // Preserve existing JXL behavior: untagged RGB is assigned sRGB by its
@@ -243,6 +244,7 @@ impl<'scene, 'output, 'session> StagedNativeRows<'scene, 'output, 'session> {
             read_limit: max_source_read_bytes,
             read_used: AtomicU64::new(readback),
             failed: AtomicBool::new(false),
+            read_nonce: *uuid::Uuid::new_v4().as_bytes(),
         };
         if let Err(error) = staged.check(check) {
             if let Err(cleanup) = staged.retire(&mut || session.cleanup_check()) {
@@ -254,6 +256,16 @@ impl<'scene, 'output, 'session> StagedNativeRows<'scene, 'output, 'session> {
     }
     pub(crate) fn session(&self) -> &'session SourceSession {
         self.session
+    }
+    #[cfg(test)]
+    pub(crate) fn test_corrupt_payload(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+        restore_modified: bool,
+    ) -> Result<(), String> {
+        self.input
+            .test_corrupt_payload(self.session, offset, bytes, restore_modified)
     }
     pub(crate) fn scene(&self) -> &SceneSnapshot {
         self.scene
@@ -284,6 +296,85 @@ impl<'scene, 'output, 'session> StagedNativeRows<'scene, 'output, 'session> {
     }
     pub(crate) fn read_used(&self) -> u64 {
         self.read_used.load(Ordering::Acquire)
+    }
+    /// Operation-local identity only. A matching digest never replaces check().
+    pub(crate) fn cache_identity(
+        &self,
+        configuration: Digest,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Digest, String> {
+        self.check(check)?;
+        let mut hash = Context::new(&SHA256);
+        hash.update(b"PeerBrushAuthenticatedOriginalChunksV1\0");
+        hash.update(&self.read_nonce);
+        hash.update(&(self.session as *const SourceSession as usize).to_be_bytes());
+        hash.update(&self.binding);
+        hash.update(&self.raw_sha256);
+        hash.update(&self.raw_bytes.to_be_bytes());
+        hash.update(&configuration);
+        Ok(hash.finish().as_ref().try_into().unwrap())
+    }
+    /// Load one original complete chunk prefix, authenticating against the
+    /// initial immutable index. This is the closed broker cache's only loader.
+    pub(crate) fn copy_complete_chunk(
+        &self,
+        start: u64,
+        count: usize,
+        output: &mut ScratchBytes,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let result = (|| {
+            self.check(check)?;
+            if start >= self.raw_bytes
+                || start % CHUNK as u64 != 0
+                || count != (self.raw_bytes - start).min(CHUNK as u64) as usize
+                || output.len() != CHUNK
+                || !output.uses_budget(&self.session.resident())
+            {
+                return Err("Native original chunk shape or pool differs".into());
+            }
+            let bytes = self.input.bytes();
+            self.charge(
+                bytes
+                    .authenticated_read_cost(start, count as u64)
+                    .map_err(|e| e.to_string())?,
+            )?;
+            let mut failure = None;
+            let mut active = || {
+                self.check(check).map_err(|e| {
+                    failure = Some(e);
+                    Error::Cancelled
+                })
+            };
+            let reading = (|| -> Result<(), String> {
+                let mut cursor = bytes
+                    .cursor(start, count as u64, &mut active)
+                    .map_err(|e| e.to_string())?;
+                // Exactly one actual Read; read_exact retry cannot hide a changed
+                // transport or undercount repeated authenticated chunk reads.
+                let n = cursor
+                    .read(&mut output[..count])
+                    .map_err(|e| e.to_string())?;
+                if n != count {
+                    return Err("Native original chunk read was incomplete".into());
+                }
+                let mut extra = [0];
+                if cursor.read(&mut extra).map_err(|e| e.to_string())? != 0 {
+                    return Err("Native original chunk has trailing bytes".into());
+                }
+                Ok(())
+            })();
+            drop(active);
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            reading?;
+            self.check(check)
+        })();
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
     }
     fn charge(&self, count: u64) -> Result<(), String> {
         self.read_used
