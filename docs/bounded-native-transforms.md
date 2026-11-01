@@ -1,0 +1,39 @@
+# Bounded native transform preparation
+
+The native sampler consumes one immutable `Surface` and validated affine,
+projective or retained Warp placement. Its output is a complete canonical tile
+in the source's native8 or native16 depth. It performs no Engine mutation,
+history update, source registration or publication.
+
+Actual output sample coordinates determine each required bilinear source
+footprint. The sampler explicitly prepares that footprint before reading its
+memory-only pixel view. If its area or pin admission is too large, it divides
+the output region and retries the smaller footprints. Coordinate scratch is
+reused across subdivisions. Every map evaluation, including repeated scans,
+consumes the caller's work allowance. Cancellation or source failure returns
+no tile; partial output cannot become a completed source.
+
+Sampling preserves the existing native8 f32 and native16 f64 premultiplied
+arithmetic, integer copies, fill-edge behavior and rounding. An exact identity
+with an unchanged frame preserves the old clone path's physical edge padding.
+Resampled edge padding is zero. Known geometric exterior is distinct from a
+failed backing read; no source error substitutes transparent pixels.
+
+Native support bounds scan one admitted physical tile at a time, including
+hidden RGB and native16 low bits while excluding physical padding. The scan
+charges logical visited samples before reading a tile. Retained placement
+validation is shared with the resident `Original` validator, whose existing
+layout and live-size checks remain in place.
+
+Warp preparation retains a separate bounded metadata reservation. Output,
+coordinate scratch, source pins and permanent source descriptors use the same
+resident pool. The source's disk pool is also checked. These are component
+admissions, not a total application RAM or performance claim.
+
+The final consumer must use the common captured edit, generation-bound source
+slots, sealed source-session output, retained-source action and guarded
+`PreparedDelta`. Original sources and placement metadata remain in their owning
+native document until that adoption succeeds. Runtime registration, linked and
+unlinked mask/selection command integration, cancellation/history acceptance and
+full dense16K qualification are separate gates. Existing live limits remain
+unchanged.
