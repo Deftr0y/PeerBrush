@@ -64,6 +64,14 @@ pub(crate) struct SourceOperation {
     // Release the workspace counter before allowing instance drain to finish.
     _operation: super::FileOperation,
     request: Request,
+    identity: Arc<()>,
+}
+/// One committed intent on one already-admitted operation. No new source I/O
+/// or writer may be constructed from this value after the closing gate wins.
+pub(crate) struct FinalizationPermit {
+    operation: Arc<()>,
+    intent: [u8; 32],
+    saving: crate::saving::CommittedControl,
 }
 
 impl SourceAdmission {
@@ -85,6 +93,7 @@ impl SourceAdmission {
         let permit = SourceOperation {
             _operation: operation,
             request,
+            identity: Arc::new(()),
         };
         permit.check()?;
         Ok(permit)
@@ -92,6 +101,40 @@ impl SourceAdmission {
 }
 
 impl SourceOperation {
+    pub(crate) fn commit_finalization(
+        &self,
+        intent: [u8; 32],
+        control: &crate::saving::Control,
+        prepared: crate::saving::PreparedCommit,
+    ) -> Result<FinalizationPermit, &'static str> {
+        let state = self
+            .request
+            .0
+            .state
+            .lock()
+            .map_err(|_| "Source request state is unavailable")?;
+        if state.stopping || intent == [0; 32] {
+            return Err("Source publication cannot commit after closing");
+        }
+        let saving = prepared.commit(control)?;
+        let permit = FinalizationPermit {
+            operation: self.identity.clone(),
+            intent,
+            saving,
+        };
+        drop(state);
+        Ok(permit)
+    }
+    pub(crate) fn check_finalization(
+        &self,
+        permit: &FinalizationPermit,
+        intent: [u8; 32],
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.identity, &permit.operation) || permit.intent != intent {
+            return Err("Finalization belongs to another source operation or intent".into());
+        }
+        permit.saving.check()
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
         if self.request.0.stopping() {
             Err("PeerBrush source session is closing".into())
@@ -207,6 +250,75 @@ impl Drop for InstanceLock {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn source_finalization_is_exact_operation_intent_and_cannot_be_reused() {
+        let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+        let workspace = crate::workspace::attach(&shared);
+        let requests = Arc::new(Requests::default());
+        let admission = SourceAdmission {
+            requests: requests.clone(),
+            workspace: Arc::downgrade(&workspace),
+        };
+        let first = admission.begin().unwrap();
+        let foreign = admission.begin().unwrap();
+        let control = crate::saving::Control::default();
+        control.begin("source".into(), 7).unwrap();
+        let prepared = control.prepare_commit("source", 7).unwrap();
+        let stale = control.prepare_commit("source", 7).unwrap();
+        let permit = first
+            .commit_finalization([1; 32], &control, prepared)
+            .unwrap();
+        first.check_finalization(&permit, [1; 32]).unwrap();
+        assert!(foreign.check_finalization(&permit, [1; 32]).is_err());
+        assert!(first.check_finalization(&permit, [2; 32]).is_err());
+        assert!(first.commit_finalization([1; 32], &control, stale).is_err());
+        requests.stop();
+        assert!(first.check().is_err());
+        assert!(admission.begin().is_err());
+        first.check_finalization(&permit, [1; 32]).unwrap();
+        control.finish(&Ok(()));
+        assert!(first.check_finalization(&permit, [1; 32]).is_err());
+    }
+
+    #[test]
+    fn source_closing_and_prepared_commit_serialize_before_the_one_way_save_boundary() {
+        for _ in 0..32 {
+            let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+            let workspace = crate::workspace::attach(&shared);
+            let requests = Arc::new(Requests::default());
+            let admission = SourceAdmission {
+                requests: requests.clone(),
+                workspace: Arc::downgrade(&workspace),
+            };
+            let operation = admission.begin().unwrap();
+            let control = crate::saving::Control::default();
+            control.begin("source".into(), 7).unwrap();
+            let prepared = control.prepare_commit("source", 7).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let stop = requests.clone();
+            let other = barrier.clone();
+            let worker = thread::spawn(move || {
+                other.wait();
+                stop.stop()
+            });
+            barrier.wait();
+            let result = operation.commit_finalization([1; 32], &control, prepared);
+            worker.join().unwrap();
+            match result {
+                Ok(permit) => {
+                    assert!(!control.status().can_cancel);
+                    operation.check_finalization(&permit, [1; 32]).unwrap();
+                    assert!(!control.cancel());
+                }
+                Err(_) => {
+                    assert!(control.status().can_cancel);
+                    assert!(control.cancel());
+                }
+            }
+            assert!(operation.check().is_err());
+            assert!(admission.begin().is_err());
+        }
+    }
     use std::{
         fs,
         io::{Read, Write},
