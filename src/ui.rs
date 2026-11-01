@@ -31,6 +31,7 @@ mod pattern_source;
 mod pen;
 #[cfg(test)]
 mod pen_tests;
+mod preview_worker;
 mod protection;
 mod recovery;
 mod refinement;
@@ -363,6 +364,8 @@ struct ParameterEdit {
     dirty: bool,
 }
 pub struct PeerBrush {
+    // Drain previews before any document, workspace or profile owner drops.
+    preview_worker: preview_worker::Worker,
     fonts: filename::FontSetup,
     shared: Shared,
     workspace_root: Shared,
@@ -723,6 +726,7 @@ impl PeerBrush {
         let tool_profile = tool_settings::initial(&tool_settings_store);
         let initial_tool_profile = tool_profile.snapshot.profile.clone();
         let (preview_tx, preview_rx) = mpsc::channel();
+        let preview_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (job_tx, job_rx) = mpsc::channel();
         let (import_tx, import_rx) = mpsc::channel();
         let (image_open_tx, image_open_rx) = mpsc::channel();
@@ -735,6 +739,7 @@ impl PeerBrush {
             (e.project_id.clone(), e.doc.clone())
         };
         Self {
+            preview_worker: preview_worker::Worker::new(preview_epoch.clone()),
             fonts,
             recovery: recovery::Browser::new(&connection.state_dir),
             saved_versions: None,
@@ -865,7 +870,7 @@ impl PeerBrush {
             preview_rx,
             preview_tx,
             pending: false,
-            preview_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            preview_epoch,
             preview_job: 0,
             #[cfg(test)]
             parameter_worker_gate: None,
@@ -2539,147 +2544,195 @@ impl PeerBrush {
                         })
                         .map(|_| (None, "cutout".into()))
                 });
-            std::thread::spawn(move || {
-                let id = doc.id.clone();
-                let revision = doc.revision;
-                let mut parameter_document = None;
-                let check = || {
-                    if epoch.load(std::sync::atomic::Ordering::Relaxed) == job {
-                        Ok(())
-                    } else {
-                        Err("Preview superseded".to_string())
-                    }
-                };
-                let output = (|| {
-                    #[cfg(test)]
-                    if let Some(gate) = &worker_gate {
-                        let (lock, ready) = &**gate;
-                        let mut released = lock.lock().unwrap();
-                        while !*released {
-                            released = ready.wait(released).unwrap();
-                        }
-                    }
-                    check()?;
-                    let mut dirty = dirty;
-                    // A replay delta belongs to these retained pixels. Keep
-                    // worker replay/render together across project switches.
-                    let mut cache = cache
-                        .lock()
-                        .map_err(|_| "Preview worker cache unavailable")?;
-                    check()?;
-                    if !commands.is_empty() {
-                        #[cfg(test)]
-                        if parameter_replayed {
-                            worker_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        if dirty.is_some() && commands.len() == 1 && commands[0]["op"] == "paint" {
-                            (doc, dirty) = cache.edit_with_region(doc, &commands, &live)?;
+            let failure_context = ctx.clone();
+            let request_context = ctx.clone();
+            let failure_tx = tx.clone();
+            let failure_message =
+                "Canvas preview could not complete; current work preserved".to_owned();
+            let failure_reply = Preview {
+                job,
+                parameter: parameter.clone(),
+                parameter_document: parameter_only.then(|| Err(failure_message.clone())),
+                #[cfg(test)]
+                parameter_replayed: false,
+                coarse: false,
+                error: Some(failure_message),
+                live: live.clone(),
+                revision: doc.revision,
+                doc_id: doc.id.clone(),
+                w: 0,
+                h: 0,
+                bytes: Vec::new(),
+                dirty: None,
+                selection: None,
+                selection_polygon: None,
+                selection_coverage: None,
+                target: variant.clone(),
+                mask,
+            };
+            let requested = self.preview_worker.request(
+                move || {
+                    let id = doc.id.clone();
+                    let revision = doc.revision;
+                    let mut parameter_document = None;
+                    let check = || {
+                        if epoch.load(std::sync::atomic::Ordering::Relaxed) == job {
+                            Ok(())
                         } else {
-                            doc = cache.edit(doc, &commands, &live)?;
+                            Err("Preview superseded".to_string())
                         }
-                    }
-                    check()?;
-                    if parameter_only {
-                        parameter_document = Some(doc.clone());
-                    }
-                    // A coarse shared-engine frame reaches the canvas before detailed sampling.
-                    // Derived only: no source changes, history, or 16-bit conversion.
-                    if dirty.is_none()
-                        && refinement.is_none()
-                        && edge > 512
-                        && doc.width.max(doc.height) > 1024
-                    {
-                        if let Ok((w, h, bytes, _)) = doc.preview(None, 256, layer.as_deref(), mask)
+                    };
+                    let output = (|| {
+                        #[cfg(test)]
+                        if let Some(gate) = &worker_gate {
+                            let (lock, ready) = &**gate;
+                            let mut released = lock.lock().unwrap();
+                            while !*released {
+                                check()?;
+                                released = ready
+                                    .wait_timeout(released, Duration::from_millis(25))
+                                    .unwrap()
+                                    .0;
+                            }
+                        }
+                        check()?;
+                        let mut dirty = dirty;
+                        // A replay delta belongs to these retained pixels. Keep
+                        // worker replay/render together across project switches.
+                        let mut cache = cache
+                            .lock()
+                            .map_err(|_| "Preview worker cache unavailable")?;
+                        check()?;
+                        if !commands.is_empty() {
+                            #[cfg(test)]
+                            if parameter_replayed {
+                                worker_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if dirty.is_some()
+                                && commands.len() == 1
+                                && commands[0]["op"] == "paint"
+                            {
+                                (doc, dirty) = cache.edit_with_region(doc, &commands, &live)?;
+                            } else {
+                                doc = cache.edit(doc, &commands, &live)?;
+                            }
+                        }
+                        check()?;
+                        if parameter_only {
+                            parameter_document = Some(doc.clone());
+                        }
+                        // A coarse shared-engine frame reaches the canvas before detailed sampling.
+                        // Derived only: no source changes, history, or 16-bit conversion.
+                        if dirty.is_none()
+                            && refinement.is_none()
+                            && edge > 512
+                            && doc.width.max(doc.height) > 1024
                         {
-                            let _ = tx.send(Preview {
-                                job,
-                                parameter: parameter.clone(),
-                                parameter_document: None,
-                                #[cfg(test)]
-                                parameter_replayed: false,
-                                coarse: true,
-                                error: None,
-                                live: live.clone(),
-                                doc_id: id.clone(),
-                                revision,
-                                target: variant.clone(),
-                                mask,
-                                w,
-                                h,
-                                bytes,
-                                dirty: None,
-                                selection: doc.selection,
-                                selection_polygon: doc.selection_polygon.clone(),
-                                selection_coverage: doc.selection_coverage.clone(),
-                            });
-                            ctx.request_repaint();
+                            if let Ok((w, h, bytes, _)) =
+                                doc.preview(None, 256, layer.as_deref(), mask)
+                            {
+                                let _ = tx.send(Preview {
+                                    job,
+                                    parameter: parameter.clone(),
+                                    parameter_document: None,
+                                    #[cfg(test)]
+                                    parameter_replayed: false,
+                                    coarse: true,
+                                    error: None,
+                                    live: live.clone(),
+                                    doc_id: id.clone(),
+                                    revision,
+                                    target: variant.clone(),
+                                    mask,
+                                    w,
+                                    h,
+                                    bytes,
+                                    dirty: None,
+                                    selection: doc.selection,
+                                    selection_polygon: doc.selection_polygon.clone(),
+                                    selection_coverage: doc.selection_coverage.clone(),
+                                });
+                                ctx.request_repaint();
+                            }
                         }
-                    }
-                    let mut rendered =
-                        cache.render(&doc, &live, dirty, edge, layer.as_deref(), mask)?;
-                    if let Some((target, mode)) = &refinement {
-                        if target.is_none() {
-                            crate::selection::display::apply(
-                                &doc,
-                                rendered.width,
-                                rendered.height,
-                                &mut rendered.bytes,
-                                mode,
-                            );
-                            rendered.dirty = None;
-                        } else if mode == "mask" {
-                            let (w, h, bytes, _) =
-                                doc.preview(None, edge, target.as_deref(), true)?;
-                            rendered.width = w;
-                            rendered.height = h;
-                            rendered.bytes = bytes;
-                            rendered.dirty = None;
+                        let mut rendered =
+                            cache.render(&doc, &live, dirty, edge, layer.as_deref(), mask)?;
+                        if let Some((target, mode)) = &refinement {
+                            if target.is_none() {
+                                crate::selection::display::apply(
+                                    &doc,
+                                    rendered.width,
+                                    rendered.height,
+                                    &mut rendered.bytes,
+                                    mode,
+                                );
+                                rendered.dirty = None;
+                            } else if mode == "mask" {
+                                let (w, h, bytes, _) =
+                                    doc.preview(None, edge, target.as_deref(), true)?;
+                                rendered.width = w;
+                                rendered.height = h;
+                                rendered.bytes = bytes;
+                                rendered.dirty = None;
+                            }
                         }
-                    }
-                    check()?;
-                    Ok::<_, String>((
-                        rendered.width,
-                        rendered.height,
-                        rendered.bytes,
-                        rendered.dirty,
-                        doc.selection,
-                        doc.selection_polygon.clone(),
-                        doc.selection_coverage.clone(),
-                    ))
-                })();
-                let error = output.as_ref().err().cloned();
-                let (w, h, bytes, dirty, selection, selection_polygon, selection_coverage) =
-                    output.unwrap_or((0, 0, vec![], None, None, None, None));
-                let _ = tx.send(Preview {
-                    job,
-                    parameter,
-                    parameter_document: if parameter_only {
-                        parameter_document
-                            .map(Ok)
-                            .filter(|_| error.is_none())
-                            .or_else(|| error.as_ref().map(|error| Err(error.clone())))
-                    } else {
-                        None
-                    },
-                    #[cfg(test)]
-                    parameter_replayed,
-                    coarse: false,
-                    error,
-                    live,
-                    doc_id: id,
-                    revision,
-                    target: variant,
-                    mask,
-                    w,
-                    h,
-                    bytes,
-                    dirty,
-                    selection,
-                    selection_polygon,
-                    selection_coverage,
-                });
-                ctx.request_repaint();
-            });
+                        check()?;
+                        Ok::<_, String>((
+                            rendered.width,
+                            rendered.height,
+                            rendered.bytes,
+                            rendered.dirty,
+                            doc.selection,
+                            doc.selection_polygon.clone(),
+                            doc.selection_coverage.clone(),
+                        ))
+                    })();
+                    let error = output.as_ref().err().cloned();
+                    let (w, h, bytes, dirty, selection, selection_polygon, selection_coverage) =
+                        output.unwrap_or((0, 0, vec![], None, None, None, None));
+                    let _ = tx.send(Preview {
+                        job,
+                        parameter,
+                        parameter_document: if parameter_only {
+                            parameter_document
+                                .map(Ok)
+                                .filter(|_| error.is_none())
+                                .or_else(|| error.as_ref().map(|error| Err(error.clone())))
+                        } else {
+                            None
+                        },
+                        #[cfg(test)]
+                        parameter_replayed,
+                        coarse: false,
+                        error,
+                        live,
+                        doc_id: id,
+                        revision,
+                        target: variant,
+                        mask,
+                        w,
+                        h,
+                        bytes,
+                        dirty,
+                        selection,
+                        selection_polygon,
+                        selection_coverage,
+                    });
+                    ctx.request_repaint();
+                },
+                move || {
+                    let _ = failure_tx.send(failure_reply);
+                    failure_context.request_repaint();
+                },
+            );
+            if let Err(error) = requested {
+                self.pending = false;
+                self.last_preview = None;
+                self.message = format!(
+                    "Canvas preview worker could not start: {error}; current work preserved"
+                );
+                request_context.request_repaint();
+            }
         }
     }
     fn thumbnail(
@@ -6201,6 +6254,7 @@ impl eframe::App for PeerBrush {
         self.draw(ctx);
     }
     fn on_exit(&mut self) {
+        self.preview_worker.stop();
         crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
         if self.update_exit_committed() {
             return;
