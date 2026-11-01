@@ -1,5 +1,6 @@
 mod fonts;
 mod instance;
+pub(crate) mod observation;
 mod reply;
 mod stream;
 #[cfg(test)]
@@ -1306,6 +1307,9 @@ fn observation(
     p: &Value,
     admission: &mut reply::ReplyAdmission,
 ) -> Result<Value, String> {
+    if let Some(captured) = observation::capture(shared, p, admission)? {
+        return captured.observe(shared, p, admission);
+    }
     let (state, doc) = {
         let mut e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, p)?;

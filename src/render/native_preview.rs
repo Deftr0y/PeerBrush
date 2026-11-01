@@ -467,6 +467,18 @@ impl Frame {
 }
 
 #[cfg(test)]
+pub(crate) fn test_frame(
+    scene: &SceneSnapshot,
+    rect: Option<[i32; 4]>,
+    edge: u32,
+    target: Option<&str>,
+    mask: bool,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Frame> {
+    Arc::new(Prepared::capture(scene, rect, edge, target, mask, check)?).render(scene, check)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::{Document, Layer};

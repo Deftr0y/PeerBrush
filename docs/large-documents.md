@@ -4,7 +4,11 @@
 
 The native response owner keeps metadata admission and encoded image bytes inseparable from their wire representation. Its sealed image slots stream base64 from bounded segments; MCP text metadata is serialized directly without constructing a second complete string. Serialized segments retain their own charges through the final reader, including cancellation, failed serialization and early connection closure.
 
-This component does not activate a native MCP path by itself. Captured scene provenance, complete metadata projection, bounded selection feedback, PNG preparation and actual HTTP/stdio routing still require integration and acceptance. Resident response behavior and document/preview limits remain unchanged.
+Native observation captures the actual document generation and inspection provenance once, then prepares status, metadata, display pixels and bounded selection bands outside Engine locks. Source and profile operations end before streamed PNG and response serialization. The HTTP/MCP owner retains the actual admission through send or failure. The authenticated stdio bridge validates a bounded, matching JSON-RPC response while forwarding chunks; a corrupt partial response terminates that transport. Resident response behavior and document/preview limits remain unchanged.
+
+Native retained-source inspection reports `bytes: null`, `storage_kind: "source-backed"` and `native_logical_bytes`; logical dimensions do not measure resident RAM. Historic Liquify selection clips retain typed source bindings in `native_coverage_clips`, including their scalar bounds, origin, contours and retained placement. These observations grant no raster-slot or edit authority. Native unsupported-profile feedback retains a bounded unmanaged-preview reason, while allocation, cancellation and source-admission failures remain errors.
+
+Tiny native8/16 data-component checks cover display/selection pixels, streamed PNG, metadata parity and refusal ownership. Complete live authority, provider and cross-platform HTTP/stdio acceptance remain release gates. Closing cancels response preparation and reader progress, retaining the request drain guard through actual I/O. The pinned HTTP transport exposes no accepted-socket deadline or shutdown handle; an already blocked kernel write or flush can still delay shutdown until the client disconnects. No bounded shutdown-time claim is made.
 
 ## Source-backed internal clipboard preparation (unreleased)
 
