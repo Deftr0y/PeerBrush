@@ -124,6 +124,66 @@ fn actual_http_framing_keeps_native_charge_through_send_and_write_failure() {
 }
 
 #[test]
+fn actual_http_response_cancellation_retires_admission_before_or_during_send() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let pool = crate::large_document::ResidentBudget::new(16 * 1024 * 1024).unwrap();
+    for before in [false, true] {
+        let mut admission = reply::ReplyAdmission::new(true);
+        admission.admit(&pool, 8192).unwrap();
+        let mut check = || Ok(());
+        let mut png = reply::SegmentWriter::new(&pool, 128 * 1024, &mut check).unwrap();
+        png.write_all(&vec![137; 128 * 1024]).unwrap();
+        admission.image(0, png.finish().unwrap()).unwrap();
+        let body = admission
+            .finish(json!({"images":[{"mime_type":"image/png","data":null}]}))
+            .unwrap()
+            .tool_result()
+            .unwrap()
+            .rpc(&json!(17))
+            .unwrap()
+            .ordered_rpc()
+            .unwrap();
+        let canceled = Arc::new(AtomicBool::new(before));
+        let gate = canceled.clone();
+        let response = owned_response_checked(body, move || {
+            if gate.load(Ordering::Acquire) {
+                Err("closed request".into())
+            } else {
+                Ok(())
+            }
+        });
+        if before {
+            assert!(response.is_err());
+            assert_eq!(pool.used(), 0);
+            continue;
+        }
+        struct Sink {
+            sent: usize,
+            canceled: Arc<AtomicBool>,
+        }
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.sent += bytes.len();
+                if self.sent > 64 * 1024 {
+                    self.canceled.store(true, Ordering::Release);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Sink { sent: 0, canceled };
+        assert!(response
+            .unwrap()
+            .raw_print(&mut sink, tiny_http::HTTPVersion(1, 1), &[], false, None)
+            .is_err());
+        assert!(sink.sent > 64 * 1024);
+        assert_eq!(pool.used(), 0);
+    }
+}
+
+#[test]
 fn actual_owned_http_sender_and_stdio_bridge_preserve_payload_and_retire_admission() {
     let fixture = Fixture::new();
     let pool = crate::large_document::ResidentBudget::new(32 * 1024 * 1024).unwrap();
