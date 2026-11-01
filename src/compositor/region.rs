@@ -118,7 +118,8 @@ mod tests {
     };
 
     fn store(budget: &ResidentBudget) -> (Store, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("pb-scene-region-{}", crate::engine::id()));
+        let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let path = parent.join(format!("pb-scene-region-{}", crate::engine::id()));
         let store = Store::create(
             &path,
             budget.clone(),
