@@ -290,6 +290,7 @@
     "src/file_ownership.rs",
     "src/file_permissions.rs",
     "src/file_safety.rs",
+    "src/file_safety/native_backup.rs",
     "src/file_safety/native_inventory.rs",
     "src/file_safety/owned_rename.rs",
     "src/fill.rs",

@@ -114,16 +114,21 @@ pub(crate) fn preserve(source: &Path, destination: &Path) -> Result<(), String> 
 
 #[cfg(unix)]
 pub(crate) fn preserve(source: &Path, destination: &Path) -> Result<(), String> {
-    use std::os::unix::{fs::MetadataExt, io::AsRawFd};
-    extern "C" {
-        fn fchown(fd: i32, owner: u32, group: u32) -> i32;
-    }
     let source = fs::File::open(source).map_err(|e| e.to_string())?;
     let destination = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(destination)
         .map_err(|e| e.to_string())?;
+    preserve_held(&source, &destination)
+}
+
+#[cfg(unix)]
+pub(crate) fn preserve_held(source: &fs::File, destination: &fs::File) -> Result<(), String> {
+    use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+    extern "C" {
+        fn fchown(fd: i32, owner: u32, group: u32) -> i32;
+    }
     let before = source.metadata().map_err(|e| e.to_string())?;
     let current = destination.metadata().map_err(|e| e.to_string())?;
     if (before.uid(), before.gid()) != (current.uid(), current.gid())
@@ -137,7 +142,88 @@ pub(crate) fn preserve(source: &Path, destination: &Path) -> Result<(), String> 
     destination
         .set_permissions(before.permissions())
         .map_err(|e| e.to_string())?;
-    copy_acl(&source, &destination)
+    copy_acl(source, destination)
+}
+
+/// Preserve the rules of the held objects, without reopening mutable names.
+#[cfg(windows)]
+pub(crate) fn preserve_held(
+    source: &std::fs::File,
+    destination: &std::fs::File,
+) -> Result<(), String> {
+    use std::{ffi::c_void, os::windows::io::AsRawHandle, ptr::null_mut};
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetSecurityInfo(
+            handle: *mut c_void,
+            kind: u32,
+            info: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            descriptor: *mut *mut c_void,
+        ) -> u32;
+        fn SetSecurityInfo(
+            handle: *mut c_void,
+            kind: u32,
+            info: u32,
+            owner: *mut c_void,
+            group: *mut c_void,
+            dacl: *mut c_void,
+            sacl: *mut c_void,
+        ) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SE_FILE_OBJECT, DACL_SECURITY_INFORMATION. The destination was created
+    // with WRITE_DAC; no token privileges or machine security policy changes.
+    // https://learn.microsoft.com/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo
+    let error = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            1,
+            4,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(format!(
+            "Cannot read held file access rules: {}",
+            std::io::Error::from_raw_os_error(error as i32)
+        ));
+    }
+    // PROTECTED_DACL_SECURITY_INFORMATION matches the existing named path
+    // implementation: a new backup must not inherit additional grants.
+    let error = unsafe {
+        SetSecurityInfo(
+            destination.as_raw_handle(),
+            1,
+            4 | 0x80000000,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null_mut(),
+        )
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if error != 0 {
+        return Err(format!(
+            "Cannot preserve held file access rules: {}",
+            std::io::Error::from_raw_os_error(error as i32)
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

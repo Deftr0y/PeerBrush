@@ -5,6 +5,8 @@ use std::{ffi::OsString, time::SystemTime};
 
 const MAX_ENTRIES: usize = 4096;
 const INVENTORY_BYTES: usize = 8 * 1024 * 1024;
+#[path = "native_backup.rs"]
+mod native_backup;
 struct Entry {
     name: OsString,
     file: fs::File,
@@ -21,6 +23,7 @@ pub(crate) struct NativeInventory<'a> {
     quota_identity: (u64, u64),
     entries: Vec<Entry>,
     backup_bytes: u64,
+    budget: ResidentBudget,
     // Names, both enumeration vectors and retained file metadata are bounded
     // before their allocations. Kernel handle memory is outside this pool.
     _charge: Reservation,
@@ -81,6 +84,7 @@ impl NativeLease {
             quota_identity,
             entries: Vec::new(),
             backup_bytes: 0,
+            budget: budget.clone(),
             _charge: charge,
         };
         inventory
