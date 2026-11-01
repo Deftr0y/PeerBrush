@@ -311,3 +311,35 @@ fn actual_native_late_foreign_replacement_prevents_receipt_settlement_without_cl
         drop(lease);
     });
 }
+
+#[test]
+fn actual_native_existing_target_refuses_new_target_driver_before_external_staging() {
+    with_session_candidate(16, |session, candidate, runtime, root, _| {
+        let path = root.join("existing-source.psb");
+        fs::write(&path, b"original version stays exactly").unwrap();
+        let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+        let inventory = lease
+            .freeze_inventory(&runtime.resident(), &|| Ok(()))
+            .unwrap();
+        let observed = inventory.observe_external(&|| Ok(())).unwrap();
+        let intent = session
+            .prepare_publication(candidate, &observed, &|| Ok(()))
+            .unwrap();
+        drop(observed);
+        let temporary = root.join(intent.temporary_name());
+        let backup = root
+            .join(".peerbrush-versions")
+            .join(intent.backup_name().unwrap());
+        assert!(
+            NativeNewDestination::create(session, candidate, &inventory, &intent, &|| Ok(()))
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"original version stays exactly");
+        assert!(!temporary.exists());
+        assert!(!backup.exists());
+        inventory.validate(&|| Ok(())).unwrap();
+        drop(intent);
+        drop(inventory);
+        drop(lease);
+    });
+}
