@@ -30,6 +30,12 @@ impl PreparationFailure {
     }
 }
 impl PreparedNative {
+    pub(crate) fn base(&self) -> &NativeDocument {
+        &self.document
+    }
+    pub(crate) fn base_key(&self) -> DocumentKey {
+        self.document.key()
+    }
     pub(crate) fn preview(&self) -> &NativeDocument {
         self.delta.preview()
     }

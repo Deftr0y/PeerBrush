@@ -46,13 +46,79 @@ pub(crate) struct StagedScene<S> {
 }
 
 pub struct CapturedScene {
+    body: CaptureBody,
+}
+enum CaptureBody {
+    Resident(ResidentCapture),
+    Native(SceneSnapshot),
+}
+impl CapturedScene {
+    pub(crate) fn from_parts(
+        document: Document,
+        project_id: String,
+        leases: Vec<super::super::Lease>,
+        file_version: Option<crate::file_safety::Version>,
+        file_ownership: Option<Arc<crate::file_ownership::Ownership>>,
+    ) -> Self {
+        Self {
+            body: CaptureBody::Resident(ResidentCapture::from_parts(
+                document,
+                project_id,
+                leases,
+                file_version,
+                file_ownership,
+            )),
+        }
+    }
+    pub(crate) fn from_native(scene: SceneSnapshot) -> Result<Self> {
+        if !matches!(scene.document, SnapshotDocument::Native(_)) {
+            return Err("Native capture requires actual native scene authority".into());
+        }
+        Ok(Self {
+            body: CaptureBody::Native(scene),
+        })
+    }
+    pub fn identity(&self) -> &SceneIdentity {
+        match &self.body {
+            CaptureBody::Resident(source) => source.identity(),
+            CaptureBody::Native(scene) => scene.identity(),
+        }
+    }
+    pub(crate) fn native_scene(&self) -> Option<&SceneSnapshot> {
+        match &self.body {
+            CaptureBody::Native(scene) => Some(scene),
+            CaptureBody::Resident(_) => None,
+        }
+    }
+    pub(crate) fn into_native(self) -> Result<SceneSnapshot> {
+        match self.body {
+            CaptureBody::Native(scene) => Ok(scene),
+            CaptureBody::Resident(_) => Err("Captured scene has resident authority".into()),
+        }
+    }
+    pub(crate) fn stage<R: StageRuntime>(
+        self,
+        runtime: &R,
+        cache: &LegacyTileCache,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<StagedScene<R::Session>> {
+        match self.body {
+            CaptureBody::Resident(source) => source.stage(runtime, cache, check),
+            CaptureBody::Native(_) => {
+                Err("Native scene reads require the actual native source factory".into())
+            }
+        }
+    }
+}
+
+struct ResidentCapture {
     document: Document,
     identity: SceneIdentity,
     leases: Vec<super::super::Lease>,
     file_version: Option<crate::file_safety::Version>,
     file_ownership: Option<Arc<crate::file_ownership::Ownership>>,
 }
-impl CapturedScene {
+impl ResidentCapture {
     pub(crate) fn from_parts(
         document: Document,
         project_id: String,
@@ -556,6 +622,47 @@ impl NativePayload for u16 {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn native_capture_never_enters_the_resident_observation_write_bridge() {
+        let runtime = Runtime::new();
+        let cache = LegacyTileCache::new(&runtime.resident(), 4).unwrap();
+        let document = crate::engine::native::NativeDocument::new_blank(
+            4,
+            2,
+            16,
+            &runtime.resident(),
+            &runtime.disk(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let scene = || {
+            SceneSnapshot::from_native(
+                SceneIdentity {
+                    project_id: "native-capture".into(),
+                    document_id: document.metadata().id().into(),
+                    revision: 0,
+                },
+                document.clone(),
+                vec![],
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let captured = CapturedScene::from_native(scene()).unwrap();
+        assert_eq!(captured.identity().project_id, "native-capture");
+        assert_eq!(captured.native_scene().unwrap().key(), document.key());
+        assert!(captured.stage(&runtime, &cache, &|| Ok(())).is_err());
+        assert_eq!(runtime.0.begins.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.0.sealed.load(Ordering::SeqCst), 0);
+        let native = CapturedScene::from_native(scene())
+            .unwrap()
+            .into_native()
+            .unwrap();
+        assert_eq!(native.key(), document.key());
+        assert_eq!(native.identity().document_id, document.metadata().id());
+        assert_eq!(runtime.disk().used().unwrap(), 0);
+    }
     struct Runtime(Arc<RuntimeInner>);
     struct RuntimeInner {
         root: std::path::PathBuf,

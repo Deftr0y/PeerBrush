@@ -97,6 +97,44 @@ fn actual_worker_preview_abort_and_commit_use_the_same_atomic_metadata_batch() {
     ];
     let disk = session.disk().used().unwrap();
     let preview = prepare(capture(&state, &commands), &session, &|| Ok(())).unwrap();
+    let base_scene = state
+        .capture_scene(
+            None,
+            "worker-preview".into(),
+            vec![crate::engine::Lease {
+                id: "lease".into(),
+                owner: "human".into(),
+                description: "Preview".into(),
+                scopes: vec![crate::engine::Scope::layer(&layer)],
+                expires: 100,
+            }],
+            None,
+            None,
+        )
+        .unwrap()
+        .into_native()
+        .unwrap();
+    assert_eq!(preview.base_key(), base_scene.key());
+    let candidate_scene = base_scene.with_prepared_preview(&preview).unwrap();
+    assert_eq!(candidate_scene.key(), preview.preview().key());
+    assert_eq!(
+        candidate_scene.identity().project_id,
+        base_scene.identity().project_id
+    );
+    assert_eq!(
+        candidate_scene.identity().document_id,
+        base_scene.identity().document_id
+    );
+    assert_eq!(candidate_scene.identity().revision, 1);
+    assert_eq!(
+        candidate_scene.leases().as_ptr(),
+        base_scene.leases().as_ptr()
+    );
+    assert_eq!(candidate_scene.file_version(), base_scene.file_version());
+    // A derived candidate cannot serve as a substitute captured base.
+    assert!(candidate_scene.with_prepared_preview(&preview).is_err());
+    drop(candidate_scene);
+    drop(base_scene);
     assert_eq!(
         preview.preview().metadata().layer(0).unwrap().name(),
         "Batch"

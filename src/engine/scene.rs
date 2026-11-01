@@ -186,6 +186,10 @@ pub struct SceneSnapshot {
     // Metadata admission outlives the other captured metadata allocations.
     document: SnapshotDocument,
     binding: super::native::DocumentKey,
+    // Shared lease payload and each snapshot's small header have independent
+    // tickets, so preview chains never retain predecessor header admissions.
+    _lease_charge: Option<Arc<MetadataCharge>>,
+    _header_charge: Option<Arc<MetadataCharge>>,
 }
 enum SnapshotDocument {
     Pending(PendingScene),
@@ -195,6 +199,50 @@ enum SnapshotDocument {
 struct RuntimeViews {
     structure: Vec<crate::psd::SourceLayerInfo>,
     patterns: Vec<crate::psd::patterns::Source>,
+}
+fn native_scene_header(
+    identity: &SceneIdentity,
+    pool: &ResidentBudget,
+) -> Result<Arc<MetadataCharge>> {
+    let bytes = identity
+        .project_id
+        .capacity()
+        .checked_add(identity.document_id.capacity())
+        .and_then(|n| n.checked_add(1024))
+        .ok_or("Native scene header admission overflow")?;
+    MetadataCharge::reserve(pool, bytes, &|| Ok(()))
+}
+fn native_scene_leases(
+    leases: &Vec<super::Lease>,
+    pool: &ResidentBudget,
+) -> Result<Arc<MetadataCharge>> {
+    let mut bytes = leases
+        .capacity()
+        .checked_mul(std::mem::size_of::<super::Lease>())
+        .and_then(|n| n.checked_add(512))
+        .ok_or("Native scene lease admission overflow")?;
+    for lease in leases {
+        for length in [
+            lease.id.capacity(),
+            lease.owner.capacity(),
+            lease.description.capacity(),
+            lease
+                .scopes
+                .capacity()
+                .checked_mul(std::mem::size_of::<super::Scope>())
+                .ok_or("Native scope footprint overflow")?,
+        ] {
+            bytes = bytes
+                .checked_add(length)
+                .ok_or("Native lease footprint overflow")?;
+        }
+        for scope in &lease.scopes {
+            bytes = bytes
+                .checked_add(scope.target.as_ref().map_or(0, String::capacity))
+                .ok_or("Native scope text footprint overflow")?;
+        }
+    }
+    MetadataCharge::reserve(pool, bytes, &|| Ok(()))
 }
 impl SceneSnapshot {
     /// Exact immutable source generation; document ID/revision alone cannot
@@ -222,6 +270,8 @@ impl SceneSnapshot {
             file_version,
             _file_ownership: file_ownership,
             runtime_views: RuntimeViews::default(),
+            _lease_charge: None,
+            _header_charge: None,
         })
     }
     pub fn identity(&self) -> &SceneIdentity {
@@ -240,6 +290,8 @@ impl SceneSnapshot {
             return Err("Native snapshot identity differs".into());
         }
         let binding = document.key();
+        let header_charge = native_scene_header(&identity, document.budget())?;
+        let lease_charge = native_scene_leases(&leases, document.budget())?;
         Ok(Self {
             identity,
             leases: Arc::new(leases),
@@ -248,6 +300,69 @@ impl SceneSnapshot {
             runtime_views: RuntimeViews::default(),
             document: SnapshotDocument::Native(document),
             binding,
+            _lease_charge: Some(lease_charge),
+            _header_charge: Some(header_charge),
+        })
+    }
+    /// Derive unpublished preview provenance from the exact captured base. The
+    /// UI cannot replace project identity, leases or file ownership through this
+    /// route. Drop this scene before aborting the prepared output sources.
+    pub(crate) fn with_prepared_preview(
+        &self,
+        prepared: &super::native::worker::PreparedNative,
+    ) -> Result<Self> {
+        let base = prepared.base();
+        let candidate = prepared.preview();
+        if !matches!(self.document, SnapshotDocument::Native(_))
+            || self.binding != prepared.base_key()
+            || self.identity.document_id != base.metadata().id()
+            || self.identity.revision != base.metadata().revision()
+            || candidate.metadata().id() != base.metadata().id()
+            || base.metadata().revision().checked_add(1) != Some(candidate.metadata().revision())
+            || !self.budget().same_pool(candidate.budget())
+            || !self.disk_budget().same_pool(candidate.disk_budget())
+            || !self
+                ._lease_charge
+                .as_ref()
+                .is_some_and(|owner| owner.uses_budget(self.budget()))
+        {
+            return Err("Prepared preview differs from its captured native scene".into());
+        }
+        if !self.runtime_views.structure.is_empty() || !self.runtime_views.patterns.is_empty() {
+            return Err("Native preview requires guarded protected inspection owners".into());
+        }
+        let bytes = self
+            .identity
+            .project_id
+            .len()
+            .checked_add(self.identity.document_id.len())
+            .and_then(|n| n.checked_add(1024))
+            .ok_or("Preview header admission overflow")?;
+        let charge = MetadataCharge::reserve(candidate.budget(), bytes, &|| Ok(()))?;
+        let copy = |value: &str| -> Result<String> {
+            let mut out = String::new();
+            out.try_reserve_exact(value.len())
+                .map_err(|_| "Preview identity allocation refused")?;
+            if out.capacity() > value.len() {
+                return Err("Preview identity exceeds admission".into());
+            }
+            out.push_str(value);
+            Ok(out)
+        };
+        Ok(Self {
+            identity: SceneIdentity {
+                project_id: copy(&self.identity.project_id)?,
+                document_id: copy(&self.identity.document_id)?,
+                revision: candidate.metadata().revision(),
+            },
+            leases: self.leases.clone(),
+            file_version: self.file_version,
+            _file_ownership: self._file_ownership.clone(),
+            runtime_views: RuntimeViews::default(),
+            document: SnapshotDocument::Native(candidate.clone()),
+            binding: candidate.key(),
+            _lease_charge: self._lease_charge.clone(),
+            _header_charge: Some(charge),
         })
     }
     pub fn metadata(&self) -> super::native::Metadata<'_> {
