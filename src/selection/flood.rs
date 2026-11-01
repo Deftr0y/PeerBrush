@@ -262,6 +262,47 @@ mod tests {
     }
 
     #[test]
+    fn source_rows_are_explicitly_prepared_before_memory_only_sampling_and_failure_poisoned() {
+        for fail in [None, Some(3)] {
+            let shape = Layout::new(17, 7).unwrap();
+            let mut states = vec![0; shape.states];
+            let mut stamps = vec![0; shape.generations];
+            let mut queue = vec![0; MAX_FRONTIER * 4];
+            let mut flood = Flood::new(shape, &mut states, &mut stamps, &mut queue, 1000).unwrap();
+            let active = Cell::new(u32::MAX);
+            let mut pixels = 0;
+            let result = flood.run_rows(
+                &[[0, 0]],
+                None,
+                || Ok::<_, &str>(()),
+                |y| {
+                    if fail == Some(y) {
+                        Err("row source changed")
+                    } else {
+                        active.set(y);
+                        Ok(())
+                    }
+                },
+                |_, _, y| {
+                    assert_eq!(active.get(), y);
+                    Ok(true)
+                },
+                |_, left, right| {
+                    pixels += right - left;
+                    Ok(())
+                },
+            );
+            if fail.is_some() {
+                assert!(matches!(result, Err(Error::Callback("row source changed"))));
+                assert!(pixels > 0);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(pixels, 17 * 7);
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "Opt-in full256MP computed-source traversal; not native document acceptance"]
     fn dense_16000_square_visits_every_computed_native_pixel_with_bounded_workspace() {
         let shape = Layout::new(16000, 16000).unwrap();
@@ -535,7 +576,21 @@ impl<'a> Flood<'a> {
         &mut self,
         seeds: &[[u32; 2]],
         radius: Option<u32>,
+        check: impl FnMut() -> Result<(), E>,
+        matches: impl FnMut(usize, u32, u32) -> Result<bool, E>,
+        emit: impl FnMut(u32, u32, u32) -> Result<(), E>,
+    ) -> Result<Complete, Error<E>> {
+        self.run_rows(seeds, radius, check, |_| Ok(()), matches, emit)
+    }
+
+    /// The worker prepares an explicit source row/stripe before any matching
+    /// samples from it. `matches` may only read that admitted immutable view.
+    pub fn run_rows<E>(
+        &mut self,
+        seeds: &[[u32; 2]],
+        radius: Option<u32>,
         mut check: impl FnMut() -> Result<(), E>,
+        mut prepare_row: impl FnMut(u32) -> Result<(), E>,
         mut matches: impl FnMut(usize, u32, u32) -> Result<bool, E>,
         mut emit: impl FnMut(u32, u32, u32) -> Result<(), E>,
     ) -> Result<Complete, Error<E>> {
@@ -556,6 +611,10 @@ impl<'a> Flood<'a> {
             while let Some((x, y)) = self.pop() {
                 self.operation()?;
                 check().map_err(Error::Callback)?;
+                if matches!(self.state(x, y), 1 | 3) {
+                    continue;
+                }
+                prepare_row(y as u32).map_err(Error::Callback)?;
                 if !self.classify(seed_index, seed, radius, x, y, &mut check, &mut matches)? {
                     continue;
                 }
@@ -599,6 +658,7 @@ impl<'a> Flood<'a> {
                 .into_iter()
                 .flatten()
                 {
+                    prepare_row(neighbor as u32).map_err(Error::Callback)?;
                     let mut in_span = false;
                     for next in left..right {
                         let accepted = self.classify(
