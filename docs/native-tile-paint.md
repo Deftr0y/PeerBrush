@@ -113,3 +113,14 @@ sealing. Refusals retain ownership and admission until proven cleanup; dropping
 an owner never silently deletes files or refunds disk. These source adapters do
 not replace the coordinator's atomic group, mask, frame, retained-source, actor,
 lease, revision, selection or history decisions, and do not raise canvas limits.
+
+Projected frame plans additionally bind a proposed shape/origin to the original
+generation and primary layer slot. Every mask plane receives the color frame's
+same translation while retaining its own original logical dimensions/depth.
+`stage_frame_with` remaps and edits each complete destination tile in one pass;
+it does not publish an intermediate expanded document. The brush worker uses
+that path for reframed strokes and the changed-tile path otherwise, applying
+soft coverage against the correctly reframed baseline. All source reads remain
+explicit before memory-only kernels, and a failed tile retires the unpublished
+fragment through the held session. Complete frame, mask, retained placement and
+source/effect metadata changes still belong to one coordinator batch.

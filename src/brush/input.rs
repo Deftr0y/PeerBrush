@@ -1,7 +1,7 @@
 //! Charged local geometry derived from one immutable native input generation.
 use super::{native::PreparedBrush, Settings};
 use crate::{
-    edit_bounds::input::{InputBinding, RasterInput},
+    edit_bounds::input::{InputBinding, InputFrame, RasterInput},
     large_document::Reservation,
     retouch::native::PreparedRetouch,
     smudge::native::PreparedSmudge,
@@ -9,6 +9,8 @@ use crate::{
 
 pub(crate) struct LocalStroke {
     binding: InputBinding,
+    shape: [u32; 2],
+    origin: [i32; 2],
     points: Vec<[f32; 2]>,
     pressures: Option<Vec<f32>>,
     polygon: Option<Vec<[f32; 2]>>,
@@ -16,9 +18,128 @@ pub(crate) struct LocalStroke {
     // Keep admission until the actual Vec capacities above have been released.
     _charge: Reservation,
 }
+
+/// Worker-only preparation. Output remains unpublished; the common dispatcher
+/// must retain the capture/session and atomically adopt every related plane.
+pub(crate) fn stage<'d, 's>(
+    input: &RasterInput<'d>,
+    stroke: &LocalStroke,
+    settings: Settings,
+    color: [u8; 4],
+    erase: bool,
+    frame: Option<&InputFrame>,
+    session: &'s crate::workspace::source_runtime::SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<crate::edit_bounds::output::BuiltTiles<'d, 's>, String> {
+    use crate::edit_bounds::{
+        input::{restrict_frame_tile, restrict_tile},
+        output::{stage_frame_with, BuiltTiles, TileOutput},
+    };
+    session.check()?;
+    check()?;
+    if input.document().metadata().read_only() {
+        return Err("Native document is read-only".into());
+    }
+    stroke.validate_frame(input, frame)?;
+    if !input.is_mask()
+        && matches!(
+            input.layer_metadata().kind(),
+            "group" | "fill" | "adjustment"
+        )
+    {
+        return Err("Paint on a paint layer or its mask".into());
+    }
+    if settings.opacity == 0. || settings.flow == 0. || color[3] == 0 {
+        return Ok(BuiltTiles::Unchanged);
+    }
+    let plan = stroke.brush(input, settings, color, erase, check)?;
+    let selection = input.selection()?;
+    if let Some(frame) = frame {
+        let draft = stage_frame_with(input, frame, session, check, |key, before, check| {
+            if plan
+                .tiles()
+                .binary_search_by_key(&(key.1, key.0), |&(x, y)| (y, x))
+                .is_err()
+            {
+                return Ok(before.clone());
+            }
+            let after = plan.render_tile(key, before, check)?;
+            if selection.has_coverage() {
+                let coverage = selection.prepare(frame.tile_document_rect(key)?, check)?;
+                restrict_frame_tile(input, frame, key, before, &after, &coverage, check)
+            } else {
+                Ok(after)
+            }
+        })?;
+        return Ok(BuiltTiles::Draft(draft));
+    }
+    let mut output = TileOutput::new(input, session)?;
+    let result = (|| {
+        for &key in plan.tiles() {
+            check()?;
+            let before = input.prepare_tile(key, check)?;
+            let mut after = plan.render_tile(key, before.bytes(), check)?;
+            if selection.has_coverage() {
+                let coverage = selection.prepare(input.tile_document_rect(key)?, check)?;
+                after = restrict_tile(input, key, before.bytes(), &after, &coverage, check)?;
+            }
+            output.replace_tile(&before, after, check)?;
+        }
+        check()
+    })();
+    if let Err(mut error) = result {
+        if let Err(cleanup) = output.abort() {
+            error.push_str("; native brush cleanup retained inventory: ");
+            error.push_str(&cleanup);
+        }
+        return Err(error);
+    }
+    output.finish(check).map_err(|refused| {
+        let mut reason = refused.reason().to_owned();
+        if let Err(cleanup) = refused.abort() {
+            reason.push_str("; native brush cleanup retained inventory: ");
+            reason.push_str(&cleanup);
+        }
+        reason
+    })
+}
 impl LocalStroke {
     pub(crate) fn new(
         input: &RasterInput<'_>,
+        points_document: &[[f32; 2]],
+        pressures: Option<&[f32]>,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        Self::in_frame(
+            input,
+            input.shape(),
+            input.origin(),
+            points_document,
+            pressures,
+            check,
+        )
+    }
+    pub(crate) fn for_frame(
+        input: &RasterInput<'_>,
+        frame: &InputFrame,
+        points_document: &[[f32; 2]],
+        pressures: Option<&[f32]>,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        input.validate(frame.binding())?;
+        Self::in_frame(
+            input,
+            frame.geometry().new_shape(),
+            frame.geometry().new_origin(),
+            points_document,
+            pressures,
+            check,
+        )
+    }
+    fn in_frame(
+        input: &RasterInput<'_>,
+        shape: [u32; 2],
+        origin: [i32; 2],
         points_document: &[[f32; 2]],
         pressures: Option<&[f32]>,
         check: &mut dyn FnMut() -> Result<(), String>,
@@ -53,7 +174,7 @@ impl LocalStroke {
             .pool()
             .reserve_bytes(admitted, admitted)
             .map_err(|e| e.to_string())?;
-        let shift = input.origin();
+        let shift = origin;
         let copy = |source: &[[f32; 2]]| -> Result<Vec<[f32; 2]>, String> {
             let mut values = Vec::new();
             values
@@ -94,15 +215,45 @@ impl LocalStroke {
         check()?;
         Ok(Self {
             binding: input.binding(),
+            shape,
+            origin,
             points,
             pressures,
             polygon,
-            clip: input.local_clip()?,
+            clip: selection
+                .bounds()
+                .map(|r| {
+                    let mut local = [0; 4];
+                    for i in 0..4 {
+                        local[i] = r[i]
+                            .checked_sub(origin[i % 2])
+                            .ok_or("Native stroke clip overflow")?;
+                    }
+                    Ok::<_, String>(local)
+                })
+                .transpose()?,
             _charge: charge,
         })
     }
     pub(crate) fn binding(&self) -> InputBinding {
         self.binding
+    }
+    pub(crate) fn validate_frame(
+        &self,
+        input: &RasterInput<'_>,
+        frame: Option<&InputFrame>,
+    ) -> Result<(), String> {
+        input.validate(self.binding)?;
+        let (shape, origin) = if let Some(frame) = frame {
+            input.validate(frame.binding())?;
+            (frame.geometry().new_shape(), frame.geometry().new_origin())
+        } else {
+            (input.shape(), input.origin())
+        };
+        if self.shape != shape || self.origin != origin {
+            return Err("Native stroke belongs to another proposed frame".into());
+        }
+        Ok(())
     }
     pub(crate) fn brush<'a>(
         &'a self,
@@ -113,10 +264,10 @@ impl LocalStroke {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PreparedBrush<'a>, String> {
         input.validate(self.binding)?;
-        settings.texture_origin = input.origin();
+        settings.texture_origin = self.origin;
         PreparedBrush::new(
-            input.shape()[0],
-            input.shape()[1],
+            self.shape[0],
+            self.shape[1],
             input.depth(),
             &self.points,
             self.pressures.as_deref(),
@@ -139,13 +290,13 @@ impl LocalStroke {
     ) -> Result<PreparedRetouch<'a>, String> {
         input.validate(self.binding)?;
         PreparedRetouch::new(
-            input.shape()[0],
-            input.shape()[1],
+            self.shape[0],
+            self.shape[1],
             input.depth(),
             &self.points,
             self.pressures.as_deref(),
             settings,
-            input.origin(),
+            self.origin,
             offset_document,
             heal_radius,
             self.clip,
@@ -162,10 +313,10 @@ impl LocalStroke {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PreparedSmudge<'a>, String> {
         input.validate(self.binding)?;
-        settings.texture_origin = input.origin();
+        settings.texture_origin = self.origin;
         PreparedSmudge::new(
-            input.shape()[0],
-            input.shape()[1],
+            self.shape[0],
+            self.shape[1],
             input.depth(),
             &self.points,
             self.pressures.as_deref(),

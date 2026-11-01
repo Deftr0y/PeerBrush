@@ -10,6 +10,9 @@ use crate::{
     workspace::source_runtime::SourceSession,
 };
 use std::collections::BTreeMap;
+#[path = "output/frame.rs"]
+mod frame;
+pub(crate) use frame::{stage_frame, stage_frame_with};
 
 enum Replacement {
     Zero,

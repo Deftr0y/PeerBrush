@@ -68,7 +68,7 @@ impl<'a> RasterInput<'a> {
                 .mask()
                 .ok_or("Native layer has no mask")?
                 .steps()
-                .find(|s| s.id() == step_id)
+                .find(|s| s.id() == step_id && s.kind() == "paint")
                 .ok_or("Unknown native mask step")?
                 .pixels()
         } else {
@@ -148,6 +148,9 @@ impl<'a> RasterInput<'a> {
             .selection()
             .map(|r| self.local_rect(r))
             .transpose()
+    }
+    pub(crate) fn tile_document_rect(&self, key: (u32, u32)) -> Result<[i32; 4], String> {
+        translate(tile_rect(self.shape(), key)?, self.origin(), false)
     }
     /// The worker must call outside Engine/UI locks. Full physical padding is
     /// preserved; an absent descriptor is explicit known zero, never a read error.
@@ -278,9 +281,67 @@ impl<'a> RasterInput<'a> {
             self.pool(),
         )
     }
+    pub(crate) fn project_frame(
+        &self,
+        requested_document: [i32; 4],
+    ) -> Result<Option<InputFrame>, String> {
+        self.frame_expansion(requested_document).map(|plan| {
+            plan.map(|geometry| InputFrame {
+                binding: self.binding,
+                layer: self.layer.pixels().slot(),
+                geometry,
+            })
+        })
+    }
     pub(crate) fn selection(&self) -> Result<SelectionInput<'a>, String> {
         SelectionInput::new(self.document)
     }
+}
+pub(crate) struct InputFrame {
+    binding: InputBinding,
+    layer: RasterSlot,
+    geometry: FrameExpansion,
+}
+impl InputFrame {
+    pub(crate) fn binding(&self) -> InputBinding {
+        self.binding
+    }
+    pub(crate) fn geometry(&self) -> &FrameExpansion {
+        &self.geometry
+    }
+    pub(crate) fn tile_document_rect(&self, key: (u32, u32)) -> Result<[i32; 4], String> {
+        translate(
+            tile_rect(self.geometry.new_shape(), key)?,
+            self.geometry.new_origin(),
+            false,
+        )
+    }
+    pub(crate) fn for_plane(&self, input: &RasterInput<'_>) -> Result<Self, String> {
+        if self.binding.generation != input.binding.generation
+            || self.layer != input.layer.pixels().slot()
+            || self.geometry.old_origin() != input.origin()
+        {
+            return Err("Native frame plane belongs to another layer or source generation".into());
+        }
+        Ok(Self {
+            binding: input.binding,
+            layer: self.layer,
+            geometry: self
+                .geometry
+                .for_plane(input.shape(), input.depth(), input.pool())?,
+        })
+    }
+}
+fn tile_rect(shape: [u32; 2], key: (u32, u32)) -> Result<[i32; 4], String> {
+    if key.0 >= shape[0].div_ceil(TILE) || key.1 >= shape[1].div_ceil(TILE) {
+        return Err("Native tile is outside the projected frame".into());
+    }
+    Ok([
+        (key.0 * TILE) as i32,
+        (key.1 * TILE) as i32,
+        ((key.0 + 1) * TILE).min(shape[0]) as i32,
+        ((key.1 + 1) * TILE).min(shape[1]) as i32,
+    ])
 }
 pub(crate) struct InputTile {
     binding: InputBinding,
@@ -510,6 +571,48 @@ pub(crate) fn restrict_tile(
     selection: &PreparedSelection<'_>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<PinnedBytes, String> {
+    restrict_geometry(
+        input,
+        input.shape(),
+        input.origin(),
+        key,
+        before,
+        after,
+        selection,
+        check,
+    )
+}
+pub(crate) fn restrict_frame_tile(
+    input: &RasterInput<'_>,
+    frame: &InputFrame,
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    selection: &PreparedSelection<'_>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<PinnedBytes, String> {
+    input.validate(frame.binding())?;
+    restrict_geometry(
+        input,
+        frame.geometry().new_shape(),
+        frame.geometry().new_origin(),
+        key,
+        before,
+        after,
+        selection,
+        check,
+    )
+}
+fn restrict_geometry(
+    input: &RasterInput<'_>,
+    shape: [u32; 2],
+    origin: [i32; 2],
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    selection: &PreparedSelection<'_>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<PinnedBytes, String> {
     check()?;
     let bpp = if input.depth() == 16 { 8 } else { 4 };
     let length = (TILE * TILE) as usize * bpp;
@@ -517,8 +620,8 @@ pub(crate) fn restrict_tile(
         || !after.uses_budget(input.pool())
         || before.len() != length
         || after.len() != length
-        || key.0 >= input.shape()[0].div_ceil(TILE)
-        || key.1 >= input.shape()[1].div_ceil(TILE)
+        || key.0 >= shape[0].div_ceil(TILE)
+        || key.1 >= shape[1].div_ceil(TILE)
     {
         return Err("Soft-selection tile input differs from its admitted native frame".into());
     }
@@ -530,10 +633,10 @@ pub(crate) fn restrict_tile(
     }
     let mut output = ScratchBytes::new(input.pool(), length, length).map_err(|e| e.to_string())?;
     output.copy_from_slice(after);
-    for y in key.1 * TILE..((key.1 + 1) * TILE).min(input.shape()[1]) {
+    for y in key.1 * TILE..((key.1 + 1) * TILE).min(shape[1]) {
         check()?;
-        for x in key.0 * TILE..((key.0 + 1) * TILE).min(input.shape()[0]) {
-            let t = selection.value(x as i32 + input.origin()[0], y as i32 + input.origin()[1])?;
+        for x in key.0 * TILE..((key.0 + 1) * TILE).min(shape[0]) {
+            let t = selection.value(x as i32 + origin[0], y as i32 + origin[1])?;
             if t == 1. {
                 continue;
             }
