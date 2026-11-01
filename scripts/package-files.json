@@ -482,6 +482,7 @@
     "src/server/fonts.rs",
     "src/server/instance.rs",
     "src/server/native_edit.rs",
+    "src/server/native_edit/reply.rs",
     "src/server/reply.rs",
     "src/server/reply/admission.rs",
     "src/server/reply/chunks.rs",

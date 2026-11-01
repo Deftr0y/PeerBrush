@@ -2,6 +2,9 @@
 use super::*;
 use crate::engine::native::{self, HistoryRequest};
 use std::sync::atomic::AtomicU8;
+#[path = "native_edit/reply.rs"]
+mod response;
+pub(crate) use response::EditReply;
 
 const READY: u8 = 0;
 const RUNNING: u8 = 1;
@@ -74,7 +77,7 @@ pub(crate) fn edit_shared(
     label: &str,
     gesture: Option<&str>,
     document_id: Option<&str>,
-) -> Result<Value, String> {
+) -> Result<EditReply, String> {
     edit_shared_controlled(
         shared,
         actor,
@@ -100,7 +103,7 @@ pub(crate) fn edit_shared_controlled(
     gesture: Option<&str>,
     document_id: Option<&str>,
     control: &EditControl,
-) -> Result<Value, String> {
+) -> Result<EditReply, String> {
     let _run = control.start()?;
     let _operation = FileOperation::begin(shared)?;
     let (seed, captured_scene) = {
@@ -113,7 +116,9 @@ pub(crate) fn edit_shared_controlled(
         }
         let Some(seed) = engine.native_seed()? else {
             control.begin_commit()?;
-            return engine.edit_with_gesture(actor, commands, expected, task, label, gesture);
+            return engine
+                .edit_with_gesture(actor, commands, expected, task, label, gesture)
+                .map(EditReply::resident);
         };
         (seed, engine.capture_scene(None)?)
     };
@@ -141,30 +146,15 @@ pub(crate) fn edit_shared_controlled(
     };
     let prepared = native::worker::prepare(captured, &session, &active)
         .map_err(|error| combine(error.reason, error.cleanup_error))?;
-    // Actual IDs come from the prepared candidate, not guessed command IDs.
-    let created = prepared
-        .created_layers()
-        .map(Value::from)
-        .collect::<Vec<_>>();
-    let created_roots = prepared
-        .preview()
-        .metadata()
-        .layers()
-        .filter(|layer| created.iter().any(|id| id.as_str() == Some(layer.id())))
-        .filter(|layer| {
-            layer
-                .parent()
-                .is_none_or(|parent| !created.iter().any(|id| id.as_str() == Some(parent)))
-        })
-        .map(|layer| Value::from(layer.id()))
-        .collect::<Vec<_>>();
-    let layers = prepared
-        .preview()
-        .metadata()
-        .layers()
-        .map(|layer| json!({"id":layer.id(),"name":layer.name()}))
-        .collect::<Vec<_>>();
-    let revision = prepared.preview().metadata().revision();
+    let mut reply = match EditReply::native(&prepared, commands.len()) {
+        Ok(reply) => reply,
+        Err(reason) => {
+            return Err(combine(
+                reason,
+                prepared.abort(&session, &|| session.cleanup_check()).err(),
+            ))
+        }
+    };
     let (base, history, delta) = prepared.into_parts();
     let pending = history.prepare_commit(
         &base,
@@ -220,9 +210,9 @@ pub(crate) fn edit_shared_controlled(
     match result {
         Ok(retired) => {
             let cleanup = retired.retire(&session, &|| session.cleanup_check()).err();
-            let mut reply = json!({"revision":revision,"applied":commands.len(),"created":created,"created_roots":created_roots,"layers":layers});
-            if let Some(warning) = cleanup {
-                reply["cleanup_warning"] = Value::String(warning);
+            if cleanup.is_some() {
+                reply.value["cleanup_warning"] =
+                    Value::String("Edit applied; provisional source cleanup is pending.".into());
             }
             Ok(reply)
         }
@@ -308,9 +298,9 @@ mod tests {
             Some(&document),
         )
         .unwrap();
-        assert_eq!(reply["revision"], 1);
-        assert_eq!(reply["applied"], 1);
-        assert!(reply["created"].as_array().unwrap().is_empty());
+        assert_eq!(reply.data()["revision"], 1);
+        assert_eq!(reply.data()["applied"], 1);
+        assert!(reply.data()["created"].as_array().unwrap().is_empty());
         assert!(edit_shared(
             &shared,
             "human",
