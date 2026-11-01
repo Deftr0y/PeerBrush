@@ -213,7 +213,12 @@ fn stage_impl<'d, 's>(
     if input.document().metadata().read_only() || input.layer_metadata().locked() {
         return Err("Native smudge requires an editable unlocked plane".into());
     }
-    if !input.is_mask() && input.layer_metadata().kind() != "paint" {
+    if !input.is_mask()
+        && matches!(
+            input.layer_metadata().kind(),
+            "group" | "fill" | "adjustment"
+        )
+    {
         return Err("Smudge a paint layer or paint mask step".into());
     }
     if settings.opacity == 0. || settings.flow == 0. || (settings.wetness == 0. && frame.is_none())

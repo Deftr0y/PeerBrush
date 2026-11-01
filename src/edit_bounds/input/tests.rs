@@ -1869,3 +1869,122 @@ fn folder_fill_prepares_a_new_zero_baseline_canvas_without_replacing_the_folder_
         }
     }
 }
+
+#[test]
+fn editable_definitions_keep_legacy_explicit_rasterize_refusal_and_allow_mask_paint() {
+    use crate::{brush::input::StrokePoints, engine::native::CommandDescriptor};
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = Document::new_depth(9, 7, 16).unwrap();
+    source.layers[0].source = Some(Arc::new(crate::source::Source {
+        width: 9,
+        height: 7,
+        matrix: [1., 0., 0., 1., 0., 0.],
+        content: crate::source::Content::Shape {
+            shape: "rectangle".into(),
+            bounds: [0., 0., 9., 7.],
+            points: vec![],
+            closed: true,
+            fill: [12347, 23521, 43217, 49153],
+            stroke: [0; 4],
+            stroke_width: 0.,
+        },
+    }));
+    source.layers[0]
+        .source
+        .as_ref()
+        .unwrap()
+        .validate_structure()
+        .unwrap();
+    source.layers[0].mask = Some(crate::engine::Mask {
+        enabled: true,
+        linked: false,
+        cache_key: crate::engine::id(),
+        steps: vec![crate::engine::MaskStep {
+            id: "paint-mask".into(),
+            kind: "paint".into(),
+            enabled: true,
+            weight: 1.,
+            value: 0.,
+            pixels: Raster::new_depth(9, 7, 16),
+            settings: serde_json::json!({}),
+        }],
+    });
+    source.selection = Some([0, 0, 9, 7]);
+    let document = native(&source, &session);
+    for operation in [
+        "paint",
+        "paint.fill",
+        "paint.clear_selection",
+        "smudge",
+        "clone",
+        "heal",
+    ] {
+        let body = serde_json::json!({"op":operation,"layer":source.layers[0].id,"rect":[1,1,7,6],
+            "points":[[2,2],[6,4]],"source":[3,1],"color":[37,83,127,193],"radius":1.8});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        assert!(legacy
+            .edit("human", &[body.clone()], None, None, "Pixels")
+            .unwrap_err()
+            .contains("explicitly rasterize"));
+        assert!(legacy.undo.is_empty());
+        assert!(legacy.doc.layers[0].source.is_some());
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let command = descriptor.commands().next().unwrap();
+        let input =
+            RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+        let before = runtime.disk().used().unwrap();
+        assert!(WriteGuard::new(&captured, command, &input, None).is_err());
+        assert_eq!(runtime.disk().used().unwrap(), before);
+    }
+    let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"mask":true,"points":[[2,2],[6,4]],"radius":1.8,"color":[200,10,20,255]});
+    let mut legacy = crate::engine::Engine::new();
+    legacy.doc = source.clone();
+    legacy
+        .edit("human", &[body.clone()], None, None, "Mask")
+        .unwrap();
+    assert!(legacy.doc.layers[0].source.is_some());
+    let descriptor = CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+    let captured = document
+        .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+        .unwrap();
+    let command = descriptor.commands().next().unwrap();
+    let input = RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+    let points = StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+    let frame = input
+        .stroke_frame(command, &points, &mut || Ok(()))
+        .unwrap();
+    assert!(frame.is_none());
+    let stroke = points.local(&input, None, &mut || Ok(())).unwrap();
+    let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+    let BuiltTiles::Draft(draft) =
+        crate::brush::input::stage_guarded(&input, &stroke, None, &guard, &session, &mut || Ok(()))
+            .unwrap()
+    else {
+        panic!("Mask paint was unexpectedly refused")
+    };
+    let output = draft.seal(&|| Ok(())).ok().unwrap();
+    let region = output
+        .surface()
+        .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+        .unwrap();
+    for y in 0..7 {
+        for x in 0..9 {
+            assert_eq!(
+                region.pixel16(x, y).unwrap(),
+                legacy.doc.layers[0].mask.as_ref().unwrap().steps[0]
+                    .pixels
+                    .get16(x, y)
+            );
+        }
+    }
+    drop(region);
+    output.abort(&session, &|| Ok(())).unwrap();
+    assert!(document.metadata().layer(0).unwrap().source().is_some());
+}

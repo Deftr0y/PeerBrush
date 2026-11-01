@@ -132,6 +132,12 @@ transparent color over a nonempty area still produces the empty child required
 by legacy insertion semantics. The engine's typed child insertion must bind the
 same command token, construct hierarchy/metadata and commit one history record.
 
+Color edits on an editable text/vector definition preserve the shared engine's
+explicit-rasterize refusal. `source.rasterize` is a separate operation; paint,
+fill, clear, smudge and clone/heal never silently remove the definition. Raw
+paint mask steps remain editable. Ordinary paint/smudge retain the legacy
+raster fallback kind policy when no editable definition is present.
+
 `edit_bounds::output::TileOutput` stages one plane through the actual
 `SourceSession` and the engine's `OutputDraft`. It compares full original padded
 tiles, keeps mutable proposal/index allocations charged, creates a fragment only
