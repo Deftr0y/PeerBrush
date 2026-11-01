@@ -57,21 +57,36 @@ impl OriginalChunks {
         start: u64,
         output: &mut ScratchBytes,
         check: &dyn Fn() -> Result<()>,
+        load: impl FnMut(u64, usize, &mut ScratchBytes) -> Result<()>,
+    ) -> Result<()> {
+        let count = output.len();
+        self.copy_prefix(identity, start, output, count, check, load)
+    }
+    /// Copy only a bounded prefix of an already charged receiver. Cache hits
+    /// retain the same session/identity checks and original-chunk authority.
+    pub(super) fn copy_prefix(
+        &mut self,
+        identity: [u8; 32],
+        start: u64,
+        output: &mut ScratchBytes,
+        requested: usize,
+        check: &dyn Fn() -> Result<()>,
         mut load: impl FnMut(u64, usize, &mut ScratchBytes) -> Result<()>,
     ) -> Result<()> {
         let result = (|| {
             if self.failed
                 || identity != self.identity
                 || !output.uses_budget(&self.pool)
+                || requested > output.len()
                 || start
-                    .checked_add(output.len() as u64)
+                    .checked_add(requested as u64)
                     .is_none_or(|n| n > self.length)
             {
                 return Err("Streaming original cache identity, range or pool differs".into());
             }
             check()?;
             let mut copied = 0;
-            while copied < output.len() {
+            while copied < requested {
                 check()?;
                 let at = start + copied as u64;
                 let chunk = at / CHUNK as u64;
@@ -109,7 +124,7 @@ impl OriginalChunks {
                     .ok_or("Streaming cache age overflow")?;
                 entry.touched = self.clock;
                 let offset = (at - begin) as usize;
-                let count = (length - offset).min(output.len() - copied);
+                let count = (length - offset).min(requested - copied);
                 output[copied..copied + count]
                     .copy_from_slice(&entry.bytes[offset..offset + count]);
                 copied += count;
@@ -136,6 +151,71 @@ mod tests {
     }
     fn byte(at: u64) -> u8 {
         (at.wrapping_mul(71).wrapping_add(at / 97) & 255) as u8
+    }
+    #[test]
+    fn full_width_prefix_matches_rows_without_per_row_owner_probes() {
+        let pool = pool();
+        let identity = [9; 32];
+        let length = 17 * 513 * 4;
+        let probes = Cell::new(0usize);
+        let mut fast = OriginalChunks::new(&pool, identity, length as u64).unwrap();
+        let mut window = ScratchBytes::new(&pool, CHUNK, CHUNK).unwrap();
+        window.fill(0xa5);
+        let mut loads = 0;
+        fast.copy_prefix(
+            identity,
+            0,
+            &mut window,
+            length,
+            &|| {
+                probes.set(probes.get() + 1);
+                Ok(())
+            },
+            |at, n, out| {
+                loads += 1;
+                for (i, b) in out[..n].iter_mut().enumerate() {
+                    *b = byte(at + i as u64);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(loads, 1);
+        assert!(probes.get() < 16);
+        for (i, b) in window[..length].iter().enumerate() {
+            assert_eq!(*b, byte(i as u64));
+        }
+        assert!(window[length..].iter().all(|b| *b == 0xa5));
+        let mut row = ScratchBytes::new(&pool, 17 * 4, CHUNK).unwrap();
+        let before = probes.get();
+        for y in 0..513 {
+            fast.copy(
+                identity,
+                (y * 17 * 4) as u64,
+                &mut row,
+                &|| {
+                    probes.set(probes.get() + 1);
+                    Ok(())
+                },
+                |_, _, _| Err("unexpected reload".into()),
+            )
+            .unwrap();
+            assert_eq!(&*row, &window[y * 17 * 4..(y + 1) * 17 * 4]);
+        }
+        assert!(probes.get() - before > 2000);
+        assert!(fast
+            .copy_prefix(
+                identity,
+                0,
+                &mut window,
+                CHUNK + 1,
+                &|| Ok(()),
+                |_, _, _| Ok(())
+            )
+            .is_err());
+        assert!(fast
+            .copy_prefix(identity, 0, &mut window, 1, &|| Ok(()), |_, _, _| Ok(()))
+            .is_err());
     }
     #[test]
     fn original_ranges_cross_chunks_and_lru_eviction_never_reuse_wrong_bytes() {
