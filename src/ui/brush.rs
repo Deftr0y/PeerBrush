@@ -40,13 +40,19 @@ impl PeerBrush {
             Tool::Brush | Tool::Eraser | Tool::Smudge | Tool::Clone | Tool::Heal
         )
     }
-    pub(super) fn straight_click(&mut self, doc: &Document, point: [f32; 2], shift: bool) {
+    pub(super) fn straight_click<'a>(
+        &mut self,
+        doc: impl Into<DocumentView<'a>>,
+        point: [f32; 2],
+        shift: bool,
+    ) {
+        let doc = doc.into();
         if !shift || !self.brush_tool() {
             return;
         }
         let Some(last) = self.straight.last.as_ref().filter(|v| {
-            v.document == doc.id
-                && v.revision == doc.revision
+            v.document == doc.id()
+                && v.revision == doc.revision()
                 && v.layer == self.selected
                 && v.mask == self.mask
                 && v.step == self.mask_step
@@ -60,9 +66,9 @@ impl PeerBrush {
         }
         self.straight.cancel();
         self.straight.line = true;
-        self.straight.document = Some(doc.id.clone());
+        self.straight.document = Some(doc.id().to_owned());
         self.drag_start = Some(point);
-        self.drag_revision = Some(doc.revision);
+        self.drag_revision = Some(doc.revision());
         self.points = vec![start, point];
         self.stroke_pressures = vec![pressure, self.current_pressure.unwrap_or(1.)];
         self.stroke_has_pressure = self.current_pressure.is_some() || pressure != 1.;
