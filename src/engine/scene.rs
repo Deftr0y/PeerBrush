@@ -593,12 +593,12 @@ impl Document36 {
 
     /// Exact deterministic native-location order, including original sources.
     /// The ordinal rule rejects duplicate, unused, aliased or cyclic wire IDs.
-    pub fn visit_rasters(
-        &self,
-        mut visit: impl FnMut(&RasterRef36) -> Result<()>,
+    pub fn visit_rasters<'a>(
+        &'a self,
+        mut visit: impl FnMut(&'a RasterRef36) -> Result<()>,
     ) -> Result<usize> {
         let mut next = 1u32;
-        let mut walk = |r: &RasterRef36| -> Result<()> {
+        let mut walk = |r: &'a RasterRef36| -> Result<()> {
             visit_one(r, &mut next, &mut visit)?;
             if let Some(original) = &r.retained {
                 visit_one(&original.pixels, &mut next, &mut visit)?;
@@ -635,10 +635,10 @@ impl Document36 {
         Ok(next as usize - 1)
     }
 }
-fn visit_one(
-    r: &RasterRef36,
+fn visit_one<'a>(
+    r: &'a RasterRef36,
     next: &mut u32,
-    visit: &mut impl FnMut(&RasterRef36) -> Result<()>,
+    visit: &mut impl FnMut(&'a RasterRef36) -> Result<()>,
 ) -> Result<()> {
     if r.id != *next
         || *next as usize > MAX_RASTER_LOCATIONS
