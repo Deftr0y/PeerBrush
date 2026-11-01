@@ -13,7 +13,10 @@ use super::{
     structural::{self, Format, Span},
 };
 use crate::{
-    engine::scene::{Document36, SceneSnapshot},
+    engine::{
+        native::Metadata as DocumentMetadata,
+        scene::{Document36, SceneSnapshot},
+    },
     large_document::{ByteRole, CompletedBytes, Error, LargeSourceTemporary, ScratchBytes},
 };
 use ring::digest::{Context, SHA256};
@@ -232,7 +235,7 @@ pub(crate) fn prepare<'a>(
             |output| container36::compress_manifest(&manifest, limits.metadata, output, check),
         )?;
         staging.push(manifest_file);
-        let profile = scene.metadata().srgb_tagged.then(|| Profile {
+        let profile = scene.metadata().srgb_tagged().then(|| Profile {
             bytes: crate::color_profile::srgb_profile(),
         });
         let layout = container36::LayoutPlan::new(
@@ -352,13 +355,13 @@ pub(crate) fn prepare<'a>(
                 limits.metadata,
                 check,
                 |doc, roster, id, revision| {
-                    if id != scene.metadata().id
-                        || revision != scene.metadata().revision
+                    if id != scene.metadata().id()
+                        || revision != scene.metadata().revision()
                         || doc.id != id
                         || doc.revision != revision
-                        || doc.width != scene.metadata().width
-                        || doc.height != scene.metadata().height
-                        || doc.bit_depth != scene.metadata().bit_depth
+                        || doc.width != scene.metadata().width()
+                        || doc.height != scene.metadata().height()
+                        || doc.bit_depth != scene.metadata().depth()
                     {
                         return Err(
                             "Reopened Source36 typed scene identity/geometry differs".into()
@@ -515,7 +518,7 @@ fn stage_core<'a>(
     index: &SourceIndex<'a>,
     limits: MetadataLimits,
     check: &dyn Fn() -> Result<(), String>,
-) -> Result<(Admitted<StagedCore<&'a Document36>>, WorkingSet), String> {
+) -> Result<(Admitted<StagedCore<DocumentMetadata<'a>>>, WorkingSet), String> {
     let header_bytes = index
         .rasters()
         .len()
