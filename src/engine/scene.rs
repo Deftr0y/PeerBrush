@@ -16,6 +16,8 @@ pub(crate) mod icc;
 #[path = "scene/payload.rs"]
 pub(crate) mod payload;
 pub use payload::MetadataPayload;
+#[path = "scene/assets.rs"]
+pub(crate) mod assets;
 #[path = "scene/metadata.rs"]
 mod metadata;
 #[path = "scene/runtime.rs"]
