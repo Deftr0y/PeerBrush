@@ -611,8 +611,8 @@ pub(crate) use native_inventory::{NativeExternalFile, NativeExternalSnapshot};
 #[path = "file_safety/native_outcome.rs"]
 mod native_outcome;
 #[cfg(test)]
-pub(crate) use native_outcome::AccountingOutcome;
-pub(crate) use native_outcome::ExternalOutcomeProof;
+pub(crate) use native_outcome::{AccountingOutcome,AccountingCreation};
+pub(crate) use native_outcome::{ExternalOutcomeProof,ExternalCreationProof,ExternalCreationRole};
 impl NativeLease {
     pub(crate) fn acquire(
         path: &Path,
