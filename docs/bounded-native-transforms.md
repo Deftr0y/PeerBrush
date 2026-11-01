@@ -76,6 +76,12 @@ fixtures compare native8/native16 current, original and mask bytes with the
 resident operators and test cancellation and duplicate-target refusal. This
 producer does not perform final guarded Engine adoption.
 
+The production entry accepts a captured command token, looks up its immutable
+normalized parameters in that exact descriptor, and checks every proposed
+logical write frame against the Engine's derived command scopes. Caller-built
+plan arrays are private to preparation. Selected-pixel and folder commands remain
+closed until their complete policies and outputs use the same transaction.
+
 Linked and unlinked mask/selection command integration,
 cancellation/history acceptance and
 full dense16K qualification are separate gates. Existing live limits remain

@@ -3,8 +3,8 @@ use super::planning::{LayerPlan, Pixels, Plane};
 use crate::{
     engine::{
         native::{
-            CapturedEdit, LayerPatch, NativeDocument, OutputDraft, PreparedDelta, RasterBatch,
-            RasterPatch, RetainedUpdate, SourceUpdate, StagedOutput,
+            CapturedEdit, CommandToken, LayerPatch, Method, NativeDocument, OutputDraft,
+            PreparedDelta, RasterBatch, RasterPatch, RetainedUpdate, SourceUpdate, StagedOutput,
         },
         scene::{Grid36, StageSession, Warp36},
     },
@@ -33,9 +33,84 @@ impl Session for crate::workspace::source_runtime::SourceSession {
     }
 }
 
+/// Consume the exact immutable normalized command captured by the Engine.
+/// This entry point accepts no independent parameters or caller-built plans.
+pub(crate) fn prepare_command(
+    captured: CapturedEdit,
+    token: CommandToken,
+    session: &impl Session,
+    work: &mut Work,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<PreparedDelta, String> {
+    let base = captured.document().clone();
+    let command = captured
+        .descriptor()
+        .ok_or("Native transform needs a captured command descriptor")?
+        .commands()
+        .find(|command| command.token() == token)
+        .ok_or("Native transform command belongs to another descriptor")?;
+    if command.method() != Method::Geometry
+        || !matches!(
+            command.parameters()["op"].as_str(),
+            Some("move" | "transform")
+        )
+    {
+        return Err("Native retained transform requires a move or transform command".into());
+    }
+    if base.metadata().selection().is_some() && command.parameters()["selection_only"] != false {
+        return Err("Native selected-pixel transaction is not prepared".into());
+    }
+    let id = command.parameters()["layer"]
+        .as_str()
+        .ok_or("Native transform needs a layer")?;
+    let layer = base
+        .metadata()
+        .layers()
+        .find(|layer| layer.id() == id)
+        .ok_or("Unknown native transform layer")?;
+    if layer.kind() == "group" {
+        return Err("Native folder transform transaction is not prepared".into());
+    }
+    let cancellation = captured.cancellation();
+    let failure = RefCell::new(None);
+    let checked = || match cancellation
+        .check()
+        .and_then(|_| session.check())
+        .and_then(|_| check())
+    {
+        Ok(()) => Ok(()),
+        Err(reason) => {
+            *failure.borrow_mut() = Some(reason);
+            Err(Error::Cancelled)
+        }
+    };
+    let planned = super::planning::layer(&base, id, command.parameters(), work, &checked);
+    let plan = match planned {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return Err("Native transform has no layer or mask target".into()),
+        Err(reason) => return Err(failure.into_inner().unwrap_or(reason)),
+    };
+    let [x, y] = plan.origin;
+    let bounds = [
+        x,
+        y,
+        x.checked_add(i32::try_from(plan.frame[0]).map_err(|_| "Native transform frame overflow")?)
+            .ok_or("Native transform bounds overflow")?,
+        y.checked_add(i32::try_from(plan.frame[1]).map_err(|_| "Native transform frame overflow")?)
+            .ok_or("Native transform bounds overflow")?,
+    ];
+    // Whole-layer and independent-mask transforms replace this complete logical
+    // frame. Input halos and retained-original support remain read footprints.
+    command.check_write(&base, plan.layer.pixels().slot(), bounds)?;
+    for plane in plan.color.iter().chain(&plan.masks) {
+        command.check_write(&base, plane.target, bounds)?;
+    }
+    prepare(captured, &[plan], session, work, check)
+}
+
 /// All linked planes and layers enter one nominal packet. A caller must keep
 /// its SourceSession alive through final Engine adoption or retirement.
-pub(crate) fn prepare(
+fn prepare(
     captured: CapturedEdit,
     plans: &[LayerPlan<'_>],
     session: &impl Session,
