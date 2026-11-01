@@ -1,4 +1,5 @@
 //! Shared straight-alpha composition with clipping and backdrop-aware folders.
+pub(crate) mod region;
 use crate::{
     effects::Image,
     engine::Document,
