@@ -40,6 +40,67 @@ impl RefusedTransaction {
     }
 }
 impl CapturedEdit {
+    /// Typed handlers call this only after complete semantic preparation proves
+    /// the command unchanged. A pixel no-op with a kind/frame/source change must
+    /// instead carry that metadata change in its ordinary atomic batch.
+    pub(crate) fn unchanged(
+        self,
+        token: CommandToken,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<PreparedDelta> {
+        let checked = || {
+            self.cancellation.check()?;
+            check()?;
+            self.cancellation.check()
+        };
+        checked()?;
+        let descriptor = self
+            .descriptor()
+            .ok_or("Unchanged command requires normalized capture admission")?;
+        let command = descriptor
+            .commands()
+            .next()
+            .ok_or("Missing normalized unchanged command")?;
+        if descriptor.commands().len() != 1 || command.token() != token {
+            return Err("Unchanged receipt differs from its normalized command".into());
+        }
+        if matches!(
+            command.method(),
+            Method::Paint
+                | Method::Fill
+                | Method::Clear
+                | Method::Smudge
+                | Method::Retouch
+                | Method::Geometry
+                | Method::Mask
+                | Method::Bake
+        ) {
+            if let Some(target) = command.parameters()["layer"].as_str() {
+                super::patch::unlocked(&self.base.core.metadata, target)?;
+            }
+        }
+        let intent = self.planned_intent(Intent::from_scopes(
+            IntentKind::Capture,
+            command.write_scopes(),
+            self.base.budget(),
+        )?)?;
+        let revision = self
+            .base
+            .metadata()
+            .revision()
+            .checked_add(1)
+            .ok_or("Native revision overflow")?;
+        let candidate = restamp(&self.base, revision, &checked)?;
+        checked()?;
+        Ok(PreparedDelta {
+            base: self.base.key(),
+            candidate,
+            cancellation: self.cancellation,
+            intent,
+            outputs: vec![],
+            admission: self.admission,
+        })
+    }
     pub(crate) fn transaction(self) -> Result<NativeTransaction> {
         self.cancellation.check()?;
         let descriptor = self
@@ -569,6 +630,156 @@ mod tests {
         drop(base);
         drop(history);
         assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn accepted_unchanged_commands_keep_sources_but_advance_revision_history_and_task() {
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let mut base = super::super::tests::document(&pool);
+        let layer = base.metadata().layer(0).unwrap().id().to_owned();
+        let key = base.source(base.layer_slot(&layer).unwrap()).unwrap().key();
+        let command = [json!({"op":"heal","layer":layer,"points":[[1.,1.]],"radius":2.})];
+        let descriptor =
+            CommandDescriptor::from_normalized(&base, 0, &command, &|| Ok(())).unwrap();
+        let token = descriptor.commands().next().unwrap().token();
+        let delta = base
+            .capture_descriptor(descriptor, "worker", &[], 1, false, true)
+            .unwrap()
+            .unchanged(token, &|| Ok(()))
+            .unwrap();
+        assert!(delta.outputs.is_empty());
+        assert_eq!(
+            delta
+                .preview()
+                .source(delta.preview().layer_slot(&layer).unwrap())
+                .unwrap()
+                .key(),
+            key
+        );
+        let mut history = NativeHistory::new(&pool, 20).unwrap();
+        let prepared = history
+            .snapshot()
+            .prepare_commit(
+                &base,
+                delta,
+                HistoryRequest {
+                    actor: "worker",
+                    label: "Unchanged heal",
+                    task: Some("task"),
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        let retired = history
+            .commit(
+                &mut base,
+                Publication {
+                    actor: "worker",
+                    leases: &[],
+                    now: 1,
+                    closed: false,
+                    write_available: true,
+                },
+                prepared,
+            )
+            .unwrap();
+        assert!(!retired.has_provisional_sources());
+        drop(retired);
+        assert_eq!(base.metadata().revision(), 1);
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(base.disk_budget().used().unwrap(), 0);
+        for direction in [Direction::Undo, Direction::Redo] {
+            let prepared = history
+                .snapshot()
+                .prepare_move(&base, direction, "worker", &|| Ok(()))
+                .unwrap();
+            drop(
+                history
+                    .move_cursor(
+                        &mut base,
+                        Publication {
+                            actor: "worker",
+                            leases: &[],
+                            now: 1,
+                            closed: false,
+                            write_available: true,
+                        },
+                        prepared,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(base.metadata().revision(), 3);
+        assert_eq!(
+            base.source(base.layer_slot(&layer).unwrap()).unwrap().key(),
+            key
+        );
+        drop(base);
+        drop(history);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn unchanged_steps_are_token_bound_cancelled_and_atomic_inside_a_larger_batch() {
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let base = super::super::tests::document(&pool);
+        let layer = base.metadata().layer(0).unwrap().id().to_owned();
+        let commands = [
+            json!({"op":"heal","layer":layer}),
+            json!({"op":"paint","layer":layer}),
+        ];
+        let mut transaction = begin(&base, &commands);
+        let first = transaction.next(&|| Ok(())).unwrap();
+        let first_token = first
+            .descriptor()
+            .unwrap()
+            .commands()
+            .next()
+            .unwrap()
+            .token();
+        let prepared = first.unchanged(first_token, &|| Ok(())).unwrap();
+        assert!(base.publish("worker", &[], 1, false, prepared).is_err());
+        let first = transaction.next(&|| Ok(())).unwrap();
+        let token = first
+            .descriptor()
+            .unwrap()
+            .commands()
+            .next()
+            .unwrap()
+            .token();
+        transaction
+            .complete(first.unchanged(token, &|| Ok(())).unwrap(), &|| Ok(()))
+            .unwrap();
+        let second = transaction.next(&|| Ok(())).unwrap();
+        assert!(second.unchanged(first_token, &|| Ok(())).is_err());
+        let second = transaction.next(&|| Ok(())).unwrap();
+        let token = second
+            .descriptor()
+            .unwrap()
+            .commands()
+            .next()
+            .unwrap()
+            .token();
+        transaction
+            .complete(second.unchanged(token, &|| Ok(())).unwrap(), &|| Ok(()))
+            .unwrap();
+        let current = base
+            .publish(
+                "worker",
+                &[],
+                1,
+                false,
+                transaction.finish(&|| Ok(())).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(current.metadata().revision(), 1);
+        let descriptor =
+            CommandDescriptor::from_normalized(&base, 0, &commands[..1], &|| Ok(())).unwrap();
+        let token = descriptor.commands().next().unwrap().token();
+        let captured = base
+            .capture_descriptor(descriptor, "worker", &[], 1, false, true)
+            .unwrap();
+        captured.cancellation().cancel();
+        assert!(captured.unchanged(token, &|| Ok(())).is_err());
     }
 }
 fn restamp(
