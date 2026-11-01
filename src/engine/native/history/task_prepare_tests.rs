@@ -320,6 +320,13 @@ fn task_pixels_preserve_later_human_bytes_and_compensate_once_with_undo_redo() {
             .retire(&session, &|| Ok(()))
             .unwrap();
         assert_eq!((current.metadata().revision(), history.undo_len()), (4, 4));
+        let last = history.entries().next_back().unwrap();
+        assert_eq!(last.actor(), "human");
+        assert_eq!(last.label(), "Undo task");
+        assert_eq!(last.revision(), 4);
+        let mut reverted = last.reverted_batches().to_vec();
+        reverted.sort_unstable();
+        assert_eq!(reverted, vec![1, 3]);
         for y in 0..2 {
             for x in 0..4 {
                 let region = current
