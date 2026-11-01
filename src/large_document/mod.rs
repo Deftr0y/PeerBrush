@@ -5,9 +5,13 @@
 //! successfully before sampling it, and retain dirty source bytes until put succeeds.
 mod access;
 mod budget;
+mod disk;
+mod planar;
 mod store;
 
 pub use budget::{Reservation, ResidentBudget};
+pub use disk::{DiskBudget, DiskReservation};
+pub use planar::{CompletedPlanar, PlanarRole, PlanarScratch, PlanarSpec};
 pub use store::{
     BlockRef, CommitRef, Limits, PinnedBytes, PinnedTile, ScratchBytes, Snapshot, Store, TileSpec,
 };

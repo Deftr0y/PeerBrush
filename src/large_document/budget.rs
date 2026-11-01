@@ -43,6 +43,9 @@ impl Reservation {
         self.bytes = bytes;
         Ok(())
     }
+    pub(super) fn uses_budget(&self, budget: &ResidentBudget) -> bool {
+        self.budget.same_pool(budget)
+    }
 }
 
 impl ResidentBudget {
