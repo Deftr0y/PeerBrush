@@ -45,7 +45,98 @@ pub(crate) struct RasterInput<'a> {
     binding: InputBinding,
     mask: bool,
 }
+pub(crate) enum RetouchInput<'a> {
+    Raster(RasterInput<'a>),
+    Merged(&'a NativeDocument),
+    ComposedMask {
+        document: &'a NativeDocument,
+        layer: LayerMetadata<'a>,
+    },
+}
 impl<'a> RasterInput<'a> {
+    /// Resolve only immutable captured metadata. Disabled paint steps remain
+    /// editable; a missing target step never falls back to a different plane.
+    pub(crate) fn from_parameters(
+        document: &'a NativeDocument,
+        parameters: &serde_json::Value,
+    ) -> Result<Self, String> {
+        let target = parameters["layer"]
+            .as_str()
+            .ok_or("Choose a target layer")?;
+        let mask = parameters
+            .get("mask")
+            .map_or(Ok(false), |v| v.as_bool().ok_or("mask must be boolean"))?;
+        if !mask {
+            return Self::layer(document, target);
+        }
+        let layer = document
+            .metadata()
+            .layers()
+            .find(|l| l.id() == target)
+            .ok_or("Unknown native paint layer")?;
+        let mask = layer.mask().ok_or("Layer has no mask")?;
+        let step = if let Some(step) = parameters.get("step") {
+            step.as_str().ok_or("Mask step must be an ID")?
+        } else {
+            mask.steps()
+                .filter(|step| step.kind() == "paint")
+                .last()
+                .ok_or("Add a paint step to the mask")?
+                .id()
+        };
+        Self::mask_step(document, target, step)
+    }
+    pub(crate) fn retouch_source(
+        &self,
+        parameters: &serde_json::Value,
+    ) -> Result<RetouchInput<'a>, String> {
+        let boolean = |key: &str| {
+            parameters.get(key).map_or(Ok(false), |v| {
+                v.as_bool().ok_or_else(|| format!("{key} must be boolean"))
+            })
+        };
+        let mask = boolean("mask")?;
+        let merged = boolean("sample_merged")?;
+        if parameters.get("source_step").is_some() && (!mask || merged) {
+            return Err("Source steps require layer mask sampling".into());
+        }
+        if merged {
+            if mask {
+                return Err("Mask retouching samples a layer mask, not merged artwork".into());
+            }
+            return Ok(RetouchInput::Merged(self.document));
+        }
+        let target = parameters
+            .get("source_layer")
+            .map(|v| v.as_str().ok_or("Source layer must be an ID"))
+            .transpose()?
+            .unwrap_or(self.layer.id());
+        let layer = self
+            .document
+            .metadata()
+            .layers()
+            .find(|l| l.id() == target)
+            .ok_or("Unknown retouch source layer")?;
+        if mask {
+            if let Some(step) = parameters.get("source_step") {
+                return Self::mask_step(
+                    self.document,
+                    target,
+                    step.as_str().ok_or("Source step must be an ID")?,
+                )
+                .map(RetouchInput::Raster);
+            }
+            layer.mask().ok_or("Source layer has no mask")?;
+            return Ok(RetouchInput::ComposedMask {
+                document: self.document,
+                layer,
+            });
+        }
+        if layer.kind() != "paint" {
+            return Err("Choose a paint source layer or sample merged artwork".into());
+        }
+        Self::layer(self.document, target).map(RetouchInput::Raster)
+    }
     pub(crate) fn layer(document: &'a NativeDocument, layer: &str) -> Result<Self, String> {
         Self::resolve(document, layer, None)
     }
