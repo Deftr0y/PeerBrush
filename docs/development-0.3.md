@@ -11,6 +11,13 @@ qualification are still required. No production workflow, credential or service
 configuration has been activated. The existing 8192-edge/32MP limits remain;
 unrestricted 16000-square support and PB-108 native acceptance remain open.
 
+Selection flood visitation uses byte generations with a full clear before a
+generation is reused. Its payload is one byte per pixel, versus four bytes for
+the previous full-width stamps; this is not a total process RAM bound. Existing
+selection admission and work limits remain unchanged. Repeated short seeds and
+generation rollover must preserve the same native selection, source and history
+semantics; full performance and large-document qualification remain open.
+
 October 29 setup follow-through (unreleased): a separate disabled fixed-offer
 setup target now connects exact signed local media to fresh registration and
 source-bound installed-identity observation. Its producer requires actual
