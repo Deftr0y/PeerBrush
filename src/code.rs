@@ -588,6 +588,25 @@ fn run(
 /// Native rectangular replacement is shared by UI/protocol/code, with source guards,
 /// selection confidence, locks, reservations and rollback supplied by the engine.
 pub(crate) fn replace_pixels(doc: &mut Document, c: &Value) -> Result<(), String> {
+    replacement_shape(doc, c)?;
+    let bytes = c["rgba"]
+        .as_str()
+        .filter(|s| s.len() <= MAX_PIXELS * 8 * 4 / 3 + 4)
+        .ok_or("Invalid bounded base64 RGBA data")?;
+    let bytes = STANDARD
+        .decode(bytes)
+        .map_err(|_| "Invalid base64 RGBA data")?;
+    replace_pixels_bytes(doc, c, &bytes, SampleOrder::Little)
+}
+
+/// Canonical backing is BE; the existing JSON protocol remains LE.
+#[derive(Clone, Copy)]
+pub(crate) enum SampleOrder {
+    Little,
+    Big,
+}
+
+fn replacement_shape(doc: &Document, c: &Value) -> Result<([i32; 4], usize), String> {
     if c["mask"] == true {
         return Err("Native pixel replacement targets layer color".into());
     }
@@ -610,13 +629,16 @@ pub(crate) fn replace_pixels(doc: &mut Document, c: &Value) -> Result<(), String
     if count > MAX_PIXELS {
         return Err("Native pixel patch exceeds 262144 pixels".into());
     }
-    let bytes = c["rgba"]
-        .as_str()
-        .filter(|s| s.len() <= MAX_PIXELS * 8 * 4 / 3 + 4)
-        .ok_or("Invalid bounded base64 RGBA data")?;
-    let bytes = STANDARD
-        .decode(bytes)
-        .map_err(|_| "Invalid base64 RGBA data")?;
+    Ok((r, count))
+}
+
+pub(crate) fn replace_pixels_bytes(
+    doc: &mut Document,
+    c: &Value,
+    bytes: &[u8],
+    order: SampleOrder,
+) -> Result<(), String> {
+    let (r, count) = replacement_shape(doc, c)?;
     let stride = if doc.bit_depth == 16 { 8 } else { 4 };
     if bytes.len() != count * stride {
         return Err("Native RGBA length does not match rectangle/depth".into());
@@ -642,8 +664,13 @@ pub(crate) fn replace_pixels(doc: &mut Document, c: &Value) -> Result<(), String
             }
             let at = ((y - r[1]) as usize * (r[2] - r[0]) as usize + (x - r[0]) as usize) * stride;
             if doc.bit_depth == 16 {
-                let pixel = std::array::from_fn(|i| {
-                    u16::from_le_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]])
+                let pixel = std::array::from_fn(|i| match order {
+                    SampleOrder::Little => {
+                        u16::from_le_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]])
+                    }
+                    SampleOrder::Big => {
+                        u16::from_be_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]])
+                    }
                 });
                 layer.pixels.set16(x - layer.x, y - layer.y, pixel);
             } else {

@@ -1,3 +1,4 @@
+pub mod backed;
 use crate::raster::{blend, check_size, Pixel, Raster};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1169,7 +1170,7 @@ impl Engine {
         gesture: Option<&str>,
     ) -> Result<Value, String> {
         self.edit_transaction(
-            actor, commands, expected, task, label, gesture, None, None, None, None,
+            actor, commands, expected, task, label, gesture, None, None, None, None, None,
         )
     }
     pub(crate) fn edit_prepared_merge(
@@ -1188,6 +1189,7 @@ impl Engine {
             "Merge layers",
             None,
             Some(prepared),
+            None,
             None,
             None,
             None,
@@ -1211,6 +1213,7 @@ impl Engine {
             None,
             None,
             Some(snapshot.clone()),
+            None,
             None,
             None,
         )
@@ -1237,6 +1240,7 @@ impl Engine {
             None,
             Some(doc),
             None,
+            None,
         )
     }
     pub(crate) fn commit_code(
@@ -1257,6 +1261,7 @@ impl Engine {
             None,
             None,
             Some(doc),
+            None,
             None,
         )
     }
@@ -1285,6 +1290,7 @@ impl Engine {
             None,
             None,
             Some(pixels.into()),
+            None,
         )
     }
     fn validate_source(&self, c: &Value) -> Result<(), String> {
@@ -1333,6 +1339,7 @@ impl Engine {
         mut clipboard: Option<crate::layer_clipboard::Layers>,
         prepared_doc: Option<Document>,
         mut imports: Option<std::collections::VecDeque<crate::image_import::Prepared>>,
+        pixels: Option<backed::PreparedPixels>,
     ) -> Result<Value, String> {
         self.ensure_open()?;
         if self.doc.read_only {
@@ -1353,6 +1360,12 @@ impl Engine {
             .resolve_commands(&commands)?;
         let resolved = crate::transform::resolve_commands(resolved)?;
         let commands = resolved.as_slice();
+        if let Some(pixels) = &pixels {
+            if commands.len() != 1 {
+                return Err("Prepared pixels require exactly one command".into());
+            }
+            pixels.validate(&self.doc, &commands[0])?;
+        }
         let before = self.doc.clone();
         let mut scopes = vec![];
         for c in commands {
@@ -1438,6 +1451,8 @@ impl Engine {
                     } else {
                         self.apply(c)
                     }
+                } else if let Some(pixels) = &pixels {
+                    self.apply_pixels(c, Some(pixels))
                 } else {
                     self.apply(c)
                 };
@@ -1485,6 +1500,12 @@ impl Engine {
         }
         if self.doc.bit_depth == 16 {
             if let Err(error) = crate::depth16::validate_budget(&self.doc) {
+                self.doc = before;
+                return Err(error);
+            }
+        }
+        if let Some(pixels) = &pixels {
+            if let Err(error) = pixels.check_cancelled() {
                 self.doc = before;
                 return Err(error);
             }
@@ -1601,6 +1622,13 @@ impl Engine {
         )
     }
     fn apply(&mut self, c: &Value) -> Result<(), String> {
+        self.apply_pixels(c, None)
+    }
+    fn apply_pixels(
+        &mut self,
+        c: &Value,
+        pixels: Option<&backed::PreparedPixels>,
+    ) -> Result<(), String> {
         if c["op"] != "selection.wand_update" && !(c["op"] == "selection" && c["kind"] == "wand") {
             self.doc.wand_source = None;
         }
@@ -1609,7 +1637,7 @@ impl Engine {
         self.doc.ensure_depth();
         crate::edit_bounds::prepare(&mut self.doc, c)?;
         let before = crate::retained::has_originals(&self.doc).then(|| self.doc.clone());
-        self.apply_retained(c)?;
+        self.apply_retained(c, pixels)?;
         if let Some(before) = before {
             let whole_transform = matches!(c["op"].as_str(), Some("move" | "transform"))
                 && (before.selection.is_none() || c["selection_only"] == false);
@@ -1619,7 +1647,11 @@ impl Engine {
         }
         Ok(())
     }
-    fn apply_retained(&mut self, c: &Value) -> Result<(), String> {
+    fn apply_retained(
+        &mut self,
+        c: &Value,
+        pixels: Option<&backed::PreparedPixels>,
+    ) -> Result<(), String> {
         if c.get("source_revision")
             .is_some_and(|r| r.as_u64() != Some(self.doc.revision))
             || c.get("document_id")
@@ -1652,14 +1684,18 @@ impl Engine {
                 .filter(|m| self.doc.selection == Some(m.bounds))
             {
                 let before = self.doc.clone();
-                self.apply_inner(c)?;
+                self.apply_inner(c, pixels)?;
                 crate::selection::restrict_document(&mut self.doc, &before, &coverage);
                 return Ok(());
             }
         }
-        self.apply_inner(c)
+        self.apply_inner(c, pixels)
     }
-    fn apply_inner(&mut self, c: &Value) -> Result<(), String> {
+    fn apply_inner(
+        &mut self,
+        c: &Value,
+        pixels: Option<&backed::PreparedPixels>,
+    ) -> Result<(), String> {
         let mut linked;
         let c = if matches!(c["op"].as_str(), Some("move" | "transform"))
             && c["mask"] == true
@@ -2637,7 +2673,16 @@ impl Engine {
             return Ok(());
         }
         if op == "pixels.replace" {
-            return crate::code::replace_pixels(&mut self.doc, c);
+            return if let Some(pixels) = pixels {
+                crate::code::replace_pixels_bytes(
+                    &mut self.doc,
+                    c,
+                    pixels.bytes(),
+                    crate::code::SampleOrder::Big,
+                )
+            } else {
+                crate::code::replace_pixels(&mut self.doc, c)
+            };
         }
         if op == "image.patch" {
             let path = text(c, "path", "");
