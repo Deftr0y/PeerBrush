@@ -46,6 +46,10 @@ need the worker's owned source storage and guarded document publication.
 
 `CoverageSource` retains the native scalar8 surface, document origin, bounds and
 shared contour metadata without a serialization or infallible pixel interface.
+Contour payload and its reservation share one private frozen owner; callers
+receive a borrowed slice. Surviving Vec capacities remain charged across source
+and prepared-region clones. A growth reservation is reduced only after old
+allocations have been freed; this does not resize pin, scratch or disk charges.
 Its prepared region retains both source ownership and payload pins. Sampling
 outside the declared footprint fails; metadata-proven exterior pixels are zero.
 The scalar red channel remains authoritative even when independent RGBA alpha
