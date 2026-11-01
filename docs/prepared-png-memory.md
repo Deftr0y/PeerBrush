@@ -14,6 +14,13 @@ unused ICC decompression, but cannot skip verification of its encoded bytes.
 Consequently an invalid IEND CRC is rejected before row delivery; decoder,
 compressed-stream checksum and row-sink failures still return no completion.
 
+png0.18.1 also intentionally swallows iCCP parsing/decompression/limit errors.
+The container's explicit iCCP declaration is therefore bound to a successfully
+decoded profile before Raw/ToSrgb can deliver rows. Missing decoded metadata
+cannot silently turn a declared profile into untagged sRGB, including when the
+declaration accompanies nonstandard gAMA. RawSelection's intentional unused-ICC
+policy remains separate.
+
 The current pattern policy retains the existing 4 MiB encoded/512-square
 limits. The selection policy keeps 64 MiB encoded, 8192-edge and exactly
 16,000,000 pixels. Raw decoding can preserve ICC metadata; the explicit
@@ -90,7 +97,13 @@ length. One maximum16-bit table is below 265 KiB. Three direct TRCs are limited
 to65536 entries by `ParsingOptions`. An auxiliary gamut table's channel counts
 are checked at1..16. In `reader.rs`, its three nested curve groups therefore
 contain at most48 bounded curves (6 MiB of native words); its CLUT must also fit
-inside the at-most4 MiB input tag. The moxcms factories in `transform.rs` and
+inside the at-most4 MiB input tag.
+`reader.rs::read_lut_table_f32`, despite its name, stores native u8/u16 LUT
+arrays. The mAB reader has its own hardcoded10,000,000-sample check rather than
+the supplied classic-CLUT parsing limit; the auxiliary physical tag-length
+bound and channel/curve checks are therefore necessary. Float conversion in
+the selected executor factories belongs to their separately admitted groups.
+The factories in `transform.rs` and
 `conversions/{lut_transforms,prelude_lut_xyz_rgb,rgbxyz,interpolator}.rs` build
 fixed-entry gamma/linear/interpolation tables and selected classic CLUT stages.
 The largest interpolation weight contains two i32 indices plus one scalar;

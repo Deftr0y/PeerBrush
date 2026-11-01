@@ -211,7 +211,7 @@ pub(crate) fn decode_rows(
     if !encoded.bytes.uses_budget(pool) || encoded.length > limits.encoded {
         return Err("Prepared PNG input pool or transport admission differs".into());
     }
-    let (width, height) = container(encoded.bytes(), limits, color, check)?;
+    let (width, height, declared_profile) = container(encoded.bytes(), limits, color, check)?;
     let decoder_charge = pool
         .reserve_bytes(DECODER_BYTES, DECODER_BYTES)
         .map_err(|e| e.to_string())?;
@@ -232,6 +232,14 @@ pub(crate) fn decode_rows(
     decoder.set_ignore_iccp_chunk(matches!(color, ColorPolicy::RawSelection));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    // png0.18.1 intentionally swallows iCCP parsing/decompression/limit
+    // errors. A declared source profile must never become untagged sRGB.
+    if declared_profile
+        && !matches!(color, ColorPolicy::RawSelection)
+        && reader.info().icc_profile.is_none()
+    {
+        return Err("Declared PNG ICC profile could not be decoded within admission".into());
+    }
     if (reader.info().width, reader.info().height) != (width, height)
         || (!matches!(color, ColorPolicy::RawSelection)
             && (reader.info().animation_control.is_some() || reader.info().frame_control.is_some()))
@@ -644,7 +652,7 @@ fn container(
     limits: Limits,
     color: ColorPolicy,
     check: &mut dyn FnMut() -> Result<(), String>,
-) -> Result<(u32, u32), String> {
+) -> Result<(u32, u32, bool), String> {
     if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") {
         return Err("Prepared source is not a PNG".into());
     }
@@ -743,7 +751,9 @@ fn container(
                             .into(),
                     );
                 }
-                return shape.ok_or("Prepared PNG has no shape".into());
+                return shape
+                    .map(|(w, h)| (w, h, profiles == 1))
+                    .ok_or("Prepared PNG has no shape".into());
             }
             _ => {}
         }
@@ -1337,6 +1347,101 @@ mod tests {
             |_, _, _| Ok(())
         )
         .is_err());
+        drop(encoded);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn declared_icc_parse_failures_cannot_become_untagged_srgb_even_with_managed_gamma() {
+        let original = fixture(png::ColorType::Rgb, png::BitDepth::Eight, None, 1);
+        for profile in [
+            b"Profile\0\0not-zlib".as_slice(),
+            b"Profile\0\0\x78\x9c\x03".as_slice(),
+        ] {
+            let mut bytes = original[..33].to_vec();
+            chunk(&mut bytes, b"gAMA", &100000u32.to_be_bytes());
+            chunk(&mut bytes, b"iCCP", profile);
+            bytes.extend_from_slice(&original[33..]);
+            let pool = ResidentBudget::new(64 * 1024 * 1024).unwrap();
+            let encoded = EncodedPng::base64(
+                &STANDARD.encode(&bytes),
+                Limits::SELECTION,
+                &pool,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            let held = pool.used();
+            for policy in [ColorPolicy::Raw, ColorPolicy::ToSrgb] {
+                let mut rows = 0;
+                let error = match decode_rows(
+                    &encoded,
+                    Limits::SELECTION,
+                    policy,
+                    &pool,
+                    &mut || Ok(()),
+                    |_, _, _| {
+                        rows += 1;
+                        Ok(())
+                    },
+                ) {
+                    Ok(_) => panic!("Declared invalid ICC was silently dropped"),
+                    Err(error) => error,
+                };
+                assert!(error.contains("Declared PNG ICC"), "{error}");
+                assert_eq!(rows, 0);
+                assert_eq!(pool.used(), held);
+            }
+            let complete = decode_rows(
+                &encoded,
+                Limits::SELECTION,
+                ColorPolicy::RawSelection,
+                &pool,
+                &mut || Ok(()),
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+            assert!(complete.profile().is_none());
+            assert_eq!(complete.source_sha256(), sha(&bytes));
+            drop(complete);
+            drop(encoded);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+    #[test]
+    fn swallowed_decoder_icc_expansion_limit_still_refuses_the_declared_profile() {
+        let bytes = fixture(
+            png::ColorType::Rgb,
+            png::BitDepth::Eight,
+            Some(vec![0; DECODER_LIMIT + 1]),
+            1,
+        );
+        assert!(bytes.len() < 128 * 1024);
+        let pool = ResidentBudget::new(64 * 1024 * 1024).unwrap();
+        let encoded = EncodedPng::base64(
+            &STANDARD.encode(bytes),
+            Limits::SELECTION,
+            &pool,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let held = pool.used();
+        let mut rows = 0;
+        let error = match decode_rows(
+            &encoded,
+            Limits::SELECTION,
+            ColorPolicy::ToSrgb,
+            &pool,
+            &mut || Ok(()),
+            |_, _, _| {
+                rows += 1;
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("Declared excessive ICC was silently dropped"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Declared PNG ICC"), "{error}");
+        assert_eq!(rows, 0);
+        assert_eq!(pool.used(), held);
         drop(encoded);
         assert_eq!(pool.used(), 0);
     }
