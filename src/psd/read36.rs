@@ -4,10 +4,12 @@
 use super::{
     bulk36::{self, BulkLimits, BulkVerifier, CompletedBulk, Digest, Record, TileIndexEntry},
     manifest36::{CompletedStandard, Manifest},
+    memory36::Admitted,
     row_stream::Source,
     structural::{Ambiguity, Encoding, Index, Span},
 };
 use ring::digest::{Context, SHA256};
+use std::cell::Cell;
 use std::io::{Read, Seek};
 
 pub(crate) struct VerificationLimits {
@@ -182,6 +184,7 @@ pub(crate) fn verify<'a, R: Read + Seek, T>(
         standard,
         streams: completed_streams,
         rows: completed_rows,
+        failed: Cell::new(false),
     })
 }
 
@@ -252,6 +255,7 @@ pub(crate) struct CompletedSource<'a, R> {
     standard: CompletedStandard,
     streams: usize,
     rows: u64,
+    failed: Cell<bool>,
 }
 impl<R: Read + Seek> CompletedSource<'_, R> {
     pub(crate) fn check<T>(
@@ -262,20 +266,29 @@ impl<R: Read + Seek> CompletedSource<'_, R> {
         expected_whole: Digest,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String> {
-        check()?;
-        if !std::ptr::eq(self.source, source)
-            || !std::ptr::eq(self.index, index)
-            || self.whole != expected_whole
-            || manifest.resource_origin() != Some(self.origin)
-        {
-            return Err(
-                "Source36 completion belongs to another source/index/manifest admission".into(),
-            );
+        if self.failed.replace(true) {
+            return Err("Source36 source completion is failed".into());
         }
-        self.bulk.check(manifest.plan(), check)?;
-        self.standard.check(manifest)?;
-        source.unchanged_length()?;
-        check()
+        let result = (|| {
+            check()?;
+            if !std::ptr::eq(self.source, source)
+                || !std::ptr::eq(self.index, index)
+                || self.whole != expected_whole
+                || manifest.resource_origin() != Some(self.origin)
+            {
+                return Err(
+                    "Source36 completion belongs to another source/index/manifest admission".into(),
+                );
+            }
+            self.bulk.check(manifest.plan(), check)?;
+            self.standard.check(manifest)?;
+            source.unchanged_length()?;
+            check()
+        })();
+        if result.is_ok() {
+            self.failed.set(false);
+        }
+        result
     }
     pub(crate) fn streams(&self) -> usize {
         self.streams
@@ -295,21 +308,44 @@ impl<R: Read + Seek> CompletedSource<'_, R> {
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String> {
         self.check(source, index, manifest, expected_whole, check)?;
-        if scratch.is_empty() || scratch.len() > bulk36::MAX_TILE_BYTES {
-            return Err("Source36 source recheck requires admitted bounded scratch".into());
+        self.failed.set(true);
+        let result = (|| {
+            if scratch.is_empty() || scratch.len() > bulk36::MAX_TILE_BYTES {
+                return Err("Source36 source recheck requires admitted bounded scratch".into());
+            }
+            if hash_range(
+                source,
+                Span {
+                    offset: 0,
+                    bytes: index.file_bytes,
+                },
+                scratch,
+                check,
+            )? != self.whole
+            {
+                return Err("Source36 source changed after completed stream observations".into());
+            }
+            source.unchanged_length()?;
+            check()
+        })();
+        if result.is_ok() {
+            self.failed.set(false);
         }
-        if hash_range(
-            source,
-            Span {
-                offset: 0,
-                bytes: index.file_bytes,
-            },
-            scratch,
-            check,
-        )? != self.whole
-        {
-            return Err("Source36 source changed after completed stream observations".into());
-        }
-        self.check(source, index, manifest, expected_whole, check)
+        result
+    }
+    /// Consume the observed source completion and move the typed payload with
+    /// its existing charge owner. This is the codec-to-PendingScene handoff,
+    /// not permission to publish the scene without render/lease/revision checks.
+    pub(crate) fn into_metadata<T>(
+        self,
+        source: &Source<R>,
+        index: &Index,
+        manifest: Admitted<Manifest<T>>,
+        expected_whole: Digest,
+        scratch: &mut [u8],
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Admitted<T>, String> {
+        self.recheck(source, index, &manifest, expected_whole, scratch, check)?;
+        manifest.map_unique(|manifest, _| Ok(manifest.into_metadata()))
     }
 }
