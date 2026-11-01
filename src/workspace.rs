@@ -1,5 +1,6 @@
 //! Stable project engines. Registry locks never acquire existing engine locks.
 pub mod lifecycle;
+pub(crate) mod source_runtime;
 use crate::{
     engine::{self, Document, Engine, Scope},
     server::Shared,
@@ -36,6 +37,7 @@ struct Entry {
     handle: Handle,
 }
 pub struct Workspace {
+    pub(crate) source_runtime: Option<Arc<source_runtime::SourceRuntime>>,
     pub(crate) activation: crate::activation::Queue,
     pub(crate) open_warning: Option<String>,
     entries: Vec<Entry>,
@@ -119,6 +121,7 @@ pub fn attach(root: &Shared) -> Registry {
         return workspace;
     }
     let workspace = Arc::new(Mutex::new(Workspace {
+        source_runtime: None,
         activation: Default::default(),
         entries: vec![Entry {
             id: e.project_id.clone(),

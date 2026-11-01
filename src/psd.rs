@@ -9,6 +9,10 @@ pub(crate) mod memory36;
 pub mod patterns;
 pub(crate) mod read36;
 mod row_stream;
+pub(crate) mod save36;
+pub(crate) mod scene_save36;
+pub(crate) mod source_bulk36;
+pub(crate) mod standard36;
 mod structural;
 mod styles;
 use crate::{

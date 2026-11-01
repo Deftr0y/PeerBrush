@@ -230,6 +230,7 @@ fn run() -> Result<(), String> {
             return Err(error);
         }
     };
+    connection.configure_native_sources(profile.as_ref(), local_preferences)?;
     if launch.headless {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));

@@ -13,6 +13,8 @@ mod bounds;
 mod capture;
 #[path = "scene/icc.rs"]
 pub(crate) mod icc;
+#[path = "scene/runtime.rs"]
+mod runtime;
 pub use capture::{CapturedScene, LegacyTileCache};
 pub(crate) use capture::{StageRuntime, StageSession, StagedScene};
 

@@ -399,6 +399,48 @@ mod tests {
     }
 
     #[test]
+    fn source_configuration_is_bound_once_and_stays_lazy_after_instance_shutdown() {
+        let dir = directory();
+        let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
+        let connection = super::super::start(shared.clone(), dir.clone()).unwrap();
+        let workspace = crate::workspace::attach(&shared);
+        assert!(connection.configure_native_sources(None, false).is_err());
+        assert!(workspace.lock().unwrap().source_runtime.is_none());
+        connection.configure_native_sources(None, true).unwrap();
+        let runtime = workspace
+            .lock()
+            .unwrap()
+            .source_runtime
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(runtime.resident().used(), 0);
+        assert_eq!(runtime.disk().used().unwrap(), 0);
+        assert!(!dir.join("native-sources-v1").exists());
+        assert!(connection.configure_native_sources(None, true).is_err());
+        assert!(Arc::ptr_eq(
+            &runtime,
+            workspace.lock().unwrap().source_runtime.as_ref().unwrap()
+        ));
+        let other = Arc::new(Mutex::new(crate::engine::Engine::new()));
+        assert!(crate::workspace::attach(&other)
+            .lock()
+            .unwrap()
+            .source_runtime
+            .is_none());
+        drop(connection);
+        assert!(runtime.begin().is_err());
+        assert!(!dir.join("native-sources-v1").exists());
+        let registered = workspace.lock().unwrap().source_runtime.take();
+        drop(registered);
+        drop(runtime);
+        drop(workspace);
+        drop(shared);
+        drop(other);
+        cleanup(&dir);
+    }
+
+    #[test]
     fn source_operation_blocks_update_seal_and_cannot_begin_after_seal() {
         let dir = directory();
         let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));

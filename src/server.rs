@@ -62,6 +62,56 @@ impl Connection {
     pub fn is_available(&self) -> bool {
         self.availability.load(Ordering::Acquire)
     }
+    /// Bind native source workers to this exact authenticated instance. Creating
+    /// this service allocates no source directories and writes no source data.
+    pub fn configure_native_sources(
+        &self,
+        profile: Option<&crate::settings::Profile>,
+        explicit_state: bool,
+    ) -> Result<(), String> {
+        use crate::{large_document::root::PersistentRootContext, workspace::source_runtime};
+        let admission = self
+            .instance_lock
+            .as_ref()
+            .ok_or("Source instance is unavailable")?
+            .source_admission();
+        let operation = admission.begin()?;
+        let workspace = admission.workspace()?;
+        let context = match (profile, explicit_state) {
+            (Some(profile), false) => {
+                PersistentRootContext::from_profile(self, profile.source_profile()?)?
+            }
+            (None, true) => PersistentRootContext::from_explicit_state(self)?,
+            _ => {
+                return Err(
+                    "Native sources need one actual default profile or explicit state owner".into(),
+                )
+            }
+        };
+        let runtime = source_runtime::SourceRuntime::new(
+            context,
+            source_runtime::Limits {
+                resident_bytes: 768 * 1024 * 1024,
+                disk_bytes: 64 * 1024 * 1024 * 1024,
+                max_files: 4096,
+                store: crate::large_document::Limits {
+                    disk_bytes: 64 * 1024 * 1024 * 1024,
+                    max_blocks: 262144,
+                    max_resident_blocks: 128,
+                    manifest_bytes: 64 * 1024 * 1024,
+                },
+            },
+        )?;
+        let mut workspace = workspace
+            .lock()
+            .map_err(|_| "Source workspace unavailable")?;
+        operation.check()?;
+        if workspace.exiting || workspace.source_runtime.is_some() {
+            return Err("Native source service is closing or already configured".into());
+        }
+        workspace.source_runtime = Some(runtime);
+        Ok(())
+    }
 }
 struct ServerAvailability(Arc<AtomicBool>);
 impl Drop for ServerAvailability {
