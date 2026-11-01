@@ -219,6 +219,34 @@ impl<'c> WriteGuard<'c> {
         }
         self.check_active()
     }
+    pub(crate) fn validate_fill_frame(
+        &self,
+        input: &RasterInput<'_>,
+        frame: &InputFrame,
+    ) -> Result<(), String> {
+        self.check_active()?;
+        input.validate(frame.binding())?;
+        if self._capture.base_key() != input.binding.generation
+            || input.is_mask()
+            || input.layer_metadata().kind() != "fill"
+            || input.layer_metadata().source().is_some()
+            || self.parameters()["mask"] != true
+            || self.parameters()["layer"].as_str() != Some(input.layer_metadata().id())
+            || !matches!(
+                self.parameters()["op"].as_str(),
+                Some("paint" | "smudge" | "clone" | "heal" | "paint.fill")
+            )
+            || frame.command != Some(self.token())
+            || frame.geometry().new_shape() != self.shape
+            || frame.geometry().new_origin() != self.origin
+        {
+            return Err(
+                "Native fill baseline is not an ancillary frame of this captured mask command"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 impl InputBinding {
     pub(crate) fn generation(self) -> DocumentKey {
@@ -651,7 +679,7 @@ impl<'a> RasterInput<'a> {
             .and_then(crate::engine::rect)
             .or(metadata.selection())
             .unwrap_or([0, 0, metadata.width() as i32, metadata.height() as i32]);
-        let mut frame = self.project_frame(requested)?;
+        let mut frame = self.command_frame(requested)?;
         if let Some(frame) = &mut frame {
             frame.command = Some(command.token());
         }
@@ -697,12 +725,23 @@ impl<'a> RasterInput<'a> {
                 + radius)
                 .ceil() as i32,
         ];
-        let mut frame = self.project_frame(requested)?;
+        let mut frame = self.command_frame(requested)?;
         if let Some(frame) = &mut frame {
             frame.command = Some(command.token());
         }
         check()?;
         Ok(frame)
+    }
+    fn command_frame(&self, requested: [i32; 4]) -> Result<Option<InputFrame>, String> {
+        if self.is_mask() {
+            let color = Self::layer(self.document, self.layer.id())?;
+            color
+                .project_frame(requested)?
+                .map(|frame| frame.for_plane(self))
+                .transpose()
+        } else {
+            self.project_frame(requested)
+        }
     }
     pub(crate) fn selection(&self) -> Result<SelectionInput<'a>, String> {
         SelectionInput::new(self.document)

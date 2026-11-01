@@ -1,8 +1,8 @@
 //! Raster edits use document coordinates, independently of transformed content bounds.
-#[path = "edit_bounds/native.rs"]
-pub(crate) mod native;
 #[path = "edit_bounds/input.rs"]
 pub(crate) mod input;
+#[path = "edit_bounds/native.rs"]
+pub(crate) mod native;
 #[path = "edit_bounds/output.rs"]
 pub(crate) mod output;
 use crate::{engine::Document, raster::check_size};
@@ -120,6 +120,7 @@ pub(crate) fn prepare(doc: &mut Document, c: &Value) -> Result<(), String> {
         }
         pixels
     };
+    crate::fill::materialize_visual_layer(&mut doc.layers[index])?;
     let layer = &mut doc.layers[index];
     layer.pixels = shift(&layer.pixels);
     if let Some(mask) = &mut layer.mask {

@@ -181,6 +181,34 @@ fn foreground_color(parameters: &serde_json::Value) -> Result<[u8; 4], String> {
     Ok(std::array::from_fn(|i| values[i].as_u64().unwrap() as u8))
 }
 
+/// Semantic-equivalent color prebaseline for a mask command that expands a
+/// procedural fill. The coordinator pairs this kind transition and every mask
+/// output in one batch; it is not a color draw or a separate publication.
+pub(crate) fn stage_visual_frame<'d, 's>(
+    input: &RasterInput<'d>,
+    frame: &InputFrame,
+    guard: &crate::edit_bounds::input::WriteGuard<'_>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<FillStage<'d, 's>, String> {
+    guard.validate_fill_frame(input, frame)?;
+    validate(input, session, check)?;
+    let baseline =
+        FillBaseline::capture(input)?.ok_or("Native frame has no procedural fill baseline")?;
+    let mut checked = || {
+        guard.check_active()?;
+        check()?;
+        guard.check_active()
+    };
+    let output = stage_frame_with(input, frame, session, &mut checked, |key, _raw, check| {
+        baseline.tile(input, Some(frame), key, check)
+    })?;
+    Ok(FillStage {
+        output: BuiltTiles::Draft(output),
+        baseline: Some(baseline),
+    })
+}
+
 /// New folder child pixels. The existing group slot is only a captured scope
 /// target; its source plane is never used as the child's baseline or replaced.
 pub(crate) fn stage_child_fill<'d, 's>(
@@ -461,13 +489,14 @@ fn stage_fill_impl<'d, 's>(
     } else {
         (input.shape(), input.origin())
     };
-    let local = [
+    let requested_local = [
         area[0] - origin[0],
         area[1] - origin[1],
         area[2] - origin[0],
         area[3] - origin[1],
     ];
-    if clip(local, [0, 0, shape[0] as i32, shape[1] as i32]) != local {
+    let local = clip(requested_local, [0, 0, shape[0] as i32, shape[1] as i32]);
+    if !input.is_mask() && local != requested_local {
         return Err(
             "Native foreground fill requires the complete captured destination frame".into(),
         );

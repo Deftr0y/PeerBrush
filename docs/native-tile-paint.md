@@ -138,6 +138,15 @@ fill, clear, smudge and clone/heal never silently remove the definition. Raw
 paint mask steps remain editable. Ordinary paint/smudge retain the legacy
 raster fallback kind policy when no editable definition is present.
 
+Mask command frame planning starts from the primary color extent and projects
+its translation onto each mask's own original shape/depth. If it expands a
+procedural fill, the old literal color extent is materialized before expansion;
+new space remains zero. The native auxiliary color producer carries a nominal
+fill-baseline proof alongside the mask output for one atomic kind/frame batch.
+It does not turn the mask command into a color draw. A small reproducer records
+the former new-space color leak and compares corrected native8/16 color/mask
+planes plus the shared one-entry undo path; native execution is still required.
+
 `edit_bounds::output::TileOutput` stages one plane through the actual
 `SourceSession` and the engine's `OutputDraft`. It compares full original padded
 tiles, keeps mutable proposal/index allocations charged, creates a fragment only

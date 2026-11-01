@@ -2256,3 +2256,303 @@ fn real_child_producer_typed_insertion_and_native_history_keep_one_undo_redo() {
         assert_eq!(history.redo_len(), 0);
     }
 }
+
+#[test]
+fn command_mask_frames_use_primary_color_extent_before_projecting_small_steps() {
+    use crate::{brush::input::StrokePoints, engine::native::CommandDescriptor};
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = source(16);
+    source.width = 20;
+    source.height = 14;
+    source.layers[0].mask = Some(crate::engine::Mask {
+        enabled: false,
+        linked: false,
+        cache_key: crate::engine::id(),
+        steps: vec![crate::engine::MaskStep {
+            id: "small".into(),
+            kind: "paint".into(),
+            enabled: false,
+            weight: 1.,
+            value: 0.,
+            pixels: Raster::new_depth(5, 4, 16),
+            settings: serde_json::json!({}),
+        }],
+    });
+    let document = native(&source, &session);
+    for (points, expands) in [
+        (serde_json::json!([[1., 4.]]), false),
+        (serde_json::json!([[18., 10.]]), true),
+    ] {
+        let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"mask":true,"points":points,"radius":0.5,"color":[200,10,20,255]});
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[body.clone()], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let command = descriptor.commands().next().unwrap();
+        let input =
+            RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+        let points = StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+        let frame = input
+            .stroke_frame(command, &points, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(frame.is_some(), expands);
+        let mut expected = source.clone();
+        crate::edit_bounds::prepare(&mut expected, &body).unwrap();
+        if let Some(frame) = frame {
+            assert_eq!(frame.geometry().new_shape(), [23, 14]);
+            assert_eq!(frame.geometry().old_shape(), [5, 4]);
+            assert_eq!(frame.geometry().shift(), [0, 2]);
+            assert_eq!(
+                [
+                    expected.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .width,
+                    expected.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .height
+                ],
+                [23, 14]
+            );
+            WriteGuard::new(&captured, command, &input, Some(&frame)).unwrap();
+        } else {
+            assert_eq!(
+                [
+                    expected.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .width,
+                    expected.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .height
+                ],
+                [5, 4]
+            );
+        }
+    }
+}
+
+#[test]
+fn expanded_fill_mask_preserves_old_visible_color_and_pairs_one_native_history_entry() {
+    use crate::{
+        brush::input::StrokePoints,
+        engine::native::{
+            CommandDescriptor, Direction, HistoryRequest, LayerPatch, NativeHistory, Publication,
+            RasterBatch, RasterPatch, RetainedUpdate, SourceUpdate,
+        },
+    };
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(12, 10, depth).unwrap();
+        source.layers[0].kind = "fill".into();
+        source.layers[0].color = [32, 96, 160, 128];
+        source.layers[0].x = 5;
+        source.layers[0].y = 4;
+        source.layers[0].pixels = Raster::new_depth(4, 3, depth);
+        source.layers[0]
+            .pixels
+            .set16(0, 0, [12347, 23521, 43217, 49153]);
+        source.layers[0].mask = Some(crate::engine::Mask {
+            enabled: false,
+            linked: false,
+            cache_key: crate::engine::id(),
+            steps: vec![crate::engine::MaskStep {
+                id: "paint-mask".into(),
+                kind: "paint".into(),
+                enabled: true,
+                weight: 1.,
+                value: 0.,
+                pixels: Raster::new_depth(4, 3, depth),
+                settings: serde_json::json!({}),
+            }],
+        });
+        // Former ordering expanded the kindfill's logical extent while copying
+        // its unused raw plane, introducing literal color in new empty space.
+        let mut former = source.clone();
+        former.layers[0].pixels =
+            crate::transform::copy_shift(&former.layers[0].pixels, 12, 10, 5, 4);
+        former.layers[0].x = 0;
+        former.layers[0].y = 0;
+        let (_, _, former_pixels, _) = former.preview(None, 12, None, false).unwrap();
+        assert_eq!(
+            &former_pixels[(12 + 1) * 4..(12 + 1) * 4 + 4],
+            &[32, 96, 160, 128]
+        );
+        let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"mask":true,"points":[[1.,1.],[2.,2.]],
+            "radius":1.5,"opacity":0.7,"flow":0.6,"color":[200,10,20,255]});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[body.clone()], None, None, "Mask")
+            .unwrap();
+        assert_eq!(legacy.undo.len(), 1);
+        assert_eq!(legacy.doc.layers[0].kind, "paint");
+        assert_eq!(legacy.doc.layers[0].pixels.get16(1, 1), [0; 4]);
+        assert_eq!(
+            legacy.doc.layers[0].pixels.get16(6, 5),
+            [32, 96, 160, 128].map(|v| v * 257)
+        );
+        let (_, _, fixed_pixels, _) = legacy.doc.preview(None, 12, None, false).unwrap();
+        assert_eq!(&fixed_pixels[(12 + 1) * 4..(12 + 1) * 4 + 4], &[0; 4]);
+        let mut document = native(&source, &session);
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let batch = {
+            let command = descriptor.commands().next().unwrap();
+            let mask =
+                RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+            let color = RasterInput::layer(captured.document(), &source.layers[0].id).unwrap();
+            let points = StrokePoints::from_command(command, mask.pool(), &mut || Ok(())).unwrap();
+            let frame = mask
+                .stroke_frame(command, &points, &mut || Ok(()))
+                .unwrap()
+                .unwrap();
+            let color_frame = frame.for_plane(&color).unwrap();
+            let stroke = points.local(&mask, Some(&frame), &mut || Ok(())).unwrap();
+            let guard = WriteGuard::new(&captured, command, &mask, Some(&frame)).unwrap();
+            let BuiltTiles::Draft(mask_draft) = crate::brush::input::stage_guarded(
+                &mask,
+                &stroke,
+                Some(&frame),
+                &guard,
+                &session,
+                &mut || Ok(()),
+            )
+            .unwrap() else {
+                panic!("No mask output")
+            };
+            let color_stage = crate::fill::input::stage_visual_frame(
+                &color,
+                &color_frame,
+                &guard,
+                &session,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            assert!(color_stage.materializes_fill());
+            let (BuiltTiles::Draft(color_draft), proof) = color_stage.into_parts() else {
+                panic!("No fill prebaseline")
+            };
+            assert_eq!(proof.unwrap().logical_shape(), [4, 3]);
+            RasterBatch {
+                rasters: vec![
+                    RasterPatch {
+                        target: color.binding().slot(),
+                        output: color_draft.seal(&|| Ok(())).ok().unwrap(),
+                        retained: RetainedUpdate::Clear,
+                        layer_origin: None,
+                    },
+                    RasterPatch {
+                        target: mask.binding().slot(),
+                        output: mask_draft.seal(&|| Ok(())).ok().unwrap(),
+                        retained: RetainedUpdate::Clear,
+                        layer_origin: None,
+                    },
+                ],
+                layers: vec![LayerPatch {
+                    target: color.binding().slot(),
+                    origin: Some(color_frame.geometry().new_origin()),
+                    source: SourceUpdate::Keep,
+                    materialize_fill: true,
+                }],
+                effects: vec![],
+                selection: None,
+            }
+        };
+        let delta = captured.batch(batch, &|| Ok(())).unwrap_or_else(|refused| {
+            let reason = refused.reason().to_owned();
+            refused.abort(&session, &|| Ok(())).unwrap();
+            panic!("Native fill-mask batch refused: {reason}")
+        });
+        let mut history = NativeHistory::new(&runtime.resident(), 20).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Mask frame",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        drop(
+            history
+                .commit(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    commit,
+                )
+                .unwrap(),
+        );
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(document.metadata().layer(0).unwrap().kind(), "paint");
+        let color_slot = document.metadata().layer(0).unwrap().pixels().slot();
+        let mask_slot = document
+            .metadata()
+            .layer(0)
+            .unwrap()
+            .mask()
+            .unwrap()
+            .steps()
+            .next()
+            .unwrap()
+            .pixels()
+            .slot();
+        for (slot, expected) in [
+            (color_slot, &legacy.doc.layers[0].pixels),
+            (
+                mask_slot,
+                &legacy.doc.layers[0].mask.as_ref().unwrap().steps[0].pixels,
+            ),
+        ] {
+            let region = document
+                .source(slot)
+                .unwrap()
+                .prepare_region(Region::new([0, 0, 12, 10]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            for y in 0..10 {
+                for x in 0..12 {
+                    assert_eq!(region.pixel16(x, y).unwrap(), expected.get16(x, y));
+                }
+            }
+        }
+        let undo = history
+            .snapshot()
+            .prepare_move(&document, Direction::Undo, "human", &|| Ok(()))
+            .unwrap();
+        drop(
+            history
+                .move_cursor(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    undo,
+                )
+                .unwrap(),
+        );
+        assert_eq!(document.metadata().layer(0).unwrap().kind(), "fill");
+        assert_eq!(document.metadata().layer(0).unwrap().origin(), [5, 4]);
+        assert_eq!(document.metadata().layer(0).unwrap().pixels().width(), 4);
+    }
+}
