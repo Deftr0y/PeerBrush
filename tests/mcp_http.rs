@@ -8,6 +8,51 @@ use std::{
 };
 
 #[test]
+fn private_stream_preserves_exact_observation_wire_and_existing_auth_origin_guards() {
+    let canvas = Canvas::new();
+    let request = json!({"jsonrpc":"2.0","id":"stream-fixture","method":"tools/call","params":{"name":"peerbrush_observe","arguments":{"max_edge":32}}});
+    let query = json!({"method":"mcp_stream","params":{"request":request}});
+    let result = response(canvas.request("POST", "/rpc").send_json(query.clone()));
+    assert_eq!(result.status(), 200);
+    assert_eq!(result.header("Content-Type"), Some("application/json"));
+    assert!(result.header("Content-Length").is_some());
+    assert!(result.header("Transfer-Encoding").is_none());
+    let wire = result.into_string().unwrap();
+    assert!(wire.starts_with("{\"id\":\"stream-fixture\",\"jsonrpc\":\"2.0\","));
+    let value: Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(value["result"]["isError"], false);
+    assert_eq!(value["result"]["content"][1]["mimeType"], "image/png");
+    let png = STANDARD
+        .decode(value["result"]["content"][1]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(image::load_from_memory(&png).unwrap().width(), 32);
+    let old = response(
+        canvas
+            .request("POST", "/rpc")
+            .send_json(json!({"method":"mcp","params":{"request":request}})),
+    )
+    .into_json::<Value>()
+    .unwrap();
+    assert_eq!(old["ok"], true);
+    assert_eq!(old["result"], value);
+    let unauthorized = response(
+        canvas
+            .request("POST", "/rpc")
+            .set("Authorization", "Bearer invalid-fixture")
+            .send_json(query.clone()),
+    );
+    assert_eq!(unauthorized.status(), 401);
+    let origin = response(
+        canvas
+            .request("POST", "/rpc")
+            .set("Origin", "https://untrusted.example")
+            .send_json(query),
+    );
+    assert_eq!(origin.status(), 403);
+    assert!(canvas.shared.lock().unwrap().undo.is_empty());
+}
+
+#[test]
 fn modern_fonts_are_bounded_path_free_and_independent_of_document_history() {
     let canvas = Canvas::new();
     let before = peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap();

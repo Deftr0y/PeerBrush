@@ -27,6 +27,31 @@ fn read(bytes: Segments) -> Vec<u8> {
 }
 
 #[test]
+fn private_rpc_prefix_binds_id_before_any_native_payload() {
+    let pool = ResidentBudget::new(32 * 1024 * 1024).unwrap();
+    let source = [19, 82, 201];
+    let reply = reply(&pool, &source)
+        .tool_result()
+        .unwrap()
+        .rpc(&json!("request-🙂"))
+        .unwrap()
+        .ordered_rpc()
+        .unwrap();
+    let wire = read(reply.serialized(&mut || Ok(())).unwrap());
+    let prefix = "{\"id\":\"request-🙂\",\"jsonrpc\":\"2.0\",";
+    assert!(wire.starts_with(prefix.as_bytes()));
+    let value: Value = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(
+        value["result"]["content"][1]["data"],
+        STANDARD.encode(source)
+    );
+    assert_eq!(pool.used(), 0);
+    assert!(OwnedReply::plain(json!({"jsonrpc":"2.0"}))
+        .ordered_rpc()
+        .is_err());
+}
+
+#[test]
 fn segmented_base64_preserves_every_boundary_and_exact_wire_coordinates() {
     for length in [
         0,
