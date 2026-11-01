@@ -363,17 +363,18 @@ mod tests {
         let request = TaskRequest::new(&other, "human", "agent", "task", &|| Ok(())).unwrap();
         assert!(history.capture_task(&other, request).is_err());
         let layer = other.metadata().layer(0).unwrap().id().to_owned();
+        // Visibility has its own reservation domain. Capture the real normalized
+        // command so this fixture reaches the foreign-history refusal below,
+        // rather than failing its earlier editor-intent preparation.
+        let descriptor = CommandDescriptor::from_normalized(
+            &other,
+            other.metadata().revision(),
+            &[serde_json::json!({"op":"layer.update","layer":layer,"visible":false})],
+            &|| Ok(()),
+        )
+        .unwrap();
         let delta = other
-            .capture_intent(
-                other.key(),
-                0,
-                "human",
-                &[Scope::layer(&layer)],
-                &[],
-                1,
-                false,
-                true,
-            )
+            .capture_descriptor(descriptor, "human", &[], 1, false, true)
             .unwrap()
             .visibility(&layer, false, &|| Ok(()))
             .unwrap();
