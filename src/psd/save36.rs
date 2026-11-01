@@ -39,7 +39,7 @@ pub(crate) struct OwnedRoots<'a> {
 }
 
 /// Stage, seal, reopen and compare an entire captured native source save before
-/// granting the closed publication result. The root publication transaction is
+/// granting the closed publication result. The final publication transaction is
 /// still responsible for destination lease/backup/identity/final revision guards.
 pub(crate) fn prepare<'a>(
     scene: &'a SceneSnapshot,
