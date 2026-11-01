@@ -5,6 +5,7 @@
 //! successfully before sampling it, and retain dirty source bytes until put succeeds.
 mod access;
 mod budget;
+mod bytes;
 mod disk;
 mod linear;
 mod planar;
@@ -12,6 +13,9 @@ mod scalar;
 mod store;
 
 pub use budget::{Reservation, ResidentBudget};
+pub use bytes::{
+    AppendWriter, ByteRole, BytesCursor, CompletedBytes, LargeSourceTemporary, MAX_SOURCE_PAYLOAD,
+};
 pub use disk::{DiskBudget, DiskReservation};
 pub use planar::{CompletedPlanar, PlanarRole, PlanarScratch, PlanarSpec};
 pub use scalar::{CompletedScalar, ScalarScratch, ScalarSpec};

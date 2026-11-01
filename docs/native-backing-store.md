@@ -183,3 +183,20 @@ Unknown partial writes, extra bytes, changed hashes or foreign replacements keep
 their bytes and charge. Drop still performs no cleanup. The caller retains its
 actual session I/O permit through abort; cleanup checks may ignore the obsolete
 gesture revision, but cannot invent filesystem or profile authority.
+
+## Opaque source-operation spools
+
+`LargeSourceTemporary` admits an exact payload length up to 64 GiB before creating
+an exclusive append-only file. Its role, length, random identity, ordered chunk
+hashes and caller binding have separate byte-spool hash domains. This does not
+change the legacy SaveTemporary limit or provide Photoshop/source authority.
+Unknown compressed lengths require a bounded deterministic sizing pass before
+construction; there is no random-write or truncate interface.
+
+Sealed byte ranges verify complete overlapping 64 KiB chunks. Each bounded
+Read/Seek cursor retains its own charged 64 KiB buffer and exact relative EOF;
+callers separately admit their transfer buffers. Cancellation propagates without
+the standard I/O helpers retrying it as Interrupted. A cursor keeps retirement
+busy. Zero-length opaque blobs are valid, but prove no codec completion. Explicit
+abort and completed retirement preserve the same held-handle, foreign-replacement
+and conservative disk-reservation rules as the image staging wrappers.
