@@ -5,7 +5,7 @@ use super::{
     manifest36::{self, Core, Raster, StagedCore},
 };
 use crate::{
-    engine::scene::{Document36, SceneSnapshot},
+    engine::{native::Metadata, scene::SceneSnapshot},
     raster::surface::PhysicalTile,
 };
 use ring::digest::{Context, SHA256};
@@ -37,7 +37,8 @@ impl<'a> SourceIndex<'a> {
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
         check()?;
-        if scene.rasters().len() > limits.rasters
+        let raster_count = scene.metadata().visit_rasters(|_| Ok(()))?;
+        if raster_count > limits.rasters
             || limits.rasters > 65536
             || limits.references > 1_048_576
             || limits.tiles > 1_048_576
@@ -46,7 +47,8 @@ impl<'a> SourceIndex<'a> {
             return Err("Source36 physical source index exceeds declared admission".into());
         }
         let mut count = 0usize;
-        for (_, source) in scene.rasters().iter() {
+        scene.metadata().visit_rasters(|raster| {
+            let source = scene.raster(raster.slot())?;
             check()?;
             if !source.uses_budget(scene.budget()) || !source.uses_disk_budget(scene.disk_budget())
             {
@@ -60,14 +62,15 @@ impl<'a> SourceIndex<'a> {
             if count > limits.references {
                 return Err("Source36 physical references exceed declared admission".into());
             }
-        }
+            Ok(())
+        })?;
         let max_chunks = (count
             .checked_mul(2)
             .ok_or("Source36 record count overflow")?)
         .min(limits.chunks);
         let bytes = count
             .checked_mul(std::mem::size_of::<Location>() + std::mem::size_of::<usize>())
-            .and_then(|n| n.checked_add(scene.rasters().len() * std::mem::size_of::<Raster>()))
+            .and_then(|n| n.checked_add(raster_count * std::mem::size_of::<Raster>()))
             .and_then(|n| {
                 n.checked_add(
                     max_chunks * (std::mem::size_of::<Chunk>() + std::mem::size_of::<u32>()),
@@ -82,9 +85,11 @@ impl<'a> SourceIndex<'a> {
             .map_err(|_| "Source36 physical index allocation refused")?;
         let mut rasters = Vec::new();
         rasters
-            .try_reserve_exact(scene.rasters().len())
+            .try_reserve_exact(raster_count)
             .map_err(|_| "Source36 raster index allocation refused")?;
-        for (id, source) in scene.rasters().iter() {
+        scene.metadata().visit_rasters(|raster| {
+            let id = raster.ordinal();
+            let source = scene.raster(raster.slot())?;
             check()?;
             let start = locations.len();
             let spec = Spec::new(source.depth())?;
@@ -111,7 +116,8 @@ impl<'a> SourceIndex<'a> {
                 depth: source.depth(),
                 references: (locations.len() - start) as u32,
             });
-        }
+            Ok(())
+        })?;
         if locations.len() != count {
             return Err(
                 "Source36 captured physical roster changed during metadata indexing".into(),
@@ -220,12 +226,12 @@ impl<'a> SourceIndex<'a> {
     pub(crate) fn rasters(&self) -> &[Raster] {
         &self.rasters
     }
-    pub(crate) fn core(&self) -> Core<&'a Document36> {
+    pub(crate) fn core(&self) -> Core<Metadata<'a>> {
         let doc = self.scene.metadata();
         Core {
             format: 36,
-            source_id: doc.id.clone(),
-            revision: doc.revision,
+            source_id: doc.id().to_owned(),
+            revision: doc.revision(),
             metadata: doc,
             rasters: self.rasters.clone(),
             tiles: self.unique.len() as u32,
@@ -301,8 +307,8 @@ impl<'a> SourceIndex<'a> {
         writer.finish(check)
     }
     pub(crate) fn check_core<T>(&self, core: &StagedCore<T>) -> Result<(), String> {
-        if core.source_id() != self.scene.metadata().id
-            || core.revision() != self.scene.metadata().revision
+        if core.source_id() != self.scene.metadata().id()
+            || core.revision() != self.scene.metadata().revision()
         {
             return Err("Source36 staged core belongs to another captured document".into());
         }
