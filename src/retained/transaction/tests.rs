@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    engine::{Document, Engine},
+    engine::{native::CommandDescriptor, Document, Engine},
     large_document::{BlockRef, Limits, Snapshot},
     retained::planning,
 };
@@ -329,6 +329,73 @@ fn foreign_session_refuses_before_creation_and_duplicate_batch_retires_every_pla
     assert!(reason.contains("Duplicate"), "{reason}");
     assert_eq!(fixture.disk.used().unwrap(), baseline);
     assert_eq!(fixture.document.metadata().revision(), 0);
+    drop(session);
+    fixture.finish();
+}
+
+#[test]
+fn production_entry_uses_immutable_descriptor_parameters_and_rejects_foreign_tokens() {
+    let fixture = Fixture::new(16, "paint", Some(true));
+    let baseline = fixture.disk.used().unwrap();
+    let mut commands = vec![json!({"op":"transform","layer":fixture.legacy.layers[0].id,
+        "angle":17.5,"dx":3,"dy":-2,"selection_only":false})];
+    let expected = Engine::preview_edits(fixture.legacy.clone(), &commands).unwrap();
+    let descriptor =
+        CommandDescriptor::from_normalized(&fixture.document, 0, &commands, &|| Ok(())).unwrap();
+    let token = descriptor.commands().next().unwrap().token();
+    let captured = fixture
+        .document
+        .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+        .unwrap();
+    commands[0]["dx"] = json!(900);
+    let session = fixture.session();
+    let prepared = prepare_command(
+        captured,
+        token,
+        &session,
+        &mut Work::new(10_000_000).unwrap(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let layer = prepared.preview().metadata().layers().next().unwrap();
+    assert_eq!(layer.origin(), [expected.layers[0].x, expected.layers[0].y]);
+    planning::tests::assert_pixels(
+        prepared.preview().source(layer.pixels().slot()).unwrap(),
+        &expected.layers[0].pixels,
+        &fixture.pool,
+    );
+    fixture
+        .document
+        .adopt(prepared)
+        .err()
+        .unwrap()
+        .abort(&session, &|| Ok(()))
+        .unwrap();
+    assert_eq!(fixture.disk.used().unwrap(), baseline);
+    drop(session);
+    let session = fixture.session();
+    let another =
+        CommandDescriptor::from_normalized(&fixture.document, 0, &commands, &|| Ok(())).unwrap();
+    let captured = fixture
+        .document
+        .capture_descriptor(descriptor, "human", &[], 1, false, true)
+        .unwrap();
+    let reason = prepare_command(
+        captured,
+        another.commands().next().unwrap().token(),
+        &session,
+        &mut Work::new(10_000_000).unwrap(),
+        &|| Ok(()),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        reason,
+        "Native transform command belongs to another descriptor"
+    );
+    assert_eq!(session.created.get(), 0);
+    assert_eq!(fixture.disk.used().unwrap(), baseline);
+    drop(another);
     drop(session);
     fixture.finish();
 }
