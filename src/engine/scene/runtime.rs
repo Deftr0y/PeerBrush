@@ -19,6 +19,13 @@ impl StageRuntime for Arc<SourceRuntime> {
     }
 }
 impl StageSession for SourceSession {
+    fn abort_fragment(
+        &self,
+        fragment: crate::large_document::FreshFragment,
+        cleanup: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        SourceSession::abort_fragment(self, fragment, &mut || cleanup())
+    }
     fn check(&self) -> Result<(), String> {
         SourceSession::check(self)
     }
