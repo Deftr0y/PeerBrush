@@ -433,6 +433,9 @@ impl Store {
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+    pub(crate) fn filesystem_identity(&self) -> ((u64, u64), (u64, u64)) {
+        (self.0.directory_id, self.0.identity)
+    }
     /// Known in-memory checkpoint only; never scans for a latest commit.
     pub(crate) fn checkpoint_reference(&self) -> Result<Option<CommitRef>> {
         Ok(self.state()?.head)
